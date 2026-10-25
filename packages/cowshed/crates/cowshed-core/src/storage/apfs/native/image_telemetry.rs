@@ -1042,6 +1042,7 @@ mod tests {
         use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
         use crate::repository::{ProjectPaths, RepoId};
         use crate::storage::apfs::{ApfsSubstrateConfig, native::MacOsApfsExecutionHost};
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
         let fixture = Fixture::new();
         let project = ProjectPaths::with_mount_root(
@@ -1052,9 +1053,10 @@ mod tests {
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
         fs::create_dir_all(layout.images()).unwrap();
+        let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
         let host = MacOsApfsExecutionHost::new(
-            cowshed_apfs::SystemCommandRunner,
-            ApfsSubstrateConfig::new(&fixture.0, fixture.0.join("checkout")),
+            cowshed_apfs::SystemCommandRunner::new(namespace),
+            ApfsSubstrateConfig::new(namespace, &fixture.0, fixture.0.join("checkout")),
         )
         .unwrap();
         let source = BuildVolumeId::mint();

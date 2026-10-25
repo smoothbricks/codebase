@@ -26,6 +26,7 @@ use cowshed_core::storage::lifecycle::{
     Revision, StorageFact, StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate,
     SubstrateStats,
 };
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -1227,7 +1228,11 @@ fn workspace(name: &str, revision: u64) -> LifecycleWorkspace {
 
 fn substrate(host: FakeHost, lane: CountingLane) -> ApfsSubstrate<FakeHost, CountingLane> {
     ApfsSubstrate::with_lane_and_incarnations(
-        ApfsSubstrateConfig::new("/store", "/project"),
+        ApfsSubstrateConfig::new(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            "/store",
+            "/project",
+        ),
         host,
         lane,
         FixedIncarnations::default(),
@@ -1938,7 +1943,11 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
         let host = FakeHost::default();
         let lane = CountingLane::default();
         let substrate = ApfsSubstrate::with_lane_and_incarnations(
-            ApfsSubstrateConfig::new("/store", checkout_path),
+            ApfsSubstrateConfig::new(
+                HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+                "/store",
+                checkout_path,
+            ),
             host.clone(),
             lane.clone(),
             FixedIncarnations::default(),

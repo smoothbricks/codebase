@@ -111,13 +111,16 @@ import type { TempVolumeSpace } from './verdict.js';
  * by root (measured 2026-10-15). A creator that dies part way leaves debris at the staging directory or as an
  * unmounted volume, never an unmarked volume at the mountpoint. No Disk Arbitration call made either
  * directory, so none removes it: this module removes both once the volume is gone.
- * The I/O Registry is the only record of what was
- * attached: before creating, a task detaches every RAM disk of this user and
- * this volume's exact size that is mounted nowhere but its mountpoint or staging directory,
- * because a creator killed or deadlined mid-step leaves one behind — measured
- * 2026-10-06: a deadlined `hdiutil attach` whose diskimages-helper finished the
- * attach after `hdiutil` was killed, and a volume mounted with no marker. A
- * disk with a lease directory on it is never detached; its error names it.
+ * The I/O Registry is the only record of what was attached, and it names every disk's volume. A task inventories the
+ * RAM disks that are this volume's and no other (`volumeDisks`): of this user and this volume's exact size, mounting
+ * nowhere but at its mountpoint or staging directory, and either carrying a volume called exactly its name, which a
+ * volume is made under and keeps, or recorded by the exact registry entry its owner holds a receipt or its ledger holds
+ * custody for, which covers an attach whose format never finished. A RAM disk of that size that is neither, another
+ * volume's, a test's, or an unformatted one nothing recorded, is ignored, however it is mounted. Before creating, a
+ * task detaches each disk of that inventory its owner holds a receipt for, because a creator killed or deadlined
+ * mid-step leaves one behind — measured 2026-10-06: a deadlined `hdiutil attach` whose diskimages-helper finished the
+ * attach after `hdiutil` was killed, and a volume mounted with no marker. A disk it holds no receipt for, one with a
+ * lease directory on it, or one with something attached below it stops the creation instead; its error names it.
  *
  * An image attached from a file below a lease belongs to whoever attached it:
  * cowshed's real-APFS fixtures release theirs under the production per-image
@@ -232,7 +235,11 @@ export interface HostCommands {
    * owner is the cowshed gateway (`ram-attach`), never this task: a helper the task's own job forked would end with it.
    */
   attachRam(sectors: number): Promise<Result<string, string | RamUnavailable>>;
-  /** Exact attach receipts owned by this caller; names and capacity never establish this authority. */
+  /**
+   * Exact attach receipts owned by this caller; names and capacity never establish this authority. A disk it owns
+   * counts as the volume's even with nothing mounted, which covers an attach whose format never finished; one it holds
+   * no receipt for counts only as the volume of its exact name.
+   */
   ownsRamDisk?(disk: AttachedRamDisk): boolean;
   detachRam(device: string, registryEntry: string, deadlineMs?: number): Promise<CommandOutput>;
 }
@@ -259,10 +266,52 @@ export function describeSignalled(entry: SignalledProcess): string {
   return `${entry.pid} (${entry.image ?? 'unknown image'})`;
 }
 
+/**
+ * A test run's host namespace: seven lowercase base-36 characters, the pid of the process that minted it in the first
+ * five (zero-padded, so the first is a digit, which begins no production name) and that process's ordinal in the last
+ * two. The pid tells a later run whether the namespace's owner is gone. Mirrors `cowshed_os::namespace::TestNamespace`.
+ */
+export type TestNamespace = { readonly kind: 'test'; readonly name: string };
+
+/**
+ * Whose names a host's RAM temp volume carries: production's, or one test run's own (specs/cowshed/01_storage.md,
+ * "Host namespace"). Every path and name the volume takes derives from it (`ramTempPaths`), so no name a test makes can
+ * be one production reads, sweeps or reclaims, and no guard compares them. Mirrors
+ * `cowshed_os::namespace::HostNamespace`.
+ */
+export type HostNamespace = { readonly kind: 'production' } | TestNamespace;
+
+/** The namespace of the user's own volume, which no test leases, creates or detaches. */
+export const PRODUCTION: HostNamespace = { kind: 'production' };
+
+const NAMESPACE_BASE = 36;
+const NAMESPACE_PID_DIGITS = 5;
+const NAMESPACE_ORDINAL_DIGITS = 2;
+
+/** `value` as `digits` zero-padded lowercase base-36 digits; the refusal names it `what` when it does not fit them. */
+function base36Digits(value: number, digits: number, what: string): string {
+  if (!Number.isSafeInteger(value) || value < 0 || value >= NAMESPACE_BASE ** digits) {
+    throw new RangeError(`${what} ${value} does not fit a test namespace's ${digits} base-36 digits`);
+  }
+  return value.toString(NAMESPACE_BASE).padStart(digits, '0');
+}
+
+/**
+ * The namespace process `pid` mints as its `ordinal`th, encoded as `TestNamespace::of` encodes it:
+ * `testNamespace(94769, 3)` is `0214h03`. A pid or an ordinal that does not fit its digits throws.
+ */
+export function testNamespace(pid: number, ordinal: number): TestNamespace {
+  const pidDigits = base36Digits(pid, NAMESPACE_PID_DIGITS, 'pid');
+  const ordinalDigits = base36Digits(ordinal, NAMESPACE_ORDINAL_DIGITS, 'ordinal');
+  return { kind: 'test', name: `${pidDigits}${ordinalDigits}` };
+}
+
 export interface RamTempPaths {
   /**
-   * The per-user root `cowshed setup` makes, `/private/var/folders/cowshed/<uid>`: a directory of `uid`'s with
-   * mode 0700, holding the mountpoint and the staging directory. mds admits no volume mounted below `/var/folders/`.
+   * The root the volume mounts below: a directory of `uid`'s with mode 0700, holding the mountpoint and the staging
+   * directory. Production's is the per-user root `cowshed setup` makes, `/private/var/folders/cowshed/<uid>`; a test
+   * namespace's is the directory of its name below that root, which its fixture makes. mds admits no volume mounted
+   * below `/var/folders/`.
    */
   root: string;
   /** The user that must own `root`. */
@@ -272,25 +321,47 @@ export interface RamTempPaths {
    * a socket below a lease must fit sun_path (104 bytes).
    */
   mountpoint: string;
+  /**
+   * The kernel lock, and the ledger beside it: `/private/tmp/<volumeName>.lock` for production,
+   * `<root>/ram<revision>.lock` for a test namespace, which keeps its ordinary scratch beside the lock in its own root.
+   */
   lockFile: string;
-  /** APFS volume name; its marker holds it. */
+  /** APFS volume name; its marker holds it. `smoo-ram<revision>-<uid>`, with `-<ns>` after it for a test namespace. */
   volumeName: string;
   /** Where the volume is mounted to be marked before it is mounted at `mountpoint`. */
   staging: string;
 }
 
-export function ramTempPaths(user: { uid: number }): RamTempPaths {
-  const volumeName = `smoo-ram${RAM_TEMP_REVISION}-${user.uid}`;
-  const root = `/private/var/folders/cowshed/${user.uid}`;
-  const mountpoint = `${root}/ram${RAM_TEMP_REVISION}`;
+/**
+ * Where the volume of `user` in `namespace` lives and what it is called. Production's are the user's own: the per-user
+ * root `/private/var/folders/cowshed/<uid>`, the mountpoint `<root>/ram3` and staging directory `<root>/ram3-new` below
+ * it, the volume `smoo-ram3-<uid>` and its lock in `/private/tmp`. A test namespace's lie in the directory of its name
+ * below that root, `<root>/<ns>`: its mountpoint, staging directory and lock (`ram3.lock`) in it, and its name after
+ * the volume's (`smoo-ram3-<uid>-<ns>`), so none of its paths or names is production's.
+ */
+export function ramTempPaths(user: { uid: number }, namespace: HostNamespace): RamTempPaths {
+  const userRoot = `/private/var/folders/cowshed/${user.uid}`;
+  const leaf = `ram${RAM_TEMP_REVISION}`;
+  const own = `smoo-${leaf}-${user.uid}`;
+  const production = namespace.kind === 'production';
+  const root = production ? userRoot : `${userRoot}/${namespace.name}`;
+  const mountpoint = `${root}/${leaf}`;
   return {
     root,
     uid: user.uid,
     mountpoint,
-    lockFile: `/private/tmp/${volumeName}.lock`,
-    volumeName,
+    lockFile: production ? `/private/tmp/${own}.lock` : `${mountpoint}.lock`,
+    volumeName: production ? own : `${own}-${namespace.name}`,
     staging: `${mountpoint}-new`,
   };
+}
+
+/** An APFS volume of a RAM disk, as the I/O Registry names it and the mount table places it. */
+export interface RamVolume {
+  /** Its `FullName`. A volume is made under its final name and never renamed, so the name says whose it is. */
+  name: string;
+  /** Where it is mounted, if anywhere. */
+  mountpoints: string[];
 }
 
 /** An attached RAM disk, as the I/O Registry and the mount table show it. */
@@ -307,6 +378,8 @@ export interface RamDisk {
   uid: number;
   /** Where its volumes are mounted, if anywhere. */
   mountpoints: string[];
+  /** Its APFS volumes, by the exact names the I/O Registry gives them: none before it is formatted. */
+  volumes: RamVolume[];
 }
 
 /** A RAM disk with its whole disk published, which a detach can name. */
@@ -367,7 +440,10 @@ export type RamTempError =
   | { kind: 'volume-full'; mountpoint: string; capacityBytes: number; freeBytes: number }
   /** The lease went while its task held it: its volume was detached or replaced, or its directory removed. */
   | { kind: 'lease-lost'; lease: string; mountpoint: string; detail: string }
-  /** The per-user root the volume mounts below is missing, or is not the user's 0700 directory. */
+  /**
+   * The root the volume mounts below, the per-user root or a test namespace's directory, is missing or is not the
+   * user's 0700 directory.
+   */
   | { kind: 'root-unready'; root: string; detail: string };
 
 export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
@@ -573,7 +649,8 @@ export class RamTempVolume {
    * Where optional RAM's ordinary fallback makes its owned scratch: the lock's own directory, which an unavailable answer
    * has just written. For the user's volume that is `/private/tmp`, outside every checkout, so no Git or Cargo walk from
    * the command's temp files finds the workspace it builds; the workspace's runtime alias resolves into
-   * `<mount>/.cowshed/run`, inside the checkout, and the inherited TMPDIR may be RAM.
+   * `<mount>/.cowshed/run`, inside the checkout, and the inherited TMPDIR may be RAM. A test namespace's lock lies in
+   * its own root, so its ordinary scratch does too.
    */
   readonly ordinaryParent: string;
 
@@ -1789,10 +1866,12 @@ export class RamTempVolume {
   }
 
   /**
-   * This module's RAM disks attached on the host: this user's, of this volume's exact size, mounted nowhere else. Read
-   * from the I/O Registry, which omits no attached disk; one still publishing its media is named, never passed over.
+   * This volume's RAM disks attached on the host, read from the I/O Registry, which omits no attached disk: the ones
+   * `volumeDisks` names. A RAM disk of this user and size that is not this volume's, another volume's, a test's, or an
+   * unformatted one nothing recorded, is not its to inventory or detach, and is ignored. One of its own still
+   * publishing its media is named, never passed over.
    */
-  private async attached(): Promise<Result<AttachedRamDisk[], ProvisionFailed>> {
+  private async attached(): Promise<Result<AttachedRamDisk[], RamTempError>> {
     const registry = await this.commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
     if (registry.status !== 0) {
       return failed('ioreg (RAM disks)', commandText(registry));
@@ -1805,13 +1884,20 @@ export class RamTempVolume {
     if (!disks.ok) {
       return failed('ioreg (RAM disks)', disks.error);
     }
-    // The mount table lists a mount by the kernel's path; both paths are written as that path, so they compare exactly.
-    const ours = (point: string) => point === this.paths.mountpoint || point === this.paths.staging;
+    const custody = await this.custody();
+    if (!custody.ok) {
+      return custody;
+    }
     const attached: AttachedRamDisk[] = [];
-    for (const disk of disks.value) {
-      if (disk.uid !== this.paths.uid || disk.sectors !== this.sectors || !disk.mountpoints.every(ours)) {
-        continue;
-      }
+    for (const disk of volumeDisks(
+      disks.value,
+      this.paths,
+      this.sectors,
+      (candidate) =>
+        custody.value.has(candidate.entry) ||
+        (candidate.physical !== null &&
+          this.commands.ownsRamDisk?.({ ...candidate, physical: candidate.physical }) === true),
+    )) {
       const { physical } = disk;
       if (physical === null) {
         return failed(
@@ -1824,10 +1910,21 @@ export class RamTempVolume {
     return { ok: true, value: attached };
   }
 
+  /** The registry entries the ledger keeps pending detach custody of: exact, and published before the spawn. */
+  private async custody(): Promise<Result<ReadonlySet<string>, RamTempError>> {
+    const read = await this.readLedger();
+    if (!read.ok) {
+      return read;
+    }
+    const entry = read.value.ledger.lifecycle?.pending?.registryEntry;
+    return { ok: true, value: new Set(entry === undefined || entry === null ? [] : [entry]) };
+  }
+
   /**
-   * Detach what earlier creators left attached: no marked volume is mounted, so every RAM disk of
-   * this volume is debris — unformatted, staged, or mounted without its marker. One carrying a
-   * lease, or with anything attached below it, is still in use and stops the creation instead.
+   * Detach what earlier creators left attached: no marked volume is mounted, so every RAM disk of this volume
+   * (`attached`: by its exact name or its exact record) is debris — unformatted and recorded, staged, or mounted
+   * without its marker. One carrying a lease, or with anything attached below it, is still in use and stops the
+   * creation instead, and so does one its owner holds no receipt for: it is named, never detached.
    */
   private async reclaimStrays(op: Operation, holders: Holders): Promise<Result<void, RamTempError>> {
     const strays = await this.attached();
@@ -1899,7 +1996,7 @@ export class RamTempVolume {
     if (!disk) {
       return failed(
         'detach',
-        `the I/O Registry lists no RAM disk of uid ${this.paths.uid} with ${this.sectors} sectors mounted at ${this.paths.mountpoint}`,
+        `the I/O Registry lists no RAM disk of uid ${this.paths.uid} with ${this.sectors} sectors mounted at ${this.paths.mountpoint} as volume ${this.paths.volumeName}`,
       );
     }
     const unchanged = await this.locked(
@@ -1985,8 +2082,9 @@ function candidatesBelow(inventory: Inventory, prefix: string): HeldCandidate[] 
 }
 
 /**
- * Whether the per-user root is the one `cowshed setup` makes: a directory, not a link, the user's, mode 0700. A link
- * could place the mount outside `/var/folders/`, where mds admits it, and another owner or mode exposes the volume.
+ * Whether the root is a directory its volume may mount below: the per-user root `cowshed setup` makes, or a test
+ * namespace's directory its fixture made, each a directory, not a link, the user's, mode 0700. A link could place the
+ * mount outside `/var/folders/`, where mds admits it, and another owner or mode exposes the volume.
  */
 async function rootReadiness(paths: RamTempPaths): Promise<Result<void, RamTempError>> {
   const unready = (detail: string): Result<void, RamTempError> => ({
@@ -2347,9 +2445,10 @@ export function operationDisk(stdout: string): string | null {
  * The RAM disks in `ioreg -r -c IOHDIXHDDriveOutKernel -l -w0` output, with the mounts `mount` output gives them. A RAM
  * disk is a legacy DiskImages device served by a diskimages-helper: each starts a `+-o IOHDIXHDDriveOutKernel` entry
  * whose own properties carry `image-path` <"ram://<sectors>"> and `owner-uid`, and the `BSD Name`s below it are its
- * whole disk first, then its APFS container and volumes. The registry is the kernel's record, and unlike `hdiutil info`,
- * which drops images while another attaches or detaches, it leaves out no attached disk. So an entry this cannot read is
- * an error, never a disk left out: a partial read must not stand for an absent disk.
+ * whole disk first, then its APFS container and volumes; each volume node carries its `FullName` beside its `BSD Name`,
+ * which is how a volume's name reaches its mounts. The registry is the kernel's record, and unlike `hdiutil info`,
+ * which drops images while another attaches or detaches, it leaves out no attached disk. So an entry this cannot read
+ * is an error, never a disk left out: a partial read must not stand for an absent disk.
  */
 export function ramDisksIn(registry: string, table: string): Result<RamDisk[], string> {
   const mounted = new Map<string, string[]>();
@@ -2390,15 +2489,52 @@ export function ramDisksIn(registry: string, table: string): Result<RamDisk[], s
     const names = [...entry.matchAll(/"BSD Name" = "(disk\d+(?:s\d+)*)"/g)].flatMap((match) =>
       match[1] === undefined ? [] : [match[1]],
     );
+    const volumes: RamVolume[] = [];
+    for (const node of entry.split(/^(?=[| ]*\+-o )/m)) {
+      if (!/^[| ]*\+-o [^\n]*<class AppleAPFSVolume,/.test(node)) {
+        continue;
+      }
+      const name = /^[| ]*"FullName" = "(.*)"[ \t]*$/m.exec(node)?.[1];
+      const device = /"BSD Name" = "(disk\d+(?:s\d+)*)"/.exec(node)?.[1];
+      if (name !== undefined) {
+        volumes.push({ name, mountpoints: device === undefined ? [] : (mounted.get(device) ?? []) });
+      }
+    }
     disks.push({
       entry: entryId,
       physical: names[0] === undefined ? null : `/dev/${names[0]}`,
       sectors: Number(sectors),
       uid: Number(owner),
       mountpoints: names.flatMap((name) => mounted.get(name) ?? []),
+      volumes,
     });
   }
   return { ok: true, value: disks };
+}
+
+/**
+ * The RAM disks of `disks` that are this volume's, and no others. A disk is the volume's only when it has its user and
+ * its exact size, mounts nowhere but at its mountpoint or staging directory, and either carries a volume called exactly
+ * its name that is mounted, or is recorded: `recorded` says the disk's exact registry entry is one this volume's owner
+ * holds a receipt or its ledger holds custody for, which covers an attach whose format never finished. A disk's size
+ * and owner establish nothing, so an unmounted disk of the same size that nothing recorded is not the volume's.
+ */
+export function volumeDisks(
+  disks: readonly RamDisk[],
+  paths: Pick<RamTempPaths, 'uid' | 'mountpoint' | 'staging' | 'volumeName'>,
+  sectors: number,
+  recorded: (disk: RamDisk) => boolean,
+): RamDisk[] {
+  // The mount table lists a mount by the kernel's path; both paths are written as that path, so they compare exactly.
+  const ours = (point: string) => point === paths.mountpoint || point === paths.staging;
+  return disks.filter(
+    (disk) =>
+      disk.uid === paths.uid &&
+      disk.sectors === sectors &&
+      disk.mountpoints.every(ours) &&
+      (disk.volumes.some((volume) => volume.name === paths.volumeName && volume.mountpoints.length > 0) ||
+        recorded(disk)),
+  );
 }
 
 /**
@@ -2502,10 +2638,15 @@ const predatesSeen = new Map<string, { at: number; what: 'leases' | 'alone' }>()
  * device until reboot. Never acquire a second lease around the facade. Other leased helpers
  * take their lease here. Recorded lease waits ask for `alone`; an older gateway is asked
  * shared at once, and for a minute after.
+ *
+ * `gatewaySocket` is the gateway every disk lease, facade admission and RAM attach and detach goes through. It has no
+ * default: the caller names it. The Nx executor names the host's own, `GATEWAY_SOCKET`, which `disk-command` defaults
+ * to, so the facade is not told of it and a cowshed that predates `--gateway-socket` still serves it. A host proof
+ * names its fixture's, which the facade is told of.
  */
 export function createHostCommands(
+  gatewaySocket: string,
   defaultDeadlineMs: number = HOST_COMMAND_DEADLINE_MS,
-  gatewaySocket: string = GATEWAY_SOCKET,
   wantedShare: PhaseShare = recordedShare(),
   cowshed = process.env[COWSHED_EXECUTABLE_ENV] ?? 'cowshed',
 ): HostCommands {

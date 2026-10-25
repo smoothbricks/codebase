@@ -1,16 +1,7 @@
 import { describe, expect, it } from 'bun:test';
-import { GATEWAY_SOCKET } from './gateway-lease.js';
-import { diskCommand, type RamTempPaths } from './ram-temp.js';
+import { diskCommand, RAM_TEMP_CAPACITY_BYTES, ramTempPaths, testNamespace } from './ram-temp.js';
 import { fixtureRamVolume } from './ram-temp-fixtures.js';
 
-const paths: RamTempPaths = {
-  root: '/private/var/folders/cowshed/999999',
-  uid: 999999,
-  mountpoint: '/private/var/folders/cowshed/999999/t/fixture-volume',
-  staging: '/private/var/folders/cowshed/999999/t/fixture-volume-new',
-  lockFile: '/tmp/fixture-volume.lock',
-  volumeName: 'fixture-volume',
-};
 const socket = '/tmp/fixture-gateway/gateway.sock';
 
 describe('fixture gateway custody', () => {
@@ -40,12 +31,15 @@ describe('fixture gateway custody', () => {
       '/dev/disk7',
     ]);
   });
-  it('refuses the production gateway before creating a host command', () => {
-    expect(() =>
-      fixtureRamVolume(
-        { paths, capacity: 64 * 1024 * 1024, owned: '/tmp/fixture-owned.jsonl', gatewaySocket: GATEWAY_SOCKET },
-        undefined,
-      ),
-    ).toThrow('gatewaySocket');
+  it("refuses the size of the user's own volume, the one name a test namespace does not derive", () => {
+    const volume = {
+      paths: ramTempPaths({ uid: 999999 }, testNamespace(process.pid, 0)),
+      owned: '/tmp/fixture-owned.jsonl',
+      gatewaySocket: socket,
+    };
+    expect(() => fixtureRamVolume({ ...volume, capacity: 64 * 1024 * 1024 }, undefined)).not.toThrow();
+    expect(() => fixtureRamVolume({ ...volume, capacity: RAM_TEMP_CAPACITY_BYTES }, undefined)).toThrow(
+      "user's own volume",
+    );
   });
 });

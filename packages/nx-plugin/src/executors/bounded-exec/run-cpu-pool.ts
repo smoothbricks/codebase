@@ -3,7 +3,6 @@ import { availableParallelism } from 'node:os';
 import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import { type CpuPool, createCpuPool, readInheritedCpuPool } from './cpu-pool.js';
-import { GATEWAY_SOCKET } from './gateway-lease.js';
 
 /**
  * The CPU budget of an Nx run on a host without a gateway (specs/cowshed/05_gateway.md, "Host CPU budget", "A run
@@ -31,8 +30,8 @@ const pools = new Map<string, CpuPool>();
  */
 export async function serveRunCpuPool(
   context: Pick<PreTasksExecutionContext, 'id'>,
+  gateway: string,
   env: NodeJS.ProcessEnv = process.env,
-  gateway: string = GATEWAY_SOCKET,
   cores: number = availableParallelism(),
 ): Promise<void> {
   if (readInheritedCpuPool(env) !== null || !(await absent(gateway))) {

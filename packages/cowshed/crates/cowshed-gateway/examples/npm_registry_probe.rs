@@ -58,10 +58,11 @@ mod probe {
     use async_trait::async_trait;
     use cowshed_gateway::{
         AuditError, AuditEvent, AuditSink, CredentialError, CredentialProvider, CredentialQuery,
-        CredentialRecord, EgressGrant, Gateway, GatewayConfig, MACOS_PORT_MAX, MACOS_PORT_MIN,
-        MirrorCacheConfig, NEW_PORT_BLOCK_SIZE, SystemConnector, TOKEN_BYTES, WorkspaceCa,
-        WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+        CredentialRecord, EgressGrant, Gateway, GatewayConfig, MACOS_PORT_MAX, MirrorCacheConfig,
+        NEW_PORT_BLOCK_SIZE, SystemConnector, TOKEN_BYTES, WorkspaceCa, WorkspaceEndpoint,
+        WorkspacePolicy, WorkspaceSession, WorkspaceToken,
     };
+    use cowshed_gateway_types::MACOS_FIXTURE_PORT_MIN;
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
         KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
@@ -169,9 +170,11 @@ mod probe {
         Ok(WorkspaceToken::from_bytes(bytes))
     }
 
-    /// The base of the first port block nothing else is listening on.
+    /// The base of the first port block of the fixture partition nothing else is listening on: the
+    /// probe never takes a host-partition block production allocates from (specs/cowshed/08_testing.md,
+    /// "Fixtures").
     fn free_block_base() -> Result<SocketAddr, String> {
-        (MACOS_PORT_MIN..=MACOS_PORT_MAX)
+        (MACOS_FIXTURE_PORT_MIN..=MACOS_PORT_MAX)
             .step_by(usize::from(NEW_PORT_BLOCK_SIZE))
             .map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
             .find(|address| TcpListener::bind(address).is_ok())

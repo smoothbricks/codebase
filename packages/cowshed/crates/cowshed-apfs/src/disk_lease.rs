@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare};
+use cowshed_os::namespace::HostNamespace;
 
 use crate::device::DISKUTIL;
 use crate::{CommandDeadline, DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS};
@@ -117,6 +118,7 @@ pub fn refuse_volume_rename(
 /// leases, it is asked shared. Every disk tool is first appended to the command record when
 /// [`COMMAND_RECORD_ENV`] names one, leased or not.
 pub fn leased<T, E: fmt::Display + From<VolumeRenameRefused>>(
+    host: HostNamespace,
     program: &Path,
     args: &[impl AsRef<OsStr>],
     deadline: Option<CommandDeadline>,
@@ -126,7 +128,7 @@ pub fn leased<T, E: fmt::Display + From<VolumeRenameRefused>>(
     let Some(class) = class_of(program) else {
         return run();
     };
-    leased_class(class, &describe(program, args), deadline, run)
+    leased_class(host, class, &describe(program, args), deadline, run)
 }
 
 /// The same command admission against an explicitly selected gateway, never the host socket.
@@ -147,13 +149,31 @@ pub fn leased_on<T, E: fmt::Display + From<VolumeRenameRefused>>(
 /// Admit a descriptor-native namespace operation through the same client as disk children.
 /// The operation record is its real native effect, not an invented executable or second runner.
 pub(crate) fn namespace<T, E: fmt::Display>(
+    host: HostNamespace,
     operation: &str,
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    leased_class(DiskClass::Namespace, operation, None, run)
+    leased_class(host, DiskClass::Namespace, operation, None, run)
+}
+
+/// The control socket of the gateway that schedules `host`'s disk tools: production's at
+/// production's store, a test namespace's at that namespace's root, where its fixture gateway
+/// binds (01_storage.md, "Host namespace"). With no gateway answering there, the tools run
+/// unleased, as they do whenever a gateway is down.
+pub fn lease_socket(host: HostNamespace) -> PathBuf {
+    match host {
+        HostNamespace::Production => cowshed_gateway_types::production_control_socket(),
+        HostNamespace::Test(_) => {
+            // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and
+            // cannot fail.
+            host.macos_user_root(unsafe { libc::geteuid() })
+                .join("gateway.sock")
+        }
+    }
 }
 
 fn leased_class<T, E: fmt::Display>(
+    host: HostNamespace,
     class: DiskClass,
     command: &str,
     deadline: Option<CommandDeadline>,
@@ -162,12 +182,16 @@ fn leased_class<T, E: fmt::Display>(
     if let Some(record) = COMMAND_RECORD.as_ref() {
         record.append(class, command);
     }
+    // What a gateway that predates leases taught this process is production's gateway's alone.
+    if let HostNamespace::Test(_) = host {
+        return leased_at(&lease_socket(host), class, command, deadline, run);
+    }
     let share = match predates_recently() {
         Some(Predates::Leases) => return run(),
         Some(Predates::Alone) => PhaseShare::Shared,
         None => wanted_share(),
     };
-    let socket = cowshed_gateway_types::control_socket_path();
+    let socket = lease_socket(host);
     lease_then(
         &socket,
         class,
@@ -822,7 +846,14 @@ fn describe(program: &Path, args: &[impl AsRef<OsStr>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::namespace::TestNamespace;
     use std::os::unix::net::UnixListener;
+
+    /// A host namespace of the test's own: no test leases as production does, or names a volume
+    /// with production's `[cowshed]`.
+    fn test_namespace() -> HostNamespace {
+        HostNamespace::Test(TestNamespace::mint().expect("a test namespace"))
+    }
 
     /// A wait only the peer ends: by answering, or by closing its socket, which it does when it
     /// is dropped, its thread's panic included. The clock never decides it: it is the run's
@@ -922,8 +953,10 @@ mod tests {
                 marker.clone().into_os_string(),
             ],
         );
-        let outcome =
-            crate::SystemCommandRunner.run_within(&request, NO_ANSWER, |deadline, run| {
+        let outcome = crate::SystemCommandRunner::new(test_namespace()).run_within(
+            &request,
+            NO_ANSWER,
+            |deadline, run| {
                 let deadline = deadline.expect("SAFE admission has the original budget");
                 let refused = connect(&socket.0, Some(deadline))
                     .expect_err("the real kernel backlog remains full");
@@ -942,7 +975,8 @@ mod tests {
                     std::thread::park_timeout(remaining);
                 }
                 run()
-            });
+            },
+        );
         let executed = marker.exists();
         if executed {
             std::fs::remove_file(&marker)
@@ -995,6 +1029,8 @@ mod tests {
     /// run is ever called; diskutil's other verbs, and other programs' `rename`, go on to run.
     #[test]
     fn leased_refuses_a_disk_arbitration_rename_without_running_it() {
+        let host = test_namespace();
+        let label = host.volume_label(format_args!("fixture · dispatch — main"));
         for (program, verb) in [
             (DISKUTIL, "renameVolume"),
             (DISKUTIL, "rename"),
@@ -1002,8 +1038,9 @@ mod tests {
             ("diskutil", "ReName"),
         ] {
             let refused = leased(
+                host,
                 Path::new(program),
-                &[verb, "/dev/disk3s5", "[cowshed] fixture · dispatch — main"],
+                &[verb, "/dev/disk3s5", label.as_str()],
                 None,
                 || -> io::Result<()> { panic!("{program} {verb} ran") },
             )
@@ -1297,7 +1334,7 @@ mod tests {
                     marker.clone().into_os_string(),
                 ],
             );
-            let error = crate::SystemCommandRunner
+            let error = crate::SystemCommandRunner::new(test_namespace())
                 .run_within(&request, budget, |deadline, run| {
                     assert!(
                         deadline.is_some(),

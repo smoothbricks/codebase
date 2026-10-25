@@ -4122,44 +4122,40 @@ mod tests {
             .map(|(session, service)| (Fenced::new(session), Fenced::new(service)))
         }
 
+        /// Claims a two-port subblock for one installed session: inside the port block the workspace
+        /// running the tests exported, or, outside a workspace, inside the fixture partition, which is a
+        /// port block of its own, so a test never claims a port the host partition lends production's
+        /// workspaces (specs/cowshed/08_testing.md, "Fixtures").
         fn claim_endpoint(&mut self) -> (Fenced<std::net::TcpListener>, u16) {
-            if let (Some(base), Some(size)) = (
+            use cowshed_gateway_types::{
+                MACOS_FIXTURE_PORT_MIN, MACOS_FIXTURE_PORTS as FIXTURE_PORTS,
+            };
+            let (base, size) = match (
                 std::env::var("COWSHED_PORT_BASE").ok(),
                 std::env::var("COWSHED_PORT_BLOCK_SIZE").ok(),
             ) {
-                let base: u16 = base.parse().expect("COWSHED_PORT_BASE is a port");
-                let size: u16 = size.parse().expect("COWSHED_PORT_BLOCK_SIZE is a size");
-                assert!(
-                    size >= 4,
-                    "a workspace block needs room for a 2-port session"
-                );
-                for offset in (2..size - 1).step_by(2) {
-                    let subblock = base + offset;
-                    match Self::claim_ports(subblock) {
-                        Ok((session, service)) => {
-                            self.claims.push(service);
-                            return (session, 2);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
-                        Err(error) => panic!("claim workspace subblock {subblock}+2: {error}"),
-                    }
-                }
-                panic!("workspace port block {base}+{size} has no free two-port subblock");
-            }
-            use cowshed_gateway_types::{MACOS_PORT_MAX, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE};
-            let blocks = (MACOS_PORT_MAX - MACOS_PORT_MIN + 1) / NEW_PORT_BLOCK_SIZE;
-            for index in 0..blocks {
-                let base = MACOS_PORT_MIN + index * NEW_PORT_BLOCK_SIZE;
-                match Self::claim_ports(base) {
+                (Some(base), Some(size)) => (
+                    base.parse::<u16>().expect("COWSHED_PORT_BASE is a port"),
+                    size.parse::<u16>()
+                        .expect("COWSHED_PORT_BLOCK_SIZE is a size"),
+                ),
+                _ => (MACOS_FIXTURE_PORT_MIN, FIXTURE_PORTS),
+            };
+            assert!(size >= 4, "a port block needs room for a 2-port session");
+            for offset in (2..size - 1).step_by(2) {
+                let subblock = base + offset;
+                match Self::claim_ports(subblock) {
                     Ok((session, service)) => {
                         self.claims.push(service);
-                        return (session, NEW_PORT_BLOCK_SIZE);
+                        return (session, 2);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
-                    Err(error) => panic!("claim global subblock {base}+2: {error}"),
+                    Err(error) => {
+                        panic!("claim subblock {subblock}+2 of port block {base}+{size}: {error}")
+                    }
                 }
             }
-            panic!("no free macOS gateway port block for the actor fixture");
+            panic!("port block {base}+{size} has no free two-port subblock");
         }
 
         /// Installs one session through the actor's own install path, and returns its encoded token.

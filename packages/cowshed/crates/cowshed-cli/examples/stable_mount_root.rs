@@ -34,6 +34,7 @@ mod native {
     };
     use cowshed_core::storage::bootstrap::execute_mount_root_provisioning;
     use cowshed_core::storage::host_config::{HOST_CONFIG_FILE, HostConfig};
+    use cowshed_os::namespace::HostNamespace;
     use serde_json::json;
     use std::fs;
     use std::io;
@@ -161,7 +162,13 @@ mod native {
         let alias = receipts.join("workspaces");
         symlink(&root, &alias)?;
         let alias_mount = alias.join(mount.strip_prefix(&root)?);
-        let outcome = cycle(scratch.path(), &mount, &alias_mount, &receipts);
+        let outcome = cycle(
+            scratch.path(),
+            HostNamespace::Test(scratch.namespace()),
+            &mount,
+            &alias_mount,
+            &receipts,
+        );
         // The scratch guard releases only images backed by its own root, including on failure.
         drop(scratch);
         let scratch_released = !scratch_path.exists();
@@ -191,12 +198,18 @@ mod native {
         Ok(())
     }
 
-    fn cycle(scratch: &Path, mount: &Path, alias: &Path, receipts: &Path) -> ProofResult<()> {
-        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    fn cycle(
+        scratch: &Path,
+        namespace: HostNamespace,
+        mount: &Path,
+        alias: &Path,
+        receipts: &Path,
+    ) -> ProofResult<()> {
+        let backend = MacOsApfsBackend::new(SystemCommandRunner::new(namespace));
         let image = backend.create_staged_image(&CreateImageRequest {
             staged_stem: scratch.join("cycle"),
             capacity: ImageCapacity::from_gibibytes(1),
-            volume_name: "[cowshed] stable root proof".into(),
+            volume_name: namespace.volume_label(format_args!("stable root proof")),
             owner_uid: unsafe { libc::getuid() },
             owner_gid: unsafe { libc::getgid() },
         })?;

@@ -995,6 +995,7 @@ mod tests {
     }
 
     fn seed_before_mount(kept: bool) {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let fixture = Fixture::new();
         let build = fixture.build();
         let mut source = fixture.source(Some(build.clone()));
@@ -1026,7 +1027,11 @@ mod tests {
                 id: build.id.clone(),
                 incarnation: source.replacement.clone(),
             },
-            ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout),
+            ApfsSubstrateConfig::new(
+                HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+                fixture.store(),
+                &fixture.checkout,
+            ),
         )
         .unwrap();
 

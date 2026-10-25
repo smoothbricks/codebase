@@ -33,7 +33,9 @@
 //! not a crash and not a silent success.
 
 use crate::gateway_service::launchd_error;
-use crate::launchd::{SCCACHE_BINARY_NAME, STABLE_BINARY_DIRECTORY, StoreBackedProgram};
+use crate::launchd::{
+    LaunchAgentTarget, SCCACHE_BINARY_NAME, STABLE_BINARY_DIRECTORY, StoreBackedProgram,
+};
 use cowshed_core::api::{Finding, FindingSeverity};
 use cowshed_core::capabilities::sccache::gc_root;
 use cowshed_core::{CowshedError, Result};
@@ -334,7 +336,11 @@ pub fn flake_directory_from(search_from: &Path) -> Result<PathBuf> {
 ///
 /// Nothing is reported when no agent is installed. sccache is opt-in, and a host that never asked
 /// for it is not a host with a problem.
-pub fn pinning_findings(home: &Path, plist: &Path) -> Vec<Finding> {
+///
+/// `agent` is the agent's control target: its plist is the definition launchd loaded, and its
+/// label is how a finding names it.
+pub fn pinning_findings(home: &Path, agent: &LaunchAgentTarget) -> Vec<Finding> {
+    let plist = agent.plist_path();
     if !plist.is_file() {
         return Vec::new();
     }
@@ -356,7 +362,7 @@ pub fn pinning_findings(home: &Path, plist: &Path) -> Vec<Finding> {
             return unpinned(
                 format!(
                     "the {} agent is installed but cowshed holds no nix GC root at {} ({error}); nix store gc may delete the binary launchd runs",
-                    crate::launchd::SCCACHE_LABEL,
+                    agent.label(),
                     root.display()
                 ),
                 "cowshed setup --sccache",
@@ -465,15 +471,17 @@ mod tests {
     #[test]
     fn a_missing_gc_root_under_an_installed_agent_is_an_error_finding() {
         let home = scratch("pinning");
-        let plist = home.join("dev.cowshed.sccache.plist");
+        let agent = LaunchAgentTarget::new(&home, "dev.cowshed.sccache").expect("the agent");
+        let plist = agent.plist_path().to_path_buf();
+        std::fs::create_dir_all(agent.launch_agents_directory()).expect("LaunchAgents");
 
         assert!(
-            pinning_findings(&home, &plist).is_empty(),
+            pinning_findings(&home, &agent).is_empty(),
             "sccache is opt-in: no agent, no finding"
         );
 
         std::fs::write(&plist, b"<plist/>").expect("plist");
-        let findings = pinning_findings(&home, &plist);
+        let findings = pinning_findings(&home, &agent);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].code, UNPINNED_CODE);
         assert_eq!(findings[0].severity, FindingSeverity::Error);
@@ -490,7 +498,7 @@ mod tests {
         let root = gc_root(&home);
         std::fs::create_dir_all(root.parent().expect("root parent")).expect("root parent");
         std::os::unix::fs::symlink(&collected, &root).expect("symlink the gc root");
-        let findings = pinning_findings(&home, &plist);
+        let findings = pinning_findings(&home, &agent);
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].message.contains("was collected"),
@@ -505,7 +513,7 @@ mod tests {
             .join(SCCACHE_BINARY_NAME);
         std::fs::create_dir_all(installed.parent().expect("store bin")).expect("store bin");
         std::fs::write(&installed, b"#!/bin/sh\n").expect("program");
-        let findings = pinning_findings(&home, &plist);
+        let findings = pinning_findings(&home, &agent);
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].message.contains("some other build"),
@@ -515,7 +523,7 @@ mod tests {
 
         // And a plist that does name it is healthy.
         std::fs::write(&plist, format!("<plist>{}</plist>", installed.display())).expect("plist");
-        assert!(pinning_findings(&home, &plist).is_empty());
+        assert!(pinning_findings(&home, &agent).is_empty());
 
         let _ = std::fs::remove_dir_all(&home);
     }

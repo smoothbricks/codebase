@@ -9,9 +9,7 @@ use std::time::Instant;
 
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::verify_no_symlinks;
-use cowshed_apfs::template::{
-    BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
-};
+use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
 use cowshed_apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
     ImageCapture, MacOsApfsBackend, SystemCommandRunner, volume_name,
@@ -35,6 +33,7 @@ use cowshed_core::storage::lifecycle::{
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
 use cowshed_os::fork_lock::Run as _;
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
@@ -46,8 +45,8 @@ use scratch_apfs::ScratchRoot;
 
 /// Give `store` the run's blank template where its mints look for theirs, so they clone it
 /// rather than mint one of the store's own.
-fn seed(store: &Path) {
-    blank_image::blank_image(&blank_template_path(store, CAPACITY));
+fn seed(namespace: TestNamespace, store: &Path) {
+    blank_image::blank_image(namespace, &blank_template_path(store, CAPACITY));
 }
 
 struct DeterministicIncarnations(AtomicU64);
@@ -154,8 +153,9 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
     let checkout_path = root.path().join("main-mount");
     fs::create_dir_all(&store)?;
     fs::create_dir_all(&checkout_path)?;
-    seed(&store);
-    let config = ApfsSubstrateConfig::new(&store, &checkout_path)
+    seed(root.namespace(), &store);
+    let namespace = HostNamespace::Test(root.namespace());
+    let config = ApfsSubstrateConfig::new(namespace, &store, &checkout_path)
         .with_capacity(ImageCapacity::from_gibibytes(1));
     let identity = || -> Result<OperationIdentity, Box<dyn Error>> {
         Ok(OperationIdentity {
@@ -172,7 +172,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             )?))?,
         })
     };
-    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
+    let host = MacOsApfsExecutionHost::new(SystemCommandRunner::new(namespace), config.clone())?;
     let substrate = ApfsSubstrate::with_lane_and_incarnations(
         config,
         host,
@@ -230,7 +230,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         // Main is a clone of the store's blank template and carries its label until main's
         // supervisor relabels it, off adoption's path. Read from the kernel rather than from Disk
         // Arbitration's cache.
-        assert_eq!(volume_name(&checkout_path)?, BLANK_TEMPLATE_LABEL);
+        assert_eq!(volume_name(&checkout_path)?, blank_image::SHARED_TEMPLATE_LABEL);
 
         let payload = checkout_path.join("payload.txt");
         fs::write(&payload, b"checkpoint baseline\n")?;
@@ -298,7 +298,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         );
         // Provisioning leaves the label the clone inherited: the workspace's supervisor names
         // the volume later, off the path that creates it.
-        assert_eq!(volume_name(&fork_mount)?, BLANK_TEMPLATE_LABEL);
+        assert_eq!(volume_name(&fork_mount)?, blank_image::SHARED_TEMPLATE_LABEL);
 
         let checkpoint_plan = substrate.plan_checkpoint(
             &main,
@@ -544,13 +544,14 @@ struct KillWindow {
     main: LifecycleWorkspace,
     identity: OperationIdentity,
     _root: ScratchRoot,
+    namespace: TestNamespace,
 }
 
 impl KillWindow {
     /// A kill window over a store seeded with the run's blank template.
     fn new(label: &str) -> Result<Self, Box<dyn Error>> {
         let world = Self::unseeded(label)?;
-        seed(&world.store);
+        seed(world.namespace, &world.store);
         Ok(world)
     }
 
@@ -562,7 +563,9 @@ impl KillWindow {
         fs::create_dir_all(&store)?;
         fs::create_dir_all(&checkout)?;
         fs::write(checkout.join("tracked"), b"original source\n")?;
-        let config = ApfsSubstrateConfig::new(&store, &checkout).with_capacity(CAPACITY);
+        let namespace = root.namespace();
+        let config = ApfsSubstrateConfig::new(HostNamespace::Test(namespace), &store, &checkout)
+            .with_capacity(CAPACITY);
         let repo = RepoId::parse(&format!("cowshed/kill-{}", std::process::id()))?;
         let layout = StorageLayout::new(&store, &repo)?;
         let image = layout.main_image()?.image().to_owned();
@@ -593,7 +596,10 @@ impl KillWindow {
                 NEW_PORT_BLOCK_SIZE,
             )?))?,
         };
-        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
+        let host = MacOsApfsExecutionHost::new(
+            SystemCommandRunner::new(HostNamespace::Test(namespace)),
+            config.clone(),
+        )?;
         let substrate = ApfsSubstrate::with_lane_and_incarnations(
             config,
             host,
@@ -610,6 +616,7 @@ impl KillWindow {
             staging,
             main,
             identity,
+            namespace,
             _root: root,
         })
     }
@@ -751,6 +758,7 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_between_clone_and_attach() {
     let template = blank_template(
         backend,
         &world.store,
+        &HostNamespace::Test(world.namespace).label_prefix(),
         CAPACITY,
         &cowshed_core::held_lock::ImageLockTaker {
             holding: &cowshed_core::api::held_lock::LockHolding::store(
@@ -784,7 +792,7 @@ fn real_apfs_adopt_mints_a_template_over_the_one_a_killed_minter_left_attached()
     let request = CreateImageRequest {
         staged_stem: stem,
         capacity: CAPACITY,
-        volume_name: BLANK_TEMPLATE_LABEL.to_owned(),
+        volume_name: HostNamespace::Test(world.namespace).label_prefix(),
         // SAFETY: `getuid`/`getgid` read this process's credentials and cannot fail.
         owner_uid: unsafe { libc::getuid() },
         owner_gid: unsafe { libc::getgid() },
@@ -804,7 +812,7 @@ fn real_apfs_adopt_mints_a_template_over_the_one_a_killed_minter_left_attached()
     assert!(blank_template_path(&world.store, CAPACITY).is_file());
     assert!(!leftover.exists(), "the killed minter's image is removed");
     assert!(
-        SystemCommandRunner
+        SystemCommandRunner::new(HostNamespace::Test(world.namespace))
             .attached_disk_images()
             .expect("kernel disk-image inventory")
             .iter()
@@ -813,7 +821,7 @@ fn real_apfs_adopt_mints_a_template_over_the_one_a_killed_minter_left_attached()
     );
     assert_eq!(
         volume_name(&world.checkout).expect("main's label"),
-        BLANK_TEMPLATE_LABEL
+        HostNamespace::Test(world.namespace).label_prefix().as_str()
     );
 }
 

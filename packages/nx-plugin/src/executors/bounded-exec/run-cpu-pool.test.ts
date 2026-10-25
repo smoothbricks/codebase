@@ -25,7 +25,7 @@ function gatewayPath(): string {
 describe('a run without a gateway', () => {
   it('serves its tasks one pool of one token per core, so a second runner waits for the first', async () => {
     const env: NodeJS.ProcessEnv = {};
-    await serveRunCpuPool({ id: 'run-477' }, env, gatewayPath(), 4);
+    await serveRunCpuPool({ id: 'run-477' }, gatewayPath(), env, 4);
     const pool = readInheritedCpuPool(env);
     if (pool === null) {
       throw new Error(`the run published no pool: ${JSON.stringify(env)}`);
@@ -65,7 +65,7 @@ describe('a run without a gateway', () => {
 
   it('leaves a run that inherits a pool to that pool', async () => {
     const env: NodeJS.ProcessEnv = { [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' };
-    await serveRunCpuPool({ id: 'nested' }, env, gatewayPath(), 4);
+    await serveRunCpuPool({ id: 'nested' }, gatewayPath(), env, 4);
     expect(env).toEqual({ [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' });
   });
 
@@ -73,7 +73,7 @@ describe('a run without a gateway', () => {
     const gateway = gatewayPath();
     writeFileSync(gateway, '');
     const env: NodeJS.ProcessEnv = {};
-    await serveRunCpuPool({ id: 'gateway-host' }, env, gateway, 4);
+    await serveRunCpuPool({ id: 'gateway-host' }, gateway, env, 4);
     expect(env).toEqual({});
   });
 });

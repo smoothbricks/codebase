@@ -16,6 +16,7 @@ use cowshed_apfs::{
 };
 use cowshed_core::api::dto::{BinaryData, DiskCommandEvent, MAX_INLINE_OUTPUT_BYTES};
 use cowshed_core::{CowshedError, ErrorCode};
+use cowshed_os::namespace::HostNamespace;
 
 use crate::args::DiskCommandArgs;
 use crate::output::Output;
@@ -74,18 +75,16 @@ pub(crate) async fn run(
     let deadline = CommandDeadline::new(args.deadline);
     let registry_entry = args.registry_entry;
     let gateway_socket = args.gateway_socket.clone();
+    // The verb is the host's own, so production's namespace names its runner.
+    let runner = SystemCommandRunner::new(HostNamespace::Production);
     tokio::task::spawn_blocking(move || match (registry_entry, input) {
         // A bound detach reads no input, from either caller.
-        (Some(entry), _) => {
-            SystemCommandRunner.run_detach_of_entry(&request, entry, gateway_socket.as_deref())
+        (Some(entry), _) => runner.run_detach_of_entry(&request, entry, gateway_socket.as_deref()),
+        (None, ToolInput::Inherited) => {
+            runner.run_with_inherited_input(&request, deadline, gateway_socket.as_deref())
         }
-        (None, ToolInput::Inherited) => SystemCommandRunner.run_with_inherited_input(
-            &request,
-            deadline,
-            gateway_socket.as_deref(),
-        ),
         (None, ToolInput::Bytes(bytes)) => {
-            SystemCommandRunner.run_with_input(&request, deadline, bytes, gateway_socket.as_deref())
+            runner.run_with_input(&request, deadline, bytes, gateway_socket.as_deref())
         }
     })
     .await

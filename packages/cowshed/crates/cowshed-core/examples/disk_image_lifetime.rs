@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DiskImageSource, MountAccess, SystemCommandRunner,
     };
     use cowshed_core::storage::apfs::{ApfsSubstrateConfig, native::MacOsApfsExecutionHost};
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
     use std::{fs, path::PathBuf, time::Duration};
 
     let mut args = std::env::args_os().skip(1);
@@ -38,10 +39,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir(&root)?;
     let mount = root.join("mount");
     fs::create_dir(&mount)?;
-    let host =
-        MacOsApfsExecutionHost::new(SystemCommandRunner, ApfsSubstrateConfig::new(&root, &mount))?;
+    // The volumes this run mints are its own, never the production volumes.
+    let namespace = TestNamespace::mint()?;
+    let runner = SystemCommandRunner::new(HostNamespace::Test(namespace));
+    let host = MacOsApfsExecutionHost::new(
+        runner,
+        ApfsSubstrateConfig::new(HostNamespace::Test(namespace), &root, &mount),
+    )?;
     let count = |cycle: usize, phase: &str| -> Result<(), Box<dyn std::error::Error>> {
-        let output = SystemCommandRunner.run(&CommandRequest::new(
+        let output = runner.run(&CommandRequest::new(
             "/usr/sbin/ioclasscount",
             [
                 "AppleDiskImageDevice",
@@ -79,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             count(cycle, "before")?;
             if mode == "commands" {
                 // No I/O Registry walk, raw-device pin, fsck or mount while attached.
-                let output = SystemCommandRunner.run(&CommandRequest::new(
+                let output = runner.run(&CommandRequest::new(
                     "/usr/sbin/diskutil",
                     [
                         "image".as_ref(),
@@ -105,8 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|entity| entity.get("dev-entry"))
                     .and_then(plist::Value::as_string)
                     .ok_or("attach has no whole-device entry")?;
-                let output = SystemCommandRunner
-                    .run(&CommandRequest::new("/usr/bin/hdiutil", ["detach", device]))?;
+                let output =
+                    runner.run(&CommandRequest::new("/usr/bin/hdiutil", ["detach", device]))?;
                 if !output.succeeded() {
                     return Err(format!(
                         "detach {device}: {}",
@@ -125,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Release the raw pin before the deliberately independent eject comparison.
                 drop(attachment);
                 if mode == "eject" {
-                    let output = SystemCommandRunner.run(&CommandRequest::new(
+                    let output = runner.run(&CommandRequest::new(
                         "/usr/sbin/diskutil",
                         ["eject", &device],
                     ))?;
@@ -143,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             count(cycle, "after")?;
             std::thread::sleep(Duration::from_secs(1));
             count(cycle, "settled")?;
-            if SystemCommandRunner.attached_disk_images()?.iter().any(|attached| matches!(&attached.source, DiskImageSource::File(path) if path == &image)) {
+            if runner.attached_disk_images()?.iter().any(|attached| matches!(&attached.source, DiskImageSource::File(path) if path == &image)) {
                 return Err(format!("{} remains attached after cycle {cycle}", image.display()).into());
             }
         }

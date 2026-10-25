@@ -20,6 +20,7 @@ use crate::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 use crate::mounts::{NativeUnmountError, PostUnmountFd, UnmountEffect, UnmountMode};
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::host_load::HostLoad;
+use cowshed_os::namespace::HostNamespace;
 pub use cowshed_os::process::{CommandOutput, ProcessStatus};
 use cowshed_os::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
 use std::collections::BTreeSet;
@@ -440,9 +441,11 @@ pub trait CommandRunner {
             .into_iter()
             .find(|mount| mount.source_device == volume_device))
     }
-    /// Admit one native unmount, then prove its root. The returned root owns the same descriptor
-    /// through the syscall and compound postcondition. Recording runners explicitly record the
-    /// native operation; an unoverridden stated root has no descriptor and fails closed.
+    /// Prove the root of one native unmount, then unmount it. The returned root owns the same
+    /// descriptor through the syscall and compound postcondition. Recording runners explicitly
+    /// record the native operation; an unoverridden stated root has no descriptor and fails
+    /// closed. A runner that schedules disk work admits the unmount under its namespace's lease
+    /// first ([`SystemCommandRunner`]).
     fn unmount_guarded<E>(
         &self,
         mode: UnmountMode,
@@ -451,22 +454,7 @@ pub trait CommandRunner {
     where
         E: From<NativeUnmountError> + fmt::Display,
     {
-        let operation = match mode {
-            UnmountMode::Normal => "funmount normal",
-            UnmountMode::ForceAfterGrace => "funmount force-after-grace",
-        };
-        disk_lease::namespace(operation, || {
-            let Some(root) = prove()? else {
-                return Ok(UnmountEffect::NoEffect);
-            };
-            cowshed_os::timing::attribute(
-                "apfs-command",
-                format_args!("unmount verified APFS volume"),
-                "filesystem",
-                format_args!("{:?}", root.filesystem_id()),
-            );
-            root.unmount(mode).map_err(E::from)
-        })
+        unmount_proved(mode, prove)
     }
     /// Every disk image the kernel has attached right now, read from the I/O Registry.
     ///
@@ -596,10 +584,45 @@ enum DeadlineStep {
     Kill,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemCommandRunner;
+/// Prove the root `prove` names and unmount it (`CommandRunner::unmount_guarded`).
+fn unmount_proved<E>(
+    mode: UnmountMode,
+    prove: impl FnOnce() -> Result<Option<OwnedVolumeRoot>, E>,
+) -> Result<UnmountEffect, E>
+where
+    E: From<NativeUnmountError> + fmt::Display,
+{
+    let Some(root) = prove()? else {
+        return Ok(UnmountEffect::NoEffect);
+    };
+    cowshed_os::timing::attribute(
+        "apfs-command",
+        format_args!("unmount verified APFS volume"),
+        "filesystem",
+        format_args!("{:?}", root.filesystem_id()),
+    );
+    root.unmount(mode).map_err(E::from)
+}
+
+/// The real runner. Every disk tool and native unmount it runs takes its host namespace's
+/// disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease"; 01_storage.md, "Host namespace"):
+/// production's from production's gateway, a test namespace's from the gateway at that
+/// namespace's root, so no test's disk work queues on, or spaces out, production's.
+#[derive(Clone, Copy, Debug)]
+pub struct SystemCommandRunner {
+    namespace: HostNamespace,
+}
 
 impl SystemCommandRunner {
+    pub fn new(namespace: HostNamespace) -> Self {
+        Self { namespace }
+    }
+
+    /// Whose disk lease this runner takes.
+    pub fn namespace(&self) -> HostNamespace {
+        self.namespace
+    }
+
     /// Run a disk command with one total monotonic SAFE budget, including lease admission.
     /// Protected image commands retain their warning-only child policy.
     pub fn run_with_deadline(
@@ -612,7 +635,13 @@ impl SystemCommandRunner {
             CommandDeadline::new(deadline),
             ChildInput::Null,
             |deadline, run| {
-                crate::disk_lease::leased(&request.program, &request.args, deadline, run)
+                crate::disk_lease::leased(
+                    self.namespace,
+                    &request.program,
+                    &request.args,
+                    deadline,
+                    run,
+                )
             },
         )
     }
@@ -636,7 +665,7 @@ impl SystemCommandRunner {
             CommandDeadline::new(DISK_CHILD_DEADLINE),
             ChildInput::Null,
             |deadline, run| {
-                Self::admit(request, gateway_socket, deadline, || {
+                self.admit(request, gateway_socket, deadline, || {
                     revalidate_detach(request, entry)?;
                     run()
                 })
@@ -683,11 +712,12 @@ impl SystemCommandRunner {
             deadline
         };
         self.run_admitted(request, deadline, input, |deadline, run| {
-            Self::admit(request, gateway_socket, deadline, run)
+            self.admit(request, gateway_socket, deadline, run)
         })
     }
 
     fn admit(
+        &self,
         request: &CommandRequest,
         gateway_socket: Option<&Path>,
         deadline: Option<CommandDeadline>,
@@ -697,7 +727,13 @@ impl SystemCommandRunner {
             Some(socket) => {
                 crate::disk_lease::leased_on(socket, &request.program, &request.args, deadline, run)
             }
-            None => crate::disk_lease::leased(&request.program, &request.args, deadline, run),
+            None => crate::disk_lease::leased(
+                self.namespace,
+                &request.program,
+                &request.args,
+                deadline,
+                run,
+            ),
         }
     }
 
@@ -974,6 +1010,20 @@ impl fmt::Display for DiskImageVerb<'_> {
 }
 
 impl CommandRunner for SystemCommandRunner {
+    fn unmount_guarded<E>(
+        &self,
+        mode: UnmountMode,
+        prove: impl FnOnce() -> Result<Option<OwnedVolumeRoot>, E>,
+    ) -> Result<UnmountEffect, E>
+    where
+        E: From<NativeUnmountError> + fmt::Display,
+    {
+        let operation = match mode {
+            UnmountMode::Normal => "funmount normal",
+            UnmountMode::ForceAfterGrace => "funmount force-after-grace",
+        };
+        disk_lease::namespace(self.namespace, operation, || unmount_proved(mode, prove))
+    }
     fn run_guarded<E>(
         &self,
         request: &CommandRequest,
@@ -1003,16 +1053,22 @@ impl CommandRunner for SystemCommandRunner {
         let deadline = CommandDeadline::new(DISK_CHILD_DEADLINE);
         let policy = DeadlinePolicy::for_request(request, DISK_CHILD_DEADLINE);
         let total = matches!(policy.past_deadline, PastDeadline::Kill).then_some(deadline);
-        let output = crate::disk_lease::leased(&request.program, &request.args, total, || {
-            if !check().map_err(Guarded::Check)? {
-                return Ok(None);
-            }
-            Self::run_unleased(request, ChildInput::Null, policy, total, &mut |elapsed| {
-                warn_outlived(request, DISK_CHILD_DEADLINE, elapsed)
-            })
-            .map(Some)
-            .map_err(Guarded::Run)
-        })
+        let output = crate::disk_lease::leased(
+            self.namespace,
+            &request.program,
+            &request.args,
+            total,
+            || {
+                if !check().map_err(Guarded::Check)? {
+                    return Ok(None);
+                }
+                Self::run_unleased(request, ChildInput::Null, policy, total, &mut |elapsed| {
+                    warn_outlived(request, DISK_CHILD_DEADLINE, elapsed)
+                })
+                .map(Some)
+                .map_err(Guarded::Run)
+            },
+        )
         .map_err(|error| match error {
             Guarded::Check(error) => error,
             Guarded::Run(error) => E::from(error),
@@ -6955,9 +7011,21 @@ mod io_registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::namespace::TestNamespace;
     use std::cell::{Ref, RefCell};
     use std::collections::{BTreeMap, VecDeque};
     use std::ffi::OsStr;
+
+    /// A host namespace of the test's own: no test leases a disk tool as production does, or names
+    /// a volume with production's `[cowshed]`.
+    fn test_namespace() -> HostNamespace {
+        HostNamespace::Test(TestNamespace::mint().expect("a test namespace"))
+    }
+
+    /// A runner whose disk tools lease as a test namespace of the test's own.
+    fn test_runner() -> SystemCommandRunner {
+        SystemCommandRunner::new(test_namespace())
+    }
 
     const BLANK_IMAGE_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
       <dict><key>dev-entry</key><string>disk8</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
@@ -7632,7 +7700,7 @@ mod tests {
 
     #[test]
     fn system_runner_reports_output_spawn_errors_and_signal_status() {
-        let output = SystemCommandRunner
+        let output = test_runner()
             .run(&CommandRequest::new(
                 "/bin/sh",
                 ["-c", "printf stdout; printf stderr >&2; exit 7"],
@@ -7642,13 +7710,13 @@ mod tests {
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
 
-        let signaled = SystemCommandRunner
+        let signaled = test_runner()
             .run(&CommandRequest::new("/bin/sh", ["-c", "kill -TERM $$"]))
             .unwrap();
         assert_eq!(signaled.status, ProcessStatus::Signal(libc::SIGTERM));
 
         let missing = temp_path("missing-command", "bin");
-        let error = SystemCommandRunner
+        let error = test_runner()
             .run(&CommandRequest::new(
                 &missing,
                 std::iter::empty::<OsString>(),
@@ -7670,7 +7738,7 @@ mod tests {
         // runs a single builtin, and a pid the child had to write itself was then empty. The spin
         // never ends on its own, so the `Deadline` failure with its SIGKILL is the proof the
         // deadline fired; a runner that never fired it would hang to the run's no-progress bound.
-        let error = SystemCommandRunner
+        let error = test_runner()
             .run_with_deadline(
                 &CommandRequest::new("/bin/sh", ["-c", "while true; do :; done"]),
                 Duration::from_millis(250),
@@ -7714,7 +7782,7 @@ mod tests {
             "no owned child remains alive"
         );
         // The queue continues: a fast child right after the kill still runs.
-        let output = SystemCommandRunner
+        let output = test_runner()
             .run(&CommandRequest::new("/bin/sh", ["-c", "printf 'next\\n'"]))
             .unwrap();
         assert_eq!(output.stdout, b"next\n");
@@ -8122,7 +8190,7 @@ mod tests {
                 marker.clone().into_os_string(),
             ],
         );
-        let error = SystemCommandRunner
+        let error = test_runner()
             .run_within(&request, Duration::from_millis(25), |deadline, run| {
                 let deadline = deadline.expect("SAFE custom admission carries its total budget");
                 while let Some(remaining) = deadline.remaining() {
@@ -8220,8 +8288,8 @@ mod tests {
             ],
         );
         if std::env::var_os(DISK_CHILD_INPUT_ROLE).is_some() {
-            let null = SystemCommandRunner.run(&read).expect("null-input child");
-            let inherited = SystemCommandRunner
+            let null = test_runner().run(&read).expect("null-input child");
+            let inherited = test_runner()
                 .run_with_inherited_input(&read, CommandDeadline::new(DISK_CHILD_DEADLINE), None)
                 .expect("inheriting child");
             println!(
@@ -8272,11 +8340,11 @@ mod tests {
                 "if read line; then printf 'got %s' \"$line\"; else printf eof; fi; cat",
             ],
         );
-        let given = SystemCommandRunner
+        let given = test_runner()
             .run_with_input(&read, deadline(), b"passphrase\nrest".to_vec(), None)
             .expect("child given bytes");
         assert_eq!(given.stdout, b"got passphraserest");
-        let empty = SystemCommandRunner
+        let empty = test_runner()
             .run_with_input(&read, deadline(), Vec::new(), None)
             .expect("child given nothing");
         assert_eq!(empty.stdout, b"eof");
@@ -8284,7 +8352,7 @@ mod tests {
         let large: Vec<u8> = (0..(1 << 20))
             .map(|index: u32| index.to_le_bytes()[0])
             .collect();
-        let echoed = SystemCommandRunner
+        let echoed = test_runner()
             .run_with_input(
                 &CommandRequest::new("cat", Vec::<OsString>::new()),
                 deadline(),
@@ -8299,7 +8367,7 @@ mod tests {
             echoed.stdout.len()
         );
 
-        let ignored = SystemCommandRunner
+        let ignored = test_runner()
             .run_with_input(
                 &CommandRequest::new("true", Vec::<OsString>::new()),
                 deadline(),
@@ -8429,7 +8497,7 @@ mod tests {
             ],
         );
         let large = vec![b'x'; 1 << 20];
-        let ran = SystemCommandRunner
+        let ran = test_runner()
             .run_with_input(
                 &request,
                 CommandDeadline::new(DISK_CHILD_DEADLINE),
@@ -8495,7 +8563,7 @@ mod tests {
         // pipe buffer must complete with its output intact, never wedge on a full pipe. The
         // deadline is not the subject, so it sits at the run's no-progress backstop: a wedged
         // pipe still ends in the deadline error, and a loaded host never does.
-        let output = SystemCommandRunner
+        let output = test_runner()
             .run_with_deadline(
                 &CommandRequest::new("/bin/sh", ["-c", "seq 1 20000"]),
                 cowshed_os::test_backstop::NO_PROGRESS,
@@ -9990,7 +10058,7 @@ mod tests {
             let renamed = backend.rename_volume(
                 &attachment,
                 Path::new(SESSION_MOUNT),
-                "[cowshed] fixture · dispatch — main",
+                &test_namespace().volume_label(format_args!("fixture · dispatch — main")),
             );
 
             assert!(
@@ -10083,21 +10151,23 @@ mod tests {
     /// any other verb of it does.
     #[test]
     fn the_system_runner_refuses_disk_arbitration_renames_before_spawning() {
+        let label = test_namespace().volume_label(format_args!("fixture · dispatch — main"));
         let request = |verb: &str| {
             CommandRequest::new(
                 "/nonexistent/cowshed-test/diskutil",
-                [verb, "/dev/disk3s5", "[cowshed] fixture · dispatch — main"],
+                [verb, "/dev/disk3s5", label.as_str()],
             )
         };
+        let system = test_runner();
         for verb in ["rename", "renameVolume", "RENAMEVOLUME", "ReNaMe"] {
             for refused in [
-                SystemCommandRunner.run(&request(verb)),
-                SystemCommandRunner.run_with_inherited_input(
+                system.run(&request(verb)),
+                system.run_with_inherited_input(
                     &request(verb),
                     CommandDeadline::new(DISK_CHILD_DEADLINE),
                     None,
                 ),
-                SystemCommandRunner
+                system
                     .run_guarded(&request(verb), || Ok::<_, ApfsError>(true))
                     .map_err(|error| match error {
                         ApfsError::CommandRun(error) => error,
@@ -10113,7 +10183,7 @@ mod tests {
                 assert!(error.to_string().contains("/dev/disk3s5"), "{error}");
             }
         }
-        let other = SystemCommandRunner
+        let other = system
             .run(&request("info"))
             .expect_err("the stand-in diskutil does not exist");
         assert!(
@@ -10139,7 +10209,7 @@ mod tests {
             let renamed = backend.rename_volume(
                 &attachment,
                 Path::new(SESSION_MOUNT),
-                "[cowshed] fixture · intents — slotted",
+                &test_namespace().volume_label(format_args!("fixture · intents — slotted")),
             );
 
             assert!(
@@ -10499,7 +10569,7 @@ mod tests {
             0o700
         );
 
-        let held = SystemCommandRunner
+        let held = test_runner()
             .image_lease(&own)
             .unwrap()
             .expect("production takes a real lease");
@@ -10517,7 +10587,7 @@ mod tests {
         );
         drop(probe);
         assert!(
-            SystemCommandRunner.image_lease(&other).unwrap().is_some(),
+            test_runner().image_lease(&other).unwrap().is_some(),
             "another identity is free while this one is held"
         );
 
@@ -10542,7 +10612,7 @@ mod tests {
             let (started, waiting) = std::sync::mpsc::channel();
             let contender = scope.spawn(move || {
                 started.send(()).expect("the test awaits the contender");
-                let lease = SystemCommandRunner.image_lease(own);
+                let lease = test_runner().image_lease(own);
                 order.lock().expect("order").push("acquired");
                 lease
             });
@@ -11026,9 +11096,7 @@ mod tests {
         use std::os::unix::fs::{FileExt, MetadataExt};
         let (image, before) = sparse_raw_file("grow-raw", capacity("1g"));
         let allocated_before = fs::metadata(&image).unwrap().blocks() * 512;
-        SystemCommandRunner
-            .grow_image(&image, capacity("2g"))
-            .unwrap();
+        test_runner().grow_image(&image, capacity("2g")).unwrap();
         let file = File::open(&image).unwrap();
         assert_eq!(file.metadata().unwrap().len(), capacity("2g").bytes());
         let mut prefix = vec![0; before.len()];
@@ -11054,9 +11122,7 @@ mod tests {
         ] {
             let (image, _) = sparse_raw_file(label, ImageCapacity::from_bytes(8192));
             let before = fs::read(&image).unwrap();
-            let error = SystemCommandRunner
-                .grow_image(&image, requested)
-                .unwrap_err();
+            let error = test_runner().grow_image(&image, requested).unwrap_err();
             assert_eq!(
                 error.kind(),
                 io::ErrorKind::InvalidInput,
@@ -11068,7 +11134,7 @@ mod tests {
         for bytes in [Vec::new(), vec![1; 513]] {
             let image = temp_path("invalid-raw-size", IMAGE_EXTENSION);
             fs::write(&image, &bytes).unwrap();
-            let error = SystemCommandRunner
+            let error = test_runner()
                 .grow_image(&image, capacity("1g"))
                 .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -11091,7 +11157,7 @@ mod tests {
             .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK)
             .open(&image)
             .unwrap();
-        let error = SystemCommandRunner
+        let error = test_runner()
             .grow_image(&image, capacity("2g"))
             .expect_err("a held image cannot grow");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
@@ -11127,7 +11193,7 @@ mod tests {
                 panic!("growing spawned {request:?}");
             }
             fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
-                SystemCommandRunner.image_lease(identity)
+                test_runner().image_lease(identity)
             }
             fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>> {
                 panic!("growing pinned {}", device.display());

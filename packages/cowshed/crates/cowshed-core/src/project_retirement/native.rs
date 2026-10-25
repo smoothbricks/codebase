@@ -284,8 +284,9 @@ mod macos {
         let image_count = found.images.len();
         let detached_store = store.clone();
         let detached_project = project.clone();
+        let runner = SystemCommandRunner::new(storage.namespace());
         let detached = dispatch_blocking(move || -> Result<_> {
-            let backend = MacOsApfsBackend::new(SystemCommandRunner);
+            let backend = MacOsApfsBackend::new(runner);
             let mut holds = Vec::with_capacity(found.images.len());
             for image in &found.images {
                 backend.release_image(&image.path, DetachIntent::WhenIdle).map_err(|error| {
@@ -298,7 +299,7 @@ mod macos {
                 })?;
                 holds.push(hold_detached(image)?);
             }
-            let remaining = SystemCommandRunner.attached_disk_images()
+            let remaining = runner.attached_disk_images()
                 .map_err(|error| io_error("read image inventory after retirement detach", &detached_store, error))?;
             if let Some(image) = remaining.iter().find(|image| matches!(&image.source, DiskImageSource::File(path) if path.starts_with(&detached_project))) {
                 return Err(CowshedError::conflict(
@@ -328,8 +329,13 @@ mod macos {
         use super::*;
         use crate::project_retirement::acquire_project_reader;
         use crate::storage::bootstrap::CanonicalRoots;
+        use cowshed_os::namespace::TestNamespace;
 
-        fn recorded(root: &Path, repo: &RepoId) -> (ValidatedHostStorage, PathBuf) {
+        fn recorded(
+            root: &Path,
+            namespace: TestNamespace,
+            repo: &RepoId,
+        ) -> (ValidatedHostStorage, PathBuf) {
             let store = root.join("s");
             let project = crate::storage::StorageLayout::new(&store, repo)
                 .unwrap()
@@ -341,7 +347,11 @@ mod macos {
             fs::write(project.join("repository.json"), b"retained corrupt binding").unwrap();
             fs::write(project.join("evidence"), b"do not lose these bytes").unwrap();
             (
-                ValidatedHostStorage::new(root.join("home"), Vec::new(), CanonicalRoots::at(store)),
+                ValidatedHostStorage::new(
+                    root.join("home"),
+                    Vec::new(),
+                    CanonicalRoots::fixture(namespace, store),
+                ),
                 project,
             )
         }
@@ -350,7 +360,11 @@ mod macos {
         async fn missing_checkout_and_owner_marker_never_authorize_collection() {
             let root = crate::temp_root::TempRoot::new("pr");
             let repo = RepoId::parse("acme/missing").unwrap();
-            let (storage, project) = recorded(&root, &repo);
+            let (storage, project) = recorded(
+                &root,
+                TestNamespace::mint().expect("a test namespace"),
+                &repo,
+            );
             let outcomes = super::super::resume_retirements(storage.clone())
                 .await
                 .unwrap();
@@ -371,10 +385,11 @@ mod macos {
             let root = crate::temp_root::TempRoot::new("pr");
             let repo = RepoId::parse("acme/abandoned").unwrap();
             let other = RepoId::parse("acme/active").unwrap();
-            let (storage, project) = recorded(&root, &repo);
+            let namespace = TestNamespace::mint().expect("a test namespace");
+            let (storage, project) = recorded(&root, namespace, &repo);
             // A failed mint may leave opaque partial image bytes, with no live disk attachment.
             fs::write(project.join("main.dmg"), b"partial image evidence").unwrap();
-            let (_, other_project) = recorded(&root, &other);
+            let (_, other_project) = recorded(&root, namespace, &other);
             let _other_owner = acquire_project_reader(storage.store(), &other).unwrap();
             let report = forget_project(storage.clone(), repo.clone()).await.unwrap();
             assert_eq!(report.repo_id, repo);
@@ -411,7 +426,11 @@ mod macos {
         async fn a_live_controller_blocks_archive_and_only_positive_intent_resumes() {
             let root = crate::temp_root::TempRoot::new("pr");
             let repo = RepoId::parse("acme/held").unwrap();
-            let (storage, project) = recorded(&root, &repo);
+            let (storage, project) = recorded(
+                &root,
+                TestNamespace::mint().expect("a test namespace"),
+                &repo,
+            );
             let owner = acquire_project_reader(storage.store(), &repo).unwrap();
             let refusal = forget_project(storage.clone(), repo.clone())
                 .await
@@ -444,10 +463,11 @@ mod macos {
             use cowshed_apfs::{ApfsBackend, CommandRequest, MountAccess};
             let root = crate::scratch_apfs::ScratchRoot::new("pr").unwrap();
             let repo = RepoId::parse("acme/forget-native").unwrap();
-            let (storage, project) = recorded(root.path(), &repo);
+            let (storage, project) = recorded(root.path(), root.namespace(), &repo);
+            let runner = SystemCommandRunner::new(storage.namespace());
             let image = project.join("main.dmg");
             let count = || {
-                let output = SystemCommandRunner
+                let output = runner
                     .run(&CommandRequest::new(
                         "/usr/sbin/ioclasscount",
                         [
@@ -462,10 +482,10 @@ mod macos {
                 String::from_utf8(output.stdout).unwrap()
             };
             cowshed_os::eprintln!("forget-native before: {}", count().trim());
-            crate::blank_image::blank_image(&image);
+            crate::blank_image::blank_image(root.namespace(), &image);
             let mount = root.path().join("mnt");
             fs::create_dir(&mount).unwrap();
-            let backend = MacOsApfsBackend::new(SystemCommandRunner);
+            let backend = MacOsApfsBackend::new(runner);
             let attachment = backend.attach_verified(&image).unwrap();
             backend
                 .mount(&attachment, &mount, MountAccess::ReadWrite, false)
@@ -482,7 +502,7 @@ mod macos {
                 .unwrap_err();
             assert_eq!(busy.code, ErrorCode::Conflict, "{busy}");
             assert!(project.exists());
-            assert!(SystemCommandRunner.attached_disk_images().unwrap().iter().any(
+            assert!(runner.attached_disk_images().unwrap().iter().any(
                 |entry| matches!(&entry.source, DiskImageSource::File(path) if path == &image)
             ));
             assert_eq!(
@@ -501,7 +521,7 @@ mod macos {
                 fs::read(report.archive.join("repository.json")).unwrap(),
                 b"retained corrupt binding"
             );
-            assert!(!SystemCommandRunner.attached_disk_images().unwrap().iter().any(
+            assert!(!runner.attached_disk_images().unwrap().iter().any(
                 |entry| matches!(&entry.source, DiskImageSource::File(path) if path == &image || path.starts_with(&report.archive))
             ));
             cowshed_os::eprintln!("forget-native after: {}", count().trim());

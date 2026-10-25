@@ -106,7 +106,7 @@ async fn directory_egress_revoke_does_not_reconcile_an_absent_gateway() {
     let fixture = Fixture::directory();
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
-    let control = fixture.storage.store().join("gateway.sock");
+    let control = fixture.storage.control_socket();
     assert!(
         !control
             .try_exists()

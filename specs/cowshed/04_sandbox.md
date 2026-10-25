@@ -646,9 +646,10 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   Dev-side headless simulators need no `sim` grant at all — they are reached directly via the "simulator" profile preset
   below. macOS desktop apps add no grant axis, and no sandbox verb launches one as the personal user.
 - `portBlock` is **macOS-only and platform-optional**. When present it is the workspace's contiguous block
-  `{base, size}` from the reserved range (default 32768–49151; 05_gateway.md): `base` is the gateway data-plane listener
-  and `base+1 … base+size-1` are workspace service ports. A block's size is persisted data, not a global assumption:
-  `size` is a power of two of at least 2, `base` is aligned to its own `size`, and every reader — sidecar parsing, grant
+  `{base, size}` from the reserved range (32768–49151: production allocates only from its host partition and test
+  namespaces only from the fixture partition, 05_gateway.md): `base` is the gateway data-plane listener and
+  `base+1 … base+size-1` are workspace service ports. A block's size is persisted data, not a global assumption: `size`
+  is a power of two of at least 2, `base` is aligned to its own `size`, and every reader — sidecar parsing, grant
   validation, the gateway's session check, the Seatbelt profile — validates a block against its own recorded
   `{base, size}`. A new workspace gets `NEW_PORT_BLOCK_SIZE` (64) ports — the gateway plus 63 service ports — at the
   lowest aligned base whose block shares no port with any claimed block of any size. A block is claimed while any record

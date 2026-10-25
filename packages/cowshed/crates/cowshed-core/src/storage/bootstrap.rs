@@ -12,6 +12,7 @@ use thiserror::Error;
 use toml::Spanned;
 
 use crate::capabilities::{CapabilityId, CapabilityOverride, DeclaredState};
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::process::fmt_command_failure;
 
 use super::fstab::FstabPin;
@@ -1028,30 +1029,43 @@ pub enum MountGuardError {
     },
 }
 
-/// The machine-global host store, or a test fixture store with isolated port allocation.
+/// A host store and the namespace it belongs to (01_storage.md, "Host namespace"): production's
+/// machine-global store, or a test namespace's fixture store. The namespace decides every name
+/// minted for the store and its port partition: production allocates from the host partition, a
+/// test namespace from the fixture partition, whose detached blocks its store claims.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalRoots {
     store: Arc<Path>,
     telemetry: PathBuf,
+    namespace: HostNamespace,
     ports: PortPartition,
 }
 
 impl CanonicalRoots {
     pub fn global() -> Self {
-        Self::new(PathBuf::from(STORE_ROOT), PortPartition::Host)
+        Self::new(
+            PathBuf::from(STORE_ROOT),
+            HostNamespace::Production,
+            PortPartition::Host,
+        )
     }
 
-    /// A test fixture store; its ports never come from the host allocation partition, and it
-    /// holds the claims on its detached blocks for as long as any handle to it lives.
-    pub fn at(store: PathBuf) -> Self {
-        Self::new(store, PortPartition::Fixture(Arc::default()))
+    /// `namespace`'s fixture store at `store`; it holds the claims on its detached blocks for as
+    /// long as any handle to it lives.
+    pub fn fixture(namespace: TestNamespace, store: PathBuf) -> Self {
+        Self::new(
+            store,
+            HostNamespace::Test(namespace),
+            PortPartition::Fixture(Arc::default()),
+        )
     }
 
-    fn new(store: PathBuf, ports: PortPartition) -> Self {
+    fn new(store: PathBuf, namespace: HostNamespace, ports: PortPartition) -> Self {
         let telemetry = store.join("telemetry");
         Self {
             store: Arc::from(store),
             telemetry,
+            namespace,
             ports,
         }
     }
@@ -1069,6 +1083,16 @@ impl CanonicalRoots {
         &self.telemetry
     }
 
+    /// Whose names this store's objects carry.
+    pub fn namespace(&self) -> HostNamespace {
+        self.namespace
+    }
+
+    /// The store's gateway control socket, at its root: short for `sun_path` (01_storage.md).
+    pub fn control_socket(&self) -> PathBuf {
+        self.store.join(GATEWAY_SOCKET_NAME)
+    }
+
     pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
         match self.ports {
             PortPartition::Host => crate::metadata::PortAllocation::Host,
@@ -1084,6 +1108,9 @@ impl CanonicalRoots {
         }
     }
 }
+
+/// The gateway control socket's name at its store's root.
+pub const GATEWAY_SOCKET_NAME: &str = "gateway.sock";
 
 /// A store's port allocation partition. Two handles on one partition are equal whatever claims
 /// each holds: the claims are the store's kernel state, not its identity.
@@ -1206,6 +1233,14 @@ impl ValidatedHostStorage {
 
     pub fn telemetry(&self) -> &Path {
         self.roots.telemetry()
+    }
+
+    pub fn namespace(&self) -> HostNamespace {
+        self.roots.namespace()
+    }
+
+    pub fn control_socket(&self) -> PathBuf {
+        self.roots.control_socket()
     }
 
     pub fn port_allocation(&self) -> crate::metadata::PortAllocation {

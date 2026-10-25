@@ -1,11 +1,18 @@
 use super::*;
 use cowshed_os::fork_lock::Spawn as _;
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use scratch_apfs::ScratchRoot;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+/// The runner of a fixture's disk tools: they lease as the fixture's test namespace, never as
+/// production.
+fn runner(namespace: TestNamespace) -> SystemCommandRunner {
+    SystemCommandRunner::new(HostNamespace::Test(namespace))
+}
 
 fn capacity(value: &str) -> ImageCapacity {
     ImageCapacity::parse(value).expect("test capacities are well formed")
@@ -149,7 +156,7 @@ fn fixture_cleanup_proves_backing_file_unlock_before_unlink() {
         .custom_flags(libc::O_SHLOCK | libc::O_NONBLOCK)
         .open(&image)
         .expect("hold the helper's image-file lock");
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let backend = MacOsApfsBackend::new(runner(root.namespace()));
     let refused = RealImageCleanup::new(&backend, image.clone()).finish();
     assert!(matches!(
         refused,
@@ -170,11 +177,52 @@ fn fixture_cleanup_proves_backing_file_unlock_before_unlink() {
         .expect("an absent backing file needs no unlink");
 }
 
+/// A scratch root is the directory of the test namespace it mints, in the per-user root beside `t`
+/// (01_storage.md, "Host namespace"): 0700 and the user's, named for the namespace and so for the
+/// pid that owns it. `t` holds only what every test run shares, never a root.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_scratch_root_is_its_test_namespaces_private_directory_beside_t() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = ScratchRoot::new_owned("namespace-directory").expect("owned scratch root");
+    // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let namespace = root.namespace();
+    assert_eq!(
+        namespace.owner_pid(),
+        std::process::id(),
+        "this process minted it"
+    );
+    assert_eq!(
+        root.path(),
+        HostNamespace::Test(namespace)
+            .macos_user_root(euid)
+            .as_path(),
+        "the root is the directory of its namespace"
+    );
+    assert_eq!(
+        root.path().parent(),
+        Some(HostNamespace::Production.macos_user_root(euid).as_path()),
+        "it is an entry of the per-user root, beside t, mnt and ram<revision>"
+    );
+    assert!(
+        !root
+            .path()
+            .starts_with(crate::scratch_apfs::SCRATCH_PARENT.as_path()),
+        "no root is made in the directory every test run shares"
+    );
+    let metadata = fs::symlink_metadata(root.path()).expect("the root's metadata");
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.uid(), euid);
+    assert_eq!(metadata.mode() & 0o777, 0o700);
+}
+
 /// The system runner, except that naming a volume first force-unmounts it, as another process
 /// may (`hdiutil detach -force` past a grace, a fixture teardown after its supervisor was
 /// stopped): the window between proving a volume's root and naming it.
 #[cfg(target_os = "macos")]
-struct ForcedUnmountBeforeNaming;
+struct ForcedUnmountBeforeNaming(SystemCommandRunner);
 
 #[cfg(target_os = "macos")]
 impl CommandRunner for ForcedUnmountBeforeNaming {
@@ -182,7 +230,7 @@ impl CommandRunner for ForcedUnmountBeforeNaming {
         &self,
         request: &CommandRequest,
     ) -> Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError> {
-        SystemCommandRunner.run(request)
+        self.0.run(request)
     }
     fn run_guarded<E>(
         &self,
@@ -192,28 +240,28 @@ impl CommandRunner for ForcedUnmountBeforeNaming {
     where
         E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
     {
-        SystemCommandRunner.run_guarded(request, check)
+        self.0.run_guarded(request, check)
     }
     fn image_lease(
         &self,
         identity: &Path,
     ) -> io::Result<Option<cowshed_os::fork_lock::Fenced<fs::File>>> {
-        SystemCommandRunner.image_lease(identity)
+        self.0.image_lease(identity)
     }
     fn pin_raw_device(
         &self,
         device: &Path,
     ) -> io::Result<Option<cowshed_os::fork_lock::Fenced<fs::File>>> {
-        SystemCommandRunner.pin_raw_device(device)
+        self.0.pin_raw_device(device)
     }
     fn attached_disk_images(&self) -> io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
-        SystemCommandRunner.attached_disk_images()
+        self.0.attached_disk_images()
     }
     fn attachments_of(&self, image: &Path) -> io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
-        SystemCommandRunner.attachments_of(image)
+        self.0.attachments_of(image)
     }
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
-        SystemCommandRunner.grow_image(image, capacity)
+        self.0.grow_image(image, capacity)
     }
     fn name_volume(&self, root: &cowshed_apfs::OwnedVolumeRoot, name: &str) -> io::Result<()> {
         use std::os::unix::ffi::OsStrExt as _;
@@ -248,10 +296,12 @@ fn name_at(path: &Path) -> String {
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_a_rename_names_only_its_own_held_volume_root() {
-    const LABEL: &str = "[cowshed] fixture · dispatch — main";
     let root = ScratchRoot::new("owned-rename").expect("scratch root");
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
-    let forcing = MacOsApfsBackend::new(ForcedUnmountBeforeNaming);
+    let label = HostNamespace::Test(root.namespace())
+        .volume_label(format_args!("fixture · dispatch — main"));
+    let system = runner(root.namespace());
+    let backend = MacOsApfsBackend::new(system);
+    let forcing = MacOsApfsBackend::new(ForcedUnmountBeforeNaming(system));
     let outer_image = root.path().join("outer").with_extension(IMAGE_EXTENSION);
     let inner_image = root.path().join("inner").with_extension(IMAGE_EXTENSION);
     let outer_mount = root.path().join("outer-volume");
@@ -260,8 +310,8 @@ fn real_apfs_a_rename_names_only_its_own_held_volume_root() {
     let mut outer_cleanup = RealImageCleanup::new(&backend, outer_image.clone());
     let mut inner_cleanup = RealImageCleanup::new(&backend, inner_image.clone());
     let result = (|| -> Result<(), ApfsError> {
-        crate::blank_image::blank_image(&outer_image);
-        crate::blank_image::blank_image(&inner_image);
+        crate::blank_image::blank_image(root.namespace(), &outer_image);
+        crate::blank_image::blank_image(root.namespace(), &inner_image);
         let outer = outer_cleanup.track(backend.attach_mounted(
             &outer_image,
             &outer_mount,
@@ -275,17 +325,17 @@ fn real_apfs_a_rename_names_only_its_own_held_volume_root() {
             false,
         )?);
         let outer_name = name_at(&outer_mount);
-        assert_ne!(outer_name, LABEL);
+        assert_ne!(outer_name, label);
 
-        backend.rename_volume(inner, &inner_mount, LABEL)?;
+        backend.rename_volume(inner, &inner_mount, &label)?;
         assert_eq!(
             name_at(&inner_mount),
-            LABEL,
+            label,
             "the store rename names its volume"
         );
 
         let refused = backend
-            .rename_volume(inner, &outer_mount, LABEL)
+            .rename_volume(inner, &outer_mount, &label)
             .expect_err("the outer volume's root is not the inner's");
         assert!(
             matches!(
@@ -316,7 +366,7 @@ fn real_apfs_a_rename_names_only_its_own_held_volume_root() {
         );
 
         backend.mount(inner, &inner_mount, MountAccess::ReadWrite, false)?;
-        assert_eq!(name_at(&inner_mount), LABEL, "the failed name never landed");
+        assert_eq!(name_at(&inner_mount), label, "the failed name never landed");
         Ok(())
     })();
     finish_real_image_test(result, inner_cleanup);
@@ -332,17 +382,18 @@ fn real_apfs_a_rename_names_only_its_own_held_volume_root() {
 #[test]
 fn real_apfs_one_image_is_matched_by_the_url_its_driver_registered() {
     let root = ScratchRoot::new("image-url").expect("scratch root");
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let system = runner(root.namespace());
+    let backend = MacOsApfsBackend::new(system);
     let image = root.path().join("a b%2F#c").with_extension(IMAGE_EXTENSION);
     let absent = root.path().join("a b%2F#d").with_extension(IMAGE_EXTENSION);
     let mount = root.path().join("volume");
     let _paths = TestPaths(vec![mount.clone()]);
     let mut cleanup = RealImageCleanup::new(&backend, image.clone());
     let result = (|| -> Result<(), ApfsError> {
-        crate::blank_image::blank_image(&image);
+        crate::blank_image::blank_image(root.namespace(), &image);
         let attached =
             cleanup.track(backend.attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?);
-        let whole: Vec<_> = SystemCommandRunner
+        let whole: Vec<_> = system
             .attached_disk_images()
             .map_err(ApfsError::KernelInventory)?
             .into_iter()
@@ -350,13 +401,13 @@ fn real_apfs_one_image_is_matched_by_the_url_its_driver_registered() {
             .collect();
         assert_eq!(whole.len(), 1, "the image is attached once: {whole:?}");
         assert_eq!(
-            SystemCommandRunner
+            system
                 .attachments_of(&image)
                 .map_err(ApfsError::KernelInventory)?,
             whole
         );
         assert!(
-            SystemCommandRunner
+            system
                 .attachments_of(&absent)
                 .map_err(ApfsError::KernelInventory)?
                 .is_empty()
@@ -452,7 +503,8 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
     }
 
     let root = ScratchRoot::new("leases").expect("scratch root");
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let system = runner(root.namespace());
+    let backend = MacOsApfsBackend::new(system);
     let image_a = root
         .path()
         .join("lease-held")
@@ -473,12 +525,12 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
     let order = std::sync::Mutex::new(Vec::new());
     let mut cleanup_a = RealImageCleanup::new(&backend, image_a.clone());
     let result = (|| -> Result<(), ApfsError> {
-        crate::blank_image::blank_image(&image_a);
+        crate::blank_image::blank_image(root.namespace(), &image_a);
         let attachment = cleanup_a.track(backend.attach_verified(&image_a)?);
         assert!(attachment.whole_device().starts_with("/dev/disk"));
         assert!(attachment.volume_device().starts_with("/dev/disk"));
         // Before A's lease is held below, since resizing takes it.
-        let refused = SystemCommandRunner
+        let refused = system
             .grow_image(&image_a, capacity("2g"))
             .expect_err("growth refuses an attached image");
         assert_eq!(refused.kind(), io::ErrorKind::WouldBlock, "{refused}");
@@ -507,7 +559,7 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
         fs::hard_link(&image_a, &hard_link).expect("hard-link alias");
         let symlinked = alias_parent.join(image_a.file_name().expect("image name"));
 
-        let held = SystemCommandRunner
+        let held = system
             .image_lease(&image_a)
             .expect("take the image's production lease")
             .expect("production takes a real lease");
@@ -523,7 +575,7 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
                 "{} has an inventory mapping of its own",
                 alias.display()
             );
-            let refused = SystemCommandRunner
+            let refused = system
                 .grow_image(alias, capacity("2g"))
                 .expect_err("A's attachment backs the file every alias names");
             assert_eq!(
@@ -691,7 +743,7 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
         });
         (child, forwarded)
     };
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let backend = MacOsApfsBackend::new(runner(TestNamespace::mint().expect("a test namespace")));
     for ending in ["panic", "kill"] {
         let (mut child, forwarded) = run(ending);
         let mut lines = BufReader::new(child.stdout.take().expect("run stdout"))
@@ -807,8 +859,9 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
     let root = ScratchRoot::new_owned("fixture-kill").expect("owned scratch root");
+    let system = runner(root.namespace());
+    let backend = MacOsApfsBackend::new(system);
     let image = root.path().join("attach.dmg");
     // Releases and deletes the image if the test fails before it does.
     let _cleanup = RealImageCleanup::new(&backend, image.clone());
@@ -907,7 +960,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     // attachment backs (01a_apfs.md, "Images") or a helper locks, and it succeeds, so no image
     // driver still holds it — proved without another attach. The released image is then
     // deleted, so a passing run retains no fixture.
-    SystemCommandRunner
+    system
         .grow_image(&image, capacity("2g"))
         .expect("no image driver still holds the released image");
     backend
@@ -931,9 +984,10 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
     };
     let root = PathBuf::from(root);
     std::env::set_current_dir(&root).expect("work in the fixture root");
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let namespace = TestNamespace::mint().expect("a test namespace");
+    let backend = MacOsApfsBackend::new(runner(namespace));
     let image = root.join("attach.dmg");
-    crate::blank_image::blank_image(&image);
+    crate::blank_image::blank_image(namespace, &image);
     // Announce only the attaching hdiutil while attach is in flight, so the parent kills
     // mid-attach rather than during inventory reads or the exact-device release afterward.
     // Release starts only after attach returned and the attaching flag has been cleared.
@@ -988,10 +1042,10 @@ fn real_apfs_fixture_run_ended_by_its_parent() {
         return;
     };
     let root = ScratchRoot::new_owned("fixture-run").expect("owned scratch root");
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let backend = MacOsApfsBackend::new(runner(root.namespace()));
     for name in ["first", "retained/second"] {
         let image = root.path().join(name).with_extension(IMAGE_EXTENSION);
-        crate::blank_image::blank_image(&image);
+        crate::blank_image::blank_image(root.namespace(), &image);
         if name == "first" {
             let mount = root.path().join(format!("{name}-volume"));
             fs::create_dir(&mount).expect("a fixture mountpoint");

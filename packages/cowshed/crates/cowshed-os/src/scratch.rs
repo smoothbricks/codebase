@@ -21,12 +21,16 @@ const MAX_SOCKET_ENTRIES: usize = 8;
 /// keeps its nested sockets inside `sockaddr_un.sun_path` only at this length.
 const NAMED_SUFFIX: usize = 17;
 
-/// The parent of every disk-image test fixture on macOS: `/private/var/folders/cowshed/<euid>/t`,
-/// beside the workspace mount root `mnt`. Spotlight's `mds` admits no volume whose mount path
-/// contains `/var/folders/` and keeps, until it exits, one `AppleAPFSVolume` right for every
-/// volume it admits; a volume mounted below this parent takes none (specs/cowshed/01a_apfs.md,
-/// "Spotlight media references"). The per-user root `cowshed setup` makes must exist; `t` is
-/// created 0700 and refused unless it is a directory this euid owns with that mode.
+/// The directory every test run on macOS shares: `/private/var/folders/cowshed/<euid>/t`, holding the
+/// user's image template, the lane pools and the dead-run sweep's lock and record. Each run's own
+/// tree is its test namespace's root beside it (`HostNamespace::macos_user_root`), never inside;
+/// production's names in the per-user root are `mnt` and `ram<revision>`, and nothing production
+/// runs reads `t` or a test namespace (specs/cowshed/01_storage.md, "Host namespace"). Spotlight's
+/// `mds` admits no volume whose mount path contains `/var/folders/` and keeps, until it exits, one
+/// `AppleAPFSVolume` right for every volume it admits; a volume mounted below the per-user root
+/// takes none (specs/cowshed/01a_apfs.md, "Spotlight media references"). The per-user root
+/// `cowshed setup` makes must exist; `t` is created 0700 and refused unless it is a directory this
+/// euid owns with that mode.
 #[cfg(target_os = "macos")]
 pub fn macos_scratch_root() -> io::Result<PathBuf> {
     // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
@@ -299,10 +303,10 @@ fn host_roots(temp: PathBuf) -> Vec<PathBuf> {
 /// Whether a canonical path is at or below a bounded-exec RAM temp volume.
 /// The names count only in the slots ram-temp.ts mounts them in: the leaf
 /// ram<revision> (and its ram<revision>-new staging sibling) directly below
-/// /private/var/folders/cowshed/<uid>, a fixture volume mounted by its
-/// smoo-ram name below that root's t, or a volume-name mount under /Volumes
-/// (revisions 1-2). A ram-shaped name anywhere else is an ordinary temp
-/// root and stays in the sweep.
+/// a namespace's per-user root, production's /private/var/folders/cowshed/<uid>
+/// or a test namespace's directory below it, or a volume-name mount under
+/// /Volumes (revisions 1-2). A ram-shaped name anywhere else is an ordinary
+/// temp root and stays in the sweep.
 fn is_ram_temp_owned(path: &Path) -> bool {
     let parts: Vec<String> = path
         .components()
@@ -320,10 +324,8 @@ fn is_ram_temp_owned(path: &Path) -> bool {
     if ram_mountpoint(&parts[6]) {
         return true;
     }
-    parts[6] == "t"
-        && parts
-            .get(7)
-            .is_some_and(|name| name.starts_with("smoo-ram"))
+    crate::namespace::TestNamespace::parse(&parts[6]).is_some()
+        && parts.get(7).is_some_and(|name| ram_mountpoint(name))
 }
 
 fn ram_mountpoint(name: &str) -> bool {

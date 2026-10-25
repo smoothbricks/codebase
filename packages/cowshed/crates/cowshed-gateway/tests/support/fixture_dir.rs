@@ -48,6 +48,7 @@ pub(crate) use temp_parent::scratch_parent;
 /// The mode is then read back and asserted. That is what keeps a permissive umask, or a temp
 /// strategy that hands back a directory this fixture did not create, from resurfacing as a bare
 /// `InvalidInput` raised deep inside `Gateway::start`, which names neither the path nor the mode.
+#[allow(dead_code)]
 pub fn secure_fixture_dir(name: &str) -> FixtureDir {
     secure_fixture_dir_in(&scratch_parent(), name)
 }

@@ -11,6 +11,7 @@ use cowshed_gateway::{
     ControlError, ControlFailureCode, CredentialProtocol, GatewayControlClient, GatewayHandle,
     GatewayLimits, MirrorRoute,
 };
+use cowshed_gateway_types::MACOS_FIXTURE_PORT_MIN;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version, header};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Empty, Full};
@@ -197,15 +198,23 @@ impl AuditSink for ChannelAudit {
     }
 }
 
-const PORT_BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN + 1)
-    / cowshed_gateway::NEW_PORT_BLOCK_SIZE;
+/// The fixture partition, `MACOS_FIXTURE_PORT_MIN..=MACOS_PORT_MAX`, as the port block it is: a
+/// power-of-two size beginning on a multiple of it. Outside a workspace every test claims inside it,
+/// as inside a workspace every test claims inside the workspace's own block, so no test ever claims a
+/// host-partition port production allocates from (specs/cowshed/08_testing.md, "Fixtures").
+use cowshed_gateway_types::MACOS_FIXTURE_PORTS as FIXTURE_PORTS;
+
+/// The two-port subblocks [`enclosed_subblock`] offers in the fixture partition: the most blocks a
+/// claim loop tries before it reports the partition full.
+const PORT_BLOCKS: u16 = (FIXTURE_PORTS - 2) / 2;
 
 /// The blocks this process holds, by base port: a listener on each block's base+1. A static is
 /// never dropped, so a claim outlives every session its test installs and goes back to the
 /// kernel when the process exits, after a panic too, unless [`release_claim`] returns it first.
 static CLAIMS: Mutex<BTreeMap<u16, std::net::TcpListener>> = Mutex::new(BTreeMap::new());
 
-/// Claim a gateway block in the kernel and return its base as the endpoint to try.
+/// Claim a gateway block in the kernel and return its base as the endpoint to try: a two-port
+/// subblock of the workspace's own port block, or, outside a workspace, of the fixture partition.
 ///
 /// A PID modulo the block count is not unique, and file locks under TMPDIR are not shared
 /// across test runners with different temp roots. The claim is a listener on the block's next
@@ -216,37 +225,20 @@ static CLAIMS: Mutex<BTreeMap<u16, std::net::TcpListener>> = Mutex::new(BTreeMap
 /// it, and every allocator on the host binds the lowest free block's base first, so a released
 /// base can be anyone's by then. [`install_claimed`] makes the gateway's own bind the probe.
 fn free_endpoint() -> SocketAddr {
-    match fixture_ports::enclosing_cow_port_block() {
-        Some((base, size)) => enclosed_subblock(base, size),
-        None => global_block(),
-    }
+    let (base, size) = fixture_ports::enclosing_cow_port_block()
+        .unwrap_or((MACOS_FIXTURE_PORT_MIN, FIXTURE_PORTS));
+    enclosed_subblock(base, size)
 }
 
-/// Outside a workspace: the next free global block, claimed as above.
-fn global_block() -> SocketAddr {
-    static NEXT_BLOCK: AtomicU16 = AtomicU16::new(0);
-    let seed = (std::process::id() % u32::from(PORT_BLOCKS)) as u16;
-    for _ in 0..PORT_BLOCKS {
-        let step = NEXT_BLOCK.fetch_add(1, Ordering::Relaxed);
-        let index = ((u32::from(seed) + u32::from(step)) % u32::from(PORT_BLOCKS)) as u16;
-        let base = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::NEW_PORT_BLOCK_SIZE;
-        let Ok(claim) = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, base + 1)) else {
-            continue;
-        };
-        CLAIMS.lock().expect("port claims").insert(base, claim);
-        return SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base);
-    }
-    panic!("no free macOS gateway port block in {PORT_BLOCKS} candidates");
-}
-
-/// Inside a workspace block: the 2-port subblocks at even offsets 2..=size-2, since base and
-/// base+1 belong to the gateway and the sandbox's upstream. Each subblock is claimed on its
-/// service port exactly as a global block is, so another claimant skips it.
+/// A two-port subblock of the port block of `size` ports at `base`: a workspace's own, or the fixture
+/// partition outside a workspace. Subblocks lie at even offsets 2..=size-2, since base and base+1
+/// belong to the gateway and the sandbox's upstream. Each subblock is claimed on its service port,
+/// so another claimant skips it.
 fn enclosed_subblock(base: u16, size: u16) -> SocketAddr {
     static NEXT_SUBBLOCK: AtomicU16 = AtomicU16::new(0);
     assert!(
         size >= 4,
-        "workspace port block {base}+{size} needs a larger fixture capacity: it holds no free 2-port subblock"
+        "port block {base}+{size} needs a larger fixture capacity: it holds no free 2-port subblock"
     );
     let count = (size - 2) / 2;
     for _ in 0..count {
@@ -258,13 +250,10 @@ fn enclosed_subblock(base: u16, size: u16) -> SocketAddr {
                 return SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), subblock);
             }
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
-            Err(error) => panic!(
-                "claim workspace subblock service port {}: {error}",
-                subblock + 1
-            ),
+            Err(error) => panic!("claim subblock service port {}: {error}", subblock + 1),
         }
     }
-    panic!("workspace port block {base}+{size} has no free 2-port subblock");
+    panic!("port block {base}+{size} has no free 2-port subblock");
 }
 
 /// A claimed block whose base this process binds too, for a test that needs an endpoint the
@@ -284,15 +273,12 @@ fn release_claim(endpoint: SocketAddr) {
     CLAIMS.lock().expect("port claims").remove(&endpoint.port());
 }
 
-/// The session endpoint for a block [`free_endpoint`] claimed.
+/// The session endpoint for a block [`free_endpoint`] claimed: a two-port subblock, its session port and
+/// its claimed service port.
 fn block_endpoint(address: SocketAddr) -> WorkspaceEndpoint {
-    let block_size = match fixture_ports::enclosing_cow_port_block() {
-        Some(_) => 2,
-        None => cowshed_gateway::NEW_PORT_BLOCK_SIZE,
-    };
     WorkspaceEndpoint::Tcp {
         address,
-        block_size,
+        block_size: 2,
     }
 }
 

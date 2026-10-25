@@ -169,6 +169,44 @@ and travels with every clone. The wiring rule follows the split: shared state re
 string in every context, while workspace-keyed state resolves to in-image relative `.cowshed/...` paths (correct in
 every clone automatically). Main and sessions use identical wiring; only the sandbox's permission mask differs.
 
+### Host namespace
+
+Every name cowshed mints on a host derives from one value, the **host namespace**, which the host-storage value carries:
+`CanonicalRoots` holds it beside the store root, and `ValidatedHostStorage` and `ApfsSubstrateConfig` pass it on.
+Production's is `cowshed` (`CanonicalRoots::global`). A test fixture mints a namespace of its own
+(`cowshed_os::namespace::TestNamespace::mint`) and passes it to every constructor it builds
+(`CanonicalRoots::fixture(namespace, store)`); no environment variable, global or lock selects one. A test namespace's
+name is seven lowercase base-36 characters: the minting process's pid zero-padded to five, then that process's ordinal
+in two. It therefore starts with a digit, which begins no production name. A namespace root records its owner's pid and
+start time in `.owner`, published whole by rename; the run is dead when that pid names no process or names one born at
+another instant, and a later run then reclaims the root.
+
+<!-- prettier-ignore -->
+| Name | Production | Test namespace `<ns>` |
+| --- | --- | --- |
+| Volume label prefix | `[cowshed]` | `[cowshed-test-<ns>]` |
+| Store root | `/private/cowshed/store` | the fixture's store, passed with its namespace |
+| Per-user root (macOS) | `/private/var/folders/cowshed/<uid>`, holding `mnt` and `ram<revision>` | `/private/var/folders/cowshed/<uid>/<ns>` |
+| Workspace mount root | `<per-user root>/mnt` | `<store>/mnt` |
+| RAM temp volume | `smoo-ram3-<uid>` at `<per-user root>/ram3` | `smoo-ram3-<uid>-<ns>` at `<ns root>/ram3` |
+| Gateway control socket | `<store>/gateway.sock` | `<store>/gateway.sock` of its own store |
+| Port partition | host, 32768–45055 | fixture, 45056–49151 |
+| Disk-lifecycle lease | production's gateway | the gateway at `<ns root>/gateway.sock`, or none |
+| launchd labels | `dev.cowshed.<service>` | `dev.cowshed-test-<ns>.<service>` |
+
+Production's inventories, sweeps and collection read only production's names: store walkers walk its store, session
+mount checks its mount root, the RAM temp volume its own paths and the port allocator its partition. No test object can
+therefore be one production counts, sweeps or reclaims, and no guard compares a test's names with production's. The
+per-user root's `t` is every test run's shared directory (the user's image template, the lane pools and the dead-run
+sweep's lock and record, 08_testing.md); production never reads it or a test namespace's directory.
+
+Every disk-changing tool takes its namespace's disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease"):
+production's from production's gateway, a test namespace's from the gateway at `<ns root>/gateway.sock` (its RAM fixture
+gateway where one runs, otherwise none, and the tool runs unleased). A test's disk work therefore never queues on, holds
+or spaces out production's; `storagekitd`, which every attach shares physically, a test spares by attaching only where
+an image's behavior is what it proves (08_testing.md). Doctor's kernel-wide counts (attach budget, departed volume
+references, orphaned disk-image helpers) count devices and processes, not names, and so include a test's.
+
 ## Runtime state: derived, never stored
 
 | Question                | Source of truth                                                                                                                              |
@@ -383,12 +421,12 @@ fixtures. The runtime write-site audit also covers Git's `cowshed-ignore-rules-*
 `cowshed-advisor-*` (parent and probe child). Existing unmarked test scratch is reported but not guessed dead. Workspace
 runtime `cs-*` **symlinks** retain their existing `point_runtime_link` lifecycle; this directory reaper never follows or
 removes them. Workspace exec temp and sandbox profiles belong to the store's existing workspace and profile reclamation,
-not the shared-temp sweep. Real-image roots live outside shared temp, as
-`/private/var/folders/cowshed/<uid>/t/<pid>-<n>` beside their sweep lock/record (08_testing.md), and remain with
-`cowshed-apfs/tests/support/scratch_apfs.rs`: that owner stops workers and releases attached images under its own lock
-before reclaiming a root. The generic reaper still excludes and reports a `cowshed-itest-*` root an earlier build left
-in shared temp, even if it acquires a marker; moving an attached backing image here would race its existing recovery
-protocol.
+not the shared-temp sweep. Real-image roots live outside shared temp, each its test namespace's directory
+`/private/var/folders/cowshed/<uid>/<ns>`, with their sweep lock/record in the per-user `t` (08_testing.md), and remain
+with `cowshed-apfs/tests/support/scratch_apfs.rs`: that owner stops workers and releases attached images under its own
+lock before reclaiming a root. The generic reaper still excludes and reports a `cowshed-itest-*` root an earlier build
+left in shared temp, even if it acquires a marker; moving an attached backing image here would race its existing
+recovery protocol.
 
 Only a bounded set of the marker, `s`/`s.sock` Unix sockets and an empty `s.sock.lock` can be deleted directly.
 Unexpected files, subdirectories, nonempty locks, stdout, and Arrow traces are evidence: one rename moves the whole
@@ -407,10 +445,10 @@ it still take their turn; the next full listing walks it again from its root.
 The roots are canonical `/tmp` and the daemon/CLI's non-RAM temp root, deduplicated. Foreign `node_*`, `bash_*`,
 `cargo_*`, `bun_*`, `devenv-*`, and `sccache_*` entries are excluded, even if they contain a marker. Bounded-exec
 remains the sole owner of RAM lease reclamation: `ram-temp.ts::settle` runs under its kernel lock, claim ledger and
-identity recheck during acquire/release. This sweep never enters the per-user `ram<revision>` mounts below
-`/private/var/folders/cowshed/<uid>`, their leases, staging, `.archive`, `.archive/.deleting`, locks or ledgers, and
-reports that delegation. Reclamation and retention decisions are printed by path and reason; the summary states the
-examined count and bound.
+identity recheck during acquire/release. This sweep never enters a namespace's `ram<revision>` mount, production's below
+`/private/var/folders/cowshed/<uid>` or a test namespace's below its directory, their leases, staging, `.archive`,
+`.archive/.deleting`, locks or ledgers, and reports that delegation. Reclamation and retention decisions are printed by
+path and reason; the summary states the examined count and bound.
 
 ## Tradeoffs
 

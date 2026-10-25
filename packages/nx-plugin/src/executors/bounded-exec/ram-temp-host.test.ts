@@ -20,7 +20,6 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
-import { expectFixtureVolume } from '../../__tests__/fixture-ram-volume.js';
 import { whenChanged } from '../../__tests__/path-change.js';
 import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
@@ -39,6 +38,7 @@ import {
   type RamTempPaths,
   RamTempVolume,
   ramTempPaths,
+  testNamespace,
 } from './ram-temp.js';
 import {
   attachedDisks,
@@ -47,7 +47,7 @@ import {
   ownsRecordedDisk,
   recordedRamAttach,
   registryDevice,
-  removeScratchDirectories,
+  removeScratchVolume,
   scratchVolume,
   startFixtureGateway,
 } from './ram-temp-fixtures.js';
@@ -102,8 +102,7 @@ function expectUntouched(outside: string): void {
 
 async function nativeRamVolume(): Promise<void> {
   const fixture = scratchVolume(1);
-  const { parent, paths, capacity, owned, gatewaySocket } = fixture;
-  expectFixtureVolume(paths, capacity);
+  const { paths, capacity, owned, gatewaySocket } = fixture;
   const trace = useTestSpan<OpContextBinding>();
   const caseStartedAt = Date.now();
   process.stderr.write(`RAM lifecycle case started pid=${process.pid} wallAtMs=${caseStartedAt}\n`);
@@ -111,7 +110,7 @@ async function nativeRamVolume(): Promise<void> {
   // (`__tests__/stand-in-cowshed.ts`). A handle this test marks foreign is a live job of another task's, answered by
   // `foreignAnswers` in turn, as the supervisor answers a caller that is not that job's member.
   const standIn = cowshedSubtreeOwner(
-    await standInCowshed(join(parent, 'supervisor'), { admission: 'admitted', retire: 'retire' }),
+    await standInCowshed(join(paths.root, 'supervisor'), { admission: 'admitted', retire: 'retire' }),
   );
   const foreignAnswers: SubtreeRetirement[] = [];
   const subtrees: SubtreeOwner = {
@@ -129,13 +128,13 @@ async function nativeRamVolume(): Promise<void> {
   };
   // A readonly directory outside every lease. Each lease links to it: removal must unlink the
   // link and never follow it, leaving this directory's mode and contents as they were.
-  const outside = join(parent, 'outside');
+  const outside = join(paths.root, 'outside');
   mkdirSync(outside);
   writeFileSync(join(outside, 'keep'), 'outside the lease');
   chmodSync(outside, 0o555);
   // The host's own commands, with one injectable image in the I/O Registry listing. The steps that
   // mount, unmount or place the volume are recorded in the order provisioning runs them.
-  const delegate = createHostCommands(undefined, gatewaySocket);
+  const delegate = createHostCommands(gatewaySocket);
   const host: HostCommands = {
     detachRam: delegate.detachRam,
     ownsRamDisk: (disk) => ownsRecordedDisk(owned, disk),
@@ -311,7 +310,7 @@ async function nativeRamVolume(): Promise<void> {
     expect(leaseA.mountpoint).toBe(paths.mountpoint);
     expect(leaseB.mountpoint).toBe(paths.mountpoint);
     expect(leaseA.directory).not.toBe(leaseB.directory);
-    expect(statSync(leaseA.directory).dev).not.toBe(statSync(parent).dev);
+    expect(statSync(leaseA.directory).dev).not.toBe(statSync(paths.root).dev);
     writeFileSync(join(leaseA.directory, 'scratch'), 'on RAM');
     readonlyTree(leaseA.directory);
     symlinkSync(outside, join(leaseA.directory, 'outside-link'));
@@ -320,7 +319,7 @@ async function nativeRamVolume(): Promise<void> {
     expect(await first.release(leaseA, false, subtrees)).toEqual({ ok: true, value: [] });
     expect(existsSync(leaseA.directory)).toBe(false);
     expectUntouched(outside);
-    expect(statSync(leaseB.directory).dev).not.toBe(statSync(parent).dev);
+    expect(statSync(leaseB.directory).dev).not.toBe(statSync(paths.root).dev);
 
     // The second task dies without releasing, with an image still attached from its lease: the
     // registry entry is injected, so the test spends no attach of its own. The next task keeps
@@ -360,7 +359,7 @@ async function nativeRamVolume(): Promise<void> {
     expectUntouched(outside);
     expect(await third.release(c.value.lease, false, subtrees)).toEqual({ ok: true, value: [] });
     expect(existsSync(c.value.lease.directory)).toBe(false);
-    expect(statSync(leaseB.directory).dev).not.toBe(statSync(parent).dev);
+    expect(statSync(leaseB.directory).dev).not.toBe(statSync(paths.root).dev);
     expect(statSync(join(leaseB.directory, 'tree')).mode & 0o777).toBe(0o555);
 
     // Once its owner has detached the image, the next task reclaims the lease, and its release,
@@ -377,7 +376,7 @@ async function nativeRamVolume(): Promise<void> {
     // per iteration filled this 64 MiB volume's metadata before the next acquire could make its lease (ENOSPC).
     attachedBelow.image = null;
     const writer = spawn('sh', ['-c', 'sleep 600 & echo $!; while :; do : > "$TMPDIR/w1"; done'], {
-      cwd: parent,
+      cwd: paths.root,
       env: { ...process.env, TMPDIR: leaseB.directory },
       detached: true,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -509,15 +508,14 @@ async function nativeRamVolume(): Promise<void> {
     expect(existsSync(paths.mountpoint)).toBe(false);
     expect(await attachedDisks(paths, capacity, gatewaySocket)).toEqual([]);
   } finally {
-    // Restore the owner write the outside directory was given, so the parent can be removed.
+    // Restore the owner write the outside directory was given, so the root can be removed.
     chmodSync(outside, 0o755);
     try {
       await detachOwned(owned, paths.uid, gatewaySocket);
     } finally {
       await stopGateway();
     }
-    removeScratchDirectories(paths);
-    rmSync(parent, { recursive: true, force: true });
+    removeScratchVolume(fixture);
   }
 }
 
@@ -549,9 +547,8 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
   process.stderr.write(`RAM provisioning case started in ${process.pid}\n`);
   const { injected, reported } = REAL_FAILING_STEP;
   const fixture = scratchVolume(2);
-  const { parent, paths, capacity, owned, gatewaySocket } = fixture;
-  expectFixtureVolume(paths, capacity);
-  const host = createHostCommands(undefined, gatewaySocket);
+  const { paths, capacity, owned, gatewaySocket } = fixture;
+  const host = createHostCommands(gatewaySocket);
   const calls: { file: string; args: readonly string[]; output: CommandOutput }[] = [];
   const commands: HostCommands = {
     ownsRamDisk: (disk) => ownsRecordedDisk(owned, disk),
@@ -683,8 +680,7 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
     } finally {
       await stopGateway();
     }
-    removeScratchDirectories(paths);
-    rmSync(parent, { recursive: true, force: true });
+    removeScratchVolume(fixture);
     trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-done' }));
   }
 }
@@ -779,7 +775,7 @@ async function aFailedStepRollsBackOnAStandIn(): Promise<void> {
       const root = join(parent, 'root');
       mkdirSync(root, { mode: 0o700 });
       const paths: RamTempPaths = {
-        ...ramTempPaths(userInfo()),
+        ...ramTempPaths(userInfo(), testNamespace(process.pid, 0)),
         root,
         mountpoint: join(root, 'ram'),
         staging: join(root, 'ram-new'),
@@ -810,8 +806,7 @@ async function aFailedStepRollsBackOnAStandIn(): Promise<void> {
  */
 async function aLeaseLostUnderItsTask(): Promise<void> {
   const fixture = scratchVolume(3);
-  const { parent, paths, capacity, owned, gatewaySocket } = fixture;
-  expectFixtureVolume(paths, capacity);
+  const { paths, capacity, owned, gatewaySocket } = fixture;
   const stopGateway = await startFixtureGateway(fixture);
   // The module attaches the disk through the fixture gateway and records it, so the teardown can detach it.
   const volume = fixtureRamVolume(fixture, undefined);
@@ -852,8 +847,7 @@ async function aLeaseLostUnderItsTask(): Promise<void> {
     }
     // Only once nothing is mounted there: the bare mountpoint, with the lease directory the write made again.
     rmSync(paths.mountpoint, { recursive: true, force: true });
-    removeScratchDirectories(paths);
-    rmSync(parent, { recursive: true, force: true });
+    removeScratchVolume(fixture);
   }
 }
 /** The non-Darwin executor owns no RAM disk: inherited and target-supplied temp directories stay with their owner. */

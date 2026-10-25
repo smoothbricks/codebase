@@ -68,13 +68,14 @@ fn await_detached(disk: &OwnedDisk) {
 async fn a_ram_detach_outlives_the_requester_that_asked_for_it() {
     // The test holds a namespace phase for as long as the requester lives; the gateway must not
     // evict it to the waiting detach meanwhile.
-    let (gateway, _root, socket) = gateway(DiskLeaseLimits {
+    let (gateway, root, socket) = gateway(DiskLeaseLimits {
         phase_bound: Duration::from_secs(600),
         ..DiskLeaseLimits::default()
     })
     .await;
+    let namespace = root.namespace();
     tokio::task::spawn_blocking(move || {
-        let mut disks = FixtureDisks::new(socket.clone());
+        let mut disks = FixtureDisks::new(namespace);
         let disk = disks.attach(fixture_sectors(0));
         let line = detach_line(&disk, disk.entry);
         let monitor = monitor(1);
@@ -126,9 +127,10 @@ async fn a_ram_detach_outlives_the_requester_that_asked_for_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ram_detach_refuses_an_entry_that_does_not_register_the_device() {
-    let (gateway, _root, socket) = gateway(DiskLeaseLimits::default()).await;
+    let (gateway, root, socket) = gateway(DiskLeaseLimits::default()).await;
+    let namespace = root.namespace();
     tokio::task::spawn_blocking(move || {
-        let mut disks = FixtureDisks::new(socket.clone());
+        let mut disks = FixtureDisks::new(namespace);
         let first = disks.attach(fixture_sectors(1));
         let second = disks.attach(fixture_sectors(2));
 

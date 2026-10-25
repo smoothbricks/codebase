@@ -983,6 +983,7 @@ mod journal_tests {
     use crate::storage::apfs::ApfsSubstrateConfig;
 
     fn swap_fixture() -> (PathBuf, DirectoryExecutionHost, BuildVolumeLayout) {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let root = std::env::temp_dir().join(format!(
             "cowshed-directory-journal-swap-{}",
             uuid::Uuid::new_v4().simple()
@@ -990,9 +991,12 @@ mod journal_tests {
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let store = root.join("store");
-        let host =
-            DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
-                .unwrap();
+        let host = DirectoryExecutionHost::new(ApfsSubstrateConfig::new(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            &store,
+            root.join("checkout"),
+        ))
+        .unwrap();
         let project = ProjectPaths::with_mount_root(
             &store,
             root.join("mnt"),
@@ -1128,6 +1132,7 @@ mod journal_tests {
     /// and the images directory) before the record goes, and frees none of it.
     #[test]
     fn the_build_journal_is_never_followed_through_a_link_and_a_retry_syncs_its_commit() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let root = std::env::temp_dir().join(format!(
             "cowshed-directory-build-journal-{}",
             uuid::Uuid::new_v4().simple()
@@ -1135,9 +1140,12 @@ mod journal_tests {
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let store = root.join("store");
-        let host =
-            DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
-                .unwrap();
+        let host = DirectoryExecutionHost::new(ApfsSubstrateConfig::new(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            &store,
+            root.join("checkout"),
+        ))
+        .unwrap();
         let project = ProjectPaths::with_mount_root(
             &store,
             root.join("mnt"),
@@ -1228,6 +1236,7 @@ mod detach_tests {
 
     #[test]
     fn claimed_build_detach_refuses_holders_and_preserves_payload_metadata_and_claim() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let root = std::env::temp_dir().join(format!(
             "cowshed-directory-build-detach-{}",
             uuid::Uuid::new_v4().simple()
@@ -1235,9 +1244,12 @@ mod detach_tests {
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let store = root.join("store");
-        let host =
-            DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
-                .unwrap();
+        let host = DirectoryExecutionHost::new(ApfsSubstrateConfig::new(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            &store,
+            root.join("checkout"),
+        ))
+        .unwrap();
         let project = ProjectPaths::with_mount_root(
             &store,
             root.join("mnt"),

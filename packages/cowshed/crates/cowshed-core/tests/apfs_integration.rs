@@ -6,9 +6,11 @@ mod macos;
 #[test]
 fn native_apfs_clone_refuses_a_host_without_clonefile() {
     use cowshed_apfs::{ApfsBackend, CloneFileError, MacOsApfsBackend, SystemCommandRunner};
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
     use std::path::Path;
 
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
+    let backend = MacOsApfsBackend::new(SystemCommandRunner::new(namespace));
     assert!(matches!(
         backend.clone_image(
             Path::new("/tmp/source.dmg"),

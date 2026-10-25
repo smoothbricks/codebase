@@ -34,6 +34,7 @@ mod kernel_unmount {
     /// All effects remain production effects. Only the held-root answer can be redirected to
     /// another disposable image, to prove the owner refuses it before any native unmount.
     struct WitnessedNativeUnmount {
+        system: SystemCommandRunner,
         foreign_root: PathBuf,
         substitute_root: AtomicBool,
         disk_arbitration_unmounts: AtomicUsize,
@@ -57,7 +58,7 @@ mod kernel_unmount {
     impl CommandRunner for WitnessedNativeUnmount {
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             self.observe_command(request);
-            SystemCommandRunner.run(request)
+            self.system.run(request)
         }
 
         fn run_guarded<E>(
@@ -69,15 +70,15 @@ mod kernel_unmount {
             E: From<CommandRunError> + std::fmt::Display,
         {
             self.observe_command(request);
-            SystemCommandRunner.run_guarded(request, check)
+            self.system.run_guarded(request, check)
         }
 
         fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
-            SystemCommandRunner.image_lease(identity)
+            self.system.image_lease(identity)
         }
 
         fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>> {
-            SystemCommandRunner.pin_raw_device(device)
+            self.system.pin_raw_device(device)
         }
 
         fn hold_mount(&self, mount_point: &Path) -> io::Result<HeldMount> {
@@ -86,7 +87,7 @@ mod kernel_unmount {
             } else {
                 mount_point
             };
-            SystemCommandRunner.hold_mount(root)
+            self.system.hold_mount(root)
         }
 
         fn unmount_guarded<E>(
@@ -98,7 +99,7 @@ mod kernel_unmount {
             E: From<NativeUnmountError> + std::fmt::Display,
         {
             let mut filesystem = None;
-            let effect = SystemCommandRunner.unmount_guarded::<E>(mode, || {
+            let effect = self.system.unmount_guarded::<E>(mode, || {
                 let root = prove()?;
                 filesystem = root.as_ref().map(OwnedVolumeRoot::filesystem_id);
                 Ok(root)
@@ -121,15 +122,15 @@ mod kernel_unmount {
         }
 
         fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
-            SystemCommandRunner.attached_disk_images()
+            self.system.attached_disk_images()
         }
 
         fn attachments_of(&self, image: &Path) -> io::Result<Vec<AttachedDiskImage>> {
-            SystemCommandRunner.attachments_of(image)
+            self.system.attachments_of(image)
         }
 
         fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
-            SystemCommandRunner.grow_image(image, capacity)
+            self.system.grow_image(image, capacity)
         }
     }
 
@@ -146,7 +147,7 @@ mod kernel_unmount {
         let foreign_mount = fixture.root().join("foreign-mount");
         fixture.blank_image(&image);
         fixture.blank_image(&foreign_image);
-        let system = MacOsApfsBackend::new(SystemCommandRunner);
+        let system = MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace()));
         let foreign = system
             .attach_mounted(
                 &foreign_image,
@@ -159,6 +160,7 @@ mod kernel_unmount {
         let foreign_id = foreign_root.filesystem_id();
         let foreign_name = cowshed_apfs::volume_name(&foreign_mount).expect("foreign name");
         let backend = MacOsApfsBackend::new(WitnessedNativeUnmount {
+            system: SystemCommandRunner::new(fixture.host_namespace()),
             foreign_root: foreign_mount.clone(),
             substitute_root: AtomicBool::new(false),
             disk_arbitration_unmounts: AtomicUsize::new(0),
@@ -206,14 +208,17 @@ mod kernel_unmount {
                 .is_empty()
         );
 
+        let label = fixture
+            .host_namespace()
+            .volume_label(format_args!("kernel-unmount fixture"));
         backend
-            .rename_volume(&owned, &mount, "[cowshed] kernel-unmount fixture")
+            .rename_volume(&owned, &mount, &label)
             .expect("event-only held root retains descriptor-native naming");
         assert_eq!(
             cowshed_apfs::volume_name(&mount)
                 .expect("owned name readback")
                 .to_string_lossy(),
-            "[cowshed] kernel-unmount fixture"
+            label.as_str()
         );
         assert_eq!(
             hold_mount(&mount)

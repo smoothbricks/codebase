@@ -36,7 +36,7 @@ import {
   type TokenGrant,
   wallClock,
 } from './cpu-tokens.js';
-import type { InstallRestart } from './gateway-lease.js';
+import { GATEWAY_SOCKET, type InstallRestart } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { LockWait } from './lock-wait.js';
@@ -57,6 +57,7 @@ import {
   describeRamTempError,
   describeSignalled,
   LEFTOVER_GRACE_MS,
+  PRODUCTION,
   RAM_TEMP_CAPACITY_BYTES,
   type RamTempLease,
   RamTempVolume,
@@ -206,36 +207,43 @@ export default function boundedExecExecutor(
 
 /**
  * Runs with the normal process, RAM lease and CPU-budget owners, with an optional stdout sink, on the user's RAM temp
- * volume where there is one: the Nx executor's runs, never a test's.
+ * volume where there is one, through the host's own gateway: the Nx executor's runs, never a test's.
  */
 export function runDefaultBoundedExec(
   options: BoundedExecOptions,
   context: BoundedExecContext,
 ): Promise<BoundedExecResult> {
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
-  return runBoundedExecWith(options, context, (cowshed) =>
-    process.platform === 'darwin'
-      ? new RamTempVolume(
-          ramTempPaths(userInfo()),
-          RAM_TEMP_CAPACITY_BYTES,
-          createHostCommands(undefined, undefined, undefined, cowshed),
-          undefined,
-          undefined,
-          'optional',
-        )
-      : null,
+  return runBoundedExecWith(
+    options,
+    context,
+    (cowshed) =>
+      process.platform === 'darwin'
+        ? new RamTempVolume(
+            ramTempPaths(userInfo(), PRODUCTION),
+            RAM_TEMP_CAPACITY_BYTES,
+            createHostCommands(GATEWAY_SOCKET, undefined, undefined, cowshed),
+            undefined,
+            undefined,
+            'optional',
+          )
+        : null,
+    GATEWAY_SOCKET,
   );
 }
 
 /**
- * The default runner with every owner but its RAM volume, which `volume` makes for the cowshed the run's disk commands go
- * through: a host proof passes a fixture volume of its own (`fixtureRamVolume`), so no test leases, creates or detaches
- * the user's.
+ * The default runner with every owner but its RAM volume and the gateway its CPU budget asks, which its caller names:
+ * `volume` makes the volume for the cowshed the run's disk commands go through, and `gatewaySocket` is the gateway the
+ * run takes its CPU tokens from. The Nx executor names the host's own; a host proof passes a fixture volume
+ * (`fixtureRamVolume`) and the control socket of its fixture gateway, so no test leases, creates or detaches the user's
+ * volume, or takes tokens from the user's gateway.
  */
 export function runBoundedExecWith(
   options: BoundedExecOptions,
   context: BoundedExecContext,
   volume: (cowshed: string | undefined) => TempVolume | null,
+  gatewaySocket: string,
 ): Promise<BoundedExecResult> {
   // A target that names the cowshed its disk commands run through names it for this run's own RAM volume work and
   // for its command alike. Nx resolves `{workspaceRoot}/…` in an option to a workspace-relative path, which the
@@ -262,7 +270,7 @@ export function runBoundedExecWith(
     context,
     createProcessTreeKiller(),
     tempVolume,
-    gatewayCpuBudget(),
+    gatewayCpuBudget(gatewaySocket),
     inherited,
     captureHangDiagnostics,
     wallClock,

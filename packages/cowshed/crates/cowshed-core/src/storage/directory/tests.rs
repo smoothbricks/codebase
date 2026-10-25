@@ -166,7 +166,9 @@ pub(crate) fn published_directory(
 ) {
     use super::*;
     use crate::metadata::{GrantSet, PortBlock};
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
     let config = ApfsSubstrateConfig::new(
+        HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
         scratch.path().join("store"),
         scratch.path().join("checkout"),
     );
@@ -1115,6 +1117,8 @@ fn host_controller_recovery_refuses_a_mounted_temp_subtree_and_keeps_the_image()
     use crate::error::ErrorCode;
     use crate::storage::recovery_image::{MANIFEST_FILE, recover};
     use cowshed_apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
+    let namespace = TestNamespace::mint().expect("a test namespace");
 
     fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         let mut files = Vec::new();
@@ -1157,10 +1161,10 @@ fn host_controller_recovery_refuses_a_mounted_temp_subtree_and_keeps_the_image()
         .path()
         .join("mounted")
         .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
-    crate::blank_image::blank_image(&mount_image);
+    crate::blank_image::blank_image(namespace, &mount_image);
     let mount = exec_temp.join("mounted");
     fs::create_dir_all(&mount).unwrap();
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(namespace)));
     let attachment = backend
         .attach_mounted(&mount_image, &mount, MountAccess::ReadWrite, false)
         .unwrap();
@@ -1251,6 +1255,8 @@ fn host_controller_recovery_refuses_a_mounted_temp_root_and_keeps_the_image() {
     use crate::error::ErrorCode;
     use crate::storage::recovery_image::{MANIFEST_FILE, recover};
     use cowshed_apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
+    let namespace = TestNamespace::mint().expect("a test namespace");
 
     fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         let mut files = Vec::new();
@@ -1292,8 +1298,8 @@ fn host_controller_recovery_refuses_a_mounted_temp_root_and_keeps_the_image() {
         .path()
         .join("root-volume")
         .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
-    crate::blank_image::blank_image(&mount_image);
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    crate::blank_image::blank_image(namespace, &mount_image);
+    let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(namespace)));
     let attachment = backend
         .attach_mounted(&mount_image, &exec_temp, MountAccess::ReadWrite, false)
         .unwrap();

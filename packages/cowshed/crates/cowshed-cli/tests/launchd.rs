@@ -9,14 +9,14 @@ use cowshed_apfs::image::ImageCapacity;
 use cowshed_cli::launchd::{
     BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, CommandStatus, ControlAction,
     ControlExecutionError, ControlPlan, DevenvProfile, ExecutableDigest, ExecutableInstallState,
-    ExistingPlist, FilesystemOperation, GATEWAY_LABEL, HostStableExecutable, InstallOutcome,
-    InstallState, InstalledExecutable, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand,
-    LaunchctlOutput, LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus,
-    Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME,
-    SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram,
-    plan_cargo_link_removal, plan_executable_install, plan_executable_remove, plan_install,
-    plan_remove, replace_symlink,
+    ExistingPlist, FilesystemOperation, HostStableExecutable, InstallOutcome, InstallState,
+    InstalledExecutable, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput,
+    LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, Mutation,
+    NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME,
+    STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram, plan_cargo_link_removal,
+    plan_executable_install, plan_executable_remove, plan_install, plan_remove, replace_symlink,
 };
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 #[cfg(target_os = "macos")]
 use cowshed_apfs::{
@@ -55,7 +55,7 @@ fn bun() -> BunDirectory {
 }
 
 fn gateway() -> LaunchAgentSpec {
-    LaunchAgentSpec::gateway(&cowshed_binary(), &bun()).unwrap()
+    LaunchAgentSpec::gateway(HostNamespace::Production, &cowshed_binary(), &bun()).unwrap()
 }
 
 fn sccache_program() -> StoreBackedProgram {
@@ -72,7 +72,7 @@ fn sccache_program() -> StoreBackedProgram {
 fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
     let spec = gateway();
 
-    assert_eq!(spec.label(), GATEWAY_LABEL);
+    assert_eq!(spec.label(), "dev.cowshed.gateway");
     assert_eq!(spec.executable(), Path::new(EXECUTABLE));
     assert_eq!(spec.arguments(), ["gateway", "run"]);
     assert_eq!(spec.lifecycle(), ServiceLifecycle::KeepAlive);
@@ -255,6 +255,7 @@ fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
 #[test]
 fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     let spec = LaunchAgentSpec::sccache(
+        HostNamespace::Production,
         &sccache_program(),
         Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
         Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
@@ -263,7 +264,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     )
     .unwrap();
 
-    assert_eq!(spec.label(), SCCACHE_LABEL);
+    assert_eq!(spec.label(), "dev.cowshed.sccache");
     assert_eq!(spec.arguments(), [] as [String; 0]);
     assert_eq!(spec.lifecycle(), ServiceLifecycle::KeepAlive);
     assert_eq!(
@@ -355,6 +356,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     // Socket and cache paths are validated like every other launchd path.
     assert!(matches!(
         LaunchAgentSpec::sccache(
+            HostNamespace::Production,
             &sccache_program(),
             Path::new("relative.sock"),
             Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
@@ -363,6 +365,44 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         ),
         Err(LaunchdError::InvalidPath { .. })
     ));
+}
+
+/// A test namespace's agents are its own: both labels, both plist paths and both plists' `Label`
+/// name the namespace, and nothing in either names production's (01_storage.md, "Host
+/// namespace").
+#[test]
+fn a_test_namespaces_agents_are_labelled_by_it_and_never_by_production() {
+    let namespace = TestNamespace::mint().expect("a test namespace");
+    let gateway =
+        LaunchAgentSpec::gateway(HostNamespace::Test(namespace), &cowshed_binary(), &bun())
+            .unwrap();
+    let sccache = LaunchAgentSpec::sccache(
+        HostNamespace::Test(namespace),
+        &sccache_program(),
+        Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
+        Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
+        ImageCapacity::from_gibibytes(40),
+        Path::new("/Users/cowshed-test/.cowshed"),
+    )
+    .unwrap();
+
+    for (spec, service) in [(&gateway, "gateway"), (&sccache, "sccache")] {
+        let label = format!("dev.cowshed-test-{namespace}.{service}");
+        assert_eq!(spec.label(), label);
+        assert_eq!(
+            spec.plist_path(),
+            PathBuf::from(format!("{HOME}/Library/LaunchAgents/{label}.plist"))
+        );
+        let plist = String::from_utf8(spec.plist_bytes()).unwrap();
+        assert!(
+            plist.contains(&format!("  <key>Label</key>\n  <string>{label}</string>\n")),
+            "{plist}"
+        );
+        assert!(
+            !plist.contains(&format!("dev.cowshed.{service}")),
+            "no part of a test namespace's definition names production's agent: {plist}"
+        );
+    }
 }
 
 #[test]
@@ -1144,8 +1184,9 @@ fn each_agent_plist_names_only_the_program_its_type_can_prove() {
     );
 
     let specs = [
-        LaunchAgentSpec::gateway(&cowshed, &bun()).unwrap(),
+        LaunchAgentSpec::gateway(HostNamespace::Production, &cowshed, &bun()).unwrap(),
         LaunchAgentSpec::sccache(
+            HostNamespace::Production,
             &sccache,
             Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
             Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
@@ -1707,7 +1748,10 @@ mod descriptor_inheritance {
         // The host harness deliberately has a long TMPDIR. Use the same short owned root as
         // native CLI socket fixtures rather than deriving a Unix-socket path from that directory.
         let scratch = scratch_apfs::ScratchRoot::new("cli-fd").expect("short descriptor fixture");
-        let label = format!("dev.cowshed.descriptors.{}", std::process::id());
+        // The probe is isolated by its scratch root's namespace: the generated gateway definition
+        // carries that namespace's label, never production's.
+        let namespace = HostNamespace::Test(scratch.namespace());
+        let label = namespace.launchd_label("gateway");
         // SAFETY: geteuid has no preconditions.
         let domain = format!("gui/{}", unsafe { libc::geteuid() });
         let mut agent = Agent {
@@ -1718,8 +1762,8 @@ mod descriptor_inheritance {
         let root = agent._scratch.path();
         let executable =
             HostStableExecutable::new(root, COWSHED_BINARY_NAME).expect("probe program");
-        let spec =
-            LaunchAgentSpec::gateway(&executable, &bun()).expect("generated gateway definition");
+        let spec = LaunchAgentSpec::gateway(namespace, &executable, &bun())
+            .expect("generated gateway definition");
         fs::create_dir_all(executable.path().parent().expect("binary directory"))
             .expect("binary directory");
         fs::create_dir_all(spec.standard_error_path().parent().expect("log directory"))
@@ -1737,14 +1781,11 @@ mod descriptor_inheritance {
             fs::Permissions::from_mode(STABLE_BINARY_MODE),
         )
         .expect("executable mode");
-        // The service is isolated by label and is one-shot so it cannot restart a successful
-        // probe. All generated resource-limit bytes remain exactly as the gateway writes them.
+        // The service is isolated by its namespace's label and is one-shot so it cannot restart a
+        // successful probe. All generated resource-limit bytes remain exactly as the gateway
+        // writes them.
         let plist = String::from_utf8(spec.plist_bytes())
             .expect("UTF-8 plist")
-            .replace(
-                &format!("<string>{GATEWAY_LABEL}</string>"),
-                &format!("<string>{label}</string>"),
-            )
             .replace(
                 "<key>KeepAlive</key>\n  <true/>",
                 "<key>KeepAlive</key>\n  <false/>",

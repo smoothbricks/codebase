@@ -557,11 +557,14 @@ fn host_roots_never_enter_a_bounded_exec_ram_lease() {
         "/private/var/folders/cowshed/4242/ram3-new",
         // Another revision's checkout mounts beside it, never on one directory.
         "/private/var/folders/cowshed/4242/ram4/12345-aBcDeF",
-        // Revisions 1-2 mounted by volume name; fixtures still mount by name under t.
+        // A test namespace's directory in the per-user root holds its own RAM volume at the same
+        // leaf, at any depth below it.
+        "/private/var/folders/cowshed/4242/0214h03/ram3",
+        "/private/var/folders/cowshed/4242/0214h03/ram3-new",
+        "/private/var/folders/cowshed/4242/0214h03/ram3/12345-aBcDeF",
+        // Revisions 1-2 mounted by volume name.
         "/Volumes/smoo-ram2-4242/12345-aBcDeF",
         "/Volumes/smoo-ram-4242/12345-aBcDeF",
-        "/private/var/folders/cowshed/4242/t/smoo-ram-test-31736-0/12345-aBcDeF",
-        "/private/var/folders/cowshed/4242/t/smoo-ram-test-31736-0-new",
     ] {
         assert_eq!(
             host_roots(PathBuf::from(temp)),
@@ -587,6 +590,13 @@ fn host_roots_still_sweep_non_ram_temp_roots_with_ram_shaped_names() {
         "/tmp/smoo-ram-notes/temp",
         "/Volumes/other-volume/ram3/lease",
         "/private/var/folders/ab/cdef/T",
+        // A namespace's directory holds a RAM volume only at its ram<revision> leaf, and a name
+        // that is not a namespace's (it starts with a letter) holds none.
+        "/private/var/folders/cowshed/4242/0214h03/t",
+        "/private/var/folders/cowshed/4242/abcdefg/ram3",
+        // The shape the fixtures' RAM volumes had, mounted by name below t, is no RAM slot.
+        "/private/var/folders/cowshed/4242/t/smoo-ram-test-31736-0/12345-aBcDeF",
+        "/private/var/folders/cowshed/4242/t/smoo-ram-test-31736-0-new",
     ] {
         assert_eq!(
             host_roots(PathBuf::from(temp)),

@@ -1103,7 +1103,7 @@ impl ProjectRuntime {
                 storage,
                 |config| {
                     crate::storage::apfs::native::MacOsApfsExecutionHost::new(
-                        cowshed_apfs::SystemCommandRunner,
+                        cowshed_apfs::SystemCommandRunner::new(config.namespace),
                         config,
                     )
                 },
@@ -3884,7 +3884,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 )
             })?;
         }
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(storage.store(), &git_root);
+        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
+            storage.namespace(),
+            storage.store(),
+            &git_root,
+        );
         let host = host_factory(config.clone()).map_err(native_storage_error)?;
         let lifecycle_intents_path = layout
             .project()
@@ -9251,8 +9255,16 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         .map_err(native_integrity_error)?
                         .image()
                         .to_owned(),
-                    workspace: crate::storage::apfs::volume_label(&self.descriptor.repo_id, name),
-                    build: crate::storage::apfs::build_volume_label(&self.descriptor.repo_id, name),
+                    workspace: crate::storage::apfs::volume_label(
+                        self.descriptor.storage.namespace(),
+                        &self.descriptor.repo_id,
+                        name,
+                    ),
+                    build: crate::storage::apfs::build_volume_label(
+                        self.descriptor.storage.namespace(),
+                        &self.descriptor.repo_id,
+                        name,
+                    ),
                     labeller: std::sync::Arc::new(ApfsLabeller(self.substrate.shared_host())),
                 })
             } else {
@@ -9262,7 +9274,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             job_sampling: super::supervisor::JobSamplingPolicy::default(),
             // Every job's command spawns under a grant from this host's gateway CPU budget.
             cpu: std::sync::Arc::new(super::job_cpu::GatewayJobCpu::new(
-                self.descriptor.storage.store().join("gateway.sock"),
+                self.descriptor.storage.control_socket(),
             )),
             // A job's end releases the volume it held when an adoption or reseed superseded it
             // while the job ran: inside this controller, awaited before the job is told ended,
@@ -13578,7 +13590,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .host()
                 .label_image_volume(
                     &main_image,
-                    &crate::storage::apfs::volume_label(&self.descriptor.repo_id, &main_name()),
+                    &crate::storage::apfs::volume_label(
+                        self.descriptor.storage.namespace(),
+                        &self.descriptor.repo_id,
+                        &main_name(),
+                    ),
                 )
                 .map_err(native_storage_error)?;
             require_named_after_mount(named, &main_image)?;
@@ -21035,6 +21051,7 @@ mod retired_recovery_tests {
     use crate::metadata::{
         DetachedWorkspaceMetadata, GrantSet, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
     };
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
     #[test]
     fn retired_trash_is_a_verified_restart_baseline_fact() {
@@ -21327,7 +21344,12 @@ mod retired_recovery_tests {
         }
         .write_for_image(&image)
         .unwrap();
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(&root, root.join("checkout"));
+        let namespace = TestNamespace::mint().expect("a test namespace");
+        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
+            HostNamespace::Test(namespace),
+            &root,
+            root.join("checkout"),
+        );
         let mut commitments = super::super::supervisor::CommitmentPublisher::open(
             root.join("telemetry"),
             crate::storage::audit::ContinuityAudit::Off,
@@ -21394,7 +21416,12 @@ mod retired_recovery_tests {
         let companion = crate::metadata::append_suffix(&image, ".ca.key");
         std::fs::write(&image, b"retired image").unwrap();
         std::fs::write(&companion, b"retired CA key").unwrap();
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(&root, root.join("checkout"));
+        let namespace = TestNamespace::mint().expect("a test namespace");
+        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
+            HostNamespace::Test(namespace),
+            &root,
+            root.join("checkout"),
+        );
         let mut commitments = super::super::supervisor::CommitmentPublisher::open(
             root.join("telemetry"),
             crate::storage::audit::ContinuityAudit::Off,
@@ -25625,6 +25652,7 @@ mod port_reservation_tests {
     use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;
     use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
+    use cowshed_os::namespace::TestNamespace;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
@@ -25636,7 +25664,10 @@ mod port_reservation_tests {
     }
 
     fn inventory(root: &std::path::Path) -> (NativeGatewayInventory, StorageLayout) {
-        let roots = CanonicalRoots::at(root.join("store"));
+        let roots = CanonicalRoots::fixture(
+            TestNamespace::mint().expect("a test namespace"),
+            root.join("store"),
+        );
         std::fs::create_dir_all(roots.store()).expect("store");
         let repo = RepoId::parse("acme/widget").expect("repo");
         let layout = StorageLayout::new(roots.store(), &repo).expect("layout");
@@ -26052,7 +26083,10 @@ mod port_reservation_tests {
         let inventory = NativeGatewayInventory::new(ValidatedHostStorage::new(
             home,
             Vec::new(),
-            CanonicalRoots::at(fixture.store().to_owned()),
+            CanonicalRoots::fixture(
+                TestNamespace::mint().expect("a test namespace"),
+                fixture.store().to_owned(),
+            ),
         ));
         let staging = fixture.store().join(".staging");
 
@@ -27512,6 +27546,7 @@ mod volume_labeller_tests {
     use crate::storage::apfs::native::{MacOsApfsExecutionHost, SystemKernelMountSource};
     use cowshed_apfs::{AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError};
     use cowshed_os::fork_lock::Fenced;
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
     /// Records every disk command instead of running it, and reports no image attached.
     #[derive(Clone, Default)]
@@ -27581,10 +27616,11 @@ mod volume_labeller_tests {
         ));
         let store = root.join("store");
         std::fs::create_dir_all(&store).expect("the store root");
+        let namespace = TestNamespace::mint().expect("a test namespace");
         let runner = RecordedDiskCommands::default();
         let host = MacOsApfsExecutionHost::with_mount_source(
             runner.clone(),
-            ApfsSubstrateConfig::new(&store, root.join("mnt")),
+            ApfsSubstrateConfig::new(HostNamespace::Test(namespace), &store, root.join("mnt")),
             SystemKernelMountSource,
         )
         .expect("native APFS host");
@@ -27605,15 +27641,16 @@ mod volume_labeller_tests {
             .join("intents")
             .join("slotted");
         std::fs::create_dir_all(&refused).expect("an empty mountpoint on the host volume");
-        let label = "[cowshed] fixture · intents — slotted";
+        let label = HostNamespace::Test(namespace)
+            .volume_label(format_args!("fixture · intents — slotted"));
 
-        let named = labeller.ensure_label(&slotted, label);
+        let named = labeller.ensure_label(&slotted, &label);
         let foreign = [
             refused.as_path(),
             Path::new("/System/Volumes/Preboot"),
             Path::new("/System/Volumes/Data"),
         ]
-        .map(|path| labeller.ensure_label(path, label).is_err());
+        .map(|path| labeller.ensure_label(path, &label).is_err());
         std::fs::remove_dir_all(&root).expect("remove the fixture");
 
         assert_eq!(

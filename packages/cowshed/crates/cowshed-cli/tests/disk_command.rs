@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 
 use cowshed_apfs::{CommandRequest, CommandRunner, ProcessStatus, SystemCommandRunner};
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 /// The `cowshed` binary under test, read when the test runs (see `output_contracts.rs`).
 fn cowshed() -> PathBuf {
@@ -45,7 +46,12 @@ fn hdiutil_info_answers_through_the_facade() {
 #[test]
 fn a_failing_tool_passes_its_own_status_and_bytes_through() {
     let argv = ["info", "cowshed-disk-command-no-such-disk"];
-    let expected = SystemCommandRunner
+    // This test's own runner is a test namespace's: its disk lease is that namespace's, never
+    // production's.
+    let runner = SystemCommandRunner::new(HostNamespace::Test(
+        TestNamespace::mint().expect("a test namespace"),
+    ));
+    let expected = runner
         .run(&CommandRequest::new("/usr/sbin/diskutil", argv))
         .expect("the runner answers diskutil");
     let ProcessStatus::Exit(code) = expected.status else {

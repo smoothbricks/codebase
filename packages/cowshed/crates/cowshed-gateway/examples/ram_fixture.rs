@@ -1,9 +1,16 @@
 //! A real, private gateway for the TypeScript RAM-disk fixtures.
 //!
 //! Build with cargo build -p cowshed-gateway --example ram_fixture, then run
-//! ram_fixture <absolute secure-owned-root>. The caller creates that real directory with mode
-//! 0700, keeps stdin open, and waits for the single stdout readiness line:
-//! {"socket":"<root>/gateway.sock"}. Readiness follows the gateway's successful bind.
+//! ram_fixture <test-namespace>: the seven-character spelling of the caller's own test namespace
+//! (`TestNamespace::mint`, specs/cowshed/01_storage.md, "Host namespace"). Anything else is
+//! refused, and no argument names a path: the fixture's root is the namespace's directory below the
+//! per-user root, /private/var/folders/cowshed/<euid>/<test-namespace>
+//! (`HostNamespace::macos_user_root`, on whatever OS runs the helper), so neither it nor its
+//! socket can be production's (specs/cowshed/08_testing.md, "Fixtures"). The caller creates that
+//! real directory with mode 0700, keeps stdin open, and waits for the single stdout readiness
+//! line: {"socket":"<root>/gateway.sock"}. Readiness follows the gateway's successful bind. The RAM
+//! disk runner is built from the same namespace, so its disk lease (`lease_socket`) is that socket:
+//! the helper's attaches and detaches take their lease from this gateway and no other.
 //!
 //! The caller owns every requested disk and must detach only its recorded registry identities,
 //! through this gateway's `ram-detach` of each exact whole disk and entry, before closing stdin.
@@ -29,7 +36,7 @@ use cowshed_gateway::{
     CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
-use cowshed_gateway_types::control_socket_path;
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use serde::Serialize;
 
 struct NoCredentials;
@@ -73,16 +80,30 @@ impl AuditSink for DiscardAudit {
     }
 }
 
-fn fixture_root() -> Result<PathBuf, String> {
+/// The test namespace the one argument spells: the caller's own, seven lowercase base-36 characters,
+/// and nothing else.
+fn fixture_namespace() -> Result<TestNamespace, String> {
     let mut arguments = std::env::args_os().skip(1);
-    let (Some(root), None) = (arguments.next(), arguments.next()) else {
-        return Err("usage: ram_fixture <absolute secure-owned-root>".to_owned());
+    let (Some(argument), None) = (arguments.next(), arguments.next()) else {
+        return Err("usage: ram_fixture <test-namespace>".to_owned());
     };
-    // Strip trailing separators and dots before lstat: neither may hide a symlink leaf.
-    let root: PathBuf = Path::new(&root).components().collect();
-    if !root.is_absolute() {
-        return Err(format!("fixture root {} must be absolute", root.display()));
-    }
+    argument
+        .to_str()
+        .and_then(TestNamespace::parse)
+        .ok_or_else(|| {
+            format!(
+                "{argument:?} is not a test namespace: {} lowercase base-36 characters, the first a digit",
+                TestNamespace::LEN
+            )
+        })
+}
+
+/// The root of `namespace`, `HostNamespace::macos_user_root` of this euid, which the caller made as
+/// a real directory this euid owns with mode 0700.
+fn fixture_root(namespace: TestNamespace) -> Result<PathBuf, String> {
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let root = HostNamespace::Test(namespace).macos_user_root(uid);
     let metadata = fs::symlink_metadata(&root)
         .map_err(|error| format!("lstat fixture root {}: {error}", root.display()))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -91,8 +112,6 @@ fn fixture_root() -> Result<PathBuf, String> {
             root.display()
         ));
     }
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
     if metadata.uid() != uid {
         return Err(format!(
             "fixture root {} belongs to uid {}, not effective uid {uid}",
@@ -112,18 +131,6 @@ fn fixture_root() -> Result<PathBuf, String> {
 
 fn fixture_socket(root: &Path) -> Result<PathBuf, String> {
     let socket = root.join("gateway.sock");
-    // Resolve only for the production identity check. Bind the caller's original short path;
-    // its granted scratch parent may be an alias for a longer workspace runtime directory.
-    let resolved = fs::canonicalize(root)
-        .map_err(|error| format!("resolve fixture root {}: {error}", root.display()))?
-        .join("gateway.sock");
-    let production = control_socket_path();
-    if socket == production || resolved == production {
-        return Err(format!(
-            "refusing production gateway socket {}",
-            production.display()
-        ));
-    }
     SocketAddr::from_pathname(&socket)
         .map_err(|error| format!("invalid fixture socket path {}: {error}", socket.display()))?;
     if socket.to_str().is_none() {
@@ -161,7 +168,8 @@ fn ready(socket: &Path) -> Result<(), String> {
 }
 
 async fn run() -> Result<(), String> {
-    let root = fixture_root()?;
+    let namespace = fixture_namespace()?;
+    let root = fixture_root(namespace)?;
     let socket = fixture_socket(&root)?;
     let cache = root.join("cache");
     fs::DirBuilder::new()
@@ -173,7 +181,9 @@ async fn run() -> Result<(), String> {
             control_socket: Some(socket.clone()),
             mirror_cache: MirrorCacheConfig::new(cache),
             #[cfg(target_os = "macos")]
-            ram_disks: Some(Arc::new(SystemRamDisks::new(socket.clone()))),
+            ram_disks: Some(Arc::new(SystemRamDisks::new(HostNamespace::Test(
+                namespace,
+            )))),
             ..GatewayConfig::default()
         },
         Arc::new(NoCredentials),

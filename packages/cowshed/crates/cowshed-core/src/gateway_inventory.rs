@@ -306,7 +306,7 @@ impl InventorySource for NativeInventorySource {
                 .join(UNRESOLVED_CHECKOUT_PATH),
         );
         // One host for the complete pass, not a mount-registry thread per captured image.
-        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config)?;
+        let host = MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config)?;
         let published = host.list(repo)?;
         let mut records = Vec::with_capacity(published.len());
         for fact in published {
@@ -327,7 +327,7 @@ impl InventorySource for NativeInventorySource {
         let (layout, config) = project_layout_and_config(storage, repo)?;
         let captured = SystemKernelMountSource.mounts()?;
         let host = MacOsApfsExecutionHost::with_mount_source(
-            SystemCommandRunner,
+            SystemCommandRunner::new(config.namespace),
             config.clone(),
             CapturedKernelMountSource {
                 mounts: captured.clone(),
@@ -374,7 +374,7 @@ impl InventorySource for NativeInventorySource {
         });
         let mount = workspace_mountpoint(&layout, &checkout, workspace)?;
         let host = MacOsApfsExecutionHost::new(
-            SystemCommandRunner,
+            SystemCommandRunner::new(storage.namespace()),
             project_substrate_config(storage, checkout),
         )?;
         Ok(host
@@ -495,7 +495,7 @@ fn project_substrate_config(
     storage: &ValidatedHostStorage,
     checkout_path: PathBuf,
 ) -> ApfsSubstrateConfig {
-    ApfsSubstrateConfig::new(storage.store(), checkout_path)
+    ApfsSubstrateConfig::new(storage.namespace(), storage.store(), checkout_path)
 }
 
 /// One project's mount side, opened once and mounting nothing on its own.
@@ -556,7 +556,10 @@ impl HealSource for NativeHealSource {
             }
         })?;
         let config = project_substrate_config(storage, checkout_path);
-        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
+        let host = MacOsApfsExecutionHost::new(
+            SystemCommandRunner::new(config.namespace),
+            config.clone(),
+        )?;
         Ok(Arc::new(NativeProjectMounts {
             repo: repo.clone(),
             substrate: ApfsSubstrate::new(config, host),
@@ -2741,6 +2744,7 @@ mod tests {
     use crate::storage::bootstrap::CanonicalRoots;
     use crate::storage::lifecycle::{KernelMountFact, LifecycleWorkspace, Pin, Revision};
     use crate::workspace_credentials::mint_workspace_credentials;
+    use cowshed_os::namespace::TestNamespace;
 
     use super::*;
 
@@ -2896,7 +2900,10 @@ mod tests {
             ));
             let home = root.join("home");
             fs::create_dir_all(&home).expect("fixture home");
-            let roots = CanonicalRoots::at(root.join("store"));
+            let roots = CanonicalRoots::fixture(
+                TestNamespace::mint().expect("a test namespace"),
+                root.join("store"),
+            );
             fs::create_dir_all(roots.store()).expect("fixture store");
             fs::create_dir_all(roots.telemetry()).expect("fixture telemetry");
             Self {

@@ -44,11 +44,11 @@ use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::bootstrap::{
-    CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
-    HostSetupReport, HostUninstallPlan, RETIRED_CACHES_MOUNTPOINT, UninstallFstabOutcome,
-    UninstallReport, UninstallServiceOutcome, VOLUME_MARKER_FILE, VolumeOutcome, VolumeState,
-    execute_host_setup, execute_host_uninstall, main_cowshed_config, plan_host_setup,
-    plan_host_uninstall,
+    CachesVolume, CanonicalRoots, FstabOutcome, HostAction, HostActionOutcome, HostActionResult,
+    HostSetupPlan, HostSetupReport, HostUninstallPlan, RETIRED_CACHES_MOUNTPOINT,
+    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VOLUME_MARKER_FILE,
+    VolumeOutcome, VolumeState, execute_host_setup, execute_host_uninstall, main_cowshed_config,
+    plan_host_setup, plan_host_uninstall,
 };
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
@@ -317,10 +317,12 @@ pub trait HostSetup: Send {
     }
 }
 
-/// The real host, rooted at the canonical home every other host verb resolves, and the install
-/// slot this setup holds for its whole run.
+/// The real host, rooted at the canonical home every other host verb resolves and at the
+/// canonical roots ([`CanonicalRoots::global`]) whose namespace names its agents and whose store
+/// holds its gateway's control socket, and the install slot this setup holds for its whole run.
 pub struct NativeHostSetup {
     home: PathBuf,
+    roots: CanonicalRoots,
     slot: InstallSlot,
     /// Whether this run may install a build that does not contain the installed cowshed.
     downgrade: Downgrade,
@@ -330,6 +332,7 @@ impl NativeHostSetup {
     pub fn for_canonical_home(slot: InstallSlot, downgrade: Downgrade) -> Result<Self> {
         Ok(Self {
             home: canonical_home()?,
+            roots: CanonicalRoots::global(),
             slot,
             downgrade,
         })
@@ -355,12 +358,15 @@ impl HostSetup for NativeHostSetup {
     }
 
     async fn refresh_host_services(&mut self) -> Result<Vec<ServiceBinaryRefresh>> {
-        Ok(
-            crate::gateway_service::refresh_gateway_binary(&self.slot, &self.home, self.downgrade)
-                .await?
-                .into_iter()
-                .collect(),
+        Ok(crate::gateway_service::refresh_gateway_binary(
+            &self.slot,
+            &self.roots,
+            &self.home,
+            self.downgrade,
         )
+        .await?
+        .into_iter()
+        .collect())
     }
 
     async fn install_cli(&mut self) -> Result<Option<CliInstall>> {
@@ -547,8 +553,10 @@ impl HostSetup for NativeHostSetup {
     /// Releasing the root is all teardown does about sccache's binary: the store path itself is
     /// nix's to reclaim, and deleting anything under `/nix/store` is not cowshed's business.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>> {
-        let (gateway_binary, gateway_agent) = gateway_launch_agent(&self.home)?;
-        let (sccache_agent, sccache_root, sccache_socket) = sccache_launch_agent(&self.home)?;
+        let namespace = self.roots.namespace();
+        let (gateway_binary, gateway_agent) = gateway_launch_agent(namespace, &self.home)?;
+        let (sccache_agent, sccache_root, sccache_socket) =
+            sccache_launch_agent(namespace, &self.home)?;
         let removals = vec![
             HostArtifactRemoval::new(
                 format!("{} agent", gateway_agent.label()),
@@ -629,14 +637,14 @@ impl HostSetup for NativeHostSetup {
         let owners = plan.owners();
         let gateway = owners.contains(&Owner::Gateway);
         let sccache_running = owners.contains(&Owner::Sccache)
-            && crate::capabilities::sccache::service::service_status()
+            && crate::capabilities::sccache::service::service_status(self.roots.namespace())
                 .await
                 .is_ok_and(|status| status.running);
         if gateway {
-            crate::gateway_service::stop_for_host_move(&self.slot).await?;
+            crate::gateway_service::stop_for_host_move(&self.slot, &self.roots).await?;
         }
         if sccache_running {
-            crate::capabilities::sccache::service::stop_for_host_move()?;
+            crate::capabilities::sccache::service::stop_for_host_move(self.roots.namespace())?;
         }
         let executed =
             tokio::task::spawn_blocking(move || caches_retirement::execute(&layout, &plan))

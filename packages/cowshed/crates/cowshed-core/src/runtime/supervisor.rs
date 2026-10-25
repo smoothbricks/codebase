@@ -11054,14 +11054,17 @@ mod label_report_tests {
     /// already right is silent.
     #[test]
     fn a_skipped_volume_label_is_said_and_only_a_right_one_is_silent() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let name = WorkspaceName::new("slotted").expect("workspace name");
+        let label = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"))
+            .volume_label(format_args!("acme · widget — slotted"));
         let image = Path::new("/private/cowshed/store/acme/widget/sessions/slotted.dmg");
         let report = |outcome: io::Result<Labelled>| {
             label_report(
                 &name,
                 "volume",
                 image,
-                "[cowshed] acme · widget — slotted",
+                &label,
                 &outcome,
                 Duration::from_millis(5),
             )

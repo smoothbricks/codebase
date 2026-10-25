@@ -5,7 +5,6 @@ import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { expectFixtureVolume } from '../../__tests__/fixture-ram-volume.js';
 import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from '../../bounded-test-policy.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool } from './cpu-pool.js';
@@ -16,7 +15,7 @@ import { COWSHED_EXECUTABLE_ENV } from './ram-temp.js';
 import {
   attachedDisks,
   detachOwned,
-  removeScratchDirectories,
+  removeScratchVolume,
   type ScratchVolume,
   scratchVolume,
   startFixtureGateway,
@@ -26,7 +25,8 @@ import { VERDICT_FILE } from './verdict.js';
 
 /**
  * The production runner's built Node artifact, run in its own process, with the real CPU-budget owner and, on macOS, a
- * RAM volume of this file's own: never the user's, which no test leases, creates or detaches. `test-host` already
+ * RAM volume of this file's own, both served by the fixture gateway of this file's own test namespace: never the user's
+ * gateway or volume, which no test leases, creates, detaches or takes tokens from. `test-host` already
  * depends on this package's build; these peers must not compile TypeScript inside a test. These proofs need the host
  * (`hdiutil` on darwin), so the pure shards exclude this file.
  */
@@ -54,8 +54,20 @@ function volumeSource(): string {
   }
   if (ramVolume === undefined) throw new Error('the fixture gateway must be ready before a runner starts');
   const { paths, capacity } = ramVolume;
-  expectFixtureVolume(paths, capacity);
   return `(cowshed) => fixtureRamVolume(${JSON.stringify({ paths, capacity, owned: ramVolume.owned, gatewaySocket: ramVolume.gatewaySocket })}, cowshed)`;
+}
+
+/**
+ * A runner script's `runBoundedExecWith` gateway, as a JavaScript string literal: this file's fixture gateway on macOS,
+ * which serves the volume's disk work and the run's CPU tokens alike. Elsewhere none is served, so it is a path in the
+ * script's own root that nothing listens on, as on a host with no gateway; never the user's.
+ */
+function gatewaySource(root: string): string {
+  if (process.platform !== 'darwin') {
+    return JSON.stringify(join(root, 'no-gateway.sock'));
+  }
+  if (ramVolume === undefined) throw new Error('the fixture gateway must be ready before a runner starts');
+  return JSON.stringify(ramVolume.gatewaySocket);
 }
 
 /** The runner scripts' imports: the runner that takes a volume, and the fixture volume it is given. */
@@ -74,8 +86,7 @@ afterAll(async () => {
   } finally {
     await stopRamGateway?.();
   }
-  removeScratchDirectories(ramVolume.paths);
-  await rm(ramVolume.parent, { recursive: true, force: true });
+  removeScratchVolume(ramVolume);
 });
 
 /**
@@ -248,7 +259,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
           })};`,
           `const context = ${JSON.stringify({ root })};`,
           `const volume = ${volumeSource()};`,
-          'const results = await Promise.all(Array.from({ length: 5 }, () => runBoundedExecWith(options, context, volume)));',
+          `const gatewaySocket = ${gatewaySource(root)};`,
+          'const results = await Promise.all(Array.from({ length: 5 }, () => runBoundedExecWith(options, context, volume, gatewaySocket)));',
           "console.log('leases-complete');",
           'process.exitCode = results.every((result) => result.success) ? 0 : 1;',
           '',
@@ -576,7 +588,7 @@ async function writeRunner(
     [
       RUNNER_IMPORTS,
       RESOURCES_HANDLER,
-      `const result = await runBoundedExecWith(${JSON.stringify(options)}, ${JSON.stringify(context)}, ${volumeSource()});`,
+      `const result = await runBoundedExecWith(${JSON.stringify(options)}, ${JSON.stringify(context)}, ${volumeSource()}, ${gatewaySource(root)});`,
       'process.exitCode = result.success ? 0 : 1;',
       '',
     ].join('\n'),
@@ -785,10 +797,11 @@ async function writeChurnWorker(root: string, name: string, stopFile: string): P
       RESOURCES_HANDLER,
       `const options = ${JSON.stringify(CHURN_OPTIONS)};`,
       `const volume = ${volumeSource()};`,
+      `const gatewaySocket = ${gatewaySource(root)};`,
       `const context = ${JSON.stringify({ root })};`,
       `for (let run = 1; !existsSync(${JSON.stringify(stopFile)}); run += 1) {`,
       `  process.stdout.write('cowshed-test churn ${name} begin ' + run + '\\n');`,
-      '  const result = await runBoundedExecWith(options, context, volume);',
+      '  const result = await runBoundedExecWith(options, context, volume, gatewaySocket);',
       '  if (!result.success) {',
       `    process.stderr.write('cowshed host proof churn ${name} failed at run ' + run + ':\\n');`,
       '    process.stderr.write(result.terminalOutput);',

@@ -197,10 +197,13 @@ socket below the fixture past Darwin's 104-byte `sun_path`. A fixture that holds
 such as a test `HOME`, takes the granted `TMPDIR`. An invalid requested alias fails loudly; it never falls through to a
 global or temp directory.
 
-RAM host fixtures own a private root, control socket, volume paths, lock and exact attached registry identities. Every
-attach and every facade or non-facade disk operation uses a real fixture gateway, never the installed gateway or the
-user's shared RAM volume. `cowshed-gateway`'s `ram_fixture` executable serves that gateway until its stdin closes; host
-tests start the prebuilt helper, wait for its socket readiness, detach only identities their own attaches recorded, then
+RAM host fixtures own a test namespace (01_storage.md, "Host namespace") and derive everything from it: their root
+`/private/var/folders/cowshed/<uid>/<ns>`, the fixture gateway's control socket `<root>/gateway.sock`, the volume paths
+(`<root>/ram3`, `<root>/ram3-new`), the volume name `smoo-ram3-<uid>-<ns>`, the lock, and the exact attached registry
+identities they record. No fixture path can be the installed gateway's or the user's shared RAM volume's, so no guard
+compares them. Every attach and every facade or non-facade disk operation uses that real fixture gateway.
+`cowshed-gateway`'s `ram_fixture <ns>` executable serves it until its stdin closes; host tests create the namespace's
+root, start the prebuilt helper, wait for its socket readiness, detach only identities their own attaches recorded, then
 close the helper. `disk-command --gateway-socket` routes native tools to the same fixture admission, with registry-bound
 detach revalidation inside it. Size and UID distinguish fixture inventories but never authorize teardown.
 
@@ -270,13 +273,15 @@ its session port, which it leaves unbound; it never hands out a port it bound an
 allocator exists to claim against, and such a fixture hands out a port-0 listener's port after closing it. A block
 exported without its size, or the reverse, fails loudly by name. Inside a Cow test gateway, `free_endpoint` allocates
 aligned two-port sub-blocks starting at `base+2`, never the reserved real gateway `base`; each claimed service port is a
-single listener, and its claim is retained for the listener's lifetime. Outside a workspace, a fixture binds any free
-loopback port through the existing global allocator. The private actor fixture installer claims the adjacent service
-port first, then the session port in one fork-lock creation step. The service-port claim remains held until the
-installed listener is quiesced. It excludes other fixture installers across test processes throughout the session port's
-release/rebind handoff; requests and the other tests remain parallel. Both claims use the existing fork-lock `Fenced`
-value (11_shell.md): socket creation and release wait only for concurrent spawns in flight, so another fixture's
-pre-exec descriptor copy cannot outlive the release/rebind handoff. No process-local installer mutex is needed.
+single listener, and its claim is retained for the listener's lifetime. Outside a workspace the fixture partition
+(`MACOS_FIXTURE_PORT_MIN..=MACOS_PORT_MAX`, one 4096-port block aligned to its size) is the enclosing block: the test
+allocators take its aligned two-port sub-blocks from `base+2` by the same claim protocol, never a host-partition port
+production allocates from. The private actor fixture installer claims the adjacent service port first, then the session
+port in one fork-lock creation step. The service-port claim remains held until the installed listener is quiesced. It
+excludes other fixture installers across test processes throughout the session port's release/rebind handoff; requests
+and the other tests remain parallel. Both claims use the existing fork-lock `Fenced` value (11_shell.md): socket
+creation and release wait only for concurrent spawns in flight, so another fixture's pre-exec descriptor copy cannot
+outlive the release/rebind handoff. No process-local installer mutex is needed.
 
 An exact-count network fixture, including single-shot HTTP and TLS backends, keeps its listener owned until the test
 releases its fixture handle or its joined result, even after its accept loop finishes (including a zero-count loop). A
@@ -507,28 +512,30 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 
 Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
 skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.dmg` images (1 GiB caps) under
-`/private/var/folders/cowshed/<uid>/t/<pid>-<n>` (the label is said on stderr, not spelled, so sockets below fit
-`sun_path`) (`cowshed_os::scratch::macos_scratch_root`), driven by the production host — real
-`diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel mount table. The
-per-user scratch parent is host state `cowshed setup` provisions, never fixture state: a fixture creates only `t` inside
-it and refuses a missing or foreign root, so a host lacking setup gets setup's same directories from the Nx target
-`cowshed:apfs-test-root`, which every such test target depends on (below). A mount state a test needs (wrong flags, an
-impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every scratch root
-selects its backing image paths, then calls the same production owned-attachment cleanup used by normal removal,
-recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup rereads
-image/whole-device/volume identity and retains each owned volume's raw pin through namespace admission and same-root-FD
-`funmount`, then runs guarded `hdiutil detach` of the exact physical device under the image's lease. The detach guard
-rechecks after storage admission; a cached device number, caller mount set or mountpoint never authorizes an effect. A
-failed release keeps the scratch tree intact for the next run, rather than deleting a still-attached image's backing
-files. Before any release, a scratch root ends every process working in its tree, selected by the working directory the
-kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory): `SIGTERM`, as
-`nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started detaches from its
-starter, so a failed test's unwinding otherwise never reached it and it kept running in the deleted root. Successful
-cleanup removes the root, and every run first ends the processes working under, then reclaims the roots and attachments
-of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with
-datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
-Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
-both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+`/private/var/folders/cowshed/<uid>/<ns>`, the directory of the test namespace each scratch root mints (01_storage.md,
+"Host namespace"; the label is said on stderr, not spelled, so sockets below fit `sun_path`), driven by the production
+host — real `diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel mount table.
+The root's volumes carry a test label, never production's `[cowshed]`: a clone carries the shared test template's
+`[cowshed-test]` until its workspace's supervisor relabels it with the namespace's prefix `[cowshed-test-<ns>]`. The
+per-user root is host state `cowshed setup` provisions, never fixture state: a fixture creates only its namespace's
+directory and `t` inside it and refuses a missing or foreign root, so a host lacking setup gets setup's same directories
+from the Nx target `cowshed:apfs-test-root`, which every such test target depends on (below). A mount state a test needs
+(wrong flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every
+scratch root selects its backing image paths, then calls the same production owned-attachment cleanup used by normal
+removal, recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup
+rereads image/whole-device/volume identity and retains each owned volume's raw pin through namespace admission and
+same-root-FD `funmount`, then runs guarded `hdiutil detach` of the exact physical device under the image's lease. The
+detach guard rechecks after storage admission; a cached device number, caller mount set or mountpoint never authorizes
+an effect. A failed release keeps the scratch tree intact for the next run, rather than deleting a still-attached
+image's backing files. Before any release, a scratch root ends every process working in its tree, selected by the
+working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory):
+`SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started
+detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept running in the deleted
+root. Successful cleanup removes the root, and every run first ends the processes working under, then reclaims the roots
+and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev
+(`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also exercises
+`cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
+same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The Nx target `cowshed:apfs-test-root` (`packages/cowshed/scripts/apfs-test-root.ts`) gives a host `cowshed setup` has
 not run on, such as a CI runner that cannot answer setup's interactive authorization prompt, setup's own three
@@ -537,8 +544,9 @@ that (the user's, 0700). Every target that runs a test creating a scratch root d
 the `cowshed-*` crates, both real-APFS groups, `host-controller-test` and `integration-apfs`. It creates only what is
 missing, by `sudo -n` for the prefix and the per-user root and as the user for `mnt`, refuses a link, a non-directory or
 a foreign owner rather than writing through it, and with a directory missing and `sudo -n` refused fails naming the
-exact commands to run. It never looks at `t`: the fixtures make it, and a `cowshed exec` sandbox, where the shards run
-too, denies it. On a host setup has been through it checks and changes nothing.
+exact commands to run. It never looks at `t` or a test namespace's directory: the fixtures make them, and a
+`cowshed exec` sandbox, where the shards run too, denies it. On a host setup has been through it checks and changes
+nothing.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (the mounted RAW image, then the retained RAW input) and the worker record; neither a sibling's
@@ -665,15 +673,19 @@ the selected child's complete `wait4` lifetime, not a pre-exit self-report; cach
 and retain their isolation, allocation/cache-hit and kernel-terminal empty-census negative controls.
 
 Test tasks run under `@smoothbricks/nx-plugin:bounded-exec`, which on a macOS host gives each task a `TMPDIR` lease on
-one RAM-backed volume (`packages/nx-plugin/README.md`). Real-APFS scratch roots, the user's template, the lane pools and
-the sweep's lock and record stay under `/private/var/folders/cowshed/<uid>/t` whatever `TMPDIR` a runner has: every
-run's sweep must see every dead run, not only those of one task's lease; a clone reaches its template by `clonefile`,
-which cannot cross volumes (that parent is on Data, as the template is); and Darwin's socket bound must not depend on
-the runner's `TMPDIR`. The parent is beside the workspace mount root because Spotlight's `mds` admits no volume whose
-mount path contains `/var/folders/`, and keeps one `AppleAPFSVolume` right for every volume it admits until it exits: a
-fixture volume mounted under `/private/tmp` left one each (01a_apfs.md, "Spotlight media references"). It needs the
-per-user root `cowshed setup` makes; `t` is created 0700 and refused unless the user owns it with that mode. The lease
-never detaches an image attached from below it; it keeps such a lease and names it.
+one RAM-backed volume (`packages/nx-plugin/README.md`). Real-APFS scratch roots stay in their namespaces' directories
+below `/private/var/folders/cowshed/<uid>`, and the user's template, the lane pools and the sweep's lock and record in
+its `t`, whatever `TMPDIR` a runner has: every run's sweep must see every dead run, not only those of one task's lease,
+and finds them as the per-user root's entries that parse as a test namespace whose owner is gone: its pid names no
+process, or names one born at another instant than the start time the root's `.owner` record holds; a clone reaches its
+template by `clonefile`, which cannot cross volumes (that root is on Data, as the template is); and Darwin's socket
+bound must not depend on the runner's `TMPDIR`. The roots are beside the workspace mount root because Spotlight's `mds`
+admits no volume whose mount path contains `/var/folders/`, and keeps one `AppleAPFSVolume` right for every volume it
+admits until it exits: a fixture volume mounted under `/private/tmp` left one each (01a_apfs.md, "Spotlight media
+references"). Production names only `mnt` and `ram<revision>` there and reads neither `t` nor a namespace's directory.
+They need the per-user root `cowshed setup` makes; `t` and each namespace's directory are created 0700 and refused
+unless the user owns them with that mode. The lease never detaches an image attached from below it; it keeps such a
+lease and names it.
 
 These canonical scratch roots, the `/private/tmp` directory fixtures, and the canonical `/tmp` parent of the independent
 controller-git sandbox fixtures, are host-only and run in the land gate; a `cowshed exec` sandbox denies `/private/tmp`.

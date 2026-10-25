@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { type HostCommands, RamTempVolume, ramTempPaths } from './ram-temp.js';
+import { type HostCommands, RamTempVolume, ramTempPaths, testNamespace } from './ram-temp.js';
 
 const noSubtrees = {
   rootArgv(): never {
@@ -17,12 +17,11 @@ function fixture() {
   const root = join(parent, 'root');
   mkdirSync(root, { mode: 0o700 });
   const paths = {
-    ...ramTempPaths(userInfo()),
+    ...ramTempPaths(userInfo(), testNamespace(process.pid, 0)),
     root,
     mountpoint: join(root, 'owned'),
     staging: join(root, 'owned-new'),
     lockFile: join(parent, 'v.lock'),
-    volumeName: 'owned-provenance',
   };
   mkdirSync(paths.mountpoint);
   writeFileSync(join(paths.mountpoint, 'keep'), 'owned payload');

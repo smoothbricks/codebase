@@ -49,9 +49,9 @@ pub use ram_disk::{
 };
 pub use repo_id::{InvalidRepoId, validate_repo_id};
 pub use session::{
-    ConfigError, MACOS_PORT_MAX, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, TOKEN_BYTES, WorkspaceCa,
-    WorkspaceEndpoint, WorkspaceSession, WorkspaceToken, is_macos_port_block, is_port_block,
-    validate_identifier,
+    ConfigError, MACOS_FIXTURE_PORT_MIN, MACOS_FIXTURE_PORTS, MACOS_PORT_MAX, MACOS_PORT_MIN,
+    NEW_PORT_BLOCK_SIZE, TOKEN_BYTES, WorkspaceCa, WorkspaceEndpoint, WorkspaceSession,
+    WorkspaceToken, is_macos_port_block, is_port_block, validate_identifier,
 };
 pub use status::{DaemonStatus, SessionStatus, StartupHeal, SupervisorRecovery};
 
@@ -70,16 +70,16 @@ use std::path::{Path, PathBuf};
 /// same machine-global herd and leaves the evidence layer outside the dedicated volumes.
 pub const STORE_ROOT: &str = "/private/cowshed/store";
 
-/// The gateway control socket, at the store root.
+/// Production's gateway control socket, at production's store root: where production's disk tools
+/// take their disk-lifecycle lease (`cowshed_apfs::disk_lease::lease_socket`; 05_gateway.md,
+/// "Disk-lifecycle lease"). A test namespace leases from its own root's gateway, and every other
+/// client derives its store's socket from the store it was given (`CanonicalRoots::control_socket`
+/// in cowshed-core), so no test reaches production's gateway.
 ///
 /// Root-level keeps `sun_path` short (01_storage.md): a Unix socket address is capped near 104
-/// bytes, and a home-relative path spent that budget on the user's name before the gateway had
-/// said anything. The store is also the only location every peer agrees on — a LaunchAgent, the
-/// CLI, and a supervising runtime each know the store, while `HOME` differs between them.
-///
-/// Defined here, below the controller, the disk-image layer and the daemon, so each of them
+/// bytes. Defined here, below the controller, the disk-image layer and the daemon, so each of them
 /// names the one definition and no constant is copied across a crate boundary.
-pub fn control_socket_path() -> PathBuf {
+pub fn production_control_socket() -> PathBuf {
     Path::new(STORE_ROOT).join("gateway.sock")
 }
 

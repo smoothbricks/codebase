@@ -942,7 +942,7 @@ impl CliService for ActorBridge {
                 CowshedError::internal("the CLI project runtime has already been shut down")
             })?
             .descriptor();
-        gateway_service::ControlSocket::at(descriptor.storage.store().join("gateway.sock"))?
+        gateway_service::ControlSocket::at(descriptor.storage.control_socket())?
             .clear_nx_cache(&descriptor.repo_id)
             .await
     }
@@ -3118,9 +3118,11 @@ async fn attach_project_sessions_from_store(
 ) -> Result<Vec<WorkspaceInfo>> {
     let layout = StorageLayout::new(storage.store(), &project.repo_id)
         .map_err(attach_store_storage_error)?;
-    let config = ApfsSubstrateConfig::new(storage.store(), &project.project_root);
-    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
-        .map_err(attach_store_storage_error)?;
+    let config =
+        ApfsSubstrateConfig::new(storage.namespace(), storage.store(), &project.project_root);
+    let host =
+        MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config.clone())
+            .map_err(attach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
     let derived = substrate
         .list(&project.repo_id)
@@ -3318,9 +3320,11 @@ async fn detach_project_sessions_from_store(
     storage: &ValidatedHostStorage,
     project: &AdoptedProject,
 ) -> Result<usize> {
-    let config = ApfsSubstrateConfig::new(storage.store(), &project.project_root);
-    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
-        .map_err(detach_store_storage_error)?;
+    let config =
+        ApfsSubstrateConfig::new(storage.namespace(), storage.store(), &project.project_root);
+    let host =
+        MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config.clone())
+            .map_err(detach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
     let derived = substrate
         .list(&project.repo_id)
@@ -5055,6 +5059,8 @@ fn departed_volume_references_finding(
 async fn diagnose_host() -> Result<Vec<Finding>> {
     use cowshed_core::doctor::{probe, probe_sync, probe_value, waits_on};
     let home = gateway_service::canonical_home()?;
+    // Doctor reads the host it runs on: production's roots, and so production's names and sockets.
+    let roots = CanonicalRoots::global();
     let plan = probe("host-storage", async {
         waits_on(
             format_args!("host-storage"),
@@ -5079,11 +5085,11 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
             format_args!("gateway-status"),
             format_args!(
                 "launchd ({}), then the gateway daemon at {}",
-                crate::launchd::GATEWAY_LABEL,
-                cowshed_gateway_types::control_socket_path().display()
+                roots.namespace().launchd_label("gateway"),
+                roots.control_socket().display()
             ),
         );
-        gateway_service::service_status_within(DOCTOR_PEER_ANSWER).await
+        gateway_service::service_status_within(&roots, DOCTOR_PEER_ANSWER).await
     })
     .await;
     match gateway {
@@ -5130,11 +5136,15 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
             format_args!("sccache-status"),
             format_args!(
                 "launchd ({}), then the sccache server at {}",
-                crate::launchd::SCCACHE_LABEL,
+                roots.namespace().launchd_label("sccache"),
                 cowshed_core::capabilities::sccache::server_socket().display()
             ),
         );
-        crate::capabilities::sccache::service::service_status_within(DOCTOR_PEER_ANSWER).await
+        crate::capabilities::sccache::service::service_status_within(
+            roots.namespace(),
+            DOCTOR_PEER_ANSWER,
+        )
+        .await
     })
     .await;
     match sccache {
@@ -5161,9 +5171,8 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     // agent whose store path was collected looks identical to a healthy one until launchd next
     // tries to exec it, which may be a reboot away.
     let pinning = probe_sync(format_args!("sccache-agent"), || {
-        crate::capabilities::sccache::service::control_target(&home).map(|target| {
-            crate::capabilities::sccache::nix::pinning_findings(&home, target.plist_path())
-        })
+        crate::capabilities::sccache::service::control_target(roots.namespace(), &home)
+            .map(|target| crate::capabilities::sccache::nix::pinning_findings(&home, &target))
     });
     match pinning {
         Ok(pinning) => findings.extend(pinning),
@@ -5179,7 +5188,6 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     // not permission to hide project state. One registry traversal supplies every view below.
     match probe("inventory", doctor_projects()).await {
         Ok((projects, mains, checkoutless, unreadable)) => {
-            let roots = CanonicalRoots::global();
             let store = roots.store();
             findings.extend(retired_mount_layout_findings(store));
             findings.push(Finding {

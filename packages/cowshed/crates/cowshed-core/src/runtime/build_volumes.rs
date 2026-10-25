@@ -4105,6 +4105,7 @@ mod tests {
         use crate::capabilities::BuildStatePath;
         use crate::storage::apfs::ApfsSubstrateConfig;
         use cowshed_apfs::SystemCommandRunner;
+        use cowshed_os::namespace::HostNamespace;
         const GIB: u64 = ImageCapacity::GIBIBYTE;
 
         let root = crate::scratch_apfs::ScratchRoot::new("build-resize").expect("scratch root");
@@ -4118,8 +4119,12 @@ mod tests {
         .unwrap();
         let host = Arc::new(
             MacOsApfsExecutionHost::new(
-                SystemCommandRunner,
-                ApfsSubstrateConfig::new(&store, root.path().join("checkout")),
+                SystemCommandRunner::new(HostNamespace::Test(root.namespace())),
+                ApfsSubstrateConfig::new(
+                    HostNamespace::Test(root.namespace()),
+                    &store,
+                    root.path().join("checkout"),
+                ),
             )
             .unwrap(),
         );
@@ -4293,7 +4298,9 @@ mod tests {
                 FixtureRoot::Apfs(
                     crate::scratch_apfs::ScratchRoot::new(name).expect("scratch APFS root"),
                 ),
-                |config| MacOsApfsExecutionHost::new(SystemCommandRunner, config),
+                |config| {
+                    MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config)
+                },
                 test_volume,
             )
         }
@@ -4332,7 +4339,15 @@ mod tests {
             mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64, &Registration) -> PathBuf,
         ) -> Self {
             use crate::storage::apfs::ApfsSubstrateConfig;
+            use cowshed_os::namespace::{HostNamespace, TestNamespace};
             let store = root.path().join("store");
+            let namespace = match &root {
+                FixtureRoot::Apfs(apfs) => HostNamespace::Test(apfs.namespace()),
+                // A directory root names no namespace of its own, so this run mints one.
+                FixtureRoot::Directory(_) => {
+                    HostNamespace::Test(TestNamespace::mint().expect("a test namespace"))
+                }
+            };
             fs::create_dir_all(&store).unwrap();
             let project = ProjectPaths::with_mount_root(
                 &store,
@@ -4342,6 +4357,7 @@ mod tests {
             .unwrap();
             let host = Arc::new(
                 make_host(ApfsSubstrateConfig::new(
+                    namespace,
                     &store,
                     root.path().join("checkout"),
                 ))
@@ -6915,13 +6931,18 @@ fn main() {
         gib: u64,
         registration: &Registration,
     ) -> PathBuf {
-        use cowshed_apfs::{CommandRunner, SystemCommandRunner};
+        use cowshed_apfs::CommandRunner;
+        use cowshed_os::namespace::HostNamespace;
+        let HostNamespace::Test(namespace) = host.backend().runner().namespace() else {
+            unreachable!("a runtime test host runs in its test namespace")
+        };
         let _creating = layout.register(id, registration).unwrap();
         let image = layout.image(id);
-        crate::blank_image::blank_image(&image);
+        crate::blank_image::blank_image(namespace, &image);
         let capacity = ImageCapacity::from_gibibytes(gib);
         if capacity > crate::blank_image::CAPACITY {
-            SystemCommandRunner
+            host.backend()
+                .runner()
                 .grow_image(&image, capacity)
                 .expect("grow the clone's sparse image length");
         }
@@ -7292,6 +7313,8 @@ fn main() {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_failed_mint_beside_main_fails_only_a_first_touch_that_needs_it() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
+        let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
         let store = Store::new();
         let checkout = tracked_checkout(
             &store.root,
@@ -7301,8 +7324,8 @@ fn main() {
         );
         let host = Arc::new(
             MacOsApfsExecutionHost::new(
-                SystemCommandRunner,
-                crate::storage::apfs::ApfsSubstrateConfig::new(&store.root, &checkout),
+                SystemCommandRunner::new(namespace),
+                crate::storage::apfs::ApfsSubstrateConfig::new(namespace, &store.root, &checkout),
             )
             .unwrap(),
         );

@@ -36,6 +36,7 @@ use cowshed_core::storage::job_artifact::{
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fork_lock::Spawn as _;
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
@@ -2750,10 +2751,11 @@ async fn quiesce_does_not_wait_for_background_volume_labels() {
     let (entered, mut renaming) = mpsc::unbounded_channel();
     let (release, gate) = std::sync::mpsc::channel();
     let mut supervisor = config(&root);
+    let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
     supervisor.volume_labels = Some(VolumeLabels {
         workspace_image: root.join("store").join("main.dmg"),
-        workspace: "[cowshed] acme · widget — main".into(),
-        build: "[cowshed] acme · widget — build main".into(),
+        workspace: namespace.volume_label(format_args!("acme · widget — main")),
+        build: namespace.volume_label(format_args!("acme · widget — build main")),
         labeller: std::sync::Arc::new(BlockedLabeller {
             entered,
             release: std::sync::Mutex::new(gate),
@@ -2798,10 +2800,11 @@ async fn a_build_volume_label_request_cannot_name_a_host_mount_outside_its_layou
     link::point(&checkout, &host_mount).unwrap();
     let (named, mut labels) = mpsc::unbounded_channel();
     let image = root.join("store").join("main.dmg");
+    let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
     supervisor.volume_labels = Some(VolumeLabels {
         workspace_image: image.clone(),
-        workspace: "[cowshed] acme · widget — main".into(),
-        build: "[cowshed] acme · widget — build main".into(),
+        workspace: namespace.volume_label(format_args!("acme · widget — main")),
+        build: namespace.volume_label(format_args!("acme · widget — build main")),
         labeller: std::sync::Arc::new(RecordingLabeller(named)),
     });
     let h = harness_with_config(supervisor, 1, 1024, false, false);

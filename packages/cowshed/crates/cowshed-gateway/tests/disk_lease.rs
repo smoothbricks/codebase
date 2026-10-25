@@ -4,6 +4,8 @@
 
 #[path = "support/fixture_dir.rs"]
 mod fixture_dir;
+#[path = "support/namespace_root.rs"]
+mod namespace_root;
 
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
@@ -14,7 +16,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use cowshed_apfs::disk_lease::leased_at;
+use cowshed_apfs::disk_lease::{lease_socket, leased_at};
 use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 use cowshed_apfs::{
     ApfsBackend, AttachedImage, CommandOutput, CommandRequest, CreateImageRequest,
@@ -26,7 +28,7 @@ use cowshed_gateway::{
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
 use cowshed_gateway_types::DiskClass;
-use uuid::Uuid;
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 struct NoCredentials;
 
@@ -69,15 +71,16 @@ impl AuditSink for DiscardAudit {
     }
 }
 
-/// A gateway serving leases with `limits` on a socket under `/tmp` (a bind path is capped at
-/// `sun_path`'s 104 bytes), and the guard that removes its root on every exit path.
-async fn gateway(limits: DiskLeaseLimits) -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
-    let id = Uuid::new_v4().simple().to_string();
-    let root = fixture_dir::secure_fixture_dir(&format!("csdl-{}", &id[..8]));
+/// A gateway serving leases with `limits` on the socket of a test namespace of its own: at that
+/// namespace's root, which is short enough for a bind path (capped at `sun_path`'s 104 bytes), and
+/// where its disk tools take their lease (`lease_socket`). The guard removes the root on every exit
+/// path.
+async fn gateway(limits: DiskLeaseLimits) -> (Gateway, namespace_root::NamespaceRoot, PathBuf) {
+    let root = namespace_root::NamespaceRoot::mint();
     let cache = root.path().join("cache");
     std::fs::create_dir(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
-    let socket = root.path().join("gateway.sock");
+    let socket = lease_socket(HostNamespace::Test(root.namespace()));
     let gateway = Gateway::start(
         GatewayConfig {
             control_socket: Some(socket.clone()),
@@ -217,14 +220,15 @@ enum Arm {
 /// it printed. The unleased arm is the deliberately free-for-all baseline.
 fn timed(
     arm: Arm,
-    socket: &Path,
+    namespace: TestNamespace,
     class: DiskClass,
     argv: &[&str],
 ) -> (Duration, Duration, CommandOutput) {
     let request = CommandRequest::new(argv[0], &argv[1..]);
+    let host = HostNamespace::Test(namespace);
     let asked = Instant::now();
     let mut ran = Duration::ZERO;
-    let output = SystemCommandRunner
+    let output = SystemCommandRunner::new(host)
         .run_within(&request, DISK_CHILD_DEADLINE, |deadline, run| {
             let mut timed_run = || {
                 let started = Instant::now();
@@ -234,7 +238,13 @@ fn timed(
             };
             match arm {
                 Arm::Unleased => timed_run(),
-                Arm::Leased => leased_at(socket, class, &argv.join(" "), deadline, timed_run),
+                Arm::Leased => leased_at(
+                    &lease_socket(host),
+                    class,
+                    &argv.join(" "),
+                    deadline,
+                    timed_run,
+                ),
             }
         })
         .expect("run a disk command");
@@ -274,7 +284,7 @@ struct Measured {
 /// One attach/detach loop until `stop`, or until a command fails, which stops every loop.
 fn attach_loop(
     arm: Arm,
-    socket: &Path,
+    namespace: TestNamespace,
     image: &str,
     stop: &AtomicBool,
 ) -> Result<Vec<(Duration, Duration)>, String> {
@@ -282,7 +292,7 @@ fn attach_loop(
     while !stop.load(Ordering::Relaxed) {
         let (ran, waited, output) = timed(
             arm,
-            socket,
+            namespace,
             DiskClass::Storage,
             &[
                 "/usr/sbin/diskutil",
@@ -302,7 +312,7 @@ fn attach_loop(
             .ok_or_else(|| format!("attach {image} named no device: {output:?}"))?;
         let (_, _, detached) = timed(
             arm,
-            socket,
+            namespace,
             DiskClass::Storage,
             &["/usr/sbin/diskutil", "eject", "force", &device],
         );
@@ -318,7 +328,7 @@ fn attach_loop(
 /// itself. The lease still has to keep such churn out of every storage phase.
 fn mount_loop(
     arm: Arm,
-    socket: &Path,
+    namespace: TestNamespace,
     volume: &str,
     mount_point: &str,
     stop: &AtomicBool,
@@ -327,7 +337,7 @@ fn mount_loop(
     while !stop.load(Ordering::Relaxed) {
         let (_, _, mounted) = timed(
             arm,
-            socket,
+            namespace,
             DiskClass::Namespace,
             &["/sbin/mount_apfs", "-o", "nobrowse", volume, mount_point],
         );
@@ -336,7 +346,7 @@ fn mount_loop(
         }
         let (_, _, unmounted) = timed(
             arm,
-            socket,
+            namespace,
             DiskClass::Namespace,
             &["/sbin/umount", mount_point],
         );
@@ -351,7 +361,7 @@ fn mount_loop(
 /// One attach/detach loop per image beside one mount/unmount loop per volume, for `period`.
 fn contend(
     arm: Arm,
-    socket: &Path,
+    namespace: TestNamespace,
     attach_images: &[PathBuf],
     mounted: &[(String, PathBuf)],
     period: Duration,
@@ -361,13 +371,9 @@ fn contend(
     let attachers: Vec<_> = attach_images
         .iter()
         .map(|image| {
-            let (stop, socket, image) = (
-                Arc::clone(&stop),
-                socket.to_path_buf(),
-                image.to_string_lossy().into_owned(),
-            );
+            let (stop, image) = (Arc::clone(&stop), image.to_string_lossy().into_owned());
             std::thread::spawn(move || {
-                let result = attach_loop(arm, &socket, &image, &stop);
+                let result = attach_loop(arm, namespace, &image, &stop);
                 if result.is_err() {
                     stop.store(true, Ordering::Relaxed);
                 }
@@ -378,14 +384,13 @@ fn contend(
     let mounters: Vec<_> = mounted
         .iter()
         .map(|(volume, mount_point)| {
-            let (stop, socket, volume, mount_point) = (
+            let (stop, volume, mount_point) = (
                 Arc::clone(&stop),
-                socket.to_path_buf(),
                 volume.clone(),
                 mount_point.to_string_lossy().into_owned(),
             );
             std::thread::spawn(move || {
-                let result = mount_loop(arm, &socket, &volume, &mount_point, &stop);
+                let result = mount_loop(arm, namespace, &volume, &mount_point, &stop);
                 if result.is_err() {
                     stop.store(true, Ordering::Relaxed);
                 }
@@ -459,10 +464,11 @@ async fn contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease()
     const ATTACHERS: usize = 8;
     const MOUNTERS: usize = 2;
     const PERIOD: Duration = Duration::from_secs(40);
-    let (gateway, root, socket) = gateway(DiskLeaseLimits::default()).await;
+    let (gateway, root, _socket) = gateway(DiskLeaseLimits::default()).await;
     let images = root.path().join("images");
     std::fs::create_dir(&images).expect("image directory");
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let namespace = root.namespace();
+    let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(namespace)));
     let source = backend
         .create_staged_image(&CreateImageRequest {
             staged_stem: images.join("source"),
@@ -498,10 +504,9 @@ async fn contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease()
         })
         .collect();
 
-    let socket_for = socket.clone();
     let (unleased, leased) = tokio::task::spawn_blocking(move || {
-        let leased = contend(Arm::Leased, &socket_for, &attach_images, &mounted, PERIOD);
-        let unleased = contend(Arm::Unleased, &socket_for, &attach_images, &mounted, PERIOD);
+        let leased = contend(Arm::Leased, namespace, &attach_images, &mounted, PERIOD);
+        let unleased = contend(Arm::Unleased, namespace, &attach_images, &mounted, PERIOD);
         (unleased, leased)
     })
     .await

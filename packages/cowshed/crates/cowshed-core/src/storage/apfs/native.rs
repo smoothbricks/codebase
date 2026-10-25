@@ -7220,6 +7220,7 @@ mod tests {
             re_adopt_tests::Fixture,
         };
         use cowshed_apfs::SystemCommandRunner;
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
         let fixture = Fixture::new();
         let repo = RepoId::parse("acme/widget").unwrap();
@@ -7234,8 +7235,14 @@ mod tests {
         let retained = &image.retained;
         fs::create_dir_all(retained.parent().unwrap()).unwrap();
         fs::write(retained, b"retained source evidence").unwrap();
-        let config = ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout);
-        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone()).unwrap();
+        let config = ApfsSubstrateConfig::new(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            fixture.store(),
+            &fixture.checkout,
+        );
+        let host =
+            MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config.clone())
+                .unwrap();
         let before = host
             .preview_gc(&config, &repo, StorageGcOptions::default())
             .unwrap();
@@ -7324,6 +7331,7 @@ mod tests {
         use crate::storage::apfs::COMPANION_SUFFIX;
         use crate::storage::recovery::re_adopt_tests::Fixture;
         use cowshed_apfs::SystemCommandRunner;
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         use std::os::unix::fs::symlink;
 
         #[derive(Clone, Copy)]
@@ -7436,8 +7444,14 @@ mod tests {
                     At::LinkAtRetained => symlink(&link_target, &retained).unwrap(),
                 }
             }
-            let config = ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout);
-            let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config).unwrap();
+            let config = ApfsSubstrateConfig::new(
+                HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+                fixture.store(),
+                &fixture.checkout,
+            );
+            let host =
+                MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config)
+                    .unwrap();
             let mut before = BTreeMap::new();
             snapshot(&fixture.project, &mut before);
 
@@ -7540,12 +7554,19 @@ mod tests {
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::storage::recovery::re_adopt_tests::Fixture;
         use cowshed_apfs::SystemCommandRunner;
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
         let fixture = Fixture::new();
         let repo = RepoId::parse("acme/widget").expect("repo");
-        let config = ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout);
+        let config = ApfsSubstrateConfig::new(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            fixture.store(),
+            &fixture.checkout,
+        );
         let storage = layout(&config, &repo).expect("layout");
-        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone()).expect("host");
+        let host =
+            MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config.clone())
+                .expect("host");
         let mut metadata = fixture.source(None).metadata;
         metadata.workspace = WorkspaceName::session("retired").expect("workspace");
         metadata.info_snapshot.role = crate::metadata::WorkspaceRole::Workspace;
@@ -8433,6 +8454,7 @@ mod tests {
     /// device (`disk4`, not its synthesized container `disk5`) once.
     #[test]
     fn detaching_an_existing_image_unmounts_only_its_mounted_volumes_then_detaches_it_once() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let root = std::env::temp_dir().join(format!(
             "cowshed-two-volume-detach-{}",
             uuid::Uuid::new_v4().simple()
@@ -8451,7 +8473,11 @@ mod tests {
                     "/dev/disk5s2".into()
                 ])),
             },
-            ApfsSubstrateConfig::new(&store, root.join("mnt")),
+            ApfsSubstrateConfig::new(
+                HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+                &store,
+                root.join("mnt"),
+            ),
             FixedMounts(vec![KernelMountSnapshot::new(
                 1,
                 root.join("sibling"),

@@ -115,15 +115,6 @@ fn sync_parent_path(path: &Path) -> Result<(), TemplateError> {
 /// a repository owner (`is_reserved_store_namespace`).
 const BLANK_TEMPLATE_DIRECTORY: &str = ".blank";
 
-/// The label every template's volume carries, and so every image minted from one until the
-/// supervisor of the checkout it serves names it (`VolumeLabels` in the runtime's supervisor):
-/// after its workspace, a build volume after the checkout that links it. Relabelling queues on
-/// Disk Arbitration, so it runs off every provisioning path, but it always runs: Disk Utility
-/// shows every attached volume, and one named only this says nothing about what it is
-/// (01a_apfs.md, "Ownership, identity, and the volume label"; 16_build_volumes.md,
-/// "Substrate").
-pub const BLANK_TEMPLATE_LABEL: &str = "[cowshed]";
-
 /// `<store>/.blank/<bytes>-<uid>-<gid>.dmg`: the template a mint at `capacity` clones for the
 /// invoking user. The owner is part of the name because `newfs_apfs -U/-G` writes it into the
 /// volume root, and every clone inherits it.
@@ -182,9 +173,19 @@ fn owner() -> (u32, u32) {
 /// partway left — attached or not, its file present or not — is released and removed first. The
 /// minter takes the template's lock as `taker`, recorded on it and naming who holds it when it
 /// waits.
+///
+/// The template's volume carries `label`, its store's namespace's prefix
+/// (`HostNamespace::label_prefix`, `[cowshed]` for production), and so does every image minted
+/// from it until the supervisor of the checkout it serves names it (`VolumeLabels` in the
+/// runtime's supervisor): after its workspace, a build volume after the checkout that links it.
+/// Relabelling queues on Disk Arbitration, so it runs off every provisioning path, but it always
+/// runs: Disk Utility shows every attached volume, and one named only this says nothing about what
+/// it is (01a_apfs.md, "Ownership, identity, and the volume label"; 16_build_volumes.md,
+/// "Substrate").
 pub fn blank_template<R: CommandRunner>(
     backend: &MacOsApfsBackend<R>,
     store_root: &Path,
+    label: &str,
     capacity: ImageCapacity,
     taker: &dyn Taker,
 ) -> Result<PathBuf, TemplateError> {
@@ -210,6 +211,7 @@ pub fn blank_template<R: CommandRunner>(
         mint(
             backend,
             &blank_template_staged_stem(store_root, capacity),
+            label,
             capacity,
         )
         .and_then(|minted| rename_into_place(backend, &minted, &template))
@@ -222,13 +224,14 @@ pub fn blank_template<R: CommandRunner>(
 fn mint<R: CommandRunner>(
     backend: &MacOsApfsBackend<R>,
     staged_stem: &Path,
+    label: &str,
     capacity: ImageCapacity,
 ) -> Result<PathBuf, TemplateError> {
     let (owner_uid, owner_gid) = owner();
     let request = CreateImageRequest {
         staged_stem: staged_stem.to_owned(),
         capacity,
-        volume_name: BLANK_TEMPLATE_LABEL.to_owned(),
+        volume_name: label.to_owned(),
         owner_uid,
         owner_gid,
     };

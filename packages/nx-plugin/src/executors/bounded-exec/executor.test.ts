@@ -34,12 +34,14 @@ import {
   runBoundedExec,
   type TempVolume,
 } from './executor.js';
+import { GATEWAY_SOCKET } from './gateway-lease.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS, type HangDiagnostics } from './hang-diagnostics.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
 import {
   createHostCommands,
   describeRamTempError,
+  PRODUCTION,
   RAM_TEMP_CAPACITY_BYTES,
   type RamTempAcquisition,
   type RamTempError,
@@ -1327,7 +1329,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   }
 
   it("makes the user's ordinary scratch beside its RAM lock, outside every Git work tree and Cargo workspace", () => {
-    const volume = new RamTempVolume(ramTempPaths(userInfo()), RAM_TEMP_CAPACITY_BYTES, createHostCommands());
+    const volume = new RamTempVolume(
+      ramTempPaths(userInfo(), PRODUCTION),
+      RAM_TEMP_CAPACITY_BYTES,
+      createHostCommands(GATEWAY_SOCKET),
+    );
     expect(volume.ordinaryParent).toBe('/private/tmp');
     expect(enclosingTreeMarker(volume.ordinaryParent)).toBeNull();
   });

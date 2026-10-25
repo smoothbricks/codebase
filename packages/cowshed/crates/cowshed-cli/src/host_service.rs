@@ -19,6 +19,7 @@ use cowshed_core::api::server::{
     ConnectionAuthority, EventSource, HostRole, RouterCommand, RouterHandle, RouterRequest,
     RouterResponse, serve_controller_connection,
 };
+use cowshed_core::storage::bootstrap::{CanonicalRoots, GATEWAY_SOCKET_NAME};
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::stdio::Blocking;
 use tokio::sync::mpsc;
@@ -114,7 +115,7 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
             )
         }
         Op::HostGatewayStatus(_) => respond::<operations::HostGatewayStatus>(
-            &crate::gateway_service::service_status().await?,
+            &crate::gateway_service::service_status(&CanonicalRoots::global()).await?,
         ),
         Op::HostCredentialStatus(request) => {
             let root = crate::runtime::discover_project_root(&request.project).await?;
@@ -143,9 +144,10 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
         Op::HostClearNxStore(request) => {
             let root = crate::runtime::discover_project_root(&request.project).await?;
             let (repo_id, store) = crate::credential_service::project(&root).await?;
-            let cleared = crate::gateway_service::ControlSocket::at(store.join("gateway.sock"))?
-                .clear_nx_cache(&repo_id)
-                .await?;
+            let cleared =
+                crate::gateway_service::ControlSocket::at(store.join(GATEWAY_SOCKET_NAME))?
+                    .clear_nx_cache(&repo_id)
+                    .await?;
             respond::<operations::HostClearNxStore>(&cleared)
         }
         Op::HostGatewayStart(_) => {
@@ -156,7 +158,8 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
             )
         }
         Op::HostGatewayStop(request) => {
-            crate::gateway_service::stop(request.purge).await?;
+            crate::gateway_service::stop(CanonicalRoots::global().namespace(), request.purge)
+                .await?;
             respond::<operations::HostGatewayStop>(&EmptyResult {})
         }
         Op::HostLockHolders(request) => {
@@ -270,11 +273,16 @@ async fn answer(request: RouterRequest) -> Result<RouterResponse> {
             )
         }
         Op::SccacheStop(_) => {
-            crate::capabilities::sccache::service::stop_service()?;
+            crate::capabilities::sccache::service::stop_service(
+                CanonicalRoots::global().namespace(),
+            )?;
             respond::<operations::SccacheStop>(&EmptyResult {})
         }
         Op::SccacheStatusRead(_) => respond::<operations::SccacheStatusRead>(
-            &crate::capabilities::sccache::service::service_status().await?,
+            &crate::capabilities::sccache::service::service_status(
+                CanonicalRoots::global().namespace(),
+            )
+            .await?,
         ),
         other => Err(CowshedError::internal(format!(
             "{} reached the host router past the connection's scope check",

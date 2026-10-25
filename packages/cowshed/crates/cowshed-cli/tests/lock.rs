@@ -33,6 +33,7 @@ use cowshed_core::api::held_lock::LockWaiterEvent;
 use cowshed_core::runtime::job_groups::{await_exit_unreaped, signal_unreaped_group};
 use cowshed_core::storage::apfs::{ApfsExecutionHost as _, ApfsSubstrateConfig};
 use cowshed_core::storage::directory::DirectoryExecutionHost;
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use serde_json::Value;
 
 const POLL: Duration = Duration::from_millis(20);
@@ -1314,9 +1315,14 @@ fn image_lock_taker() {
         std::env::var(IMAGE_WORKSPACE_ENV).expect("the workspace the lock is taken for"),
     )
     .expect("a workspace name");
-    let host =
-        DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, store.join("checkout")))
-            .expect("open the directory store");
+    // A directory store's image lock names no namespace; this process mints one for its config.
+    let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
+    let host = DirectoryExecutionHost::new(ApfsSubstrateConfig::new(
+        namespace,
+        &store,
+        store.join("checkout"),
+    ))
+    .expect("open the directory store");
     let _held = host
         .lock_images(
             &[PathBuf::from(lock)],

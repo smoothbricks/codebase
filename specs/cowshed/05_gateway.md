@@ -25,23 +25,27 @@ naturally; child-spawn code does not change them. Kernel-wide descriptor capacit
 reconciles the generated plist as well as the installed cowshed (below), including on hosts whose installed copy already
 matches.
 
-The host-only control plane is host-netns `127.0.0.1:7644` (override `COWSHED_GATEWAY_PORT`) plus
-`/private/cowshed/store/gateway.sock` for status, audit tail, and coordinator verbs. Neither host endpoint is reachable
-from a workspace, and the sandbox baseline denies both. Linux separately reuses the numeric address `127.0.0.1:7644`
-inside each private netns for its data-plane connector; namespace separation makes it a different listener. Data-plane
-topology is platform-specific:
+The host-only control plane is host-netns `127.0.0.1:7644` (override `COWSHED_GATEWAY_PORT`) plus the store's
+`<store>/gateway.sock`, production's `/private/cowshed/store/gateway.sock`, for status, audit tail, and coordinator
+verbs; every client derives the socket from the store it was given, so a test namespace's gateway binds and answers only
+its own (01_storage.md, "Host namespace"). Neither host endpoint is reachable from a workspace, and the sandbox baseline
+denies both. Linux separately reuses the numeric address `127.0.0.1:7644` inside each private netns for its data-plane
+connector; namespace separation makes it a different listener. Data-plane topology is platform-specific:
 
-- **macOS — port block.** Every workspace, main included, gets a contiguous block of ports from 32768–49151, recorded as
-  `portBlock {base, size}` (04_sandbox.md: a power-of-two size, a base aligned to it; new workspaces get 64 ports, and a
-  live block grows only through a `service_ports` grant; one that moves keeps its old block reserved as
-  `retainedPortBlocks`, which carries no gateway listener). `portBlock` is allocated at fork (adopt for main), preserved
-  across restore, and present only in macOS grant files. The gateway binds `base`; `base+1 … base+size-1` are workspace
-  service ports. A session carries its block's recorded size, and the gateway validates the endpoint against it.
-  Seatbelt permits a workspace to connect only to its current and retained blocks. The destination `base` listener is
-  the primary, kernel-enforced workspace identity. Of two sessions whose blocks share a port, the gateway serves the
-  older workspace's and not the newer one's, at startup and in every per-project reconcile, with
-  `next: cowshed doctor --repair`, serving every other session (04_sandbox.md, `portBlock` collisions); neither startup
-  nor a reconcile fails over a collision.
+- **macOS — port block.** Every workspace, main included, gets a contiguous block of ports from the reserved range
+  32768–49151, the union of the host partition production allocates from and the fixture partition test namespaces
+  allocate from, recorded as `portBlock {base, size}` (04_sandbox.md: a power-of-two size, a base aligned to it; new
+  workspaces get 64 ports, and a live block grows only through a `service_ports` grant; one that moves keeps its old
+  block reserved as `retainedPortBlocks`, which carries no gateway listener). `portBlock` is allocated at fork (adopt
+  for main), preserved across restore, and present only in macOS grant files. The gateway binds `base`;
+  `base+1 … base+size-1` are workspace service ports. A session carries its block's recorded size, and the gateway
+  validates the endpoint against it. A store allocates from its namespace's partition: production from the host
+  partition (32768–45055), a test namespace's fixture store from the fixture partition (45056–49151), so no test block
+  is ever one production holds. Seatbelt permits a workspace to connect only to its current and retained blocks. The
+  destination `base` listener is the primary, kernel-enforced workspace identity. Of two sessions whose blocks share a
+  port, the gateway serves the older workspace's and not the newer one's, at startup and in every per-project reconcile,
+  with `next: cowshed doctor --repair`, serving every other session (04_sandbox.md, `portBlock` collisions); neither
+  startup nor a reconcile fails over a collision.
 - **Linux — Unix socket, private netns, and trusted connector.** No `portBlock` is allocated. The controller creates
   `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts
   that one socket as `/run/cowshed/gateway.sock` inside the workspace's private network namespace. The namespace has
@@ -793,15 +797,21 @@ connection open.
 ## Disk-lifecycle lease
 
 Disk-changing tools and descriptor-native unmounts cowshed runs on the host — the CLI's, a supervisor's, the gateway's
-own startup pass, and every test's — run under a host-wide lease the gateway schedules. One client path takes it:
-`SystemCommandRunner` admits disk children by command class and native `funmount` by namespace class through the same
-lease client. Setup uses that client too. Mount and unmount retain a registry-proven raw device pin across their lease
-wait and effect. Native unmount resolves and proves its current held root after admission, including when running
-unleased. Unpinned detach commands recheck positive exact-image/device registry ownership after the lease wait,
-immediately before spawning. An attach spends most of its time in StorageKit's `syncAllDisks`, after its device already
-exists, and that sync does not finish while the mount table keeps changing (01a_apfs.md, "How the APFS host degrades"),
-so attaches stall beside mount churn and stay fast once the two are kept apart. Attaches among themselves only queue on
-`storagekitd`; so the lease is two classes that exclude each other rather than N interchangeable tokens.
+own startup pass, and a test's — run under a lease the gateway of their host namespace schedules (01_storage.md, "Host
+namespace"): production's gateway leases production's disk work and nothing else, and a test namespace's disk work
+leases from the gateway at its root, `<ns root>/gateway.sock`, the RAM fixture gateway where one runs, and otherwise
+runs unleased. A test therefore never queues on, holds or spaces out production's disk phases. `storagekitd` is a
+physical host resource every attach shares: a test bounds its effect on it by attaching only where an image's behavior
+is what the test proves (08_testing.md), never by holding production's lease. One client path takes the lease:
+`SystemCommandRunner`, built from a namespace, admits disk children by command class and native `funmount` by namespace
+class through the same lease client. Setup uses that client too. Mount and unmount retain a registry-proven raw device
+pin across their lease wait and effect. Native unmount resolves and proves its current held root after admission,
+including when running unleased. Unpinned detach commands recheck positive exact-image/device registry ownership after
+the lease wait, immediately before spawning. An attach spends most of its time in StorageKit's `syncAllDisks`, after its
+device already exists, and that sync does not finish while the mount table keeps changing (01a_apfs.md, "How the APFS
+host degrades"), so attaches stall beside mount churn and stay fast once the two are kept apart. Attaches among
+themselves only queue on `storagekitd`; so the lease is two classes that exclude each other rather than N
+interchangeable tokens.
 
 - **Storage**: `diskutil`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs`, `umount`, and owned-root native
   `funmount`. Cowshed's image unmount is the native namespace effect, not a DA command. An operator's `diskutil` facade
@@ -897,7 +907,9 @@ Registry entry, which it reads right after the attach, and detaches the disk onl
 and its whole disk: the disk just attached for it when its provisioning fails, and any later one, a stray it reclaims
 included. It never detaches one through `disk-command`, and never with `-force`. The helper's own session keeps it out
 of the gateway's process group, so a gateway restart leaves the disk attached. A caller that stops waiting leaves the
-attach running; a disk it never collects is a stray the volume's next creator reclaims.
+attach running. A volume counts as its own only the disks of its uid and size that carry its exact volume name at its
+mountpoint or staging, or whose registry entry its ledger or a receipt records; it reclaims those strays and ignores
+every other disk, so a disk of another namespace, a test's, is never taken for production's.
 
 `ram-detach` is the gateway's other RAM disk mutation and has the attach's owner. The gateway forks
 `hdiutil detach <device>` through `SystemCommandRunner`'s registry-bound detach under the storage class of its own
@@ -927,12 +939,12 @@ A requester that receives no answer knows no more than `unknown`. The gateway sa
 `cowshed: ram-detach <device> entry=<entry> outcome=<outcome>` followed by the status or the cause.
 
 The regression is `cowshed-gateway`'s `a_ram_disk_the_gateway_attaches_outlives_the_job_that_asked_for_it`: a fixture
-gateway on its own socket attaches a disk of a size no other process uses for a job the test's process monitor owns.
-When the job concludes, its retirement signals no `diskimages-helper` and the disk stays registered; the same attach
-forked inside the job is retired with it and the disk leaves the registry. Only the fixture's own disks are detached.
-The detach's are `cowshed-gateway`'s `ram_detach` tests, each on a fixture gateway of its own with disks only it
-attached: `a_ram_detach_outlives_the_requester_that_asked_for_it` kills a job's requester and retires its job while the
-detach waits behind a namespace phase the test holds; the retirement signals no `hdiutil`, and the disk leaves the
+gateway on its own test namespace's socket attaches a disk of a size no other process uses for a job the test's process
+monitor owns. When the job concludes, its retirement signals no `diskimages-helper` and the disk stays registered; the
+same attach forked inside the job is retired with it and the disk leaves the registry. Only the fixture's own disks are
+detached. The detach's are `cowshed-gateway`'s `ram_detach` tests, each on a fixture gateway of its own with disks only
+it attached: `a_ram_detach_outlives_the_requester_that_asked_for_it` kills a job's requester and retires its job while
+the detach waits behind a namespace phase the test holds; the retirement signals no `hdiutil`, and the disk leaves the
 registry once the phase drains. `a_ram_detach_refuses_an_entry_that_does_not_register_the_device` swaps the entries of
 two fixture disks, answers `not-started` for both and leaves both registered, then detaches one by its own entry while
 the other stays registered under the same whole disk.

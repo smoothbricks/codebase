@@ -12,11 +12,13 @@ use cowshed_cli::launchd::{
 };
 use cowshed_cli::output::Output;
 use cowshed_core::api::{GatewayCpuBudget, GatewayStatus as CliGatewayStatus};
-use cowshed_core::{CowshedError, Result};
+use cowshed_core::storage::bootstrap::CanonicalRoots;
+use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
 use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
     CpuWaiter,
 };
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -80,6 +82,7 @@ fn bun() -> BunDirectory {
 
 fn launch_spec() -> LaunchAgentSpec {
     LaunchAgentSpec::gateway(
+        HostNamespace::Production,
         &HostStableExecutable::new(Path::new("/Users/test"), COWSHED_BINARY_NAME)
             .expect("valid host-stable binary"),
         &bun(),
@@ -215,6 +218,31 @@ fn production_config_disables_tcp_and_uses_validated_roots_and_fixed_helper() {
     assert_eq!(config.production_cache_dir, Some(paths.cache_dir));
     assert_eq!(config.mirror_cache.cache_root, paths.mirror_cache);
     assert_eq!(config.git_helper_executable, Some(helper));
+}
+
+/// The daemon binds the control socket of the storage it was given (05_gateway.md, "Placement and
+/// identity"): a test namespace's store has its own, never production's.
+#[test]
+fn the_daemons_control_socket_is_its_storages_own() {
+    let store = PathBuf::from("/tmp/cowshed-gateway-paths/store");
+    let storage = ValidatedHostStorage::new(
+        PathBuf::from("/tmp/cowshed-gateway-paths"),
+        Vec::new(),
+        CanonicalRoots::fixture(
+            TestNamespace::mint().expect("a test namespace"),
+            store.clone(),
+        ),
+    );
+
+    let paths = GatewayPaths::from_storage(&storage);
+
+    assert_eq!(paths.control_socket, store.join("gateway.sock"));
+    assert_eq!(paths.control_socket, storage.control_socket());
+    assert_ne!(
+        paths.control_socket,
+        CanonicalRoots::global().control_socket(),
+        "a fixture namespace's gateway never binds production's socket"
+    );
 }
 
 struct FakeDrainer(Arc<AtomicBool>);
@@ -931,7 +959,8 @@ fn installing_the_agent_binary_publishes_a_content_addressed_copy_and_reuses_it(
         "what the daemon and the PATH entry run is the stored copy"
     );
     // The plist launchd reads names the stable name, which never changes with the build.
-    let spec = LaunchAgentSpec::gateway(&executable, &bun()).expect("valid spec");
+    let spec = LaunchAgentSpec::gateway(HostNamespace::Production, &executable, &bun())
+        .expect("valid spec");
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
     // A current copy is left in place: same inode, no rewrite of a running binary.
@@ -1012,7 +1041,8 @@ fn installing_from_a_workspace_build_copies_onto_the_host_volume() {
         !stored.starts_with(home.join(".cowshed")),
         "nothing under the workspace is named"
     );
-    let spec = LaunchAgentSpec::gateway(&executable, &bun()).expect("valid spec");
+    let spec = LaunchAgentSpec::gateway(HostNamespace::Production, &executable, &bun())
+        .expect("valid spec");
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
     fs::remove_dir_all(&home).expect("remove scratch home");

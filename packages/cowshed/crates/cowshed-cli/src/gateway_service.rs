@@ -5,12 +5,11 @@ use crate::install_basis::{self, InstallSlot};
 use crate::land_turn::local_clock;
 use crate::launchd::{
     BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, DevenvProfile, ExecutableDigest,
-    ExecutableInstallState, ExistingPlist, GATEWAY_LABEL, HostStableExecutable, InstallOutcome,
-    InstallState, InstalledExecutable, LaunchAgentSpec, LaunchAgentTarget, LaunchctlCommand,
-    LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
-    NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint,
-    plan_cargo_link_removal, plan_executable_install, plan_executable_remove, plan_install,
-    plan_remove, replace_symlink,
+    ExecutableInstallState, ExistingPlist, HostStableExecutable, InstallOutcome, InstallState,
+    InstalledExecutable, LaunchAgentSpec, LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor,
+    LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand,
+    PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint, plan_cargo_link_removal,
+    plan_executable_install, plan_executable_remove, plan_install, plan_remove, replace_symlink,
 };
 use crate::output::Output;
 use crate::path_entry::PathEntryOutcome;
@@ -30,6 +29,7 @@ use cowshed_core::runtime::supervisor_manager::{
     self, ProgramSpawner, SocketPeers, SupervisorManager,
 };
 use cowshed_core::runtime::supervisor_socket;
+use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::{
     CowshedError, ErrorCode, GatewayStoreBackend, NativeGatewayInventory, Result, StartupHealState,
     ValidatedHostStorage, validate_existing_host_storage,
@@ -39,6 +39,7 @@ use cowshed_gateway::{
     GatewayControlClient, GatewayError, GatewayHandle, MirrorCacheConfig, StartupHeal,
     StartupProbe, SupervisorRecovery, WorkspaceSession,
 };
+use cowshed_os::namespace::HostNamespace;
 use cowshed_os::stdio::Blocking;
 use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
@@ -57,14 +58,11 @@ pub use cowshed_core::gateway_sessions::{
     reconcile_against_status, reconcile_project, reconcile_project_with_reallocator,
     session_from_fact, sessions_from_facts, stable_workspace_id,
 };
-pub use cowshed_gateway_types::control_socket_path;
 use std::collections::BTreeSet;
 
 /// Bind the runtime's gateway dependency once, without making a control request during open.
 pub fn runtime_control(storage: &ValidatedHostStorage) -> Result<Box<dyn GatewayControl>> {
-    Ok(Box::new(ControlSocket::at(
-        storage.store().join("gateway.sock"),
-    )?))
+    Ok(Box::new(ControlSocket::at(storage.control_socket())?))
 }
 
 /// A running daemon reached over its control socket.
@@ -346,7 +344,7 @@ async fn reconcile_project_for_backend(
     backend: GatewayStoreBackend,
 ) -> Result<ReconcileReport> {
     let inventory = NativeSessionInventory::with_backend(storage.clone(), backend);
-    let control = ControlSocket::at(storage.store().join("gateway.sock"))?;
+    let control = ControlSocket::at(storage.control_socket())?;
     let reallocator = NativePortReallocator {
         storage,
         repo_id,
@@ -399,7 +397,7 @@ impl GatewayPaths {
             cache_dir: cowshed_core::host_dirs::cache_directory(storage.home()),
             mirror_cache: cowshed_core::host_dirs::gateway_mirror(storage.home()),
             telemetry: storage.telemetry().join("gateway"),
-            control_socket: storage.store().join("gateway.sock"),
+            control_socket: storage.control_socket(),
         }
     }
 
@@ -744,7 +742,7 @@ where
             emit_gateway_status(output, json, status)?;
         }
         GatewayCommand::Stop { purge } => {
-            let purged = stop(purge).await?;
+            let purged = stop(CanonicalRoots::global().namespace(), purge).await?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
             } else {
@@ -766,7 +764,7 @@ where
             }
         }
         GatewayCommand::Status => {
-            let status = service_status().await?;
+            let status = service_status(&CanonicalRoots::global()).await?;
             emit_gateway_status(output, json, status)?;
         }
         GatewayCommand::Run => run_daemon().await?,
@@ -786,13 +784,13 @@ where
 }
 
 /// `gateway stop [--purge]` and `host.gatewayStop`. A purge empties the install slot, so it waits
-/// its turn like any install does.
-pub(crate) async fn stop(purge: bool) -> Result<RemovalOutcome> {
+/// its turn like any install does. `namespace` is the host's, whose agent is stopped.
+pub(crate) async fn stop(namespace: HostNamespace, purge: bool) -> Result<RemovalOutcome> {
     let _slot = match purge {
         true => Some(take_install_slot(&canonical_home()?).await?),
         false => None,
     };
-    stop_service(purge)
+    stop_service(namespace, purge)
 }
 
 /// Install the running build and start the gateway onto it. `slot` is the install slot this
@@ -828,7 +826,8 @@ where
         refuse_restart_while_busy(slot, &home, &client, &mut Blocking::new(io::stderr())).await?;
     }
     install_nx_cache_server(&mut executor, &home, &candidate.source)?;
-    let spec = LaunchAgentSpec::gateway(&executable, &bun).map_err(launchd_error)?;
+    let spec =
+        LaunchAgentSpec::gateway(storage.namespace(), &executable, &bun).map_err(launchd_error)?;
     let observed = inspect_install_state(spec.target())?;
     let plan = plan_install(
         &spec,
@@ -980,7 +979,7 @@ where
                     "gateway did not become healthy within {}s of starting",
                     START_DEADLINE.as_secs()
                 ),
-                kickstart_hint(uid, GATEWAY_LABEL),
+                kickstart_hint(uid, target.label()),
             ));
         }
         if let Some(line) = progress.line(waited, waiting) {
@@ -1150,9 +1149,16 @@ fn stored_files(
 ///
 /// Deterministic on purpose: stop and uninstall have to reach the agent `start` installed however
 /// this process was invoked, and need neither the plist's contents nor a `bun` on this `PATH`.
-pub fn gateway_launch_agent(home: &Path) -> Result<(HostStableExecutable, LaunchAgentTarget)> {
+///
+/// The agent is `namespace`'s ([`HostNamespace::launchd_label`]): production's is
+/// `dev.cowshed.gateway`.
+pub fn gateway_launch_agent(
+    namespace: HostNamespace,
+    home: &Path,
+) -> Result<(HostStableExecutable, LaunchAgentTarget)> {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    let target = LaunchAgentTarget::new(home, GATEWAY_LABEL).map_err(launchd_error)?;
+    let target =
+        LaunchAgentTarget::new(home, &namespace.launchd_label("gateway")).map_err(launchd_error)?;
     Ok((executable, target))
 }
 
@@ -1179,9 +1185,9 @@ fn invoking_bun() -> Result<BunDirectory> {
 ///
 /// Without `purge` the copy stays: it is host state rather than agent state, and leaving it makes
 /// the next `start` a plist write instead of a fresh multi-megabyte copy.
-fn stop_service(purge: bool) -> Result<RemovalOutcome> {
+fn stop_service(namespace: HostNamespace, purge: bool) -> Result<RemovalOutcome> {
     let home = canonical_home()?;
-    let (executable, target) = gateway_launch_agent(&home)?;
+    let (executable, target) = gateway_launch_agent(namespace, &home)?;
     remove_launch_agent(&target)?;
     if purge {
         remove_path_entries(executable.path())?;
@@ -1226,8 +1232,8 @@ pub(crate) fn remove_path_entries(stable: &Path) -> Result<RemovalOutcome> {
 /// Stop the gateway while setup moves its mirrors; the installed binary stays. A gateway that
 /// answers is refused the stop while a land or a gate of it runs ([`refuse_restart_while_busy`]):
 /// stopping it cuts them off as a restart does.
-pub(crate) async fn stop_for_host_move(slot: &InstallSlot) -> Result<()> {
-    let client = GatewayControlClient::new(control_socket_path()).map_err(control_error)?;
+pub(crate) async fn stop_for_host_move(slot: &InstallSlot, roots: &CanonicalRoots) -> Result<()> {
+    let client = GatewayControlClient::new(roots.control_socket()).map_err(control_error)?;
     if client.status().await.is_ok() {
         refuse_restart_while_busy(
             slot,
@@ -1237,7 +1243,7 @@ pub(crate) async fn stop_for_host_move(slot: &InstallSlot) -> Result<()> {
         )
         .await?;
     }
-    stop_service(false).map(|_| ())
+    stop_service(roots.namespace(), false).map(|_| ())
 }
 
 /// Start the gateway again after setup moved its mirrors, saying nothing: setup reports the
@@ -1247,8 +1253,8 @@ pub(crate) async fn start_after_host_move(slot: &InstallSlot, downgrade: Downgra
     start_service(&mut quiet, slot, downgrade).await.map(|_| ())
 }
 
-pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
-    let Ok(status) = observe_service(|client| async move {
+pub(crate) async fn service_status(roots: &CanonicalRoots) -> Result<CliGatewayStatus> {
+    let Ok(status) = observe_service(roots, |client| async move {
         Ok::<_, Infallible>(match client.status().await {
             Ok(status) => Some((status, read_cpu_budget(&client).await)),
             Err(_) => None,
@@ -1270,10 +1276,11 @@ pub(crate) struct Unanswered {
 /// [`service_status`] for `doctor`, from a gateway that must answer within `within` of taking
 /// each request (specs/cowshed/06_cli.md, "doctor"): one that stays silent is [`Unanswered`].
 pub(crate) async fn service_status_within(
+    roots: &CanonicalRoots,
     within: Duration,
 ) -> Result<std::result::Result<CliGatewayStatus, Unanswered>> {
-    let socket = control_socket_path();
-    observe_service(|client| async move {
+    let socket = roots.control_socket();
+    observe_service(roots, |client| async move {
         match client.status_within(within).await {
             Ok(status) => {
                 let cpu_budget = match client.cpu_budget_within(within).await {
@@ -1296,17 +1303,16 @@ pub(crate) async fn service_status_within(
 /// The gateway's status as launchd and the daemon report it, `ask` putting the questions to a
 /// loaded daemon; what `ask` cannot answer for is its own error.
 async fn observe_service<E, Asked>(
+    roots: &CanonicalRoots,
     ask: impl FnOnce(GatewayControlClient) -> Asked,
 ) -> Result<std::result::Result<CliGatewayStatus, E>>
 where
     Asked: Future<Output = std::result::Result<Option<(DaemonStatus, GatewayCpuBudget)>, E>>,
 {
     let home = canonical_home()?;
-    let socket = control_socket_path();
-    let executable =
-        HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let socket = roots.control_socket();
+    let (executable, target) = gateway_launch_agent(roots.namespace(), &home)?;
     let pending_install = InstallSlot::observe(executable.support_directory())?;
-    let target = LaunchAgentTarget::new(&home, GATEWAY_LABEL).map_err(launchd_error)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let installed = matches!(
         executor
@@ -1565,7 +1571,7 @@ async fn run_daemon() -> Result<()> {
         // "RAM disks").
         #[cfg(target_os = "macos")]
         ram_disks: Some(Arc::new(cowshed_apfs::ram_disk::SystemRamDisks::new(
-            paths.control_socket.clone(),
+            storage.namespace(),
         ))),
         ..paths.config(effective_uid(), executable)
     };
@@ -2901,19 +2907,22 @@ pub fn installed_binary_is_stale(
 /// copied, and a failed activation puts the old binary back: this is the function that,
 /// no loaded agent. The caller holds the install slot: `slot` ([`take_install_slot`]), and a
 /// refresh that restarted the gateway returns only once it serves ([`await_healthy`]), so the
-/// slot is released to a gateway a land step can reach.
+/// slot is released to a gateway a land step can reach. `roots` are the host's: their namespace
+/// names the agent refreshed and their store holds the control socket it answers on.
 pub async fn refresh_gateway_binary(
     slot: &InstallSlot,
+    roots: &CanonicalRoots,
     home: &Path,
     downgrade: Downgrade,
 ) -> Result<Option<ServiceBinaryRefresh>> {
     let candidate = Candidate::of(running_executable()?, BuildRecord::running())?;
-    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let (executable, target) = gateway_launch_agent(roots.namespace(), home)?;
     let basis = check_basis(&executable, &candidate, downgrade, async || {
         adopted_mains(home).await
     })
     .await;
-    let client = GatewayControlClient::new(control_socket_path()).ok();
+    let socket = roots.control_socket();
+    let client = GatewayControlClient::new(socket.clone()).ok();
     let daemon = match &client {
         Some(client) => client.status().await.ok(),
         None => None,
@@ -2925,8 +2934,9 @@ pub async fn refresh_gateway_binary(
         .map(|client| (slot, client));
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     // Held until the restarted gateway serves (`await_healthy` below).
-    let _carrying = carry_listeners(&control_socket_path(), downgrade);
+    let _carrying = carry_listeners(&socket, downgrade);
     let refresh = refresh_gateway_from(
+        roots.namespace(),
         home,
         IncomingBuild {
             candidate: &candidate,
@@ -2940,9 +2950,7 @@ pub async fn refresh_gateway_binary(
     )
     .await?;
     if let Some(ServiceBinaryRefresh::Refreshed { .. }) = &refresh {
-        let socket = control_socket_path();
         let client = GatewayControlClient::new(socket.clone()).map_err(control_error)?;
-        let target = LaunchAgentTarget::new(home, GATEWAY_LABEL).map_err(launchd_error)?;
         // Setup reports the refresh itself; the wait says only what it is still waiting for.
         let mut output = Output::new(io::sink(), Blocking::new(io::stderr()), false);
         await_healthy(
@@ -2975,6 +2983,7 @@ struct IncomingBuild<'a> {
 /// ([`refuse_restart_while_busy`]). `bun` is asked only when a gateway agent is installed: a host
 /// without one needs no interpreter.
 async fn refresh_gateway_from<C: LaunchctlCommand>(
+    namespace: HostNamespace,
     home: &Path,
     incoming: IncomingBuild<'_>,
     daemon: Option<&DaemonStatus>,
@@ -2987,13 +2996,12 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
         debug_build,
         basis,
     } = incoming;
-    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    let target = LaunchAgentTarget::new(home, GATEWAY_LABEL).map_err(launchd_error)?;
+    let (executable, target) = gateway_launch_agent(namespace, home)?;
     let observed = inspect_install_state(&target)?;
     if observed.plist.is_none() {
         return Ok(None);
     }
-    let spec = LaunchAgentSpec::gateway(&executable, &bun()?).map_err(launchd_error)?;
+    let spec = LaunchAgentSpec::gateway(namespace, &executable, &bun()?).map_err(launchd_error)?;
     let plan = plan_install(
         &spec,
         InstallState {
@@ -3426,6 +3434,7 @@ pub(crate) fn output_error(error: io::Error) -> CowshedError {
 mod tests {
     use super::*;
     use crate::launchd::STABLE_BINARY_MODE;
+    use cowshed_os::namespace::TestNamespace;
 
     type RecordingExecutor = LaunchdExecutor<NativeFilesystem, RecordingGatewayLaunchctl>;
 
@@ -3482,7 +3491,9 @@ mod tests {
     fn host_with_agent(label: &str) -> (PathBuf, HostStableExecutable, LaunchAgentSpec) {
         let home = scratch_root(label);
         let executable = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).unwrap();
-        let spec = LaunchAgentSpec::gateway(&executable, &test_bun(&home)).unwrap();
+        let spec =
+            LaunchAgentSpec::gateway(HostNamespace::Production, &executable, &test_bun(&home))
+                .unwrap();
         let mut filesystem = NativeFilesystem::new();
         for directory in [
             executable.support_directory(),
@@ -3646,6 +3657,7 @@ mod tests {
         ] {
             let candidate = Candidate::of(source, None).unwrap();
             let refreshed = refresh_gateway_from(
+                HostNamespace::Production,
                 &home,
                 IncomingBuild {
                     candidate: &candidate,
@@ -3662,7 +3674,7 @@ mod tests {
             assert_eq!(
                 refreshed,
                 Some(ServiceBinaryRefresh::Refreshed {
-                    service: GATEWAY_LABEL.to_owned(),
+                    service: "dev.cowshed.gateway".to_owned(),
                 })
             );
             assert_eq!(fs::read(spec.plist_path()).unwrap(), desired);
@@ -3675,6 +3687,7 @@ mod tests {
             );
             assert_eq!(
                 refresh_gateway_from(
+                    HostNamespace::Production,
                     &home,
                     IncomingBuild {
                         candidate: &candidate,
@@ -3696,6 +3709,72 @@ mod tests {
         assert_eq!(command.argv.len(), 6);
         assert_eq!(command.argv[2][0], "bootstrap");
         assert_eq!(command.argv[5][0], "bootstrap");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A refresh in one host namespace reconciles that namespace's agent and no other's
+    /// (01_storage.md, "Host namespace"): over a home that holds production's installed agent, a
+    /// test namespace has no agent, so it plans nothing, runs no launchctl command, and leaves
+    /// production's plist as it was.
+    #[tokio::test]
+    async fn a_refresh_in_a_test_namespace_leaves_the_production_agent_alone() {
+        let (home, _, production) = host_with_agent("namespaced-refresh");
+        let candidate = build(&home, "incoming", b"an incoming build", None);
+        let plist = fs::read(production.plist_path()).unwrap();
+        let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
+        let mut executor: RecordingExecutor = LaunchdExecutor::new(
+            NativeFilesystem::new(),
+            RecordingGatewayLaunchctl::default(),
+        );
+
+        let refreshed = refresh_gateway_from(
+            namespace,
+            &home,
+            IncomingBuild {
+                candidate: &candidate,
+                debug_build: false,
+                basis: Ok(()),
+            },
+            None,
+            None,
+            &mut executor,
+            || Ok(test_bun(&home)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshed, None, "{} installed no agent", namespace.name());
+        assert_eq!(fs::read(production.plist_path()).unwrap(), plist);
+        let (_, command) = executor.into_parts();
+        assert!(command.argv.is_empty(), "{:?}", command.argv);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The agent a namespace's verbs reach is the one its label names, in the home's
+    /// LaunchAgents: production's `dev.cowshed.gateway`, a test namespace's its own.
+    #[test]
+    fn the_gateway_agent_is_labelled_by_its_host_namespace() {
+        let home = scratch_root("agent-label");
+        let namespace = TestNamespace::mint().expect("a test namespace");
+
+        let (_, production) = gateway_launch_agent(HostNamespace::Production, &home).unwrap();
+        assert_eq!(production.label(), "dev.cowshed.gateway");
+        assert_eq!(
+            production.plist_path(),
+            home.join("Library/LaunchAgents/dev.cowshed.gateway.plist")
+        );
+
+        let (_, test) = gateway_launch_agent(HostNamespace::Test(namespace), &home).unwrap();
+        assert_eq!(
+            test.label(),
+            format!("dev.cowshed-test-{namespace}.gateway")
+        );
+        assert_eq!(
+            test.plist_path(),
+            home.join(format!(
+                "Library/LaunchAgents/dev.cowshed-test-{namespace}.gateway.plist"
+            ))
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -3735,6 +3814,7 @@ mod tests {
                 replace_symlink(target, &cargo).unwrap();
             }
             refresh_gateway_from(
+                HostNamespace::Production,
                 &home,
                 IncomingBuild {
                     candidate: &candidate,
@@ -3878,6 +3958,7 @@ mod tests {
         );
         let refresh = async |executor: &mut RecordingExecutor, daemon: Option<&DaemonStatus>| {
             refresh_gateway_from(
+                HostNamespace::Production,
                 &home,
                 IncomingBuild {
                     candidate: &candidate,
@@ -3908,7 +3989,7 @@ mod tests {
             assert_eq!(
                 refresh(&mut executor, Some(&stale)).await,
                 Some(ServiceBinaryRefresh::Refreshed {
-                    service: GATEWAY_LABEL.to_owned(),
+                    service: "dev.cowshed.gateway".to_owned(),
                 })
             );
         }
@@ -3965,6 +4046,7 @@ mod tests {
             )
             .await;
             refresh_gateway_from(
+                HostNamespace::Production,
                 &home,
                 IncomingBuild {
                     candidate,
@@ -3997,7 +4079,7 @@ mod tests {
             else {
                 panic!("{} must be refused", refused.source.display());
             };
-            assert_eq!(service, GATEWAY_LABEL);
+            assert_eq!(service, "dev.cowshed.gateway");
             assert!(
                 reason.contains(refused.source.to_str().unwrap()),
                 "the refusal names the binary it would have installed: {reason}"
@@ -4080,6 +4162,7 @@ mod tests {
         );
         assert!(matches!(
             refresh_gateway_from(
+                HostNamespace::Production,
                 &home,
                 IncomingBuild {
                     candidate: &candidate,
@@ -4376,6 +4459,7 @@ mod tests {
             RecordingGatewayLaunchctl::default(),
         );
         let error = refresh_gateway_from(
+            HostNamespace::Production,
             &home,
             IncomingBuild {
                 candidate: &candidate,
@@ -5237,8 +5321,8 @@ mod tests {
                         NativeFilesystem::new(),
                         RecordingGatewayLaunchctl::default(),
                     );
-                    let target =
-                        LaunchAgentTarget::new(Path::new("/tmp"), GATEWAY_LABEL).expect("target");
+                    let target = LaunchAgentTarget::new(Path::new("/tmp"), "dev.cowshed.gateway")
+                        .expect("target");
                     let mut output = Output::new(Vec::new(), Vec::new(), false);
                     let served = await_healthy(
                         &mut output,
@@ -5313,7 +5397,7 @@ mod tests {
     #[test]
     fn kickstart_guidance_targets_the_per_user_domain() {
         assert_eq!(
-            kickstart_hint(501, GATEWAY_LABEL),
+            kickstart_hint(501, "dev.cowshed.gateway"),
             "launchctl kickstart -k gui/501/dev.cowshed.gateway"
         );
     }

@@ -18,15 +18,16 @@ use crate::gateway_service::{
 use crate::launchd::{
     ExistingPlist, InstallState, LaunchAgentSpec, LaunchAgentTarget, LaunchdExecutor,
     LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand, PRIVATE_PLIST_MODE,
-    SCCACHE_LABEL, StoreBackedProgram, kickstart_hint, plan_install,
+    StoreBackedProgram, kickstart_hint, plan_install,
 };
 use crate::output::Output;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
 use cowshed_core::capabilities::sccache::{cache_directory, gc_root, server_socket};
-use cowshed_core::storage::bootstrap::ValidatedHostStorage;
+use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
 use cowshed_os::fork_lock::RunAsync as _;
+use cowshed_os::namespace::HostNamespace;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt as _;
@@ -72,7 +73,7 @@ where
             emit_sccache_status(output, json, status)?;
         }
         SccacheCommand::Stop => {
-            stop_service()?;
+            stop_service(CanonicalRoots::global().namespace())?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
             } else {
@@ -82,7 +83,7 @@ where
             }
         }
         SccacheCommand::Status => {
-            let status = service_status().await?;
+            let status = service_status(CanonicalRoots::global().namespace()).await?;
             emit_sccache_status(output, json, status)?;
         }
     }
@@ -130,6 +131,7 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let program = installed_program(&home)?;
     let spec = LaunchAgentSpec::sccache(
+        storage.namespace(),
         &program,
         &socket,
         &cache_directory,
@@ -328,16 +330,16 @@ pub(crate) async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<I
     ))
 }
 
-pub(crate) fn stop_service() -> Result<()> {
+pub(crate) fn stop_service(namespace: HostNamespace) -> Result<()> {
     let home = canonical_home()?;
-    remove_launch_agent(&control_target(&home)?)?;
+    remove_launch_agent(&control_target(namespace, &home)?)?;
     remove_stale_socket(&server_socket())?;
     Ok(())
 }
 
 /// Stop the daemon while setup moves its store; setup starts it again afterwards.
-pub(crate) fn stop_for_host_move() -> Result<()> {
-    stop_service()
+pub(crate) fn stop_for_host_move(namespace: HostNamespace) -> Result<()> {
+    stop_service(namespace)
 }
 
 /// The socket file is the daemon's artifact and cowshed owns its lifecycle: a booted-out server
@@ -359,8 +361,8 @@ pub(crate) fn remove_stale_socket(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn service_status() -> Result<SccacheStatus> {
-    let (home, socket, installed, running) = observe_agent().await?;
+pub(crate) async fn service_status(namespace: HostNamespace) -> Result<SccacheStatus> {
+    let (home, socket, installed, running) = observe_agent(namespace).await?;
     let stats = if running {
         read_stats(&home, &socket).await
     } else {
@@ -382,9 +384,10 @@ async fn read_stats(home: &Path, socket: &Path) -> Option<SccacheStats> {
 /// `within` (specs/cowshed/06_cli.md, "doctor"): one that took the connection and stays silent
 /// is [`Unanswered`], beside a status that reports no statistics.
 pub(crate) async fn service_status_within(
+    namespace: HostNamespace,
     within: Duration,
 ) -> Result<(SccacheStatus, Option<Unanswered>)> {
-    let (home, socket, installed, running) = observe_agent().await?;
+    let (home, socket, installed, running) = observe_agent(namespace).await?;
     let (stats, unanswered) = match stats_command(&home, &socket).filter(|_| running) {
         None => (None, None),
         Some(mut command) => {
@@ -415,10 +418,10 @@ pub(crate) async fn service_status_within(
 
 /// The agent's home and socket, whether launchd has it loaded, and whether its socket takes a
 /// connection.
-async fn observe_agent() -> Result<(PathBuf, PathBuf, bool, bool)> {
+async fn observe_agent(namespace: HostNamespace) -> Result<(PathBuf, PathBuf, bool, bool)> {
     let home = canonical_home()?;
     let socket = server_socket();
-    let target = control_target(&home)?;
+    let target = control_target(namespace, &home)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let installed = match executor
         .execute_status(&crate::launchd::ControlPlan::print(
@@ -484,9 +487,10 @@ fn parse_stats(output: std::process::Output) -> Option<SccacheStats> {
 /// A target rather than a whole definition, because `stop` and `status` must reach the agent
 /// `start` installed even when the program it names is gone — a store path whose GC root was
 /// deleted and then collected is exactly that state, and it is one `doctor` has to be able to
-/// report rather than one that makes the control verbs unconstructible.
-pub(crate) fn control_target(home: &Path) -> Result<LaunchAgentTarget> {
-    LaunchAgentTarget::new(home, SCCACHE_LABEL).map_err(launchd_error)
+/// report rather than one that makes the control verbs unconstructible. The agent is
+/// `namespace`'s ([`HostNamespace::launchd_label`]): production's is `dev.cowshed.sccache`.
+pub(crate) fn control_target(namespace: HostNamespace, home: &Path) -> Result<LaunchAgentTarget> {
+    LaunchAgentTarget::new(home, &namespace.launchd_label("sccache")).map_err(launchd_error)
 }
 
 /// The sccache agent's control target, its nix GC root, and its socket — everything
@@ -495,8 +499,15 @@ pub(crate) fn control_target(home: &Path) -> Result<LaunchAgentTarget> {
 /// Returned together because the order matters: the agent is deactivated before the root is
 /// released. Removing the root first would leave a `KeepAlive` agent respawning a store path the
 /// next collection is entitled to delete.
-pub(crate) fn sccache_launch_agent(home: &Path) -> Result<(LaunchAgentTarget, PathBuf, PathBuf)> {
-    Ok((control_target(home)?, gc_root(home), server_socket()))
+pub(crate) fn sccache_launch_agent(
+    namespace: HostNamespace,
+    home: &Path,
+) -> Result<(LaunchAgentTarget, PathBuf, PathBuf)> {
+    Ok((
+        control_target(namespace, home)?,
+        gc_root(home),
+        server_socket(),
+    ))
 }
 
 /// The sccache this host installed, named by its own nix GC root.
@@ -541,6 +552,7 @@ pub fn emit_sccache_status<W: Write, E: Write>(
 mod tests {
     use super::*;
     use cowshed_gateway_types::STORE_ROOT;
+    use cowshed_os::namespace::TestNamespace;
 
     /// A canonical absolute home, as every host-path type requires.
     fn scratch_home(label: &str) -> PathBuf {
@@ -587,6 +599,7 @@ mod tests {
         // The plist launchd reads names that store path, not the out-link: a rebuild is therefore a
         // changed plist rather than a silently substituted program.
         let spec = LaunchAgentSpec::sccache(
+            HostNamespace::Production,
             &program,
             Path::new("/private/cowshed/store/sccache.sock"),
             Path::new("/Users/cowshed-test/Library/Caches/Mozilla.sccache"),
@@ -681,8 +694,9 @@ mod tests {
     fn the_control_target_needs_no_program_at_all() {
         let home = scratch_home("control");
 
-        let target = control_target(&home).expect("a control target needs only a home and a label");
-        assert_eq!(target.label(), SCCACHE_LABEL);
+        let target = control_target(HostNamespace::Production, &home)
+            .expect("a control target needs only a home and a label");
+        assert_eq!(target.label(), "dev.cowshed.sccache");
         assert_eq!(
             target.plist_path(),
             home.join("Library/LaunchAgents/dev.cowshed.sccache.plist")
@@ -690,10 +704,33 @@ mod tests {
 
         // And teardown names the root rather than a copied binary: releasing the root is what lets
         // the store path be collected.
-        let (agent, root, socket) = sccache_launch_agent(&home).expect("teardown artifacts");
-        assert_eq!(agent.label(), SCCACHE_LABEL);
+        let (agent, root, socket) =
+            sccache_launch_agent(HostNamespace::Production, &home).expect("teardown artifacts");
+        assert_eq!(agent.label(), "dev.cowshed.sccache");
         assert_eq!(root, gc_root(&home));
         assert_eq!(socket, server_socket());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A test namespace's agent is its own: its label and plist never name production's.
+    #[test]
+    fn a_test_namespaces_control_target_is_its_own() {
+        let home = scratch_home("namespaced-control");
+        let namespace = TestNamespace::mint().expect("a test namespace");
+
+        let target = control_target(HostNamespace::Test(namespace), &home)
+            .expect("a control target needs only a home and a label");
+        assert_eq!(
+            target.label(),
+            format!("dev.cowshed-test-{namespace}.sccache")
+        );
+        assert_eq!(
+            target.plist_path(),
+            home.join(format!(
+                "Library/LaunchAgents/dev.cowshed-test-{namespace}.sccache.plist"
+            ))
+        );
 
         let _ = fs::remove_dir_all(&home);
     }

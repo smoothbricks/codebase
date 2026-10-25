@@ -21,6 +21,17 @@ pub const TOKEN_BYTES: usize = 32;
 /// range bounds how many workspaces a host can hold at once: 256 at the initial block size.
 pub const MACOS_PORT_MIN: u16 = 32_768;
 pub const MACOS_PORT_MAX: u16 = 49_151;
+/// The first port of the fixture partition: test namespaces allocate in
+/// `MACOS_FIXTURE_PORT_MIN..=MACOS_PORT_MAX`, production below it, so no test block can be one
+/// production holds (specs/cowshed/01_storage.md, "Host namespace").
+pub const MACOS_FIXTURE_PORT_MIN: u16 = 45_056;
+/// The fixture partition's size: one port block aligned to it, so a test allocator outside a
+/// workspace takes sub-blocks of it as it would of a workspace's own block.
+pub const MACOS_FIXTURE_PORTS: u16 = MACOS_PORT_MAX - MACOS_FIXTURE_PORT_MIN + 1;
+const _: () = assert!(
+    is_macos_port_block(MACOS_FIXTURE_PORT_MIN, MACOS_FIXTURE_PORTS),
+    "the fixture partition is a port block aligned to its size"
+);
 /// The size a newly allocated macOS workspace port block gets. A block's size is data recorded
 /// with it when it is allocated, so raising this changes only what new workspaces get: every
 /// check validates a live block against its own recorded size, never against this constant.

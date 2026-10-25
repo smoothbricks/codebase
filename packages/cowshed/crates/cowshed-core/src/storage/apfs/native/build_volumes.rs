@@ -1004,21 +1004,24 @@ mod tests {
     use crate::storage::apfs::ApfsSubstrateConfig;
     use cowshed_apfs::mounts::KernelMountSnapshot;
     use cowshed_apfs::{CommandRequest, SystemCommandRunner};
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
     use std::io::Read;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant, SystemTime};
 
     fn fixture(
+        namespace: TestNamespace,
         root: &Path,
     ) -> (
         MacOsApfsExecutionHost<SystemCommandRunner>,
         BuildVolumeLayout,
     ) {
-        fixture_with(root, SystemKernelMountSource)
+        fixture_with(namespace, root, SystemKernelMountSource)
     }
 
     fn fixture_with(
+        namespace: TestNamespace,
         root: &Path,
         mount_source: impl KernelMountSource,
     ) -> (
@@ -1033,9 +1036,10 @@ mod tests {
             &RepoId::parse("acme/widget").unwrap(),
         )
         .unwrap();
+        let namespace = HostNamespace::Test(namespace);
         let host = MacOsApfsExecutionHost::with_mount_source(
-            SystemCommandRunner,
-            ApfsSubstrateConfig::new(&store, root.join("checkout")),
+            SystemCommandRunner::new(namespace),
+            ApfsSubstrateConfig::new(namespace, &store, root.join("checkout")),
             mount_source,
         )
         .unwrap();
@@ -1049,7 +1053,7 @@ mod tests {
         use cowshed_os::timing::{Step, StepSink, reporting};
 
         let root = std::env::temp_dir().join(format!("build-first-write-{}", uuid::Uuid::new_v4()));
-        let (host, layout) = fixture(&root);
+        let (host, layout) = fixture(TestNamespace::mint().expect("a test namespace"), &root);
         fs::create_dir_all(layout.images()).unwrap();
         for contents in [vec![0x5a; 8192], vec![0x5a; 32]] {
             let source = BuildVolumeId::mint();
@@ -1133,8 +1137,8 @@ mod tests {
     fn real_apfs_build_seed_live_capture_is_fresh_until_an_admitted_job_writes() {
         let root = crate::scratch_apfs::ScratchRoot::new("seed-admission-clock").unwrap();
         let source = BuildVolumeId::mint();
-        let (system, layout) = fixture(root.path());
-        crate::blank_image::blank_image(&layout.image(&source));
+        let (system, layout) = fixture(root.namespace(), root.path());
+        crate::blank_image::blank_image(root.namespace(), &layout.image(&source));
         let mount = system.mount_build_volume(&layout, &source).unwrap();
         layout.write_record(&source, &linked("main")).unwrap();
         fs::write(mount.join("warm"), b"captured build state\n").unwrap();
@@ -1152,6 +1156,7 @@ mod tests {
         );
         let denied = Arc::new(AtomicBool::new(false));
         let (host, _) = fixture_with(
+            root.namespace(),
             root.path(),
             CaptureAdmissionMounts {
                 layout: layout.clone(),
@@ -1262,10 +1267,10 @@ mod tests {
 
         let root = crate::scratch_apfs::ScratchRoot::new("seed-quiet-admission").unwrap();
         let source = BuildVolumeId::mint();
-        let (system, layout) = fixture(root.path());
+        let (system, layout) = fixture(root.namespace(), root.path());
         let checkout = root.path().join("checkout");
         fs::create_dir_all(checkout.join(".cowshed")).unwrap();
-        crate::blank_image::blank_image(&layout.image(&source));
+        crate::blank_image::blank_image(root.namespace(), &layout.image(&source));
         let mount = system.mount_build_volume(&layout, &source).unwrap();
         crate::build_volume::BuildVolumeState::default()
             .write(&mount)
@@ -1304,6 +1309,7 @@ mod tests {
             .expect("the stopped workspace has no writers");
         let denied = Arc::new(AtomicBool::new(false));
         let (host, _) = fixture_with(
+            root.namespace(),
             root.path(),
             CaptureAdmissionMounts {
                 layout: layout.clone(),
@@ -1502,6 +1508,7 @@ mod tests {
 
     impl Lane {
         fn mount(
+            namespace: TestNamespace,
             root: &Path,
             host: &MacOsApfsExecutionHost<SystemCommandRunner>,
             layout: &BuildVolumeLayout,
@@ -1510,7 +1517,7 @@ mod tests {
             use crate::capabilities::BuildStatePath;
 
             let image = root.join("store/lane.dmg");
-            crate::blank_image::blank_image(&image);
+            crate::blank_image::blank_image(namespace, &image);
             let checkout = root.join("lane");
             fs::create_dir_all(&checkout).unwrap();
             let attachment = host
@@ -1520,7 +1527,7 @@ mod tests {
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
 
             let build_id = BuildVolumeId::mint();
-            crate::blank_image::blank_image(&layout.image(&build_id));
+            crate::blank_image::blank_image(namespace, &layout.image(&build_id));
             let build_mount = host
                 .mount_build_volume(layout, &build_id)
                 .expect("mount the build volume");
@@ -1586,10 +1593,10 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let root = crate::scratch_apfs::ScratchRoot::new("claimed-build-detach").unwrap();
-        let (host, layout) = fixture(root.path());
+        let (host, layout) = fixture(root.namespace(), root.path());
         let id = BuildVolumeId::mint();
         let image = layout.image(&id);
-        crate::blank_image::blank_image(&image);
+        crate::blank_image::blank_image(root.namespace(), &image);
         let mount = host.mount_build_volume(&layout, &id).unwrap();
         layout.write_record(&id, &linked("main")).unwrap();
         fs::write(mount.join("warm"), b"old build state\n").unwrap();
@@ -1659,11 +1666,11 @@ mod tests {
     #[test]
     fn real_apfs_build_volumes_clone_with_mtimes_and_release_unless_a_job_holds_them() {
         let root = crate::scratch_apfs::ScratchRoot::new("build-volume").expect("scratch root");
-        let (host, layout) = fixture(root.path());
+        let (host, layout) = fixture(root.namespace(), root.path());
         let source = BuildVolumeId::mint();
         // Creation is proven by first touch (build_volume::migrate) and adoption; this test's
         // source is a clone of the run's blank image, mounted the way a fork's volume is.
-        crate::blank_image::blank_image(&layout.image(&source));
+        crate::blank_image::blank_image(root.namespace(), &layout.image(&source));
         let mount = host
             .mount_build_volume(&layout, &source)
             .expect("mount a build volume");
@@ -1831,8 +1838,8 @@ mod tests {
         );
     }
 
-    fn diskutil(args: &[&str]) -> String {
-        let output = SystemCommandRunner
+    fn diskutil(namespace: HostNamespace, args: &[&str]) -> String {
+        let output = SystemCommandRunner::new(namespace)
             .run(&CommandRequest::new(cowshed_apfs::device::DISKUTIL, args))
             .expect("run diskutil");
         assert!(
@@ -1846,13 +1853,16 @@ mod tests {
 
     /// Add an unmounted APFS volume named `name` to `container`, answering its device. A scratch
     /// root's release takes it with the container's other volumes, on a panic too.
-    fn add_volume(container: &str, name: &str) -> String {
-        diskutil(&["apfs", "addVolume", container, "APFS", name, "-nomount"])
-            .lines()
-            .find_map(|line| line.strip_prefix("Created new APFS Volume "))
-            .expect("diskutil names the volume it added")
-            .trim()
-            .to_owned()
+    fn add_volume(namespace: HostNamespace, container: &str, name: &str) -> String {
+        diskutil(
+            namespace,
+            &["apfs", "addVolume", container, "APFS", name, "-nomount"],
+        )
+        .lines()
+        .find_map(|line| line.strip_prefix("Created new APFS Volume "))
+        .expect("diskutil names the volume it added")
+        .trim()
+        .to_owned()
     }
 
     /// The APFS volume stat a job's samples read: a job writes 64 MiB into its workspace and 32
@@ -1863,7 +1873,7 @@ mod tests {
     /// workspace's own container moves neither delta, which a container-wide reading would by the
     /// sibling's whole 32 MiB. A mountpoint its volume has left is a typed failure, never the
     /// parent volume's usage.
-    fn prove_owned_volume_usage(root: &Path, lane: &Lane) {
+    fn prove_owned_volume_usage(namespace: HostNamespace, root: &Path, lane: &Lane) {
         use crate::api::resources::VolumeUsage;
         use crate::runtime::volume_usage::{
             VolumeAtSpawn, VolumeBaseline, VolumeStat as _, VolumeStatError,
@@ -1878,10 +1888,13 @@ mod tests {
             .rsplit_once('s')
             .map(|(container, _)| container)
             .expect("an APFS volume device is <container>s<n>");
-        let added = add_volume(container, "sibling");
+        let added = add_volume(namespace, container, "sibling");
         let sibling = root.join("sibling");
         fs::create_dir_all(&sibling).unwrap();
-        diskutil(&["mount", "-mountPoint", sibling.to_str().unwrap(), &added]);
+        diskutil(
+            namespace,
+            &["mount", "-mountPoint", sibling.to_str().unwrap(), &added],
+        );
 
         job(checkout, &write("predates.bin", 16));
         let captured = |mount: &Path, what: &str| {
@@ -1953,7 +1966,7 @@ mod tests {
         // A mountpoint whose volume has gone answers for its parent volume: refused, not read.
         // Deleting the added volume unmounts it first; a separate unmount storagekitd may dissent.
         let (left, _) = ApfsVolume::capture(&sibling).expect("the sibling volume");
-        diskutil(&["apfs", "deleteVolume", &added]);
+        diskutil(namespace, &["apfs", "deleteVolume", &added]);
         assert!(matches!(
             ApfsVolumeStat.used_bytes(&left),
             Err(VolumeStatError::Read(_))
@@ -1976,6 +1989,7 @@ mod tests {
         attachment: &cowshed_apfs::AttachedImage,
     ) {
         use cowshed_apfs::ApfsError;
+        let namespace = host.backend.runner().namespace();
         let one_volume_refusal = |error: &ApfsError| {
             matches!(error,
                 ApfsError::InvalidAttachmentInventory(message)
@@ -1992,15 +2006,18 @@ mod tests {
                 .expect("canonical volume device"),
         )
         .expect("APFS volume names its synthesized container");
-        let sibling = add_volume(container, "sibling");
+        let sibling = add_volume(namespace, container, "sibling");
         let sibling_mount = root.join("sibling");
         fs::create_dir_all(&sibling_mount).unwrap();
-        diskutil(&[
-            "mount",
-            "-mountPoint",
-            sibling_mount.to_str().unwrap(),
-            &sibling,
-        ]);
+        diskutil(
+            namespace,
+            &[
+                "mount",
+                "-mountPoint",
+                sibling_mount.to_str().unwrap(),
+                &sibling,
+            ],
+        );
 
         let looked_up = host.backend.recovered_image_attachment(&image).err();
         assert!(
@@ -2200,9 +2217,9 @@ mod tests {
         };
 
         let root = crate::scratch_apfs::ScratchRoot::new("job-volumes").expect("scratch root");
-        let (host, layout) = fixture(root.path());
-        let lane = Lane::mount(root.path(), &host, &layout);
-        prove_owned_volume_usage(root.path(), &lane);
+        let (host, layout) = fixture(root.namespace(), root.path());
+        let lane = Lane::mount(root.namespace(), root.path(), &host, &layout);
+        prove_owned_volume_usage(host.backend.runner().namespace(), root.path(), &lane);
         let defaults = WorkspaceSupervisorConfig::default();
         let config = WorkspaceSupervisorConfig {
             workspace_root: lane.checkout.clone(),

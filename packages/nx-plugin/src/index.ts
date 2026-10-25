@@ -80,6 +80,7 @@ import {
 import { eslintConfigClosure } from './eslint-config-closure.js';
 import type { EslintFileSet } from './eslint-file-set.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
+import { GATEWAY_SOCKET } from './executors/bounded-exec/gateway-lease.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
 import {
@@ -1102,7 +1103,7 @@ export const preTasksExecution: PreTasksExecution<ProducerReceiptsOptions> = asy
   assertUpstreamBasePrecondition(context.workspaceRoot);
   preTaskResults(options, context);
   await preProducerReceipts(options, context);
-  await serveRunCpuPool(context);
+  await serveRunCpuPool(context, GATEWAY_SOCKET);
 };
 export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
   await postTaskResults(options, context);

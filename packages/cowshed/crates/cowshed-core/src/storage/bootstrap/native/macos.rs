@@ -49,6 +49,7 @@ use cowshed_apfs::{
 };
 use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_os::namespace::HostNamespace;
 
 const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
@@ -88,8 +89,9 @@ fn is_diskutil_mount(command: &HostCommand) -> bool {
             .is_some_and(|argument| argument == "mount")
 }
 
-fn arbitration_probe(device: &str) -> Result<(), HostError> {
+fn arbitration_probe(namespace: HostNamespace, device: &str) -> Result<(), HostError> {
     run_disk_tool(
+        namespace,
         &HostCommand::new(DISKUTIL, ["info", device]),
         DISKUTIL_PROBE_DEADLINE,
     )
@@ -100,11 +102,12 @@ fn arbitration_probe(device: &str) -> Result<(), HostError> {
 /// ([`SystemCommandRunner`]): the host disk lease, its own session, and `deadline` (an ordinary
 /// verb is killed there; a disk-image verb is never killed, only warned about).
 fn run_disk_tool(
+    namespace: HostNamespace,
     command: &HostCommand,
     deadline: Duration,
 ) -> Result<HostCommandOutput, HostError> {
     let request = CommandRequest::new(command.program(), command.args());
-    SystemCommandRunner
+    SystemCommandRunner::new(namespace)
         .run_with_deadline(&request, deadline)
         .map_err(|error| match error.failure {
             CommandRunFailure::Deadline { deadline, .. }
@@ -140,13 +143,13 @@ impl BootstrapHost for SystemBootstrapHost {
         ensure_supported_host()?;
         if is_diskutil_mount(command) {
             let device = command.args().last().expect("mount argv carries a device");
-            arbitration_probe(device)?;
-            return run_disk_tool(command, DISKUTIL_MOUNT_DEADLINE);
+            arbitration_probe(HostNamespace::Production, device)?;
+            return run_disk_tool(HostNamespace::Production, command, DISKUTIL_MOUNT_DEADLINE);
         }
         if command.program() == DISKUTIL {
-            return run_disk_tool(command, DISK_CHILD_DEADLINE);
+            return run_disk_tool(HostNamespace::Production, command, DISK_CHILD_DEADLINE);
         }
-        run_command_with(command, |program, args| {
+        run_command_with(HostNamespace::Production, command, |program, args| {
             Command::new(program).args(args).output_locked()
         })
     }
@@ -250,7 +253,7 @@ impl BootstrapHost for AuthorizedBootstrapHost {
             let device = command.args().last().expect("mount argv carries a device");
             // Admission and execution share the probe's budget. Failure is evidence about
             // that owned command, never authority to signal a system daemon.
-            arbitration_probe(device)?;
+            arbitration_probe(HostNamespace::Production, device)?;
         }
         if [DISKUTIL, INSTALL, LAUNCHCTL, RM, SECURITY].contains(&command.program()) {
             return self.session()?.execute(command);
@@ -2056,7 +2059,7 @@ fn volume_keychain_item_present(label: &str) -> Result<bool, HostError> {
             SYSTEM_KEYCHAIN,
         ],
     );
-    run_command_with(&command, |program, args| {
+    run_command_with(HostNamespace::Production, &command, |program, args| {
         Command::new(program).args(args).output_locked()
     })
     .map(|output| output.succeeded())
@@ -2888,6 +2891,7 @@ fn classify_volume(
 }
 
 fn run_command_with(
+    namespace: HostNamespace,
     command: &HostCommand,
     spawn: impl FnOnce(&Path, &[String]) -> io::Result<Output>,
 ) -> Result<HostCommandOutput, HostError> {
@@ -2898,7 +2902,7 @@ fn run_command_with(
             command.program()
         )));
     }
-    let output = cowshed_apfs::disk_lease::leased(program, command.args(), None, || {
+    let output = cowshed_apfs::disk_lease::leased(namespace, program, command.args(), None, || {
         spawn(program, command.args())
     })
     .map_err(|source| {
@@ -3454,9 +3458,13 @@ impl MacAuthorizationSession {
                 command.program()
             )));
         }
-        cowshed_apfs::disk_lease::leased(Path::new(command.program()), command.args(), None, || {
-            self.execute_authorized_unleased(command, input)
-        })
+        cowshed_apfs::disk_lease::leased(
+            HostNamespace::Production,
+            Path::new(command.program()),
+            command.args(),
+            None,
+            || self.execute_authorized_unleased(command, input),
+        )
     }
 
     fn execute_authorized_unleased(
@@ -4843,12 +4851,16 @@ mod tests {
 
     #[test]
     fn boot_spotlight_roots_are_fixed_and_refuse_custom_configuration() {
+        use cowshed_os::namespace::TestNamespace;
         let directory =
             std::env::temp_dir().join(format!("cowshed-spotlight-roots-{}", Uuid::new_v4()));
         let store = directory.join("physical/store");
         let home = directory.join("home");
         fs::create_dir_all(&store).unwrap();
-        let roots = CanonicalRoots::at(store.clone());
+        let roots = CanonicalRoots::fixture(
+            TestNamespace::mint().expect("a test namespace"),
+            store.clone(),
+        );
         let defaults = spotlight_roots(&roots, &home).unwrap();
         assert!(defaults.contains(&directory.join("physical")));
         let default_mount = canonical_mount_root(&home);
@@ -6259,20 +6271,25 @@ mod tests {
 
     #[test]
     fn command_runner_uses_argv_and_preserves_failure_status_and_streams() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let seen = RefCell::new(VecDeque::new());
         let command = HostCommand::new(
             "/usr/sbin/diskutil",
             ["info", "-plist", "literal;not-shell"],
         );
-        let output = run_command_with(&command, |program, args| {
-            seen.borrow_mut()
-                .push_back((program.to_owned(), args.to_vec()));
-            Ok(Output {
-                status: std::process::ExitStatus::from_raw(1 << 8),
-                stdout: b"ignored".to_vec(),
-                stderr: b"diskutil exact failure\n".to_vec(),
-            })
-        })
+        let output = run_command_with(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            &command,
+            |program, args| {
+                seen.borrow_mut()
+                    .push_back((program.to_owned(), args.to_vec()));
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(1 << 8),
+                    stdout: b"ignored".to_vec(),
+                    stderr: b"diskutil exact failure\n".to_vec(),
+                })
+            },
+        )
         .unwrap();
         assert!(!output.succeeded());
         assert_eq!(output.stderr, b"diskutil exact failure\n");
@@ -8509,9 +8526,11 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     /// outcome proves that Disk Arbitration is wedged.
     #[test]
     fn run_disk_tool_completes_when_the_child_answers() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         // The deadline is not the subject: it sits at the run's no-progress backstop, so a loaded
         // host's slow child never races it.
         let output = run_disk_tool(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
             &HostCommand::new("/bin/sleep", ["0.05"]),
             cowshed_os::test_backstop::NO_PROGRESS,
         )
@@ -8521,11 +8540,14 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
     #[test]
     fn a_mount_probe_refusal_preserves_command_evidence_without_guessing_a_restart() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         // NUL cannot be passed to exec, so this reaches the real consumer without running
         // diskutil, touching a mount, requesting authorization or signalling any daemon.
-        let error = SystemBootstrapHost
-            .run_command(&HostCommand::new(DISKUTIL, ["mount", "invalid\0device"]))
-            .expect_err("the probe cannot execute its native argv");
+        let error = arbitration_probe(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            "invalid\0device",
+        )
+        .expect_err("the probe cannot execute its native argv");
         let message = error.to_string();
         assert!(message.contains("diskutil"), "{message}");
         assert!(!message.contains("unresponsive"), "{message}");
@@ -8535,6 +8557,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
     #[test]
     fn run_disk_tool_preserves_its_total_deadline_without_inventing_daemon_failure() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         // The child outlives the deadline, so the deadline's kill is the event: the report names
         // the signalled group, which a runner that waited for the child to end could not. The
         // child blocks opening for reading a FIFO no writer ever opens: only the kill ends it.
@@ -8553,6 +8576,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             std::io::Error::last_os_error()
         );
         let error = run_disk_tool(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
             &HostCommand::new(
                 "/bin/sh",
                 [

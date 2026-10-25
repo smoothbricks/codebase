@@ -41,6 +41,7 @@ use cowshed_core::storage::lifecycle::{
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
@@ -394,6 +395,7 @@ impl RecoveryMarkerSource for ByteRecoveryMarkers {
 
 struct Fixture {
     root: PathBuf,
+    namespace: TestNamespace,
 }
 
 impl Fixture {
@@ -403,11 +405,18 @@ impl Fixture {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir(&root).expect("fixture root");
-        Self { root }
+        Self {
+            root,
+            namespace: TestNamespace::mint().expect("a test namespace"),
+        }
+    }
+
+    fn host_namespace(&self) -> HostNamespace {
+        HostNamespace::Test(self.namespace)
     }
 
     fn config(&self) -> ApfsSubstrateConfig {
-        ApfsSubstrateConfig::new(&self.root, self.root.join("mount"))
+        ApfsSubstrateConfig::new(self.host_namespace(), &self.root, self.root.join("mount"))
     }
 }
 
@@ -458,14 +467,27 @@ impl RealFixture {
         self.scratch.path()
     }
 
+    /// The namespace this fixture's store, and every name it mints, derives from.
+    pub(super) fn host_namespace(&self) -> HostNamespace {
+        HostNamespace::Test(self.scratch.namespace())
+    }
+
     fn config(&self) -> ApfsSubstrateConfig {
-        ApfsSubstrateConfig::new(self.root(), self.root().join("mount"))
+        ApfsSubstrateConfig::new(
+            self.host_namespace(),
+            self.root(),
+            self.root().join("mount"),
+        )
     }
 
     /// A fresh production host. Each one starts with an empty mount registry, so a second one is
     /// what a restarted controller sees: whatever is mounted, it learns from the kernel alone.
     fn host(&self) -> MacOsApfsExecutionHost<SystemCommandRunner> {
-        MacOsApfsExecutionHost::new(SystemCommandRunner, self.config()).expect("native APFS host")
+        MacOsApfsExecutionHost::new(
+            SystemCommandRunner::new(self.host_namespace()),
+            self.config(),
+        )
+        .expect("native APFS host")
     }
 
     /// Main mounts at the adopted checkout itself.
@@ -481,7 +503,7 @@ impl RealFixture {
     /// handed back detached: every verb that grows or replaces it next needs an image nothing
     /// holds. It is a clone of the run's blank image, not a mint of its own.
     pub(super) fn blank_image(&self, image: &Path) {
-        blank_image::blank_image(image);
+        blank_image::blank_image(self.scratch.namespace(), image);
     }
 
     /// [`Self::blank_image`] published as [`workspace`]'s: its sidecar and CA key beside it.
@@ -509,7 +531,7 @@ impl RealFixture {
     /// Mount the attached `volume_device` at `mount_point` with exactly `options`.
     pub(super) fn remount(&self, volume_device: &str, mount_point: &Path, options: &str) {
         std::fs::create_dir_all(mount_point).expect("mount point");
-        let mounted = SystemCommandRunner
+        let mounted = SystemCommandRunner::new(self.host_namespace())
             .run(&CommandRequest::new(
                 "/sbin/mount_apfs",
                 [
@@ -536,8 +558,15 @@ impl RealFixture {
     }
 }
 
+/// The system runner of a helper that no fixture hands its namespace to: a namespace of its own.
+fn helper_system() -> SystemCommandRunner {
+    SystemCommandRunner::new(HostNamespace::Test(
+        TestNamespace::mint().expect("a test namespace"),
+    ))
+}
+
 fn unmount(mount: &Path) {
-    let unmounted = SystemCommandRunner
+    let unmounted = helper_system()
         .run(&CommandRequest::new(
             "/usr/sbin/diskutil",
             ["unmount".as_ref(), mount.as_os_str()],
@@ -571,7 +600,7 @@ pub(super) fn kernel_mount_at(mount_point: &Path) -> Option<KernelMountSnapshot>
 /// Every attachment the kernel's I/O Registry holds for `image` right now. `hdiutil info` is no
 /// witness here: it omits attached images while another image attaches or detaches.
 fn kernel_attachments(image: &Path) -> Vec<AttachedDiskImage> {
-    SystemCommandRunner
+    helper_system()
         .attached_disk_images()
         .expect("kernel disk-image inventory")
         .into_iter()
@@ -850,10 +879,13 @@ fn native_host(
     .expect("native APFS host")
 }
 
-fn native_host_at(root: &Path) -> MacOsApfsExecutionHost<RecordingRunner> {
+fn native_host_at(
+    namespace: HostNamespace,
+    root: &Path,
+) -> MacOsApfsExecutionHost<RecordingRunner> {
     MacOsApfsExecutionHost::with_recovery_sources(
         RecordingRunner::default(),
-        ApfsSubstrateConfig::new(root, root.join("mount")),
+        ApfsSubstrateConfig::new(namespace, root, root.join("mount")),
         SystemKernelMountSource,
         ByteRecoveryMarkers,
     )
@@ -2984,7 +3016,10 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     let host = fixture.host();
     let host_data = cowshed_apfs::volume_name(Path::new("/System/Volumes/Data"))
         .expect("the host's Data volume name");
-    let label = "[cowshed] fixture · intents — main";
+    let label_name = fixture
+        .host_namespace()
+        .volume_label(format_args!("fixture · intents — main"));
+    let label = label_name.as_str();
 
     let slotted = layout
         .canonical_image(&WorkspaceName::new("slotted").expect("workspace name"))
@@ -3127,7 +3162,12 @@ fn renames(runner: &RecordingRunner) -> Vec<(String, String)> {
     runner.named.lock().expect("named").clone()
 }
 
-const SLOTTED: &str = "[cowshed] fixture · intents — slotted";
+/// The label a test's slotted volume is named, in the fixture's namespace.
+fn slotted_label(fixture: &Fixture) -> String {
+    fixture
+        .host_namespace()
+        .volume_label(format_args!("fixture · intents — slotted"))
+}
 
 #[test]
 fn native_volume_rename_names_the_image_volume_through_its_held_root() {
@@ -3150,13 +3190,17 @@ fn native_volume_rename_names_the_image_volume_through_its_held_root() {
     );
 
     assert_eq!(
-        host.label_image_volume(&image, SLOTTED).expect("rename"),
+        host.label_image_volume(&image, &slotted_label(&fixture))
+            .expect("rename"),
         Labelled::Renamed
     );
 
     assert_eq!(
         renames(&runner),
-        [("/dev/disk10s1".to_owned(), SLOTTED.to_owned())]
+        [(
+            "/dev/disk10s1".to_owned(),
+            slotted_label(&fixture).to_owned()
+        )]
     );
     assert!(
         runner.requests().iter().all(|request| request
@@ -3195,7 +3239,7 @@ fn a_volume_unmounted_before_its_rename_is_refused_before_any_rename() {
     let beneath = cowshed_apfs::mounts::hold_mount(&mount).expect("the directory beneath");
 
     let refused = host
-        .label_image_volume(&image, SLOTTED)
+        .label_image_volume(&image, &slotted_label(&fixture))
         .expect_err("a volume unmounted since is no rename target");
 
     assert!(
@@ -3239,12 +3283,13 @@ fn an_unmounted_workspace_names_no_volume_through_its_mount_path() {
     );
 
     assert_eq!(
-        host.label_image_volume(&slotted_image(&fixture), SLOTTED)
+        host.label_image_volume(&slotted_image(&fixture), &slotted_label(&fixture))
             .expect("a refused create is a typed skip"),
         Labelled::NotAttached
     );
     assert!(
-        host.label_image_volume(&mount, SLOTTED).is_err(),
+        host.label_image_volume(&mount, &slotted_label(&fixture))
+            .is_err(),
         "a mountpoint is no image under the store"
     );
     assert!(
@@ -3265,7 +3310,7 @@ fn an_attached_image_mounted_nowhere_names_no_volume() {
     let host = host_seeing(&fixture, runner.clone(), Vec::new());
 
     assert_eq!(
-        host.label_image_volume(&image, SLOTTED)
+        host.label_image_volume(&image, &slotted_label(&fixture))
             .expect("typed skip"),
         Labelled::NotMounted
     );
@@ -3293,7 +3338,9 @@ fn an_image_outside_the_store_is_refused_as_a_rename_target() {
         )],
     );
 
-    let refused = host.label_image_volume(&foreign, SLOTTED).unwrap_err();
+    let refused = host
+        .label_image_volume(&foreign, &slotted_label(&fixture))
+        .unwrap_err();
 
     assert!(
         matches!(
@@ -3329,7 +3376,7 @@ fn an_image_held_twice_is_refused_as_ambiguous_and_never_renamed() {
     );
 
     let refused = host
-        .label_image_volume(&image, SLOTTED)
+        .label_image_volume(&image, &slotted_label(&fixture))
         .expect_err("an image held twice names no volume");
 
     assert!(
@@ -3415,7 +3462,7 @@ fn an_image_held_unformatted_is_refused_rather_than_reported_unattached() {
     .expect("native APFS host");
 
     let refused = host
-        .label_image_volume(&image, SLOTTED)
+        .label_image_volume(&image, &slotted_label(&fixture))
         .expect_err("an unformatted attachment is no skip");
 
     assert!(
@@ -3446,8 +3493,13 @@ fn the_host_rename_refuses_an_attachment_of_an_image_outside_the_store() {
         .attach_verified(&foreign)
         .expect("a verified attachment of a foreign image");
 
-    let refused =
-        ApfsExecutionHost::rename_volume(&host, &attachment, &fixture.root, SLOTTED).unwrap_err();
+    let refused = ApfsExecutionHost::rename_volume(
+        &host,
+        &attachment,
+        &fixture.root,
+        &slotted_label(&fixture),
+    )
+    .unwrap_err();
 
     assert!(
         matches!(
@@ -3467,7 +3519,11 @@ fn the_host_rename_refuses_an_attachment_of_an_image_outside_the_store() {
 fn gc_distinguishes_a_missing_store_from_a_non_directory_store() {
     let fixture = Fixture::new("gc-store");
     let missing_root = fixture.root.join("missing-store");
-    let config = ApfsSubstrateConfig::new(&missing_root, fixture.root.join("mount"));
+    let config = ApfsSubstrateConfig::new(
+        fixture.host_namespace(),
+        &missing_root,
+        fixture.root.join("mount"),
+    );
     let host =
         MacOsApfsExecutionHost::new(RecordingRunner::default(), config.clone()).expect("host");
     assert_eq!(
@@ -3530,7 +3586,7 @@ fn real_apfs_unmount_verified_twice_preserves_the_attached_image() {
     let image = fixture.root().join("owned.dmg");
     let mount = fixture.root().join("mounted");
     fixture.blank_image(&image);
-    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let backend = MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace()));
     let attachment = backend
         .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)
         .expect("mount owned image");
@@ -3570,6 +3626,7 @@ fn real_apfs_unmount_verified_twice_preserves_the_attached_image() {
 /// Unexpected refusals retain command timing and current ownership observations without changing
 /// the Busy oracle or adding a pin that could itself prevent release.
 struct EjectAtFsck {
+    system: SystemCommandRunner,
     owned: PathBuf,
     foreign: PathBuf,
     ejected: AtomicUsize,
@@ -3578,8 +3635,8 @@ struct EjectAtFsck {
 
 impl EjectAtFsck {
     fn try_recycle(&self, volume: &str) -> Result<(), CommandRunError> {
-        let system = SystemCommandRunner;
-        let owned = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+        let system = self.system;
+        let owned = cowshed_apfs::MacOsApfsBackend::new(self.system)
             .existing_attachment(&self.owned)
             .expect("exact current pinned image mapping")
             .expect("the recorded pinned fixture image is attached");
@@ -3688,7 +3745,7 @@ impl CommandRunner for EjectAtFsck {
     where
         E: From<CommandRunError> + std::fmt::Display,
     {
-        SystemCommandRunner.run_guarded(request, check)
+        self.system.run_guarded(request, check)
     }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
         let volume = if request.program == Path::new("/sbin/fsck_apfs") {
@@ -3710,15 +3767,15 @@ impl CommandRunner for EjectAtFsck {
             cowshed_os::eprintln!("raw-pin attack hook request={request:?}");
             self.try_recycle(volume)?;
         }
-        SystemCommandRunner.run(request)
+        self.system.run(request)
     }
 
     fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
-        SystemCommandRunner.image_lease(identity)
+        self.system.image_lease(identity)
     }
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
-        let pin = SystemCommandRunner.pin_raw_device(device)?;
+        let pin = self.system.pin_raw_device(device)?;
         cowshed_os::eprintln!(
             "raw-pin opened wall={:?} image={} raw={} descriptor={pin:?} rdev={:?}",
             SystemTime::now(),
@@ -3731,15 +3788,15 @@ impl CommandRunner for EjectAtFsck {
     }
 
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
-        SystemCommandRunner.attached_disk_images()
+        self.system.attached_disk_images()
     }
 
     fn attachments_of(&self, image: &Path) -> std::io::Result<Vec<AttachedDiskImage>> {
-        SystemCommandRunner.attachments_of(image)
+        self.system.attachments_of(image)
     }
 
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
-        SystemCommandRunner.grow_image(image, capacity)
+        self.system.grow_image(image, capacity)
     }
 }
 
@@ -3756,6 +3813,7 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
     fixture.blank_image(&owned);
     fixture.blank_image(&foreign);
     let runner = EjectAtFsck {
+        system: SystemCommandRunner::new(fixture.host_namespace()),
         owned: owned.clone(),
         foreign: foreign.clone(),
         ejected: AtomicUsize::new(0),
@@ -3783,11 +3841,11 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         "/usr/bin/hdiutil",
         ["detach", "-force", attachment.whole_device()],
     );
-    let image_driver_ejected = SystemCommandRunner
+    let image_driver_ejected = SystemCommandRunner::new(fixture.host_namespace())
         .run(&image_driver_request)
         .expect("external image-driver forced detach");
     if image_driver_ejected.succeeded() {
-        let attached_foreign = SystemCommandRunner
+        let attached_foreign = SystemCommandRunner::new(fixture.host_namespace())
             .run(&foreign_kernel_attach(&foreign, true))
             .expect("external foreign attachment");
         assert!(
@@ -3851,7 +3909,7 @@ fn foreign_kernel_attach(image: &Path, mount: bool) -> CommandRequest {
 
 /// Attach `image` the way another process does, outside every cowshed image lease and check.
 fn attach_behind_cowshed(image: &Path) {
-    let attached = SystemCommandRunner
+    let attached = helper_system()
         .run(&foreign_kernel_attach(image, false))
         .expect("foreign kernel attach");
     assert!(
@@ -3895,7 +3953,7 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
             .expect("a template stem")
     ));
     hold_twice(&fixture, &reused);
-    let refused = MacOsApfsBackend::new(SystemCommandRunner)
+    let refused = MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace()))
         .attach_verified(&reused)
         .expect_err("a held path is never attached again");
     assert!(
@@ -3911,8 +3969,9 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
     assert!(attached(&orphaned));
 
     let minted = blank_template(
-        &MacOsApfsBackend::new(SystemCommandRunner),
+        &MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace())),
         &store,
+        &fixture.host_namespace().label_prefix(),
         capacity,
         &cowshed_core::held_lock::ImageLockTaker {
             holding: &cowshed_core::api::held_lock::LockHolding::store(
@@ -3953,6 +4012,7 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
 /// foreign media, which is what a recycled spelling hands the pin. Everything else stays the
 /// kernel's: the attachments, the inventory the identity proof reads, the mount table.
 struct EjectAfterAttach {
+    system: SystemCommandRunner,
     owned: PathBuf,
     foreign: PathBuf,
     ejected: AtomicUsize,
@@ -3977,10 +4037,10 @@ impl CommandRunner for EjectAfterAttach {
     where
         E: From<CommandRunError> + std::fmt::Display,
     {
-        SystemCommandRunner.run_guarded(request, check)
+        self.system.run_guarded(request, check)
     }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        let system = SystemCommandRunner;
+        let system = self.system;
         let output = system.run(request)?;
         if request.program == Path::new("/sbin/fsck_apfs") {
             self.fscks.fetch_add(1, Ordering::SeqCst);
@@ -3994,7 +4054,7 @@ impl CommandRunner for EjectAfterAttach {
             && self.ejected.fetch_add(1, Ordering::SeqCst) == 0
         {
             assert!(output.succeeded(), "owner attach failed: {output:?}");
-            let owned = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+            let owned = cowshed_apfs::MacOsApfsBackend::new(self.system)
                 .existing_attachment(&self.owned)
                 .expect("exact current owner mapping")
                 .expect("the recorded fixture image is attached");
@@ -4009,7 +4069,7 @@ impl CommandRunner for EjectAfterAttach {
             );
             let attached = system.run(&foreign_kernel_attach(&self.foreign, true))?;
             assert!(attached.succeeded(), "foreign mount failed: {attached:?}");
-            let replacement = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+            let replacement = cowshed_apfs::MacOsApfsBackend::new(self.system)
                 .existing_attachment(&self.foreign)
                 .expect("exact current replacement mapping")
                 .expect("the recorded foreign image is attached");
@@ -4022,29 +4082,29 @@ impl CommandRunner for EjectAfterAttach {
     }
 
     fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
-        SystemCommandRunner.image_lease(identity)
+        self.system.image_lease(identity)
     }
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
         match &*self.reused.lock().expect("reused spelling") {
             Some((recorded, foreign)) if device == recorded => {
                 self.pinned_foreign.fetch_add(1, Ordering::SeqCst);
-                SystemCommandRunner.pin_raw_device(foreign)
+                self.system.pin_raw_device(foreign)
             }
-            _ => SystemCommandRunner.pin_raw_device(device),
+            _ => self.system.pin_raw_device(device),
         }
     }
 
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
-        SystemCommandRunner.attached_disk_images()
+        self.system.attached_disk_images()
     }
 
     fn attachments_of(&self, image: &Path) -> std::io::Result<Vec<AttachedDiskImage>> {
-        SystemCommandRunner.attachments_of(image)
+        self.system.attachments_of(image)
     }
 
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
-        SystemCommandRunner.grow_image(image, capacity)
+        self.system.grow_image(image, capacity)
     }
 }
 
@@ -4056,6 +4116,7 @@ fn real_apfs_lost_attachment_refuses_without_verifying_foreign_volume() {
     fixture.blank_image(&owned);
     fixture.blank_image(&foreign);
     let backend = cowshed_apfs::MacOsApfsBackend::new(EjectAfterAttach {
+        system: SystemCommandRunner::new(fixture.host_namespace()),
         owned: owned.clone(),
         foreign: foreign.clone(),
         ejected: AtomicUsize::new(0),
@@ -4081,10 +4142,11 @@ fn real_apfs_lost_attachment_refuses_without_verifying_foreign_volume() {
         !attached(&owned),
         "the refused attempt must not reattach the owner"
     );
-    let replacement = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
-        .existing_attachment(&foreign)
-        .expect("exact current foreign mapping")
-        .expect("the foreign attachment must survive the owner's refusal");
+    let replacement =
+        cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace()))
+            .existing_attachment(&foreign)
+            .expect("exact current foreign mapping")
+            .expect("the foreign attachment must survive the owner's refusal");
     assert!(
         SystemKernelMountSource
             .mounts()
@@ -4234,7 +4296,11 @@ fn direct_mount_handoff_swaps_the_checkout_for_an_empty_mountpoint() {
     let pre_cowshed = fixture.root.join("mount.pre-cowshed");
     std::fs::create_dir_all(&checkout).expect("checkout");
     std::fs::write(checkout.join("README"), b"the user's tree").expect("user file");
-    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, fixture.config()).expect("host");
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner::new(fixture.host_namespace()),
+        fixture.config(),
+    )
+    .expect("host");
 
     host.vacate_adopted_checkout(&checkout, &pre_cowshed)
         .expect("vacate");
@@ -4272,7 +4338,11 @@ fn direct_mount_handoff_refuses_a_checkout_it_did_not_take_over() {
     let pre_cowshed = fixture.root.join("mount.pre-cowshed");
     std::fs::create_dir_all(&checkout).expect("checkout");
     std::fs::create_dir_all(&pre_cowshed).expect("collision");
-    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, fixture.config()).expect("host");
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner::new(fixture.host_namespace()),
+        fixture.config(),
+    )
+    .expect("host");
 
     // A retained tree already at the destination means a previous adoption left state behind.
     host.vacate_adopted_checkout(&checkout, &pre_cowshed)
@@ -5879,7 +5949,8 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
     let pool = blank_image::pool_root();
     let layout = StorageLayout::new(&pool, &repo()).expect("pool layout");
     let canonical = layout.main_image().expect("canonical");
-    let shared = blank_image::shared_image_at("scenario-main", canonical.image());
+    let namespace = TestNamespace::mint().expect("a test namespace");
+    let shared = blank_image::shared_image_at(namespace, "scenario-main", canonical.image());
     metadata()
         .write_for_image(canonical.image())
         .expect("sidecar");
@@ -5887,9 +5958,11 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("fixture P-256 private key");
     write_ca_key(canonical.image(), signing_key.serialize_pem().as_bytes());
     let mount = pool.join("mount");
-    let host =
-        MacOsApfsExecutionHost::new(SystemCommandRunner, ApfsSubstrateConfig::new(&pool, &mount))
-            .expect("native APFS host");
+    let host = MacOsApfsExecutionHost::new(
+        SystemCommandRunner::new(HostNamespace::Test(namespace)),
+        ApfsSubstrateConfig::new(HostNamespace::Test(namespace), &pool, &mount),
+    )
+    .expect("native APFS host");
     let mounted = shared.mount_at(&mount, "nobrowse,owners");
     host.write_marker(&mount, &workspace(), None, &identity_at(&pool))
         .expect("mount marker");
@@ -6305,7 +6378,9 @@ fn flock_child_helper() {
     let release = PathBuf::from(
         std::env::var_os("COWSHED_FLOCK_HELPER_RELEASE").expect("helper release path"),
     );
-    let host = native_host_at(Path::new(&root));
+    // Its own namespace suffices: this helper only takes image locks, which derive no names.
+    let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
+    let host = native_host_at(namespace, Path::new(&root));
     let _guard = host
         .lock_images(&[lock], LockMode::Wait, &other_operation())
         .expect("helper lock")
@@ -6322,8 +6397,8 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
     let fixture = Fixture::new("flock-process");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let lock = layout.main_image().expect("main").lock().to_owned();
-    let first = native_host_at(&fixture.root);
-    let second = native_host_at(&fixture.root);
+    let first = native_host_at(fixture.host_namespace(), &fixture.root);
+    let second = native_host_at(fixture.host_namespace(), &fixture.root);
     let guard = first
         .lock_images(
             std::slice::from_ref(&lock),
@@ -6412,8 +6487,8 @@ fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
     std::fs::create_dir_all(staged.parent().expect("staging directory"))
         .expect("staging directory");
     std::fs::write(&staged, b"sidecarless staged orphan").expect("staged orphan");
-    let owner = native_host_at(&fixture.root);
-    let collector = native_host_at(&fixture.root);
+    let owner = native_host_at(fixture.host_namespace(), &fixture.root);
+    let collector = native_host_at(fixture.host_namespace(), &fixture.root);
     let guard = owner
         .lock_images(
             &[canonical.lock().to_owned()],
@@ -6795,6 +6870,7 @@ fn real_apfs_resize_and_defrag_scenario_puts_a_mounted_workspace_back_on_its_mou
     // and the workspace back on its mount, on this same fixture.
     let refused_host = MacOsApfsExecutionHost::with_mount_source(
         ImmutableDuringResize {
+            system: SystemCommandRunner::new(fixture.host_namespace()),
             image: image.clone(),
             resized: AtomicUsize::new(0),
         },
@@ -6988,6 +7064,7 @@ fn resize_refuses_an_image_still_attached_with_nothing_mounted_before_touching_i
 /// user-immutable flag goes on immediately before the grow and comes off as soon as it returns.
 /// The open really refuses, and the image is really unchanged.
 struct ImmutableDuringResize {
+    system: SystemCommandRunner,
     image: PathBuf,
     resized: AtomicUsize,
 }
@@ -7014,10 +7091,10 @@ impl CommandRunner for ImmutableDuringResize {
     where
         E: From<CommandRunError> + std::fmt::Display,
     {
-        SystemCommandRunner.run_guarded(request, check)
+        self.system.run_guarded(request, check)
     }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        SystemCommandRunner.run(request)
+        self.system.run(request)
     }
 
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> std::io::Result<()> {
@@ -7025,26 +7102,26 @@ impl CommandRunner for ImmutableDuringResize {
         assert_eq!(image, self.image, "only the fixture image grows");
         let flags = std::fs::metadata(&self.image).expect("image").st_flags();
         set_file_flags(&self.image, flags | libc::UF_IMMUTABLE);
-        let grown = SystemCommandRunner.grow_image(image, capacity);
+        let grown = self.system.grow_image(image, capacity);
         set_file_flags(&self.image, flags);
         self.resized.fetch_add(1, Ordering::SeqCst);
         grown
     }
 
     fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
-        SystemCommandRunner.image_lease(identity)
+        self.system.image_lease(identity)
     }
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
-        SystemCommandRunner.pin_raw_device(device)
+        self.system.pin_raw_device(device)
     }
 
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
-        SystemCommandRunner.attached_disk_images()
+        self.system.attached_disk_images()
     }
 
     fn attachments_of(&self, image: &Path) -> std::io::Result<Vec<AttachedDiskImage>> {
-        SystemCommandRunner.attachments_of(image)
+        self.system.attachments_of(image)
     }
 }
 
@@ -7389,6 +7466,7 @@ mod build_mount_races {
     }
 
     struct Runner {
+        system: SystemCommandRunner,
         recorded: RecordingRunner,
         mounts: Mounts,
         completion: Completion,
@@ -7466,7 +7544,7 @@ mod build_mount_races {
                 gate.waiting.send(()).unwrap();
                 gate.resume.lock().recv().unwrap();
             }
-            SystemCommandRunner.image_lease(identity)
+            self.system.image_lease(identity)
         }
         fn pin_raw_device(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
             Ok(None)
@@ -7482,8 +7560,14 @@ mod build_mount_races {
         }
     }
 
-    fn runner(recorded: &RecordingRunner, mounts: &Mounts, completion: Completion) -> Runner {
+    fn runner(
+        recorded: &RecordingRunner,
+        mounts: &Mounts,
+        completion: Completion,
+        system: SystemCommandRunner,
+    ) -> Runner {
         Runner {
+            system,
             recorded: recorded.clone(),
             mounts: mounts.clone(),
             completion,
@@ -7519,7 +7603,12 @@ mod build_mount_races {
         let (layout, id) = build(&fixture, &recorded);
         let (waiting, waited) = mpsc::sync_channel(1);
         let (resume, resumed) = mpsc::sync_channel(1);
-        let mut loser = runner(&recorded, &mounts, Completion::Mount);
+        let mut loser = runner(
+            &recorded,
+            &mounts,
+            Completion::Mount,
+            SystemCommandRunner::new(fixture.host_namespace()),
+        );
         loser.gate = Some(LeaseGate {
             waiting,
             resume: Mutex::new(resumed),
@@ -7536,7 +7625,12 @@ mod build_mount_races {
             });
             waited.recv().expect("loser reached its second image lease");
             let winner = MacOsApfsExecutionHost::with_mount_source(
-                runner(&recorded, &mounts, Completion::Mount),
+                runner(
+                    &recorded,
+                    &mounts,
+                    Completion::Mount,
+                    SystemCommandRunner::new(fixture.host_namespace()),
+                ),
                 fixture.config(),
                 mounts.clone(),
             )
@@ -7568,6 +7662,7 @@ mod build_mount_races {
                 &recorded,
                 &mounts,
                 Completion::InProgress(Observation::Expected),
+                SystemCommandRunner::new(fixture.host_namespace()),
             ),
             fixture.config(),
             mounts,
@@ -7594,7 +7689,12 @@ mod build_mount_races {
             let mounts = Mounts::default();
             let (layout, id) = build(&fixture, &recorded);
             let host = MacOsApfsExecutionHost::with_mount_source(
-                runner(&recorded, &mounts, Completion::InProgress(observation)),
+                runner(
+                    &recorded,
+                    &mounts,
+                    Completion::InProgress(observation),
+                    SystemCommandRunner::new(fixture.host_namespace()),
+                ),
                 fixture.config(),
                 mounts,
             )
@@ -7624,7 +7724,12 @@ mod build_mount_races {
         let mounts = Mounts::default();
         let (layout, id) = build(&fixture, &recorded);
         let host = MacOsApfsExecutionHost::with_mount_source(
-            runner(&recorded, &mounts, Completion::OtherFailure),
+            runner(
+                &recorded,
+                &mounts,
+                Completion::OtherFailure,
+                SystemCommandRunner::new(fixture.host_namespace()),
+            ),
             fixture.config(),
             mounts,
         )

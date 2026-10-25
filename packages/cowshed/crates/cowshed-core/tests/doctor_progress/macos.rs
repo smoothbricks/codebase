@@ -10,6 +10,7 @@ use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_os::fork_lock::Run as _;
+use cowshed_os::namespace::TestNamespace;
 use cowshed_os::timing::{Step, StepSink};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -100,10 +101,11 @@ async fn a_probe_that_waits_for_an_answer_is_the_doctor_step_its_call_is_in() {
     .expect("workspace hooks ignore");
     git(&checkout, &["add", "tracked", ".gitignore"]);
     git(&checkout, &["commit", "-q", "-m", "initial"]);
+    let namespace = TestNamespace::mint().expect("a test namespace");
     let storage = ValidatedHostStorage::new(
         scratch.path().to_path_buf(),
         Vec::new(),
-        CanonicalRoots::at(store),
+        CanonicalRoots::fixture(namespace, store),
     );
     let repo = RepoId::parse("fixture/doctor").expect("repository identity");
 

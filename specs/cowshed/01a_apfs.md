@@ -26,12 +26,12 @@ links back to the sections here.
   the kernel's RAW class attaches as a disk of that length (measured 2026-10-22: a zero-block 1 GiB file attached, took
   `newfs_apfs`, passed `fsck_apfs -q` and detached cleanly),
   `hdiutil attach -kernel -nomount -noverify -nobrowse -imagekey diskimage-class=CRawDiskImage -plist <image>`,
-  `newfs_apfs -U <uid> -G <gid> -e -v [cowshed] <whole-device>`, a `fsck_apfs -q` of the new volume, and owned-registry
-  `hdiutil detach -verbose <whole-device>` of that exact whole device; only then is it renamed to its name. Only minting
-  takes the template's lock, and a minter that finds the template once it holds the lock returns it, so concurrent first
-  mints make one template and a mint that finds it needs no lock at all. Each minter stages under a name of its own
-  (`-minting-<nonce>`), so a path is attached at most once: a minter killed with its attach still queued on
-  `storagekitd` can have that attach land after the next minter removed its file, and on the single reused `-minting`
+  `newfs_apfs -U <uid> -G <gid> -e -v <label prefix> <whole-device>`, a `fsck_apfs -q` of the new volume, and
+  owned-registry `hdiutil detach -verbose <whole-device>` of that exact whole device; only then is it renamed to its
+  name. Only minting takes the template's lock, and a minter that finds the template once it holds the lock returns it,
+  so concurrent first mints make one template and a mint that finds it needs no lock at all. Each minter stages under a
+  name of its own (`-minting-<nonce>`), so a path is attached at most once: a minter killed with its attach still queued
+  on `storagekitd` can have that attach land after the next minter removed its file, and on the single reused `-minting`
   name it landed beside the next minter's attach, leaving one path attached twice. Before it starts, a minter releases
   every attachment the kernel holds for any of the template's staging names (old reused name included) — the inventory
   decides, since an attachment outlives its file and keeps its path — and removes their files. No attach runs for a path
@@ -147,8 +147,10 @@ links back to the sections here.
   written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
   identity from it — renaming a volume by hand (`diskutil rename`) changes the label and nothing else. Identity comes
   from where the backing image lives and from the in-image marker; see "Ownership, identity, and the volume label"
-  below. A minted image carries its template's label, `[cowshed]`, until its workspace's supervisor relabels it off the
-  provisioning path; a build volume keeps it, since nothing mounts one browsable.
+  below. A minted image carries its template's label, its store's namespace's prefix (`[cowshed]` for production,
+  `[cowshed-test-<ns>]` or the shared test template's `[cowshed-test]` for a test store, 01_storage.md "Host
+  namespace"), until its workspace's supervisor relabels it off the provisioning path; a build volume keeps it, since
+  nothing mounts one browsable.
 - **Spotlight**: the root storage service merges the fixed store and per-user mount roots into the Data volume's
   Spotlight Search Privacy `Exclusions` at setup and boot, preserving other entries. These exclusions and the image
   marker express indexing policy, not media-reference ownership. In mds **2418.6.3.9.400 arm64e**, an admitted mounted
@@ -288,9 +290,10 @@ rights against the live I/O Registry after successful release, with the same mds
   right under `/private/tmp`, kept after detach; the same two under the Darwin per-user temporary root left none. The
   departed rights came from mounts outside `/var/folders/`: real-APFS test fixtures under `/private/tmp`, the nx-plugin
   RAM temp volume at `/Volumes` and its `/private/tmp` staging mount, and smoke projects adopted under `/private/tmp`.
-  So every test fixture mounts below `/private/var/folders/cowshed/<uid>/t` (08_testing.md) and the RAM temp at
-  `/private/var/folders/cowshed/<uid>/ram3`, its leaf naming the revision (`packages/nx-plugin/README.md`); a main's
-  mount at its checkout path is the one cowshed mount mds still admits, once per remount.
+  So every real-APFS test fixture mounts below its test namespace's directory `/private/var/folders/cowshed/<uid>/<ns>`
+  (08_testing.md) and the RAM temp at `/private/var/folders/cowshed/<uid>/ram3` (a test namespace's at `<ns>/ram3`), its
+  leaf naming the revision (`packages/nx-plugin/README.md`); a main's mount at its checkout path is the one cowshed
+  mount mds still admits, once per remount.
 
 Cowshed must not depend on mds releasing these references to finish unmount, eject, reclamation or publication.
 Attachment presence is the kernel's current registered image/device mapping, not the class's still-live instance count.
@@ -894,7 +897,8 @@ What the substrate does about each:
 - **Test images are 1 GiB** and a fixture detaches its images on every exit path it survives, panic included; a killed
   run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
   attach budget for as long as it stays attached. Tests mint one blank template per host user with the production
-  minter, at `/private/var/folders/cowshed/<uid>/t/templates-uid<uid>`, and clone every test image from it; a test store
+  minter, at `/private/var/folders/cowshed/<uid>/t/templates-uid<uid>-cowshed-test`, labelled `[cowshed-test]`, a test
+  name no single namespace owns and never production's `[cowshed]`, and clone every test image from it; a test store
   that mints is seeded with a clone of it. Like a store's template it outlives its minter and its name spells everything
   its bytes depend on, so concurrent lanes and later runs clone the same one instead of each test process tree paying a
   create, a formatting attach, a format and a detach before its first test. Real-APFS tests attach with `noMount` unless
@@ -1118,10 +1122,11 @@ Remaining options, not additional guarantees or implemented cutovers:
 
 Three questions, three authorities, none of them the volume label:
 
-- **Which volumes are cowshed's?** Ownership is by location. Every backing image lives under `/private/cowshed/store`,
-  and enumeration is a `readdir` of that tree (`sessions/` plus the one canonical `main` image per project) — never a
-  scan of `diskutil list`. A volume cowshed did not create has no image there and is therefore invisible to enumeration,
-  gc, and crash-window classification regardless of what it is called.
+- **Which volumes are cowshed's?** Ownership is by location. Every backing image lives under its store root,
+  production's `/private/cowshed/store` and a test namespace's its fixture store (01_storage.md, "Host namespace"), and
+  enumeration is a `readdir` of that tree (`sessions/` plus the one canonical `main` image per project) — never a scan
+  of `diskutil list`. A volume cowshed did not create has no image there and is therefore invisible to enumeration, gc,
+  and crash-window classification regardless of what it is called.
 - **Which workspace is a given image?** The sibling `<image>.grants.json` metadata, cross-checked against the image's
   filename stem. This is what makes discovery and attach possible while detached.
 - **Is the volume mounted here ours?** The in-image marker `.cowshed/workspace.json`, matched on `repoId`, `workspace`,

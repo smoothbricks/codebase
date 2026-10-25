@@ -9,6 +9,7 @@ mod macos {
         SystemCommandRunner,
     };
     use cowshed_core::copy::copy_until_quiescent_blocking;
+    use cowshed_os::namespace::HostNamespace;
 
     pub fn run() {
         let mut arguments = std::env::args_os();
@@ -97,7 +98,7 @@ mod macos {
             std::fs::remove_dir_all(&root.0)?;
         }
         std::fs::create_dir_all(&root.0)?;
-        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Production));
         let request = CreateImageRequest {
             staged_stem: root.0.join("source"),
             capacity: ImageCapacity::from_gibibytes(1),

@@ -30,9 +30,12 @@ use super::{CheckpointLabel, PRE_RESTORE_PREFIX, StorageLayout, StorageLayoutErr
 
 pub const DEFAULT_IMAGE_CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(100);
 use super::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
+use cowshed_os::namespace::HostNamespace;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApfsSubstrateConfig {
+    /// Whose names the store's volumes carry (01_storage.md, "Host namespace").
+    pub namespace: HostNamespace,
     pub store_root: PathBuf,
     /// The adopted checkout's path — the place in the user's source tree that adoption took over,
     /// and main's mountpoint.
@@ -41,8 +44,13 @@ pub struct ApfsSubstrateConfig {
 }
 
 impl ApfsSubstrateConfig {
-    pub fn new(store_root: impl Into<PathBuf>, checkout_path: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        namespace: HostNamespace,
+        store_root: impl Into<PathBuf>,
+        checkout_path: impl Into<PathBuf>,
+    ) -> Self {
         Self {
+            namespace,
             store_root: store_root.into(),
             checkout_path: checkout_path.into(),
             capacity: DEFAULT_IMAGE_CAPACITY,
@@ -3503,7 +3511,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
             host.rename_volume(
                 &attachment,
                 &staging_mount,
-                &volume_label(replacement.repo(), replacement.name()),
+                &volume_label(config.namespace, replacement.repo(), replacement.name()),
             )?;
         }
         host.mint_workspace_credentials(
@@ -4088,37 +4096,26 @@ pub fn volume_key(repo: &RepoId, workspace: &WorkspaceName) -> String {
     )
 }
 
-/// The APFS volume label, which Finder shows for a mounted volume's directory in place of the
-/// directory's own name. It is purely human-facing: it carries the full identity so volumes from
-/// different repositories and workspaces stay distinguishable, but nothing parses it and nothing
-/// classifies a volume by it — renaming a volume by hand changes nothing but the label. No `/`
-/// on purpose: a slash in a label renders as `:` in POSIX-path contexts.
-///
-/// An identity change still relabels every volume — but because the label is not an authority, a
-/// relabel interrupted partway leaves nothing but a cosmetic disagreement, which is why recovery
-/// does not have to redo it. Uniform across main and sessions: every volume names its workspace,
-/// a fresh clone from the moment its supervisor first serves rather than from its publication: the
-/// label is cosmetic, so nothing on the provisioning path waits on it.
-pub fn volume_label(repo: &RepoId, workspace: &WorkspaceName) -> String {
-    format!(
-        "[cowshed] {} · {} — {}",
+pub fn volume_label(namespace: HostNamespace, repo: &RepoId, workspace: &WorkspaceName) -> String {
+    namespace.volume_label(format_args!(
+        "{} · {} — {}",
         repo.owner(),
         repo.repo(),
         workspace.as_str()
-    )
+    ))
 }
 
-/// The label of the build volume `checkout` links (16_build_volumes.md, "Substrate"): the
-/// checkout's own label with `build` before its name, so Disk Utility lists the two volumes of
-/// one checkout side by side and says which one holds the build state. Like [`volume_label`] it
-/// is never an authority: the checkout's link says which volume is its.
-pub fn build_volume_label(repo: &RepoId, checkout: &WorkspaceName) -> String {
-    format!(
-        "[cowshed] {} · {} — build {}",
+pub fn build_volume_label(
+    namespace: HostNamespace,
+    repo: &RepoId,
+    checkout: &WorkspaceName,
+) -> String {
+    namespace.volume_label(format_args!(
+        "{} · {} — build {}",
         repo.owner(),
         repo.repo(),
         checkout.as_str()
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -4183,7 +4180,9 @@ mod tests {
 
     #[test]
     fn every_mutating_operation_maps_to_its_exact_canonical_lock_set() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let config = ApfsSubstrateConfig::new(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
             "/tmp/cowshed-lock-table/store",
             "/tmp/cowshed-lock-table/main",
         );
@@ -4271,6 +4270,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_lock_serializes_metadata_read_modify_write() {
+        use cowshed_os::namespace::{HostNamespace, TestNamespace};
         let root = std::env::temp_dir().join(format!(
             "cowshed-grant-lock-{}-{}",
             std::process::id(),
@@ -4281,10 +4281,16 @@ mod tests {
         let counter = root.join("grant-revision");
         std::fs::write(&counter, "0").expect("initial revision");
         let lock = store.join("sessions/raven.dmg.lock");
-        let config = ApfsSubstrateConfig::new(&store, root.join("checkout"));
-        let host =
-            native::MacOsApfsExecutionHost::new(cowshed_apfs::SystemCommandRunner, config.clone())
-                .expect("native host");
+        let config = ApfsSubstrateConfig::new(
+            HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
+            &store,
+            root.join("checkout"),
+        );
+        let host = native::MacOsApfsExecutionHost::new(
+            cowshed_apfs::SystemCommandRunner::new(config.namespace),
+            config.clone(),
+        )
+        .expect("native host");
         let substrate = ApfsSubstrate::new(config, host);
 
         let (first_entered_tx, first_entered_rx) = std::sync::mpsc::sync_channel(1);

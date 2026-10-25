@@ -28,6 +28,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             let template = blank_template(
                 &self.backend,
                 &self.config.store_root,
+                &self.config.namespace.label_prefix(),
                 capacity,
                 &crate::held_lock::ImageLockTaker {
                     holding: &crate::api::held_lock::LockHolding::store(

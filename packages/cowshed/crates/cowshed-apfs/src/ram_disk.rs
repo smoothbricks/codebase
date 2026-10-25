@@ -14,22 +14,28 @@ use cowshed_gateway_types::{
     RamDiskEntry, RamDiskSectors, RamDisks,
 };
 
-use crate::disk_lease::leased_at;
+use crate::disk_lease::{lease_socket, leased_at};
 use crate::{
     CommandRequest, CommandRunFailure, DISK_CHILD_DEADLINE, HDIUTIL, ProcessStatus,
     SystemCommandRunner,
 };
+use cowshed_os::namespace::HostNamespace;
 
-/// Attaches and detaches RAM disks under a storage lease from the gateway at `lease_socket`: the
-/// gateway that serves them, so a fixture gateway's disks never ask the host's.
+/// Attaches and detaches RAM disks under a storage lease from the gateway that serves them, the
+/// one of their namespace ([`lease_socket`]): production's gateway for production, a test
+/// namespace's fixture gateway for its own, so a fixture's disks never ask production's.
 #[derive(Clone, Debug)]
 pub struct SystemRamDisks {
+    runner: SystemCommandRunner,
     lease_socket: PathBuf,
 }
 
 impl SystemRamDisks {
-    pub fn new(lease_socket: PathBuf) -> Self {
-        Self { lease_socket }
+    pub fn new(namespace: HostNamespace) -> Self {
+        Self {
+            runner: SystemCommandRunner::new(namespace),
+            lease_socket: lease_socket(namespace),
+        }
     }
 }
 
@@ -46,7 +52,8 @@ impl RamDisks for SystemRamDisks {
         let image = format!("ram://{}", sectors.get());
         let command = format!("hdiutil attach -nomount {image}");
         let request = CommandRequest::new(HDIUTIL, ["attach", "-nomount", image.as_str()]);
-        let output = SystemCommandRunner
+        let output = self
+            .runner
             .run_within(&request, DISK_CHILD_DEADLINE, |deadline, run| {
                 leased_at(
                     &self.lease_socket,
@@ -83,30 +90,30 @@ impl RamDisks for SystemRamDisks {
         output_limit: usize,
     ) -> RamDetached {
         let request = CommandRequest::new(HDIUTIL, ["detach", device.as_str()]);
-        let output = match SystemCommandRunner.run_detach_of_entry(
-            &request,
-            entry.get(),
-            Some(&self.lease_socket),
-        ) {
-            Ok(output) => output,
-            Err(error) => {
-                let reason = error.to_string();
-                return match error.failure {
-                    // Refused or failed before `hdiutil` executed: nothing was detached.
-                    CommandRunFailure::Spawn(_)
-                    | CommandRunFailure::VolumeRename
-                    | CommandRunFailure::Release(_)
-                    | CommandRunFailure::DeviceChanged(_)
-                    | CommandRunFailure::Unspawned(_) => RamDetached::NotStarted { reason },
-                    // `hdiutil` ran, and its end, or its output, was not observed.
-                    CommandRunFailure::Wait(_)
-                    | CommandRunFailure::Deadline { .. }
-                    | CommandRunFailure::Kill { .. }
-                    | CommandRunFailure::Reap { .. }
-                    | CommandRunFailure::Input { .. } => RamDetached::Unknown { reason },
-                };
-            }
-        };
+        let output =
+            match self
+                .runner
+                .run_detach_of_entry(&request, entry.get(), Some(&self.lease_socket))
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    let reason = error.to_string();
+                    return match error.failure {
+                        // Refused or failed before `hdiutil` executed: nothing was detached.
+                        CommandRunFailure::Spawn(_)
+                        | CommandRunFailure::VolumeRename
+                        | CommandRunFailure::Release(_)
+                        | CommandRunFailure::DeviceChanged(_)
+                        | CommandRunFailure::Unspawned(_) => RamDetached::NotStarted { reason },
+                        // `hdiutil` ran, and its end, or its output, was not observed.
+                        CommandRunFailure::Wait(_)
+                        | CommandRunFailure::Deadline { .. }
+                        | CommandRunFailure::Kill { .. }
+                        | CommandRunFailure::Reap { .. }
+                        | CommandRunFailure::Input { .. } => RamDetached::Unknown { reason },
+                    };
+                }
+            };
         let status = match output.status {
             ProcessStatus::Exit(code) => RamDetachStatus::Exit(code),
             ProcessStatus::Signal(signal) => RamDetachStatus::Signal(signal),

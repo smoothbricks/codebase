@@ -25,6 +25,7 @@ use cowshed_core::storage::recovery::{
 };
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::namespace::TestNamespace;
 use serde_json::{Value, json};
 
 #[path = "../support/refusing_gateway.rs"]
@@ -195,11 +196,11 @@ async fn ignored_only_copy_source_content_keeps_recovery_trash() {
 }
 
 /// The directory store of the fixture whose scratch root is `scratch`: its `store` directory.
-fn fixture_storage(scratch: &Path) -> ValidatedHostStorage {
+fn fixture_storage(namespace: TestNamespace, scratch: &Path) -> ValidatedHostStorage {
     ValidatedHostStorage::new(
         scratch.to_path_buf(),
         Vec::new(),
-        CanonicalRoots::at(scratch.join("store")),
+        CanonicalRoots::fixture(namespace, scratch.join("store")),
     )
 }
 
@@ -295,7 +296,8 @@ impl Fixture {
         .expect("workspace hooks ignore");
         git(&checkout, &["add", "tracked", ".gitignore"]);
         git(&checkout, &["commit", "-q", "-m", "initial"]);
-        let storage = fixture_storage(scratch.path());
+        let namespace = TestNamespace::mint().expect("a test namespace");
+        let storage = fixture_storage(namespace, scratch.path());
         Self {
             _scratch: scratch,
             checkout,
@@ -1317,11 +1319,13 @@ async fn supervisor_process() {
     let Some(scratch) = std::env::var_os(SUPERVISOR_SCRATCH_ENV).map(PathBuf::from) else {
         return;
     };
+    // Its own namespace suffices: a directory store carries no volume labels or disk-tool leases.
+    let namespace = TestNamespace::mint().expect("a test namespace");
     let served = name("served");
     let supervisor = ProjectRuntime::open_directory_existing_at(
         &scratch.join("checkout"),
         RecoveryScope::Supervisor(served.clone()),
-        fixture_storage(&scratch),
+        fixture_storage(namespace, &scratch),
         refusing_gateway::connect,
     )
     .await
@@ -3226,10 +3230,12 @@ async fn gc_process() {
             .map(PathBuf::from)
             .unwrap_or_else(|| panic!("{name} names gc's storage"))
     };
+    // Its own namespace suffices: a directory store carries no volume labels or disk-tool leases.
+    let namespace = TestNamespace::mint().expect("a test namespace");
     let storage = ValidatedHostStorage::new(
         variable(GC_HOME_ENV),
         Vec::new(),
-        CanonicalRoots::at(variable(GC_STORE_ENV)),
+        CanonicalRoots::fixture(namespace, variable(GC_STORE_ENV)),
     );
     let supersede = std::env::var(GC_SUPERSEDE_ENV).expect("the abandonment gc supersedes");
     let (workspace, head) = supersede

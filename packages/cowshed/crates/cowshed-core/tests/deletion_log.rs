@@ -19,6 +19,7 @@ use cowshed_core::storage::lifecycle::{StorageGcOptions, StorageGcReason};
 use cowshed_core::storage::recovery::{
     FenceStep, FenceSteps, LifecycleIntent, LifecycleIntentJournal,
 };
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 #[derive(Clone, Default)]
 struct StubRunner;
@@ -73,6 +74,7 @@ impl CommandRunner for StubRunner {
 
 struct Fixture {
     root: PathBuf,
+    namespace: TestNamespace,
 }
 
 impl Fixture {
@@ -90,11 +92,16 @@ impl Fixture {
         // supplies.
         Self {
             root: std::fs::canonicalize(&root).expect("canonical fixture root"),
+            namespace: TestNamespace::mint().expect("a test namespace"),
         }
     }
 
     fn config(&self) -> ApfsSubstrateConfig {
-        ApfsSubstrateConfig::new(&self.root, self.root.join("mount"))
+        ApfsSubstrateConfig::new(
+            HostNamespace::Test(self.namespace),
+            &self.root,
+            self.root.join("mount"),
+        )
     }
 
     fn project_root(&self) -> PathBuf {

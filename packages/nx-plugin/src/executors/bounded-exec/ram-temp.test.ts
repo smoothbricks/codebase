@@ -10,6 +10,7 @@ import { createInterface } from 'node:readline';
 import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { awaitExit, ownedSocketDirectory } from '../../testing.js';
+import { GATEWAY_SOCKET } from './gateway-lease.js';
 import { attachRamDisk } from './ram-attach.js';
 import {
   type AttachedRamDisk,
@@ -23,13 +24,23 @@ import {
   imagesBackedUnder,
   mountsBelow,
   operationDisk,
+  PRODUCTION,
   RAM_TEMP_CAPACITY_BYTES,
+  type RamDisk,
   type RamTempError,
   RamTempVolume,
   ramDisksIn,
   ramTempPaths,
+  testNamespace,
+  volumeDisks,
 } from './ram-temp.js';
 import { registryDevice } from './ram-temp-fixtures.js';
+
+/**
+ * The namespace the cases that run fake host commands name their volumes by. They make nothing below it: each case's
+ * root, mountpoint, staging directory and lock are temporary directories of its own.
+ */
+const NAMESPACE = testNamespace(process.pid, 0);
 
 describe('RAM temp volume output parsing', () => {
   it('names the disk diskutil apfs reports it created', () => {
@@ -42,21 +53,30 @@ describe('RAM temp volume output parsing', () => {
 
   it('lists the RAM disks the I/O Registry holds, with their owner, size and mounts', () => {
     // Captured 2026-10-22 on macOS 26.6 with `ioreg -r -c IOHDIXHDDriveOutKernel -l -w0`: another checkout's
-    // revision-2 RAM disk, unmounted at that instant, and a 64 MiB disk whose volume mount_apfs placed below t/.
+    // revision-2 RAM disk, unmounted at that instant, and a 64 MiB disk whose volume mount_apfs placed at a test
+    // namespace's ram3. Each disk's volume carries the name the registry gives it, which is whose it is.
     const table = [
       '/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)',
-      '/dev/disk543s1 on /private/var/folders/cowshed/502/t/smoo-ram-fixture-27416 (apfs, local, nodev, nosuid, journaled, noowners, nobrowse, mounted by danny)',
+      '/dev/disk543s1 on /private/var/folders/cowshed/502/00l5k00/ram3 (apfs, local, nodev, nosuid, journaled, noowners, nobrowse, mounted by danny)',
     ].join('\n');
     expect(ramDisksIn(capturedRegistry(), table)).toEqual({
       ok: true,
       value: [
-        { entry: '0x100055578', physical: '/dev/disk539', sectors: 16777218, uid: 502, mountpoints: [] },
+        {
+          entry: '0x100055578',
+          physical: '/dev/disk539',
+          sectors: 16777218,
+          uid: 502,
+          mountpoints: [],
+          volumes: [{ name: 'smoo-ram2-502', mountpoints: [] }],
+        },
         {
           entry: '0x10005557b',
           physical: '/dev/disk540',
           sectors: 131072,
           uid: 502,
-          mountpoints: ['/private/var/folders/cowshed/502/t/smoo-ram-fixture-27416'],
+          mountpoints: ['/private/var/folders/cowshed/502/00l5k00/ram3'],
+          volumes: [{ name: 'smoo-ram-fixture-27416', mountpoints: ['/private/var/folders/cowshed/502/00l5k00/ram3'] }],
         },
       ],
     });
@@ -98,7 +118,7 @@ describe('RAM temp volume output parsing', () => {
   it('mounts below the per-user cowshed root, where mds keeps no right for it, short enough to hold sockets', () => {
     // sun_path is 104 bytes; a lease directory leaves room for nested fixture paths. mds admits no
     // volume whose mount path contains /var/folders/ (specs/cowshed/01a_apfs.md, "Spotlight media references").
-    expect(ramTempPaths({ uid: 501 })).toEqual({
+    expect(ramTempPaths({ uid: 501 }, PRODUCTION)).toEqual({
       root: '/private/var/folders/cowshed/501',
       uid: 501,
       mountpoint: '/private/var/folders/cowshed/501/ram3',
@@ -106,6 +126,73 @@ describe('RAM temp volume output parsing', () => {
       volumeName: 'smoo-ram3-501',
       staging: '/private/var/folders/cowshed/501/ram3-new',
     });
+  });
+
+  it('gives a test namespace its own root, volume, lock and staging directory below the per-user root', () => {
+    expect(ramTempPaths({ uid: 501 }, testNamespace(94769, 3))).toEqual({
+      root: '/private/var/folders/cowshed/501/0214h03',
+      uid: 501,
+      mountpoint: '/private/var/folders/cowshed/501/0214h03/ram3',
+      lockFile: '/private/var/folders/cowshed/501/0214h03/ram3.lock',
+      volumeName: 'smoo-ram3-501-0214h03',
+      staging: '/private/var/folders/cowshed/501/0214h03/ram3-new',
+    });
+  });
+
+  it('names a test namespace as cowshed_os does: the pid in five base-36 digits, the ordinal in two', () => {
+    expect(testNamespace(94769, 3)).toEqual({ kind: 'test', name: '0214h03' });
+    expect(testNamespace(36 ** 5 - 1, 36 ** 2 - 1).name).toBe('zzzzzzz');
+    expect(() => testNamespace(36 ** 5, 0)).toThrow('pid 60466176 does not fit');
+    expect(() => testNamespace(1, 36 ** 2)).toThrow('ordinal 1296 does not fit');
+    for (const refused of [-1, 1.5, Number.NaN]) {
+      expect(() => testNamespace(refused, 0)).toThrow('does not fit');
+      expect(() => testNamespace(1, refused)).toThrow('does not fit');
+    }
+  });
+
+  it("counts a RAM disk as the volume's only by its exact name where mounted, or by an exact record", () => {
+    const paths = ramTempPaths({ uid: 501 }, testNamespace(94769, 3));
+    const sectors = 131_072;
+    const disk = (entry: string, rest: Partial<RamDisk> = {}): RamDisk => ({
+      entry,
+      physical: '/dev/disk7',
+      sectors,
+      uid: 501,
+      mountpoints: [],
+      volumes: [],
+      ...rest,
+    });
+    const volume = (name: string, ...mountpoints: string[]): Partial<RamDisk> => ({
+      mountpoints,
+      volumes: [{ name, mountpoints }],
+    });
+    // Its own by its exact name where it is mounted: at its mountpoint, or while it is staged.
+    const own = [
+      disk('0x1', volume(paths.volumeName, paths.mountpoint)),
+      disk('0x2', volume(paths.volumeName, paths.staging)),
+    ];
+    expect(volumeDisks(own, paths, sectors, () => false)).toEqual(own);
+    // Of its user and size, and still not its own: nothing mounted and nothing recorded (a test's disk, another
+    // checkout's, its own interrupted attach), a volume of its name that is not mounted, another volume's name at its
+    // mountpoint, its name mounted elsewhere too, another user's disk, another size.
+    const strangers = [
+      disk('0x3'),
+      disk('0x4', { volumes: [{ name: paths.volumeName, mountpoints: [] }] }),
+      disk('0x5', volume('smoo-ram3-501', paths.mountpoint)),
+      disk('0x6', {
+        mountpoints: [paths.mountpoint, '/Volumes/other'],
+        volumes: [{ name: paths.volumeName, mountpoints: [paths.mountpoint] }],
+      }),
+      disk('0x7', { uid: 502, ...volume(paths.volumeName, paths.mountpoint) }),
+      disk('0x8', { sectors: sectors + 1, ...volume(paths.volumeName, paths.mountpoint) }),
+    ];
+    expect(volumeDisks(strangers, paths, sectors, () => false)).toEqual([]);
+    // An exact record makes a disk its own with nothing mounted, which covers an attach whose format never finished;
+    // it makes no other user's disk, no other size's and none with a mount elsewhere its own.
+    expect(volumeDisks(strangers, paths, sectors, (candidate) => candidate.entry === '0x3')).toEqual([strangers[0]]);
+    expect(
+      volumeDisks(strangers, paths, sectors, (candidate) => ['0x6', '0x7', '0x8'].includes(candidate.entry)),
+    ).toEqual([]);
   });
 
   it('never shares a volume or a RAM disk size with the checkouts of revisions 1 and 2', () => {
@@ -131,7 +218,7 @@ describe('the root the RAM temp volume mounts below', () => {
         make(root);
         // The volume's paths, all below this root, so no case can find the host's own volume.
         const paths = {
-          ...ramTempPaths({ uid }),
+          ...ramTempPaths({ uid }, NAMESPACE),
           root,
           mountpoint: join(root, 'ram'),
           staging: join(root, 'ram-new'),
@@ -173,6 +260,37 @@ describe('the root the RAM temp volume mounts below', () => {
 function capturedRegistry(): string {
   return readFileSync(new URL('./ram-temp-registry.txt', import.meta.url), 'utf8');
 }
+
+/** One RAM disk as `ioreg -r -c IOHDIXHDDriveOutKernel -l -w0` lists it, with its APFS volume when it has one. */
+function registryRamDisk(disk: {
+  readonly entry: string;
+  readonly uid: number;
+  readonly sectors: number;
+  readonly device: string;
+  readonly volume?: string;
+}): string {
+  return [
+    `+-o IOHDIXHDDriveOutKernel@1  <class IOHDIXHDDriveOutKernel, id ${disk.entry}, registered, matched, active, busy 0, retain 1>`,
+    '  | {',
+    `  |   "image-path" = <"ram://${disk.sectors}">`,
+    `  |   "owner-uid" = ${disk.uid}`,
+    '  | }',
+    '  +-o Apple read/write Media  <class IOMedia, id 0x100000a01, registered, matched, active, busy 0, retain 1>',
+    '    | {',
+    `    |   "BSD Name" = "${disk.device}"`,
+    '    | }',
+    ...(disk.volume === undefined
+      ? []
+      : [
+          `    +-o ${disk.volume}@1  <class AppleAPFSVolume, id 0x100000a02, registered, matched, active, busy 0, retain 1>`,
+          '      | {',
+          `      |   "FullName" = "${disk.volume}"`,
+          `      |   "BSD Name" = "${disk.device}s1"`,
+          '      | }',
+        ]),
+    '',
+  ].join('\n');
+}
 /** A real facade boundary: owns a detached stand-in, kills only SAFE children, and waits for reap.
  * The control socket gates facade exit after reap; protected output stays in owned files.
  */
@@ -194,7 +312,7 @@ async function ownedDiskFacadeFixture() {
   await writeFile(
     executable,
     `#!${process.execPath}\n` +
-      "import { spawn } from 'node:child_process';\nimport { once } from 'node:events';\nimport { closeSync, openSync } from 'node:fs';\nimport { createConnection } from 'node:net';\nimport { dirname, join } from 'node:path';\nimport { createInterface } from 'node:readline';\n\nconst startedAt = performance.now();\nconst argv = process.argv.slice(2);\nconst control = createConnection(argv.at(-1));\nawait once(control, 'connect');\nconst tool = argv[1];\nconst safe = argv[2] === '--deadline-ms';\nconst budget = safe ? Number(argv[3]) : undefined;\nconst native = argv.slice(safe ? 5 : 3);\nconst image = tool === 'hdiutil' || (tool === 'diskutil' && (native[0] === 'image' || native[0] === 'eject'));\nif (argv[0] !== 'disk-command' || (tool !== 'hdiutil' && tool !== 'diskutil') ||\n    argv[safe ? 4 : 2] !== '--' || safe === image ||\n    (safe && (!Number.isSafeInteger(budget) || budget <= 0))) {\n  control.end('invalid facade request\\n');\n  process.exitCode = 2;\n} else {\n  const mode = native[1];\n  const tail = mode === 'exit' ? 'exit 7' : mode === 'signal' ? 'kill -TERM $$' : 'exec sleep 600';\n  const files = image ? [openSync(join(dirname(argv.at(-1)), 'stdout'), 'w'), openSync(join(dirname(argv.at(-1)), 'stderr'), 'w')] : [];\n  const child = spawn('/bin/sh', ['-c', 'printf \"owned stdout\\\\n\"; printf \"owned stderr\\\\n\" >&2; printf ready >&3; ' + tail], {\n    detached: true,\n    stdio: ['ignore', files[0] ?? 'pipe', files[1] ?? 'pipe', 'pipe'],\n  });\n  for (const fd of files) closeSync(fd);\n  const ended = once(child, 'close');\n  if (!image) {\n    child.stdout.on('data', (chunk) => process.stdout.write(chunk));\n    child.stderr.on('data', (chunk) => process.stderr.write(chunk));\n  }\n  let release;\n  const finished = new Promise((resolve) => { release = resolve; });\n  let reaped = false;\n  const commands = createInterface({ input: control });\n  commands.on('line', (line) => {\n    if (line === 'cleanup') {\n      if (!reaped && child.exitCode === null && child.signalCode === null) process.kill(-child.pid, 'SIGKILL');\n      release();\n    } else if (line === 'finish') {\n      release();\n    } else if (line === 'inspect') {\n      process.kill(child.pid, 0);\n      control.write('custody ' + child.pid + '\\n');\n    }\n  });\n  let expired = false;\n  const timer = safe ? setTimeout(() => {\n    expired = true;\n    control.write('deadline ' + budget + '\\n');\n    process.kill(-child.pid, 'SIGKILL');\n  }, Math.max(0, budget - (performance.now() - startedAt))) : undefined;\n  const ready = await new Promise((resolve) => {\n    child.stdio[3].once('data', () => resolve(true));\n    child.stdio[3].once('end', () => resolve(false));\n    child.stdio[3].once('error', () => resolve(false));\n  });\n  if (!ready) throw new Error('owned child ended before readiness');\n  control.write('started ' + process.pid + ' ' + child.pid + '\\n');\n  const [code, signal] = await ended;\n  reaped = true;\n  clearTimeout(timer);\n  control.write('reaped ' + child.pid + ' ' + code + ' ' + signal + '\\n');\n  if (expired) process.stderr.write('owned child ' + child.pid + ' terminated by ' + signal + ' and reaped after ' + budget + ' ms deadline\\n');\n  await finished;\n  commands.close();\n  control.end();\n  await once(control, 'close');\n  if (mode === 'signal') process.kill(process.pid, 'SIGTERM');\n  else process.exitCode = expired ? 1 : code ?? 1;\n}\n",
+      "import { spawn } from 'node:child_process';\nimport { once } from 'node:events';\nimport { closeSync, openSync } from 'node:fs';\nimport { createConnection } from 'node:net';\nimport { dirname, join } from 'node:path';\nimport { createInterface } from 'node:readline';\n\nconst startedAt = performance.now();\nconst argv = process.argv.slice(2);\nif (argv[2] === '--gateway-socket') argv.splice(2, 2);\nconst control = createConnection(argv.at(-1));\nawait once(control, 'connect');\nconst tool = argv[1];\nconst safe = argv[2] === '--deadline-ms';\nconst budget = safe ? Number(argv[3]) : undefined;\nconst native = argv.slice(safe ? 5 : 3);\nconst image = tool === 'hdiutil' || (tool === 'diskutil' && (native[0] === 'image' || native[0] === 'eject'));\nif (argv[0] !== 'disk-command' || (tool !== 'hdiutil' && tool !== 'diskutil') ||\n    argv[safe ? 4 : 2] !== '--' || safe === image ||\n    (safe && (!Number.isSafeInteger(budget) || budget <= 0))) {\n  control.end('invalid facade request\\n');\n  process.exitCode = 2;\n} else {\n  const mode = native[1];\n  const tail = mode === 'exit' ? 'exit 7' : mode === 'signal' ? 'kill -TERM $$' : 'exec sleep 600';\n  const files = image ? [openSync(join(dirname(argv.at(-1)), 'stdout'), 'w'), openSync(join(dirname(argv.at(-1)), 'stderr'), 'w')] : [];\n  const child = spawn('/bin/sh', ['-c', 'printf \"owned stdout\\\\n\"; printf \"owned stderr\\\\n\" >&2; printf ready >&3; ' + tail], {\n    detached: true,\n    stdio: ['ignore', files[0] ?? 'pipe', files[1] ?? 'pipe', 'pipe'],\n  });\n  for (const fd of files) closeSync(fd);\n  const ended = once(child, 'close');\n  if (!image) {\n    child.stdout.on('data', (chunk) => process.stdout.write(chunk));\n    child.stderr.on('data', (chunk) => process.stderr.write(chunk));\n  }\n  let release;\n  const finished = new Promise((resolve) => { release = resolve; });\n  let reaped = false;\n  const commands = createInterface({ input: control });\n  commands.on('line', (line) => {\n    if (line === 'cleanup') {\n      if (!reaped && child.exitCode === null && child.signalCode === null) process.kill(-child.pid, 'SIGKILL');\n      release();\n    } else if (line === 'finish') {\n      release();\n    } else if (line === 'inspect') {\n      process.kill(child.pid, 0);\n      control.write('custody ' + child.pid + '\\n');\n    }\n  });\n  let expired = false;\n  const timer = safe ? setTimeout(() => {\n    expired = true;\n    control.write('deadline ' + budget + '\\n');\n    process.kill(-child.pid, 'SIGKILL');\n  }, Math.max(0, budget - (performance.now() - startedAt))) : undefined;\n  const ready = await new Promise((resolve) => {\n    child.stdio[3].once('data', () => resolve(true));\n    child.stdio[3].once('end', () => resolve(false));\n    child.stdio[3].once('error', () => resolve(false));\n  });\n  if (!ready) throw new Error('owned child ended before readiness');\n  control.write('started ' + process.pid + ' ' + child.pid + '\\n');\n  const [code, signal] = await ended;\n  reaped = true;\n  clearTimeout(timer);\n  control.write('reaped ' + child.pid + ' ' + code + ' ' + signal + '\\n');\n  if (expired) process.stderr.write('owned child ' + child.pid + ' terminated by ' + signal + ' and reaped after ' + budget + ' ms deadline\\n');\n  await finished;\n  commands.close();\n  control.end();\n  await once(control, 'close');\n  if (mode === 'signal') process.kill(process.pid, 'SIGTERM');\n  else process.exitCode = expired ? 1 : code ?? 1;\n}\n",
     { mode: 0o755 },
   );
   async function event(): Promise<string> {
@@ -253,7 +371,7 @@ describe('RAM temp volume on this host', () => {
       const lifetime = join(directory, 'lifetime.fifo');
       execFileSync('mkfifo', [lifetime]);
       const ended = readFile(lifetime, 'utf8');
-      const result = await createHostCommands(500).run('/bin/sh', [
+      const result = await createHostCommands(join(directory, 'unused-gateway.sock'), 500).run('/bin/sh', [
         '-c',
         'exec 3>"$1"; tail -f /dev/null & exec 3>&-; echo $!; wait',
         'sh',
@@ -283,7 +401,13 @@ describe('RAM temp volume on this host', () => {
     const reader = openForProbe(lifetime);
     try {
       const gone = readFile(lifetime, 'utf8');
-      const result = await createHostCommands(500).run('/bin/sh', ['-c', churnScript(), 'sh', lifetime, '/dev/null']);
+      const result = await createHostCommands(join(directory, 'unused-gateway.sock'), 500).run('/bin/sh', [
+        '-c',
+        churnScript(),
+        'sh',
+        lifetime,
+        '/dev/null',
+      ]);
       expect(result.status).not.toBe(0);
       expect(result.stderr).toMatch(
         /^no answer within 500 ms; (?:killed process group \d+|signalled its process group, but .*)$/,
@@ -321,10 +445,55 @@ describe('RAM temp volume on this host', () => {
     expect(diskCommand('/sbin/umount', ['/volume'], 300)).toBeNull();
   });
 
+  it("names its gateway to the disk facade unless it is the host's own, which the facade defaults to", async () => {
+    const directory = mkdtempSync(join(realpathSync(tmpdir()), 'rt-facade-argv-'));
+    try {
+      // The stand-in prints the argv it is given and asks no gateway: only what the facade is told is under test.
+      const facade = join(directory, 'cowshed');
+      writeFileSync(facade, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o755 });
+      const fixtureGateway = join(directory, 'gateway.sock');
+      const told = async (gateway: string): Promise<string[]> => {
+        const output = await createHostCommands(gateway, 5_000, undefined, facade).run('/usr/sbin/diskutil', [
+          'info',
+          'x',
+        ]);
+        expect(output.status).toBe(0);
+        return output.stdout.trim().split('\n');
+      };
+      expect(await told(GATEWAY_SOCKET)).toEqual([
+        'disk-command',
+        'diskutil',
+        '--deadline-ms',
+        '5000',
+        '--',
+        'info',
+        'x',
+      ]);
+      expect(await told(fixtureGateway)).toEqual([
+        'disk-command',
+        'diskutil',
+        '--gateway-socket',
+        fixtureGateway,
+        '--deadline-ms',
+        '5000',
+        '--',
+        'info',
+        'x',
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('waits past the SAFE deadline for actual owned child reap and the facade terminal exit', async () => {
     const fixture = await ownedDiskFacadeFixture();
     let settled = false;
-    const result = createHostCommands(undefined, undefined, undefined, fixture.executable)
+    const result = createHostCommands(
+      join(fixture.directory, 'unused-gateway.sock'),
+      undefined,
+      undefined,
+      fixture.executable,
+    )
       .run('/usr/sbin/diskutil', ['info', 'overrun', fixture.socketPath], 300)
       .then((output) => {
         settled = true;
@@ -354,10 +523,12 @@ describe('RAM temp volume on this host', () => {
       { tool: 'diskutil', verb: 'eject' },
     ]) {
       const fixture = await ownedDiskFacadeFixture();
-      const result = createHostCommands(300, undefined, undefined, fixture.executable).run(tool, [
-        verb,
-        fixture.socketPath,
-      ]);
+      const result = createHostCommands(
+        join(fixture.directory, 'unused-gateway.sock'),
+        300,
+        undefined,
+        fixture.executable,
+      ).run(tool, [verb, fixture.socketPath]);
       let pid = 0;
       try {
         pid = await fixture.started();
@@ -383,7 +554,11 @@ describe('RAM temp volume on this host', () => {
       for (const mode of ['exit', 'signal']) {
         const fixture = await ownedDiskFacadeFixture();
         process.env[COWSHED_EXECUTABLE_ENV] = fixture.executable;
-        const result = createHostCommands().run('/usr/sbin/diskutil', ['info', mode, fixture.socketPath]);
+        const result = createHostCommands(join(fixture.directory, 'unused-gateway.sock')).run('/usr/sbin/diskutil', [
+          'info',
+          mode,
+          fixture.socketPath,
+        ]);
         try {
           const pid = await fixture.started();
           expect(await fixture.event()).toBe(`reaped ${pid} ${mode === 'exit' ? '7 null' : 'null SIGTERM'}`);
@@ -408,7 +583,12 @@ describe('RAM temp volume on this host', () => {
     try {
       const executable = join(directory, 'missing-cowshed');
       // The bound is the leg backstop: a missing facade fails at spawn, so the run ends at once.
-      const host = createHostCommands(BOUNDED_TEST_IDLE_TIMEOUT_MS, undefined, undefined, executable);
+      const host = createHostCommands(
+        join(directory, 'unused-gateway.sock'),
+        BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        undefined,
+        executable,
+      );
       const output = await host.run('/usr/sbin/diskutil', ['info']);
       expect(output.status).toBe(1);
       expect(output.stdout).toBe('');
@@ -440,7 +620,7 @@ describe('RAM temp volume on this host', () => {
       server.listen(socket, listened);
       await listening;
       server.off('error', failed);
-      const host = createHostCommands(BOUNDED_TEST_IDLE_TIMEOUT_MS, socket);
+      const host = createHostCommands(socket, BOUNDED_TEST_IDLE_TIMEOUT_MS);
       // `umount` with no operand only prints its usage, and it is a disk tool that takes a lease.
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
@@ -474,7 +654,7 @@ describe('RAM temp volume on this host', () => {
       server.listen(socket, listened);
       await listening;
       server.off('error', failed);
-      const host = createHostCommands(BOUNDED_TEST_IDLE_TIMEOUT_MS, socket, 'alone');
+      const host = createHostCommands(socket, BOUNDED_TEST_IDLE_TIMEOUT_MS, 'alone');
       // `umount` with no operand only prints its usage, and it is a disk tool that takes a lease.
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
@@ -494,6 +674,7 @@ describe('detaching a RAM disk an inventory found', () => {
     sectors: 131072,
     uid: 502,
     mountpoints: [],
+    volumes: [],
   };
 
   it('binds the detach to the registry entry the inventory read, never forced', () => {
@@ -596,7 +777,7 @@ describe("the gateway's ram-attach", () => {
         asked.push(line);
         return '{"ok":true,"ramDisk":{"device":"/dev/disk7"}}\n';
       },
-      (socket) => createHostCommands(BOUNDED_TEST_IDLE_TIMEOUT_MS, socket).attachRam(131_072),
+      (socket) => createHostCommands(socket, BOUNDED_TEST_IDLE_TIMEOUT_MS).attachRam(131_072),
     );
     expect(asked).toEqual(['{"op":"ram-attach","sectors":131072}\n']);
     expect(attached).toEqual({ ok: true, value: '/dev/disk7' });
@@ -649,6 +830,15 @@ describe("the gateway's ram-attach", () => {
   });
 });
 
+const noSubtrees = {
+  rootArgv(): never {
+    throw new Error('a creation that fails admits no command');
+  },
+  async retire(): Promise<never> {
+    throw new Error('a creation that fails settles no dead lease');
+  },
+};
+
 describe('creating the RAM temp volume', () => {
   it('asks its owner for the disk and never runs an attach of its own', async () => {
     // A root the creation accepts, and paths below it, so nothing here can find the user's volume.
@@ -656,7 +846,7 @@ describe('creating the RAM temp volume', () => {
     const root = join(parent, 'root');
     mkdirSync(root, { mode: 0o700 });
     const paths = {
-      ...ramTempPaths(userInfo()),
+      ...ramTempPaths(userInfo(), NAMESPACE),
       root,
       mountpoint: join(root, 'ram'),
       staging: join(root, 'ram-new'),
@@ -701,6 +891,111 @@ describe('creating the RAM temp volume', () => {
       rmSync(parent, { recursive: true, force: true });
     }
   });
+
+  it('ignores a RAM disk of its user and size that is not its own', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'ra-ignore-'));
+    const root = join(parent, 'root');
+    mkdirSync(root, { mode: 0o700 });
+    const paths = {
+      ...ramTempPaths(userInfo(), NAMESPACE),
+      root,
+      mountpoint: join(root, 'ram'),
+      staging: join(root, 'ram-new'),
+      lockFile: join(parent, 'v.lock'),
+    };
+    const capacity = 64 * 1024 * 1024;
+    const disk = { entry: '0x100000def', uid: paths.uid, sectors: capacity / 512, device: 'disk9' };
+    // Not the volume's, though of its user and size: nothing mounted, with a volume of its name on it, and another
+    // volume's name where the mount table puts it at the mountpoint.
+    const strangers = [
+      { registry: registryRamDisk({ ...disk, volume: paths.volumeName }), table: '' },
+      {
+        registry: registryRamDisk({ ...disk, volume: 'smoo-ram3-0' }),
+        table: `/dev/disk9s1 on ${paths.mountpoint} (apfs, local, nobrowse, noowners)`,
+      },
+    ];
+    try {
+      for (const { registry, table } of strangers) {
+        const asked: number[] = [];
+        const commands: HostCommands = {
+          async run(file, args): Promise<CommandOutput> {
+            if (file === '/usr/sbin/ioreg') return { status: 0, stdout: registry, stderr: '' };
+            if (file === '/sbin/mount') return { status: 0, stdout: table, stderr: '' };
+            throw new Error(`${file} ${args.join(' ')} ran: a disk that is not the volume's was acted on`);
+          },
+          async detachRam() {
+            throw new Error("a disk that is not the volume's was detached");
+          },
+          async attachRam(sectors) {
+            asked.push(sectors);
+            return { ok: false, error: 'the owner refused' };
+          },
+        };
+        expect(await new RamTempVolume(paths, capacity, commands).acquire(noSubtrees)).toEqual({
+          ok: false,
+          error: { kind: 'provision-failed', step: 'ram-attach', detail: 'the owner refused' },
+        });
+        expect(asked).toEqual([131_072]);
+      }
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('names a disk mounted at its mountpoint under its exact name, and detaches it only with a receipt', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'ra-named-'));
+    const root = join(parent, 'root');
+    mkdirSync(root, { mode: 0o700 });
+    const paths = {
+      ...ramTempPaths(userInfo(), NAMESPACE),
+      root,
+      mountpoint: join(root, 'ram'),
+      staging: join(root, 'ram-new'),
+      lockFile: join(parent, 'v.lock'),
+    };
+    mkdirSync(paths.mountpoint);
+    const capacity = 64 * 1024 * 1024;
+    const registry = registryRamDisk({
+      entry: '0x100000def',
+      uid: paths.uid,
+      sectors: capacity / 512,
+      device: 'disk9',
+      volume: paths.volumeName,
+    });
+    const commands: HostCommands = {
+      async run(file, args): Promise<CommandOutput> {
+        if (file === '/usr/sbin/ioreg') {
+          return { status: 0, stdout: args.includes('AppleDiskImageDevice') ? '' : registry, stderr: '' };
+        }
+        if (file === '/sbin/mount') {
+          return {
+            status: 0,
+            stdout: `/dev/disk9s1 on ${paths.mountpoint} (apfs, local, nobrowse, noowners)`,
+            stderr: '',
+          };
+        }
+        throw new Error(`${file} ${args.join(' ')} ran: a disk with no receipt was acted on`);
+      },
+      async detachRam() {
+        throw new Error('a disk with no receipt was detached');
+      },
+      async attachRam() {
+        throw new Error('a creation that stops at a disk it cannot prove its own attaches none');
+      },
+    };
+    try {
+      expect(await new RamTempVolume(paths, capacity, commands).acquire(noSubtrees)).toEqual({
+        ok: false,
+        error: {
+          kind: 'ram-unavailable',
+          reason: 'unproven-owner',
+          detail: '/dev/disk9 has no exact gateway creation receipt; no reclaim or detach admitted',
+        },
+      });
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
 });
 
 /** No native disk command runs: the only child is this owned facade, whose effect and exit have separate controls. */
@@ -712,12 +1007,11 @@ async function detachCustodyFixture(mode: 'stray' | 'rollback' = 'stray', boundM
   const root = join(directory, 'root');
   mkdirSync(root, { mode: 0o700 });
   const paths = {
-    ...ramTempPaths(userInfo()),
+    ...ramTempPaths(userInfo(), NAMESPACE),
     root,
     mountpoint: join(root, 'ram'),
     staging: join(root, 'ram-new'),
     lockFile: join(directory, 'v.lock'),
-    volumeName: 'owned-scripted-ram',
   };
   const capacity = 131_072 * 512;
   const entry = '0x100000abc';
@@ -788,7 +1082,7 @@ socket.end();
 `,
     { mode: 0o755 },
   );
-  const host = createHostCommands(300, join(directory, 'unused-gateway.sock'), 'shared', executable);
+  const host = createHostCommands(join(directory, 'unused-gateway.sock'), 300, 'shared', executable);
   const output = Promise.withResolvers<CommandOutput>();
   const calls: string[] = [];
   let attaches = 0;
@@ -997,7 +1291,7 @@ describe('RAM detach custody after a bounded wait', () => {
 import { readFile } from 'node:fs/promises';
 import { createHostCommands, RamTempVolume } from ${JSON.stringify(new URL('../../../dist/executors/bounded-exec/ram-temp.js', import.meta.url).href)};
 const paths = ${JSON.stringify(fixture.paths)};
-const host = createHostCommands(300, ${JSON.stringify(join(fixture.directory, 'unused-gateway.sock'))}, 'shared', ${JSON.stringify(fixture.executable)});
+const host = createHostCommands(${JSON.stringify(join(fixture.directory, 'unused-gateway.sock'))}, 300, 'shared', ${JSON.stringify(fixture.executable)});
 const commands = {
   async run(file, args, deadline, binding) {
     if (file === '/usr/sbin/ioreg') return { status: 0, stdout: await readFile(${JSON.stringify(fixture.registry)}, 'utf8'), stderr: '' };

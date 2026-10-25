@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { GATEWAY_SOCKET, holdLease, type InstallRestart, type Unleased } from './gateway-lease.js';
+import { holdLease, type InstallRestart, type Unleased } from './gateway-lease.js';
 import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
 
 /**
@@ -384,11 +384,12 @@ export interface CpuBudget {
 }
 
 /**
- * The gateway at `socket`'s budget. A grant has no deadline: the wait is how the budget works, and
+ * The gateway at `socket`'s budget. The caller names the gateway, with no default: the Nx executor the host's own, a
+ * host proof its fixture's. A grant has no deadline: the wait is how the budget works, and
  * the gateway answers `queued` at once, so a client knows it is alive. `checkout` is the Nx
  * workspace root: the gateway shares tokens fairly between checkouts.
  */
-export function gatewayCpuBudget(socket: string = GATEWAY_SOCKET): CpuBudget {
+export function gatewayCpuBudget(socket: string): CpuBudget {
   return {
     async take(want, checkout, command) {
       const lease = await holdLease(socket, { op: 'cpu-tokens', want, checkout, command }, 'the CPU budget', {

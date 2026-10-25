@@ -1,6 +1,11 @@
 //! A fixture gateway serving `ram-attach`, `ram-detach` and the disk lease on a socket of its own,
 //! and the I/O Registry's RAM disks, for the RAM disk tests (05_gateway.md, "RAM disks").
 //!
+//! Every fixture owns a test namespace and derives everything from it (01_storage.md, "Host
+//! namespace"): its root, the namespace's directory below the per-user root; the gateway's socket, at
+//! that root, where the namespace's disk tools take their lease; and the runner that detaches. No
+//! fixture path can be the user's gateway's, so none is compared with it.
+//!
 //! Every disk a test attaches is its own: a size no other process uses, attached under its fixture
 //! gateway's lease. The fixture records each disk's registry identity right after its attach and
 //! its teardown detaches only those identities, each while a fresh registry read still lists it
@@ -18,6 +23,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cowshed_apfs::disk_lease::lease_socket;
 use cowshed_apfs::ram_disk::SystemRamDisks;
 use cowshed_apfs::{CommandRequest, SystemCommandRunner};
 use cowshed_core::api::dto::JobId;
@@ -29,9 +35,11 @@ use cowshed_gateway::{
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
 use cowshed_gateway_types::{RamAttachRequest, RamDiskDevice, RamDiskEntry, RamDiskSectors};
-use uuid::Uuid;
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
-use crate::fixture_dir::{FixtureDir, secure_fixture_dir};
+#[path = "namespace_root.rs"]
+mod namespace_root;
+use namespace_root::NamespaceRoot;
 
 struct NoCredentials;
 
@@ -84,7 +92,7 @@ const FIXTURE_TOP: u64 = FIXTURE_BASE + PID_MAX * 4 + 4;
 const NX_PLUGIN_FIXTURE_TOP: u64 = 131_072 + PID_MAX * 4 + 4;
 /// The user's RAM temp volume, in sectors: `RAM_TEMP_CAPACITY_BYTES` (8 GiB plus its revision, 3,
 /// in sectors) of `packages/nx-plugin/src/executors/bounded-exec/ram-temp.ts` over 512.
-const RAM_TEMP_SECTORS: u64 = 16_777_216 + 3;
+pub const RAM_TEMP_SECTORS: u64 = 16_777_216 + 3;
 
 /// A size no other process attaches: [`FIXTURE_BASE`] plus sectors this process's pid and `index`
 /// pick. Its band lies above the nx-plugin host proofs' and below the RAM temp volume's own size.
@@ -103,26 +111,23 @@ pub fn fixture_sectors(index: u64) -> RamDiskSectors {
     RamDiskSectors::new(NonZeroU64::new(sectors).expect("a positive size"))
 }
 
-/// A gateway serving the RAM disk operations and the disk lease on a socket of its own under
-/// `disk_lease`, its RAM disks attached and detached under its own lease, and the guard that
-/// removes its root on every exit path.
-pub async fn gateway(disk_lease: DiskLeaseLimits) -> (Gateway, FixtureDir, PathBuf) {
-    let id = Uuid::new_v4().simple().to_string();
-    let root = secure_fixture_dir(&format!("csrd-{}", &id[..8]));
+/// A gateway serving the RAM disk operations and the disk lease on the socket of a test namespace of
+/// its own under `disk_lease`, its RAM disks attached and detached under its own lease, and the
+/// guard that removes the namespace's root on every exit path. That socket is where the
+/// namespace's disk tools lease from (`lease_socket`), so the runners that attach and detach ask
+/// this gateway and no other.
+pub async fn gateway(disk_lease: DiskLeaseLimits) -> (Gateway, NamespaceRoot, PathBuf) {
+    let root = NamespaceRoot::mint();
+    let host = HostNamespace::Test(root.namespace());
     let cache = root.path().join("cache");
     std::fs::create_dir(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
-    let socket = root.path().join("gateway.sock");
-    assert_ne!(
-        socket,
-        cowshed_gateway_types::control_socket_path(),
-        "the fixture never serves on the user's gateway socket"
-    );
+    let socket = lease_socket(host);
     let gateway = Gateway::start(
         GatewayConfig {
             control_socket: Some(socket.clone()),
             mirror_cache: MirrorCacheConfig::new(cache),
-            ram_disks: Some(Arc::new(SystemRamDisks::new(socket.clone()))),
+            ram_disks: Some(Arc::new(SystemRamDisks::new(host))),
             disk_lease,
             ..GatewayConfig::default()
         },
@@ -236,16 +241,21 @@ impl OwnedDisk {
 /// The fixture's disks: only those it recorded right after attaching them, detached when it drops,
 /// on every way out of the test, before the gateway whose lease the detach takes.
 pub struct FixtureDisks {
-    socket: PathBuf,
+    namespace: TestNamespace,
     owned: Vec<OwnedDisk>,
 }
 
 impl FixtureDisks {
-    pub fn new(socket: PathBuf) -> Self {
+    /// The disks of the fixture gateway of `namespace`, none recorded yet.
+    pub fn new(namespace: TestNamespace) -> Self {
         Self {
-            socket,
+            namespace,
             owned: Vec::new(),
         }
+    }
+
+    fn host(&self) -> HostNamespace {
+        HostNamespace::Test(self.namespace)
     }
 
     /// Attach a disk of `sectors` through the fixture gateway's `ram-attach` and record it by the
@@ -260,7 +270,7 @@ impl FixtureDisks {
         );
         let request =
             serde_json::to_string(&RamAttachRequest::new(sectors)).expect("encode the attach");
-        let answer = ask(&self.socket, &request);
+        let answer = ask(&lease_socket(self.host()), &request);
         assert_eq!(
             answer["ok"], true,
             "the gateway attached the disk: {answer}"
@@ -271,6 +281,13 @@ impl FixtureDisks {
                 .expect("the answer names the whole disk"),
         )
         .expect("a whole disk");
+        self.own(device, sectors)
+    }
+
+    /// Record `device`, the disk of `sectors` an attach of this fixture's gateway just answered, by
+    /// the one registry entry that lists it with that size and this user. Any other listing is no
+    /// ownership and is never recorded, so never detached.
+    pub fn own(&mut self, device: RamDiskDevice, sectors: RamDiskSectors) -> OwnedDisk {
         let listed: Vec<RegisteredRamDisk> = ram_disks()
             .into_iter()
             .filter(|disk| disk.device.as_ref() == Some(&device))
@@ -282,8 +299,7 @@ impl FixtureDisks {
                 sectors,
             },
             other => panic!(
-                "the fixture's attach answered {device} of {sectors}, but the registry lists {other:?}: \
-                 not recorded, so never detached"
+                "the fixture's attach answered {device} of {sectors}, but the registry lists {other:?}: not recorded, so never detached"
             ),
         };
         self.owned.push(owned.clone());
@@ -301,6 +317,7 @@ impl FixtureDisks {
     pub fn detach(&mut self) -> (Vec<RamDiskDevice>, Vec<String>) {
         let mut detached = Vec::new();
         let mut refused = Vec::new();
+        let runner = SystemCommandRunner::new(self.host());
         for owned in self.owned.drain(..) {
             let Some(now) = registered(owned.entry) else {
                 continue;
@@ -315,13 +332,10 @@ impl FixtureDisks {
                 ));
                 continue;
             }
+            cowshed_os::eprintln!("fixture exact-owned detach: {owned:?}");
             let request =
                 CommandRequest::new("/usr/bin/hdiutil", ["detach", owned.device.as_str()]);
-            match SystemCommandRunner.run_detach_of_entry(
-                &request,
-                owned.entry.get(),
-                Some(&self.socket),
-            ) {
+            match runner.run_detach_of_entry(&request, owned.entry.get(), None) {
                 Ok(output) if output.status.succeeded() => detached.push(owned.device),
                 Ok(output) => refused.push(format!(
                     "hdiutil detach {} ended {}: {}",

@@ -19,8 +19,9 @@
 //! Mount and unmount output capture uses the fork-safe `Run::output_locked` path, so fixture
 //! commands obey the same process-launch lock as production commands.
 //!
-//! `#[path]`-included beside [`super::scratch_apfs`]. The template directory spells no pid, so no
-//! sweep reclaims it.
+//! `#[path]`-included beside [`super::scratch_apfs`]. The template directory lies in `t`, beside no
+//! test namespace, and its name spells the template's label, so no sweep reclaims it and a template
+//! of another label is never found in it.
 
 // The pool's mount/umount run in the test process, not under a supervisor: no fork is in flight.
 #![allow(dead_code, clippy::disallowed_methods)]
@@ -29,9 +30,10 @@ use std::fs::{self, File};
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use cowshed_os::fork_lock::Run as _;
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 use super::scratch_apfs::{SCRATCH_PARENT, release_image};
 use super::{
@@ -41,6 +43,18 @@ use super::{
 
 /// The 1 GiB test cap (08_testing.md): the template's capacity, and so every clone's.
 pub const CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(1);
+
+/// The label of the user's blank template, and so of every image cloned from it until its
+/// workspace's supervisor names it. The template is every test run's, not one test namespace's, so
+/// no namespace's `[cowshed-test-<ns>]` is its label; it is never production's `[cowshed]`
+/// either. A test that asserts the label of a volume it seeded from the template asserts this one.
+/// The template's directory spells it, so a template of any other label is not found there.
+pub const SHARED_TEMPLATE_LABEL: &str = "[cowshed-test]";
+
+/// The runner of the disk tools this support code runs for the fixture of `namespace`.
+fn runner(namespace: TestNamespace) -> SystemCommandRunner {
+    SystemCommandRunner::new(HostNamespace::Test(namespace))
+}
 
 /// The fixture's taker of the template's lock. It records its pid and its one request, minting
 /// the template, on the lock, and names a holder it waits for only as the one kind of process that
@@ -64,17 +78,18 @@ impl cowshed_apfs::store_lock::Taker for TemplateTaker {
 }
 
 /// The user's template, minted by whichever test asks first.
-static TEMPLATE: LazyLock<PathBuf> = LazyLock::new(mint_once);
+static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Put a formatted, detached, one-volume RAW image of [`CAPACITY`] at `destination`, which must
-/// not exist yet, creating its directory: an APFS clone of this run's template. This is how a
-/// store is seeded; it attaches nothing, so it is the only image a test may mint for itself.
-pub fn blank_image(destination: &Path) {
+/// not exist yet, creating its directory: an APFS clone of this run's template, which the fixture
+/// of `namespace` mints if it asks first. This is how a store is seeded; it attaches nothing, so
+/// it is the only image a test may mint for itself.
+pub fn blank_image(namespace: TestNamespace, destination: &Path) {
     let directory = destination.parent().expect("an image has a directory");
     fs::create_dir_all(directory)
         .unwrap_or_else(|error| panic!("image directory {}: {error}", directory.display()));
-    let template = TEMPLATE.as_path();
-    MacOsApfsBackend::new(SystemCommandRunner)
+    let template = TEMPLATE.get_or_init(|| mint_once(namespace)).as_path();
+    MacOsApfsBackend::new(runner(namespace))
         .clone_image(template, destination, ImageCapture::Detached)
         .unwrap_or_else(|error| {
             panic!(
@@ -85,23 +100,30 @@ pub fn blank_image(destination: &Path) {
         });
 }
 
-/// Mint the user's template unless an earlier test already has.
+/// Mint the user's template, as the fixture of `namespace`, unless an earlier test already has.
 ///
 /// A template is a store's, and like a store's it outlives the process that minted it: its name
-/// spells everything its bytes depend on (capacity, owner uid and gid), so every later run, and
-/// every concurrent nextest lane, clones the same one. A run once minted its own, so each of a
-/// gate's lanes paid a create, a formatting attach, a format and a detach before any of its tests
-/// could start, all of it disk churn on the queue every other attach waits behind. Concurrent first
-/// asks and a minter killed halfway are the production minter's to settle, under its lock.
-fn mint_once() -> PathBuf {
+/// spells everything its bytes depend on (capacity, owner uid and gid, and, in its directory's
+/// name, its label), so every later run, and every concurrent nextest lane, clones the same one. A
+/// run once minted its own, so each of a gate's lanes paid a create, a formatting attach, a format
+/// and a detach before any of its tests could start, all of it disk churn on the queue every other
+/// attach waits behind. Concurrent first asks and a minter killed halfway are the production
+/// minter's to settle, under its lock.
+fn mint_once(namespace: TestNamespace) -> PathBuf {
     // SAFETY: `getuid` has no preconditions and cannot fail.
     let user = unsafe { libc::getuid() };
-    let directory = SCRATCH_PARENT.join(format!("templates-uid{user}"));
+    let directory = SCRATCH_PARENT.join(format!(
+        "templates-uid{user}-{}",
+        SHARED_TEMPLATE_LABEL
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+    ));
     fs::create_dir_all(&directory)
         .unwrap_or_else(|error| panic!("template directory {}: {error}", directory.display()));
     blank_template(
-        &MacOsApfsBackend::new(SystemCommandRunner),
+        &MacOsApfsBackend::new(runner(namespace)),
         &directory,
+        SHARED_TEMPLATE_LABEL,
         CAPACITY,
         &TemplateTaker,
     )
@@ -120,7 +142,7 @@ pub fn fixture_registry_size() -> u64 {
 
 /// This lane run's pool directory, shared by every test process of the run: nextest gives them
 /// all one `NEXTEST_RUN_ID`; a `cargo test` run is one process, so its pid names it instead.
-/// Its name spells no scratch-root pid, so no run's sweep reclaims another's pool.
+/// It lies in `t`, beside no test namespace, so no run's sweep reclaims another's pool.
 fn pool_directory() -> PathBuf {
     let run =
         std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| format!("cargo-{}", std::process::id()));
@@ -133,10 +155,12 @@ fn pool_directory() -> PathBuf {
 
 /// A handle to one of the pool's scenario images, already attached by the pool. It hands out
 /// the image's path and volume device and mounts that volume; it cannot attach or detach —
-/// the pool owns the attachment for the whole lane run.
+/// the pool owns the attachment for the whole lane run. Its mounts run their disk tools as the
+/// namespace of the fixture that asked for it.
 pub struct SharedImage {
     image: PathBuf,
     volume_device: String,
+    namespace: TestNamespace,
 }
 
 impl SharedImage {
@@ -158,6 +182,7 @@ impl SharedImage {
         fs::create_dir_all(mount_point)
             .unwrap_or_else(|error| panic!("mount point {}: {error}", mount_point.display()));
         let mounted = disk_tool(
+            self.namespace,
             "/sbin/mount_apfs",
             &[
                 "-o".as_ref(),
@@ -176,6 +201,7 @@ impl SharedImage {
         SharedMount {
             image: self.image.clone(),
             mount_point: mount_point.to_owned(),
+            namespace: self.namespace,
         }
     }
 }
@@ -184,6 +210,7 @@ impl SharedImage {
 pub struct SharedMount {
     image: PathBuf,
     mount_point: PathBuf,
+    namespace: TestNamespace,
 }
 
 impl SharedMount {
@@ -194,7 +221,7 @@ impl SharedMount {
 
 impl Drop for SharedMount {
     fn drop(&mut self) {
-        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let backend = MacOsApfsBackend::new(runner(self.namespace));
         let unmounted = backend
             .existing_attachment(&self.image)
             .and_then(|attachment| match attachment {
@@ -212,11 +239,18 @@ impl Drop for SharedMount {
     }
 }
 
-/// Run the disk tool `program args` as production runs one: under the host's disk-lifecycle
-/// lease, which also appends it to the run's disk command record, through the fork-safe launch.
-fn disk_tool(program: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
+/// Run the disk tool `program args` as production runs one, for the fixture of `namespace`: under
+/// that namespace's disk-lifecycle lease, which its fixture gateway serves at
+/// `<namespace root>/gateway.sock` and nothing serves otherwise, so the tool then runs unleased;
+/// never under production's. It is also appended to the run's disk command record, through the
+/// fork-safe launch.
+fn disk_tool(
+    namespace: TestNamespace,
+    program: &str,
+    args: &[&std::ffi::OsStr],
+) -> std::process::Output {
     let program = Path::new(program);
-    cowshed_apfs::disk_lease::leased(program, args, None, || {
+    cowshed_apfs::disk_lease::leased(HostNamespace::Test(namespace), program, args, None, || {
         Command::new(program).args(args).output_locked()
     })
     .unwrap_or_else(|error| panic!("run {}: {error}", program.display()))
@@ -234,8 +268,10 @@ pub fn pool_root() -> PathBuf {
 /// would take the run past the registry's size: the lane assertion that a per-test attach
 /// cannot sneak back in, enforced where the attach would be spent. A scenario whose image a
 /// test detached while proving detach behaviour is re-attached by the next ask, replacing its
-/// registry line; it is still the one scenario image.
-pub fn shared_image_at(scenario: &str, image: &Path) -> SharedImage {
+/// registry line; it is still the one scenario image. Its attach, the clone of a missing image and
+/// the release of an earlier run's pool run as `namespace`, the asking fixture's, and so do the
+/// handle's mounts.
+pub fn shared_image_at(namespace: TestNamespace, scenario: &str, image: &Path) -> SharedImage {
     assert!(
         REGISTRY.contains(&scenario),
         "no fixture-pool scenario named {scenario}; add it to the registry in blank_image.rs"
@@ -245,7 +281,7 @@ pub fn shared_image_at(scenario: &str, image: &Path) -> SharedImage {
         .unwrap_or_else(|error| panic!("pool directory {}: {error}", pool.display()));
     let _lock = super::scratch_apfs::lock_exclusive(&pool.join("pool.lock"))
         .unwrap_or_else(|error| panic!("pool lock: {error}"));
-    detach_previous_runs(&pool);
+    detach_previous_runs(namespace, &pool);
 
     let registry_path = pool.join("registry.tsv");
     let recorded = fs::read_to_string(&registry_path).unwrap_or_default();
@@ -261,10 +297,11 @@ pub fn shared_image_at(scenario: &str, image: &Path) -> SharedImage {
                 .next()
                 .expect("a recorded image has a device")
                 .to_owned();
-            if recorded_image == image && kernel_holds(&recorded_image) {
+            if recorded_image == image && kernel_holds(namespace, &recorded_image) {
                 return SharedImage {
                     image: recorded_image,
                     volume_device: device,
+                    namespace,
                 };
             }
         }
@@ -281,12 +318,12 @@ pub fn shared_image_at(scenario: &str, image: &Path) -> SharedImage {
     }
 
     if !image.exists() {
-        blank_image(image);
+        blank_image(namespace, image);
     }
     // Attached without a mount on purpose: every test of the run shares this one volume and
     // mounts it at its own path with its own flags through `SharedImage::mount_at`, so no single
     // mount point belongs to the attach.
-    let attachment = MacOsApfsBackend::new(SystemCommandRunner)
+    let attachment = MacOsApfsBackend::new(runner(namespace))
         .attach_verified(image)
         .unwrap_or_else(|error| panic!("attach the pool's {scenario} image: {error}"));
     let device = attachment.volume_device().to_owned();
@@ -307,11 +344,12 @@ pub fn shared_image_at(scenario: &str, image: &Path) -> SharedImage {
     SharedImage {
         image: image.to_owned(),
         volume_device: device,
+        namespace,
     }
 }
 /// Whether the kernel currently holds `image` attached.
-fn kernel_holds(image: &Path) -> bool {
-    SystemCommandRunner
+fn kernel_holds(namespace: TestNamespace, image: &Path) -> bool {
+    runner(namespace)
         .attached_disk_images()
         .expect("kernel disk-image inventory")
         .iter()
@@ -320,8 +358,10 @@ fn kernel_holds(image: &Path) -> bool {
 
 /// Detach every image an earlier lane run's pool left attached and remove its directory: a
 /// pool's images live exactly one run, and a later run is what ends an earlier one. Only a
-/// pool untouched for an hour is ended, so a lane running concurrently is never touched.
-fn detach_previous_runs(current: &Path) {
+/// pool untouched for an hour is ended, so a lane running concurrently is never touched. A pool
+/// belongs to a run, not to a namespace, so its images are released as `namespace`, the asking
+/// fixture's.
+fn detach_previous_runs(namespace: TestNamespace, current: &Path) {
     let Ok(entries) = fs::read_dir(SCRATCH_PARENT.as_path()) else {
         return;
     };
@@ -348,8 +388,8 @@ fn detach_previous_runs(current: &Path) {
         };
         for line in recorded.lines() {
             let image = PathBuf::from(line.split('\t').nth(1).unwrap_or_default());
-            if kernel_holds(&image)
-                && let Err(error) = release_image(&image)
+            if kernel_holds(namespace, &image)
+                && let Err(error) = release_image(namespace, &image)
             {
                 cowshed_os::eprintln!(
                     "release the previous run's pool image {}: {error}",

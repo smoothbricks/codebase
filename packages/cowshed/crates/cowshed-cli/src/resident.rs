@@ -17,6 +17,7 @@ use cowshed_core::api::{ExecRequest, JobId, JobInfo};
 use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::resident::{Decline, HostProbe, Resident, resolve};
 use cowshed_core::runtime::supervisor::WorkspaceSupervisorHandle;
+use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::{CowshedError, ErrorCode, JobStream, Result};
 use cowshed_gateway_types::STORE_ROOT;
@@ -24,7 +25,7 @@ use cowshed_os::timing::{event, span, spanned};
 use tokio::io::AsyncRead;
 
 use crate::args::{Cli, Command};
-use crate::gateway_service::{ControlSocket, control_socket_path, stable_workspace_id};
+use crate::gateway_service::{ControlSocket, stable_workspace_id};
 use crate::output::Output;
 use crate::runtime::{
     DispatchExit, ExecEnd, ExecPresentation, ExecResult, ForegroundJob, emit_mount_path,
@@ -151,7 +152,9 @@ fn invocation_start(project: Option<&Path>) -> Result<PathBuf> {
 /// exactly the case in which the controller's pre-exec reconcile would install nothing for it.
 async fn gateway_current(resident: &Resident) -> bool {
     let _span = span("resident", "gateway");
-    let Ok(control) = ControlSocket::at(control_socket_path()) else {
+    // The resident path reads the host's own store (`STORE_ROOT`), so the gateway it asks is the
+    // host's.
+    let Ok(control) = ControlSocket::at(CanonicalRoots::global().control_socket()) else {
         return false;
     };
     let authority = resident.authority();

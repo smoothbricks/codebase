@@ -1,19 +1,21 @@
 /**
  * Provisions the per-user directories the real-APFS tests need, on a host `cowshed setup` has not run on.
  *
- * Every real-image fixture keeps its tree below `/private/var/folders/cowshed/<uid>/t`
- * (`cowshed_os::scratch::macos_scratch_root`), in the per-user root that also holds the workspace mount root `mnt`. A
- * fixture creates only `t`: it refuses a missing or foreign per-user root and never makes the root-owned prefix above
- * it, because that is host state `cowshed setup` provisions (specs/cowshed/01a_apfs.md "Stable workspace mount root",
- * specs/cowshed/08_testing.md "Integration tests (real substrate)"). A development host has been through setup, so
- * there this changes nothing and costs a few lstat calls. A CI runner has not, and setup's authorization prompt is
- * interactive, so this applies setup's own three directories (`mount_root_operations` in cowshed-core) with their
- * owners and modes without it, split by the privilege each needs: `sudo -n` creates only the prefix and the per-user
- * root, each beneath a root-owned parent no unprivileged writer can plant a link in, and this user creates `mnt` inside
- * its own 0700 root. A link, a non-directory or a foreign owner in any path's place is refused, never repaired over,
- * and every result is attested by lstat. With the root missing and `sudo -n` refused, it fails naming the exact
- * commands. `t` is the fixtures' to make and is never looked at here: a `cowshed exec` sandbox, where the shards that
- * depend on this run too, denies it.
+ * Every real-image fixture keeps its tree in the directory of its own test namespace,
+ * `/private/var/folders/cowshed/<uid>/<ns>` (`HostNamespace::macos_user_root`), in the per-user root that also holds
+ * the workspace mount root `mnt`, beside `t` (`cowshed_os::scratch::macos_scratch_root`), which holds only the state
+ * every test run shares: the user's image template, the lane pools and the dead-run sweep's lock and record. A fixture
+ * creates only its namespace directory and `t`: it refuses a missing or foreign per-user root and never makes the
+ * root-owned prefix above it, because that is host state `cowshed setup` provisions (specs/cowshed/01a_apfs.md "Stable
+ * workspace mount root", specs/cowshed/08_testing.md "Integration tests (real substrate)"). A development host has been
+ * through setup, so there this changes nothing and costs a few lstat calls. A CI runner has not, and setup's
+ * authorization prompt is interactive, so this applies setup's own three directories (`mount_root_operations` in
+ * cowshed-core) with their owners and modes without it, split by the privilege each needs: `sudo -n` creates only the
+ * prefix and the per-user root, each beneath a root-owned parent no unprivileged writer can plant a link in, and this
+ * user creates `mnt` inside its own 0700 root. A link, a non-directory or a foreign owner in any path's place is
+ * refused, never repaired over, and every result is attested by lstat. With the root missing and `sudo -n` refused, it
+ * fails naming the exact commands. `t` and each namespace directory are the fixtures' to make and are never looked at
+ * here: a `cowshed exec` sandbox, where the shards that depend on this run too, denies it.
  *
  * Every Nx target that runs a test creating a scratch root depends on `cowshed:apfs-test-root`, which runs this.
  *

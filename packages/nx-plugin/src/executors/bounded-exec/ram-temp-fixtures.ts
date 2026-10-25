@@ -1,9 +1,8 @@
 import { spawn } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, rmdirSync, rmSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GATEWAY_SOCKET } from './gateway-lease.js';
 import {
   createHostCommands,
   describeRamTempError,
@@ -15,6 +14,8 @@ import {
   RamTempVolume,
   ramDisksIn,
   ramTempPaths,
+  type TestNamespace,
+  testNamespace,
 } from './ram-temp.js';
 
 const MIB = 1024 * 1024;
@@ -32,60 +33,74 @@ export function registryDevice(url: string, disk: string): string[] {
   ];
 }
 
-/** A host proof's RAM volume: where it lives, its size, and the record of the disks its attaches made. */
+/**
+ * A host proof's RAM volume: its test namespace, where it lives, its size, and the record of the disks its attaches
+ * made. Every path derives from the namespace, and the namespace's root is the fixture's one directory.
+ */
 export interface ScratchVolume {
-  readonly parent: string;
+  readonly namespace: TestNamespace;
   readonly paths: RamTempPaths;
   readonly capacity: number;
   readonly owned: string;
-  readonly gatewayRoot: string;
   readonly gatewaySocket: string;
 }
 
 /**
- * A volume of its own for one host proof: a lock beside it, and a name and a size no other test process uses, since the
- * size and the user are what identify a RAM disk as this volume's. It mounts in `t` below the per-user root `cowshed
- * setup` makes, as the user's own volume mounts below that root, so mds keeps no right for it
- * (specs/cowshed/01a_apfs.md, "Spotlight media references"). `index` is 0 to 3: the size spends 4 sectors per pid.
- * `owned` records the disks the volume's attaches made, by identity: the only disks its teardown may detach.
+ * A fixture volume's size is the one name its namespace does not derive. A creator's stray reclaim matches RAM disks by
+ * user and size, so a fixture volume of the size of the user's own could take the user's disk.
+ */
+function refuseUserVolumeSize(capacity: number): void {
+  if (capacity === RAM_TEMP_CAPACITY_BYTES) {
+    throw new Error(
+      `a fixture RAM volume has the size of the user's own volume (${capacity} bytes); a test owns a size of its own`,
+    );
+  }
+}
+
+/**
+ * A volume of its own for one host proof, in a test namespace of its own: `testNamespace(process.pid, index)`. It makes
+ * the namespace's root, `/private/var/folders/cowshed/<uid>/<ns>`, 0700, and refuses one that exists: a fixture adopts
+ * nothing. Every path derives from the namespace (`ramTempPaths`): the volume mounts at `<root>/ram3`, below the
+ * per-user root `cowshed setup` makes, as the user's own volume mounts below that root, so mds keeps no right for it
+ * (specs/cowshed/01a_apfs.md, "Spotlight media references"), and the fixture gateway serves `<root>/gateway.sock`
+ * (`startFixtureGateway`). Nothing it names can be what production names. The size is a name of its own: one no other
+ * test process uses, since the size and the user are what identify a RAM disk as this volume's. `index` is 0 to 3: the
+ * size spends 4 sectors per pid. `owned` records the disks the volume's attaches made, by identity: the only disks its
+ * teardown may detach.
  */
 export function scratchVolume(index: 0 | 1 | 2 | 3): ScratchVolume {
-  const parent = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'rt-'));
-  const gatewayRoot = mkdtempSync(join(process.env.COWSHED_RUNTIME_LINK ?? '/tmp', 'csrg-'));
-  const gatewaySocket = join(gatewayRoot, 'gateway.sock');
-  if (gatewaySocket === GATEWAY_SOCKET) throw new Error('a fixture cannot own the host gateway');
   const { uid } = userInfo();
-  const root = `/private/var/folders/cowshed/${uid}`;
-  const fixtures = join(root, 't');
+  const namespace = testNamespace(process.pid, index);
+  const paths = ramTempPaths({ uid }, namespace);
+  const capacity = 64 * MIB + (process.pid * 4 + index + 1) * 512;
+  refuseUserVolumeSize(capacity);
   try {
-    mkdirSync(fixtures, { mode: 0o700 });
+    mkdirSync(paths.root, { mode: 0o700 });
   } catch (error) {
-    if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) {
-      throw error;
+    if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+      throw new Error(`fixture namespace root ${paths.root} exists: a fixture makes its own and adopts none`, {
+        cause: error,
+      });
     }
+    throw error;
   }
-  const name = `smoo-ram-test-${process.pid}-${index}`;
   return {
-    parent,
-    gatewayRoot,
-    gatewaySocket,
-    paths: {
-      root,
-      uid,
-      mountpoint: join(fixtures, name),
-      lockFile: join(parent, 'v.lock'),
-      volumeName: name,
-      staging: join(fixtures, `${name}-new`),
-    },
-    capacity: 64 * MIB + (process.pid * 4 + index + 1) * 512,
-    owned: join(parent, 'owned-disks.jsonl'),
+    namespace,
+    paths,
+    capacity,
+    owned: join(paths.root, 'owned-disks.jsonl'),
+    gatewaySocket: join(paths.root, 'gateway.sock'),
   };
 }
 
-/** Start the prebuilt real gateway; readiness and exit are observed, never polled or faked. */
+/**
+ * Start the prebuilt real gateway for the volume's namespace (`ram_fixture <ns>`, which serves `<root>/gateway.sock`);
+ * readiness and exit are observed, never polled or faked. The stop it returns ends the helper and awaits its exit; the
+ * root stays for the teardown (`removeScratchVolume`), which removes it once the volume is gone.
+ */
 export async function startFixtureGateway(volume: ScratchVolume): Promise<() => Promise<void>> {
   const binary = fileURLToPath(new URL('../../../../cowshed/.cache/ram-fixture/ram_fixture', import.meta.url));
-  const child = spawn(binary, [volume.gatewayRoot], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(binary, [volume.namespace.name], { stdio: ['pipe', 'pipe', 'pipe'] });
   let stderr = '';
   let stdout = '';
   child.stderr.setEncoding('utf8').on('data', (text: string) => {
@@ -128,29 +143,41 @@ export async function startFixtureGateway(volume: ScratchVolume): Promise<() => 
   } catch (error) {
     child.stdin.end();
     await exited.catch((exitError: unknown) => process.stderr.write(`${String(exitError)}\n`));
-    rmSync(volume.gatewayRoot, { recursive: true, force: true });
+    // The caller got no stop to tear down with, and a root this cannot remove must not hide the failure it follows.
+    try {
+      removeScratchVolume(volume);
+    } catch (removeError) {
+      process.stderr.write(`fixture gateway startup: ${String(removeError)}\n`);
+    }
     throw error;
   }
   return async () => {
     child.stdin.end();
     await exited;
-    rmSync(volume.gatewayRoot, { recursive: true, force: true });
   };
 }
 
 /**
- * Remove what a failed run left of the scratch volume's directories. Teardown must not hide the failure it follows,
- * so a directory `rmdirSync` refuses, one still mounted on, is said on stderr instead of thrown.
+ * Remove what a run left of the scratch volume: the directories its volume mounts on, then its namespace root with
+ * everything the fixture made there. Teardown must not hide the failure it follows, so a directory `rmdirSync` refuses,
+ * one still mounted on, is said on stderr instead of thrown, and the root stays with it: nothing is deleted through a
+ * mount.
  */
-export function removeScratchDirectories(paths: RamTempPaths): void {
-  for (const directory of [paths.mountpoint, paths.staging]) {
+export function removeScratchVolume(volume: ScratchVolume): void {
+  const { root, mountpoint, staging } = volume.paths;
+  let kept = false;
+  for (const directory of [mountpoint, staging]) {
     try {
       rmdirSync(directory);
     } catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
-        process.stderr.write(`scratch volume teardown: rmdir ${directory}: ${String(error)}\n`);
+        kept = true;
+        process.stderr.write(`scratch volume teardown: rmdir ${directory}: ${String(error)}; ${root} is kept\n`);
       }
     }
+  }
+  if (!kept) {
+    rmSync(root, { recursive: true, force: true });
   }
 }
 
@@ -159,7 +186,7 @@ export function removeScratchDirectories(paths: RamTempPaths): void {
  * A guard for assertions only: a disk of the size is no proof it is the test's, so nothing detaches by it.
  */
 export async function attachedDisks(paths: RamTempPaths, capacity: number, gatewaySocket: string): Promise<RamDisk[]> {
-  const host = createHostCommands(undefined, gatewaySocket);
+  const host = createHostCommands(gatewaySocket);
   const registry = await host.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
   const table = await host.run('/sbin/mount', []);
   if (registry.status !== 0 || table.status !== 0) {
@@ -231,7 +258,7 @@ export async function detachOwned(owned: string, uid: number, gatewaySocket: str
   if (records.length === 0) {
     return;
   }
-  const host = createHostCommands(undefined, gatewaySocket);
+  const host = createHostCommands(gatewaySocket);
   const registry = await host.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
   const table = await host.run('/sbin/mount', []);
   if (registry.status !== 0 || table.status !== 0) {
@@ -305,8 +332,9 @@ export function recordedRamAttach(
 
 /**
  * A host proof's RAM volume: `volume`'s paths and size, its disk commands through `cowshed`, and its disk attached by the
- * fixture's own gateway and recorded in `volume.owned`. It refuses the user's own volume, by path or by size: no test leases,
- * creates or detaches that one.
+ * fixture's own gateway and recorded in `volume.owned`. Its paths and its gateway's socket derive from its test
+ * namespace, so none can be the user's own; its size is the one name a namespace does not derive, and the user's own is
+ * refused: no test leases, creates or detaches that volume.
  */
 export function fixtureRamVolume(
   volume: {
@@ -317,16 +345,8 @@ export function fixtureRamVolume(
   },
   cowshed: string | undefined,
 ): RamTempVolume {
-  const own = ramTempPaths({ uid: volume.paths.uid });
-  const shared = (['mountpoint', 'staging', 'lockFile', 'volumeName'] as const).filter(
-    (field) => volume.paths[field] === own[field],
-  );
-  if (shared.length > 0 || volume.capacity === RAM_TEMP_CAPACITY_BYTES || volume.gatewaySocket === GATEWAY_SOCKET) {
-    throw new Error(
-      `a fixture RAM volume names the user's own volume (${[...shared, ...(volume.capacity === RAM_TEMP_CAPACITY_BYTES ? ['capacity'] : []), ...(volume.gatewaySocket === GATEWAY_SOCKET ? ['gatewaySocket'] : [])].join(', ')}); a test owns its own`,
-    );
-  }
-  const host = createHostCommands(undefined, volume.gatewaySocket, undefined, cowshed);
+  refuseUserVolumeSize(volume.capacity);
+  const host = createHostCommands(volume.gatewaySocket, undefined, undefined, cowshed);
   return new RamTempVolume(volume.paths, volume.capacity, {
     run: host.run,
     detachRam: host.detachRam,

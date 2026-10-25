@@ -27,9 +27,10 @@ use cowshed_core::storage::apfs::{ApfsSubstrateConfig, build_volume_label};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::{ErrorCode, Result};
 use cowshed_gateway::{
-    ArrowAuditConfig, ArrowAuditSink, CpuBudgetLimits, Gateway, GatewayConfig,
-    KeychainCredentialProvider, MirrorCacheConfig, SystemConnector,
+    ArrowAuditConfig, ArrowAuditSink, CpuBudgetLimits, CredentialError, CredentialProvider,
+    CredentialQuery, CredentialRecord, Gateway, GatewayConfig, MirrorCacheConfig, SystemConnector,
 };
+use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::NO_PROGRESS;
 use std::cell::Cell;
 use std::ffi::OsString;
@@ -128,9 +129,12 @@ impl Fixture {
         for path in [&store, &granted] {
             fs::create_dir_all(path).expect("fixture directory");
         }
-        if matches!(&scratch, FixtureRoot::Apfs(_)) {
+        if let FixtureRoot::Apfs(root) = &scratch {
             // Only the native backend mints images from the user's blank template.
-            blank_image::blank_image(&blank_template_path(&store, blank_image::CAPACITY));
+            blank_image::blank_image(
+                root.namespace(),
+                &blank_template_path(&store, blank_image::CAPACITY),
+            );
         }
         clone_tree(&checkout_template(project), &checkout);
         // The fixture's workspaces run the host's own tools (bash, Bun, Nx's node), resolved
@@ -138,8 +142,18 @@ impl Fixture {
         // explicitly (08_testing.md, "Fixtures").
         let home = scratch.path().to_path_buf();
         let program_directories = cowshed_core::capabilities::host_program_directories(&home);
-        let storage =
-            ValidatedHostStorage::new(home, program_directories, CanonicalRoots::at(store));
+        // The fixture's names derive from one test namespace (01_storage.md, "Host namespace"): an
+        // APFS scratch root's own, which its directory is named for, or one a directory root
+        // mints.
+        let namespace = match &scratch {
+            FixtureRoot::Apfs(root) => root.namespace(),
+            FixtureRoot::Directory(_) => TestNamespace::mint().expect("a test namespace"),
+        };
+        let storage = ValidatedHostStorage::new(
+            home,
+            program_directories,
+            CanonicalRoots::fixture(namespace, store),
+        );
         Self {
             _scratch: scratch,
             checkout,
@@ -187,7 +201,7 @@ impl Fixture {
                 .expect("private gateway directory");
         }
         let config = GatewayConfig {
-            control_socket: Some(self.storage.store().join("gateway.sock")),
+            control_socket: Some(self.storage.control_socket()),
             mirror_cache: MirrorCacheConfig::new(cache),
             cpu_budget: self.cpu_budget,
             ..GatewayConfig::default()
@@ -199,7 +213,7 @@ impl Fixture {
         self.gateway = Some(
             Gateway::start(
                 config,
-                Arc::new(KeychainCredentialProvider::new()),
+                Arc::new(NoCredentials),
                 Arc::new(connector),
                 Arc::new(audit),
             )
@@ -212,6 +226,41 @@ impl Fixture {
         if let Some(gateway) = self.gateway.take() {
             gateway.drain().await.expect("drain real gateway");
         }
+    }
+
+    /// The disk runner of this fixture's namespace: the disk lease it takes is the namespace's
+    /// own, never production's (01_storage.md, "Host namespace").
+    fn runner(&self) -> SystemCommandRunner {
+        SystemCommandRunner::new(self.storage.namespace())
+    }
+
+    /// A controller host over this fixture's store and checkout, built as the project runtime
+    /// builds one: its config and its runner carry the fixture's namespace.
+    fn controller_host(&self) -> MacOsApfsExecutionHost<SystemCommandRunner> {
+        MacOsApfsExecutionHost::new(
+            self.runner(),
+            ApfsSubstrateConfig::new(
+                self.storage.namespace(),
+                self.storage.store(),
+                &self.checkout,
+            ),
+        )
+        .expect("fixture controller")
+    }
+}
+
+/// The credentials a fixture gateway serves: none. A fixture gateway never reads the host's
+/// keychain, whose `dev.cowshed.gateway` items are production's.
+#[derive(Debug)]
+struct NoCredentials;
+
+#[async_trait::async_trait]
+impl CredentialProvider for NoCredentials {
+    async fn lookup(
+        &self,
+        _query: &CredentialQuery,
+    ) -> std::result::Result<Option<CredentialRecord>, CredentialError> {
+        Ok(None)
     }
 }
 
@@ -5272,9 +5321,15 @@ fn assert_linked_build_mounts(layout: &BuildVolumeLayout, checkouts: &[&Path]) {
     );
 }
 
-async fn assert_build_label(layout: &BuildVolumeLayout, checkout: &Path, name: &str) {
+async fn assert_build_label(
+    namespace: HostNamespace,
+    layout: &BuildVolumeLayout,
+    checkout: &Path,
+    name: &str,
+) {
     let mount = layout.mount(&linked_volume(layout, checkout));
     let expected = build_volume_label(
+        namespace,
         &RepoId::parse("fixture/dispatch").expect("repository identity"),
         &WorkspaceName::new(name).expect("checkout name"),
     );
@@ -5335,6 +5390,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         return;
     }
     let mut fixture = Fixture::with(Project::Declared);
+    let namespace = fixture.storage.namespace();
     assert!(fixture.checkout.join(DECLARED_STATE).join(".git").is_dir());
     let mut service = serve_project(&mut fixture, &[]).await;
     let link = Path::new(".cowshed/build/declared").join(DECLARED_STATE);
@@ -5352,7 +5408,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     );
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
-    assert_build_label(&layout, &fixture.checkout, "main").await;
+    assert_build_label(namespace, &layout, &fixture.checkout, "main").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout]);
 
     // The author's reconstruct script, run once more: from now on it lives on main's volume.
@@ -5380,7 +5436,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         b"warm\n",
         "a fork of main clones main's declared state warm"
     );
-    assert_build_label(&layout, &topic, "topic").await;
+    assert_build_label(namespace, &layout, &topic, "topic").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
 
     succeed(&mut service, ["fork", "topic", "sibling"]).await;
@@ -5390,7 +5446,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         .expect("sibling is mounted")
         .mount;
     let sibling_volume = linked_volume(&layout, &sibling);
-    assert_build_label(&layout, &sibling, "sibling").await;
+    assert_build_label(namespace, &layout, &sibling, "sibling").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic, &sibling]);
     let mount = layout.mount(&sibling_volume);
     let holder = Holder(
@@ -5440,8 +5496,8 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         !layout.record(&previous).exists(),
         "land reclaims the previous record"
     );
-    assert_build_label(&layout, &fixture.checkout, "main").await;
-    assert_build_label(&layout, &topic, "topic").await;
+    assert_build_label(namespace, &layout, &fixture.checkout, "main").await;
+    assert_build_label(namespace, &layout, &topic, "topic").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout, &topic]);
 
     succeed(&mut service, ["rm", "topic", "--force"]).await;
@@ -5449,7 +5505,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
         layout.image(&landing).exists(),
         "rm preserves main's adopted volume"
     );
-    assert_build_label(&layout, &fixture.checkout, "main").await;
+    assert_build_label(namespace, &layout, &fixture.checkout, "main").await;
     assert_linked_build_mounts(&layout, &[&fixture.checkout]);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
@@ -5636,11 +5692,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
     service.shutdown().await.expect("stop the runtime");
 
     // Start the interrupted-recovery walk from this first warm RAW adoption.
-    let host = MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
-    )
-    .expect("fixture controller");
+    let host = fixture.controller_host();
     let main_device = SystemKernelMountSource
         .mounts()
         .expect("own fixture mounts")
@@ -5652,7 +5704,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         "/sbin/umount",
         [fixture.checkout.as_os_str().to_os_string()],
     );
-    let result = SystemCommandRunner.run(&unmount).unwrap();
+    let result = fixture.runner().run(&unmount).unwrap();
     assert!(result.succeeded(), "own main unmount: {result:?}");
     fs::write(
         fixture.checkout.join("publication-blocker"),
@@ -5668,7 +5720,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             fixture.checkout.as_os_str().to_os_string(),
         ],
     );
-    let result = SystemCommandRunner.run(&remount).unwrap();
+    let result = fixture.runner().run(&remount).unwrap();
     assert!(result.succeeded(), "own main remount: {result:?}");
     assert_eq!(git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]), head);
     assert_eq!(fs::read(warm.join("build.ninja")).unwrap(), b"warm\n");
@@ -5799,7 +5851,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             "/usr/sbin/diskutil",
             [OsString::from("unmount"), OsString::from(device)],
         );
-        let result = SystemCommandRunner.run(&unmount).unwrap();
+        let result = fixture.runner().run(&unmount).unwrap();
         assert!(
             result.succeeded(),
             "normal own retained-input unmount: {result:?}"
@@ -5817,7 +5869,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
                 OsString::from(device),
             ],
         );
-        let result = SystemCommandRunner.run(&remount).unwrap();
+        let result = fixture.runner().run(&remount).unwrap();
         assert!(
             result.succeeded(),
             "normal own readonly remount: {result:?}"
@@ -6079,11 +6131,7 @@ async fn real_apfs_missing_main_recovers_empty_and_surviving_builds_and_replays_
 
     // Lose main's image with its sidecar and key, and the build volume's image, record and
     // retained contents. Only the journal survives as authority.
-    let host = MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
-    )
-    .expect("fixture controller");
+    let host = fixture.controller_host();
     host.detach_existing_image(&main_image, DetachIntent::WhenIdle)
         .expect("detach main without force");
     let build_image = layout.image(&main_volume);
@@ -6247,11 +6295,7 @@ fn lose_main_to_a_plain_checkout(fixture: &Fixture, main_image: &Path, phase: &s
             plain_source.to_str().expect("a UTF-8 source path"),
         ],
     );
-    let host = MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
-    )
-    .expect("fixture controller");
+    let host = fixture.controller_host();
     host.detach_existing_image(main_image, DetachIntent::WhenIdle)
         .expect("detach main without force");
     for lost in [
@@ -6312,11 +6356,7 @@ async fn prove_missing_main_keeps_surviving_build(fixture: &mut Fixture) {
         b"main's warm build state\n",
     )
     .expect("warm main's build volume");
-    let host = MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
-    )
-    .expect("fixture controller");
+    let host = fixture.controller_host();
     host.detach_existing_image(&layout.image(&recorded), DetachIntent::WhenIdle)
         .expect("detach main's build volume without force");
     let surviving = BuildVolumeId::mint();
@@ -6524,11 +6564,7 @@ async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_
 
     // An underlay file at the checkout blocks publication after the build copy: the
     // prepublication crash boundary, with main's own image attached back over it.
-    let host = MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
-    )
-    .expect("fixture controller");
+    let host = fixture.controller_host();
     host.detach_existing_image(&main_image, DetachIntent::WhenIdle)
         .expect("detach main without force");
     fs::write(
@@ -6552,7 +6588,7 @@ async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_
             main_image.as_os_str().to_os_string(),
         ],
     );
-    let attached = SystemCommandRunner.run(&attach).expect("reattach main");
+    let attached = fixture.runner().run(&attach).expect("reattach main");
     assert!(attached.succeeded(), "reattach main: {attached:?}");
     let mut interrupted = fixture.open().await;
     let (refused, _, _) = run(
@@ -6745,11 +6781,7 @@ async fn prove_published_build_loss(fixture: &mut Fixture) {
     .expect("reopen main's re-adoption at the crash boundary");
 
     // After publication, the retained build image is lost.
-    let host = MacOsApfsExecutionHost::new(
-        SystemCommandRunner,
-        ApfsSubstrateConfig::new(fixture.storage.store(), &fixture.checkout),
-    )
-    .expect("fixture controller");
+    let host = fixture.controller_host();
     host.detach_existing_image(&build.image.retained, DetachIntent::WhenIdle)
         .expect("detach the retained build without force");
     fs::remove_file(&build.image.retained).expect("lose the retained build image");
@@ -8174,7 +8206,7 @@ async fn directory_an_exec_on_a_loaded_host_answers_at_admission_and_cancels_whi
     }
     let mut fixture = Fixture::directory();
     let mut service = serve_project(&mut fixture, &[]).await;
-    let socket = fixture.storage.store().join("gateway.sock");
+    let socket = fixture.storage.control_socket();
 
     let load = LoadedHost::hold(&socket).await;
     let ran = fixture.checkout.join("ran");

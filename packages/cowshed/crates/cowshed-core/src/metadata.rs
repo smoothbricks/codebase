@@ -711,10 +711,9 @@ pub enum PortAllocation {
 
 impl PortAllocation {
     pub fn range(self) -> RangeInclusive<u16> {
-        const FIXTURE_MIN: u16 = 45_056;
         match self {
-            Self::Host => MACOS_PORT_MIN..=FIXTURE_MIN - 1,
-            Self::Fixture => FIXTURE_MIN..=MACOS_PORT_MAX,
+            Self::Host => MACOS_PORT_MIN..=cowshed_gateway_types::MACOS_FIXTURE_PORT_MIN - 1,
+            Self::Fixture => cowshed_gateway_types::MACOS_FIXTURE_PORT_MIN..=MACOS_PORT_MAX,
         }
     }
 
@@ -1820,13 +1819,17 @@ mod tests {
     #[test]
     fn host_and_fixture_allocations_never_share_ports() {
         use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
+        use cowshed_os::namespace::TestNamespace;
 
         let host =
             ValidatedHostStorage::new(PathBuf::from("/home"), Vec::new(), CanonicalRoots::global());
         let fixture = ValidatedHostStorage::new(
             PathBuf::from("/fixture"),
             Vec::new(),
-            CanonicalRoots::at(PathBuf::from("/fixture/store")),
+            CanonicalRoots::fixture(
+                TestNamespace::mint().expect("a test namespace"),
+                PathBuf::from("/fixture/store"),
+            ),
         );
         assert_eq!(host.port_allocation(), PortAllocation::Host);
         assert_eq!(fixture.port_allocation(), PortAllocation::Fixture);

@@ -1924,6 +1924,7 @@ mod tests {
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     fn host_controller_copy_preserves_holes_and_verifies_each_lifecycle_step() {
         use cowshed_apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
+        use cowshed_os::namespace::HostNamespace;
         use std::io::{Seek, SeekFrom, Write};
         use std::os::unix::fs::symlink;
 
@@ -1949,8 +1950,10 @@ mod tests {
             .path()
             .join("destination")
             .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
-        crate::blank_image::blank_image(&image);
-        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        crate::blank_image::blank_image(root.namespace(), &image);
+        let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(
+            root.namespace(),
+        )));
         let attachment = backend
             .attach_mounted(&image, &destination, MountAccess::ReadWrite, false)
             .unwrap();

@@ -1742,11 +1742,20 @@ run says. The self-hosted NixOS runner gets ownership exactly when its `nx` runs
 serves the socket. The host temp-directory proof runs the real default executor for that contract on Linux; on macOS it
 exercises RAM-volume recovery, shared leases and final detach. No test leases, creates or detaches the user's volume:
 every macOS host proof runs the executor on a fixture volume of its own (`runBoundedExecWith` with `fixtureRamVolume`),
-whose mountpoint, lock and size no other process uses. Its real fixture gateway attaches the disk; every facade and
-non-facade disk command uses that gateway's own socket. Teardown detaches only exact registry identities its attaches
-recorded, never disks selected by UID or size alone. `fixtureRamVolume` refuses the user's own paths, size and gateway.
-The host target depends on `cowshed:ram-fixture`, which builds the native helper before any test; no test compiles or
-installs a gateway.
+in a test namespace of its own: `testNamespace(<pid>, <index>)`, seven base-36 characters, the pid in five and the index
+in two, as `cowshed_os::namespace::TestNamespace` encodes them (`specs/cowshed/01_storage.md`, "Host namespace"). The
+fixture makes the namespace's root, `/private/var/folders/cowshed/<uid>/<ns>`, with mode 0700 and refuses one that
+exists. Every path derives from the namespace (`ramTempPaths(user, namespace)`): the volume `smoo-ram3-<uid>-<ns>` at
+`<root>/ram3`, its staging directory `<root>/ram3-new`, its lock `<root>/ram3.lock`, its record of attached disks and
+its gateway's control socket `<root>/gateway.sock`. None of them can be a name production uses, so no guard compares a
+fixture's paths or gateway socket with production's. The size is the one name a namespace does not derive: no other
+process's, and `fixtureRamVolume` refuses the user's own. Its real fixture gateway (`ram_fixture <ns>`) attaches the
+disk; every facade and non-facade disk command, and the CPU tokens of the runner the proof drives, go through that
+gateway's own socket. The proof names it: `createHostCommands`, `gatewayCpuBudget` and `runBoundedExecWith` take their
+gateway socket from their caller with no default, and the Nx executor passes the host's own. Teardown detaches only
+exact registry identities its attaches recorded, never disks selected by UID or size alone, then removes the root,
+unless a volume is still mounted below it. The host target depends on `cowshed:ram-fixture`, which builds the native
+helper before any test; no test compiles or installs a gateway.
 
 RAM is optional acceleration for the production executor, not a correctness prerequisite. Gateway absence, an
 unsupported RAM operation, or unproven legacy ownership yields a typed unavailable reason and one report of the actual
@@ -1815,11 +1824,11 @@ by the census, never signalled), beside a dead lease that recorded no handle and
 (kept, then reclaimed once that job ends), a later dead lease whose archive rotates the oldest out and is deleted in the
 background, a failed run's own lease archived below the half-volume floor and so deleted with every other archive, and
 the final detach. Its supervisor is a stand-in speaking the subtree verbs' wire shapes, whose tree is the root's process
-group (`src/__tests__/stand-in-cowshed.ts`). Its volume uses a real private gateway served by `ram_fixture`, with
-`recordedRamAttach` capturing every attached identity and `disk-command --gateway-socket` routing native admission. The
-helper is closed only after exact-owned teardown; no test asks the installed gateway. External symlink targets and held
-directory modes stay unchanged, without duplicate provision and teardown; its 60 s case bound is unchanged and its
-target has the progress bound.
+group (`src/__tests__/stand-in-cowshed.ts`). Its volume uses a real private gateway served by `ram_fixture <ns>` on its
+namespace's socket, with `recordedRamAttach` capturing every attached identity and `disk-command --gateway-socket`
+routing native admission. The helper is closed only after exact-owned teardown, which then removes the namespace root;
+no test asks the installed gateway. External symlink targets and held directory modes stay unchanged, without duplicate
+provision and teardown; its 60 s case bound is unchanged and its target has the progress bound.
 
 The host target names both owned files with `./` paths: Bun otherwise interprets a bare path as a filter over recursive
 test discovery. This changes no selected case or timeout. The failed-provisioning regression keeps its exact injected
@@ -1838,7 +1847,9 @@ the delegate's wait, so logging cost is never presented as child execution time.
 
 The volume mounts at `/private/var/folders/cowshed/<uid>/ram3`. The parent is the per-user root `cowshed setup` makes,
 `/private/var/folders/cowshed/<uid>`, a 0700 directory of the user's; the leaf carries the protocol's revision, so two
-revisions never mount on one directory. Spotlight's `mds` admits no volume whose kernel-resolved mount path contains
+revisions never mount on one directory. A test namespace's volume mounts at
+`/private/var/folders/cowshed/<uid>/<ns>/ram3`, in the 0700 directory of its name that its fixture makes in that root,
+so it is below `/var/folders/` too. Spotlight's `mds` admits no volume whose kernel-resolved mount path contains
 `/var/folders/`, and keeps one IOKit right for every volume it admits for as long as it runs, with no way to release it
 (`specs/cowshed/01a_apfs.md`, "Spotlight media references"). Measured 2026-10-22: a RAM volume mounted at `/Volumes` or
 `/private/tmp` left `mds` one right; the same mount under `/private/var/folders` left none. A task refuses to create the
@@ -1848,25 +1859,29 @@ volume while that root is missing, is a link, or is not a 0700 directory the use
 is `noowners`, and launchd refuses a plist from it, so a test that bootstraps a launchd job keeps the plist outside
 `TMPDIR`.
 
-The volume is created under its final name, `smoo-ram3-<uid>`, and is never renamed. It is mounted and marked at a
-private staging directory, `/private/var/folders/cowshed/<uid>/ram3-new`, then unmounted and mounted again at its
-mountpoint, so a creator that dies part way never leaves an unmarked volume there. No DiskArbitration call makes either
-directory, so none removes them: the task that detaches the volume, or whose provisioning step failed, removes both.
-Before creating, a task inventories RAM disks of the same uid and size, but those fields authorize no detach. Only an
-exact creation receipt owned by this volume permits debris reclamation; unknown legacy or unmarked disks make the RAM
-optimization unavailable and are left untouched. One that still carries a lease directory, or has something attached
+The volume is created under its final name, `smoo-ram3-<uid>` (a test namespace's is `smoo-ram3-<uid>-<ns>`), and is
+never renamed. It is mounted and marked at a private staging directory, `/private/var/folders/cowshed/<uid>/ram3-new`
+(`<root>/ram3-new` in a test namespace), then unmounted and mounted again at its mountpoint, so a creator that dies part
+way never leaves an unmarked volume there. No DiskArbitration call makes either directory, so none removes them: the
+task that detaches the volume, or whose provisioning step failed, removes both. Before creating, a task inventories the
+RAM disks that are this volume's and no other: of its uid and exact size, mounting nowhere but at its mountpoint or
+staging directory, and either mounted there as a volume called exactly its name, or recorded by the exact registry entry
+its owner holds a receipt or its ledger holds custody for, which covers an attach whose format never finished. Size and
+owner alone make no disk its own: another volume's, a test's or an unformatted disk nothing recorded is ignored, however
+it is mounted. Only an exact creation receipt permits debris reclamation; a disk of its name with none makes the RAM
+optimization unavailable and is left untouched. One that still carries a lease directory, or has something attached
 below it, is named in the task's error instead. The task finds these disks, and the one it detaches with the last lease,
-in the I/O Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its size and owner uid) and their mounts in
-the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info` left an attached RAM disk out of 2 of 10
-listings while other images attached and detached, and a disk left out would read as absent. A registry read that does
-not parse whole fails the task instead. A BSD name passes to the next disk once its disk goes, so every RAM detach,
-including provisioning rollback, is the typed gateway-owned `ram-detach` of an exact device and registry entry
-(specs/cowshed/05_gateway.md, "RAM disks"). The gateway revalidates that identity inside its own lease before spawning
-the native tool. It uses no force; a busy owned staging volume stays in place with its named refusal. A requester or its
-job ending cannot kill this protected mutation. Authoritative terminal, proven not-started and unknown outcomes remain
-distinct; only the first two or exact entry disappearance release pending authority. A gateway that predates
-`ram-attach`, or has no control listener, makes optional RAM unavailable with its typed reason, not a task failure.
-Required RAM fixtures still fail. No task ever attaches the disk itself.
+in the I/O Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its size, its owner uid and the `FullName` of
+each of its volumes) and their mounts in the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info`
+left an attached RAM disk out of 2 of 10 listings while other images attached and detached, and a disk left out would
+read as absent. A registry read that does not parse whole fails the task instead. A BSD name passes to the next disk
+once its disk goes, so every RAM detach, including provisioning rollback, is the typed gateway-owned `ram-detach` of an
+exact device and registry entry (specs/cowshed/05_gateway.md, "RAM disks"). The gateway revalidates that identity inside
+its own lease before spawning the native tool. It uses no force; a busy owned staging volume stays in place with its
+named refusal. A requester or its job ending cannot kill this protected mutation. Authoritative terminal, proven
+not-started and unknown outcomes remain distinct; only the first two or exact entry disappearance release pending
+authority. A gateway that predates `ram-attach`, or has no control listener, makes optional RAM unavailable with its
+typed reason, not a task failure. Required RAM fixtures still fail. No task ever attaches the disk itself.
 
 RAM attach and detach go through their typed gateway operations; every other `hdiutil` and `diskutil` execution goes
 through `cowshed disk-command`, including host-test inventory. The cowshed is the installed one on `PATH`, which must

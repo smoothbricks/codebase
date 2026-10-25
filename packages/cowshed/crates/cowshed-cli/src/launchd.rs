@@ -6,6 +6,7 @@
 
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_os::fork_lock::Run as _;
+use cowshed_os::namespace::HostNamespace;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
@@ -14,8 +15,6 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-pub const GATEWAY_LABEL: &str = "dev.cowshed.gateway";
-pub const SCCACHE_LABEL: &str = "dev.cowshed.sccache";
 pub const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 pub const PRIVATE_PLIST_MODE: u32 = 0o600;
 /// Runnable, and writable only by the user launchd runs the agent as.
@@ -470,7 +469,12 @@ impl LaunchAgentSpec {
     /// The gateway agent. Its `PATH` is the directory of the `bun` setup found ([`BunDirectory`])
     /// ahead of launchd's own default, so the daemon runs its Nx cache server with that `bun`
     /// and every other child it names resolves exactly as it did under launchd's default.
+    ///
+    /// The label is `namespace`'s ([`HostNamespace::launchd_label`], 01_storage.md "Host
+    /// namespace"): production's `dev.cowshed.gateway`, a test namespace's
+    /// `dev.cowshed-test-<ns>.gateway`.
     pub fn gateway(
+        namespace: HostNamespace,
         executable: &HostStableExecutable,
         bun: &BunDirectory,
     ) -> Result<Self, LaunchdError> {
@@ -482,7 +486,7 @@ impl LaunchAgentSpec {
             executable.home(),
             executable.path(),
             AgentDefinition {
-                label: GATEWAY_LABEL.to_owned(),
+                label: namespace.launchd_label("gateway"),
                 arguments: vec!["gateway".into(), "run".into()],
                 environment: vec![("PATH".to_owned(), path)],
                 lifecycle: ServiceLifecycle::KeepAlive,
@@ -526,8 +530,12 @@ impl LaunchAgentSpec {
     /// those rustc children would run below every wrapped `sccache rustc` client at PRI 31, and
     /// the host's compile fleet would wait on a niced queue instead of hitting a cache.
     ///
+    /// The label is `namespace`'s ([`HostNamespace::launchd_label`]): production's
+    /// `dev.cowshed.sccache`, a test namespace's `dev.cowshed-test-<ns>.sccache`.
+    ///
     /// All source-verified against sccache 0.17.
     pub fn sccache(
+        namespace: HostNamespace,
         program: &StoreBackedProgram,
         server_socket: &Path,
         cache_directory: &Path,
@@ -552,7 +560,7 @@ impl LaunchAgentSpec {
             program.home(),
             program.program(),
             AgentDefinition {
-                label: SCCACHE_LABEL.to_owned(),
+                label: namespace.launchd_label("sccache"),
                 arguments: Vec::new(),
                 environment,
                 lifecycle: ServiceLifecycle::KeepAlive,

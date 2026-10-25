@@ -50,6 +50,7 @@ use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};
+use cowshed_os::namespace::TestNamespace;
 use cowshed_os::timing::{timed, timed_async};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -312,7 +313,10 @@ impl FakeHost {
                 storage: cowshed_core::storage::bootstrap::ValidatedHostStorage::new(
                     root.join("home"),
                     Vec::new(),
-                    cowshed_core::storage::bootstrap::CanonicalRoots::at(root.join("store")),
+                    cowshed_core::storage::bootstrap::CanonicalRoots::fixture(
+                        TestNamespace::mint().expect("a test namespace"),
+                        root.join("store"),
+                    ),
                 ),
             },
             state_path: root.join("durable.json"),
