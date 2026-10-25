@@ -258,6 +258,9 @@
     "@nx/js": "23.2.1",
     "nx": "23.2.1"
   },
+  "trustedDependencies": [
+    "scriptc"
+  ],
   "smoo": {
     "github": {
       "runsOn": [

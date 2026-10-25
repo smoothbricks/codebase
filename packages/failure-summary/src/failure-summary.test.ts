@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
-import { summarizeFailures } from '@smoothbricks/nx-plugin/failure-summary';
+import { summarizeFailures } from './failure-summary.js';
 
-describe('land failure summary', () => {
+describe('failure summary', () => {
   it('deduplicates exact task IDs and messages without merging distinct errors or their locations', () => {
     const first =
       'error: daemon on /tmp/first/d.sock to answer PING: no event within 30000 ms\n    at fixture.ts:113:24';

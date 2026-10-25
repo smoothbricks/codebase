@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 
-const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*[A-Za-z]', 'g');
+const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`, 'g');
 // Recognized diagnostic sections keep their exact lines, including assertion diffs and stack locations.
 // Unknown formats fall back to their output; the complete log is retained by the caller in either case.
 const DIAGNOSTIC =
@@ -91,15 +91,15 @@ export function summarizeFailures(output: string): string {
         (messages.length > 0 ? messages.join('\n\n') : 'diagnostic unavailable: this run printed no task output'),
     );
   }
-  for (const task of stopped) sections.push('stopped ' + task + ': Nx stopped it before it finished');
-  for (const task of unfinished) sections.push('unfinished ' + task + ': the run ended without finishing it');
+  for (const task of stopped) sections.push(`stopped ${task}: Nx stopped it before it finished`);
+  for (const task of unfinished) sections.push(`unfinished ${task}: the run ended without finishing it`);
   if (sections.length === 0) {
     sections.push(
       'Gate failed without a task-level failure summary:\n' +
         (diagnostics(lines).join('\n\n') || 'diagnostic unavailable: this run printed no output'),
     );
   }
-  return sections.join('\n\n') + '\n';
+  return `${sections.join('\n\n')}\n`;
 }
 
 /** CLI entry shared by the installed binary and repository host entrypoints; success means reporting succeeded only. */
@@ -113,7 +113,7 @@ export function runFailureSummary(args: readonly string[]): number {
     process.stdout.write(summarizeFailures(readFileSync(path, 'utf8')));
     return 0;
   } catch (error) {
-    process.stderr.write('smoo-nx-failures: ' + (error instanceof Error ? error.message : String(error)) + '\n');
+    process.stderr.write(`smoo-nx-failures: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
 }

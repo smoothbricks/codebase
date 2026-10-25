@@ -134,6 +134,20 @@
         "eslint": ">=5.0.0",
       },
     },
+    "packages/failure-summary": {
+      "name": "@smoothbricks/failure-summary",
+      "version": "0.0.1-next.0",
+      "bin": {
+        "smoo-nx-failures": "./dist/ts/bin/smoo-nx-failures.js",
+      },
+      "dependencies": {
+        "tslib": "^2.8.1",
+      },
+      "devDependencies": {
+        "@smoothbricks/validation": "workspace:*",
+        "scriptc": "0.4.4",
+      },
+    },
     "packages/lmao": {
       "name": "@smoothbricks/lmao",
       "version": "0.5.7",
@@ -243,7 +257,6 @@
         "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
         "smoo-nx-nextest-timings": "./dist/bin/smoo-nx-nextest-timings.js",
         "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
-        "smoo-nx-failures": "./dist/bin/smoo-nx-failures.js",
         "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
         "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
         "smoo-nx-build-inputs": "./dist/bin/smoo-nx-build-inputs.js",
@@ -429,10 +442,14 @@
       "name": "@smoothbricks/tooling",
       "dependencies": {
         "@smoothbricks/cli": "workspace:*",
+        "@smoothbricks/failure-summary": "workspace:*",
         "typia": "15.2.1",
       },
     },
   },
+  "trustedDependencies": [
+    "scriptc",
+  ],
   "patchedDependencies": {
     "@nx/js@23.2.1": "patches/@nx%2Fjs@23.2.1.patch",
     "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch",
@@ -1741,6 +1758,20 @@
 
     "@rollup/pluginutils": ["@rollup/pluginutils@5.4.0", "", { "dependencies": { "@types/estree": "^1.0.0", "estree-walker": "^2.0.2", "picomatch": "^4.0.2" }, "peerDependencies": { "rollup": "^1.20.0||^2.0.0||^3.0.0||^4.0.0" }, "optionalPeers": ["rollup"] }, "sha512-MfPp06CjRLfXQ3wY0R8vJDYBy/MvVcc9OulEfR0B8Iv9ko+GCNaRZ+EpJYFl27LhKsZK0o420sYCRHCjfCgeUg=="],
 
+    "@scriptc/cli-darwin-arm64": ["@scriptc/cli-darwin-arm64@0.4.4", "", { "os": "darwin", "cpu": "arm64" }, "sha512-jn1yzbXcsu/4J9lVbZTyg1hQaq6I4KB7tu8Gez+aW6hTqXYlusDWtzjvxKuO/I0thokI79PdFU8OeTNDCnv/Yw=="],
+
+    "@scriptc/cli-darwin-x64": ["@scriptc/cli-darwin-x64@0.4.4", "", { "os": "darwin", "cpu": "x64" }, "sha512-UnjiiWfljD01/NkI/DWwUHhMoB0NNIrtiZ+hq2KZB2taNbEL86bMwVQt41BLEWVjuMUecSANf7nHr0iZ8RW8Mw=="],
+
+    "@scriptc/cli-linux-arm64-gnu": ["@scriptc/cli-linux-arm64-gnu@0.4.4", "", { "os": "linux", "cpu": "arm64" }, "sha512-CTk+WxR3ecNz1e5zCxvTAcnssEVgHCpwHbcL3j6E5cAYXd9nW1MZec+I+o0tVacujJAqxkqIYcndJCQimVpc6w=="],
+
+    "@scriptc/cli-linux-arm64-musl": ["@scriptc/cli-linux-arm64-musl@0.4.4", "", { "os": "linux", "cpu": "arm64" }, "sha512-lsxWknOblf6DwupYs/bqynBAn7kliQNHsWF5rsoIhox2NOwMDk9vHnx2BQdS55Sjl/edpWBNpnC3EOhCCcqQ1A=="],
+
+    "@scriptc/cli-linux-x64-gnu": ["@scriptc/cli-linux-x64-gnu@0.4.4", "", { "os": "linux", "cpu": "x64" }, "sha512-gDaN5kP3S73z0sufLTdyazwGVLGcTH/eW3UBcvN8qcBDMiSnjxGdixIc/L8GDAbLE2w4BX/tikFi3ZWMBfkooQ=="],
+
+    "@scriptc/cli-linux-x64-musl": ["@scriptc/cli-linux-x64-musl@0.4.4", "", { "os": "linux", "cpu": "x64" }, "sha512-6hA1YX0Ko1beXoi1O+uMUOg7qiSJePv0PSsLVc6e6lwJZCDU+pzkCZKX/vNVDGtK1mXj3T8RBZq4EUpIMtJUJA=="],
+
+    "@scriptc/cli-win32-x64-msvc": ["@scriptc/cli-win32-x64-msvc@0.4.4", "", { "os": "win32", "cpu": "x64" }, "sha512-VpX2lS6xZUdeZCHiJ1+RGlhJY97AV0ZgkOOVxewIBWrlo6zyz/vsylxtiLAmFgpfz0ts3mDkd0cFmFdFVgS7cg=="],
+
     "@shikijs/core": ["@shikijs/core@4.3.1", "", { "dependencies": { "@shikijs/primitive": "4.3.1", "@shikijs/types": "4.3.1", "@shikijs/vscode-textmate": "^10.0.2", "@types/hast": "^3.0.4", "hast-util-to-html": "^9.0.5" } }, "sha512-ANMDxuaPsNMdDC1m4vfvhlDmJweMwkE5XitTwrq2rWHx5jM+dlm4MmHt2PP6t0uejfR77SuhrhJ0zEijIF/uhA=="],
 
     "@shikijs/engine-javascript": ["@shikijs/engine-javascript@4.3.1", "", { "dependencies": { "@shikijs/types": "4.3.1", "@shikijs/vscode-textmate": "^10.0.2", "oniguruma-to-es": "^4.3.6" } }, "sha512-JBItcnPuYq7jVJdZo/vMj94r+szT7XEjHFX+mvFDGSEIbVAXAGyHAHzhbWzpGOwYidCZrErJLLgn2PVeiokHnQ=="],
@@ -1778,6 +1809,8 @@
     "@smoothbricks/cowshed": ["@smoothbricks/cowshed@workspace:packages/cowshed"],
 
     "@smoothbricks/duration": ["@smoothbricks/duration@workspace:packages/duration"],
+
+    "@smoothbricks/failure-summary": ["@smoothbricks/failure-summary@workspace:packages/failure-summary"],
 
     "@smoothbricks/lmao": ["@smoothbricks/lmao@workspace:packages/lmao"],
 
@@ -4196,6 +4229,8 @@
     "sax": ["sax@1.6.0", "", {}, "sha512-6R3J5M4AcbtLUdZmRv2SygeVaM7IhrLXu9BmnOGmmACak8fiUtOsYNWUS4uK7upbmHIBbLBeFeI//477BKLBzA=="],
 
     "scheduler": ["scheduler@0.27.0", "", {}, "sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q=="],
+
+    "scriptc": ["scriptc@0.4.4", "", { "optionalDependencies": { "@scriptc/cli-darwin-arm64": "0.4.4", "@scriptc/cli-darwin-x64": "0.4.4", "@scriptc/cli-linux-arm64-gnu": "0.4.4", "@scriptc/cli-linux-arm64-musl": "0.4.4", "@scriptc/cli-linux-x64-gnu": "0.4.4", "@scriptc/cli-linux-x64-musl": "0.4.4", "@scriptc/cli-win32-x64-msvc": "0.4.4" }, "bin": { "scriptc": "bin/scriptc.exe" } }, "sha512-KqAuR6C7vWFohgic6p259uHE8mEK5avkcfDeAbFOaZveuHvLENAVSpuC/w+NCGQQ2Fgtz41Y5f6oAL/cM2DXnw=="],
 
     "section-matter": ["section-matter@1.0.0", "", { "dependencies": { "extend-shallow": "^2.0.1", "kind-of": "^6.0.0" } }, "sha512-vfD3pmTzGpufjScBh50YHKzEu2lxBWhVEHsNGoEXmCmn2hKGfeNLYMzCJpe8cD7gqX7TJluOVpBkAequ6dgMmA=="],
 

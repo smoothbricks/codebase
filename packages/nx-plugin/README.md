@@ -2095,10 +2095,10 @@ runner, or with two (they would write one report), is judged by its exit alone.
 records and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for
 that task's hash, is a `bound`; a failed task without one is not. This diagnostic is not land acceptance. The land
 wrapper, `tooling/land-host.sh`, requires `nx run-many -t gate` to exit zero: bounds, assertions and infrastructure
-failures all stop the land without a retry or waiver. `smoo-nx-failures OUTPUT` reports unique failing tasks and
-deduplicated exact diagnostics from that invocation's retained output, not a shared last-run record. The portable
-`@smoothbricks/nx-plugin/failure-summary` export owns `summarizeFailures(output)` and `runFailureSummary(args)`;
-repository entrypoints such as `tooling/land-summary.ts` call that owner without copying the parser. Its zero exit means
+failures all stop the land without a retry or waiver. `smoo-nx-failures OUTPUT`, from `@smoothbricks/failure-summary`,
+reports unique failing tasks and deduplicated exact diagnostics from that invocation's retained output, not a shared
+last-run record. That package's `summarizeFailures(output)` and `runFailureSummary(args)` are the one parser;
+`tooling/land-host.sh` runs main's native build of its bin (`dist/bin/<platform>/smoo-nx-failures`). Its zero exit means
 reporting succeeded, never that the failed gate may land. Known diagnostic sections omit fixture progress and daemon
 debug dumps while preserving multiline assertions and source locations; unknown formats retain their output.
 

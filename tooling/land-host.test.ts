@@ -287,7 +287,6 @@ function fixture(replayFails = false, publishFails = false, pick: PickScenario =
     'land-history.ts',
     'land-pick.ts',
     'land-publish.ts',
-    'land-summary.ts',
     'land-cargo-env.ts',
   ]) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
@@ -298,6 +297,9 @@ function fixture(replayFails = false, publishFails = false, pick: PickScenario =
   for (const file of ['cache_adapter.js', 'nx_publish.js']) {
     cpSync(join(repo, BRIDGE, file), join(main, BRIDGE, file));
   }
+  // The failure reporter is main's native build of the failure-summary package (tooling:test depends on its build).
+  mkdirSync(join(main, 'packages'), { recursive: true });
+  symlinkSync(join(repo, 'packages/failure-summary'), join(main, 'packages/failure-summary'));
   writeFileSync(join(main, 'nx.json'), '{}\n');
   // The land cross-lints the gated tree for Linux after the gate; the fixture's check passes.
   writeFileSync(join(main, 'package.json'), '{"scripts":{"check:linux":"echo linux cross check passed"}}\n');
@@ -429,7 +431,7 @@ describe('land-host.sh', () => {
     );
     expect(run.nx).toEqual(['daemon --stop', GATE.join(' '), MAIN_BUILD.join(' ')]);
   });
-  // Which diagnostics the summary keeps is land-summary.test.ts's; this land proves what the script does with them.
+  // Which diagnostics the summary keeps is the failure-summary package's; this land proves what the script does with them.
   it('stops immediately on a failed gate, reporting its complete captured failure once, without rerunning or committing a ledger', () => {
     const land = fixture();
     const before = git(land.main, 'rev-parse', 'HEAD');
@@ -481,7 +483,7 @@ describe('land-host.sh', () => {
   it('keeps the failing gate status and raw diagnostics when the reporter is unavailable', () => {
     const land = fixture();
     const before = git(land.main, 'rev-parse', 'HEAD');
-    rmSync(join(land.main, 'tooling/land-summary.ts'));
+    rmSync(join(land.main, 'packages/failure-summary'));
     const failed = failedRun('error: original failure', 9);
     const run = land.land([
       DAEMON_STOP,

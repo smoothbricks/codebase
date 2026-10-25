@@ -24,12 +24,6 @@
       "import": "./dist/eslint-file-set.js",
       "default": "./dist/eslint-file-set.js"
     },
-    "./failure-summary": {
-      "types": "./dist/failure-summary.d.ts",
-      "development": "./src/failure-summary.ts",
-      "import": "./dist/failure-summary.js",
-      "default": "./dist/failure-summary.js"
-    },
     "./cargo-build-script-env": {
       "types": "./dist/cargo-build-script-env.d.ts",
       "development": "./src/cargo-build-script-env.ts",
@@ -238,7 +232,6 @@
     "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
     "smoo-nx-nextest-timings": "./dist/bin/smoo-nx-nextest-timings.js",
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
-    "smoo-nx-failures": "./dist/bin/smoo-nx-failures.js",
     "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
     "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
     "smoo-nx-build-inputs": "./dist/bin/smoo-nx-build-inputs.js"

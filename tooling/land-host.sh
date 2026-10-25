@@ -15,7 +15,9 @@
 # 4. Gate the rebased tree on the host: `nx run-many -t gate --nx-bail=false`. The root Nx graph owns
 #    every project's lint/test/build and the host-e2e aggregate. Cached tasks replay unless their inputs changed.
 #    The host, unlike the land sandbox, can run the real-APFS tests. Any nonzero gate exit stops the land.
-#    A failure summary keeps unique tasks and exact diagnostics; the complete failed output is retained.
+#    A failure summary keeps unique tasks and exact diagnostics; the complete failed output is retained. The reporter
+#    is main's native build of @smoothbricks/failure-summary (dist/bin/<platform>/smoo-nx-failures), which step 5
+#    keeps current.
 #    The gate runs as a cowshed gate job (`cowshed exec --class gate --host`): the jobserver serves every task it
 #    starts ahead of other execs, at nice 0 where they run at +10 (05_gateway.md, "Host CPU budget").
 #    A red names, for each task the gate failed, the commits of the land that change a file Nx hashes for it or for a
@@ -42,6 +44,15 @@ workspace=$(bun "$here/land-decide.ts" workspace "$@")
 shift
 main=$(cowshed path main)
 checkout=$(cowshed path "$workspace")
+# The failure reporter's platform directory, named as the native tool packages name dist/bin/<platform>.
+case "$(uname -s)-$(uname -m)" in
+Darwin-arm64) platform=darwin-arm64 ;;
+Darwin-x86_64) platform=darwin-x64 ;;
+Linux-aarch64 | Linux-arm64) platform=linux-arm64 ;;
+Linux-x86_64) platform=linux-x64 ;;
+*) platform="unsupported-$(uname -s)-$(uname -m)" ;;
+esac
+failure_summary="$here/../packages/failure-summary/dist/bin/$platform/smoo-nx-failures"
 started=$(date +%s)
 
 
@@ -204,7 +215,7 @@ gate_workspace() {
   # asks for its own through the job's pool. Nothing here caps a width: load is the jobserver's to order.
   gate_job bun nx run-many -t gate --parallel="$(sysctl -n hw.ncpu)" --nx-bail=false --outputStyle=static-failures-only >"$output" 2>&1 || gate_status=$?
   if [ "$gate_status" -ne 0 ]; then
-    (cd "$checkout" && direnv exec "$checkout" bun "$here/land-summary.ts" "$output") >&2 || {
+    "$failure_summary" "$output" >&2 || {
       say "failure summary unavailable; complete gate output: $output"
       replay_gate_output "$output"
     }

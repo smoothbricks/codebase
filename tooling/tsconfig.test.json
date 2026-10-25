@@ -22,6 +22,7 @@
   "references": [
     {
       "path": "../packages/cli/tsconfig.lib.json"
-    }
+    },
+    { "path": "../packages/failure-summary/tsconfig.lib.json" }
   ]
 }
