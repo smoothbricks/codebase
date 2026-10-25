@@ -2310,6 +2310,24 @@ pub(crate) fn plan(
     }
     for (id, reason, seen) in doomed {
         let image = layout.image(&id);
+        // A hold is asked before the image is read: a creator holds its volume from registration
+        // and may sit in its first write with the image's vnode held, which a stat waits out
+        // (measured 2026-10-25: 37 s of an `rm`'s open). The hold is a file of its own. The
+        // release would defer under its claim all the same.
+        match layout.held(&id) {
+            Ok(false) => {}
+            Ok(true) => {
+                plan.deferred.push((id, Deferral::Held(Vec::new())));
+                continue;
+            }
+            Err(error) => {
+                plan.deferred.push((
+                    id,
+                    Deferral::ReleaseFailed(format!("cannot tell whether a job holds it: {error}")),
+                ));
+                continue;
+            }
+        }
         // Only absence lets a volume go without its size: an image that does not exist cannot be
         // waiting for anything, and deferring its record deferred it on every pass forever. An
         // image that exists but cannot be read is deferred with the error, never released on a
@@ -3677,6 +3695,29 @@ mod tests {
                 .unwrap()
                 .map(|(id, _)| id),
             Some(published)
+        );
+    }
+
+    /// A volume a live creator or job holds is deferred by the plan itself, before anything stats
+    /// its image: a creator may sit in its first write holding the image's vnode, and a stat of
+    /// the image waits as long (measured 2026-10-25: an `rm`'s open spent 37 s in one `lstat` of
+    /// a concurrent fork's volume). Its hold, a file of its own, answers at once.
+    #[test]
+    fn a_held_volume_is_deferred_before_its_image_is_read() {
+        let store = Store::new();
+        let forming = store.registered(linked("lane"), Registrant::Intent);
+        let held = store.layout.hold(&forming).unwrap();
+        let planned = plan(
+            &store.layout,
+            std::slice::from_ref(&forming),
+            &Links::default(),
+        )
+        .unwrap();
+        drop(held);
+        assert_eq!(doomed(&planned), Vec::new(), "{planned:?}");
+        assert_eq!(
+            planned.deferred,
+            vec![(forming, Deferral::Held(Vec::new()))]
         );
     }
 

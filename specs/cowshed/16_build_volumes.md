@@ -1095,11 +1095,15 @@ delta incrementally, as an edit would.
   While the create, fork or adopt is past its mutation fence and unfinished in the lifecycle intent journal, collection
   in any process defers the published volumes recorded as that workspace's or as its seed, naming the workspace; what it
   has registered and not yet published, it holds by id meanwhile. Without this, an `rm` in one process deletes the
-  volume and seed of a fork running in another, and the fork's mount refuses its link to a volume nobody owns. A verb
-  crosses its fence before it makes a volume, so collection lists the images first and then reads the journal and the
-  workspaces, and decides only the images it listed: one made after the listing is left to a later pass, never decided
-  from links read before it existed. An adoption killed between the mint and the link leaves main's registered sidecar,
-  which no process holds any more, and the next open releases it by its id once the adoption's intent is recovered.
+  volume and seed of a fork running in another, and the fork's mount refuses its link to a volume nobody owns.
+  Collection asks that hold before it reads the image at all: a volume whose hold is taken is deferred as held without a
+  stat, because its creator may sit in the first write with the image's vnode held, and a stat waits as long (measured
+  2026-10-25: an `rm`'s open spent 37 s in one `lstat` of a concurrent fork's volume); the hold is a file of its own. A
+  verb crosses its fence before it makes a volume, so collection lists the images first and then reads the journal and
+  the workspaces, and decides only the images it listed: one made after the listing is left to a later pass, never
+  decided from links read before it existed. An adoption killed between the mint and the link leaves main's registered
+  sidecar, which no process holds any more, and the next open releases it by its id once the adoption's intent is
+  recovered.
 - Collection says why it skips: a job hold, an unfinished create/fork/adopt, an unreadable detached checkout or record,
   or a failed release names the volume and reason. Opportunistic collection counts routine detached/still-forming
   deferrals on one line. One volume's release failure does not hide later candidates. `--dry-run` changes nothing and
