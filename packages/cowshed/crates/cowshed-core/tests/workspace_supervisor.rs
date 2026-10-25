@@ -9772,11 +9772,27 @@ fn native_process_fixture(
 
 /// The command exits while its child is blocked on a fixture-owned socket. The child may keep
 /// its inherited output open; the socket, not a late PID kill, releases it even on panic.
+///
+/// The child also passes this test a copy of its stdout, so the job cannot seal until the test
+/// drops it: the draining window the test asserts in is the test's, not the retirement grace's.
+/// Retirement sends the child TERM and, a grace later, KILL; a child the host does not schedule
+/// within that grace never answers the TERM, so the answer is optional and the child's end -- its
+/// socket closing -- is the event the test waits for. In train 5's gate the test, then requiring
+/// the answer, read `early eof`: the child had ended at the KILL without answering. `starved`
+/// makes that order certain: the child blocks SIGTERM, so the TERM stays pending and the KILL ends
+/// it unanswered. Stopping the child instead is no starvation: once the leader exits, the kernel
+/// sends SIGHUP and SIGCONT to a stopped member of the group that exit orphans, and the child dies
+/// before retirement signals it.
 #[cfg(target_os = "macos")]
-async fn terminal_descendant_reproduction(detach: bool, cancel: bool, hold_output: bool) {
+async fn terminal_descendant_reproduction(
+    detach: bool,
+    cancel: bool,
+    hold_output: bool,
+    starved: bool,
+) {
     use cowshed_core::runtime::job_groups::{Process, group_has_live_members};
     use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
-    use tokio::io::AsyncReadExt as _;
+    use std::io::Read as _;
 
     let (handle, ledger, root) =
         native_process_fixture("terminal-descendant", None, Arc::new(ImmediateCpu));
@@ -9786,11 +9802,13 @@ async fn terminal_descendant_reproduction(detach: bool, cancel: bool, hold_outpu
 import os, signal, socket, struct, sys
 if os.fork() == 0:
     signal.signal(signal.SIGTERM, lambda *_: peer.sendall(b"t"))
+    if sys.argv[4] == "starve":
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     if sys.argv[2] == "detach":
         os.setsid()
     peer = socket.socket(socket.AF_UNIX)
     peer.connect(sys.argv[1])
-    peer.sendall(struct.pack("!IIII", os.getpid(), os.getppid(), os.getpgrp(), os.getsid(0)))
+    socket.send_fds(peer, [struct.pack("!IIII", os.getpid(), os.getppid(), os.getpgrp(), os.getsid(0))], [1])
     for fd in ((0,) if sys.argv[3] == "hold" else (0, 1, 2)):
         os.close(fd)
     peer.recv(1)
@@ -9806,12 +9824,13 @@ os._exit(0)
                 command: ExecCommand::Argv(vec![
                     "/bin/sh".into(),
                     "-c".into(),
-                    r#"exec python3 -c "$1" "$2" "$3" "$4""#.into(),
+                    r#"exec python3 -c "$1" "$2" "$3" "$4" "$5""#.into(),
                     "descendant-fixture".into(),
                     script.into(),
                     CommandArg::from(socket.into_os_string()),
                     if detach { "detach" } else { "group" }.into(),
                     if hold_output { "hold" } else { "close" }.into(),
+                    if starved { "starve" } else { "run" }.into(),
                 ]),
                 cwd: None,
                 scope: ExecScope::HostGate,
@@ -9827,9 +9846,15 @@ os._exit(0)
         )
         .await
         .unwrap();
-    let (mut child_socket, _) = listener.accept().await.unwrap();
-    let mut report = [0_u8; 16];
-    child_socket.read_exact(&mut report).await.unwrap();
+    let (child_socket, _) = listener.accept().await.unwrap();
+    let child_socket = child_socket.into_std().unwrap();
+    child_socket.set_nonblocking(false).unwrap();
+    let (child_socket, report, held_stdout) = tokio::task::spawn_blocking(move || {
+        let (report, stdout) = report_with_descriptor(&child_socket);
+        (child_socket, report, stdout)
+    })
+    .await
+    .unwrap();
     let [child, parent, group, session] = [0, 4, 8, 12]
         .map(|offset| u32::from_be_bytes(report[offset..offset + 4].try_into().unwrap()));
     let child_record = Darwin.record(child).unwrap().unwrap();
@@ -9878,7 +9903,6 @@ os._exit(0)
         "a blocked live job is not a leak"
     );
     assert_eq!(ledger_leaders(&ledger).len(), 1);
-
     let finishing_handle = handle.clone();
     let finishing = tokio::spawn(async move {
         if cancel {
@@ -9890,10 +9914,19 @@ os._exit(0)
         }
         finishing_handle.wait(job).await
     });
-    let mut term = [0_u8; 1];
-    // Retirement signals the owned descendant.
-    child_socket.read_exact(&mut term).await.unwrap();
-    assert_eq!(term, *b"t");
+    // Retirement ends the owned descendant, its socket closing with it. It answers the TERM it is
+    // sent first only if the host schedules it within the grace, before the KILL.
+    let (child_socket, answered) = tokio::task::spawn_blocking(move || {
+        let mut answered = Vec::new();
+        (&child_socket).read_to_end(&mut answered).unwrap();
+        (child_socket, answered)
+    })
+    .await
+    .unwrap();
+    assert!(
+        answered.is_empty() || (!starved && answered == b"t"),
+        "{answered:?}"
+    );
     let draining = handle.info(job).await.unwrap();
     assert_eq!(draining.state, JobState::Draining);
     assert_eq!(draining.exit, None);
@@ -9904,8 +9937,9 @@ os._exit(0)
     );
     assert!(
         !finishing.is_finished(),
-        "wait joins membership, not just the leader"
+        "sealing waits for the stdout this test holds"
     );
+    drop(held_stdout);
     let ended = finishing.await.unwrap().unwrap();
     assert_eq!(
         ended.state,
@@ -9981,25 +10015,95 @@ os._exit(0)
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn terminal_reaps_a_background_descendant_with_closed_output() {
-    terminal_descendant_reproduction(false, false, false).await;
+    terminal_descendant_reproduction(false, false, false, false).await;
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn terminal_reaps_a_descendant_that_started_a_new_session() {
-    terminal_descendant_reproduction(true, false, false).await;
+    terminal_descendant_reproduction(true, false, false, false).await;
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn cancellation_reaps_a_background_descendant_with_closed_output() {
-    terminal_descendant_reproduction(false, true, false).await;
+    terminal_descendant_reproduction(false, true, false, false).await;
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn cancellation_reaps_a_descendant_that_started_a_new_session() {
-    terminal_descendant_reproduction(true, true, false).await;
+    terminal_descendant_reproduction(true, true, false, false).await;
+}
+
+/// Train 5's gate order: the host does not run the fixture child again before retirement's KILL.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn terminal_reaps_a_descendant_the_host_does_not_run_within_the_grace() {
+    terminal_descendant_reproduction(false, false, false, true).await;
+}
+
+/// The fixture child's 16-byte report and the one descriptor it passes with it (`SCM_RIGHTS`).
+#[cfg(target_os = "macos")]
+fn report_with_descriptor(
+    socket: &std::os::unix::net::UnixStream,
+) -> ([u8; 16], std::os::fd::OwnedFd) {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let mut report = [0_u8; 16];
+    // Aligned for `cmsghdr` and larger than CMSG_SPACE of one descriptor.
+    let mut space = [0_u64; 8];
+    let mut part = libc::iovec {
+        iov_base: report.as_mut_ptr().cast(),
+        iov_len: report.len(),
+    };
+    // SAFETY: an all-zero msghdr is a valid empty header; the fields set next point at live
+    // buffers of the lengths given.
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &mut part;
+    header.msg_iovlen = 1;
+    header.msg_control = space.as_mut_ptr().cast();
+    header.msg_controllen = libc::socklen_t::try_from(std::mem::size_of_val(&space)).unwrap();
+    // SAFETY: `header` describes writable storage that outlives the call.
+    let read = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut header, 0) };
+    let read = usize::try_from(read)
+        .unwrap_or_else(|_| panic!("recvmsg: {}", std::io::Error::last_os_error()));
+    assert_ne!(
+        read, 0,
+        "the fixture child closed its socket before reporting"
+    );
+    // SAFETY: `header` was filled by recvmsg; CMSG_FIRSTHDR reads only its control fields.
+    let message = unsafe { libc::CMSG_FIRSTHDR(&header) };
+    assert!(
+        header.msg_flags & libc::MSG_CTRUNC == 0
+            && !message.is_null()
+            // SAFETY: a non-null CMSG_FIRSTHDR points into `space`.
+            && unsafe {
+                (*message).cmsg_level == libc::SOL_SOCKET
+                    && (*message).cmsg_type == libc::SCM_RIGHTS
+                    && (*message).cmsg_len
+                        == libc::CMSG_LEN(
+                            libc::c_uint::try_from(std::mem::size_of::<libc::c_int>()).unwrap(),
+                        )
+            },
+        "the fixture child passes its stdout, and only it, with its report"
+    );
+    // SAFETY: an SCM_RIGHTS message carries descriptors, possibly unaligned after its header.
+    let descriptor =
+        unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(message).cast::<libc::c_int>()) };
+    // SAFETY: the kernel installed this descriptor for this process; nothing else owns it.
+    let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) };
+    // Darwin's recvmsg has no MSG_CMSG_CLOEXEC; a process this one spawns must not hold the stdout.
+    // SAFETY: F_SETFD takes a plain integer and touches no memory of ours.
+    assert_ne!(
+        unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        -1,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    let mut rest = socket;
+    rest.read_exact(&mut report[read..]).unwrap();
+    (report, descriptor)
 }
 
 /// A refused membership retirement answers its client instead of hanging it, keeps the job held
@@ -10132,7 +10236,7 @@ async fn host_controller_a_refused_retirement_answers_its_client_and_its_survivo
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn terminal_reaps_a_detached_descendant_still_holding_output_open() {
-    terminal_descendant_reproduction(true, false, true).await;
+    terminal_descendant_reproduction(true, false, true, false).await;
 }
 
 /// Client detachment leaves the declared Resident under the supervisor's one ownership ledger.
