@@ -304,8 +304,8 @@ export function keepReason(outcome: PlannedOutcome, path: string): string | unde
   return outcome.retained.find((entry) => entry.path === path)?.reason;
 }
 
-export function future(): Date {
-  return new Date(Date.now() + DAY3);
+export function future(): number {
+  return Date.now() + DAY3;
 }
 
 export function fixtureConfig(mtimeOnUse: boolean): string {
@@ -594,7 +594,7 @@ export function retainWithoutPerl(
     `const { retainCargoWorkspace } = await import(${JSON.stringify(compiled)});`,
     `const { nodeLocks } = await import(${JSON.stringify(locksCompiled)});`,
     'Object.defineProperty(process, "platform", { value: "linux" });',
-    `const result = await retainCargoWorkspace(${JSON.stringify(workspace)}, { apply: process.argv[2] === "apply", now: new Date(${future().getTime()}) }, nodeLocks);`,
+    `const result = await retainCargoWorkspace(${JSON.stringify(workspace)}, { apply: process.argv[2] === "apply", now: ${future()} }, nodeLocks);`,
     'console.log(JSON.stringify(result));',
   );
   const child = spawnSync(node, ['--input-type=module', '-e', source, perl, apply ? 'apply' : 'plan'], {

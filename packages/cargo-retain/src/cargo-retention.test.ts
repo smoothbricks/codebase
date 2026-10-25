@@ -360,7 +360,7 @@ async function plansAndKeepsRecent(fx: Churn, gen: Generations, label: string): 
   check(keepReason(plan, gen.leafOld)).toBe('newest-of-identity');
   check(keepReason(plan, gen.extMeta)).toBe('dependency-of-kept');
   // At real now the same generations are inside the recent window: nothing goes.
-  const recent = planned(await retain(fx.ws, { apply: true }));
+  const recent = planned(await retain(fx.ws, { apply: true, now: Date.now() }));
   check(recent.reclaim).toEqual([]);
   check(recent.reclaimedBytes).toBe(0);
   for (const path of gen.superseded) check(await exists(path), path).toBe(true);
@@ -430,7 +430,7 @@ async function noOpPassReadsFingerprintsOnce(fx: Churn): Promise<void> {
     'syncBuiltinESMExports();',
     `const { retainCargoWorkspace } = await import(${JSON.stringify(module)});`,
     `const { nodeLocks } = await import(${JSON.stringify(locksModule)});`,
-    `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: process.argv[1] === 'automatic', automatic: process.argv[1] === 'automatic', now: new Date(${future().getTime()}) }, nodeLocks);`,
+    `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: process.argv[1] === 'automatic', automatic: process.argv[1] === 'automatic', now: ${future()} }, nodeLocks);`,
     'if (!result.ok) throw new Error(JSON.stringify(result.error));',
     'console.log(JSON.stringify({ report: result.value, reads, stats, asyncFingerprintCalls, children }));',
   );
@@ -866,7 +866,7 @@ async function automaticCadence(fx: Churn, superseded: readonly string[]): Promi
     'automatic cadence uses only successful matching receipts and due/manual runs read the current graph',
   );
   await clearReceipt(fx.target);
-  const now = new Date();
+  const now = Date.now();
   const first = await retain(fx.ws, { apply: true, automatic: true, now });
   check(planned(first).reclaim).toEqual([]);
   if (first.completed === undefined) throw new Error('first successful apply has no completion');
@@ -878,33 +878,29 @@ async function automaticCadence(fx: Churn, superseded: readonly string[]): Promi
   const path = join(json, name);
   const original = await readFile(path, 'utf8');
   await writeFile(path, '{');
-  const within = new Date(now.getTime() + 1);
+  const within = now + 1;
   check((await retain(fx.ws, { apply: true, automatic: true, now: within })).outcome.kind).toBe('not-due');
   check(await readFile(receiptPath, 'utf8')).toBe(before);
   check(refused(await retain(fx.ws, { apply: false, now: within })).reason).toContain('fingerprint');
   const forced = await retain(fx.ws, { apply: true, now: within });
   check(forced.outcome.kind).toBe('refused');
   check(forced.completed).toBeUndefined();
-  const invalidClock = await retainCargoWorkspace(
-    fx.ws,
-    { apply: true, automatic: true, now: new Date(Number.NaN) },
-    nodeLocks,
-  );
+  const invalidClock = await retainCargoWorkspace(fx.ws, { apply: true, automatic: true, now: Number.NaN }, nodeLocks);
   check(invalidClock.ok).toBe(false);
-  const due = new Date(now.getTime() + AUTOMATIC_INTERVAL_MS);
+  const due = now + AUTOMATIC_INTERVAL_MS;
   const failed = await retain(fx.ws, { apply: true, automatic: true, now: due });
   check(failed.outcome.kind).toBe('refused');
   check(failed.completed).toBeUndefined();
   await writeFile(path, original);
   const recovered = await retain(fx.ws, { apply: true, automatic: true, now: due });
   check(reclaimPaths(planned(recovered))).toEqual([...superseded]);
-  check(recovered.completed?.at).toBe(due.getTime());
+  check(recovered.completed?.at).toBe(due);
   // Invalid/foreign/backward/busy evidence cannot suppress a real current pass.
   const invalidReceipts = [
     '{',
     JSON.stringify({ ...first, workspaceRoot: fx.root }),
     JSON.stringify({ ...first, targetDir: fx.root }),
-    JSON.stringify({ ...first, completed: { ...first.completed, at: now.getTime() + 1 } }),
+    JSON.stringify({ ...first, completed: { ...first.completed, at: now + 1 } }),
     JSON.stringify({ ...first, completed: { ...first.completed, configuration: 'foreign' } }),
     JSON.stringify({ ...first, outcome: { kind: 'busy', lock: 'held' } }),
     JSON.stringify({ ...first, outcome: { kind: 'refused', profile: 'debug', reason: 'unreadable' } }),
@@ -1109,7 +1105,7 @@ async function supersedesOlderToolchain(fx: Churn, older: Toolchain, newer: Tool
     throw new Error('a toolchain made no generations of its own');
   }
   // Both compilers were used a moment ago, so both are roots and nothing goes.
-  const recent = planned(await retain(fx.ws, { apply: true }));
+  const recent = planned(await retain(fx.ws, { apply: true, now: Date.now() }));
   check(recent.reclaim, 'two toolchains in recent use').toEqual([]);
   // Outside the recency window the older one's generations, its dependency units included, are superseded.
   const plan = planned(await retain(fx.ws, { apply: false, now: future() }));
@@ -1148,13 +1144,15 @@ async function reportsRecencyFromStampedUse(fx: Churn, stamping: boolean): Promi
   );
   const unknown = { kind: 'recency-unknown', reason: 'mtime-on-use off' } as const;
   await build(fx.ws);
-  check(planned(await retain(fx.ws, { apply: false })).recency, 'compiled and never reused').toEqual(unknown);
+  check(planned(await retain(fx.ws, { apply: false, now: Date.now() })).recency, 'compiled and never reused').toEqual(
+    unknown,
+  );
   const used = (await Promise.all(['ret-mid', 'ret-leaf', 'ret-ext'].map((pkg) => metasOf(fx.target, pkg)))).flat();
   const unused = await metasOf(fx.target, 'ret-app');
   // A hash file with no compile stamp beside it has nothing to be newer than: that is no evidence either.
   const stamps = [...used, ...unused].map((meta) => join(meta, 'fingerprint', 'invoked.timestamp'));
   for (const stamp of stamps) await rm(stamp);
-  check(planned(await retain(fx.ws, { apply: false })).recency, 'no compile stamps').toEqual(unknown);
+  check(planned(await retain(fx.ws, { apply: false, now: Date.now() })).recency, 'no compile stamps').toEqual(unknown);
   for (const stamp of stamps) await put(stamp, '');
   await backdate([...used, ...unused]);
   const aged = Date.now() - DAY3;
@@ -1171,7 +1169,7 @@ async function reportsRecencyFromStampedUse(fx: Churn, stamping: boolean): Promi
   const stamped = async (meta: string): Promise<boolean> => (await hashMtime(meta)) > aged + RECENT_USE_MS;
   for (const meta of used) check(await stamped(meta), `${meta}, used`).toBe(stamping);
   for (const meta of unused) check(await stamped(meta), `${meta}, not used`).toBe(false);
-  check(planned(await retain(fx.ws, { apply: false })).recency, 'after the reuse').toEqual(
+  check(planned(await retain(fx.ws, { apply: false, now: Date.now() })).recency, 'after the reuse').toEqual(
     stamping ? { kind: 'use-stamped' } : unknown,
   );
 }
@@ -1350,7 +1348,7 @@ describe('cargo retention against real Cargo target layouts', () => {
           expect(said).toBe('ready');
           const buildDir = join(target, 'debug', 'build');
           const before = await snapshot(buildDir);
-          const report = await retain(ws, { apply: true });
+          const report = await retain(ws, { apply: true, now: Date.now() });
           expect(exited).toBe(false);
           if (report.outcome.kind !== 'busy') {
             throw new Error(`expected busy while cargo is held, got ${JSON.stringify(report.outcome)}`);
@@ -1372,13 +1370,13 @@ describe('cargo retention against real Cargo target layouts', () => {
 
   it('accepts a real pre-created Cargo target without a backup tag, but refuses a foreign root or forged tag', async () => {
     await inFixture(async (root) => {
-      const empty = await retainCargoWorkspace(root, { apply: false }, nodeLocks);
+      const empty = await retainCargoWorkspace(root, { apply: false, now: Date.now() }, nodeLocks);
       if (empty.ok) throw new Error('an empty directory produced a report');
       expect(empty.error.kind).toBe('cargo-metadata');
       const fx = await churnFixture(root, false);
       await mkdir(fx.target, { recursive: true });
       await scopedTo(fx.target, async () => {
-        const foreign = await retainCargoWorkspace(fx.ws, { apply: false }, nodeLocks);
+        const foreign = await retainCargoWorkspace(fx.ws, { apply: false, now: Date.now() }, nodeLocks);
         if (foreign.ok) throw new Error('an unbuilt target produced a report');
         expect(foreign.error.kind).toBe('target-not-cargo');
         const gen = await churnGenerations(fx);

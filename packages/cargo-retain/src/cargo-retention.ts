@@ -141,8 +141,11 @@ export interface RetentionOptions {
   readonly apply: boolean;
   /** Only the automatic hook opts into the successful receipt's maintenance interval. */
   readonly automatic?: boolean;
-  /** The clock {@link RECENT_USE_MS} counts back from. */
-  readonly now?: Date;
+  /**
+   * The clock {@link RECENT_USE_MS} counts back from, in milliseconds since the epoch. The shell reads the ambient clock
+   * once and passes it in; the core never does, so a pass is a function of its inputs.
+   */
+  readonly now: number;
 }
 
 /** A unit used this recently is a root whatever its generation: one working day of alternating commands. */
@@ -1088,7 +1091,7 @@ export async function retainCargoWorkspace(
   options: RetentionOptions,
   provider: LockProvider,
 ): Promise<Result<RetentionReport, RetentionError>> {
-  if (options.now !== undefined && !Number.isFinite(options.now.getTime())) {
+  if (!Number.isFinite(options.now)) {
     return {
       ok: false,
       error: {
@@ -1107,7 +1110,7 @@ export async function retainCargoWorkspace(
   const configuration = schedulingConfiguration(workspaceRoot, targetDir, members);
   if (!configuration.ok) return configuration;
   if (options.apply && options.automatic) {
-    const due = nextAutomaticPass(workspaceRoot, targetDir, configuration.value, (options.now ?? new Date()).getTime());
+    const due = nextAutomaticPass(workspaceRoot, targetDir, configuration.value, options.now);
     if (due !== undefined)
       return {
         ok: true,
@@ -1136,12 +1139,7 @@ export async function retainCargoWorkspace(
   try {
     // Another automatic caller may have completed between the first check and our lock acquisition.
     if (options.apply && options.automatic) {
-      const due = nextAutomaticPass(
-        workspaceRoot,
-        targetDir,
-        configuration.value,
-        (options.now ?? new Date()).getTime(),
-      );
+      const due = nextAutomaticPass(workspaceRoot, targetDir, configuration.value, options.now);
       if (due !== undefined) return { ok: true, value: report({ kind: 'not-due', nextDueAt: due }) };
     }
     const result = await passRoots(targetDir, layout.value.profiles, members, options, provider);
@@ -1154,7 +1152,7 @@ export async function retainCargoWorkspace(
       ...(options.apply &&
       result.value.outcome.kind === 'reclaimed' &&
       result.value.nestedRoots.every((nested) => nested.outcome.kind === 'reclaimed')
-        ? { completed: { at: (options.now ?? new Date()).getTime(), configuration: configuration.value } }
+        ? { completed: { at: options.now, configuration: configuration.value } }
         : {}),
     };
     if (options.apply) {
@@ -1288,7 +1286,7 @@ async function pass(
     selection =
       nested && metas.length > 0 && !metas.some((meta) => members.has(meta.pkg))
         ? { reclaim: [], kept: [{ path: targetDir, reason: 'foreign-root', detail: 'no unit of a workspace member' }] }
-        : select(metas, members, (options.now ?? new Date()).getTime());
+        : select(metas, members, options.now);
     performance.measure('cargoRetention:select', { start: selectionStarted });
     if (options.apply) {
       for (const profile of ownedProfiles) {

@@ -6,15 +6,18 @@ import type { LockProvider } from './locks.js';
 // attempt). 1: no pass ran. 2: usage.
 const USAGE = 'usage: smoo-nx-cargo-retain [--apply] [cargo-workspace-dir]';
 
-/** The CLI with its locks taken by `locks`; the entries differ only in which provider they pass. Returns the exit code. */
-export async function runCli(args: readonly string[], locks: LockProvider): Promise<number> {
+/**
+ * The CLI with its locks taken by `locks` and its pass dated `now`, in milliseconds since the epoch. The entries differ
+ * only in the provider they pass; each reads the clock once. Returns the exit code.
+ */
+export async function runCli(args: readonly string[], locks: LockProvider, now: number): Promise<number> {
   const apply = args[0] === '--apply';
   const operands = apply ? args.slice(1) : args;
   if (operands.length > 1 || operands.some((operand) => operand.startsWith('-'))) {
     process.stderr.write(`${USAGE}\n`);
     return 2;
   }
-  const result = await retainCargoWorkspace(operands[0] ?? process.cwd(), { apply }, locks);
+  const result = await retainCargoWorkspace(operands[0] ?? process.cwd(), { apply, now }, locks);
   if (!result.ok) {
     process.stderr.write(`smoo-nx-cargo-retain: ${describeRetentionError(result.error)}\n`);
     return 1;

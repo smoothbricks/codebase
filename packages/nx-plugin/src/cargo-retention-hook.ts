@@ -71,7 +71,7 @@ export async function postTasksExecution(_options: unknown, context: PostTasksEx
     const cpu = process.cpuUsage();
     let result: Result<RetentionReport, RetentionError>;
     try {
-      result = await retainCargoWorkspace(root, { apply: true, automatic: true }, nodeLocks);
+      result = await retainCargoWorkspace(root, { apply: true, automatic: true, now: Date.now() }, nodeLocks);
     } catch (error) {
       // Maintenance never fails the run it follows: say what escaped, then go on to the next workspace.
       const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
