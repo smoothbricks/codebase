@@ -1044,10 +1044,15 @@ job never starts a daemon: every job, sandboxed or host gate, gets `NX_DAEMON_ST
 passes. Under it the patched Nx client uses the daemon the record names while that process runs, otherwise runs the
 command without one. When its daemon stops under it, the client never starts one: a request in flight resumes on a
 successor that comes up within Nx's reconnect wait, and otherwise every remaining request of the command, the rest of a
-task run included, continues in the client's own process. A daemon a job started would belong to that job's process tree
-and end with the job, while clients of other jobs still used it through the shared record. A host shell's client, which
-has no such variable, that cannot reach the socket starts a daemon of its own, which overwrites the record and so
-retires the daemon it replaced (pinned Nx 23.2.1, `daemon/client/client.js` and `daemon/server/server.js`).
+task run included, continues in the client's own process. One stop admits neither: a daemon that stops because a plugin
+linked from outside the checkout changed its bytes (`LINKED_PLUGIN_CHANGED`) first tells each command it serves so, and
+that command fails at once naming the change. A successor and the client's own process would both load the changed
+plugin, so the rest of the run would be keyed by a graph it was not planned by (`patches/README.md`, "A lost daemon ends
+the command"). A daemon a job started would belong to that job's process tree and end with the job, while clients of
+other jobs still used it through the shared record. A host shell's client, which has no such variable, that cannot reach
+the socket starts a daemon of its own, which overwrites the record and so retires the daemon it replaced; one whose
+daemon is lost under a request, with no successor within the wait, fails that request and every later one of the command
+at once (pinned Nx 23.2.1, `daemon/client/client.js` and `daemon/server/server.js`).
 
 One escape exists, for tests only: a test whose subject is a daemon's retirement must be able to create what it retires.
 A fixture `nx` spawned with the named `FIXTURE_STARTS_ITS_OWN_DAEMON` option

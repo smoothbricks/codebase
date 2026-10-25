@@ -384,7 +384,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..6b982fae848cc82a310eee9a1036be1a
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f63580178c9ab471 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb6564074a011 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -395,7 +395,16 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const tmp_dir_1 = require("../tmp-dir");
  const sandbox_socket_hint_1 = require("../sandbox-socket-hint");
-@@ -135,12 +134,55 @@ class DaemonClient {
+@@ -92,6 +91,8 @@ class DaemonClient {
+         this.projectGraphListenerFramingFailures = 0;
+         this.projectGraphListenerCallbacks = new Map();
+         this.envReflectionSent = false;
++        /** The error that ended this process's use of the daemon (`loseDaemon`); null while it has one. */
++        this.lostDaemon = null;
+         try {
+             this.nxJson = (0, configuration_1.readNxJson)();
+         }
+@@ -135,12 +136,55 @@ class DaemonClient {
                  });
                  this._enabled = false;
              }
@@ -451,7 +460,31 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
      reset() {
          this.socketMessenger?.close();
          this.socketMessenger = null;
-@@ -668,27 +710,6 @@ class DaemonClient {
+@@ -157,6 +201,23 @@ class DaemonClient {
+         this._daemonStatus = DaemonStatus.DISCONNECTED;
+         this._waitForDaemonReady = new Promise((resolve) => (this._daemonReady = resolve));
+     }
++    /**
++     * Ends this process's use of the daemon with `error`: the request waiting on
++     * it, every request parked on a reconnect (`startDaemonIfNecessary`), and
++     * every later request fail with it at once. Stock 23.2.1 left a failed
++     * reconnect CONNECTING with its ready signal never given, so every later
++     * request waited for good: a land gate's run sat 2 h 48 min with no task
++     * running after its daemon's SIGTERM (pid 23683, 2026-10-25). Under
++     * NX_DAEMON_START=never a lost connection arrives tagged
++     * `daemonStartForbidden`, and `orWithoutDaemon` continues each request in
++     * this process; a `daemonGraphChanged` error never continues anywhere.
++     */
++    loseDaemon(error) {
++        this.lostDaemon = error;
++        this._daemonStatus = DaemonStatus.DISCONNECTED;
++        this.currentReject?.(error);
++        this._daemonReady();
++    }
+     getSocketPath() {
+         const daemonProcessJson = (0, cache_1.readDaemonProcessJsonCache)();
+         if (daemonProcessJson?.socketPath) {
+@@ -668,27 +729,6 @@ class DaemonClient {
          };
          return this.sendToDaemonViaQueue(message);
      }
@@ -479,7 +512,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
-@@ -813,8 +834,15 @@ class DaemonClient {
+@@ -813,8 +853,15 @@ class DaemonClient {
                  }
              }
              if (!probe.available) {
@@ -497,7 +530,16 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
              }
              this.setUpConnection();
              this._daemonStatus = DaemonStatus.CONNECTED;
-@@ -831,13 +859,29 @@ class DaemonClient {
+@@ -825,19 +872,38 @@ class DaemonClient {
+         }
+         else if (this._daemonStatus == DaemonStatus.CONNECTING) {
+             await this._waitForDaemonReady;
++            if (this.lostDaemon) {
++                throw this.lostDaemon;
++            }
+             const daemonPid = (0, cache_1.getDaemonProcessIdSync)();
+             // Fire-and-forget - don't block daemon connection by waiting for metrics registration
+             this.registerDaemonProcessWithMetricsService(daemonPid);
          }
      }
      async sendToDaemonViaQueue(messageToDaemon, parser) {
@@ -534,7 +576,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
      }
      setUpConnection() {
          const socketPath = this.getSocketPath();
-@@ -846,7 +890,13 @@ class DaemonClient {
+@@ -846,7 +912,13 @@ class DaemonClient {
          // sendMessageToDaemon method uses a keep-alive setTimeout to
          // explicitly hold the event loop open while awaiting a response.
          socket.unref();
@@ -549,7 +591,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
              // it's ok for the daemon to terminate if the client doesn't wait on
              // any messages from the daemon
              if (this.queue.isEmpty()) {
-@@ -892,6 +942,12 @@ class DaemonClient {
+@@ -892,12 +964,22 @@ class DaemonClient {
              else {
                  error = daemonProcessException(err.toString());
              }
@@ -562,16 +604,66 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
              this.currentReject(error);
              this.socketMessenger?.close();
          });
-@@ -936,7 +992,7 @@ class DaemonClient {
-         else {
-             // Failed to reconnect after all attempts, reject the pending request
-             if (this.currentReject) {
--                this.currentReject(error);
-+                this.currentReject(process.env.NX_DAEMON_START === 'never' ? daemonStartForbidden() : error);
+     }
+     async handleConnectionError(error) {
+         logger_1.clientLogger.log(`[Reconnect] Connection error detected: ${error.message}`);
++        if (this.lostDaemon) {
++            // The daemon said why it stopped first (`loseDaemon`): nothing to wait for.
++            return;
++        }
+         // Create a new ready promise for new requests to wait on
+         this._waitForDaemonReady = new Promise((resolve) => (this._daemonReady = resolve));
+         // Set status to CONNECTING so new requests will wait for reconnection
+@@ -911,9 +993,7 @@ class DaemonClient {
+         catch (err) {
+             if (err instanceof daemon_socket_messenger_1.VersionMismatchError) {
+                 // New daemon has different version - reject with error so caller can handle
+-                if (this.currentReject) {
+-                    this.currentReject(err);
+-                }
++                this.loseDaemon(err);
+                 return;
+             }
+             throw err;
+@@ -934,10 +1014,8 @@ class DaemonClient {
              }
          }
+         else {
+-            // Failed to reconnect after all attempts, reject the pending request
+-            if (this.currentReject) {
+-                this.currentReject(error);
+-            }
++            // No daemon took over within the wait: this request and every later one fail.
++            this.loseDaemon(process.env.NX_DAEMON_START === 'never' ? daemonStartForbidden(error) : error);
+         }
      }
-@@ -1132,8 +1188,11 @@ class DaemonClient {
+     establishConnection() {
+@@ -998,6 +1076,9 @@ class DaemonClient {
+         return { available: false, refusal };
+     }
+     async sendMessageToDaemon(message, force) {
++        if (this.lostDaemon) {
++            throw this.lostDaemon;
++        }
+         // the first message sent to the daemon includes an env prop
+         // that updates the process.env values on the daemon.
+         if (!this.envReflectionSent && !global.NX_PLUGIN_WORKER) {
+@@ -1055,7 +1136,13 @@ class DaemonClient {
+                 console[parsedResult.level](parsedResult.message);
+                 return;
+             }
+-            if (parsedResult.error) {
++            if (parsedResult.error?.daemonGraphChanged) {
++                // The daemon is stopping because the code that computed this
++                // command's graph changed; it says so to every command it serves,
++                // idle or waiting, before it closes their connections.
++                this.loseDaemon(parsedResult.error);
++            }
++            else if (parsedResult.error) {
+                 this.currentReject(parsedResult.error);
+             }
+             else {
+@@ -1132,8 +1219,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -585,7 +677,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1161,19 +1220,31 @@ class DaemonClient {
+@@ -1161,19 +1251,31 @@ class DaemonClient {
              ].join('\n'));
          }
      }
@@ -627,7 +719,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
              }
          }
          (0, tmp_dir_1.removeSocketDir)();
-@@ -1200,6 +1271,26 @@ function isDocker() {
+@@ -1200,6 +1302,26 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
@@ -654,7 +746,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..00c0ae10e3a5741a53a40a53f6358017
  /**
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
-@@ -1226,6 +1317,21 @@ function daemonPermissionException(socketPath, cause) {
+@@ -1226,6 +1348,21 @@ function daemonPermissionException(socketPath, cause) {
      error.daemonPermissionError = true;
      return error;
  }
@@ -1212,10 +1304,10 @@ index 0000000000000000000000000000000000000000..3c6c7182b7f5cf29f8f6912e000d4611
 +export declare function stopDaemonForStoppedWatcher(reason: string): void;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..eb5d71551fec8e2a70dd190fb70349c22ba24cd3
+index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db33149567e
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.js
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,325 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.relativeServerProcess = exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = void 0;
@@ -1415,10 +1507,12 @@ index 0000000000000000000000000000000000000000..eb5d71551fec8e2a70dd190fb70349c2
 +    }
 +    return census;
 +}
++// The first linked plugin file whose bytes moved since the baseline, described;
++// null when none did.
 +function linkedPluginsChanged() {
-+    if (linkedPluginFiles === undefined) return false;
++    if (linkedPluginFiles === undefined) return null;
 +    const roots = linkedPluginRoots();
-+    if (roots === null) return false;
++    if (roots === null) return null;
 +    const rootKey = JSON.stringify(roots);
 +    const now = Date.now();
 +    const full = rootKey !== linkedPluginRootKey || now - linkedPluginCensusAt >= exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS;
@@ -1438,9 +1532,8 @@ index 0000000000000000000000000000000000000000..eb5d71551fec8e2a70dd190fb70349c2
 +        if (!files.has(key)) change ??= `${path} disappeared`;
 +    }
 +    linkedPluginFiles = files;
-+    if (change === null) return false;
-+    logger_1.serverLogger.log(`[Server] linked plugin file ${change}`);
-+    return true;
++    if (change !== null) logger_1.serverLogger.log(`[Server] linked plugin file ${change}`);
++    return change;
 +}
 +// Applied paths have been hashed by the native workspace context; same-byte
 +// rewrites were dropped already. No lockfile is read on this watcher path.
@@ -1495,8 +1588,16 @@ index 0000000000000000000000000000000000000000..eb5d71551fec8e2a70dd190fb70349c2
 +        restartDaemon('LOCK_FILES_CHANGED');
 +        return true;
 +    }
-+    if (linkedPluginsChanged()) {
-+        restartDaemon('LINKED_PLUGIN_CHANGED');
++    const change = linkedPluginsChanged();
++    if (change !== null) {
++        // Every graph this daemon served, and so every task a connected command
++        // planned and keyed by it, came from the plugin code before the change. A
++        // successor, or the command's own process, would load the new code, so no
++        // command resumes: each is told why and fails (DaemonClient.loseDaemon).
++        const reason = `LINKED_PLUGIN_CHANGED (linked plugin file ${change})`;
++        const notice = new Error(`The Nx daemon (pid ${process.pid}) stopped: ${reason}. This command's project graph and task hashes came from the plugin before that change; run it again.`);
++        notice.daemonGraphChanged = true;
++        restartDaemon('LINKED_PLUGIN_CHANGED', notice);
 +        return true;
 +    }
 +    return false;
@@ -1504,10 +1605,10 @@ index 0000000000000000000000000000000000000000..eb5d71551fec8e2a70dd190fb70349c2
 +function isReplaced() {
 +    return (0, cache_1.getDaemonProcessIdSync)() !== process.pid;
 +}
-+function stopDaemon(reason) {
++function stopDaemon(reason, notice) {
 +    if (!daemon || terminating) return;
 +    terminating = true;
-+    (0, shutdown_utils_1.handleServerProcessTermination)({ server: daemon.server, reason, sockets: daemon.sockets });
++    (0, shutdown_utils_1.handleServerProcessTermination)({ server: daemon.server, reason, sockets: daemon.sockets, notice });
 +}
 +// A file watcher that stopped delivering leaves the daemon blind to every
 +// later change, so it stops rather than restarts: a successor it spawned
@@ -1517,19 +1618,20 @@ index 0000000000000000000000000000000000000000..eb5d71551fec8e2a70dd190fb70349c2
 +    logger_1.serverLogger.watcherLog(reason);
 +    stopDaemon(reason);
 +}
-+function restartDaemon(reason) {
++// `notice`, when given, is the error each connected command fails with.
++function restartDaemon(reason, notice) {
 +    if (!daemon || terminating) return;
 +    logger_1.serverLogger.log(`[Server] Daemon outdated: ${reason}`);
 +    if (keptByLauncher) {
 +        logger_1.serverLogger.log('[Server] Stopping: the process that started this daemon (--kept) starts its successor');
-+        stopDaemon(reason);
++        stopDaemon(reason, notice);
 +        return;
 +    }
 +    // Do not spawn multiple replacements or answer queued requests while the
 +    // asynchronous restart releases ownership and starts the successor.
 +    terminating = true;
 +    logger_1.serverLogger.log('[Server] Restarting daemon...');
-+    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets });
++    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets, notice });
 +}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
 index b1c143e244efd435b28642ed86e999d6c86f7d94..0ea9c84c3dced043459bfb15d5d44a72882a1fb1 100644
@@ -1882,7 +1984,7 @@ index 698fcf9e061b8e0b37057a6318614dbe6d290b9e..832d848841cb8a0f761750e24ecfb84a
  export declare function respondToClient(socket: Socket, response: Buffer, description: string): Promise<unknown>;
  /**
 diff --git a/dist/src/daemon/server/shutdown-utils.js b/dist/src/daemon/server/shutdown-utils.js
-index a449f2fb3c864bc9d3d710078418c8a05879aa84..c398f4ecdbe359201063b3fa4271e07147ccd2ee 100644
+index a449f2fb3c864bc9d3d710078418c8a05879aa84..83e23bb1aec2f5f3af3e886d8df3b24be678bf68 100644
 --- a/dist/src/daemon/server/shutdown-utils.js
 +++ b/dist/src/daemon/server/shutdown-utils.js
 @@ -3,14 +3,13 @@ Object.defineProperty(exports, "__esModule", { value: true });
@@ -1956,7 +2058,7 @@ index a449f2fb3c864bc9d3d710078418c8a05879aa84..c398f4ecdbe359201063b3fa4271e071
      backgroundProcess.unref();
      logger_1.serverLogger.log('Started new daemon process in background');
  }
-@@ -68,13 +78,6 @@ function storeWatcherInstance(instance) {
+@@ -68,40 +78,68 @@ function storeWatcherInstance(instance) {
  function getWatcherInstance() {
      return watcherInstance;
  }
@@ -1966,23 +2068,53 @@ index a449f2fb3c864bc9d3d710078418c8a05879aa84..c398f4ecdbe359201063b3fa4271e071
 -}
 -function getOutputWatcherInstance() {
 -    return outputWatcherInstance;
++async function handleServerProcessTermination({ server, reason, sockets, notice, }) {
++    await performShutdown(server, reason, sockets, notice);
+ }
+-async function handleServerProcessTermination({ server, reason, sockets, }) {
+-    await performShutdown(server, reason, sockets);
 -}
- async function handleServerProcessTermination({ server, reason, sockets, }) {
-     await performShutdown(server, reason, sockets);
- }
-@@ -85,23 +88,35 @@ async function handleServerProcessTerminationWithRestart({ server, reason, socke
+-async function handleServerProcessTerminationWithRestart({ server, reason, sockets, }) {
++async function handleServerProcessTerminationWithRestart({ server, reason, sockets, notice, }) {
+     // Clean up old daemon cache before starting new instance
+     (0, cache_1.deleteDaemonJsonProcessCache)();
+     // Start new daemon before shutting down
      await startNewDaemonInBackground();
-     await performShutdown(server, reason, sockets);
- }
--async function performShutdown(server, reason, sockets) {
+-    await performShutdown(server, reason, sockets);
++    await performShutdown(server, reason, sockets, notice);
++}
 +/** The shutdown under way: each later reason to stop joins it. */
 +let shutdown;
-+function performShutdown(server, reason, sockets) {
-+    shutdown ??= shutDown(server, reason, sockets);
++function performShutdown(server, reason, sockets, notice) {
++    shutdown ??= shutDown(server, reason, sockets, notice);
 +    return shutdown;
+ }
+-async function performShutdown(server, reason, sockets) {
++/**
++ * Answers every connection a command holds with `notice` before the daemon
++ * closes it, so the request waiting on it and every later one of that command
++ * fail with the reason. A file-watcher or project-graph-listener stream is left
++ * out: its client follows the successor and sees the change there. Both
++ * registries import server.js, which starts a daemon when imported anywhere
++ * else, so they are required here, in a stopping daemon.
++ */
++async function noticeCommands(sockets, notice) {
++    const { registeredFileWatcherSockets } = require('./file-watching/file-watcher-sockets');
++    const { registeredProjectGraphListenerSockets } = require('./project-graph-listener-sockets');
++    const streams = new Set([
++        ...registeredFileWatcherSockets.map(({ socket }) => socket),
++        ...registeredProjectGraphListenerSockets,
++    ]);
++    const commands = [...sockets].filter((socket) => !streams.has(socket));
++    logger_1.serverLogger.log(`Telling ${commands.length} command connection(s): ${notice.message}`);
++    const response = Buffer.from((0, socket_utils_1.serializeResult)(notice, null, null), 'utf8');
++    await Promise.all(commands.map((socket) => respondToClient(socket, response, null)));
 +}
-+async function shutDown(server, reason, sockets) {
++async function shutDown(server, reason, sockets, notice) {
      try {
++        if (notice !== undefined) {
++            await noticeCommands(sockets, notice);
++        }
 +        // Closing a listening Unix socket unlinks its path. Once another daemon
 +        // has bound that path, the path is that daemon's socket, and closing this
 +        // server would cut every client off from it. Such a server is left to end

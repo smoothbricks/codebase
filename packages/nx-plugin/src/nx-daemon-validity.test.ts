@@ -1,5 +1,7 @@
 import { expect, it } from 'bun:test';
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { chmodSync, existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createConnection, createServer } from 'node:net';
@@ -39,6 +41,8 @@ const LOCKFILES = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock
 const FIXTURE_WORKSPACE = 'workspace';
 /** The idle observation window, longer than the 5 s safety poll so one poll would fall inside it. */
 const OBSERVATION_MS = 6_000;
+/** How long a client waits for its daemon's successor: `WAIT_FOR_SERVER_CONFIG` in `daemon/client/client.js`. */
+const RECONNECT_WINDOW_MS = 60_000;
 
 interface DaemonRecord {
   readonly processId: number;
@@ -228,6 +232,30 @@ async function fixtureWorkspace(workspace: string, nxPackage?: string): Promise<
   await writeFile(join(workspace, 'p', 'project.json'), '{"name":"p"}\n');
 }
 
+/** A linked plugin's entry: it infers nothing, and `version` alone sets its bytes. */
+function pluginInference(version: string): string {
+  return `// inference ${version}\nmodule.exports = { name: 'linked-plugin', createNodesV2: ['**/never.json', () => []] };\n`;
+}
+
+interface LinkedPluginCheckout {
+  readonly plugin: string;
+  readonly entry: string;
+  readonly lock: string;
+}
+
+/** A developer link's target: the plugin is a package of another checkout, which has its own lockfile. */
+async function linkedPluginCheckout(root: string, name: string): Promise<LinkedPluginCheckout> {
+  const plugin = join(root, name, 'plugin');
+  await mkdir(join(plugin, 'dist'), { recursive: true });
+  await writeFile(join(root, name, 'bun.lock'), 'checkout lock one\n');
+  await writeFile(
+    join(plugin, 'package.json'),
+    JSON.stringify({ name: 'linked-plugin', version: '1.0.0', main: 'dist/index.js', files: ['dist'] }),
+  );
+  await writeFile(join(plugin, 'dist', 'index.js'), pluginInference('one'));
+  return { plugin, entry: join(plugin, 'dist', 'index.js'), lock: join(root, name, 'bun.lock') };
+}
+
 async function processEntry(pid: number): Promise<ProcessEntry> {
   const entry = (await processTable()).find((candidate) => candidate.pid === pid);
   if (entry === undefined) throw new Error(`process ${pid} is not in the process table`);
@@ -396,6 +424,47 @@ async function startDaemon(workspace: string, env: Record<string, string>): Prom
   const record = await daemonRecord(workspace);
   if (record === null) throw new Error('nx daemon --start left no daemon record');
   return readyDaemon(workspace, record);
+}
+
+interface KeptDaemon {
+  readonly daemon: Daemon;
+  /** Everything the daemon printed so far: it logs to its own stdout in the foreground. */
+  log(): string;
+  readonly exited: Promise<number | null>;
+  /** Terminate the daemon unless it has exited, and await its exit. */
+  stop(): Promise<void>;
+}
+
+/** A daemon as cowshed's keeper job starts it: the daemon's own entry in the foreground, kept. */
+async function startKeptDaemon(workspace: string, env: Record<string, string>): Promise<KeptDaemon> {
+  const kept = spawn('node', [daemonStart, '--kept'], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let log = '';
+  const append = (text: string): void => {
+    log += text;
+  };
+  kept.stdout.setEncoding('utf8').on('data', append);
+  kept.stderr.setEncoding('utf8').on('data', append);
+  const exited = Promise.withResolvers<number | null>();
+  kept.once('exit', (code) => exited.resolve(code));
+  const stop = async (): Promise<void> => {
+    if (kept.exitCode === null && kept.signalCode === null && kept.pid !== undefined) terminate(kept.pid);
+    await exited.promise;
+  };
+  try {
+    const record = await watchUntil(
+      dirname(recordPath(workspace)),
+      'the kept daemon to write its record',
+      async () => {
+        const current = await daemonRecord(workspace);
+        return current !== null && current.processId === kept.pid ? current : null;
+      },
+      async () => {},
+    );
+    return { daemon: await readyDaemon(workspace, record), log: () => log, exited: exited.promise, stop };
+  } catch (error) {
+    await stop();
+    throw error;
+  }
 }
 
 /**
@@ -719,44 +788,23 @@ it('stops a kept daemon on a lockfile change instead of spawning a successor its
       await fixtureWorkspace(workspace);
       const lock = join(workspace, 'yarn.lock');
       await writeFile(lock, 'lock one\n');
-      const env = fixtureNxEnv(workspace, socketDirectory);
-      // As cowshed's keeper job starts it: the daemon's own entry in the foreground, kept.
-      const kept = spawn('node', [daemonStart, '--kept'], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'] });
-      let log = '';
-      kept.stdout.setEncoding('utf8').on('data', (text: string) => {
-        log += text;
-      });
-      kept.stderr.setEncoding('utf8').on('data', (text: string) => {
-        log += text;
-      });
-      const exited = Promise.withResolvers<number | null>();
-      kept.once('exit', (code) => exited.resolve(code));
+      const kept = await startKeptDaemon(workspace, fixtureNxEnv(workspace, socketDirectory));
       try {
-        const record = await watchUntil(
-          dirname(recordPath(workspace)),
-          'the kept daemon to write its record',
-          async () => {
-            const current = await daemonRecord(workspace);
-            return current !== null && current.processId === kept.pid ? current : null;
-          },
-          async () => {},
-        );
-        const daemon = await readyDaemon(workspace, record);
         await writeFile(lock, 'lock two\n');
         assertNotServed(
-          await requestOnce(daemon.record.socketPath, ping(workspace), 'a PING sent after the lockfile changed'),
+          await requestOnce(kept.daemon.record.socketPath, ping(workspace), 'a PING sent after the lockfile changed'),
           'a PING sent to the kept daemon after the lockfile changed',
         );
-        await guardEvent(exited.promise, 'the kept daemon to exit after the lockfile changed', () => log);
+        await guardEvent(kept.exited, 'the kept daemon to exit after the lockfile changed', kept.log);
         // The decision is in the daemon's own log, written before it exits: it stopped, and started nothing.
+        const log = kept.log();
         expect(log, 'the kept daemon did not say it left its successor to its keeper').toContain(
           'Stopping: the process that started this daemon (--kept) starts its successor',
         );
         expect(log, 'the kept daemon spawned a successor of its own').not.toContain('Restarting daemon');
         expect(log, 'the kept daemon spawned a successor of its own').not.toContain('Started new daemon process');
       } finally {
-        if (kept.exitCode === null && kept.signalCode === null && kept.pid !== undefined) terminate(kept.pid);
-        await exited.promise;
+        await kept.stop();
       }
     },
     FIXTURE_WORKSPACE,
@@ -946,22 +994,8 @@ it('restarts a daemon once a plugin linked from outside the workspace changes it
   await withNxFixture(
     'nx-daemon-validity-plugin-',
     async ({ root, socketDirectory, workspace }) => {
-      const inference = (version: string) =>
-        `// inference ${version}\nmodule.exports = { name: 'linked-plugin', createNodesV2: ['**/never.json', () => []] };\n`;
-      // A developer link: the plugin is a package of another checkout, which has its own lockfile.
-      const checkout = async (name: string) => {
-        const plugin = join(root, name, 'plugin');
-        await mkdir(join(plugin, 'dist'), { recursive: true });
-        await writeFile(join(root, name, 'bun.lock'), 'checkout lock one\n');
-        await writeFile(
-          join(plugin, 'package.json'),
-          JSON.stringify({ name: 'linked-plugin', version: '1.0.0', main: 'dist/index.js', files: ['dist'] }),
-        );
-        await writeFile(join(plugin, 'dist', 'index.js'), inference('one'));
-        return { plugin, entry: join(plugin, 'dist', 'index.js'), lock: join(root, name, 'bun.lock') };
-      };
-      const first = await checkout('checkout-a');
-      const copy = await checkout('checkout-b');
+      const first = await linkedPluginCheckout(root, 'checkout-a');
+      const copy = await linkedPluginCheckout(root, 'checkout-b');
       const link = join(workspace, 'node_modules', 'linked-plugin');
       const relink = async (target: string) => {
         await unlink(link);
@@ -991,11 +1025,11 @@ it('restarts a daemon once a plugin linked from outside the workspace changes it
         );
       };
       let daemon = await startDaemon(workspace, env);
-      await writeFile(first.entry, inference('one'));
+      await writeFile(first.entry, pluginInference('one'));
       await serves(daemon, 'a same-bytes rewrite of the linked plugin');
       await relink(copy.plugin);
       await serves(daemon, 'the link moving to a copy with the same bytes');
-      await writeFile(copy.entry, inference('two'));
+      await writeFile(copy.entry, pluginInference('two'));
       daemon = await replaced(daemon, 'the linked plugin changing in place');
       await relink(first.plugin);
       daemon = await replaced(daemon, 'the link moving to a plugin with other bytes');
@@ -1045,6 +1079,178 @@ it('keeps an idle daemon off the lockfiles, record, and socket between its safet
         expect(isRunning(daemon.record.processId), 'the idle daemon stopped').toBe(true);
       } finally {
         await stopChild(daemonProcess);
+      }
+    },
+    FIXTURE_WORKSPACE,
+  );
+});
+
+/**
+ * The code that computed a run's project graph is the code its tasks were planned and keyed by. A plugin linked from
+ * another checkout that changes under the run (a land there rebuilds it mid-gate) leaves the run's remaining requests
+ * no daemon that computes that graph: a successor loads the new plugin, and so would the client's own process. The run
+ * fails at once, naming the change, from a daemon that restarts itself and from a kept one whose keeper is not running.
+ */
+it('fails a run at once, naming LINKED_PLUGIN_CHANGED, when its linked plugin changes under it, on a restarting daemon and on a kept one', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-plugin-run-',
+    async ({ root, socketDirectory, workspace }) => {
+      const linked = await linkedPluginCheckout(root, 'checkout');
+      await fixtureWorkspace(workspace, join(repositoryRoot, 'node_modules', 'nx'));
+      await symlink(linked.plugin, join(workspace, 'node_modules', 'linked-plugin'), 'dir');
+      await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['linked-plugin'] }));
+      await mkdir(join(workspace, 'q'));
+      await writeFile(
+        join(workspace, 'q', 'project.json'),
+        JSON.stringify({
+          name: 'q',
+          implicitDependencies: ['p'],
+          targets: {
+            build: {
+              command: 'mkdir -p q/dist && echo q > q/dist/q.txt',
+              outputs: ['{projectRoot}/dist/'],
+              dependsOn: ['^build'],
+              cache: true,
+            },
+          },
+        }),
+      );
+      const env = fixtureNxEnv(workspace, socketDirectory);
+      // `p:build` rebuilds the linked plugin with other bytes. Each step's bytes differ, so its command does, and the
+      // task misses the cache. The run's next daemon request, recording p's outputs or hashing q, finds the change.
+      const failsNamingTheChange = async (title: string, version: string, client: Record<string, string>) => {
+        const rebuilt = join(root, `inference-${version}.js`);
+        await writeFile(rebuilt, pluginInference(version));
+        await writeFile(
+          join(workspace, 'p', 'project.json'),
+          JSON.stringify({ name: 'p', targets: { build: { command: `cp ${rebuilt} ${linked.entry}`, cache: true } } }),
+        );
+        await rm(join(workspace, 'q', 'dist'), { recursive: true, force: true });
+        // Half the client's wait for a successor: a run that waits for one at all overruns it.
+        const run = spawnSync('bun', [nxEntry, 'run-many', '-t', 'build', '--outputStyle=static'], {
+          cwd: workspace,
+          env: { ...env, ...client, NX_DAEMON: 'true' },
+          encoding: 'utf8',
+          timeout: RECONNECT_WINDOW_MS / 2,
+        });
+        const printed = `${run.stdout}${run.stderr}`;
+        expect(run.signal, `${title}: still running after ${RECONNECT_WINDOW_MS / 2} ms:\n${printed}`).toBeNull();
+        // The premise: the daemon served the run until the change. A daemon that stopped before it (its watcher probe
+        // not coming back, say) leaves a daemonless run, which nothing here guards.
+        expect(printed, `${title}: the run went on without the daemon before the change`).not.toContain(
+          'Continuing without the daemon',
+        );
+        expect(run.status, `${title}: the run succeeded across a plugin change:\n${printed}`).not.toBe(0);
+        expect(printed, `${title}: the failure does not name the change`).toMatch(
+          /The Nx daemon \(pid \d+\) stopped: LINKED_PLUGIN_CHANGED \(linked plugin file \S+index\.js changed\)/,
+        );
+        expect(existsSync(join(workspace, 'q', 'dist', 'q.txt')), `${title}: q:build ran:\n${printed}`).toBe(false);
+      };
+      // A daemon a client started restarts itself, and a host shell's client (no NX_DAEMON_START) could resume on it.
+      await startDaemon(workspace, env);
+      await failsNamingTheChange('a self-restarting daemon under a host client', 'two', {});
+      nx(workspace, env, 'daemon', '--stop');
+      // A kept daemon stops for its keeper to start the successor; the client is a cowshed job's.
+      const kept = await startKeptDaemon(workspace, env);
+      try {
+        await failsNamingTheChange('a kept daemon under a job client', 'three', { NX_DAEMON_START: 'never' });
+        await guardEvent(kept.exited, 'the kept daemon to exit after its linked plugin changed', kept.log);
+        expect(kept.log(), 'the kept daemon stopped for another reason').toContain(
+          'Daemon outdated: LINKED_PLUGIN_CHANGED',
+        );
+      } finally {
+        await kept.stop();
+      }
+    },
+    FIXTURE_WORKSPACE,
+  );
+});
+
+/**
+ * A client of the installed daemon client that asks three times, one request after the other, and says how each ended.
+ * Which request the stop meets first (a write that fails with EPIPE, or one sent before the client saw the close) is a
+ * race; the request after the failed reconnect is the one pid 23683 waited on for good.
+ */
+const ASK_THRICE = `
+const { writeSync } = require('node:fs');
+const { daemonClient } = require(process.env.NX_DAEMON_CLIENT);
+const say = (...fields) => writeSync(1, fields.join('\\t') + '\\n');
+const ask = (what) =>
+  daemonClient.glob(['*.json'], []).then(
+    () => say('asked', what, 'answered'),
+    (error) => say('asked', what, 'failed', String(error?.message ?? error).split('\\n')[0]),
+  );
+ask(1).then(() => ask(2)).then(() => ask(3)).then(() => process.exit(0));
+`;
+
+/**
+ * pid 23683, a consumer's land gate (2026-10-25): its daemon was stopped (SIGTERM) under a request, and nothing started
+ * a successor. The request failed once the client's wait for one ran out, but the client stayed connecting, so every
+ * later request waited for a reconnect that had already failed, and the run sat for hours with no task running.
+ */
+it('fails every later request at once once the daemon is lost under a request and no successor answers', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-lost-',
+    async ({ socketDirectory, workspace }) => {
+      await fixtureWorkspace(workspace);
+      // Where the fixture's own daemon would bind: the job profile admits Unix sockets by literal path.
+      const socketPath = join(socketDirectory, 'd.sock');
+      await mkdir(socketDirectory, { recursive: true });
+      // Stands in for a daemon stopped under the client's first request: it ends that request's connection and closes
+      // its socket. What binds the path next refuses the client (EACCES), which ends the client's wait for a successor
+      // at once rather than after its 60 s.
+      const listening = Promise.withResolvers<void>();
+      const refused = Promise.withResolvers<void>();
+      const refusing = createServer().once('error', refused.reject);
+      const daemon = createServer((socket) => {
+        socket.once('data', () => {
+          daemon.close();
+          socket.destroy();
+          refusing.listen(socketPath, () => {
+            chmodSync(socketPath, 0o000);
+            refused.resolve();
+          });
+        });
+      }).once('error', listening.reject);
+      daemon.listen(socketPath, listening.resolve);
+      await listening.promise;
+      await mkdir(dirname(recordPath(workspace)), { recursive: true });
+      const { version } = await installedManifest();
+      await writeFile(
+        recordPath(workspace),
+        JSON.stringify({ processId: process.pid, socketPath, nxVersion: version }),
+      );
+      try {
+        const client = spawn('node', ['-e', ASK_THRICE], {
+          cwd: workspace,
+          env: { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_DAEMON_CLIENT: daemonClient },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let printed = '';
+        const append = (text: string): void => {
+          printed += text;
+        };
+        client.stdout.setEncoding('utf8').on('data', append);
+        client.stderr.setEncoding('utf8').on('data', append);
+        const [[code]] = await Promise.all([
+          guardEvent(once(client, 'exit'), 'the client that asks three times to exit', () => printed),
+          guardEvent(refused.promise, 'the refusing successor to bind', () => printed),
+        ]);
+        const answers = printed
+          .split('\n')
+          .filter((line) => line.startsWith('asked\t'))
+          .map((line) => line.split('\t').slice(1));
+        expect(
+          answers.map(([request, outcome]) => `${request} ${outcome}`),
+          printed,
+        ).toEqual(['1 failed', '2 failed', '3 failed']);
+        expect(answers[2]?.[2], printed).toBe('Daemon process terminated and closed the connection');
+        expect(code, printed).toBe(0);
+      } finally {
+        // The record names this test process, and the fixture's retirement stops the daemon a record names.
+        await rm(recordPath(workspace), { force: true });
+        refusing.close();
+        daemon.close();
       }
     },
     FIXTURE_WORKSPACE,

@@ -310,9 +310,10 @@ the workspace changes only with its lockfile and is not watched this way.
 
 Each restart (`LOCK_FILES_CHANGED`, `LINKED_PLUGIN_CHANGED`) belongs to the process that started the daemon. A daemon
 started as `start.js --kept`, cowshed's keeper job (`specs/cowshed/04_sandbox.md`), stops instead of spawning its own
-successor, and the keeper's next probe starts one inside its job; Nx clients waiting on it reconnect within their 60 s
-poll and resend. Read once at boot from argv, which no client's environment can rewrite. Any other daemon restarts
-itself as before.
+successor, and the keeper's next probe starts one inside its job; Nx clients waiting on it after a lockfile change
+reconnect within their 60 s poll and resend, while a linked plugin's change ends their commands
+([A lost daemon ends the command](#a-lost-daemon-ends-the-command)). Read once at boot from argv, which no client's
+environment can rewrite. Any other daemon restarts itself as before.
 
 The existing ignore-file content snapshot, watch-before-scan ordering, exclusive daemon claim and five-minute inactivity
 policy remain unchanged. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout
@@ -375,6 +376,39 @@ restarting daemon with the socket its clients were still writing to.
 
 Drop the hunk only when cowshed no longer ends a job's tree around a shared daemon, or upstream Nx has an equivalent
 setting; retain the regression.
+
+## A lost daemon ends the command
+
+A command's project graph, and every task key it computes from it, comes from the plugin code its daemon loaded. When a
+plugin linked from another checkout changes its bytes under a run, the daemon restarts (`LINKED_PLUGIN_CHANGED`, above),
+and its successor, or the client's own process, would load the new code: the rest of the run would be keyed by a graph
+it was not planned by, the "same tree, two keys" defect the restart exists to prevent. That happens in a consumer's land
+gate whenever a land in the plugin's checkout rebuilds it mid-gate. The run cannot keep the plugin it started with,
+since no process still runs that code, so it fails and names the change. Before it stops for that reason, the daemon
+answers every connection a command holds with an error tagged `daemonGraphChanged` that names the daemon's pid,
+`LINKED_PLUGIN_CHANGED` and the changed file, idle connections included. File-watcher and project-graph-listener streams
+are excepted: their clients follow the successor and see the change there. The client fails the request waiting on it
+and every later request of the command at once with that error. This holds under `NX_DAEMON_START=never` as well,
+because a job's in-process continuation would load the changed plugin too. A lockfile restart still resumes on its
+successor.
+
+A daemon can also be lost under a request with nothing to resume on, for example when it is stopped by SIGTERM and no
+keeper or restart starts a successor. The client waits its reconnect window (6000 polls 10 ms apart; a refusal ends the
+wait early) and then fails that request. Stock 23.2.1 left the client `CONNECTING` with its ready signal never given, so
+every later request waited for a reconnect that had already failed. pid 23683, a consumer's land gate on 2026-10-25, sat
+for 2 h 48 min after its daemon's SIGTERM with no task running, while its output-lease helpers kept the process alive.
+`DaemonClient.loseDaemon` now ends this process's use of the daemon in one place. The waiting request, any request
+parked on the reconnect, and every later request fail at once with the loss, including a version mismatch found on
+reconnect. A job's client gets the loss tagged `daemonStartForbidden` and continues in its own process, as the previous
+section specifies; a host shell's client fails.
+
+`nx-daemon-validity.test.ts` runs the installed Nx against a fixture whose plugin is linked from outside it. `p:build`
+rewrites the plugin with other bytes, and `run-many` must exit nonzero, naming `LINKED_PLUGIN_CHANGED`, without building
+`q` and within half the reconnect window. It runs once on a self-restarting daemon under a host client and once on a
+kept daemon, whose keeper is not running, under a job client. Before this hunk the first run built `q` on the new plugin
+and exited 0. A second case stands a socket server in for a daemon that ends the connection of the client's first
+request, then a successor that refuses the client. All three of the client's sequential requests must fail, the third
+with the loss. Before, the request after the failed reconnect never settled, and the client exited with it pending.
 
 ## Package-manager runs keep the daemon's graph
 
