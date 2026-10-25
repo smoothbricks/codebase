@@ -36,6 +36,8 @@ const TASK = 'cowshed:cargo-test-cowshed-core-shard1';
 const CORES = String(spawnSync('sysctl', ['-n', 'hw.ncpu'], { encoding: 'utf8' }).stdout).trim();
 const GATE = ['run-many', '-t', 'gate', `--parallel=${CORES}`, '--nx-bail=false', '--outputStyle=static-failures-only'];
 const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
+/** The build a successful land runs in main, so main's built outputs match the sources it lands. */
+const MAIN_BUILD = ['run-many', '-t', 'build', '--outputStyle=static-failures-only'];
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
 
 /** The task's actual output followed by Nx's final list; repeated entries must be shown only once. */
@@ -277,7 +279,7 @@ describe('land-host.sh', () => {
     expect(judgeHistory(join(land.ws, 'missing'), newMain, oldMain).kind).toBe('unavailable');
 
     // The land rebases, stops the daemon, gates once without bailing, captures directly to one file and replays
-    // exactly its final 64 KiB, then fast-forwards main to exactly the gated commit.
+    // exactly its final 64 KiB, fast-forwards main to exactly the gated commit, then builds main's outputs.
     const gated = git(land.ws, 'rev-parse', 'HEAD');
     const suffix = '\ncapture-suffix\n';
     const run = land.land([
@@ -287,10 +289,12 @@ describe('land-host.sh', () => {
         requireFileOutput: true,
         output: `capture-prefix\n${'x'.repeat(70_000)}${suffix.slice(0, -1)}`,
       },
+      passingRun(MAIN_BUILD),
     ]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('gating');
-    expect(run.nx).toEqual(['daemon --stop', GATE.join(' ')]);
+    expect(run.nx).toEqual(['daemon --stop', GATE.join(' '), MAIN_BUILD.join(' ')]);
+    expect(run.log).toContain("building main's outputs");
     expect(run.log).not.toContain('capture-prefix');
     expect(run.log).toContain('capture-suffix');
     expect(run.log.match(/x{1000,}/)?.[0]?.length).toBe(65_536 - suffix.length);
@@ -365,12 +369,16 @@ describe('land-host.sh', () => {
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 
-  it('rebases and gates again when main moved while it gated, and lands the new gate', () => {
+  it('rebases and gates again when main moved while it gated, lands the new gate, and keeps it when the build fails', () => {
     const land = fixture();
-    const run = land.land([DAEMON_STOP, passingRun(GATE), DAEMON_STOP, passingRun(GATE)], true);
+    const run = land.land(
+      [DAEMON_STOP, passingRun(GATE), DAEMON_STOP, passingRun(GATE), { args: MAIN_BUILD, exit: 1 }],
+      true,
+    );
     expect(run.log).toContain('main moved while the gate ran');
     expect(run.status, run.log).toBe(0);
-    expect(run.nx).toHaveLength(4);
+    expect(run.nx).toHaveLength(5);
+    expect(run.log).toContain("main's build exited 1; the land stands");
     expect(existsSync(join(land.main, 'moved.txt'))).toBe(true);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(git(land.ws, 'rev-parse', 'HEAD'));
   });
