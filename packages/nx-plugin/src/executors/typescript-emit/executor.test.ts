@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { BuildInputRecord } from '../../build-inputs.js';
-import typescriptEmitExecutor, { runTypeScriptEmit } from './executor.js';
+import typescriptEmitExecutor, { type CompilerInvocation, runTypeScriptEmit } from './executor.js';
 
 async function fixture(source: string) {
   const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-'));
@@ -171,6 +171,25 @@ describe('@smoothbricks/nx-plugin TypeScript emit build input record', () => {
     });
   });
 
+  it('writes nothing beside the tsconfig while the compiler runs, and hands ttsc that tsconfig itself', async () => {
+    await inLibWorkspace(async (root) => {
+      const lib = join(root, 'packages/lib');
+      const before = (await readdir(lib)).sort();
+      let during: string[] = [];
+      let invocation: CompilerInvocation | undefined;
+      const observe = async (call: CompilerInvocation) => {
+        invocation = call;
+        during = (await readdir(lib)).sort();
+        return true;
+      };
+      expect(await runTypeScriptEmit({ cwd: lib, tsConfig: 'tsconfig.lib.json' }, { root }, observe)).toEqual({
+        success: true,
+      });
+      // Another project's ttsc transform proves this directory's listing while it compiles.
+      expect(during).toEqual(before);
+      expect(invocation?.args.slice(0, 3)).toEqual(['-p', join(lib, 'tsconfig.lib.json'), '--emit']);
+    });
+  });
   it('writes no record when the compiler fails', async () => {
     await inLibWorkspace(async (root) => {
       const lib = join(root, 'packages/lib');

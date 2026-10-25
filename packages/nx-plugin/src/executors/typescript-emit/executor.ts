@@ -1,8 +1,7 @@
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { realpathSync } from 'node:fs';
-import { chmod, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { readJsonFile } from 'nx/src/devkit-exports.js';
@@ -27,7 +26,6 @@ interface TypeScriptEmitResult {
 }
 
 interface TsConfigJson {
-  references?: unknown;
   include?: unknown;
   exclude?: unknown;
   compilerOptions?: { outDir?: unknown };
@@ -40,6 +38,26 @@ export interface CompilerInvocation {
 }
 
 export type CompilerRunner = (invocation: CompilerInvocation) => Promise<boolean>;
+
+/**
+ * What the emit changes about the project's own options: JavaScript and declarations from one non-incremental program.
+ * They ride the command line onto the project's tsconfig. A synthesized config would have to sit beside that tsconfig,
+ * because `${configDir}` and `paths` anchor to the directory of the config that consumes them, and a transient file there
+ * changes the directory listing a concurrent ttsc transform of another project proves while it compiles; that
+ * transform then refuses with `graph/accessible-entries-changed`.
+ */
+const EMIT_OVERRIDES = [
+  '--composite',
+  'false',
+  '--declaration',
+  'true',
+  '--declarationMap',
+  'true',
+  '--emitDeclarationOnly',
+  'false',
+  '--incremental',
+  'false',
+];
 
 export default function typescriptEmitExecutor(
   options: TypeScriptEmitOptions,
@@ -56,39 +74,22 @@ export async function runTypeScriptEmit(
   const cwd = isAbsolute(options.cwd) ? options.cwd : join(context.root, options.cwd);
   const tsConfigPath = isAbsolute(options.tsConfig) ? options.tsConfig : join(cwd, options.tsConfig);
   const tsConfig = readJsonFile<TsConfigJson>(tsConfigPath);
-  const overlayPath = join(dirname(tsConfigPath), `.ttsc-js-${process.pid}-${randomUUID()}.json`);
-  const overlay = {
-    extends: `./${basename(tsConfigPath)}`,
-    compilerOptions: {
-      composite: false,
-      declaration: true,
-      declarationMap: true,
-      emitDeclarationOnly: false,
-      incremental: false,
-    },
-    ...(Array.isArray(tsConfig.references) ? { references: tsConfig.references } : {}),
-  };
 
   // Taken before the emit, so a source edited while it runs is recorded with its earlier bytes and reads as changed.
   const inputs = typeScriptInputs(tsConfigPath, tsConfig);
-  await writeFile(overlayPath, `${JSON.stringify(overlay, null, 2)}\n`, { flag: 'wx' });
-  try {
-    const javascriptSucceeded = await runner({
-      command: 'ttsc',
-      args: ['-p', overlayPath, '--emit'],
-      cwd,
-    });
-    if (!javascriptSucceeded) {
-      return { success: false };
-    }
-
-    await makePackageBinsExecutable(cwd, options.executableOutputs ?? []);
-    if (inputs !== null) writeBuildInputs(inputs.outputDirectory, inputs.record);
-
-    return { success: true };
-  } finally {
-    await rm(overlayPath, { force: true });
+  const javascriptSucceeded = await runner({
+    command: 'ttsc',
+    args: ['-p', tsConfigPath, '--emit', ...EMIT_OVERRIDES],
+    cwd,
+  });
+  if (!javascriptSucceeded) {
+    return { success: false };
   }
+
+  await makePackageBinsExecutable(cwd, options.executableOutputs ?? []);
+  if (inputs !== null) writeBuildInputs(inputs.outputDirectory, inputs.record);
+
+  return { success: true };
 }
 
 const TYPESCRIPT_SOURCES = ['ts', 'tsx', 'mts', 'cts'];
