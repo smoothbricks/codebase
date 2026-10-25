@@ -3,8 +3,8 @@
 //! The writer alone owns the kqueue, retained fold and event journal. Readers load one immutable
 //! snapshot; a demand stream reads the retained journal without resampling or moving a CPU window.
 //! A user event wakes the writer for control requests, never another reader of process events.
-//! Once its job concludes, the job keeps a [`ConcludedObservation`] -- the last tree and the
-//! journal, sharing every image -- and the writer, its thread and its kqueue end with the monitor.
+//! A sealed job drops its monitor: the writer, its thread, kqueue, fold and journal end with the
+//! last clone, after any subscriber still attached has read to the end.
 //!
 //! The writer is also the job's sole retirement authority (11_shell.md, "Complete-group
 //! termination"). Whole-job membership includes the held group; a subtree uses only immutable
@@ -90,9 +90,6 @@ enum Request {
         reply: mpsc::SyncSender<Result<JobProcessRetirement>>,
     },
     LedgerChanges(Arc<tokio::sync::Notify>),
-    Conclude {
-        reply: mpsc::SyncSender<Result<ConcludedObservation>>,
-    },
     Trace(Box<TraceWriter>),
     Open {
         every: Duration,
@@ -379,15 +376,6 @@ impl ProcessMonitor {
         self.driver.acknowledged(|reply| Request::Finish { reply })
     }
 
-    /// The ended observation as it stays: the tree last published and every event emitted.
-    /// Refused while a life is still watched. The writer's thread, kqueue and fold go with the
-    /// last clone of this monitor, so a concluded job keeps only what its readers read.
-    pub(crate) fn conclude(&self) -> Result<ConcludedObservation> {
-        let (reply, answer) = mpsc::sync_channel(1);
-        self.driver.send(Request::Conclude { reply })?;
-        answer.recv().map_err(|_| unavailable(self.driver.job_id))?
-    }
-
     /// The lives the observation saw born and not yet exit, in birth order: once the job ended,
     /// what of it outlived its root.
     pub(crate) fn running(&self) -> Result<Vec<ProcessIdentity>> {
@@ -514,7 +502,12 @@ impl ProcessMonitor {
         &self,
         every: Duration,
     ) -> Result<super::process_stream::JobProcessStream> {
-        sample_interval(every)?;
+        if every.is_zero() || Instant::now().checked_add(every).is_none() {
+            return Err(CowshedError::usage(
+                "process sampling interval is outside the clock's range",
+                "use a positive, shorter everyMs",
+            ));
+        }
         let (reply, answer) = oneshot::channel();
         self.driver.send(Request::Open { every, reply })?;
         let id = answer
@@ -536,50 +529,6 @@ impl ProcessMonitor {
                 };
                 let Some(event) = next else { return };
                 if events.send(event).await.is_err() {
-                    return;
-                }
-            }
-        });
-        Ok(super::process_stream::JobProcessStream::new(received))
-    }
-}
-
-/// A subscription's sampling interval: positive, and within the clock's range.
-fn sample_interval(every: Duration) -> Result<()> {
-    if every.is_zero() || Instant::now().checked_add(every).is_none() {
-        return Err(CowshedError::usage(
-            "process sampling interval is outside the clock's range",
-            "use a positive, shorter everyMs",
-        ));
-    }
-    Ok(())
-}
-
-/// A concluded job's observation (07_api.md, "Process-tree observations"): the tree its writer
-/// last published and every event it emitted, in order. Immutable, so it answers reads with no
-/// writer; its records share their images with no other copy.
-#[derive(Debug)]
-pub(crate) struct ConcludedObservation {
-    tree: Result<JobProcessTree>,
-    journal: Arc<[Result<JobProcessEvent>]>,
-}
-
-impl ConcludedObservation {
-    pub(crate) fn tree(&self) -> Result<JobProcessTree> {
-        self.tree.clone()
-    }
-
-    /// Every retained event from the first, then the end: what the ended writer answered.
-    pub(crate) fn subscribe(
-        &self,
-        every: Duration,
-    ) -> Result<super::process_stream::JobProcessStream> {
-        sample_interval(every)?;
-        let journal = Arc::clone(&self.journal);
-        let (events, received) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(async move {
-            for event in journal.iter() {
-                if events.send(event.clone()).await.is_err() {
                     return;
                 }
             }
@@ -866,9 +815,6 @@ impl Writer {
                         changed.notify_one();
                         self.ledger_changes = Some(changed);
                     }
-                    Request::Conclude { reply } => {
-                        let _ = reply.send(self.conclude());
-                    }
                     Request::Trace(mut trace) => {
                         trace.replay(&self.journal);
                         self.trace = Some(trace);
@@ -954,25 +900,6 @@ impl Writer {
                 }
             }
         }
-    }
-
-    /// The ended observation, copied out of the writer: an attached subscriber still reads the
-    /// writer's own journal, and the copies share every image.
-    fn conclude(&self) -> Result<ConcludedObservation> {
-        if !self.ended {
-            return Err(CowshedError::conflict(
-                format!("{}'s process observation still watches a life", self.job_id),
-                "conclude the observation once every watched life has exited",
-            ));
-        }
-        Ok(ConcludedObservation {
-            tree: self.snapshot.load().tree.job().cloned(),
-            journal: self
-                .journal
-                .iter()
-                .map(|entry| entry.event.clone())
-                .collect(),
-        })
     }
 
     fn owns_live(&mut self, peer: ProcessIdentity) -> Result<bool> {

@@ -3798,6 +3798,46 @@ async fn release(gate: PathBuf) {
     .expect("release task");
 }
 
+/// A sealed job's tree and events were released with its seal: the controller and the SDK each
+/// answer a conflict naming its sealed record (07_api.md, "Process-tree observations").
+#[cfg(target_os = "macos")]
+async fn assert_observation_released(
+    jobs: &SupervisedJobs,
+    root: &TempRoot,
+    job: &cowshed_core::api::JobHandle,
+) {
+    let tree = job
+        .processes()
+        .await
+        .expect_err("a sealed job's tree is released");
+    assert_eq!(tree.code, ErrorCode::Conflict, "{tree:?}");
+    assert!(tree.message.contains("is sealed"), "{tree:?}");
+    match job
+        .process_events(cowshed_core::api::SampleInterval::new(20).unwrap())
+        .await
+    {
+        Err(error) => assert!(error.message.contains("is sealed"), "{error:?}"),
+        Ok(mut events) => {
+            let first = events.next().await;
+            assert!(
+                matches!(&first, Some(Err(error)) if error.message.contains("is sealed")),
+                "{first:?}"
+            );
+        }
+    }
+    let reads: Vec<Value> = napi_job_read(jobs, root, job.id(),
+        "await Promise.allSettled([job.processes(), (async () => { for await (const row of job.processEvents(20)) return row; })()]).then(rows => rows.map(row => ({ status: row.status, reason: String(row.reason) })))",
+    ).await;
+    assert_eq!(reads.len(), 2, "{reads:?}");
+    for read in &reads {
+        assert_eq!(read["status"], "rejected", "{reads:?}");
+        assert!(
+            read["reason"].as_str().unwrap().contains("is sealed"),
+            "{reads:?}"
+        );
+    }
+}
+
 /// One public SDK expression on a trusted embedder's inherited coordinator connection.
 /// Its result decodes into the same canonical Rust type the controller returns.
 #[cfg(target_os = "macos")]
@@ -4138,21 +4178,7 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
         .position(|event| matches!(event, JobProcessEvent::Gap { .. }))
         .unwrap();
     assert!(born_at(0) < gap_at, "{history:?}");
-    let final_tree = job
-        .processes()
-        .await
-        .expect("retired records remain readable");
-    assert_eq!(final_tree.processes.len(), 3);
-    assert!(
-        final_tree
-            .processes
-            .iter()
-            .all(|process| process.exit.is_some())
-    );
-    let napi_history: Vec<JobProcessEvent> = napi_job_read(&jobs, &root, job.id(),
-        "await (async () => { const rows = []; for await (const row of job.processEvents(20)) rows.push(row); return rows; })()",
-    ).await;
-    assert_eq!(napi_history, history);
+    assert_observation_released(&jobs, &root, &job).await;
     let health = remote
         .trace_health()
         .await
@@ -4235,9 +4261,7 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
     use arrow_array::Array as _;
     use arrow_array::cast::AsArray as _;
     use arrow_array::types::{Int64Type, UInt16Type, UInt32Type};
-    use cowshed_core::api::process::{
-        JobProcessEvent, JobProcessTree, ProcessCoverage, ProcessCoverageGap,
-    };
+    use cowshed_core::api::process::{JobProcessEvent, ProcessCoverage, ProcessCoverageGap};
     use cowshed_core::api::resources::JobAccounting;
     use cowshed_core::runtime::supervisor_socket;
     use cowshed_os::fork_lock::Run as _;
@@ -4326,6 +4350,11 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
         }
     }
     .await;
+    // The whole history is read live: the sealed job's own reads are released with its seal.
+    let mut history = job
+        .process_events(cowshed_core::api::SampleInterval::new(20).unwrap())
+        .await
+        .expect("a live subscription");
     release(gate).await;
     while let Some(chunk) = stdout.next().await {
         oracle.extend_from_slice(&chunk.expect("oracle bytes"));
@@ -4338,40 +4367,28 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
         .map(|pid| pid.parse().unwrap())
         .collect();
     assert_eq!(grandchildren.len(), 64);
-    let tree = job.processes().await.expect("retained burst records");
-    let retained: Vec<_> = tree
-        .processes
-        .iter()
-        .filter(|process| process.ppid == child_pid)
-        .collect();
-    assert!(retained.len() <= grandchildren.len());
-    assert!(
-        retained
-            .iter()
-            .all(|process| grandchildren.contains(&process.pid))
-    );
-    let missing = grandchildren.len() - retained.len();
+    let mut births = Vec::new();
+    let mut gap = None;
+    while let Some(event) = history.next().await {
+        match event.expect("native process event") {
+            JobProcessEvent::Born { process, .. } if process.ppid == child_pid => {
+                births.push(process.pid);
+            }
+            JobProcessEvent::Gap { reason } => gap = Some(reason),
+            _ => {}
+        }
+    }
+    assert!(births.len() <= grandchildren.len());
+    assert!(births.iter().all(|pid| grandchildren.contains(pid)));
+    let missing = grandchildren.len() - births.len();
     println!(
         "controller/N-API kqueue oracle: {} grandchild births, {} retained, {missing} missing",
         grandchildren.len(),
-        retained.len(),
+        births.len(),
     );
     let reason = ProcessCoverageGap::UncountedFork { pid: root_pid };
-    assert_eq!(tree.coverage, ProcessCoverage::Gap { reason });
-    let napi_tree: JobProcessTree =
-        napi_job_read(&jobs, &root, job.id(), "await job.processes()").await;
-    assert_eq!(napi_tree.processes, tree.processes);
-    assert_eq!(napi_tree.coverage, tree.coverage);
-    let events: Vec<JobProcessEvent> = napi_job_read(
-        &jobs,
-        &root,
-        job.id(),
-        "await (async () => { const rows = []; for await (const row of job.processEvents(20)) { rows.push(row); if (row.kind === 'gap') break; } return rows; })()",
-    )
-    .await;
-    assert!(
-        matches!(events.last(), Some(JobProcessEvent::Gap { reason: observed }) if *observed == reason)
-    );
+    assert_eq!(gap, Some(reason));
+    assert_observation_released(&jobs, &root, &job).await;
     let sample = ended
         .resources
         .as_ref()
@@ -4382,7 +4399,7 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
     let JobAccounting::MacOsRusageChildren { reconciliation, .. } = &sample.accounting else {
         panic!("a macOS burst must retain its named rusage source");
     };
-    assert_eq!(reconciliation.coverage, tree.coverage);
+    assert_eq!(reconciliation.coverage, ProcessCoverage::Gap { reason });
     let health = remote
         .trace_health()
         .await

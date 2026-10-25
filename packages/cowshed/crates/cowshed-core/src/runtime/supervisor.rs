@@ -67,7 +67,7 @@ use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
 pub use crate::runtime::nx_daemon::NxDaemonIdle;
 use crate::runtime::nx_daemon::{NxDaemonKeeper, Probe, Verdict};
 #[cfg(target_os = "macos")]
-use crate::runtime::process_monitor::{ConcludedObservation, ProcessMonitor};
+use crate::runtime::process_monitor::ProcessMonitor;
 use crate::runtime::process_stream::JobProcessStream;
 use crate::runtime::supervisor_socket::AdmissionSource;
 use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, VolumeMountpoint};
@@ -4394,7 +4394,7 @@ struct JobStateRecord {
     /// while it does, its terminal sample -- or why that failed -- once it ended.
     sampling: Sampling,
     #[cfg(target_os = "macos")]
-    observation: NativeObservation,
+    monitor: Option<ProcessMonitor>,
     /// The keeper's foreground Nx daemon: its plugin workers end with it (04_sandbox.md).
     #[cfg(target_os = "macos")]
     kept_nx_daemon: bool,
@@ -4423,28 +4423,6 @@ struct JobStateRecord {
     cpu: CpuStanding,
     /// Why the job failed before any status of its own could say, when it did.
     failure: Option<JobFailure>,
-}
-
-/// A job's native process observation through its life (07_api.md, "Process-tree observations").
-#[cfg(target_os = "macos")]
-enum NativeObservation {
-    /// No observed process yet, or a spawn that observes none.
-    Unobserved,
-    /// The writer watches the job's lives.
-    Live(ProcessMonitor),
-    /// The job sealed: its tree and events stay readable, and its writer, with the thread,
-    /// kqueue and fold that only watching needs, is gone.
-    Concluded(ConcludedObservation),
-}
-
-#[cfg(target_os = "macos")]
-impl NativeObservation {
-    fn live(&self) -> Option<&ProcessMonitor> {
-        match self {
-            Self::Live(monitor) => Some(monitor),
-            Self::Unobserved | Self::Concluded(_) => None,
-        }
-    }
 }
 
 /// Process, volume and CPU claims remain held through draining and every refusal.
@@ -4558,11 +4536,12 @@ impl JobStateRecord {
     }
 
     fn processes(&self) -> Result<JobProcessTree> {
+        if self.sealed() {
+            return Err(observation_released(self.info.job_id));
+        }
         #[cfg(target_os = "macos")]
-        match &self.observation {
-            NativeObservation::Live(monitor) => return monitor.tree(),
-            NativeObservation::Concluded(concluded) => return concluded.tree(),
-            NativeObservation::Unobserved => {}
+        if let Some(monitor) = &self.monitor {
+            return monitor.tree();
         }
         Err(process_observation_unavailable(self.info.job_id))
     }
@@ -4572,20 +4551,17 @@ impl JobStateRecord {
         every: SampleInterval,
         reply: oneshot::Sender<Result<JobProcessStream>>,
     ) {
+        if self.sealed() {
+            let _ = reply.send(Err(observation_released(self.info.job_id)));
+            return;
+        }
         #[cfg(target_os = "macos")]
-        match &self.observation {
-            NativeObservation::Live(monitor) => {
-                let monitor = monitor.clone();
-                tokio::spawn(async move {
-                    let _ = reply.send(monitor.subscribe(every.duration()).await);
-                });
-                return;
-            }
-            NativeObservation::Concluded(concluded) => {
-                let _ = reply.send(concluded.subscribe(every.duration()));
-                return;
-            }
-            NativeObservation::Unobserved => {}
+        if let Some(monitor) = &self.monitor {
+            let monitor = monitor.clone();
+            tokio::spawn(async move {
+                let _ = reply.send(monitor.subscribe(every.duration()).await);
+            });
+            return;
         }
         #[cfg(not(target_os = "macos"))]
         let _ = every;
@@ -4598,6 +4574,18 @@ impl JobStateRecord {
             StreamKind::Stderr => (&self.stderr, self.stderr_tally.bytes(), self.stderr_eof),
         }
     }
+}
+
+/// A sealed job's process tree and events were released with its seal (07_api.md, "Process-tree
+/// observations"): its sealed record is what remains to read.
+fn observation_released(job_id: JobId) -> CowshedError {
+    CowshedError::conflict(
+        format!(
+            "job {} is sealed: its process tree and events were released with its sealed record",
+            job_id.get()
+        ),
+        "read the job's sealed record: its exit, containment, outlived processes and terminal resources",
+    )
 }
 
 fn process_observation_unavailable(job_id: JobId) -> CowshedError {
@@ -4693,7 +4681,7 @@ impl Drop for SupervisorActor {
         #[cfg(target_os = "macos")]
         let observed: Vec<_> = jobs
             .iter()
-            .filter_map(|(id, job)| job.observation.live().map(|monitor| (*id, monitor.clone())))
+            .filter_map(|(id, job)| job.monitor.as_ref().map(|monitor| (*id, monitor.clone())))
             .collect();
         #[cfg(target_os = "linux")]
         let contained: Vec<_> = jobs
@@ -4783,7 +4771,7 @@ fn record_job_groups(
         .filter_map(|(job_id, job)| {
             let leader = job.birth.as_ref()?.leader()?;
             #[cfg(target_os = "macos")]
-            let members = job.observation.live().map(ProcessMonitor::running_lives);
+            let members = job.monitor.as_ref().map(ProcessMonitor::running_lives);
             #[cfg(not(target_os = "macos"))]
             let members = None;
             Some(super::job_groups::JobGroupClaim {
@@ -4837,7 +4825,7 @@ fn retire_dropped_jobs(
             continue;
         }
         #[cfg(target_os = "macos")]
-        if let (Some(monitor), Some(birth)) = (job.observation.live(), &job.birth) {
+        if let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth) {
             match monitor.retire(birth.clone(), grace) {
                 Ok(_) => {
                     jobs.remove(&id);
@@ -5042,7 +5030,7 @@ impl SupervisorActor {
                 job.stderr_tally,
                 Boundary::Supervisor,
                 #[cfg(target_os = "macos")]
-                job.observation.live(),
+                job.monitor.as_ref(),
             ) {
                 job.info.resources = Some(sample);
             }
@@ -5182,7 +5170,7 @@ impl SupervisorActor {
                     .jobs
                     .values()
                     .filter(|job| !job.terminal())
-                    .filter_map(|job| job.observation.live().cloned())
+                    .filter_map(|job| job.monitor.clone())
                     .collect();
                 tokio::task::spawn_blocking(move || {
                     let outcome = (|| {
@@ -5230,7 +5218,7 @@ impl SupervisorActor {
                     }));
                     return;
                 }
-                let Some(monitor) = job.observation.live().cloned() else {
+                let Some(monitor) = job.monitor.clone() else {
                     let _ = reply.send(Ok(JobSubtreeRetirement::Refused {
                         reason: JobSubtreeRefusal::FoldUnavailable,
                     }));
@@ -6219,7 +6207,7 @@ impl SupervisorActor {
             birth: None,
             sampling: Sampling::Unowned,
             #[cfg(target_os = "macos")]
-            observation: NativeObservation::Unobserved,
+            monitor: None,
             #[cfg(target_os = "macos")]
             kept_nx_daemon: false,
             volumes,
@@ -6376,11 +6364,8 @@ impl SupervisorActor {
         };
         #[cfg(target_os = "macos")]
         {
-            job.observation = process
-                .observations()
-                .cloned()
-                .map_or(NativeObservation::Unobserved, NativeObservation::Live);
-            if let Some(monitor) = job.observation.live()
+            job.monitor = process.observations().cloned();
+            if let Some(monitor) = &job.monitor
                 && let Err(error) = monitor.ledger_changes(self.membership_changed.clone())
             {
                 cowshed_os::eprintln!(
@@ -6388,7 +6373,7 @@ impl SupervisorActor {
                     job_id.get()
                 );
             }
-            if let (Some(monitor), Some(publisher)) = (job.observation.live(), &self.job_spans)
+            if let (Some(monitor), Some(publisher)) = (&job.monitor, &self.job_spans)
                 && let Err(error) = monitor.trace(publisher.clone(), &job.info)
             {
                 cowshed_os::eprintln!(
@@ -7512,7 +7497,7 @@ impl SupervisorActor {
             return Ok(());
         }
         #[cfg(target_os = "macos")]
-        if job.observation.live().is_some() && job.birth.is_some() {
+        if job.monitor.is_some() && job.birth.is_some() {
             // Retirement takes the membership snapshot before sending a signal, so a process
             // ended by cancellation cannot disappear from the job's outlived receipt.
             self.retire_membership(job_id);
@@ -7579,7 +7564,7 @@ impl SupervisorActor {
             return false;
         }
         #[cfg(target_os = "macos")]
-        if let (Some(monitor), Some(birth)) = (job.observation.live(), &job.birth) {
+        if let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth) {
             let monitor = monitor.clone();
             let birth = birth.clone();
             let grace = self.term_grace;
@@ -7716,7 +7701,7 @@ impl SupervisorActor {
             .try_into()
             .unwrap_or(u64::MAX);
         #[cfg(target_os = "macos")]
-        if let Some(monitor) = job.observation.live() {
+        if let Some(monitor) = &job.monitor {
             let monitor = monitor.clone();
             if let Err(error) = tokio::task::spawn_blocking(move || monitor.finish())
                 .await
@@ -7732,7 +7717,7 @@ impl SupervisorActor {
         // ended none of them; its observation followed each from its birth (04_sandbox.md).
         #[cfg(target_os = "macos")]
         if job.kept_nx_daemon
-            && let (Some(monitor), Some(birth)) = (job.observation.live(), &job.birth)
+            && let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth)
         {
             let monitor = monitor.clone();
             let daemon = birth.pid().cast_signed();
@@ -7765,7 +7750,7 @@ impl SupervisorActor {
                 job.stderr_tally,
                 Boundary::Supervisor,
                 #[cfg(target_os = "macos")]
-                job.observation.live(),
+                job.monitor.as_ref(),
             )
         });
         #[cfg(target_os = "linux")]
@@ -7909,38 +7894,30 @@ impl SupervisorActor {
         if job.birth.is_some() {
             self.record_groups();
         }
-        // Likewise its observation, once the ledger has recorded the job's end with nothing
-        // awaited between its waiters' answers and that record.
+        // Likewise its process observation, once the ledger has recorded the job's end with
+        // nothing awaited between its waiters' answers and that record.
         #[cfg(target_os = "macos")]
-        self.conclude_observation(job_id).await;
+        self.release_observation(job_id).await;
     }
 
-    /// Keep a sealed job's tree and events, and release the writer that watched it: its lives
-    /// have all exited, so nothing watches them any more. Retaining the writer -- its thread,
-    /// kqueue and fold -- per ended job grew every supervisor with each job it ran.
+    /// Release a sealed job's process observation (07_api.md, "Process-tree observations"):
+    /// its lives have all exited and its sealed record is what is read of it from now on. Kept,
+    /// the writer -- its thread, kqueue, fold, journal and argv copies -- grew every supervisor
+    /// with each job it ran.
     #[cfg(target_os = "macos")]
-    async fn conclude_observation(&mut self, job_id: JobId) {
-        let Some(job) = self.jobs.get_mut(&job_id) else {
+    async fn release_observation(&mut self, job_id: JobId) {
+        let Some(monitor) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|job| job.monitor.take())
+        else {
             return;
         };
-        let observation = std::mem::replace(&mut job.observation, NativeObservation::Unobserved);
-        let NativeObservation::Live(monitor) = observation else {
-            job.observation = observation;
-            return;
-        };
-        // The last clone stops and joins the writer, so it drops off the actor.
-        job.observation = tokio::task::spawn_blocking(move || match monitor.conclude() {
-            Ok(concluded) => NativeObservation::Concluded(concluded),
-            Err(error) => {
-                cowshed_os::eprintln!(
-                    "cowshed: job {}'s process observation stays live: {error}",
-                    job_id.get()
-                );
-                NativeObservation::Live(monitor)
-            }
-        })
-        .await
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
+        // The last clone stops and joins the writer, so it drops off the actor. A subscriber
+        // still attached holds its own clone and reads to the end first.
+        tokio::task::spawn_blocking(move || drop(monitor))
+            .await
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
     }
 
     /// Admit nothing more: running jobs run on, and the keeper's daemon start is stopped, since
@@ -8295,7 +8272,7 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCo
             job.stderr_tally,
             Boundary::Supervisor,
             #[cfg(target_os = "macos")]
-            job.observation.live(),
+            job.monitor.as_ref(),
         ) {
             Ok(sample) => job.info.resources = Some(sample),
             // The latest sample stands, dated by its own `sampledAt`; a read reports the failure.
@@ -8315,7 +8292,7 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCo
 /// never changes, so saying it again changes nothing.
 #[cfg(target_os = "macos")]
 fn clock_observation(job: &JobStateRecord) {
-    if let (Some(monitor), Some(origin)) = (job.observation.live(), job.sampling.origin())
+    if let (Some(monitor), Some(origin)) = (&job.monitor, job.sampling.origin())
         && let Err(error) = monitor.clock(origin)
     {
         cowshed_os::eprintln!(
@@ -8492,7 +8469,7 @@ fn sample_job(job: &mut JobStateRecord) -> Result<JobResourceSample> {
             job.stderr_tally,
             Boundary::Read,
             #[cfg(target_os = "macos")]
-            job.observation.live(),
+            job.monitor.as_ref(),
         )
     })?;
     if !job.terminal() {

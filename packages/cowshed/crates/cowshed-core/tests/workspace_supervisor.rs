@@ -10936,44 +10936,18 @@ fn footprint() -> Footprint {
     }
 }
 
-/// The argv bytes a job's observation took from the kernel: one image per exec, and its root's.
-/// A forked life runs its parent's image until it execs, so its birth reads none.
-#[cfg(target_os = "macos")]
-async fn exec_image_bytes(handle: &WorkspaceSupervisorHandle, job: JobId) -> usize {
-    use cowshed_core::api::process::{JobProcessEvent, JobProcessSample};
-    let bytes = |process: &JobProcessSample| {
-        process.program.len()
-            + process
-                .argv
-                .iter()
-                .map(|argument| argument.as_os_str().len())
-                .sum::<usize>()
-    };
-    let mut events = handle
-        .process_events(job, cowshed_core::api::SampleInterval::new(1000).unwrap())
-        .await
-        .unwrap();
-    let mut total = 0;
-    while let Some(event) = events.next().await {
-        match event.unwrap() {
-            JobProcessEvent::Born { index: 0, process } | JobProcessEvent::Exec { process, .. } => {
-                total += bytes(&process);
-            }
-            _ => {}
-        }
-    }
-    total
-}
-
-/// A concluded job keeps its process tree and events readable and nothing else of its
-/// observation: no writer thread, no kqueue, and one copy of each image it ran (07_api.md,
-/// "Process-tree observations"). Each ended job once kept its writer, two kqueue descriptors
-/// and a copy of an argv per record of it until the supervisor retired: a workspace that built
-/// for an hour held a gigabyte.
+/// A sealed job keeps nothing of its process observation (07_api.md, "Process-tree
+/// observations"): no writer thread, no kqueue, and no argv of any life it ran; its tree and
+/// events answer a conflict naming its sealed record. Each ended job once kept its writer, two
+/// kqueue descriptors and several copies of every argv until the supervisor retired: a
+/// workspace that built for an hour held a gigabyte.
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_concluded_job_keeps_its_observation_records_and_no_writer() {
+async fn a_sealed_job_keeps_no_process_observation() {
     const JOBS: usize = 8;
+    // The lives each job runs, as the script below counts them, and each one's argv bytes.
+    const LIVES: usize = 32;
+    const ARGV_BYTES: usize = 64 * 128;
     let (handle, _ledger, _root) = native_process_fixture("concluded-observation", None);
     // Each of 32 lives runs an 8 KiB argv and forks a child that shares it until its own exec,
     // as a compiler driver and the tools it starts do.
@@ -11010,21 +10984,23 @@ async fn a_concluded_job_keeps_its_observation_records_and_no_writer() {
         assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
         job
     };
-    // The first job warms the supervisor's own allocations.
-    run().await;
+    // The first job warms the supervisor's own allocations; a read answered after its seal
+    // orders the measurement after its release.
+    let warm = run().await;
+    handle.processes(warm).await.unwrap_err();
     let before = footprint();
-    let mut images = 0;
     for _ in 0..JOBS {
         let job = run().await;
-        let tree = handle.processes(job).await.unwrap();
-        assert!(tree.processes.len() > 32, "{} lives", tree.processes.len());
-        images += exec_image_bytes(&handle, job).await;
+        // Answered by the actor once the job's seal released its observation.
+        let released = handle.processes(job).await.unwrap_err();
+        assert_eq!(released.code, ErrorCode::Conflict, "{released:?}");
+        assert!(released.message.contains("is sealed"), "{released:?}");
     }
     let after = footprint();
-    let retained = after.heap_bytes - before.heap_bytes;
+    let retained = after.heap_bytes.saturating_sub(before.heap_bytes);
     cowshed_os::eprintln!(
-        "{JOBS} concluded jobs: heap {} -> {} bytes ({retained} retained, {} blocks), \
-         {images} exec image bytes, resident {} -> {}, threads {} -> {}, kqueues {} -> {}",
+        "{JOBS} sealed jobs: heap {} -> {} bytes ({retained} retained, {} blocks), \
+         resident {} -> {}, threads {} -> {}, kqueues {} -> {}",
         before.heap_bytes,
         after.heap_bytes,
         i64::from(after.heap_blocks) - i64::from(before.heap_blocks),
@@ -11037,16 +11013,16 @@ async fn a_concluded_job_keeps_its_observation_records_and_no_writer() {
     );
     assert!(
         after.kqueues <= before.kqueues,
-        "a concluded job keeps no kqueue: {} -> {}",
+        "a sealed job keeps no kqueue: {} -> {}",
         before.kqueues,
         after.kqueues
     );
-    // One copy of each image costs its bytes, a header per argument, and the records of the
-    // lives that ran it: under twice the image bytes. A second copy of an argv per record --
-    // the tree, each event and the writer's fold each held one -- costs four times or more.
+    // A sealed job's record holds its command, once per store and record, and no life's argv:
+    // measured at under a tenth of one argv per life it ran, bounded at a quarter. One copy per
+    // life is four times the bound; the retained observation held five per life.
     assert!(
-        retained < images * 2,
-        "{JOBS} concluded jobs retain {retained} heap bytes for {images} bytes of exec images"
+        retained < JOBS * LIVES * ARGV_BYTES / 4,
+        "{JOBS} sealed jobs of {LIVES} lives retain {retained} heap bytes"
     );
     handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }

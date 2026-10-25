@@ -1139,10 +1139,10 @@ distinct; neither EOF nor a dropped attachment kills the job.
 ### Process-tree observations
 
 `processes()` returns `JobProcessTree { jobId, sampledAt, processes, coverage }`, retaining final records of observed
-exited descendants as well as current members. The supervisor observes fork, exec and exit events. Linux requires an
-event source beside pidfd identity and proc metrics. Periodic proc children polling alone is not a complete tree. A
-missed observation records a typed coverage gap and an unattributed-usage row; it never silently claims completeness or
-trusts a reused PID.
+exited descendants as well as current members until the job is sealed. The supervisor observes fork, exec and exit
+events. Linux requires an event source beside pidfd identity and proc metrics. Periodic proc children polling alone is
+not a complete tree. A missed observation records a typed coverage gap and an unattributed-usage row; it never silently
+claims completeness or trusts a reused PID.
 
 macOS per-process coverage is best-effort with a coverage gap, and its job totals carry their own named source limits
 (below). kqueue `NOTE_FORK` on each member coalesces and carries no child PID, and `NOTE_TRACK`/`NOTE_CHILD` are refused
@@ -1256,8 +1256,9 @@ dropped, and `truncated` says so. macOS bounds only a process's whole argv (`KER
 an argument no record could; a record written before this field reads it as `false`.
 
 Each exec's image is held once: the life that runs it, a child forked from it until that child's own exec, and every
-record and event of them share it, so a record copies no argv. Once a job concludes, its tree and events stay readable
-as they ended, and nothing of the observer that watched it remains: no writer, thread, kqueue or fold.
+record and event of them share it, so a record copies no argv. A concluded job's tree and events are released when it is
+sealed; afterwards `processes()`/`processEvents()` answer a conflict naming the sealed record. A subscription opened
+before the seal still reads to its end.
 
 Birth and parent identity are kernel observations retained internally, not fresh trust in numeric PID values.
 Per-process CPU counters are that process's own usage. Complete job counters have an independent, declared source and
