@@ -1656,6 +1656,14 @@ read are the host store's (`/private/cowshed/store/<owner>/<repo>/sessions`) onl
 fixture's store elsewhere records its lease there, which no census reads, so it is asked like any other process and can
 still stall a concurrent census. Linux records no unique id and its census asks every process.
 
+Nor does the tree census ask a released image's deletion child (05_gateway.md, "Deleting released images") about its
+descriptors when its entry cannot be in the tree. The child is known by the arguments the kernel holds for it,
+`<exe> __delete-released <entry>`, and its entry cannot be in the tree when it is not below the tree's root and its
+directory is on another device than the root's: an entry's later move is a rename, which stays on its device. The child
+holds nothing but its entry, and it sits in each bounded `ftruncate` cut with that entry's vnode held, so a census that
+asked it waited out the cut: measured 2026-10-25, 12-14 s of a 34-49 s `rm` with ten children freeing. Its working
+directory and executable are still checked, and a child whose arguments cannot be read is asked like any process.
+
 A record's unique id is its exact decimal string (`DecimalU64` in `api::held_lock`, the form every kernel identifier on
 the wire takes), the one form any reader parses; the switch from a JSON number was a clean cutover, with no reader of
 the old form. A record an earlier build wrote, with a numeric unique id, does not parse and names nothing: none takes a
