@@ -39,9 +39,7 @@ use super::shared::{
 use crate::error::CowshedError;
 use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
-use crate::storage::host_config::{
-    HostConfig, MACOS_MOUNT_PREFIX, canonical_mount_root, macos_mount_root,
-};
+use crate::storage::host_config::{HostConfig, MACOS_MOUNT_PREFIX, macos_mount_root};
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::{
     CommandRequest, CommandRunFailure, DISK_CHILD_DEADLINE, RegisteredApfsContainer,
@@ -474,44 +472,25 @@ fn shell_quote(value: &str) -> String {
 }
 
 /// The boot layer uses only system tools: no user-writable executable runs as root.
-/// Work beside the plist, preserve its metadata and unrelated keys, and publish only changes.
-/// mdutil exposes no reload-only operation; do not toggle indexing or restart mds.
-const SPOTLIGHT_EXCLUSIONS_SHELL: &str = r#"ensure_spotlight_exclusions() (
-    configuration=$1
-    shift
-    temporary=$(/usr/bin/mktemp "$configuration.cowshed.XXXXXX")
-    trap '/bin/rm -f "$temporary"' EXIT
-    /bin/cp -p "$configuration" "$temporary"
-    changed=0
-    if count=$(/usr/bin/plutil -extract Exclusions raw -expect array "$temporary" 2>&1); then
-        :
-    else
-        # Only an absent key can be inserted: malformed data fails without replacing the original.
-        /usr/bin/plutil -insert Exclusions -array "$temporary"
-        count=0
-        changed=1
+/// Spotlight reads an empty `.metadata_never_index` at a volume's root when the volume mounts;
+/// the Data volume's Search Privacy `Exclusions` are no alternative, since its `.Spotlight-V100`
+/// refuses writes even to this root daemon. The opt-out runs after every mount, so its refusal
+/// never costs one. It creates only an absent marker, exclusively (`set -C`), and refuses a
+/// symlink, directory or non-empty file at that name instead of writing through it.
+const SPOTLIGHT_OPT_OUT_SHELL: &str = r#"opt_out_of_spotlight() {
+    label=$1
+    marker="$2/.metadata_never_index"
+    boot_step="plant Spotlight opt-out for $label"
+    boot_line=$((LINENO + 1))
+    if [ -L "$marker" ] || { [ -e "$marker" ] && { [ ! -f "$marker" ] || [ -s "$marker" ]; }; }; then
+        echo "cowshed storage: $marker is not an empty regular file" >&2
+        return 1
     fi
-    for root do
-        index=0
-        found=0
-        while [ "$index" -lt "$count" ]; do
-            entry=$(/usr/bin/plutil -extract "Exclusions.$index" raw -expect string "$temporary")
-            if [ "$entry" = "$root" ]; then
-                found=1
-                break
-            fi
-            index=$((index + 1))
-        done
-        if [ "$found" -eq 0 ]; then
-            /usr/bin/plutil -insert "Exclusions.$count" -string "$root" "$temporary"
-            count=$((count + 1))
-            changed=1
-        fi
-    done
-    if [ "$changed" -eq 1 ]; then
-        /bin/mv -f "$temporary" "$configuration"
+    boot_line=$((LINENO + 2))
+    if [ ! -e "$marker" ]; then
+        (set -C; : > "$marker")
     fi
-)
+}
 "#;
 
 /// Boot failures retain the refusing step and source line without exposing credential bytes.
@@ -520,40 +499,10 @@ boot_line=1
 trap 'status=$?; if [ "$status" -ne 0 ]; then printf "cowshed storage: %s:%s: %s refused (exit %s)\n" "$0" "$boot_line" "$boot_step" "$status" >&2; fi' EXIT
 "#;
 
-fn spotlight_roots(
-    roots: &CanonicalRoots,
-    home: &Path,
-) -> Result<Vec<PathBuf>, NativeBootstrapError> {
-    let config = HostConfig::load(roots.store(), home)
-        .map_err(|error| NativeBootstrapError::Host(HostError::new(error.to_string())))?;
-    let default_mount = canonical_mount_root(home);
-    Ok(BTreeSet::from([
-        roots
-            .store()
-            .parent()
-            .unwrap_or(roots.store())
-            .to_path_buf(),
-        default_mount
-            .parent()
-            .unwrap_or(&default_mount)
-            .to_path_buf(),
-        config.mount_root().to_path_buf(),
-    ])
-    .into_iter()
-    .collect())
-}
-
-fn desired_mount_service(
-    pins: &[FstabPin],
-    spotlight_roots: &[PathBuf],
-) -> Result<MountServiceFiles, NativeBootstrapError> {
-    let exclusions = spotlight_roots
-        .iter()
-        .map(|root| path_argument(root).map(|root| shell_quote(&root)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(NativeBootstrapError::Host)?
-        .join(" ");
+/// Every mount first, then every Spotlight opt-out: no opt-out refusal can keep a volume unmounted.
+fn boot_calls(pins: &[FstabPin]) -> Result<String, NativeBootstrapError> {
     let mut mounts = String::new();
+    let mut opt_outs = String::new();
     for pin in pins {
         Uuid::parse_str(&pin.volume_uuid).map_err(|_| {
             NativeBootstrapError::MalformedApfsInventory(format!(
@@ -567,22 +516,26 @@ fn desired_mount_service(
                 pin.mountpoint
             )))
         })?;
+        let label = shell_quote(&pin.label);
+        let mountpoint = shell_quote(mountpoint);
         mounts.push_str(&format!(
-            "mount_volume {} {} {}\n",
-            shell_quote(&pin.label),
-            shell_quote(&pin.volume_uuid),
-            shell_quote(mountpoint)
+            "mount_volume {label} {} {mountpoint}\n",
+            shell_quote(&pin.volume_uuid)
         ));
+        opt_outs.push_str(&format!("opt_out_of_spotlight {label} {mountpoint}\n"));
     }
+    mounts.push_str(&opt_outs);
+    Ok(mounts)
+}
+
+fn desired_mount_service(pins: &[FstabPin]) -> Result<MountServiceFiles, NativeBootstrapError> {
+    let calls = boot_calls(pins)?;
     let script = format!(
         r#"#!/bin/sh
 set -eu
 umask 022
 
-{BOOT_FAILURE_SHELL}{SPOTLIGHT_EXCLUSIONS_SHELL}boot_step='merge Spotlight Search Privacy exclusions'
-boot_line=$((LINENO + 1))
-ensure_spotlight_exclusions '/System/Volumes/Data/.Spotlight-V100/VolumeConfiguration.plist' {exclusions}
-
+{BOOT_FAILURE_SHELL}{SPOTLIGHT_OPT_OUT_SHELL}
 mount_volume() {{
     label=$1
     uuid=$2
@@ -646,7 +599,7 @@ mount_volume() {{
     fi
 }}
 
-{mounts}"#
+{calls}"#
     );
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -664,13 +617,6 @@ mount_volume() {{
   <string>/var/log/cowshed-storage.log</string>
   <key>RunAtLoad</key>
   <true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
   <key>ProcessType</key>
   <string>Background</string>
 </dict>
@@ -697,14 +643,7 @@ fn mount_service_files(
             })
         })
         .collect::<Option<Vec<_>>>();
-    pins.as_deref()
-        .map(|pins| {
-            desired_mount_service(
-                pins,
-                &spotlight_roots(snapshot.plan.roots(), snapshot.plan.home())?,
-            )
-        })
-        .transpose()
+    pins.as_deref().map(desired_mount_service).transpose()
 }
 
 fn mount_service_loaded() -> bool {
@@ -4176,6 +4115,7 @@ mod tests {
     use super::super::shared::mutating_setup_actions;
     use super::*;
     use crate::storage::bootstrap::{BlockingJob, RETIRED_CACHES_MOUNTPOINT};
+    use crate::storage::host_config::canonical_mount_root;
     use cowshed_apfs::RegisteredApfsVolume;
     use cowshed_gateway_types::STORE_ROOT;
     use cowshed_os::fork_lock::Spawn as _;
@@ -4752,161 +4692,118 @@ mod tests {
         ]
     }
 
-    fn run_spotlight_merge(configuration: &Path, roots: &[PathBuf]) -> Output {
+    /// Runs the generated boot calls behind the generated opt-out and a `mount_volume` stub that
+    /// records its label: the real one needs root and a volume, and the contract test pins it.
+    fn run_boot_calls(pins: &[FstabPin], mount_log: &Path) -> Output {
         Command::new("/bin/sh")
             .arg("-c")
             .arg(format!(
-                "set -eu\n{SPOTLIGHT_EXCLUSIONS_SHELL}\nensure_spotlight_exclusions \"$@\""
+                "set -eu\n{BOOT_FAILURE_SHELL}{SPOTLIGHT_OPT_OUT_SHELL}mount_volume() {{ printf '%s\\n' \"$1\" >> \"$MOUNT_LOG\"; }}\n{}",
+                boot_calls(pins).unwrap()
             ))
-            .arg("cowshed-spotlight-test")
-            .arg(configuration)
-            .args(roots)
+            .arg("mount-volumes.sh")
+            .env("MOUNT_LOG", mount_log)
             .output_locked()
             .unwrap()
     }
 
     #[test]
-    fn boot_spotlight_merge_preserves_plist_entries_and_is_idempotent() {
-        let directory = std::env::temp_dir().join(format!("cowshed-spotlight-{}", Uuid::new_v4()));
-        fs::create_dir(&directory).unwrap();
-        let configuration = directory.join("VolumeConfiguration.plist");
-        let roots = [
-            PathBuf::from("/private/cowshed"),
-            PathBuf::from("/Users/test/Dev/my 'shed & $root"),
-        ];
-        for binary in [false, true] {
-            for existing in [
-                None,
-                Some(vec![
-                    Value::from("/someone-else"),
-                    Value::from("/private/cowshed"),
-                ]),
-            ] {
-                let mut original = plist::Dictionary::new();
-                original.insert("UnrelatedPolicy".into(), Value::Boolean(true));
-                if let Some(entries) = existing {
-                    original.insert("Exclusions".into(), Value::Array(entries));
-                }
-                let original = Value::Dictionary(original);
-                if binary {
-                    original.to_file_binary(&configuration).unwrap();
-                } else {
-                    original.to_file_xml(&configuration).unwrap();
-                }
-                fs::set_permissions(&configuration, fs::Permissions::from_mode(0o640)).unwrap();
-                let result = run_spotlight_merge(&configuration, &roots);
-                assert!(result.status.success(), "{result:?}");
-                let merged = Value::from_file(&configuration).unwrap();
-                let entries = merged.as_dictionary().unwrap()["Exclusions"]
-                    .as_array()
-                    .unwrap();
-                let mut expected = original
-                    .as_dictionary()
-                    .unwrap()
-                    .get("Exclusions")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                for root in &roots {
-                    let value = Value::from(root.to_str().unwrap());
-                    if !expected.contains(&value) {
-                        expected.push(value);
-                    }
-                }
-                assert_eq!(entries, &expected);
-                assert_eq!(
-                    merged.as_dictionary().unwrap()["UnrelatedPolicy"],
-                    Value::Boolean(true)
-                );
-                assert_eq!(fs::metadata(&configuration).unwrap().mode() & 0o777, 0o640);
-                let bytes = fs::read(&configuration).unwrap();
-                let inode = fs::metadata(&configuration).unwrap().ino();
-                let result = run_spotlight_merge(&configuration, &roots);
-                assert!(result.status.success(), "{result:?}");
-                assert_eq!(fs::read(&configuration).unwrap(), bytes);
-                assert_eq!(
-                    fs::metadata(&configuration).unwrap().ino(),
-                    inode,
-                    "an unchanged plist is not replaced"
-                );
-                assert_eq!(
-                    fs::read_dir(&directory).unwrap().count(),
-                    1,
-                    "no scratch plist remains"
-                );
-            }
-        }
-        let mut invalid = plist::Dictionary::new();
-        invalid.insert("Exclusions".into(), Value::from("not an array"));
-        Value::Dictionary(invalid)
-            .to_file_xml(&configuration)
-            .unwrap();
-        let bytes = fs::read(&configuration).unwrap();
-        let result = run_spotlight_merge(&configuration, &roots);
-        assert!(!result.status.success(), "{result:?}");
-        assert_eq!(fs::read(&configuration).unwrap(), bytes);
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn boot_spotlight_roots_are_fixed_and_refuse_custom_configuration() {
-        use cowshed_os::namespace::TestNamespace;
+    fn boot_spotlight_opt_out_refusal_never_costs_a_mount() {
         let directory =
-            std::env::temp_dir().join(format!("cowshed-spotlight-roots-{}", Uuid::new_v4()));
-        let store = directory.join("physical/store");
-        let home = directory.join("home");
-        fs::create_dir_all(&store).unwrap();
-        let roots = CanonicalRoots::fixture(
-            TestNamespace::mint().expect("a test namespace"),
-            store.clone(),
+            std::env::temp_dir().join(format!("cowshed-spotlight-opt-out-{}", Uuid::new_v4()));
+        let pins = mount_service_pins()
+            .into_iter()
+            .map(|pin| FstabPin {
+                mountpoint: directory.join(&pin.label),
+                ..pin
+            })
+            .collect::<Vec<_>>();
+        for pin in &pins {
+            fs::create_dir_all(&pin.mountpoint).unwrap();
+        }
+        let markers = pins
+            .iter()
+            .map(|pin| pin.mountpoint.join(cowshed_apfs::SPOTLIGHT_OPT_OUT))
+            .collect::<Vec<_>>();
+        let mount_log = directory.join("mounts.log");
+        let chflags = |flag: &str, path: &Path| {
+            let output = Command::new("/usr/bin/chflags")
+                .arg(flag)
+                .arg(path)
+                .output_locked()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+
+        // SIP's refusal: an immutable directory refuses a new entry with EPERM, owner or not.
+        chflags("uchg", &pins[0].mountpoint);
+        let refused = run_boot_calls(&pins, &mount_log);
+        chflags("nouchg", &pins[0].mountpoint);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        assert_eq!(
+            fs::read_to_string(&mount_log).unwrap(),
+            "cowshed.store\ncowshed.caches\n",
+            "every volume mounts before any opt-out runs"
         );
-        let defaults = spotlight_roots(&roots, &home).unwrap();
-        assert!(defaults.contains(&directory.join("physical")));
-        let default_mount = canonical_mount_root(&home);
+        assert!(stderr.contains("Operation not permitted"), "{stderr}");
         assert!(
-            defaults
-                .iter()
-                .any(|root| root.as_path() == default_mount.parent().unwrap())
+            stderr.contains("plant Spotlight opt-out for cowshed.store refused (exit 1)"),
+            "{stderr}"
         );
-        assert!(defaults.contains(&default_mount));
-        let custom = directory.join("Dev/.cowshed");
-        let path = store.join(crate::storage::host_config::HOST_CONFIG_FILE);
-        fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({"version":1,"mountRoot": custom})).unwrap(),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let before = fs::read(&path).unwrap();
-        let error = spotlight_roots(&roots, &home).unwrap_err();
-        assert!(error.to_string().contains("retired custom mountRoot"));
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!markers[0].exists());
+
+        let planted = run_boot_calls(&pins, &mount_log);
+        assert!(planted.status.success(), "{planted:?}");
+        let inodes = markers
+            .iter()
+            .map(|marker| {
+                let metadata = fs::symlink_metadata(marker).unwrap();
+                assert!(metadata.file_type().is_file());
+                assert_eq!(metadata.len(), 0);
+                metadata.ino()
+            })
+            .collect::<Vec<_>>();
+        let again = run_boot_calls(&pins, &mount_log);
+        assert!(again.status.success(), "{again:?}");
+        assert_eq!(
+            markers
+                .iter()
+                .map(|marker| fs::symlink_metadata(marker).unwrap().ino())
+                .collect::<Vec<_>>(),
+            inodes,
+            "a present marker is left alone"
+        );
+
+        // A squatter refuses instead of being written through.
+        let target = directory.join("target");
+        fs::write(&target, b"keep").unwrap();
+        fs::remove_file(&markers[1]).unwrap();
+        std::os::unix::fs::symlink(&target, &markers[1]).unwrap();
+        let squatted = run_boot_calls(&pins, &mount_log);
+        assert_eq!(squatted.status.code(), Some(1), "{squatted:?}");
+        assert!(
+            String::from_utf8_lossy(&squatted.stderr)
+                .contains("plant Spotlight opt-out for cowshed.caches refused (exit 1)"),
+            "{squatted:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn boot_mount_service_is_a_root_owned_shell_contract_not_a_cowshed_command() {
-        let files = desired_mount_service(
-            &mount_service_pins(),
-            &[
-                PathBuf::from("/private/cowshed"),
-                PathBuf::from("/Users/test/Dev/my 'shed"),
-            ],
-        )
-        .unwrap();
+        let files = desired_mount_service(&mount_service_pins()).unwrap();
         let script = String::from_utf8(files.script.clone()).unwrap();
         let plist = String::from_utf8(files.plist.clone()).unwrap();
 
-        assert!(script.contains(&shell_quote("/private/cowshed")));
-        assert!(script.contains(&shell_quote("/Users/test/Dev/my 'shed")));
+        assert!(!script.contains(".Spotlight-V100"));
         assert!(
-            script
-                .find("ensure_spotlight_exclusions '/System/Volumes/Data/")
-                .unwrap()
-                < script.find("mount_volume 'cowshed.store'").unwrap()
+            script.rfind("mount_volume '").unwrap()
+                < script.find("opt_out_of_spotlight '").unwrap(),
+            "every mount precedes every Spotlight opt-out"
         );
-        assert!(script.contains("boot_step='merge Spotlight Search Privacy exclusions'"));
+        assert!(script.ends_with(&boot_calls(&mount_service_pins()).unwrap()));
         assert!(script.contains("if password=$("));
         assert!(script.contains("unset password"));
         assert!(script.contains("refused (exit %s)"));
@@ -4931,7 +4828,10 @@ mod tests {
         assert!(plist.contains("<string>/bin/sh</string>"));
         assert!(plist.contains(MOUNT_SERVICE_SCRIPT));
         assert!(plist.contains("<key>RunAtLoad</key>"));
-        assert!(plist.contains("<key>SuccessfulExit</key>"));
+        assert!(
+            !plist.contains("<key>KeepAlive</key>"),
+            "a failed boot runs once"
+        );
         assert!(plist.contains("<key>StandardErrorPath</key>"));
         assert!(plist.contains("/var/log/cowshed-storage.log"));
         Value::from_reader_xml(files.plist.as_slice()).expect("valid launchd plist");
@@ -4951,7 +4851,7 @@ mod tests {
 
     #[test]
     fn boot_mount_service_install_is_current_only_for_exact_loaded_contents() {
-        let files = desired_mount_service(&mount_service_pins(), &[]).unwrap();
+        let files = desired_mount_service(&mount_service_pins()).unwrap();
         assert!(mount_service_contents_are_current(
             &files,
             Some(&files.script),
@@ -5027,7 +4927,7 @@ mod tests {
      {
         let (commands, received) = mpsc::channel();
         let host = MountServiceInstallHost { commands };
-        let files = desired_mount_service(&mount_service_pins(), &[]).unwrap();
+        let files = desired_mount_service(&mount_service_pins()).unwrap();
         install_mount_service_with(&host, &files).unwrap();
         let commands = received.try_iter().collect::<Vec<_>>();
 
@@ -5080,7 +4980,7 @@ mod tests {
     fn boot_mount_service_rejects_non_uuid_identifiers_before_shell_rendering() {
         let mut pins = mount_service_pins();
         pins[0].volume_uuid = "disk3s8; touch /tmp/pwned".to_owned();
-        let error = desired_mount_service(&pins, &[]).unwrap_err();
+        let error = desired_mount_service(&pins).unwrap_err();
         assert!(matches!(
             error,
             NativeBootstrapError::MalformedApfsInventory(_)

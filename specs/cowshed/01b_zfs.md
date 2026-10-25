@@ -264,13 +264,13 @@ adopt, fork, land and `rm`, and requires the counts equal.
   layouts"); the store at `/private/cowshed/store`.
 - **Spotlight.** The same three measures as APFS, none of them a disk property. The canonical mount root contains
   `/var/folders/`, which mds's volume factory rejects before it constructs a record, whatever the filesystem type
-  (01a_apfs.md, "Spotlight media references"). The root storage service merges the store and the per-user mount roots
-  into the Data volume's Spotlight Search Privacy `Exclusions` at setup and boot, preserving other entries (01a_apfs.md,
-  "Images", Spotlight). Adopt plants `.metadata_never_index` at main's worktree root, and every snapshot clone carries
-  it. These express indexing policy. That mds takes no media reference for a dataset follows from the mechanism, not a
-  measurement: its leaking lookup acquires the IOKit service of an APFS volume's media, and a dataset with `devdisk=off`
-  and `mimic=off` has neither media nor the `apfs` type. `cowshed doctor`'s `departed-volume-references` remains the
-  instrument.
+  (01a_apfs.md, "Spotlight media references"). The root storage service plants `.metadata_never_index` at the root of
+  each volume it mounts at boot, after its mounts, and writes no Search Privacy `Exclusions`, whose Data-volume store
+  refuses even root (01a_apfs.md, "Images", Spotlight). Adopt plants `.metadata_never_index` at main's worktree root,
+  and every snapshot clone carries it. These express indexing policy. That mds takes no media reference for a dataset
+  follows from the mechanism, not a measurement: its leaking lookup acquires the IOKit service of an APFS volume's
+  media, and a dataset with `devdisk=off` and `mimic=off` has neither media nor the `apfs` type. `cowshed doctor`'s
+  `departed-volume-references` remains the instrument.
 - **Finder.** `com.apple.browse=off` keeps every dataset out of Finder, the Desktop and the sidebar, as `nobrowse` does
   for APFS, and nothing mounts under `/Volumes`.
 

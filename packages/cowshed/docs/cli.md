@@ -83,11 +83,12 @@ validates the volume marker, pins the boot mount in `/etc/fstab`, and installs t
 system LaunchDaemon. That daemon runs a fixed `/bin/sh` script of the volume UUIDs and canonical paths
 (`/Library/Application Support/dev.cowshed/mount-volumes.sh`); before login and without invoking the cowshed binary, it
 reads each passphrase from System.keychain, runs `diskutil apfs unlockVolume -nomount`, then mounts the volume with
-`-nobrowse` at its canonical path; a refusal names its step and script line in `/var/log/cowshed-storage.log`. fstab
-keeps `noauto` so Disk Arbitration does not race it. Setup never recreates a volume: existing volumes are encrypted in
-place, and the only volume it ever deletes is a retired caches volume, under `--retire-caches-volume` (below). On a
-healthy host it changes nothing and says so. Every storage error in the CLI points here — a host with no volumes has no
-checkout to adopt.
+`-nobrowse` at its canonical path. Once every volume is mounted it plants an empty `.metadata_never_index` at each
+volume's root to keep Spotlight off it. It runs once per boot and launchd does not restart it: a refusal names its step
+and script line in `/var/log/cowshed-storage.log`. fstab keeps `noauto` so Disk Arbitration does not race it. Setup
+never recreates a volume: existing volumes are encrypted in place, and the only volume it ever deletes is a retired
+caches volume, under `--retire-caches-volume` (below). On a healthy host it changes nothing and says so. Every storage
+error in the CLI points here — a host with no volumes has no checkout to adopt.
 
 Once the store is mounted, setup brings its layout current before anything else reads it. Only a directory that holds
 `.cowshed-owner` is a project owner to every command, so a directory dropped into the store root costs nothing. A store
