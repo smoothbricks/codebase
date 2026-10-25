@@ -2252,7 +2252,13 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         .collect();
     assert_eq!(
         relabels,
-        ["rename-volume:[cowshed] acme · widget — main"],
+        [format!(
+            "rename-volume:{}",
+            substrate
+                .config()
+                .namespace
+                .volume_label(format_args!("acme · widget — main"))
+        )],
         "a replacement restore relabels its staging volume before publication; create and fork \
          leave the inherited label to the workspace's supervisor, off the provisioning path"
     );
