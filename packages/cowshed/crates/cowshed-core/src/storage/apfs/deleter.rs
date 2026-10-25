@@ -358,6 +358,11 @@ mod tests {
         ));
         released(&legacy);
 
+        // Main's image lock is held, as a client's opening or a fork of main holds it: the pass
+        // takes no project's image lock, so it frees all the same and never cuts under one.
+        let main_lock =
+            fs::File::create(store.join("acme/widget/main.dmg.lock")).expect("main's image lock");
+        main_lock.try_lock().expect("hold main's image lock");
         let pass = startup_pass(&store);
         assert_eq!(pass.drained.images, left.len(), "{pass:?}");
         assert!(left.iter().all(|entry| !entry.exists()));
