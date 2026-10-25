@@ -1422,6 +1422,86 @@ impl HostProcesses {
     }
 }
 
+/// Block until `name` is an entry of `dir`, or until the write end of `cancel` closes; answers
+/// whether the entry appeared. The kernel's `NOTE_WRITE` on the directory wakes it to look again,
+/// so its writer must rename the entry into place whole: its appearance is then its content.
+fn await_entry(dir: &Path, name: &str, cancel: std::io::PipeReader) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let directory = fs::File::open(dir).expect("open the watched directory");
+    // SAFETY: kqueue takes no arguments; a negative answer is an error.
+    let queue = unsafe { libc::kqueue() };
+    assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
+    // SAFETY: `queue` is a new descriptor this function alone owns.
+    let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+    let changes = [
+        libc::kevent {
+            ident: directory.as_raw_fd() as libc::uintptr_t,
+            filter: libc::EVFILT_VNODE,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: libc::NOTE_WRITE,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        },
+        libc::kevent {
+            ident: cancel.as_raw_fd() as libc::uintptr_t,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        },
+    ];
+    // SAFETY: two valid changes, no events requested back, no timeout.
+    let registered = unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            changes.as_ptr(),
+            2,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(
+        registered,
+        0,
+        "watch {}: {}",
+        dir.display(),
+        std::io::Error::last_os_error()
+    );
+    // Registered before the first look, so an entry renamed in after it still wakes the wait.
+    loop {
+        if dir.join(name).exists() {
+            return true;
+        }
+        // SAFETY: an all-zero `kevent` is a valid value of the plain C struct.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        // SAFETY: no changes, room for one event out, no timeout: block until one fires.
+        let fired = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                std::ptr::null(),
+            )
+        };
+        if fired == 1 && event.ident == cancel.as_raw_fd() as libc::uintptr_t {
+            return dir.join(name).exists();
+        }
+        if fired < 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EINTR),
+                "watch {}: {error}",
+                dir.display()
+            );
+        }
+    }
+}
+
 /// Block until `pid` has exited: the kernel's `NOTE_EXIT` for it, which it posts only once the
 /// process has released what it held. A pid already gone answers `ESRCH` when registered, which
 /// is its exit. No duration: the test runner's no-progress bound names a process that never
@@ -7768,7 +7848,7 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
     .unwrap();
     fs::write(
         fixture.checkout.join("scripts/post.js"),
-        "const fs = require('fs');\nfs.rmSync('node_modules/nx', { force: true });\nfs.rmSync('node_modules/.bin/nx', { force: true });\nfs.writeFileSync('ready', process.env.TMPDIR);\nsetInterval(() => {}, 1000);\n",
+        "const fs = require('fs');\nfs.rmSync('node_modules/nx', { force: true });\nfs.rmSync('node_modules/.bin/nx', { force: true });\nfs.writeFileSync('ready.part', process.env.TMPDIR);\nfs.renameSync('ready.part', 'ready');\nsetInterval(() => {}, 1000);\n",
     )
     .unwrap();
     fs::write(
@@ -7892,11 +7972,22 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
         .expect("start bun install as a covered job");
 
     let ready = topic.join("ready");
-    // The wait ends at the sentinel or when the job ends, never at a clock. A job that ends
-    // before writing `ready` is reported with its actual state and stderr.
-    while !fs::read_to_string(&ready).is_ok_and(|text| !text.is_empty()) {
-        let status = job.status().await.expect("the covered job's status");
-        if status.state.is_terminal() {
+    // The wait ends at the sentinel or at the job's end, whichever comes first, never at a clock:
+    // the postinstall renames `ready` into place whole, and a job that ends before it is reported
+    // with its actual state and stderr.
+    let (cancel, stop_watching) = std::io::pipe().expect("the sentinel watch's cancel pipe");
+    let watch = {
+        let topic = topic.clone();
+        tokio::task::spawn_blocking(move || await_entry(&topic, "ready", cancel))
+    };
+    tokio::select! {
+        appeared = watch => assert!(
+            appeared.expect("the sentinel watch's thread"),
+            "the sentinel watch ended without the sentinel"
+        ),
+        ended = job.wait() => {
+            drop(stop_watching);
+            let ended = ended.expect("the covered job's terminal record");
             let mut logs = job
                 .logs(cowshed_core::api::JobStream::Stderr, 0, false)
                 .await
@@ -7907,12 +7998,11 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
             }
             panic!(
                 "the covered install ended before its postinstall was ready: state {:?}, exit {:?}, stderr: {}",
-                status.state,
-                status.exit,
+                ended.state,
+                ended.exit,
                 String::from_utf8_lossy(&stderr)
             );
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
         fs::symlink_metadata(topic.join("node_modules/nx")).is_err(),
