@@ -1006,6 +1006,7 @@ name = "cowshed-os"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "lmao-core",
  "rustix",
  "thiserror",
  "tokio",

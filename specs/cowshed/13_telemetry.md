@@ -14,11 +14,13 @@ debugging (span waterfalls), security (audit joins), and fleet ops (SLOs from re
 specifically because it is trace-first and **deterministic** — with an injected `Clock` and `Entropy` it emits
 bit-identical trace bytes for a given `(build, seed, config)` (see `packages/lmao`).
 
-**Dependency honesty**: cowshed does not depend on lmao's crates. One `cowshed-core` module writes lmao's Arrow trace
-schema — the system-column prefix, the entry-type dictionary and sealed-segment publication — byte-for-byte aligned with
-`lmao-arrow`'s, because that crate cannot be imported without its `lmao-core` runtime. The gateway's request spans and
-the supervisor's job spans both use that module; neither keeps a copy. Nothing in cowshed queries traces with
-`lmao-query`.
+**Dependency honesty**: cowshed takes from lmao only `lmao-core`'s dependency-free value types: the deadline and retry
+vocabulary (`Deadline`, `LatencyClass`, `RetryClass`, `BlockedReason`; specs/lmao/01r_transient_errors_and_retry.md,
+"Rust"). It does not take lmao's telemetry runtime, so cowshed works without lmao's tracing. One `cowshed-core` module
+writes lmao's Arrow trace schema — the system-column prefix, the entry-type dictionary and sealed-segment publication —
+byte-for-byte aligned with `lmao-arrow`'s, because that crate cannot be imported without `lmao-core`'s span buffers. The
+gateway's request spans and the supervisor's job spans both use that module; neither keeps a copy. Nothing in cowshed
+queries traces with `lmao-query`.
 
 **Job span segments.** The workspace supervisor writes each job's span with the trace context the controller minted or
 adopted for it (`JobInfo.trace`): a `span-start` row at admission, the `job.unattributed` row below when its terminal

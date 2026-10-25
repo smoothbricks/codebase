@@ -9,6 +9,8 @@ publish.workspace = true
 # disk-image layer builds without the workspace controller.
 [dependencies]
 libc = "0.2"
+# The deadline vocabulary only (13_telemetry.md, "Dependency honesty"): lmao-core has no dependencies.
+lmao-core.workspace = true
 thiserror = "2"
 tokio.workspace = true
 uuid = { version = "1", features = ["v4"] }

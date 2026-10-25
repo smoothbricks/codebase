@@ -831,6 +831,40 @@ Every request is one line. A one-shot request is followed by the client's EOF an
 `disk-lease`, `cpu-tokens`, `jobserver` or `resident-pool` request is held for as long as its client keeps the
 connection open, and a `ram-lease` until its client's end line or the connection's end.
 
+## Deadlines
+
+Every wait one cowshed process has on another has a bound sized to its latency class. On expiry the wait ends and
+answers a typed failure that names the op, the peer (its socket and pid), the bound, the time waited and the last
+progress the waiter saw. The expiry ends the wait, never the peer. Nothing retries around the failure and nothing raises
+the bound to pass it: the failure is the diagnosis. The values are `lmao-core`'s (`Deadline`, `Idle`, `Expired`,
+`Silent`, `RetryClass`; specs/lmao/01r_transient_errors_and_retry.md, "Rust"). The shell that maps a connection's reads
+and writes and the timer onto them is `cowshed-os::deadline` (`PeerStream`, `within`, `establish`).
+
+| class     | covers                                                     | bound |
+| --------- | ---------------------------------------------------------- | ----- |
+| control   | connecting to a running daemon and sending it one request  | 5 s   |
+| handshake | connecting to a peer that should be running, and its hello | 10 s  |
+| reap      | a child's exit once its pipes closed or it was killed      | 5 s   |
+
+These are initial values, generous against sub-second local answers. Each will be replaced by its measured p99 under
+land-gate load × 20, recorded here with the date and the command that measured it.
+
+- **Codes.** `TIMEOUT` is a request past its class's bound. `SILENT` is a long wait whose holder showed no progress for
+  its silence bound. `PEER_LOST` means the peer ended the connection before answering, so the outcome is unknown and the
+  caller reads state again. These three are terminal. `BLOCKED` means nothing listens at the socket (missing, or
+  refusing with nothing attached); it is lmao's `Blocked(service)`, and the caller states its own fallback.
+- **A long wait has no total ceiling; its holder heartbeats.** Some answers take as long as their work: a job's
+  terminal, a log follow, a commitments read, an advance. While such an answer is not ready, the workspace supervisor
+  writes `{"progress":{"seq":n,"job":{jobId,state,members}|null}}` on the call's connection every 5 s. The job field is
+  present for a call about a job. The client connects and sends within the control bound, then reads past the heartbeats
+  under a silence bound of 15 s (three heartbeats). So a supervisor that is alive but silent, or whose actor stopped
+  answering (the heartbeat reads the job through the actor), fails `SILENT` naming its socket and pid. A heartbeat about
+  a job that is running or draining with no process of its group left is not progress. If that state persists for the
+  silence bound, the wait fails `SILENT`, naming the job as stuck between its last process and its end. A queued job is
+  progress, because CPU tokens have no admission deadline (Host CPU budget, "No admission deadline, for any class").
+- **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
+  with the failure's message.
+
 ## Disk-lifecycle lease
 
 Disk-changing tools and descriptor-native unmounts cowshed runs on the host — the CLI's, a supervisor's, the gateway's

@@ -31,8 +31,8 @@ use super::supervisor::{
     SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use crate::api::dto::{
-    AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobId,
-    JobJournalCursor, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand,
+    AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobId, JobInfo,
+    JobJournalCursor, JobState, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand,
     Sha256Digest, StdinSource, TraceContext, WorkspacePath,
 };
 #[cfg(not(target_os = "macos"))]
@@ -44,6 +44,7 @@ use crate::api::resources::SampleInterval;
 use crate::api::server::codec::Demand;
 use crate::error::{CowshedError, Result};
 use crate::storage::job_artifact::StreamKind;
+use cowshed_os::deadline::{self, PeerStream, Progress, Silent, WaitError};
 use cowshed_os::fork_lock::Fenced;
 
 /// The identity of a cowshed build: the Mach-O `LC_UUID` the linker derives from the image's
@@ -142,9 +143,6 @@ fn image_build_id() -> std::result::Result<String, String> {
 
 /// How long a commitments read waits for one to arrive before answering empty.
 const COMMITMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// How long a supervisor may take to answer hello.
-const HELLO_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Bound on one JSON frame: an exec request carries at most a 1 MiB command plus its
 /// environment; a job list is bounded by the jobs one supervisor keeps resident.
@@ -394,6 +392,42 @@ enum Call {
     },
 }
 
+impl Call {
+    /// The call as a wait on its answer names it.
+    const fn op(&self) -> &'static str {
+        match self {
+            Self::OpenSession { .. } => "open-session",
+            Self::SessionSnapshot { .. } => "session-snapshot",
+            Self::CloseSession { .. } => "close-session",
+            Self::Exec { .. } => "exec",
+            Self::StdinWrite { .. } => "stdin-write",
+            Self::StdinClose { .. } => "stdin-close",
+            Self::StreamChunk { .. } => "stream-chunk",
+            Self::StreamEnd { .. } => "stream-end",
+            Self::Info { .. } => "info",
+            Self::Sealed { .. } => "sealed",
+            Self::Resources { .. } => "resources",
+            Self::Processes { .. } => "processes",
+            Self::ProcessEvents { .. } => "process-events",
+            Self::TraceHealth => "trace-health",
+            Self::ListeningPorts { .. } => "listening-ports",
+            Self::JobByKey { .. } => "job-by-key",
+            Self::Progress { .. } => "progress",
+            Self::List => "list",
+            Self::Kill { .. } => "kill",
+            Self::Detach { .. } => "detach",
+            Self::Wait { .. } => "wait",
+            Self::Hold { .. } => "hold",
+            Self::LogRead { .. } => "log-read",
+            Self::Tail { .. } => "tail",
+            Self::Checkpoint { .. } => "checkpoint",
+            Self::Retire { .. } => "retire",
+            Self::StopNxKeeper => "stop-nx-keeper",
+            Self::NameBuildVolume { .. } => "name-build-volume",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum StreamWire {
@@ -543,6 +577,55 @@ enum Response {
         bytes: usize,
     },
     Err(CowshedError),
+    /// A call not answered yet, said every [`deadline::HEARTBEAT`] until it is (05_gateway.md,
+    /// "Deadlines").
+    Progress(ProgressWire),
+}
+
+/// What a call still being answered says each heartbeat: how many it has said, and for a call
+/// about a job, that job as the supervisor holds it now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProgressWire {
+    seq: u64,
+    job: Option<JobPulse>,
+}
+
+/// A job as a heartbeat reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JobPulse {
+    job_id: JobId,
+    state: JobState,
+    /// How many processes of the job's group its latest sample found running; absent before the
+    /// job's first sample.
+    members: Option<usize>,
+}
+
+impl JobPulse {
+    fn of(info: &JobInfo) -> Self {
+        Self {
+            job_id: info.job_id,
+            state: info.state,
+            members: info.resources.as_ref().map(|sample| sample.members.len()),
+        }
+    }
+
+    /// Whether the job is getting somewhere. Queued, it waits for tokens, which have no admission
+    /// deadline; running or draining, something of its group still runs; ended, its answer is on
+    /// the way. A job whose group is empty but which has not ended is stuck between its last
+    /// process and its end, and a waiter must not take that for progress.
+    fn advances(self) -> bool {
+        match self.state {
+            JobState::Queued => true,
+            JobState::Running | JobState::Draining => self.members != Some(0),
+            JobState::Exited
+            | JobState::Signaled
+            | JobState::Killed
+            | JobState::OutputLimit
+            | JobState::Failed => true,
+        }
+    }
 }
 
 pub(super) fn protocol_error(message: impl Into<String>) -> CowshedError {
@@ -596,6 +679,38 @@ pub(super) async fn write_json<T: Serialize>(
     write_frame(stream, &bytes, MAX_JSON_FRAME).await
 }
 
+/// Answer a call with `work`, saying every [`deadline::HEARTBEAT`] until it is done that the
+/// call is still being answered, and for a call about `job`, how that job stands
+/// (05_gateway.md, "Deadlines"). The job is read through the supervisor's actor, so an actor that
+/// stops answering stops the heartbeat too, and the caller's silence bound reports it.
+async fn heartbeating<T>(
+    writer: &mut (impl AsyncWrite + Unpin),
+    job: Option<(&WorkspaceSupervisorHandle, JobId)>,
+    work: impl Future<Output = T>,
+) -> Result<T> {
+    tokio::pin!(work);
+    let mut beats = tokio::time::interval_at(
+        tokio::time::Instant::now() + deadline::HEARTBEAT,
+        deadline::HEARTBEAT,
+    );
+    beats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut seq = 0_u64;
+    loop {
+        tokio::select! {
+            biased;
+            answer = &mut work => return Ok(answer),
+            _ = beats.tick() => {
+                seq += 1;
+                let job = match job {
+                    Some((supervisor, job_id)) => Some(JobPulse::of(&supervisor.info(job_id).await?)),
+                    None => None,
+                };
+                write_json(writer, &Response::Progress(ProgressWire { seq, job })).await?;
+            }
+        }
+    }
+}
+
 pub(super) async fn read_json<T: for<'de> Deserialize<'de>>(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<T> {
@@ -608,7 +723,11 @@ async fn read_bytes(stream: &mut UnixStream, length: usize) -> Result<Bytes> {
     if length == 0 {
         return Ok(Bytes::new());
     }
-    let bytes = read_frame(stream, MAX_BYTES_FRAME).await?;
+    announced(read_frame(stream, MAX_BYTES_FRAME).await?, length)
+}
+
+/// A raw frame, which its JSON frame announced as `length` bytes.
+fn announced(bytes: Vec<u8>, length: usize) -> Result<Bytes> {
     if bytes.len() != length {
         return Err(protocol_error(format!(
             "raw frame is {} bytes, announced {length}",
@@ -616,6 +735,127 @@ async fn read_bytes(stream: &mut UnixStream, length: usize) -> Result<Bytes> {
         )));
     }
     Ok(Bytes::from(bytes))
+}
+
+/// The process every client connection of this module waits on, as its failures name it.
+const SUPERVISOR: &str = "workspace supervisor";
+
+/// A wait on the supervisor that ended without its answer, as the caller's error. The message
+/// is the wait's own: its code, op, the supervisor's socket and pid, the time waited and the last
+/// progress seen.
+fn waited(failure: WaitError) -> CowshedError {
+    let hint = match &failure {
+        WaitError::Expired(_) | WaitError::Silent(_) => {
+            "the supervisor is alive and not answering; cowshed doctor --json names its process"
+        }
+        // The supervisor went away mid-call: the call's outcome is unknown, so the caller reads
+        // job state again rather than assuming either way.
+        WaitError::PeerLost { .. } => {
+            "read the job's state again; cowshed restarts the workspace supervisor"
+        }
+        WaitError::Absent { .. } | WaitError::Io { .. } => {
+            "retry; cowshed restarts the workspace supervisor"
+        }
+    };
+    CowshedError::environment_missing(failure.to_string(), hint)
+}
+
+/// Connect to the supervisor at `path` for `op`, whose request has `bound` from now.
+async fn open(
+    path: &Path,
+    op: &'static str,
+    bound: deadline::Bound,
+) -> Result<PeerStream<UnixStream>> {
+    PeerStream::connect(SUPERVISOR, path, deadline::start(op, bound))
+        .await
+        .map_err(waited)
+}
+
+/// Send `request`, and `payload` as its raw frame, within the connection's bound.
+async fn send(
+    stream: &mut PeerStream<impl AsyncRead + AsyncWrite + Unpin>,
+    request: &impl Serialize,
+    payload: &[u8],
+) -> Result<()> {
+    let bytes = serde_json::to_vec(request)
+        .map_err(|error| protocol_error(format!("encoding failed: {error}")))?;
+    send_frame(stream, &bytes, MAX_JSON_FRAME).await?;
+    if !payload.is_empty() {
+        send_frame(stream, payload, MAX_BYTES_FRAME).await?;
+    }
+    Ok(())
+}
+
+async fn send_frame(
+    stream: &mut PeerStream<impl AsyncWrite + Unpin>,
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<()> {
+    let length = crate::api::frame::frame_length(bytes, maximum)
+        .ok_or_else(|| protocol_error("frame exceeds its bound"))?;
+    let written = crate::api::frame::write_frame_io(stream, length, bytes).await;
+    written.map_err(|error| waited(stream.fail(error)))
+}
+
+async fn receive_frame(
+    stream: &mut PeerStream<impl AsyncRead + Unpin>,
+    maximum: usize,
+) -> Result<Vec<u8>> {
+    let read = crate::api::frame::read_frame_io(stream, maximum).await;
+    read.map_err(|error| waited(stream.fail(error)))?
+        .ok_or_else(|| protocol_error("frame exceeds its bound"))
+}
+
+/// Read a call's answer, past the heartbeats the supervisor sends while it is still answering:
+/// its value and raw frame, or its error. The connection's bound decides how long the supervisor
+/// may say nothing. A heartbeat about a job whose processes have all ended without the job ending
+/// is no progress, and the same silence bound decides how long that may last before the wait
+/// fails naming the job.
+async fn answer_of(
+    stream: &mut PeerStream<impl AsyncRead + Unpin>,
+) -> Result<(serde_json::Value, Bytes)> {
+    let mut stalled = deadline::idle(stream.op(), deadline::HEARTBEAT_SILENCE);
+    loop {
+        let frame = receive_frame(stream, MAX_JSON_FRAME).await?;
+        let response = serde_json::from_slice::<Response>(&frame)
+            .map_err(|error| protocol_error(format!("malformed frame: {error}")))?;
+        let pulse = match response {
+            Response::Ok { value, bytes } => {
+                let raw = if bytes == 0 {
+                    Bytes::new()
+                } else {
+                    announced(receive_frame(stream, MAX_BYTES_FRAME).await?, bytes)?
+                };
+                return Ok((value, raw));
+            }
+            Response::Err(error) => return Err(error),
+            Response::Progress(pulse) => pulse,
+        };
+        match pulse.job {
+            Some(job) if !job.advances() => {
+                if stalled.remaining(deadline::clock()).is_none() {
+                    let holder = format!(
+                        "job {} ({:?} with no process of its group running) of {}",
+                        job.job_id.get(),
+                        job.state,
+                        stream.peer()
+                    );
+                    return Err(stuck(stalled.silent(holder, deadline::clock())));
+                }
+            }
+            Some(_) | None => {
+                stalled.observe(Progress::Heartbeat { seq: pulse.seq }, deadline::clock());
+            }
+        }
+    }
+}
+
+/// A job that stopped between its last process and its end, as the waiter's error.
+fn stuck(silent: Silent<String>) -> CowshedError {
+    CowshedError::environment_missing(
+        silent.to_string(),
+        "the supervisor has not published the job's end; cowshed doctor --json names the supervisor",
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1866,12 +2106,18 @@ async fn serve_membership_call(
             return Ok(Retirement::Serving);
         }
     };
-    let outcome = membership_request(&stream, supervisor, request).await;
+    let (reader, mut writer) = stream.split();
+    let outcome = heartbeating(
+        &mut writer,
+        None,
+        membership_request(reader.as_ref(), supervisor, request),
+    )
+    .await?;
     let response = match outcome {
         Ok(value) => Response::Ok { value, bytes: 0 },
         Err(error) => Response::Err(error),
     };
-    write_json(&mut stream, &response).await?;
+    write_json(&mut writer, &response).await?;
     Ok(Retirement::Serving)
 }
 
@@ -1915,7 +2161,13 @@ async fn membership_request(
 
 /// Ask about this connection's own live process, never a pid supplied by the caller.
 pub async fn subtree_handle(path: &Path) -> Result<JobSubtreeAdmission> {
-    let (value, _) = exchange(path, &MembershipRequest::SubtreeHandle, Bytes::new()).await?;
+    let (value, _) = exchange(
+        path,
+        "subtree handle",
+        &MembershipRequest::SubtreeHandle,
+        Bytes::new(),
+    )
+    .await?;
     decode(value)
 }
 
@@ -1933,6 +2185,7 @@ pub async fn retire_descendants(
     })?;
     let (value, _) = exchange(
         path,
+        "retire descendants",
         &MembershipRequest::RetireDescendants { handle, grace_ms },
         Bytes::new(),
     )
@@ -1974,7 +2227,10 @@ async fn serve_call(
         Request::Commitments { after } => {
             let response = match feed {
                 Some(feed) => Response::Ok {
-                    value: to_value(&feed.since(after, COMMITMENT_WAIT).await)?,
+                    value: to_value(
+                        &heartbeating(&mut stream, None, feed.since(after, COMMITMENT_WAIT))
+                            .await?,
+                    )?,
                     bytes: 0,
                 },
                 None => Response::Err(CowshedError::conflict(
@@ -2004,11 +2260,13 @@ async fn serve_call(
                 Some(advances) => {
                     let (reply, answer) = oneshot::channel();
                     match advances.send(reply).await {
-                        Ok(()) => answer.await.unwrap_or_else(|_| {
-                            Err(CowshedError::internal(
-                                "the supervisor process stopped before advancing",
-                            ))
-                        }),
+                        Ok(()) => heartbeating(&mut stream, None, answer)
+                            .await?
+                            .unwrap_or_else(|_| {
+                                Err(CowshedError::internal(
+                                    "the supervisor process stopped before advancing",
+                                ))
+                            }),
                         Err(_) => Err(CowshedError::internal(
                             "the supervisor process no longer takes advances",
                         )),
@@ -2078,7 +2336,13 @@ async fn serve_call(
         value,
         bytes,
         admitted,
-    } = match answer(&caller, streams, *call, payload).await {
+    } = match heartbeating(
+        &mut stream,
+        reads.map(|(job, _)| (&caller, job)),
+        answer(&caller, streams, *call, payload),
+    )
+    .await?
+    {
         Ok(answer) => answer,
         Err(error) => {
             // A refused exec admitted nothing: the drain need not wait for its caller to read
@@ -2606,49 +2870,51 @@ pub async fn hello(path: &Path) -> Result<Hello> {
 /// peer's unknown response, malformed protocol, or bounded hello timeout is an error, never proof
 /// it stopped.
 pub async fn hello_if_present(path: &Path) -> Result<Option<Hello>> {
-    tokio::time::timeout(HELLO_BOUND, async {
-        let mut stream = match UnixStream::connect(path).await {
-            Ok(stream) => stream,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                return match occupant(path) {
-                    Ok(Occupant::Absent | Occupant::Stopped) => Ok(None),
-                    Ok(Occupant::Live) => Err(CowshedError::environment_missing(
-                        format!(
-                            "the workspace supervisor socket {} refuses connections while a \
-                             socket is still attached to it: its queue is full, or its holder \
-                             does not accept",
-                            path.display()
-                        ),
-                        "retry once the operation holding it finishes; cowshed doctor --json",
-                    )),
-                    Err(error) => Err(unavailable(path, &error)),
-                };
-            }
-            Err(error) => return Err(unavailable(path, &error)),
-        };
-        let (value, _) = match exchange_on(&mut stream, path, &Request::Hello, Bytes::new()).await {
-            Ok(answer) => answer,
-            Err(error) => {
-                return match occupant(path) {
-                    Ok(Occupant::Absent | Occupant::Stopped) => Ok(None),
-                    Ok(Occupant::Live) | Err(_) => Err(error),
-                };
-            }
-        };
-        decode_hello(path, value).map(Some)
-    })
+    let mut stream = match PeerStream::connect(
+        SUPERVISOR,
+        path,
+        deadline::start("hello", deadline::HANDSHAKE),
+    )
     .await
-    .map_err(|_| {
-        CowshedError::environment_missing(
-            format!(
-                "the workspace supervisor at {} did not answer within {} seconds",
-                path.display(),
-                HELLO_BOUND.as_secs()
-            ),
-            "cowshed doctor --json",
-        )
-    })?
+    {
+        Ok(stream) => stream,
+        Err(WaitError::Absent { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(WaitError::Absent { source, .. })
+            if source.kind() == io::ErrorKind::ConnectionRefused =>
+        {
+            return match occupant(path) {
+                Ok(Occupant::Absent | Occupant::Stopped) => Ok(None),
+                Ok(Occupant::Live) => Err(CowshedError::environment_missing(
+                    format!(
+                        "the workspace supervisor socket {} refuses connections while a \
+                         socket is still attached to it: its queue is full, or its holder \
+                         does not accept",
+                        path.display()
+                    ),
+                    "retry once the operation holding it finishes; cowshed doctor --json",
+                )),
+                Err(error) => Err(unavailable(path, &error)),
+            };
+        }
+        Err(failure) => return Err(waited(failure)),
+    };
+    // Hello is answered at once, so the whole exchange stays inside the handshake bound.
+    let answered = match send(&mut stream, &Request::Hello, &[]).await {
+        Ok(()) => answer_of(&mut stream).await,
+        Err(error) => Err(error),
+    };
+    let (value, _) = match answered {
+        Ok(answer) => answer,
+        Err(error) => {
+            return match occupant(path) {
+                Ok(Occupant::Absent | Occupant::Stopped) => Ok(None),
+                Ok(Occupant::Live) | Err(_) => Err(error),
+            };
+        }
+    };
+    decode_hello(path, value).map(Some)
 }
 
 fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
@@ -2696,7 +2962,13 @@ fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
 /// The commitments the supervisor at `path` recorded after cursor `after`; waits a while for
 /// one when there is none, then answers empty.
 pub async fn commitments(path: &Path, after: u64) -> Result<super::commitment_feed::FeedPage> {
-    let (value, _) = exchange(path, &Request::Commitments { after }, Bytes::new()).await?;
+    let (value, _) = exchange(
+        path,
+        "commitments",
+        &Request::Commitments { after },
+        Bytes::new(),
+    )
+    .await?;
     decode(value)
 }
 
@@ -2704,6 +2976,7 @@ pub async fn commitments(path: &Path, after: u64) -> Result<super::commitment_fe
 pub async fn acknowledge_commitments(path: &Path, through: u64) -> Result<()> {
     exchange(
         path,
+        "acknowledge commitments",
         &Request::AcknowledgeCommitments { through },
         Bytes::new(),
     )
@@ -2730,18 +3003,17 @@ impl Drained {
 /// Ask the supervisor at `path` to admit nothing more and retire once its running jobs end,
 /// whatever protocol it speaks otherwise; the process serving it.
 pub async fn drain(path: &Path) -> Result<Drained> {
-    let mut stream = UnixStream::connect(path)
-        .await
-        .map_err(|error| unavailable(path, &error))?;
-    let process = super::job_groups::Process::of_socket_peer(&stream).map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "cannot identify the supervisor at {}: {error}",
-                path.display()
-            ),
-            "use a host with kernel peer identities; retain the supervisor and its ledger",
-        )
-    })?;
+    let mut stream = open(path, "drain", deadline::CONTROL).await?;
+    let process =
+        super::job_groups::Process::of_socket_peer(stream.get_ref()).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot identify the supervisor at {}: {error}",
+                    path.display()
+                ),
+                "use a host with kernel peer identities; retain the supervisor and its ledger",
+            )
+        })?;
     let exit = process.watch_exit().map_err(|error| {
         CowshedError::environment_missing(
             format!(
@@ -2751,7 +3023,9 @@ pub async fn drain(path: &Path) -> Result<Drained> {
             "retry once it has exited; its jobs and ledger are retained",
         )
     })?;
-    let (value, _) = exchange_on(&mut stream, path, &Request::Drain, Bytes::new()).await?;
+    // A drain is answered at once, so the whole exchange stays inside the control bound.
+    send(&mut stream, &Request::Drain, &[]).await?;
+    let (value, _) = answer_of(&mut stream).await?;
     let answered: u32 = decode(value)?;
     if i32::try_from(answered).ok() != Some(process.pid()) {
         return Err(protocol_error(format!(
@@ -2831,7 +3105,7 @@ pub async fn await_other_build_retired(path: &Path, deadline: std::time::Instant
 /// Ask the supervisor at `path` to serve under its workspace's current grants; the authority
 /// it serves afterwards.
 pub async fn advance(path: &Path) -> Result<WorkspaceAuthoritySnapshot> {
-    let (value, _) = exchange(path, &Request::Advance, Bytes::new()).await?;
+    let (value, _) = exchange(path, "advance", &Request::Advance, Bytes::new()).await?;
     let authority: AuthorityWire = decode(value)?;
     Ok(authority.into())
 }
@@ -2854,48 +3128,28 @@ async fn round_trip(
     call: Call,
     payload: Bytes,
 ) -> Result<(serde_json::Value, Bytes)> {
+    let op = call.op();
     let request = Request::Call {
         authority,
         call: Box::new(call),
         bytes: payload.len(),
     };
-    exchange(path, &request, payload).await
+    exchange(path, op, &request, payload).await
 }
 
+/// One call to the supervisor at `path` (05_gateway.md, "Deadlines"): connected and sent within
+/// one control bound, then answered while the supervisor heartbeats, however long the answer
+/// takes to be ready.
 async fn exchange(
     path: &Path,
+    op: &'static str,
     request: &impl Serialize,
     payload: Bytes,
 ) -> Result<(serde_json::Value, Bytes)> {
-    let mut stream = UnixStream::connect(path)
-        .await
-        .map_err(|error| unavailable(path, &error))?;
-    exchange_on(&mut stream, path, request, payload).await
-}
-
-async fn exchange_on(
-    stream: &mut UnixStream,
-    path: &Path,
-    request: &impl Serialize,
-    payload: Bytes,
-) -> Result<(serde_json::Value, Bytes)> {
-    write_json(stream, request).await?;
-    if !payload.is_empty() {
-        write_frame(stream, &payload, MAX_BYTES_FRAME).await?;
-    }
-    match read_json::<Response>(stream).await {
-        Ok(Response::Ok { value, bytes }) => Ok((value, read_bytes(stream, bytes).await?)),
-        Ok(Response::Err(error)) => Err(error),
-        // The supervisor went away mid-call: the call's outcome is unknown, which is what
-        // "unavailable" says; the caller re-reads job state rather than assuming either way.
-        Err(_) => Err(unavailable(
-            path,
-            &io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the supervisor closed the call",
-            ),
-        )),
-    }
+    let mut stream = open(path, op, deadline::CONTROL).await?;
+    send(&mut stream, request, &payload).await?;
+    stream.hold(deadline::idle(op, deadline::HEARTBEAT_SILENCE));
+    answer_of(&mut stream).await
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(value: serde_json::Value) -> Result<T> {
@@ -2934,7 +3188,9 @@ async fn open_process_events(
     match read_json::<Response>(&mut stream).await? {
         Response::Err(error) => return Err(error),
         Response::Ok { value, bytes: 0 } if value.is_null() => {}
-        Response::Ok { .. } => return Err(protocol_error("malformed process subscription answer")),
+        Response::Ok { .. } | Response::Progress(_) => {
+            return Err(protocol_error("malformed process subscription answer"));
+        }
     }
     let (mut reader, mut writer) = stream.into_split();
     let (send, receive) = mpsc::channel(1);
@@ -2957,6 +3213,9 @@ async fn open_process_events(
             let event = match response {
                 Ok(Response::Ok { value, bytes: 0 }) => decode::<Option<JobProcessEvent>>(value),
                 Ok(Response::Ok { .. }) => Err(protocol_error("process event carried raw bytes")),
+                Ok(Response::Progress(_)) => {
+                    Err(protocol_error("process event stream sent a call heartbeat"))
+                }
                 Ok(Response::Err(error)) | Err(error) => Err(error),
             };
             let ended = !matches!(event, Ok(Some(_)));
@@ -2993,19 +3252,19 @@ enum HoldDemand {
 /// included, however it ends — kills the job; [`JobHold::release`] lets the job run on.
 #[derive(Debug)]
 pub struct JobHold {
-    stream: UnixStream,
+    stream: PeerStream<UnixStream>,
 }
 
 impl JobHold {
     /// Let the held job outlive this hold. A job that ended meanwhile has already answered the
     /// hold with its terminal record, which releases it as well.
     pub async fn release(mut self) -> Result<()> {
-        let sent = write_json(&mut self.stream, &HoldDemand::Release).await;
-        match (read_json::<Response>(&mut self.stream).await, sent) {
-            (Ok(Response::Ok { .. }), _) => Ok(()),
-            (Ok(Response::Err(error)), _) | (Err(_), Err(error)) | (Err(error), Ok(())) => {
-                Err(error)
-            }
+        self.stream
+            .request(deadline::start("release", deadline::CONTROL));
+        let sent = send(&mut self.stream, &HoldDemand::Release, &[]).await;
+        match (answer_of(&mut self.stream).await, sent) {
+            (Ok(_), _) => Ok(()),
+            (Err(_), Err(error)) | (Err(error), Ok(())) => Err(error),
         }
     }
 }
@@ -3030,22 +3289,17 @@ pub async fn hold(
             "run the command again against the current workspace",
         ));
     }
-    let mut stream = UnixStream::connect(path)
-        .await
-        .map_err(|error| unavailable(path, &error))?;
-    write_json(
-        &mut stream,
-        &Request::Call {
-            authority: (&serving.authority).into(),
-            call: Box::new(Call::Hold { job_id }),
-            bytes: 0,
-        },
-    )
-    .await?;
-    match read_json::<Response>(&mut stream).await? {
-        Response::Err(error) => Err(error),
-        Response::Ok { value, bytes: 0 } if value.is_null() => Ok(JobHold { stream }),
-        Response::Ok { .. } => Err(protocol_error("malformed hold answer")),
+    // The hold is in place once the supervisor answers, which it does at once.
+    let mut stream = open(path, "hold", deadline::CONTROL).await?;
+    let request = Request::Call {
+        authority: (&serving.authority).into(),
+        call: Box::new(Call::Hold { job_id }),
+        bytes: 0,
+    };
+    send(&mut stream, &request, &[]).await?;
+    match answer_of(&mut stream).await? {
+        (value, raw) if value.is_null() && raw.is_empty() => Ok(JobHold { stream }),
+        _ => Err(protocol_error("malformed hold answer")),
     }
 }
 
@@ -4359,5 +4613,168 @@ mod drain_read_tests {
             "a torn report says so"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod call_deadline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn job(state: JobState, members: Option<usize>) -> JobPulse {
+        JobPulse {
+            job_id: JobId::new(7).unwrap(),
+            state,
+            members,
+        }
+    }
+
+    #[test]
+    fn only_a_job_with_no_process_left_and_no_end_is_stuck() {
+        for (state, members, advances) in [
+            (JobState::Queued, None, true),
+            (JobState::Running, None, true),
+            (JobState::Running, Some(3), true),
+            (JobState::Running, Some(0), false),
+            (JobState::Draining, Some(1), true),
+            (JobState::Draining, Some(0), false),
+            (JobState::Exited, Some(0), true),
+            (JobState::Signaled, Some(0), true),
+            (JobState::Killed, Some(0), true),
+            (JobState::OutputLimit, Some(0), true),
+            (JobState::Failed, None, true),
+        ] {
+            assert_eq!(
+                job(state, members).advances(),
+                advances,
+                "{state:?} {members:?}"
+            );
+        }
+    }
+
+    /// The client half of a call, waiting on its answer. The halves are in memory: a kernel
+    /// socket's readiness arrives outside the runtime, so paused time could pass a bound before
+    /// the runtime saw bytes already sent.
+    fn waiting(client: tokio::io::DuplexStream) -> PeerStream<tokio::io::DuplexStream> {
+        let mut stream = PeerStream::connected(
+            client,
+            deadline::Peer::unix(SUPERVISOR, Path::new("/s.sock")),
+            deadline::start("wait", deadline::CONTROL),
+        );
+        stream.hold(deadline::idle("wait", deadline::HEARTBEAT_SILENCE));
+        stream
+    }
+
+    async fn beat(
+        server: &mut tokio::io::DuplexStream,
+        seq: u64,
+        pulse: Option<JobPulse>,
+    ) -> Result<()> {
+        tokio::time::sleep(deadline::HEARTBEAT).await;
+        write_json(
+            server,
+            &Response::Progress(ProgressWire { seq, job: pulse }),
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_that_takes_a_minute_arrives_while_the_job_runs() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let supervisor = tokio::spawn(async move {
+            for seq in 1..=12 {
+                beat(&mut server, seq, Some(job(JobState::Running, Some(2))))
+                    .await
+                    .unwrap();
+            }
+            let value = serde_json::json!({ "done": true });
+            write_json(&mut server, &Response::Ok { value, bytes: 0 })
+                .await
+                .unwrap();
+            server
+        });
+        let started = tokio::time::Instant::now();
+        let (value, raw) = answer_of(&mut waiting(client)).await.unwrap();
+        assert_eq!(value, serde_json::json!({ "done": true }));
+        assert!(raw.is_empty());
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+        drop(supervisor.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_supervisor_that_takes_the_call_and_falls_silent_is_named() {
+        let (client, server) = tokio::io::duplex(4096);
+        let error = answer_of(&mut waiting(client)).await.unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::EnvironmentMissing);
+        assert!(
+            error.message.starts_with(
+                "SILENT: wait: workspace supervisor at /s.sock showed no progress for 15s"
+            ),
+            "{}",
+            error.message
+        );
+        drop(server);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_job_whose_processes_ended_without_its_end_is_named_stuck() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let supervisor = tokio::spawn(async move {
+            beat(&mut server, 1, Some(job(JobState::Running, Some(1))))
+                .await
+                .unwrap();
+            // Heartbeats go on, about a job stuck draining, until the waiter hangs up.
+            let mut seq = 2;
+            while beat(&mut server, seq, Some(job(JobState::Draining, Some(0))))
+                .await
+                .is_ok()
+            {
+                seq += 1;
+            }
+            seq
+        });
+        let error = answer_of(&mut waiting(client)).await.unwrap_err();
+        assert!(
+            error.message.starts_with(
+                "SILENT: wait: job 7 (Draining with no process of its group running) of \
+                 workspace supervisor at /s.sock showed no progress for 15s"
+            ),
+            "{}",
+            error.message
+        );
+        // The job last advanced at heartbeat 1 (5 s); the stall is named at heartbeat 4 (20 s), 15 s
+        // later, and the waiter hangs up, so heartbeat 5 finds no one.
+        assert_eq!(supervisor.await.unwrap(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_supervisor_that_ends_the_call_unanswered_loses_it() {
+        let (client, server) = tokio::io::duplex(4096);
+        drop(server);
+        let error = answer_of(&mut waiting(client)).await.unwrap_err();
+        assert!(
+            error.message.starts_with("PEER_LOST: wait"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_server_says_a_slow_answer_is_coming_and_then_gives_it() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let answered = tokio::spawn(async move {
+            heartbeating(&mut server, None, async {
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                42
+            })
+            .await
+        });
+        for seq in 1..=2 {
+            let Response::Progress(pulse) = read_json(&mut client).await.unwrap() else {
+                panic!("a heartbeat comes before the answer");
+            };
+            assert_eq!(pulse, ProgressWire { seq, job: None });
+        }
+        assert_eq!(answered.await.unwrap().unwrap(), 42);
     }
 }
