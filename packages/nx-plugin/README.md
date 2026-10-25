@@ -935,10 +935,10 @@ Concrete targets come from concrete files:
   hosts, so each emits on its own rather than depending on `tsc-js` or sharing its output; scriptc type-checks the
   staged JavaScript under a strict `tsconfig.json` the run writes beside it, with a `package.json` naming it ES modules.
   Such a package still emits its `tsc-js` JavaScript into `dist/ts` (`outDir`; inference refuses `dist` itself or
-  `dist/bin`), so that JavaScript and the executables are disjoint outputs. Before compiling, a run fails on any member
-  access through a `typia` import binding left in the staged JavaScript (`file:line:column` and the call): ttsc emits a
-  typia call untransformed, without an error, when the emitting package does not list `typia` itself, and such a call
-  throws at run time.
+  `dist/bin`), so that JavaScript and the executables are disjoint outputs. Before compiling, a run fails on any call
+  through a `typia` import binding (default, namespace, named, or destructured from one) left in the staged JavaScript
+  (`file:line:column` and the call): ttsc emits a typia call untransformed, without an error, when the emitting package
+  does not list `typia` itself, and such a call throws at run time.
 - Commands this plugin infers run the tool packages' executables for the inferring host,
   `node_modules/@smoothbricks/nx-plugin/../<tool>/dist/bin/<platform>/<bin>`: `smoo-nx-build-inputs` after a napi build.
   When the tool package is a project of the workspace being inferred, the command's target depends on that tool's
