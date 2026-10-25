@@ -2235,12 +2235,8 @@ pub(super) async fn sandbox_environment(
     );
     // The bare token is no job's to read: the proxy userinfo carries it where a client presents
     // it, and `.cowshed/workspace.json` marks a workspace. A caller's stale value (a host shell
-    // that sourced an older `.cowshed/env`) is withheld, not forwarded, including the retired
-    // `NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN` that older envs exported as the Nx bearer.
-    withheld.extend([
-        WORKSPACE_TOKEN_ENV,
-        "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN",
-    ]);
+    // that sourced an older `.cowshed/env`) is withheld, not forwarded.
+    withheld.push(WORKSPACE_TOKEN_ENV);
     if sandbox
         .capabilities
         .contribution
@@ -10033,11 +10029,12 @@ mod workspace_toolchain_tests {
     }
 
     /// The real host-side environment builder creates its own global short runtime alias. The
-    /// caller's endpoint and token never reach the child; a non-Nx checkout withholds both names.
+    /// caller's endpoint and read-only flag never reach the child; a non-Nx checkout withholds both.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-    async fn host_controller_caller_supplied_nx_endpoint_and_token_never_reach_the_child() {
+    async fn host_controller_caller_supplied_nx_endpoint_and_read_only_flag_never_reach_the_child()
+    {
         struct RuntimeAlias {
             path: PathBuf,
             target: PathBuf,
@@ -10089,10 +10086,6 @@ mod workspace_toolchain_tests {
                 "http://attacker.example:9/nx".to_owned(),
             ),
             (
-                "NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN".to_owned(),
-                "attacker-token".to_owned(),
-            ),
-            (
                 crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV.to_owned(),
                 "false".to_owned(),
             ),
@@ -10110,7 +10103,7 @@ mod workspace_toolchain_tests {
         };
         std::fs::create_dir_all(&sandbox.home).expect("home");
 
-        // Without an Nx project, the caller's endpoint, read-only flag and retired token are withheld.
+        // Without an Nx project, the caller's endpoint and read-only flag are withheld.
         let mut plain = sandbox.clone();
         plain.configure_capabilities().expect("detect capabilities");
         let without_nx = sandbox_environment(&plain, &caller)
@@ -10123,7 +10116,6 @@ mod workspace_toolchain_tests {
         assert!(!without_nx.contains_key(OsStr::new(
             crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV
         )));
-        assert!(!without_nx.contains_key(OsStr::new("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN")));
 
         // With one, the endpoint is the workspace's own and the read-only flag is set.
         std::fs::write(mount.join("nx.json"), "{}").expect("nx project");
@@ -10147,7 +10139,6 @@ mod workspace_toolchain_tests {
             )),
             Some(&std::ffi::OsString::from("true"))
         );
-        assert!(!child.contains_key(OsStr::new("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN")));
         assert_eq!(
             std::fs::read_link(&runtime_link).expect("owned runtime alias"),
             alias.target
@@ -10722,6 +10713,79 @@ mod lifecycle_commitment_tests {
             Err(ArtifactError::Integrity { .. })
         ));
 
+        drop(publisher);
+        tokio::task::yield_now().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An existing shed's `.cowshed/env` from an older build exported the Nx cache bearer and no
+    /// read-only flag. The first supervisor start of this build republishes it, so a host shell
+    /// that re-sources it reads its project's Nx cache and never stores to it (05_gateway.md
+    /// "`/nx/v1/cache/{hash}`").
+    #[tokio::test]
+    async fn a_supervisor_start_rewrites_an_older_env_with_the_nx_read_only_flag() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-env-republish-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(workspace_root.join(".cowshed")).unwrap();
+        std::fs::write(workspace_root.join("nx.json"), "{}").unwrap();
+        let env = workspace_root.join(".cowshed/env");
+        std::fs::write(
+            &env,
+            "export NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:7644/nx\nexport NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=older-bearer\n",
+        )
+        .unwrap();
+        let repo_id = RepoId::parse("acme/widget").unwrap();
+        let incarnation = WorkspaceIncarnation::new("5198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let mut publisher = CommitmentPublisher::open(
+            root.join("telemetry"),
+            crate::storage::audit::ContinuityAudit::Arrow,
+            8,
+        )
+        .unwrap();
+        publisher
+            .record(CommitmentDraft::WorkspaceIntroduced {
+                repo_id: repo_id.clone(),
+                workspace_incarnation: incarnation.clone(),
+            })
+            .await
+            .unwrap();
+        let defaults = WorkspaceSupervisorConfig::default();
+        let config = WorkspaceSupervisorConfig {
+            authority: WorkspaceAuthoritySnapshot {
+                repo_id: repo_id.clone(),
+                workspace: WorkspaceName::new("raven").unwrap(),
+                workspace_incarnation: incarnation,
+                grant_revision: 1,
+                lifecycle_revision: 1,
+            },
+            owned_repo_ids: OwnedRepoIds::sole(repo_id),
+            workspace_root: workspace_root.clone(),
+            sandbox: SandboxConfig {
+                workspace_mount: workspace_root.clone(),
+                exec_temp_dir: root.join("tmp"),
+                ..defaults.sandbox.clone()
+            },
+            ..defaults
+        };
+        let supervisor = WorkspaceSupervisor::start(config, publisher.clone()).unwrap();
+        let published = std::fs::read_to_string(&env).unwrap();
+        assert!(
+            published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true\n"),
+            "{published}"
+        );
+        assert!(
+            published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:"),
+            "{published}"
+        );
+        assert!(
+            !published.contains("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN"),
+            "{published}"
+        );
+        assert!(!published.contains("older-bearer"), "{published}");
+        drop(supervisor);
         drop(publisher);
         tokio::task::yield_now().await;
         std::fs::remove_dir_all(root).unwrap();

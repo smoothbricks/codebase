@@ -579,7 +579,9 @@ to `<base>/nx`, without a trailing slash, beside `NX_SELF_HOSTED_REMOTE_CACHE_RE
 every job's environment (03_caches.md), and no access token. The read-only flag is configuration, not authority: the
 carried Nx patch makes a read-only client answer every store `false` before it builds an archive (patches/README.md, "A
 shed reads the remote cache and never stores"), so work in progress is never stored and never costs an upload. The
-gateway itself would store a shed's `PUT`; nothing configured sends one.
+gateway itself would store a shed's `PUT`; nothing configured sends one. Every supervisor start rewrites `.cowshed/env`
+whole, so an existing shed's older file, which exported the retired bearer and no flag, carries the flag from the first
+supervisor start of a build that sets it, and direnv reloads it in the shed's host shells.
 
 The listener or Linux socket selects the workspace, its session selects the project, and only the exact, query-free
 `/nx/v1/cache/{hash}` route reaches that project's backend, so a hash in one project never names another project's
