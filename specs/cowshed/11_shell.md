@@ -433,17 +433,18 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
 
 Each supervisor listens on a Unix socket at `<store>/run/<digest>.sock`, where `digest` is the first 32 hex digits of
 the SHA-256 of `repo_id`, a NUL, and the workspace name. Owner, repository and workspace names together can exceed the
-104 bytes a socket path may hold on macOS; the digest keeps every path at 64 and no two workspaces share one. The
-serving process creates `<store>/run` mode `0700`, so no other user reaches a socket in it, binds the socket there and
-sets it `0600`, and verifies each connecting peer's uid before reading a byte. A persistent no-follow file lease at
-`<digest>.sock.lock` serializes binders and stale-socket replacement. The bound listener and lease are one owned value,
-held throughout serving or a workspace mutation. A supervisor of another build must finish the other-build drain before
-a new build binds; ensure refuses the old build while it still serves, and the lifecycle stop waits for its exit. Stream
-refusal is not absence: a live Darwin listener can refuse when its backlog is full. Recovery probes the exact filesystem
-socket with a datagram connection; wrong-type or connected means a socket remains attached to that vnode, including one
-inherited after its creator exited. Only a proven unattached socket is removed under the lease. New listeners bind
-privately in mode `0600` and publish with one exclusive rename. Cleanup removes only the bound listener's own inode
-while holding the lease. Retirement releases the listener and lease **before** acknowledging success.
+103 usable bytes of a macOS socket path (`sun_path` is 104 bytes including the terminating NUL); the digest keeps every
+path at 64 and no two workspaces share one. The serving process creates `<store>/run` mode `0700`, so no other user
+reaches a socket in it, binds the socket there and sets it `0600`, and verifies each connecting peer's uid before
+reading a byte. A persistent no-follow file lease at `<digest>.sock.lock` serializes binders and stale-socket
+replacement. The bound listener and lease are one owned value, held throughout serving or a workspace mutation. A
+supervisor of another build must finish the other-build drain before a new build binds; ensure refuses the old build
+while it still serves, and the lifecycle stop waits for its exit. Stream refusal is not absence: a live Darwin listener
+can refuse when its backlog is full. Recovery probes the exact filesystem socket with a datagram connection; wrong-type
+or connected means a socket remains attached to that vnode, including one inherited after its creator exited. Only a
+proven unattached socket is removed under the lease. New listeners bind privately in mode `0600` and publish with one
+exclusive rename. Cleanup removes only the bound listener's own inode while holding the lease. Retirement releases the
+listener and lease **before** acknowledging success.
 
 The same serving actor also binds `<digest>.members.sock` under its own listener lease, with the same framing and uid
 check but a separate closed request grammar: exactly `subtreeHandle` and `retireDescendants`. Unknown operations are

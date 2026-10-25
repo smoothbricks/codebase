@@ -214,18 +214,19 @@ pinned `fsck_apfs -q` verifies the freshly probed owned APFS volume before `moun
 retained inputs are RAW and attach the same way with `-readonly`; any other format is refused by name (01a_apfs.md,
 "Mounts"). The registry-proven raw pin remains held across the host lease wait and mount command, and cowshed checks the
 held mount-root/source identity before publication (01a_apfs.md, "Mounts"). There is no combined mountpoint attach,
-fallback or stale-family selection. Release uses `diskutil unmount` of each exact currently-owned mounted volume, then
-guarded `hdiutil detach` of the exact physical whole device, retaining the existing grace/force/refusal contract
-(01a_apfs.md, "Release and device custody"). Detached checkpoint verification and resize, and blank-image formatting,
-intentionally attach without mounting. Deletion unlinks one file. Clones are logically independent of their source (no
-GC coupling), but inherit its extent map, so a fragmented main makes every clone's first write slow until
-`cowshed defrag main` (01a_apfs.md, "Clone cost follows extents, not size"), and they share its blocks until every
-sharer is released (01a_apfs.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance budgets").
+fallback or stale-family selection. Release unmounts each exact currently-owned mounted volume with `funmount` on its
+held, proven root descriptor, then guarded `hdiutil detach` of the exact physical whole device, retaining the existing
+grace/force/refusal contract (01a_apfs.md, "Release and device custody"). Detached checkpoint verification and resize,
+and blank-image formatting, intentionally attach without mounting. Deletion unlinks one file. Clones are logically
+independent of their source (no GC coupling), but inherit its extent map, so a fragmented main makes every clone's first
+write slow until `cowshed defrag main` (01a_apfs.md, "Clone cost follows extents, not size"), and they share its blocks
+until every sharer is released (01a_apfs.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance
+budgets").
 
 Whole RAW backing images can share host APFS blocks through `clonefile`; files inside two separately mounted RAW images
-cannot. Each image contains its own APFS volume, and `clonefile` does not cross those volume boundaries. Land/rebase
-cache carry therefore copies the missing entry files with their metadata (16_build_volumes.md, "Carry"), while a fork
-clones the sealed backing image. A same-host store is not evidence that its guest files can be reflinked across mounts.
+cannot. Each image contains its own APFS volume, and `clonefile` does not cross those volume boundaries; a fork clones
+the backing image whole, from a live capture that never seals, unmounts or detaches its source (01a_apfs.md, "Images").
+A same-host store is not evidence that its guest files can be reflinked across mounts.
 
 ## ZFS substrate
 

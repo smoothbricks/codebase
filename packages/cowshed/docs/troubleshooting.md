@@ -454,13 +454,17 @@ server that accepts doctor's request and stays silent for a minute is reported a
 
 ## A disk child `did not finish within 120s`
 
-Every `hdiutil`, `diskutil` and `mount_apfs` child cowshed starts is killed at a two-minute deadline, and the refusal
-says the child ran and hung — distinct from `could not run executable`, which means it never started. One host cause
-cowshed can see is a saturated kernel vnode table. `kern.num_vnodes` at `kern.maxvnodes` is not that: the kernel caches
-vnodes up to the limit and recycles the free ones (`kern.free_vnodes`), so a busy host sits there healthily. The table
-is saturated when the vnodes _in use_ — `kern.num_vnodes` minus `kern.free_vnodes` — reach the limit: nothing is left to
-recycle, and a mount that takes a second can outlast the deadline. When that is the state of the host the refusal names
-it (`… vnodes in use of kern.maxvnodes …`) and its hint is the limit to set; `cowshed doctor` reports it as
+Every ordinary disk child cowshed starts (`mount_apfs`, `diskutil info` and the like) is killed at a two-minute
+deadline, and the refusal says the child ran and hung — distinct from `could not run executable`, which means it never
+started. A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every
+`hdiutil` verb — is never killed: past the same two minutes it keeps running, still holding its leases, with a warning
+on stderr every 30 s saying what it is still waiting on, because one killed mid-operation can leak its kernel device
+until reboot; this refusal therefore never names one. One host cause cowshed can see is a saturated kernel vnode table.
+`kern.num_vnodes` at `kern.maxvnodes` is not that: the kernel caches vnodes up to the limit and recycles the free ones
+(`kern.free_vnodes`), so a busy host sits there healthily. The table is saturated when the vnodes _in use_ —
+`kern.num_vnodes` minus `kern.free_vnodes` — reach the limit: nothing is left to recycle, and a mount that takes a
+second can outlast the deadline. When that is the state of the host the refusal names it
+(`… vnodes in use of kern.maxvnodes …`) and its hint is the limit to set; `cowshed doctor` reports it as
 `vnode-table-saturated`. Raising the limit is the operator's call: `sudo sysctl kern.maxvnodes=<n>`.
 
 ## An attach is slow, or stderr says `disk-lease … unleased=`

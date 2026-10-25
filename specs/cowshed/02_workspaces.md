@@ -108,12 +108,12 @@ not a best-effort script:
    creates its per-incarnation socket/netns connector when the published workspace is attached. Verify the copied tree
    against the source before publication.
 5. Publish, building every durable artifact before the user's tree is touched: unmount the exact verified staging volume
-   with `diskutil unmount`, then activate the sidecar from `PendingFence` to `Active` in one atomic rewrite — the
-   publication point. Only then does the checkout path change hands, in the way the chosen layout prescribes, and the
-   same pinned attachment mounts there with `mount_apfs`. The guards recheck exact image/device ownership after the host
-   lease wait, and the held mount root/source is verified before handing the checkout back (01a_apfs.md §Mounts). The
-   normal path has no detach, image rename, second attach, or second fsck: an attached image is never renamed, because
-   its identity is the backing path it was attached from.
+   with `funmount` on its held, proven root descriptor (01a_apfs.md §Mounts), then activate the sidecar from
+   `PendingFence` to `Active` in one atomic rewrite — the publication point. Only then does the checkout path change
+   hands, in the way the chosen layout prescribes, and the same pinned attachment mounts there with `mount_apfs`. The
+   guards recheck exact image/device ownership after the host lease wait, and the held mount root/source is verified
+   before handing the checkout back (01a_apfs.md §Mounts). The normal path has no detach, image rename, second attach,
+   or second fsck: an attached image is never renamed, because its identity is the backing path it was attached from.
 
 ### Re-adoption: space reclamation
 

@@ -39,7 +39,8 @@ writes — but cannot add a permission absent from the enclosing execution profi
 (deny file-read* file-read-data (subpath "~"))
 (allow process-exec process-fork)
 ;; macOS refuses a sandboxed exec of a set-user-ID program; /bin/ps is one ("Process inspection").
-;; After the line above, which would otherwise match it last. Not in Git's executes-only-Git role.
+;; The rule admits it on either side of the broad exec allow above (measured); its place after that
+;; allow is not what makes it win. Not in Git's executes-only-Git role.
 (allow process-exec (literal "/bin/ps") (with no-sandbox))
 (allow file-map-executable)
 (allow sysctl-read)
@@ -88,10 +89,12 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; Loopback TCP — isolation rides ENTIRELY on outbound. Measured SBPL constraints
 ;; (see 08_testing.md): port RANGES do not parse ("invalid port in network
 ;; address") and hosts must be `localhost` or `*` — so the block is emitted as one
-;; literal single-port outbound allow per block port, and the 16384-port ephemeral range cannot
-;; be enumerated at all. Restricting network-bind would therefore break bind(0)
-;; (measured: EPERM; the kernel does not pick a within-policy port), so bind and
-;; inbound stay PERMISSIVE — dev servers, bind(0) listeners, and host-browser →
+;; literal single-port outbound allow per block port. The 16384-port ephemeral range CAN
+;; be enumerated the same way (measured: a 16,384-rule profile compiles in about 4.3 s
+;; and enforces), but no profile pays seconds of compile time to name ports the kernel
+;; picks, and restricting network-bind would still break bind(0) (measured: EPERM; the
+;; kernel does not pick a within-policy port), so bind and inbound stay PERMISSIVE —
+;; dev servers, bind(0) listeners, and host-browser →
 ;; dev-server all just work (all measured). The implicit source-port bind on an
 ;; outbound connect is exempt from network-bind filtering (measured), so
 ;; outbound-only restriction is safe.
@@ -315,12 +318,13 @@ Notes:
 - **Read policy.** The broad `file-read-data` allow exists for system paths outside HOME (dyld, `/usr`, `/System`,
   `/Applications`, `/nix/store`, `/opt`, …), which stay readable. Under HOME a read is denied unless a rule names it,
   and the rules that do are exactly: explicit `read`/`write` grants, the workspace's own mount (and the exact literal
-  ancestors `getcwd` needs), the exec temp dir, allowed sockets' ancestors, and detected capabilities' shared caches and
-  grants (above). Those come from the capability merge alone (15_capabilities.md): a detector that needs a HOME path,
-  including one it only probes while the sandboxed supervisor repeats detection, contributes it as a grant or shared
-  cache, main's `[caches] home` entries join the same merge, and nothing else adds one. A workspace's sandbox `HOME`,
-  `XDG_*` directories and runtime dir are inside its own mount, so the deny takes nothing a child's private home holds.
-  A job therefore cannot read another tool's private state under HOME, such as an agent harness's session database or
+  ancestors of it, which `realpath` and a `stat` of `..` need — each reads every ancestor's metadata; `getcwd` alone
+  needs none), the exec temp dir, allowed sockets' ancestors, and detected capabilities' shared caches and grants
+  (above). Those come from the capability merge alone (15_capabilities.md): a detector that needs a HOME path, including
+  one it only probes while the sandboxed supervisor repeats detection, contributes it as a grant or shared cache, main's
+  `[caches] home` entries join the same merge, and nothing else adds one. A workspace's sandbox `HOME`, `XDG_*`
+  directories and runtime dir are inside its own mount, so the deny takes nothing a child's private home holds. A job
+  therefore cannot read another tool's private state under HOME, such as an agent harness's session database or
   `~/Library/Application Support/*`: the broad data allow would otherwise admit any file whose metadata was denied.
 - **Main's checkout is a sibling.** Main mounts at the operator's own checkout path, outside the fixed mount root, so
   the mount-root deny never covered it: a job read main's untracked files, `.cowshed/token` included. Every workspace
@@ -519,8 +523,9 @@ A job inspects processes with the host's `ps`: a test proves a daemon is its own
 whatever the profile allows, `(allow default)` included, and `/bin/ps` is set-user-ID root, so under any profile it
 fails with `EPERM` before it runs. The one Seatbelt form that admits such an exec is `(with no-sandbox)`, which runs the
 program outside every sandbox; no rule runs it sandboxed. Every role that runs workspace commands therefore carries
-exactly one such rule, for the literal `/bin/ps`, after the broad exec allow, which would otherwise match last. Git's
-executes-only-Git role does not. Every other set-user-ID program (`top`, `login`, `su`) stays refused.
+exactly one such rule, for the literal `/bin/ps`. Its position does not decide it: the rule admits the exec on either
+side of the broad exec allow (measured), so its emission after that allow in the baseline profile carries no meaning.
+Git's executes-only-Git role does not. Every other set-user-ID program (`top`, `login`, `su`) stays refused.
 
 Outside the sandbox `ps` sees what any local user's `ps` sees: the whole process table, every process's command line,
 and the start environment of this user's processes only (`ps -E` prints none for another user's). The kernel shows an
@@ -528,22 +533,23 @@ Apple platform program's start environment to that program alone, so `ps -E` pri
 either; a Node or Nix-built daemon shows its own. `ps` reads the process table and prints it; it starts no program and
 writes no file. `/bin/ps` lies on the sealed system volume, so the path names Apple's program and no job can replace it.
 
-The rule does not widen what a job reads of this user's processes. Seatbelt mediates no operation for the
-`kern.procargs2` sysctl, so every job already reads the command line, and the start environment unless it is a platform
-program, of every process its user runs, sibling workspaces' Nx daemons and the operator's agents included, and no
-profile rule closes it: `(deny sysctl*)` and `(deny process-info*)` both leave it readable. A secret in one workspace's
-process environment is therefore readable by every workspace of the same user. What the rule adds is other users'
-command lines, which macOS shows every local user.
+The rule does not widen what a job reads of this user's processes. No single Seatbelt denial closes the `kern.procargs2`
+sysctl: `(deny sysctl*)` on its own and `(deny process-info*)` on its own each leave it readable, and only the pair
+together closes it (measured). Cowshed's profile carries neither denial — it allows `sysctl-read` outright and
+`process-info*` within the same sandbox — so every job already reads the command line, and the start environment unless
+it is a platform program, of every process its user runs, sibling workspaces' Nx daemons and the operator's agents
+included. A secret in one workspace's process environment is therefore readable by every workspace of the same user.
+What the rule adds is other users' command lines, which macOS shows every local user.
 
 ## Fixture roots under /tmp
 
 A test fixture that runs a real Nx daemon keeps the daemon's Unix sockets inside the fixture's own root, and a socket
-path is bounded by `sun_path`, 104 bytes on macOS. A root under the job's `TMPDIR`,
-`<store>/<owner>/<repo>/tmp/<workspace>` (01_storage.md), can leave no room for the socket names beneath it, and the
-workspace's short runtime link, `/tmp/cs-<digest>`, reaches only the workspace's own runtime directory. A fixture that
-keeps its root under `TMPDIR` and reaches its sockets through a short alias in that admitted runtime namespace needs
-nothing here (08_testing.md). A fixture whose root itself must be short takes the root directly under `/tmp`, in this
-namespace and nowhere else.
+path is bounded by `sun_path`: 104 bytes on macOS including the terminating NUL, so 103 usable. A root under the job's
+`TMPDIR`, `<store>/<owner>/<repo>/tmp/<workspace>` (01_storage.md), can leave no room for the socket names beneath it,
+and the workspace's short runtime link, `/tmp/cs-<digest>`, reaches only the workspace's own runtime directory. A
+fixture that keeps its root under `TMPDIR` and reaches its sockets through a short alias in that admitted runtime
+namespace needs nothing here (08_testing.md). A fixture whose root itself must be short takes the root directly under
+`/tmp`, in this namespace and nowhere else.
 
 The baseline denies every other write to the world-shared `/private/tmp`. Exactly these names are carved back for the
 two roles that run workspace commands, the trusted supervisor and the executed child, in both modes: a read-only job

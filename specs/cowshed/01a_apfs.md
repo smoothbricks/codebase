@@ -50,12 +50,12 @@ links back to the sections here.
   does not matter: adopt copies from it and sets the copied repository's `core.ignorecase` to `false`
   (02_workspaces.md).
 - **Capacity and allocation**: 100 GiB sparse. Capacity is a cap, not a reservation; a 300 GiB image does not reserve
-  300 GiB on the host. Override per project via `.cowshed.toml` `capacity`. Creation uses only the sparse `diskutil`
-  path above, never `hdiutil create -type UDIF`, which preallocates the nominal capacity. Copies preserve holes with
-  `clonefile` or a hole-aware data copy. Allocation checks use `st_blocks * 512` and `du`, not the apparent file size.
-  Re-adoption records the current source and build images' capacity from their authoritative kernel IOMedia mappings
-  before detaching them; an old image's apparent file length is not its virtual capacity. The fresh RAW image keeps that
-  recorded capacity.
+  300 GiB on the host. Override per project via `.cowshed.toml` `capacity`. Creation uses only the sparse-file path
+  above — a file created and lengthened with no disk tool — never `hdiutil create -type UDIF`, which preallocates the
+  nominal capacity. Copies preserve holes with `clonefile` or a hole-aware data copy. Allocation checks use
+  `st_blocks * 512` and `du`, not the apparent file size. Re-adoption records the current source and build images'
+  capacity from their authoritative kernel IOMedia mappings before detaching them; an old image's apparent file length
+  is not its virtual capacity. The fresh RAW image keeps that recorded capacity.
 - **Live source snapshots**: a RAW file has no outer allocation directories, chunk tables, or bitmap that a clone can
   capture from mixed generations. Source-image snapshots read the source volume's current kernel mount flags, flush the
   volume only when it is read-write, and flush the backing file before descriptor-cloning the live image. A read-only
@@ -445,8 +445,8 @@ bootstrap remounts with an unprivileged `diskutil unmount force`. A release is `
 flags, or `diskutil eject`, `unmount`, `umount`, `unmountDisk` or `umountDisk`, in any case and optionally `force`. Its
 one operand names `/dev/diskN[sM]`, `/dev/rdiskN[sM]`, `diskN[sM]`, or an absolute path whose `statfs` source is such a
 disk. The check reads that disk's owner as Disk Arbitration does, the first `owner-uid` from its IOMedia up through its
-providers to the image drive or root when none, and refuses the release as `ReleaseNeedsAuthorization` when the owner is
-neither the euid nor the euid root. A release that names a volume name, a UUID, a path off any disk or not exactly one
+providers to the image drive or root when none, and refuses the release as `ReleaseNeedsAuthorization` unless the euid
+is root (0) or equals that owner uid. A release that names a volume name, a UUID, a path off any disk or not exactly one
 operand, or whose owner cannot be read, is refused under the same name: nothing says it is not another user's image. A
 disk the registry no longer has passes, since the tool reports its absence without asking authd. A refusal is not a
 dissent: it is never retried or forced. `release_image` also refuses another user's attachment, with the same decision
