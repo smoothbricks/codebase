@@ -438,8 +438,8 @@ pub fn reap(
     // No watch is a child that has already exited (Darwin refuses to watch a zombie).
     if let Some(watch) = ExitWatch::of(pid).map_err(failed)? {
         loop {
-            let remaining = deadline.remaining(clock()).ok_or_else(expired)?;
-            match watch.within(remaining) {
+            // A spent budget still looks once: an exited child answers its status.
+            match watch.within(deadline.remaining(clock()).unwrap_or_default()) {
                 Ok(true) => break,
                 Ok(false) => return Err(expired()),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -474,7 +474,8 @@ pub async fn reap_async(
             clock(),
         )))
     };
-    let remaining = deadline.remaining(clock()).ok_or_else(expired)?;
+    // A spent budget still polls the child once before the timer: an exited child answers.
+    let remaining = deadline.remaining(clock()).unwrap_or_default();
     match tokio::time::timeout(remaining, child.wait()).await {
         Ok(status) => status.map_err(failed),
         Err(_) => Err(expired()),
@@ -986,6 +987,40 @@ mod tests {
         kill_group(expired.peer.pid);
         assert_eq!(expired.peer.role, "probe command");
         assert_eq!(failure.code(), "TIMEOUT");
+    }
+
+    #[test]
+    fn a_spent_deadline_still_answers_a_child_that_has_exited() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 4"])
+            .spawn_locked()
+            .expect("spawn sh");
+        let exit = crate::process::ExitWatch::of(child.id()).expect("watch sh");
+        if let Some(exit) = exit {
+            exit.wait().expect("sh exits");
+        }
+        let spent = start("reap probe", Bound::new(LatencyClass::Reap, Duration::ZERO));
+        let status = reap("probe child", &mut child, &spent, Progress::Nothing)
+            .expect("an exited child is answered whatever the budget left");
+        assert_eq!(status.code(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn a_spent_deadline_still_answers_a_tokio_child_that_has_exited() {
+        use crate::fork_lock::Spawn as _;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 5"])
+            .spawn_locked()
+            .expect("spawn sh");
+        let exit = crate::process::ExitWatch::of(child.id().expect("a pid")).expect("watch sh");
+        if let Some(exit) = exit {
+            exit.wait().expect("sh exits");
+        }
+        let spent = start("reap probe", Bound::new(LatencyClass::Reap, Duration::ZERO));
+        let status = reap_async("probe child", &mut child, &spent, Progress::Nothing)
+            .await
+            .expect("an exited child is answered whatever the budget left");
+        assert_eq!(status.code(), Some(5));
     }
 
     #[test]
