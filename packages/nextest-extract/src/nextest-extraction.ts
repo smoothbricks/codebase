@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, openSync, writeSync } from 'node:fs';
 import { mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -86,6 +86,21 @@ async function archiveIdentity(archive: string): Promise<ArchiveIdentity> {
 }
 
 /**
+ * The name an archive's extraction is published under: its task hash, and a digest of its file's device, inode, size
+ * and modification time. The task hash names the inputs the binaries came from; the file part names the run of that
+ * task that wrote them, because Nx runs a task again under the same hash on a cache miss and `nextest archive` is not
+ * bit-stable, so an extraction of one run must never serve another. Every runner of one Nx run reads one file, so they
+ * share one extraction.
+ */
+export async function nextestExtractionKey(archive: string): Promise<string> {
+  return extractionKey(await archiveIdentity(archive));
+}
+
+function extractionKey(identity: ArchiveIdentity): string {
+  return `${identity.key}-${createHash('sha256').update(identity.file).digest('hex').slice(0, 16)}`;
+}
+
+/**
  * The directory, inside the Cargo target directory, that holds a workspace's
  * archive extractions. An extraction is task-keyed per-checkout tool state
  * of the same kind as the rest of the target directory: rebuilt from an Nx
@@ -96,8 +111,8 @@ async function archiveIdentity(archive: string): Promise<ArchiveIdentity> {
 export const NEXTEST_EXTRACTION_DIRECTORY = 'nextest-extracted';
 
 /**
- * A workspace's extractions live under one root, each under the hash of the
- * bytes it came from; the lock and staging directories of a key carry that key
+ * A workspace's extractions live under one root, each under the key of the
+ * archive it came from (nextestExtractionKey); the lock and staging directories of a key carry that key
  * as their prefix, so cleanup can tell them from another key's.
  */
 export interface NextestExtractionPaths {
@@ -152,13 +167,13 @@ function cargoTargetDirectory(metadata: string): string {
  * The directory under `root` holding `archive`'s extraction, extracting it
  * first if no caller has yet.
  *
- * Correctness does not rest on the lock. An extraction lands under the task hash
- * of the archive it came from by renaming a private staging directory into place,
- * so a directory under a key is a complete extraction of an archive of that task
+ * Correctness does not rest on the lock. An extraction lands under its archive's
+ * key (nextestExtractionKey) by renaming a private staging directory into place,
+ * so a directory under a key is a complete extraction of that archive file
  * or it does not exist: concurrent extractors cannot corrupt it, the loser of
  * a race discards its own copy, and an archive rewritten mid-extraction is
  * caught by reading its key and its file's state again before publishing. The lock only stops every
- * runner of one Nx run from unpacking the same bytes side by side, which is the
+ * runner of one Nx run from unpacking the same archive side by side, which is the
  * cost it exists to remove.
  *
  * Publishing a key removes every other key's extraction under `root`,
@@ -175,7 +190,7 @@ export async function ensureNextestArchiveExtracted(
 ): Promise<NextestExtraction> {
   const started = performance.now();
   const identity = await archiveIdentity(archive);
-  const key = identity.key;
+  const key = extractionKey(identity);
   const paths = nextestExtractionPaths(root, key);
   if (await isDirectory(paths.directory)) {
     return { kind: 'reused', key, directory: paths.directory };
@@ -227,7 +242,7 @@ export async function ensureNextestArchiveExtracted(
 /**
  * Extract into a private staging directory and rename it to `paths.directory`.
  * False when another extractor published the same key first, which leaves a
- * complete extraction of the same bytes in place.
+ * complete extraction of the same archive in place.
  */
 async function extractAndPublish(
   archive: string,
@@ -317,7 +332,8 @@ async function readLock(path: string): Promise<{ holder: string; ageMs: number }
   try {
     const handle = await open(path, 'r');
     try {
-      const [content, metadata] = await Promise.all([handle.readFile('utf8'), handle.stat()]);
+      const content = await handle.readFile('utf8');
+      const metadata = await handle.stat();
       const pid = content.trim().split(' ')[0];
       return {
         // Empty while its creator is between creating and writing it.

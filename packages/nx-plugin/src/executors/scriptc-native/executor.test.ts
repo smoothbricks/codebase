@@ -53,7 +53,9 @@ function fake(emitted: Record<string, string>, builds: (count: number) => boolea
     },
     build: async (invocation) => {
       runs.push({ ...invocation, staged: readdirSync(dirname(dirname(invocation.entry))).sort() });
-      return builds(runs.length);
+      const built = builds(runs.length);
+      if (built) writeFileSync(invocation.output, '');
+      return built;
     },
   };
   return { runner, emits, runs };
@@ -115,12 +117,12 @@ describe('scriptc-native', () => {
     expect(dirname(staging)).toBe(join(project, '.cache/scriptc'));
     expect(emits).toEqual([
       {
-        tsconfig: expect.stringMatching(/\/packages\/tool\/\.ttsc-scriptc-aarch64-linux-musl-[^/]+\.json$/),
+        tsconfig: expect.stringMatching(/\/packages\/tool\/\.cache\/scriptc\/aarch64-linux-musl-[^/]+\.json$/),
         outDir: staging,
         cwd: project,
         // An overlay of the package's own emit config, writing only JavaScript, into staging.
         overlay: {
-          extends: './tsconfig.lib.json',
+          extends: '../../tsconfig.lib.json',
           compilerOptions: {
             outDir: staging,
             composite: false,
@@ -151,7 +153,8 @@ describe('scriptc-native', () => {
         staged,
       },
     ]);
-    // The overlay and the staging are gone; only the executables' directory remains.
+    // The overlay and the staging are gone, and so is the executable the first bin wrote: the run failed.
+    expect(readdirSync(join(project, 'dist/bin/linux-arm64'))).toEqual([]);
     expect(readdirSync(join(project, '.cache/scriptc'))).toEqual([]);
     expect(readdirSync(project).sort()).toEqual(['.cache', 'dist', 'tsconfig.lib.json']);
   });

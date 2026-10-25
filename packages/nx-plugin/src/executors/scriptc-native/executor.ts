@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { readdirSync, readFileSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { basename, dirname, isAbsolute, join, relative } from 'node:path';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 
 import ts from 'typescript';
 
@@ -74,8 +74,10 @@ export default function scriptcNativeExecutor(
 }
 
 /**
- * Every platform's run emits on its own: the four targets of a package run side by side and are collected on different
- * hosts, so none of them reads or writes another's JavaScript, and the emit is no output of any of them.
+ * Every platform's run emits on its own: the four targets of a package run side by side on one host and each family is
+ * collected from its own publish leg, so none of them reads or writes another's JavaScript, and the emit is no output of
+ * any of them. The overlay config and the emit live under the gitignored staging root, so a killed run leaves nothing a
+ * project input hashes.
  */
 export async function runScriptcNative(
   options: ScriptcNativeOptions,
@@ -85,9 +87,9 @@ export async function runScriptcNative(
   const cwd = isAbsolute(options.cwd) ? options.cwd : join(context.root, options.cwd);
   const run = `${options.triple}-${process.pid}-${randomUUID()}`;
   const staging = join(cwd, STAGING_DIRECTORY, run);
-  const overlay = join(cwd, `.ttsc-scriptc-${run}.json`);
+  const overlay = join(cwd, STAGING_DIRECTORY, `${run}.json`);
   const tsconfig = {
-    extends: `./${basename(options.tsConfig)}`,
+    extends: relative(dirname(overlay), join(cwd, options.tsConfig)),
     compilerOptions: {
       outDir: staging,
       composite: false,
@@ -98,6 +100,7 @@ export async function runScriptcNative(
       sourceMap: false,
     },
   };
+  await mkdir(staging, { recursive: true });
   await writeFile(overlay, `${JSON.stringify(tsconfig, null, 2)}\n`, { flag: 'wx' });
   try {
     if (!(await runner.emit({ tsconfig: overlay, outDir: staging, cwd }))) return { success: false };
@@ -121,9 +124,14 @@ export async function runScriptcNative(
     await writeFile(join(staging, 'package.json'), `${JSON.stringify({ type: 'module' })}\n`);
     const binaries = join(cwd, options.outputDirectory);
     await mkdir(binaries, { recursive: true });
+    const outputs = Object.keys(options.entries).map((name) => join(binaries, name));
     for (const [name, entry] of Object.entries(options.entries)) {
       const invocation = { entry: join(staging, entry), output: join(binaries, name), cwd, triple: options.triple };
-      if (!(await runner.build(invocation))) return { success: false };
+      if (!(await runner.build(invocation))) {
+        // A failed run defines none of its outputs: no executable an earlier bin of this run wrote stays to be packed.
+        await Promise.all(outputs.map((output) => rm(output, { force: true })));
+        return { success: false };
+      }
     }
     return { success: true };
   } finally {

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, jest } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -14,6 +14,7 @@ import {
   type NextestArchiveExtractor,
   type NextestExtractionEvent,
   nextestArchiveKey,
+  nextestExtractionKey,
   nextestExtractionPaths,
   nextestExtractionRoot,
 } from './nextest-extraction.js';
@@ -40,7 +41,7 @@ describe('ensureNextestArchiveExtracted', () => {
       const archive = join(root, 'archive.tar.zst');
       await writeFile(archive, 'archive bytes');
       await writeFile(`${archive}${NEXTEST_ARCHIVE_KEY_SUFFIX}`, '1234567890\n');
-      const paths = nextestExtractionPaths(join(root, 'extractions'), await nextestArchiveKey(archive));
+      const paths = nextestExtractionPaths(join(root, 'extractions'), await nextestExtractionKey(archive));
       // A holder killed mid-extraction (a bounded run's SIGKILL) leaves its
       // lock behind, and a pid in it that may since belong to anyone.
       await mkdir(paths.root, { recursive: true });
@@ -74,7 +75,7 @@ describe('ensureNextestArchiveExtracted', () => {
       const archive = join(root, 'archive.tar.zst');
       await writeFile(archive, 'archive bytes');
       await writeFile(`${archive}${NEXTEST_ARCHIVE_KEY_SUFFIX}`, '1234567890\n');
-      const paths = nextestExtractionPaths(join(root, 'extractions'), await nextestArchiveKey(archive));
+      const paths = nextestExtractionPaths(join(root, 'extractions'), await nextestExtractionKey(archive));
       // Unpacked from the old file, but the directory would be named for the
       // task while the path now holds another rebuild of it: a mixture must
       // never be published under the key.
@@ -90,6 +91,38 @@ describe('ensureNextestArchiveExtracted', () => {
       // No directory under the old key, no staging left over, no lock held.
       expect(await readdir(paths.root)).toEqual([]);
       await expect(stat(paths.directory)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('extracts again when the archive task reran under the same hash', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nextest-extraction-'));
+    try {
+      const archive = join(root, 'archive.tar.zst');
+      const extractions = join(root, 'extractions');
+      await writeFile(`${archive}${NEXTEST_ARCHIVE_KEY_SUFFIX}`, '1234567890\n');
+      const unpacked: string[] = [];
+      const recording: NextestArchiveExtractor = async (source, destination) => {
+        unpacked.push(await readFile(source, 'utf8'));
+        await unpack(source, destination);
+      };
+      await writeFile(archive, 'first run');
+      const first = await ensureNextestArchiveExtracted(archive, extractions, recording, () => {}, FAST);
+      expect(await ensureNextestArchiveExtracted(archive, extractions, recording, () => {}, FAST)).toEqual({
+        kind: 'reused',
+        key: first.key,
+        directory: first.directory,
+      });
+      // A cache miss runs the task again under the same hash; nextest's archive of it is another file.
+      await rm(archive);
+      await writeFile(archive, 'second run');
+      const second = await ensureNextestArchiveExtracted(archive, extractions, recording, () => {}, FAST);
+      expect(second.kind).toBe('extracted');
+      expect(second.key).not.toBe(first.key);
+      expect(second.key.startsWith('1234567890-')).toBe(true);
+      expect(unpacked).toEqual(['first run', 'second run']);
+      expect(await readdir(extractions)).toEqual([second.directory.slice(extractions.length + 1)]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -187,7 +220,7 @@ describe('smoo-nx-nextest-extract', () => {
       const shards = await Promise.all([1, 2, 3, 4].map((n) => shard(root, n)));
 
       const extractions = join(root, 'target', NEXTEST_EXTRACTION_DIRECTORY);
-      const key = await nextestArchiveKey(join(root, 'archive.tar.zst'));
+      const key = await nextestExtractionKey(join(root, 'archive.tar.zst'));
       const directory = join(extractions, key);
       expect(shards.map(({ code, stdout }) => ({ code, stdout }))).toEqual(
         Array.from({ length: 4 }, () => ({ code: 0, stdout: `${directory}\n` })),

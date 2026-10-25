@@ -924,19 +924,21 @@ Concrete targets come from concrete files:
   platform's runtime pack at the same version (`@scriptc/runtime-darwin-arm64`, `-darwin-x64`, `-linux-arm64-musl`,
   `-linux-x64-musl`); inference refuses a missing or mismatched pack by name. Each run emits the package's transformed
   JavaScript from `tsconfig.lib.json` with ttsc into private staging under `.cache/scriptc/` (removed when it ends) and
-  compiles every `package.json#bin` entry's module there with `linux-x64`, the directories `@smoothbricks/cowshed`'s
-  launcher reads). Every host builds every platform the same way, `SCRIPTC_TARGET=<triple>` with `SCRIPTC_CC=zigcc` (zig
-  from the devenv shell): the triples are `aarch64-macos`, `x86_64-macos`, `aarch64-linux-musl` and `x86_64-linux-musl`,
-  so the Linux executables are static musl, as cowshed's CLI is. Like every platform target, the host's own joins
-  `build` and the publish legs build and collect the others by family (`*-linux` on the Linux runner, `*-<arch>-macos`
-  on each macOS leg), so a published tarball carries all four. A platform target's closure stays in its family and the
-  four are collected on different hosts, so each emits on its own rather than depending on `tsc-js` or sharing its
-  output; scriptc type-checks the staged JavaScript under a strict `tsconfig.json` the run writes beside it, with a
-  `package.json` naming it ES modules. Such a package still emits its `tsc-js` JavaScript into `dist/ts` (`outDir`;
-  inference refuses `dist` itself or `dist/bin`), so that JavaScript and the executables are disjoint outputs. Before
-  compiling, a run fails on any member access through a `typia` import binding left in the staged JavaScript
-  (`file:line:column` and the call): ttsc emits a typia call untransformed, without an error, when the emitting package
-  does not list `typia` itself, and such a call throws at run time.
+  compiles every `package.json#bin` entry's module there with `scriptc build --strip --no-keep-llvm` into
+  `dist/bin/<platform>/<name>` (`darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, the directories
+  `@smoothbricks/cowshed`'s launcher reads); a failed run removes the executables it wrote. Every host builds every
+  platform the same way, `SCRIPTC_TARGET=<triple>` with `SCRIPTC_CC=zigcc` (zig from the devenv shell): the triples are
+  `aarch64-macos`, `x86_64-macos`, `aarch64-linux-musl` and `x86_64-linux-musl`, so the Linux executables are static
+  musl, as cowshed's CLI is. Like every platform target, the host's own joins `build` and the publish legs build and
+  collect the others by family (`*-linux` on the Linux runner, `*-<arch>-macos` on each macOS leg), so a published
+  tarball carries all four. A platform target's closure stays in its family and the four are collected on different
+  hosts, so each emits on its own rather than depending on `tsc-js` or sharing its output; scriptc type-checks the
+  staged JavaScript under a strict `tsconfig.json` the run writes beside it, with a `package.json` naming it ES modules.
+  Such a package still emits its `tsc-js` JavaScript into `dist/ts` (`outDir`; inference refuses `dist` itself or
+  `dist/bin`), so that JavaScript and the executables are disjoint outputs. Before compiling, a run fails on any member
+  access through a `typia` import binding left in the staged JavaScript (`file:line:column` and the call): ttsc emits a
+  typia call untransformed, without an error, when the emitting package does not list `typia` itself, and such a call
+  throws at run time.
 - Commands this plugin infers run the tool packages' executables for the inferring host,
   `node_modules/@smoothbricks/nx-plugin/../<tool>/dist/bin/<platform>/<bin>`: `smoo-nx-build-inputs` after a napi build.
   When the tool package is a project of the workspace being inferred, the command's target depends on that tool's

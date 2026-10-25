@@ -803,6 +803,8 @@ function createCargoTestArchiveTarget(projectRoot: string, toolConfig: string): 
         cargoFrozen(
           `nextest archive --workspace --archive-file ${CARGO_TEST_ARCHIVE_FILE} --user-config-file none ${toolConfig}`,
         ),
+        // Outside Nx there is no task hash, and an archive no task names is refused here, not by every runner.
+        'test -n "$NX_TASK_HASH"',
         `printf '%s\\n' "$NX_TASK_HASH" > ${CARGO_TEST_ARCHIVE_KEY_FILE}`,
       ]),
       cwd: projectRoot,

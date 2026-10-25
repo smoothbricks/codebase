@@ -1058,7 +1058,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // different number of `../` away from each checkout.
       expect(String(targets['cargo-test-archive']?.options?.command)).toBe(
         'mkdir -p .cache/nextest && cargo --frozen nextest archive --workspace --archive-file .cache/nextest/archive.tar.zst --user-config-file none --tool-config-file "smoo:$PWD/../../node_modules/@smoothbricks/nx-plugin/nextest.toml" && ' +
-          'printf \'%s\\n\' "$NX_TASK_HASH" > .cache/nextest/archive.tar.zst.key',
+          'test -n "$NX_TASK_HASH" && printf \'%s\\n\' "$NX_TASK_HASH" > .cache/nextest/archive.tar.zst.key',
       );
       expect(targets['cargo-test-archive']?.inputs).toContain('{projectRoot}/.config/nextest.toml');
       // Tests compile the dev profile only. Nx forwards a run's configuration
