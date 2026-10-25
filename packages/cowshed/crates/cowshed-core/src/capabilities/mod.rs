@@ -387,13 +387,17 @@ fn detect_with(
     // `#!/usr/bin/env bash` is how a checkout's scripts name their shell, and a job without
     // shell activation runs on the bootstrap PATH alone, whose fixed system directories hold no
     // bash on NixOS. Resolve exactly one bash the way a detector resolves its tool, so `env`
-    // finds it there; its directory never joins PATH.
-    add_bootstrap(
-        &mut result.contribution,
-        context,
-        "bash",
-        context.program_directories,
-    )?;
+    // finds it there; its directory never joins PATH. The Cargo discovery driver runs a few more
+    // programs beside the repository's own cargo, which a shell that supplies no coreutils would
+    // leave it without on such a host: resolve those the same way.
+    for name in std::iter::once("bash").chain(build_state_discovery::DRIVER_PROGRAMS) {
+        add_bootstrap(
+            &mut result.contribution,
+            context,
+            name,
+            context.program_directories,
+        )?;
+    }
     let mut owners = result
         .contribution
         .bootstrap_programs
@@ -1113,20 +1117,23 @@ pub mod test_support {
                 fs::write(path, "").unwrap();
             }
         }
-        /// What core detection contributes for `bash` on this host: the one bash the fixture's
-        /// program directories resolve first, with the grants that resolution takes. It depends
-        /// on the host, so a test expecting the core contribution derives it here rather than
-        /// naming a path.
-        pub fn core_bash(&self) -> CapabilityContribution {
+        /// What core detection contributes for its own bootstrap programs on this host: the one bash
+        /// and each of [`build_state_discovery::DRIVER_PROGRAMS`] the fixture's program directories
+        /// resolve first, with the grants those resolutions take. It depends on the host, so a test
+        /// expecting the core contribution derives it here rather than naming a path.
+        pub fn core_programs(&self) -> CapabilityContribution {
             let mut contribution = CapabilityContribution::default();
             let context = self.context();
-            add_bootstrap(
-                &mut contribution,
-                &context,
-                "bash",
-                context.program_directories,
-            )
-            .unwrap();
+            for name in std::iter::once("bash").chain(build_state_discovery::DRIVER_PROGRAMS) {
+                add_bootstrap(
+                    &mut contribution,
+                    &context,
+                    name,
+                    context.program_directories,
+                )
+                .unwrap();
+            }
+            contribution.bootstrap_programs.sort();
             contribution
         }
     }

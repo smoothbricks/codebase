@@ -340,18 +340,29 @@ fn cargo_lock_holders(home: &Path) -> String {
 /// activation and at most this many Cargo queries at once.
 const CARGO_QUERY_PARALLELISM: usize = 4;
 
+/// What the driver runs besides `bash` and the repository's own `cargo`. Core links each onto the
+/// bootstrap PATH the way it links `bash`, so a job whose shell supplies none of them, on a host
+/// whose fixed system directories hold none (NixOS), still runs the driver.
+pub(super) const DRIVER_PROGRAMS: [&str; 3] = ["cat", "mktemp", "rm"];
+
 /// Runs each query's Cargo in its own directory and frames each answer for
 /// [`driver_answers`]: exit status, stdout, stderr, each NUL-terminated. Cargo prints no NUL.
 /// Each worker owns its files; the parent drains them in query order after waiting, so
 /// interleaved completions cannot associate an answer or failure with another manifest.
+///
+/// `bash`, which runs it, and the `mktemp`, `rm` and `cat` it runs besides `cargo` are each the
+/// first executable of their name on the PATH the job holds, never a fixed `/bin` or `/usr/bin`
+/// path: NixOS keeps only `/bin/sh` and `/usr/bin/env`, so a job whose shell supplies none of
+/// them reaches `bash` and [`DRIVER_PROGRAMS`] through core's bootstrap links
+/// (15_capabilities.md, "Detection inputs").
 const DRIVER: &str = r#"set -u
 parallel=$1
 count=$2
 shift 2
 query=("${@:1:count}")
 shift "$count"
-work=$(/usr/bin/mktemp -d) || exit 70
-trap '/bin/rm -rf -- "$work"' EXIT
+work=$(mktemp -d) || exit 70
+trap 'rm -rf -- "$work"' EXIT
 while (($# >= 2)); do
   pids=()
   for ((slot=0; slot<parallel && $#>=2; slot++)); do
@@ -362,21 +373,22 @@ while (($# >= 2)); do
       stdout=$({ cd -- "$directory" && exec cargo "${query[@]}" --manifest-path "$manifest"; } 2>"$work/$slot.stderr")
       status=$?
       printf '%s\0%s\0' "$status" "$stdout"
-      /bin/cat -- "$work/$slot.stderr"
+      cat -- "$work/$slot.stderr"
       printf '\0'
     ) >"$work/$slot.answer" &
     pids+=("$!")
   done
   for ((slot=0; slot<${#pids[@]}; slot++)); do
     wait "${pids[$slot]}" || exit $?
-    /bin/cat -- "$work/$slot.answer" || exit 70
+    cat -- "$work/$slot.answer" || exit 70
   done
 done
 "#;
 
 fn driver_argv(args: &[&str], queries: &[&CargoQuery]) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
-        "/bin/bash".into(),
+        // Found on the job's PATH, as cargo is: NixOS has no bash in its fixed system directories.
+        "bash".into(),
         "-c".into(),
         DRIVER.into(),
         "cowshed-cargo-discovery".into(),
@@ -988,9 +1000,114 @@ fn tracked_manifests(
     Ok(paths)
 }
 
+/// The driver run for real on every platform: the NixOS runner reaches these proofs, and the
+/// macOS-only module below does not.
+#[cfg(test)]
+mod driver_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::super::test_support::Fixture;
+    use super::*;
+
+    /// An executable file of the fixture, `relative` to its root.
+    pub(super) fn executable(fixture: &Fixture, relative: &str, content: &str) {
+        let path = fixture.root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The host's own PATH: where a fixture program finds the real program it stands in front of.
+    fn host_path() -> OsString {
+        std::env::var_os("PATH").expect("the test process has a PATH")
+    }
+
+    /// The driver as a job runs it: `bash` is looked up on a PATH that leads with the fixture's
+    /// `bin` and keeps the host's own behind it, so the programs the fixture does not provide are
+    /// the host's real ones (08_testing.md, "Fixtures").
+    #[cfg(target_os = "macos")]
+    pub(super) fn run_driver(
+        fixture: &Fixture,
+        args: &[&str],
+        queries: &[CargoQuery],
+    ) -> std::process::Output {
+        let path = std::env::join_paths(
+            std::iter::once(fixture.root.join("bin")).chain(std::env::split_paths(&host_path())),
+        )
+        .unwrap();
+        run_driver_on(fixture, args, queries, path)
+    }
+
+    /// The driver with `bash` looked up on exactly `path`. `HOST_PATH` is the host's PATH, for a
+    /// fixture program that hands over to the host's own; `PROBE_ROOT` is where fixture programs
+    /// leave their notes.
+    fn run_driver_on(
+        fixture: &Fixture,
+        args: &[&str],
+        queries: &[CargoQuery],
+        path: OsString,
+    ) -> std::process::Output {
+        let argv = driver_argv(args, &queries.iter().collect::<Vec<_>>());
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("PATH", path)
+            .env("HOST_PATH", host_path())
+            .env("PROBE_ROOT", &fixture.root)
+            .output_locked()
+            .unwrap()
+    }
+
+    /// A job whose PATH holds core's bootstrap links and the repository's `cargo` has no more than
+    /// `bash`, `cargo` and [`DRIVER_PROGRAMS`]: the driver finds each there, never at a fixed path
+    /// (NixOS keeps only `/bin/sh` and `/usr/bin/env`), and needs nothing else. The PATH here is the
+    /// fixture's `bin` alone, where each program notes that it ran and hands over to the host's own:
+    /// a program reached any other way leaves no note, and one the driver newly needs is not found.
+    #[test]
+    fn cargo_driver_runs_on_a_path_holding_only_its_programs() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("ran"), "").unwrap();
+        for name in ["bash"].into_iter().chain(DRIVER_PROGRAMS) {
+            executable(
+                &fixture,
+                &format!("bin/{name}"),
+                &format!(
+                    "#!/bin/sh\n\
+                     echo {name} >>\"$PROBE_ROOT/ran\"\n\
+                     real=$(PATH=$HOST_PATH command -v {name}) || exit 127\n\
+                     exec \"$real\" \"$@\"\n"
+                ),
+            );
+        }
+        executable(
+            &fixture,
+            "bin/cargo",
+            "#!/bin/sh\necho cargo >>\"$PROBE_ROOT/ran\"\necho answered\n",
+        );
+        let queries = [CargoQuery {
+            directory: fixture.root.clone(),
+            manifest: "Cargo.toml".into(),
+        }];
+        let only_the_fixture = fixture.root.join("bin").into_os_string();
+        let output = run_driver_on(&fixture, &["locate-project"], &queries, only_the_fixture);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(driver_answers(&output, 1), [Ok(b"answered".to_vec())]);
+        let notes = fs::read_to_string(fixture.root.join("ran")).unwrap();
+        let mut ran: Vec<&str> = notes.lines().collect();
+        ran.sort_unstable();
+        ran.dedup();
+        let mut wanted: Vec<&str> = ["bash", "cargo"]
+            .into_iter()
+            .chain(DRIVER_PROGRAMS)
+            .collect();
+        wanted.sort_unstable();
+        assert_eq!(ran, wanted);
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::super::test_support::Fixture;
+    use super::driver_tests::{executable, run_driver};
     use super::*;
 
     fn write(fixture: &Fixture, relative: &str, content: &str) {
@@ -1211,15 +1328,13 @@ mod tests {
 
     #[test]
     fn cargo_driver_bounds_parallelism_and_keeps_answers_in_manifest_order() {
-        use std::os::unix::fs::PermissionsExt;
-
         let fixture = Fixture::new();
         let directory = fixture.root.join("directory with spaces");
         fs::create_dir(&directory).unwrap();
-        write(
+        executable(
             &fixture,
             "bin/cargo",
-            r#"#!/bin/bash
+            r#"#!/usr/bin/env bash
 set -eu
 index=$3
 first=$((index / 4 * 4))
@@ -1235,14 +1350,14 @@ started=$SECONDS
 for ((peer=first; peer<end; peer++)); do
   while [[ ! -f "$PROBE_ROOT/started-$peer" ]]; do
     ((SECONDS - started < 5)) || { echo "query $index did not overlap $peer" >&2; exit 91; }
-    /bin/sleep 0.01
+    sleep 0.01
   done
 done
 # Force a later query to finish first, exercising ordered output framing.
 if ((index == first && end - first > 1)); then
   while [[ ! -f "$PROBE_ROOT/done-$((end - 1))" ]]; do
     ((SECONDS - started < 5)) || { echo "last query did not finish" >&2; exit 92; }
-    /bin/sleep 0.01
+    sleep 0.01
   done
 fi
 : >"$PROBE_ROOT/done-$index"
@@ -1253,21 +1368,13 @@ fi
 printf '%s:%s\n' "$index" "$PWD"
 "#,
         );
-        let cargo = fixture.root.join("bin/cargo");
-        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
         let queries: Vec<CargoQuery> = (0..9)
             .map(|index| CargoQuery {
                 directory: directory.clone(),
                 manifest: index.to_string().into(),
             })
             .collect();
-        let argv = driver_argv(&["locate-project"], &queries.iter().collect::<Vec<_>>());
-        let output = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .env("PATH", fixture.root.join("bin"))
-            .env("PROBE_ROOT", &fixture.root)
-            .output_locked()
-            .unwrap();
+        let output = run_driver(&fixture, &["locate-project"], &queries);
         assert!(output.status.success(), "{output:?}");
         let expected: Vec<CargoAnswer> = (0..9)
             .map(|index| {

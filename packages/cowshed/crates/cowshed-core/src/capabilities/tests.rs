@@ -5,22 +5,46 @@ use super::*;
 fn a_plain_repository_has_only_the_core_executable_probes() {
     let fixture = Fixture::new();
     let detected = detect(&fixture.context(), &BTreeMap::new()).unwrap();
-    let bash = fixture.core_bash();
+    let core = fixture.core_programs();
     assert!(detected.active.is_empty());
     assert_eq!(
         detected.contribution.bootstrap_programs,
-        bash.bootstrap_programs
+        core.bootstrap_programs
     );
     let mut grants = vec![CapabilityGrant {
         path: crate::host_dirs::support_directory(&fixture.home).join("bin/cowshed"),
         scope: GrantScope::Literal,
         access: GrantAccess::Read,
     }];
-    grants.extend(bash.grants);
+    grants.extend(core.grants);
     // Detection hands its grants back sorted and deduplicated.
     grants.sort();
     grants.dedup();
     assert_eq!(detected.contribution.grants, grants);
+}
+
+/// The Cargo discovery driver runs `cat`, `mktemp` and `rm` beside the repository's own `cargo`. A
+/// job whose shell supplies none of them, on a host whose fixed system directories hold none
+/// (NixOS), still runs it because core links each the way it links `bash`.
+#[test]
+fn the_programs_the_cargo_discovery_driver_runs_are_core_bootstraps() {
+    let fixture = Fixture::new();
+    let detected = detect(&fixture.context(), &BTreeMap::new()).unwrap();
+    for name in build_state_discovery::DRIVER_PROGRAMS {
+        let target = bootstrap_program(name, &fixture.program_directories)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!("every supported host installs {name} in a conventional directory")
+            });
+        assert!(
+            detected
+                .contribution
+                .bootstrap_programs
+                .contains(&BootstrapProgram { name, target }),
+            "{name}: {:?}",
+            detected.contribution.bootstrap_programs
+        );
+    }
 }
 
 /// A job without shell activation runs on the bootstrap PATH alone, and NixOS keeps no bash in
@@ -67,12 +91,12 @@ fn the_installed_cowshed_is_a_core_bootstrap_without_controller_data_authority()
         detected.active.is_empty(),
         "core bootstrap needs no project capability"
     );
-    let bash = fixture.core_bash();
+    let core = fixture.core_programs();
     let mut programs = vec![BootstrapProgram {
         name: "cowshed",
         target: program.clone(),
     }];
-    programs.extend(bash.bootstrap_programs);
+    programs.extend(core.bootstrap_programs);
     // Detection hands its programs back sorted, like its grants.
     programs.sort();
     assert_eq!(detected.contribution.bootstrap_programs, programs);
@@ -83,7 +107,7 @@ fn the_installed_cowshed_is_a_core_bootstrap_without_controller_data_authority()
             access: GrantAccess::Read,
         })
         .to_vec();
-    grants.extend(bash.grants);
+    grants.extend(core.grants);
     grants.sort();
     grants.dedup();
     assert_eq!(detected.contribution.grants, grants);

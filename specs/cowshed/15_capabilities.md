@@ -73,6 +73,12 @@ contents change. One `git ls-files` query supplies every tracked `Cargo.toml`, `
 BLAKE3 hashes their working-tree bytes, so unstaged edits refresh the build-state paths before the next job. The
 fingerprint also folds in a discovery revision, so a cowshed that asks differently rediscovers instead of keeping an
 earlier discovery's answer, findings included. Caller environment and untracked config are not fingerprint inputs.
+
+The job that answers a batch is one `bash` script. `bash`, and the `cargo`, `mktemp`, `rm` and `cat` the script runs,
+are each the first executable of their name on the PATH the job holds, never a fixed `/bin` or `/usr/bin` path: NixOS
+keeps only `/bin/sh` and `/usr/bin/env`, and a job whose shell supplies none of them reaches `bash`, `cat`, `mktemp` and
+`rm` through core's bootstrap links (Bootstrap executables, below); `cargo` is the repository's shell's.
+
 Cargo's contribution drops caller `CARGO_TARGET_DIR` so where a job writes depends on the tracked project files, exactly
 the fingerprint's inputs, not an unrelated shell's override. It also owns `CARGO_UNSTABLE_MTIME_ON_USE=true`, so every
 cargo of a project records the use of the units it builds on (16_build_volumes.md, "One Cargo environment on every
@@ -170,7 +176,9 @@ Each detector returns data through one `CapabilityContribution`:
   their shell `#!/usr/bin/env bash`, and a job without shell activation runs on the bootstrap PATH alone, whose fixed
   system directories hold no bash on NixOS; with this link `env` finds one on every host. The directory it was found in
   never joins PATH. The runtime never parses a script's interpreter line or rewrites argv0: the kernel runs the
-  interpreter, so `$0` and `BASH_SOURCE` stay the script's.
+  interpreter, so `$0` and `BASH_SOURCE` stay the script's. Core resolves `cat`, `mktemp` and `rm` the same way, for the
+  Cargo discovery driver (Detection inputs): without them, a shell that supplies no coreutils on a host whose fixed
+  system directories hold none ends the job before `cargo` starts.
 
   Reconciliation reads the owned-name manifest and checks every requested link; it never scans unrelated entries. A
   clean manifest and matching links require no write or durability barrier. Before repairing a set, preparation durably

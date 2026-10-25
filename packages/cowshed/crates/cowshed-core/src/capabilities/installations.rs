@@ -97,7 +97,7 @@ mod tests {
         let detect = || super::super::detect(&fixture.context(), &BTreeMap::new()).unwrap();
         assert_eq!(
             detect().contribution.grants.contains(&store_read()),
-            fixture.core_bash().grants.contains(&store_read())
+            fixture.core_programs().grants.contains(&store_read())
         );
 
         std::os::unix::fs::symlink(
@@ -125,7 +125,7 @@ mod tests {
             scope: GrantScope::Literal,
             access: GrantAccess::Read,
         }];
-        grants.extend(fixture.core_bash().grants);
+        grants.extend(fixture.core_programs().grants);
         grants.sort();
         grants.dedup();
         assert_eq!(detected.contribution.grants, grants);
