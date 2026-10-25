@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
 import { Watcher, WorkspaceContext } from 'nx/src/native/index.js';
 import { globWithWorkspaceContextSync, resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
@@ -19,7 +20,6 @@ import {
   waitForCargoJoins,
   withEnvironment,
 } from './__tests__/counted-cargo.js';
-import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { CARGO_CLOSURE_INPUT, cargoLockNodeName, indexedCargoManifests } from './cargo-closure-input.js';

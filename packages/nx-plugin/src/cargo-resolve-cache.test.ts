@@ -17,6 +17,7 @@ import {
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
 import { FileLock } from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
@@ -33,7 +34,6 @@ import {
   waitForCargoJoins,
   withEnvironment,
 } from './__tests__/counted-cargo.js';
-import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';

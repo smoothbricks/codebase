@@ -32,6 +32,7 @@ function staleCheckout() {
   const plugin = join(root, 'packages/nx-plugin');
   mkdirSync(join(plugin, 'src'), { recursive: true });
   mkdirSync(join(plugin, 'dist'), { recursive: true });
+  writeFileSync(join(plugin, 'package.json'), '{}');
   writeFileSync(join(plugin, 'tsconfig.lib.json'), '{}');
   writeFileSync(join(plugin, 'src/index.ts'), 'export {};\n');
   const marker = join(plugin, 'dist/tsconfig.lib.tsbuildinfo');
@@ -149,6 +150,7 @@ it('the environment capture pass rebuilds nothing, the entry proper still does',
   try {
     const plugin = join(root, 'packages/nx-plugin');
     mkdirSync(join(plugin, 'src'), { recursive: true });
+    writeFileSync(join(plugin, 'package.json'), '{}');
     writeFileSync(join(plugin, 'tsconfig.lib.json'), '{}');
     writeFileSync(join(plugin, 'src/index.ts'), 'export {};\n');
     mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
@@ -180,6 +182,62 @@ it('the environment capture pass rebuilds nothing, the entry proper still does',
     const entry = enter({ DEVENV_SKIP_TASKS: '' });
     expect(entry.status, `${entry.stdout}${entry.stderr}`).not.toBe(0);
     expect(existsSync(attempts)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Loading the plugin imports the workspace packages it depends on at run time, so their `dist` must exist before the
+ * plugin's graph can build them: the entry rebuilds a stale one first, found through the plugin's own
+ * `node_modules` link, and leaves a current one alone.
+ */
+it('a stale workspace dependency of the plugin is rebuilt before the plugin, a current one is not', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
+  try {
+    const stalePackage = (directory: string, manifest: object) => {
+      mkdirSync(join(directory, 'src'), { recursive: true });
+      mkdirSync(join(directory, 'dist'), { recursive: true });
+      writeFileSync(join(directory, 'package.json'), JSON.stringify(manifest));
+      writeFileSync(join(directory, 'tsconfig.lib.json'), '{}');
+      writeFileSync(join(directory, 'src/index.ts'), 'export {};\n');
+      const marker = join(directory, 'dist/tsconfig.lib.tsbuildinfo');
+      writeFileSync(marker, '');
+      utimesSync(marker, new Date(0), new Date(0));
+      return marker;
+    };
+    const plugin = join(root, 'packages/nx-plugin');
+    const tool = join(root, 'packages/tool');
+    const current = join(root, 'packages/current');
+    stalePackage(tool, {});
+    const currentMarker = stalePackage(current, {});
+    utimesSync(currentMarker, new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
+    stalePackage(plugin, {
+      dependencies: { '@fixture/tool': 'workspace:*', '@fixture/current': 'workspace:*', typia: '14.0.6' },
+    });
+    mkdirSync(join(plugin, 'node_modules/@fixture'), { recursive: true });
+    symlinkSync('../../../tool', join(plugin, 'node_modules/@fixture/tool'));
+    symlinkSync('../../../current', join(plugin, 'node_modules/@fixture/current'));
+    mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
+
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    const builds = join(root, 'ttsc-builds');
+    writeFileSync(join(bin, 'ttsc'), `#!/bin/sh\npwd >> '${builds}'\n`);
+    chmodSync(join(bin, 'ttsc'), 0o755);
+
+    const entered = spawnSync('bun', [enterShell], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        DEVENV_ROOT: join(root, 'tooling/direnv'),
+        PATH: `${bin}:${process.env.PATH}`,
+        GITHUB_ACTIONS: 'true',
+      },
+    });
+    expect(entered.status, `${entered.stdout}${entered.stderr}`).toBe(0);
+    expect(readFileSync(builds, 'utf8').trim().split('\n')).toEqual([tool, plugin]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

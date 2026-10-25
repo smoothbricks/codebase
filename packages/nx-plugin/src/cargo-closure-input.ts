@@ -2,10 +2,10 @@ import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { isAbsolute, join, posix, relative, sep } from 'node:path';
 
+import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor-inputs';
 import type { ProjectGraphExternalNode, TargetConfiguration } from 'nx/src/devkit-exports.js';
 
 import {
-  CARGO_ANCESTOR_INPUTS,
   type CargoResolve,
   type CompiledCargoInput,
   compiledInFiles,

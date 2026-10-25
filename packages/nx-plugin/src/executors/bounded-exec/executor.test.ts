@@ -6,6 +6,7 @@ import { access, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFil
 import { createServer, type Socket } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
+import { enclosingTreeMarker, outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
 import { FAKE_BUN_INVOKED, FAKE_BUN_RAN, fakeBun } from '../../__tests__/fake-bun.js';
 import {
@@ -17,7 +18,6 @@ import {
   restartedBy,
   scripted,
 } from '../../__tests__/gateway-stand-in.js';
-import { enclosingTreeMarker, outsideTreesTmpdir } from '../../__tests__/outside-trees.js';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { type StandInMode, standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';

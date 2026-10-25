@@ -19,7 +19,7 @@ import {
 import { Socket } from 'node:net';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { O_EXLOCK } from '../../open-flags.js';
+import { O_EXLOCK } from '@smoothbricks/cargo-retain/open-flags';
 import { DEADLINE_PATIENCE, describeMembersLeft, killProcessGroup } from '../../process-group.js';
 import { isRecord } from '../../type-guards.js';
 import { diskClassOf, type PhaseShare, recordedShare, takeDiskLease } from './disk-lease.js';

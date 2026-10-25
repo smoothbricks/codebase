@@ -71,7 +71,7 @@ import { createInterface } from 'node:readline';
 import { logger, type ProjectGraph, readCachedProjectGraph } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import typia, { type tags } from 'typia';
-import { CARGO_ANCESTOR_INPUTS } from './cargo-source-hash.js';
+import { CARGO_ANCESTOR_INPUTS } from './cargo-ancestor-inputs.js';
 import { O_EXLOCK } from './open-flags.js';
 
 export type Result<T, E> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E };
@@ -145,8 +145,6 @@ export const AUTOMATIC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const SCHEDULE_VERSION = 1;
 const validateRetentionReport = typia.createValidate<RetentionReport>();
 export const RETENTION_RECEIPT = '.smoo-cargo-retention.json';
-/** The installed retention CLI, relative to the workspace root (`smoo-nx-cargo-retain`). */
-export const CARGO_RETAIN_BIN = 'node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-cargo-retain.js';
 const RETENTION_LOCK = '.smoo-cargo-retention.lock';
 const TRASH = '.smoo-retention-trash';
 /** Cargo's optional backup tag; not created when the target directory already exists (`paths::create_dir_all_excluded_from_backups_atomic`). */

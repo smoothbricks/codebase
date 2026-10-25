@@ -229,7 +229,6 @@
   "bin": {
     "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
     "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
-    "smoo-nx-cargo-retain": "./dist/bin/smoo-nx-cargo-retain.js",
     "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
     "smoo-nx-nextest-timings": "./dist/bin/smoo-nx-nextest-timings.js",
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
@@ -389,6 +388,7 @@
   },
   "dependencies": {
     "@nx/js": "23.2.1",
+    "@smoothbricks/cargo-retain": "workspace:*",
     "jsonc-parser": "^3.3.1",
     "minimatch": "10.2.5",
     "nx": "latest",

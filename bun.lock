@@ -48,6 +48,18 @@
       "name": "@smoothbricks/bitmosaic",
       "version": "0.0.0",
     },
+    "packages/cargo-retain": {
+      "name": "@smoothbricks/cargo-retain",
+      "version": "0.0.1-next.0",
+      "dependencies": {
+        "nx": "latest",
+        "tslib": "^2.8.1",
+        "typia": "14.0.6",
+      },
+      "devDependencies": {
+        "@smoothbricks/validation": "workspace:*",
+      },
+    },
     "packages/cli": {
       "name": "@smoothbricks/cli",
       "version": "0.12.22-next.0",
@@ -229,13 +241,16 @@
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
         "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
+        "smoo-nx-nextest-timings": "./dist/bin/smoo-nx-nextest-timings.js",
         "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
         "smoo-nx-failures": "./dist/bin/smoo-nx-failures.js",
         "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
         "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
+        "smoo-nx-build-inputs": "./dist/bin/smoo-nx-build-inputs.js",
       },
       "dependencies": {
         "@nx/js": "23.2.1",
+        "@smoothbricks/cargo-retain": "workspace:*",
         "jsonc-parser": "^3.3.1",
         "minimatch": "10.2.5",
         "nx": "latest",
@@ -1753,6 +1768,8 @@
     "@smoothbricks/arrow-builder": ["@smoothbricks/arrow-builder@workspace:packages/arrow-builder"],
 
     "@smoothbricks/bitmosaic": ["@smoothbricks/bitmosaic@workspace:packages/bitmosaic"],
+
+    "@smoothbricks/cargo-retain": ["@smoothbricks/cargo-retain@workspace:packages/cargo-retain"],
 
     "@smoothbricks/cli": ["@smoothbricks/cli@workspace:packages/cli"],
 

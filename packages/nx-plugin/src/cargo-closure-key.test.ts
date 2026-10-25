@@ -3,10 +3,10 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import { WorkspaceContext } from 'nx/src/native/index.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { byFile, closureFixture, closureOf, graphComputation } from './__tests__/cargo-closure-fixture.js';
-import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';

@@ -16,6 +16,7 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
+import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor-inputs';
 import native from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
@@ -318,8 +319,6 @@ export const HASH_SKIPPED_DIRECTORIES = [
   '.Spotlight-V100',
   '.DocumentRevisions-V100',
 ] as const;
-/** Files in every ancestor of a package directory that Cargo reads while building it. */
-export const CARGO_ANCESTOR_INPUTS = ['Cargo.toml', '.cargo/config', '.cargo/config.toml'] as const;
 
 /**
  * Cargo owns resolution, including workspace inheritance, target dependencies,

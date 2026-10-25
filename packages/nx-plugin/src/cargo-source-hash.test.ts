@@ -17,10 +17,11 @@ import {
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
-import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
-import { outsideTreesTmpdir } from './__tests__/outside-trees.js';
+import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor-inputs';
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
+import { outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
-import { CARGO_ANCESTOR_INPUTS, compiledInFiles, hashCargoPathInputs, readCargoResolve } from './cargo-source-hash.js';
+import { compiledInFiles, hashCargoPathInputs, readCargoResolve } from './cargo-source-hash.js';
 
 useFixtureCargoHome();
 

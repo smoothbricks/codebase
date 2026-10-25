@@ -15,13 +15,13 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { join } from 'node:path';
+import { outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 import fc from 'fast-check';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import { expandOutputs, WorkspaceContext } from 'nx/src/native';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory';
 import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
-import { outsideTreesTmpdir } from './__tests__/outside-trees.js';
 import { pastTick } from './__tests__/past-tick.js';
 import {
   censusStart,

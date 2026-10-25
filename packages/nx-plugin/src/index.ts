@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
+import { CARGO_PRODUCER_METADATA, postTasksExecution as postCargoRetention } from '@smoothbricks/cargo-retain';
 import {
   type CreateDependencies,
   type CreateNodesContextV2,
@@ -18,7 +18,6 @@ import {
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 import { type ParsedCommandLine, parseJsonConfigFileContent, readConfigFile, sys as typescriptSys } from 'typescript';
-
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { BUILD_INPUTS_BIN } from './build-inputs.js';
 import { bunLockDependencies, bunLockInput, bunLockNode } from './bun-lock-scope.js';
@@ -33,11 +32,6 @@ import {
   isCargoLockInput,
   resolveCargoClosureSource,
 } from './cargo-closure-input.js';
-import {
-  CARGO_PRODUCER_METADATA,
-  CARGO_RETAIN_BIN,
-  postTasksExecution as postCargoRetention,
-} from './cargo-retention.js';
 import {
   CARGO_TOOLCHAIN_NAMED_INPUT,
   CARGO_TOOLCHAIN_PIN_INPUTS,
@@ -100,6 +94,7 @@ import { isNonSourceDirectory } from './source-directories.js';
 import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
 import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
 import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
+import { toolCommand } from './tool-bins.js';
 import {
   isBuildOutputTargetName,
   isTestRunnerTargetName,
@@ -1095,7 +1090,7 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
  * other's output. The hint is recorded first so a producer-receipt bug cannot cost the controller its evidence. The
  * pair also serves a run on a host without a gateway its own CPU pool, which every task inherits
  * (`run-cpu-pool.ts`), and closes it when the run ends. Last, once every task has finished, the post hook reclaims the
- * superseded Cargo unit generations of each Cargo workspace the run built into (`cargo-retention.ts`).
+ * superseded Cargo unit generations of each Cargo workspace the run built into (`@smoothbricks/cargo-retain`).
  */
 export const preTasksExecution: PreTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
   // Before any task is hashed: a workspace that declares the test-walk check
@@ -1591,14 +1586,14 @@ async function createProjectTargets(
       options: { command: cargoFrozen('bench --workspace'), cwd: cargoWorkspaceRoot },
     };
     // A read-only preview of the retention pass the plugin's postTasksExecution
-    // schedules after runs that built (./cargo-retention.ts): the superseded unit
+    // schedules after runs that built (@smoothbricks/cargo-retain): the superseded unit
     // generations it would reclaim and why everything else stays. Never cached:
     // the verdict is about this machine's disk, not the commit.
     targets['cargo-retention'] = {
       executor: 'nx:run-commands',
       cache: false,
       options: {
-        command: `node ${posix.join(posix.relative(cargoWorkspaceRoot, '.'), CARGO_RETAIN_BIN)}`,
+        command: toolCommand(cargoWorkspaceRoot, 'cargo-retain', 'dist/bin/smoo-nx-cargo-retain.js', 'node'),
         cwd: cargoWorkspaceRoot,
       },
     };

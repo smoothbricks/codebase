@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readdir, rm, stat, utimes } from 'node:fs/promises';
+import { readdir, readFile, realpath, rm, stat, utimes } from 'node:fs/promises';
 import path from 'node:path';
 import { $ } from 'bun';
 
@@ -71,16 +71,44 @@ async function syncRuntimePinsIfDrifted(): Promise<void> {
   }
 }
 
+/**
+ * The plugin and, first, every workspace package it depends on at run time (its `workspace:*` `dependencies`, and
+ * theirs): loading the plugin imports their `dist`, so a checkout without them cannot compute the graph that would
+ * build them. Each comes before whatever depends on it.
+ */
+async function bootstrapPackages(): Promise<string[]> {
+  const ordered: string[] = [];
+  const visit = async (directory: string): Promise<void> => {
+    if (ordered.includes(directory)) return;
+    const manifest: unknown = JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'));
+    const dependencies =
+      typeof manifest === 'object' && manifest !== null && 'dependencies' in manifest
+        ? manifest.dependencies
+        : undefined;
+    if (typeof dependencies === 'object' && dependencies !== null) {
+      for (const [name, range] of Object.entries(dependencies)) {
+        if (range !== 'workspace:*') continue;
+        await visit(await realpath(path.join(directory, 'node_modules', name)));
+      }
+    }
+    ordered.push(directory);
+  };
+  await visit(path.join(projectRoot, 'packages/nx-plugin'));
+  return ordered;
+}
+
 async function rebuildNxPluginIfStale(): Promise<void> {
-  const buildMarker = path.join(projectRoot, 'packages/nx-plugin/dist/tsconfig.lib.tsbuildinfo');
-  const markerStat = await stat(buildMarker).catch(() => null);
-  // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the TS build marker.
-  if (!markerStat || (await hasFileNewerThanMarker(markerStat.mtimeMs))) {
+  let rebuilt = false;
+  for (const directory of await bootstrapPackages()) {
+    const buildMarker = path.join(directory, 'dist/tsconfig.lib.tsbuildinfo');
+    const markerStat = await stat(buildMarker).catch(() => null);
+    // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the TS build marker.
+    if (markerStat && !(await hasFileNewerThanMarker(directory, markerStat.mtimeMs))) continue;
     // Bootstrap must not call `nx`: the project graph loads this plugin and
     // `require('typescript').readConfigFile`. A cold macOS shell (publish) has
     // no prior graph cache, so `nx run nx-plugin:tsc-js` deadlocks on the plugin
     // it is trying to build. `ttsc` only needs the package tsconfig.
-    await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit'], path.join(projectRoot, 'packages/nx-plugin'));
+    await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit'], directory);
     // The marker records when dist was last VERIFIED current, not when tsc last
     // chose to write bytes. ttsc is content-incremental, so an mtime-only change —
     // a checkout, a revert, a formatter rewriting a file identically — makes it
@@ -89,8 +117,9 @@ async function rebuildNxPluginIfStale(): Promise<void> {
     // shell entry and every direnv reload rebuilds and calls clearNxDaemonState,
     // permanently destroying Nx's task cache for the whole repository.
     await utimes(buildMarker, new Date(), new Date()).catch(() => {});
-    await clearNxDaemonState();
+    rebuilt = true;
   }
+  if (rebuilt) await clearNxDaemonState();
 }
 
 async function clearNxDaemonState(): Promise<void> {
@@ -159,11 +188,8 @@ async function runQuietly(command: string, args: readonly string[], cwd: string)
   throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`);
 }
 
-async function hasFileNewerThanMarker(markerMtimeMs: number): Promise<boolean> {
-  const sourcePaths = [
-    path.join(projectRoot, 'packages/nx-plugin/src'),
-    path.join(projectRoot, 'packages/nx-plugin/tsconfig.lib.json'),
-  ];
+async function hasFileNewerThanMarker(directory: string, markerMtimeMs: number): Promise<boolean> {
+  const sourcePaths = [path.join(directory, 'src'), path.join(directory, 'tsconfig.lib.json')];
 
   for (const sourcePath of sourcePaths) {
     if (await pathHasFileNewerThanMarker(sourcePath, markerMtimeMs)) {

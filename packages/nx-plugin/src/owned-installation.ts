@@ -224,7 +224,7 @@ const HOLDERS = 'holders';
 /**
  * Takes the exclusive flock(2) of the file named by its argument and keeps it while its stdin is open: the kernel
  * lets go of it however its holder ends, so a take killed mid-copy never strands the next one. Node has no flock;
- * `cargo-retention.ts` holds Cargo's locks with a perl child the same way.
+ * `@smoothbricks/cargo-retain` holds Cargo's locks with a perl child the same way.
  */
 const LOCK_HOLDER = [
   'use strict; use Fcntl qw(:flock O_RDWR O_CREAT); $| = 1;',

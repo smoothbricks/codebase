@@ -26,6 +26,7 @@
     },
     {
       "path": "../validation/tsconfig.lib.json"
-    }
+    },
+    { "path": "../cargo-retain/tsconfig.lib.json" }
   ]
 }

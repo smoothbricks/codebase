@@ -1,7 +1,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { CARGO_ANCESTOR_INPUTS } from '../cargo-source-hash.js';
+import { CARGO_ANCESTOR_INPUTS } from '../cargo-ancestor-inputs.js';
 
 /** What a Git discovery or a Cargo manifest/config walk from a directory finds there or in an ancestor. */
 const TREE_MARKERS = ['.git', ...CARGO_ANCESTOR_INPUTS] as const;

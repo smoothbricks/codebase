@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { outsideTreesTmpdir } from './__tests__/outside-trees.js';
+import { outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 import {
   type BuildInputRecord,
   buildInputRecord,

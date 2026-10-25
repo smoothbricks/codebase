@@ -5,6 +5,8 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { CARGO_PRODUCER_METADATA } from '@smoothbricks/cargo-retain';
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import { isEslintFileSet } from '@smoothbricks/nx-plugin/eslint-file-set';
 import type {
   CreateNodesContextV2,
@@ -20,11 +22,9 @@ import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-co
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
-import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { CARGO_CLOSURE_INPUT, isCargoLockInput } from './cargo-closure-input.js';
-import { CARGO_PRODUCER_METADATA } from './cargo-retention.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
@@ -887,7 +887,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-napi']).toBeUndefined();
       expect(targets['cargo-sweep']).toBeUndefined();
       expect(targets['cargo-retention']?.options).toEqual({
-        command: 'node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-cargo-retain.js',
+        command:
+          'node "$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../cargo-retain/dist/bin/smoo-nx-cargo-retain.js"',
         cwd: 'packages/ferris',
       });
       expect(targets['cargo-retention']?.cache).toBe(false);

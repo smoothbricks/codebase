@@ -4,8 +4,8 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
-import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import type { NxTaskContext } from './executors/bounded-exec/executor.js';

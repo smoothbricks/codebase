@@ -1,6 +1,7 @@
 import { join, posix } from 'node:path';
+import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor-inputs';
 import type { CargoClosureSource } from '../cargo-closure-input.js';
-import { CARGO_ANCESTOR_INPUTS, HASH_SKIPPED_DIRECTORIES } from '../cargo-source-hash.js';
+import { HASH_SKIPPED_DIRECTORIES } from '../cargo-source-hash.js';
 
 /** Resolved metadata with the per-graph source scans already cached, as on later project visits. */
 export function filesetSource(
