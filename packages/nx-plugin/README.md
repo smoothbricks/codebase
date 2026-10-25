@@ -179,17 +179,15 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   `cargo --frozen clippy --workspace --all-targets --target-dir target/cargo-lint --config 'build.warnings="deny"'`
   cover every member. Clippy of a crate is a check build of its whole closure, so a target directory per crate rebuilt
   every shared dependency once per crate — 49 closures and 11 GiB on one repository — and no per-crate cache hit repaid
-  it. Clippy writes its own `target/cargo-lint`, so the archive, the Wasm and N-API builds and every other dev build no
-  longer queue behind a workspace-wide check on its lock. Measured in a land gate, clippy held `target/debug`'s build
-  lock for about 257 s while `cargo-test-archive` waited about 236 s with 0 crates to compile and `columine:cargo-wasm`
-  about 264 s. The price is that clippy compiles its own host units (build scripts, proc-macros) once per directory.
-  `cargo-lint-cross` keeps `target/cargo-lint-cross` for the same lock reason: a foreign triple's units are distinct
-  anyway, and its own lock keeps the cross check from queueing behind host builds. Warnings are denied by Cargo's
-  `build.warnings`, not `-- -D warnings`: arguments after `--` are clippy-driver's `CLIPPY_ARGS`, which enter every
-  member's fingerprint, so a `-- -D warnings` gate would fingerprint every member differently from a plain
-  `cargo clippy --workspace --all-targets`. `build.warnings` also fails on warnings replayed from Fresh units, so the
-  gate still fails when a warning replays instead of recompiling. Cargo's own lock serializes the invocations that share
-  a directory.
+  it. Clippy writes its own `target/cargo-lint`, so the archive, the Wasm and N-API builds and every other dev build
+  never queue behind a workspace-wide check on Cargo's build-directory lock. The price is that clippy compiles its own
+  host units (build scripts, proc-macros) once per directory. `cargo-lint-cross` keeps `target/cargo-lint-cross` for the
+  same lock reason: a foreign triple's units are distinct anyway, and its own lock keeps the cross check from queueing
+  behind host builds. Warnings are denied by Cargo's `build.warnings`, not `-- -D warnings`: arguments after `--` are
+  clippy-driver's `CLIPPY_ARGS`, which enter every member's fingerprint, so a `-- -D warnings` gate would fingerprint
+  every member differently from a plain `cargo clippy --workspace --all-targets`. `build.warnings` also fails on
+  warnings replayed from Fresh units, so the gate still fails when a warning replays instead of recompiling. Cargo's own
+  lock serializes the invocations that share a directory.
 - **Retention:** Cargo never deletes a unit generation a later build superseded, so a busy checkout's target directory
   only grows. After each Nx run that executed a Cargo producer (an inferred target that builds, checks or tests into the
   target directory, marked by its `cargoProducer` metadata: `cargo-test-archive`, `cargo-test`, `cargo-lint`,
