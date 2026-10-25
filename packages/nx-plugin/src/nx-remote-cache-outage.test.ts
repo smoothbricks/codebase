@@ -8,6 +8,7 @@ import fc from 'fast-check';
 import {
   describeRemoteCacheOutage,
   REMOTE_CACHE_ANSWER_WITHIN_MS,
+  type RemoteCacheDeadline,
   RemoteCacheOutageGuard,
   settleRemoteCacheRequest,
 } from 'nx/src/tasks-runner/remote-cache-outage.js';
@@ -44,11 +45,11 @@ const NATIVE_FATAL = [
 const DIAGNOSTIC = /^.*Remote cache .* is unavailable.*$/gm;
 
 /**
- * The deadline the in-process guards take in place of `REMOTE_CACHE_ANSWER_WITHIN_MS`. Each case holds its answer
- * off by construction (a remote that never settles, a server that answers only after the guard gave up), so the bound
- * is the case's subject and its length decides nothing but how long the case waits.
+ * The clock the in-process guards take in place of the run's timer: a deadline already elapsed. Each case holds its
+ * answer off by construction (a remote that never settles, a server that answers only after the guard gave up), so
+ * the deadline passing first is the case's subject, and the outage still names the run's own bound.
  */
-const WITHIN_MS = 100;
+const ELAPSED = (): RemoteCacheDeadline => ({ elapsed: Promise.resolve(), clear: () => {} });
 
 describe('the outage decision', () => {
   const detail = fc.string({ unit: 'grapheme', maxLength: 80 });
@@ -301,14 +302,14 @@ describe('a run against an unreachable remote cache', () => {
     const warn = spyOn(console, 'warn').mockImplementation(() => {});
     const cacheDirectory = await mkdtemp(join(tmpdir(), 'nx-cache-stalled-'));
     try {
-      const guard = new RemoteCacheOutageGuard(silent, server, WITHIN_MS);
+      const guard = new RemoteCacheOutageGuard(silent, server, ELAPSED);
       expect(await guard.retrieve('1234', cacheDirectory)).toBeNull();
       expect(await guard.store('1234', cacheDirectory, 'built', 0)).toBe(false);
       expect(await guard.retrieve('5678', cacheDirectory)).toBeNull();
       expect(asked).toEqual(['GET 1234']);
       expect(warn).toHaveBeenCalledTimes(1);
       expect(String(warn.mock.calls[0]?.[0])).toContain(
-        describeRemoteCacheOutage(server, 'GET /v1/cache/1234', `no result within ${WITHIN_MS} ms`),
+        describeRemoteCacheOutage(server, 'GET /v1/cache/1234', `no result within ${REMOTE_CACHE_ANSWER_WITHIN_MS} ms`),
       );
     } finally {
       warn.mockRestore();
@@ -385,14 +386,11 @@ describe('a lookup the deadline overtook', () => {
       }),
     );
     await withNxFixture('nx-cache-late-', async ({ root, workspace, socketDirectory }) => {
-      const child = Bun.spawn(
-        ['bun', join(import.meta.dir, '__tests__', 'remote-cache-late-lookup.ts'), root, hash, String(WITHIN_MS)],
-        {
-          env: { ...fixtureNxEnv(workspace, socketDirectory), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server.url.origin },
-          stdout: 'pipe',
-          stderr: 'pipe',
-        },
-      );
+      const child = Bun.spawn(['bun', join(import.meta.dir, '__tests__', 'remote-cache-late-lookup.ts'), root, hash], {
+        env: { ...fixtureNxEnv(workspace, socketDirectory), NX_SELF_HOSTED_REMOTE_CACHE_SERVER: server.url.origin },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
       const stderr = new Response(child.stderr).text();
       const steps = child.stdout.pipeThrough(new TextDecoderStream()).getReader();
       let printed = '';
@@ -419,7 +417,7 @@ describe('a lookup the deadline overtook', () => {
       const log = await stderr;
       expect(await child.exited, log).toBe(0);
       expect(JSON.parse(printed.trim().split('\n')[3] ?? 'null'), log).toEqual({ late: 'hit' });
-      expect(log).toContain(`no result within ${WITHIN_MS} ms`);
+      expect(log).toContain(`no result within ${REMOTE_CACHE_ANSWER_WITHIN_MS} ms`);
       expect(lateAnswers).toBe(1);
       const cache = join(root, 'cache');
       expect(await readFile(join(cache, hash, 'app', 'result.txt'), 'utf8')).toBe('local');

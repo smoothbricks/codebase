@@ -3907,10 +3907,10 @@ index ab0d47a6d12a4ce8cb6b140364b1ada923fab95a..894bbfc883a7108a9fdd118691d6e2bc
      }
 diff --git a/dist/src/tasks-runner/remote-cache-outage.d.ts b/dist/src/tasks-runner/remote-cache-outage.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..319e84017d461f91e924f78d273f6665e98c3013
+index 0000000000000000000000000000000000000000..57b52a6635973dfee4ebba8f13b45bb2c0d59fb9
 --- /dev/null
 +++ b/dist/src/tasks-runner/remote-cache-outage.d.ts
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,40 @@
 +import type { CachedResult } from '../native';
 +import type { RemoteCacheV2 } from './default-tasks-runner';
 +export declare const REMOTE_CACHE_ANSWER_WITHIN_MS = 90000;
@@ -3936,22 +3936,27 @@ index 0000000000000000000000000000000000000000..319e84017d461f91e924f78d273f6665
 +};
 +export declare function settleRemoteCacheRequest<T>(settlement: RemoteCacheSettlement<T>): RemoteCacheOutcome<T>;
 +export declare function describeRemoteCacheOutage(server: string, request: string, cause: string): string;
++/** When a remote cache request stops waiting: `elapsed` settles at the deadline, `clear` releases it once the request settled first. */
++export interface RemoteCacheDeadline {
++    readonly elapsed: Promise<void>;
++    clear(): void;
++}
 +export declare class RemoteCacheOutageGuard implements RemoteCacheV2 {
 +    private readonly remote;
 +    private readonly server;
-+    private readonly withinMs;
++    private readonly deadline;
 +    private unavailable;
-+    constructor(remote: RemoteCacheV2, server: string, withinMs?: number);
++    constructor(remote: RemoteCacheV2, server: string, deadline?: (withinMs: number) => RemoteCacheDeadline);
 +    retrieve(hash: string, cacheDirectory: string): Promise<CachedResult | null>;
 +    store(hash: string, cacheDirectory: string, terminalOutput: string, code: number): Promise<boolean>;
 +    private request;
 +}
 diff --git a/dist/src/tasks-runner/remote-cache-outage.js b/dist/src/tasks-runner/remote-cache-outage.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..cd0ca33b3061b521120c1e97d50cdf76907a7f55
+index 0000000000000000000000000000000000000000..62b8bcb2c01842b3bebf1815b68860e125772653
 --- /dev/null
 +++ b/dist/src/tasks-runner/remote-cache-outage.js
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,190 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.RemoteCacheOutageGuard = exports.REMOTE_CACHE_ANSWER_WITHIN_MS = void 0;
@@ -4012,18 +4017,25 @@ index 0000000000000000000000000000000000000000..cd0ca33b3061b521120c1e97d50cdf76
 +function oneLine(text) {
 +    return text.split(/\s+/).filter((part) => part.length > 0).join(' ');
 +}
-+/** Settles `request` as answered or rejected, or as unanswered once `withinMs` passes. */
-+async function settleWithin(request, withinMs) {
-+    const { promise: deadline, resolve } = Promise.withResolvers();
-+    const timer = setTimeout(() => resolve({ kind: 'unanswered', withinMs }), withinMs);
++/** The run's clock: a deadline that elapses `withinMs` after it is made, unless cleared first. */
++function timerDeadline(withinMs) {
++    let timer;
++    const elapsed = new Promise((resolve) => {
++        timer = setTimeout(resolve, withinMs);
++    });
++    return { elapsed, clear: () => clearTimeout(timer) };
++}
++/** Settles `request` as answered or rejected, or as unanswered once its `deadline` for `withinMs` elapses. */
++async function settleWithin(request, withinMs, deadline) {
++    const { elapsed, clear } = deadline(withinMs);
 +    try {
 +        return await Promise.race([
 +            request.then((value) => ({ kind: 'answered', value }), (error) => ({ kind: 'rejected', error })),
-+            deadline,
++            elapsed.then(() => ({ kind: 'unanswered', withinMs })),
 +        ]);
 +    }
 +    finally {
-+        clearTimeout(timer);
++        clear();
 +    }
 +}
 +/**
@@ -4041,11 +4053,11 @@ index 0000000000000000000000000000000000000000..cd0ca33b3061b521120c1e97d50cdf76
 + * exits is removed then.
 + */
 +class RemoteCacheOutageGuard {
-+    /** `withinMs` bounds each native call; a test passes a short one, a run keeps `REMOTE_CACHE_ANSWER_WITHIN_MS`. */
-+    constructor(remote, server, withinMs = exports.REMOTE_CACHE_ANSWER_WITHIN_MS) {
++    /** `deadline` is the guard's clock: a run keeps the timer, a test passes one it elapses itself. */
++    constructor(remote, server, deadline = timerDeadline) {
 +        this.remote = remote;
 +        this.server = server;
-+        this.withinMs = withinMs;
++        this.deadline = deadline;
 +        this.unavailable = false;
 +    }
 +    async retrieve(hash, cacheDirectory) {
@@ -4093,7 +4105,7 @@ index 0000000000000000000000000000000000000000..cd0ca33b3061b521120c1e97d50cdf76
 +        if (this.unavailable) {
 +            return skipped;
 +        }
-+        const outcome = settleRemoteCacheRequest(await settleWithin(native, this.withinMs));
++        const outcome = settleRemoteCacheRequest(await settleWithin(native, exports.REMOTE_CACHE_ANSWER_WITHIN_MS, this.deadline));
 +        switch (outcome.kind) {
 +            case 'answered':
 +                return outcome.value;
