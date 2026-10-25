@@ -5107,9 +5107,10 @@ fn first_launch_finding(reading: Result<gateway_service::FirstLaunchReading>) ->
             code: "first-launch-scan".into(),
             severity: FindingSeverity::Warning,
             message: format!(
-                "{measured}: macOS scans every new executable a workspace job launches, because the gateway host {path} has no Developer Tools entry; add it once in System Settings → Privacy & Security → Developer Tools → + (⇧⌘G takes the path {path})"
+                "{measured}: macOS scans every new executable a workspace job launches, because the gateway host {path} runs without a Developer Tools entry; add it once in System Settings → Privacy & Security → Developer Tools → + (⇧⌘G takes the path {path}), then restart the gateway: an entry applies only to a gateway host started after it was added ({restart}, or cowshed gateway start, which refuses while a land or gate runs)",
+                restart = reading.restart
             ),
-            hint: DEVELOPER_TOOLS_PANE.into(),
+            hint: format!("{DEVELOPER_TOOLS_PANE}; then {}", reading.restart),
             path: Some(reading.gateway_host.clone()),
         },
     }
@@ -6546,6 +6547,7 @@ mod tests {
             gateway_host: PathBuf::from(
                 "/home/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host",
             ),
+            restart: "launchctl kickstart -k gui/501/dev.cowshed.gateway".into(),
         })
     }
 
@@ -6567,7 +6569,18 @@ mod tests {
                 .contains("/home/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host"),
             "{finding:?}"
         );
-        assert_eq!(finding.hint, DEVELOPER_TOOLS_PANE);
+        assert!(
+            finding.message.contains(
+                "started after it was added (launchctl kickstart -k gui/501/dev.cowshed.gateway"
+            ),
+            "{finding:?}"
+        );
+        assert_eq!(
+            finding.hint,
+            format!(
+                "{DEVELOPER_TOOLS_PANE}; then launchctl kickstart -k gui/501/dev.cowshed.gateway"
+            )
+        );
         assert!(
             doctor_report(vec![finding]).healthy,
             "a scan is a cost, not a broken host"

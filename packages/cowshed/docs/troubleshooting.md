@@ -559,10 +559,12 @@ workspace job's responsible process is the gateway host,
 `~/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host`, which `cowshed setup` signs with your cowshed
 identity (05_gateway.md "The gateway host"). Until it has a Developer Tools entry, a gate's fresh test binaries and
 build scripts wait seconds for the scan where the same binaries start in milliseconds from your terminal. Add it once,
-as an administrator: System Settings → Privacy & Security → Developer Tools → + → ⇧⌘G → that path. The entry outlives
-every later `cowshed setup`, since setup rewrites the host at the same path with the same designated requirement.
-`cowshed doctor` then reports `first-launch-exempt` with the four launch times. Never turn Gatekeeper or XProtect off
-machine-wide instead.
+as an administrator: System Settings → Privacy & Security → Developer Tools → + → ⇧⌘G → that path. Then restart the
+gateway, since the entry applies only to a gateway host started after it was added:
+`launchctl kickstart -k gui/$(id -u)/dev.cowshed.gateway`, or `cowshed gateway start` (it refuses while a land or gate
+runs). The entry outlives every later `cowshed setup`, since setup rewrites the host at the same path with the same
+designated requirement. `cowshed doctor` then reports `first-launch-exempt` with the four launch times. Never turn
+Gatekeeper or XProtect off machine-wide instead.
 
 ## "cowshed volumes owned by another user"
 

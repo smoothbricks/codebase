@@ -175,16 +175,25 @@ pub enum Exemption {
     Charged,
 }
 
-/// Judge the gateway's first launch against the host shell's.
+/// The least first-launch excess doctor reads as the scan: 100 ms. A charged launch of a program
+/// cowshed's size waits hundreds of milliseconds to seconds (0.2 s to 17.6 s in the first
+/// exemption survey, 2078 ms and 5258.7 ms under an unexempt gateway); an exempt gateway under
+/// load measured 23.8 ms against the shell's 8.7 ms, an excess of 16.8 ms that a bound relative
+/// to the shell alone misread as the scan.
+pub const CHARGED_EXCESS_MICROS: u64 = 100_000;
+/// Judge the gateway's first launch against what a charged launch costs.
 ///
-/// What a first launch costs beyond its second is the scan, plus noise. The host shell is the
-/// reference: its terminal holds the exemption, so its excess is what an exempt run pays on this
-/// host, at this load. The gateway is exempt while its excess stays within the host shell's
-/// excess plus one host-shell first launch. A charged launch of a program cowshed's size waits
-/// hundreds of milliseconds to seconds, which no host-shell spread approaches.
+/// What a first launch costs beyond its second is the scan, plus noise. The gateway is charged
+/// only when its excess passes both [`CHARGED_EXCESS_MICROS`] and what the host shell, whose
+/// terminal holds the exemption, pays at this load: its own excess plus one of its first
+/// launches. The fixed floor keeps a loaded but exempt gateway exempt; the shell's allowance
+/// keeps a host so loaded that the shell itself takes over 100 ms from reading as charged.
 pub fn judge(host: FirstLaunch, gateway: FirstLaunch) -> Exemption {
     let excess = |launch: FirstLaunch| launch.first_micros.saturating_sub(launch.second_micros);
-    if excess(gateway) <= excess(host).saturating_add(host.first_micros) {
+    let allowance = excess(host)
+        .saturating_add(host.first_micros)
+        .max(CHARGED_EXCESS_MICROS);
+    if excess(gateway) <= allowance {
         Exemption::Exempt
     } else {
         Exemption::Charged
@@ -209,6 +218,8 @@ mod tests {
         let host = launch(25, 27);
         assert_eq!(judge(host, launch(17_600, 22)), Exemption::Charged);
         assert_eq!(judge(host, launch(200, 22)), Exemption::Charged);
+        // Before Main's restart onto the entry: 5258.7 ms against the shell's 6.0 ms.
+        assert_eq!(judge(launch(6, 5), launch(5_259, 30)), Exemption::Charged);
     }
 
     #[test]
@@ -216,8 +227,18 @@ mod tests {
         let host = launch(15, 10);
         assert_eq!(judge(host, launch(14, 11)), Exemption::Exempt);
         assert_eq!(judge(host, launch(30, 11)), Exemption::Exempt);
-        assert_eq!(judge(host, launch(31, 10)), Exemption::Charged);
         // A second launch slower than the first is no excess at all.
         assert_eq!(judge(host, launch(9, 40)), Exemption::Exempt);
+        // Main's reading after the entry and a gateway restart, on a loaded host.
+        assert_eq!(judge(launch(9, 7), launch(24, 7)), Exemption::Exempt);
+        // Up to the floor is exempt; past it, beyond the shell's spread, is the scan.
+        assert_eq!(judge(host, launch(110, 10)), Exemption::Exempt);
+        assert_eq!(judge(host, launch(111, 10)), Exemption::Charged);
+        // A shell slower than the floor raises the bound with it.
+        assert_eq!(judge(launch(300, 100), launch(600, 100)), Exemption::Exempt);
+        assert_eq!(
+            judge(launch(300, 100), launch(601, 100)),
+            Exemption::Charged
+        );
     }
 }

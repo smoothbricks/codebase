@@ -95,17 +95,21 @@ Two verbs own the host story, both runnable from any directory:
   database is unreadable to the user, so it reads behavior: doctor mints a fresh copy of its own executable, signed ad
   hoc under an unused identifier, and launches it twice in its own process, the host shell's; then the gateway
   (`first-launch` control op) does the same in the daemon's process, whose responsible process every job has. The scan
-  is what a first launch costs beyond its second. The host shell's terminal holds the exemption, so its excess is what
-  an exempt run pays at this load: the gateway is exempt while its excess stays within the host shell's excess plus one
-  host-shell first launch. A charged launch of a program cowshed's size waits hundreds of milliseconds to seconds. The
-  finding names all four times: `first-launch-exempt` (info) when jobs launch at host-shell speed; `first-launch-scan`
-  (warning) when they wait, naming the gateway host's path and the one step that ends it (System Settings → Privacy &
-  Security → Developer Tools → +), with the hint
-  `open 'x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools'`; `first-launch-unmeasured` (warning)
-  when either side measured nothing, or when doctor itself runs under the gateway host (inside a workspace job, as its
-  responsible process says) and so has no host-shell launch to compare; its hint is `cowshed setup` for a gateway of a
-  build without the op, and running doctor from a terminal for the latter. A scan is a cost, not a broken host, so no
-  `first-launch-*` finding makes doctor unhealthy.
+  is what a first launch costs beyond its second. A charged launch of a program cowshed's size waits hundreds of
+  milliseconds to seconds (2078 ms and 5258.7 ms measured under an unexempt gateway), while an exempt gateway on a
+  loaded host measured 23.8 ms against the shell's 8.7 ms. So the gateway is charged only when its excess passes both
+  100 ms (`CHARGED_EXCESS_MICROS`) and what the host shell, whose terminal holds the exemption, pays at this load: its
+  own excess plus one host-shell first launch, which keeps a host so loaded that the shell itself is slow from reading
+  as charged. The finding names all four times: `first-launch-exempt` (info) when jobs launch at host-shell speed;
+  `first-launch-scan` (warning) when they wait, naming the gateway host's path, the one step that ends it (System
+  Settings → Privacy & Security → Developer Tools → +) and the restart that step needs, since an entry applies only to a
+  gateway host started after it was added (`launchctl kickstart -k gui/<uid>/dev.cowshed.gateway`, or
+  `cowshed gateway start`, which refuses while a land or gate runs), with the hint
+  `open 'x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools'; then launchctl kickstart -k gui/<uid>/dev.cowshed.gateway`;
+  `first-launch-unmeasured` (warning) when either side measured nothing, or when doctor itself runs under the gateway
+  host (inside a workspace job, as its responsible process says) and so has no host-shell launch to compare; its hint is
+  `cowshed setup` for a gateway of a build without the op, and running doctor from a terminal for the latter. A scan is
+  a cost, not a broken host, so no `first-launch-*` finding makes doctor unhealthy.
 
 - **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones,
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin

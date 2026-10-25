@@ -199,8 +199,12 @@ that finds the host absent, or not satisfying that requirement, rewrites it the 
 runs the rewritten file at its next start. Otherwise the host is left as it is. A running host keeps the file it started
 from. The one step that completes the exemption is the operator's, one administrator authorization once per host: System
 Settings → Privacy & Security → Developer Tools → + →
-`~/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host` (⇧⌘G takes the path). No install can take it, so
-none raises it; `cowshed doctor` reports whether it holds (06_cli.md, `first-launch-scan`).
+`~/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host` (⇧⌘G takes the path). The entry applies only to a
+gateway host started after it was added: macOS judges a process's exemption when it starts, so the running host, and
+every job under it, stays charged until the gateway restarts — `launchctl kickstart -k gui/<uid>/dev.cowshed.gateway`,
+or `cowshed gateway start`, which restarts the agent onto the installed build and refuses while a land or gate runs. No
+install can take the step, so none raises it; `cowshed doctor` reports whether it holds (06_cli.md,
+`first-launch-scan`).
 
 **The `PATH` entry.** `setup` points the first `cowshed` on the operator's `PATH` at the stable name: the first absolute
 `PATH` directory holding a symbolic link or an executable file of that name. A symbolic link — what `bun link`,

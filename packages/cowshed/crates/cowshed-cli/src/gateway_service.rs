@@ -1300,6 +1300,9 @@ pub(crate) struct FirstLaunchReading {
     pub(crate) host: FirstLaunch,
     pub(crate) gateway: std::result::Result<FirstLaunch, String>,
     pub(crate) gateway_host: PathBuf,
+    /// The command that restarts the gateway agent: a Developer Tools entry exempts only a
+    /// gateway host started after it was added.
+    pub(crate) restart: String,
 }
 
 /// Measure a first launch here, then ask the gateway to measure one within `within`. One after
@@ -1343,6 +1346,7 @@ pub(crate) async fn first_launch_within(
         host,
         gateway,
         gateway_host,
+        restart: kickstart_hint(effective_uid(), &roots.namespace().launchd_label("gateway")),
     })
 }
 /// [`service_status`] for `doctor`, from a gateway that must answer within `within` of taking
