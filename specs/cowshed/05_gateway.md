@@ -846,22 +846,33 @@ and writes and the timer onto them is `cowshed-os::deadline` (`PeerStream`, `wit
 | handshake | connecting to a peer that should be running, and its hello | 10 s  |
 | reap      | a child's exit once its pipes closed or it was killed      | 5 s   |
 
-These are initial values, generous against sub-second local answers. Each will be replaced by its measured p99 under
-land-gate load × 20, recorded here with the date and the command that measured it.
+A control or handshake bound covers establishing the connection and sending the request, which the kernel completes
+whatever the peer's load. The answer itself is bounded by the heartbeat silence below, never by a total, so a saturated
+peer that is still working is never failed for being slow. Hello is the exception: the whole hello exchange is inside
+the handshake bound.
 
 - **Codes.** `TIMEOUT` is a request past its class's bound. `SILENT` is a long wait whose holder showed no progress for
   its silence bound. `PEER_LOST` means the peer ended the connection before answering, so the outcome is unknown and the
   caller reads state again. These three are terminal. `BLOCKED` means nothing listens at the socket (missing, or
-  refusing with nothing attached); it is lmao's `Blocked(service)`, and the caller states its own fallback.
+  refusing with nothing attached); it is lmao's `Blocked(service)`, and the caller states its own fallback. A socket
+  that refuses while still attached is a live peer that is not accepting (a full queue), never `BLOCKED`.
 - **A long wait has no total ceiling; its holder heartbeats.** Some answers take as long as their work: a job's
-  terminal, a log follow, a commitments read, an advance. While such an answer is not ready, the workspace supervisor
-  writes `{"progress":{"seq":n,"job":{jobId,state,members}|null}}` on the call's connection every 5 s. The job field is
-  present for a call about a job. The client connects and sends within the control bound, then reads past the heartbeats
-  under a silence bound of 15 s (three heartbeats). So a supervisor that is alive but silent, or whose actor stopped
-  answering (the heartbeat reads the job through the actor), fails `SILENT` naming its socket and pid. A heartbeat about
-  a job that is running or draining with no process of its group left is not progress. If that state persists for the
-  silence bound, the wait fails `SILENT`, naming the job as stuck between its last process and its end. A queued job is
+  terminal, a log follow, a commitments read, an advance, a process event. While such an answer is not ready, the
+  workspace supervisor writes `{"progress":{"seq":n,"job":{jobId,state,members}|null}}` on the call's connection every 5
+  s. The job field is present for a call about a job. The client connects and sends within the control bound, then reads
+  past the heartbeats under a silence bound of 15 s (three heartbeats). Each heartbeat is a round trip through the
+  supervisor's actor under the authority the supervisor serves now: it reads that authority, and the job for a call
+  about one. A grant advance during the wait therefore changes nothing. A supervisor that is alive but silent, or whose
+  actor stopped answering, writes no heartbeat and fails `SILENT`, naming its socket and pid. A heartbeat about a job
+  that is running or draining with no process of its group left is not progress. If that state persists for the silence
+  bound, the wait fails `SILENT`, naming the job as stuck between its last process and its end. A queued job is
   progress, because CPU tokens have no admission deadline (Host CPU budget, "No admission deadline, for any class").
+- **The gateway control plane heartbeats the same way.** A one-shot request is connected, written and half-closed within
+  the control bound. While its answer is not ready, and while an audit-tail follow waits for events, the gateway writes
+  `{"ok":true,"progress":n}` every 5 s, once its actor has answered a ping. The client reads past those lines under the
+  15 s silence bound. An answer that takes as long as its work (`nx-cache-clear`, `ram-attach`, `first-launch`) is
+  therefore never cut off, and a gateway whose actor stopped turning is named `SILENT`. A held request (`disk-lease`,
+  `cpu-tokens`, `jobserver`, `resident-pool`) keeps its own protocol above.
 - **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
   with the failure's message.
 

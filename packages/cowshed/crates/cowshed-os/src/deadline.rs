@@ -69,6 +69,14 @@ pub fn start(op: &'static str, bound: Bound) -> Deadline {
     Deadline::start(op, bound, clock())
 }
 
+/// The interval a holder heartbeats on: first due one [`HEARTBEAT`] from now, and a beat that
+/// comes late delays the next rather than bunching.
+pub fn beats() -> tokio::time::Interval {
+    let mut beats = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
+    beats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    beats
+}
+
 /// Start measuring the silence of `op`'s holder now.
 pub fn idle(op: &'static str, silence: Duration) -> Idle {
     Idle::start(op, silence, clock())
@@ -106,6 +114,17 @@ impl Peer {
             address: PeerAddress::Unix(socket.to_path_buf()),
             pid: PeerPid::NotReported,
         }
+    }
+
+    /// The peer with the pid the kernel reports for `connection`.
+    pub fn credited(mut self, connection: &UnixStream) -> Self {
+        self.pid = match connection.peer_cred() {
+            Ok(credential) => credential
+                .pid()
+                .map_or(PeerPid::NotReported, PeerPid::Known),
+            Err(error) => PeerPid::Unread(error.to_string()),
+        };
+        self
     }
 
     pub fn tcp(role: &'static str, address: SocketAddr) -> Self {
@@ -267,20 +286,17 @@ impl PeerStream<UnixStream> {
         socket: &Path,
         deadline: Deadline,
     ) -> Result<Self, WaitError> {
-        let mut peer = Peer::unix(role, socket);
+        let peer = Peer::unix(role, socket);
         let io = establish(&deadline, &peer, UnixStream::connect(socket)).await?;
-        peer.pid = match io.peer_cred() {
-            Ok(credential) => credential
-                .pid()
-                .map_or(PeerPid::NotReported, PeerPid::Known),
-            Err(error) => PeerPid::Unread(error.to_string()),
-        };
+        let peer = peer.credited(&io);
         Ok(Self::connected(io, peer, deadline))
     }
 }
 
-/// Run `connect` to `peer` within `deadline`: a missing or refusing peer is absent, and a connect
-/// still pending at the bound has expired with nothing sent.
+/// Run `connect` to `peer` within `deadline`: a peer whose address does not exist is absent, and
+/// a connect still pending at the bound has expired with nothing sent. A refused connect is an
+/// I/O failure: only the caller can tell whether a socket that refuses still has its holder
+/// attached (a full queue) or none (a peer that left).
 pub async fn establish<S>(
     deadline: &Deadline,
     peer: &Peer,
@@ -288,18 +304,11 @@ pub async fn establish<S>(
 ) -> Result<S, WaitError> {
     match within(deadline, peer, Progress::Nothing, connect).await? {
         Ok(io) => Ok(io),
-        Err(source)
-            if matches!(
-                source.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            Err(WaitError::Absent {
-                op: deadline.op(),
-                peer: Box::new(peer.clone()),
-                source,
-            })
-        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Err(WaitError::Absent {
+            op: deadline.op(),
+            peer: Box::new(peer.clone()),
+            source,
+        }),
         Err(source) => Err(WaitError::Io {
             op: deadline.op(),
             peer: Box::new(peer.clone()),

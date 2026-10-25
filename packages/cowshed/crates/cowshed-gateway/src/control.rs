@@ -5,7 +5,6 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -18,6 +17,8 @@ use tokio::{
     sync::mpsc,
 };
 use zeroize::{Zeroize, Zeroizing};
+
+use cowshed_os::deadline::{self, Peer, PeerStream, WaitError};
 
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
@@ -51,6 +52,10 @@ const CONTROLLER_CREDENTIAL_PREFIX: &str = "cctl1_";
 trait ControlIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> ControlIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 type BoxControlIo = Box<dyn ControlIo>;
+/// A control connection whose request is sent, read for its answer within its bound.
+type ControlReader = BufReader<PeerStream<BoxControlIo>>;
+/// The process a control client waits on, as its failures name it.
+const GATEWAY: &str = "gateway daemon";
 
 #[derive(Clone, Debug)]
 enum ControlEndpoint {
@@ -96,17 +101,6 @@ impl GatewayControlClient {
             .ok_or(ControlError::InvalidResponse)
     }
 
-    /// [`Self::status`] from a daemon that must answer within `within` of taking the request: one
-    /// that took it and stays silent is [`ControlError::Unanswered`], not a wait without end
-    /// (specs/cowshed/06_cli.md, "doctor").
-    pub async fn status_within(&self, within: Duration) -> Result<DaemonStatus, ControlError> {
-        let response: ControlResponse = self
-            .exchange_within(&ControlRequest::Status, Some(within))
-            .await?;
-        check_response(&response)?;
-        response.status.ok_or(ControlError::InvalidResponse)
-    }
-
     /// Observe one installed workspace revision without requesting the host session census.
     pub async fn session_current(
         &self,
@@ -146,26 +140,13 @@ impl GatewayControlClient {
         .ok_or(ControlError::InvalidResponse)
     }
 
-    /// [`Self::cpu_budget`] answered within `within`, as [`Self::status_within`].
-    pub async fn cpu_budget_within(
-        &self,
-        within: Duration,
-    ) -> Result<CpuBudgetStatus, ControlError> {
-        let response: ControlResponse = self
-            .exchange_within(&ControlRequest::CpuBudget, Some(within))
-            .await?;
-        check_response(&response)?;
-        response.cpu_budget.ok_or(ControlError::InvalidResponse)
-    }
-
-    /// A first-launch measurement answered within `within`, as [`Self::status_within`]. The daemon
-    /// makes it by two timed launches, so it needs far more time than a status ask.
-    pub async fn first_launch_within(&self, within: Duration) -> Result<FirstLaunch, ControlError> {
-        let response: ControlResponse = self
-            .exchange_within(&ControlRequest::FirstLaunch, Some(within))
-            .await?;
-        check_response(&response)?;
-        response.first_launch.ok_or(ControlError::InvalidResponse)
+    /// A first-launch measurement: the daemon makes it by two timed launches, heartbeating while
+    /// it does.
+    pub async fn first_launch(&self) -> Result<FirstLaunch, ControlError> {
+        self.send(&ControlRequest::FirstLaunch)
+            .await?
+            .first_launch
+            .ok_or(ControlError::InvalidResponse)
     }
 
     /// The gate jobs a gateway restart now would cut off (05_gateway.md, "An install refuses
@@ -298,10 +279,7 @@ impl GatewayControlClient {
             limit,
             follow,
         };
-        let (mut stream, encoded) = self.connect_and_encode(&request).await?;
-        stream.write_all(&encoded).await?;
-        stream.shutdown().await?;
-        let mut reader = BufReader::new(stream);
+        let mut reader = self.ask(&request).await?;
         let first = read_response_line(&mut reader).await?;
         check_response(&first)?;
         let initial = first.audit_events.unwrap_or_default();
@@ -353,38 +331,41 @@ impl GatewayControlClient {
         &self,
         request: &ControlRequest,
     ) -> Result<T, ControlError> {
-        self.exchange_within(request, None).await
+        read_answer_line(&mut self.ask(request).await?).await
     }
 
-    /// [`Self::exchange`], whose answer must arrive within `within` of the request being sent,
-    /// when a bound is given.
-    async fn exchange_within<T: serde::de::DeserializeOwned>(
-        &self,
-        request: &ControlRequest,
-        within: Option<Duration>,
-    ) -> Result<T, ControlError> {
-        let (mut stream, encoded) = self.connect_and_encode(request).await?;
-        stream.write_all(&encoded).await?;
-        stream.shutdown().await?;
-        let mut reader = BufReader::new(stream);
-        match within {
-            None => read_answer_line(&mut reader).await,
-            Some(within) => tokio::time::timeout(within, read_answer_line(&mut reader))
-                .await
-                .map_err(|_| ControlError::Unanswered { within })?,
+    /// Send `request` (05_gateway.md, "Deadlines"): connected, written and half-closed within the
+    /// control bound, then the connection held for its answer, which may take as long as its work
+    /// while the daemon heartbeats.
+    async fn ask(&self, request: &ControlRequest) -> Result<ControlReader, ControlError> {
+        let op = request.op();
+        let (mut stream, encoded) = self.connect_and_encode(request, op).await?;
+        let sent = async {
+            stream.write_all(&encoded).await?;
+            stream.shutdown().await
         }
+        .await;
+        sent.map_err(|error| ControlError::Wait(stream.fail(error)))?;
+        stream.hold(deadline::idle(op, deadline::HEARTBEAT_SILENCE));
+        Ok(BufReader::new(stream))
     }
 
     async fn connect_and_encode(
         &self,
         request: &ControlRequest,
-    ) -> Result<(BoxControlIo, Zeroizing<Vec<u8>>), ControlError> {
+        op: &'static str,
+    ) -> Result<(PeerStream<BoxControlIo>, Zeroizing<Vec<u8>>), ControlError> {
+        let budget = deadline::start(op, deadline::CONTROL);
         let (stream, mut encoded) = match &self.endpoint {
             ControlEndpoint::Unix(socket) => {
                 let encoded = serde_json::to_vec(request)
                     .map_err(|error| ControlError::Encoding(error.to_string()))?;
+                let peer = Peer::unix(GATEWAY, socket);
+                let connected =
+                    deadline::establish(&budget, &peer, UnixStream::connect(socket)).await?;
+                let peer = peer.credited(&connected);
                 (
-                    Box::new(UnixStream::connect(socket).await?) as BoxControlIo,
+                    PeerStream::connected(Box::new(connected) as BoxControlIo, peer, budget),
                     encoded,
                 )
             }
@@ -399,8 +380,11 @@ impl GatewayControlClient {
                 };
                 let encoded = serde_json::to_vec(&envelope)
                     .map_err(|error| ControlError::Encoding(error.to_string()))?;
+                let peer = Peer::tcp(GATEWAY, *address);
+                let connected =
+                    deadline::establish(&budget, &peer, TcpStream::connect(address)).await?;
                 (
-                    Box::new(TcpStream::connect(address).await?) as BoxControlIo,
+                    PeerStream::connected(Box::new(connected) as BoxControlIo, peer, budget),
                     encoded,
                 )
             }
@@ -486,6 +470,31 @@ enum ControlRequest {
     },
     /// Measure a fresh executable's first and second launch (05_gateway.md, "Control plane").
     FirstLaunch,
+}
+
+impl ControlRequest {
+    /// The request as a wait on its answer names it: its wire `op`.
+    const fn op(&self) -> &'static str {
+        match self {
+            Self::SessionCurrent { .. } => "session-current",
+            Self::Status => "status",
+            Self::Install { .. } => "install",
+            Self::Remove { .. } => "remove",
+            Self::AuditTail { .. } => "audit-tail",
+            Self::RepoMirror { .. } => "repo-mirror",
+            Self::SimConfigure { .. } => "sim-configure",
+            Self::SimApprove { .. } => "sim-approve",
+            Self::SimList { .. } => "sim-list",
+            Self::SimBoot { .. } => "sim-boot",
+            Self::CpuBudget => "cpu-budget",
+            Self::TaskTerminal { .. } => "task-terminal",
+            Self::TaskQueue => "task-queue",
+            Self::NxCacheClear { .. } => "nx-cache-clear",
+            Self::RamAttach { .. } => RAM_ATTACH_OP,
+            Self::RamDetach { .. } => RAM_DETACH_OP,
+            Self::FirstLaunch => FIRST_LAUNCH_OP,
+        }
+    }
 }
 
 /// A request as the control socket reads it: a one-shot [`ControlRequest`] answered and closed,
@@ -732,6 +741,10 @@ struct ControlResponse {
     /// The measurement a `first-launch` made: the first and second launch of a fresh executable.
     #[serde(skip_serializing_if = "Option::is_none")]
     first_launch: Option<FirstLaunch>,
+    /// A heartbeat's sequence number, on a line that answers nothing yet (05_gateway.md,
+    /// "Deadlines").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2227,7 +2240,7 @@ async fn serve_request<W>(
     W: AsyncWrite + Unpin,
 {
     let (response, mut subscription) = match request {
-        Ok(request) => dispatch(request, &services).await,
+        Ok(request) => answered(&mut writer, &services.handle, dispatch(request, &services)).await,
         Err(error) => {
             let code = if matches!(error, ControlError::Unauthorized) {
                 ControlFailureCode::Unauthorized
@@ -2241,7 +2254,22 @@ async fn serve_request<W>(
         return;
     }
     if let Some(receiver) = subscription.as_mut() {
-        while let Some(event) = receiver.recv().await {
+        // A follow waits for events as long as none happen: the heartbeat says it still serves.
+        let mut heartbeat = Heartbeat::new(&services.handle);
+        loop {
+            let event = tokio::select! {
+                biased;
+                event = receiver.recv() => event,
+                () = heartbeat.due() => {
+                    if heartbeat.beat(&mut writer).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(event) = event else {
+                break;
+            };
             let response = ControlResponse {
                 audit_event: Some(event),
                 ..success()
@@ -2252,6 +2280,74 @@ async fn serve_request<W>(
         }
     }
     let _ = writer.shutdown().await;
+}
+
+/// The heartbeat of one control connection (05_gateway.md, "Deadlines"): every
+/// [`deadline::HEARTBEAT`], a `{"ok":true,"progress":n}` line, written once the actor answers a
+/// ping, so an actor that stopped turning stops the heartbeat and the client's silence bound
+/// names the daemon.
+struct Heartbeat<'a> {
+    handle: &'a GatewayHandle,
+    beats: tokio::time::Interval,
+    seq: u64,
+}
+
+impl<'a> Heartbeat<'a> {
+    fn new(handle: &'a GatewayHandle) -> Self {
+        Self {
+            handle,
+            beats: deadline::beats(),
+            seq: 0,
+        }
+    }
+
+    async fn due(&mut self) {
+        self.beats.tick().await;
+    }
+
+    /// Ping the actor and write one heartbeat. A ping that fails writes none, said here; only a
+    /// failed write is an error: the client is gone.
+    async fn beat<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), ControlError> {
+        if let Err(error) = self.handle.ping().await {
+            cowshed_os::eprintln!(
+                "cowshed: a control answer's heartbeat could not ping the gateway actor: {error}"
+            );
+            return Ok(());
+        }
+        self.seq += 1;
+        let response = ControlResponse {
+            progress: Some(self.seq),
+            ..success()
+        };
+        write_response(writer, &response).await
+    }
+}
+
+/// Answer with `work`, heartbeating until it is done. The work is never dropped for a heartbeat:
+/// a ping still pending runs beside it, and once a heartbeat cannot be written (the client left)
+/// the work runs to its end unheartbeated, as an unanswered request always did.
+async fn answered<T, W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    handle: &GatewayHandle,
+    work: impl Future<Output = T>,
+) -> T {
+    tokio::pin!(work);
+    let mut heartbeat = Heartbeat::new(handle);
+    loop {
+        tokio::select! {
+            biased;
+            answer = &mut work => return answer,
+            () = heartbeat.due() => {}
+        }
+        let beaten = tokio::select! {
+            biased;
+            answer = &mut work => return answer,
+            beaten = heartbeat.beat(writer) => beaten,
+        };
+        if beaten.is_err() {
+            return work.await;
+        }
+    }
 }
 
 async fn dispatch(
@@ -2687,31 +2783,46 @@ where
     }
 }
 
-async fn read_response_line<R>(reader: &mut BufReader<R>) -> Result<ControlResponse, ControlError>
-where
-    R: AsyncRead + Unpin,
-{
+async fn read_response_line(reader: &mut ControlReader) -> Result<ControlResponse, ControlError> {
     read_answer_line(reader).await
 }
 
-/// One answer line of at most [`MAX_CONTROL_MESSAGE`] bytes, read as `T`.
-async fn read_answer_line<T, R>(reader: &mut BufReader<R>) -> Result<T, ControlError>
+/// A heartbeat line the daemon writes while an answer is not ready (05_gateway.md,
+/// "Deadlines"). Read before the answer's own type, which never carries `progress`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgressLine {
+    #[serde(rename = "ok")]
+    _ok: bool,
+    #[serde(rename = "progress")]
+    _progress: u64,
+}
+
+/// The next answer line of at most [`MAX_CONTROL_MESSAGE`] bytes, read as `T`, past the heartbeat
+/// lines before it. The connection's silence bound decides how long the daemon may write none.
+async fn read_answer_line<T>(reader: &mut ControlReader) -> Result<T, ControlError>
 where
     T: serde::de::DeserializeOwned,
-    R: AsyncRead + Unpin,
 {
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_CONTROL_MESSAGE + 1)
-        .read_until(b'\n', &mut bytes)
-        .await?;
-    if bytes.is_empty() {
-        return Err(ControlError::UnexpectedEof);
+    loop {
+        let mut bytes = Vec::new();
+        let read = (&mut *reader)
+            .take(MAX_CONTROL_MESSAGE + 1)
+            .read_until(b'\n', &mut bytes)
+            .await;
+        read.map_err(|error| ControlError::Wait(reader.get_ref().fail(error)))?;
+        if bytes.is_empty() {
+            return Err(ControlError::UnexpectedEof);
+        }
+        if bytes.len() > MAX_CONTROL_MESSAGE as usize || !bytes.ends_with(b"\n") {
+            return Err(ControlError::InvalidResponse);
+        }
+        if serde_json::from_slice::<ProgressLine>(&bytes).is_ok() {
+            continue;
+        }
+        return serde_json::from_slice(&bytes)
+            .map_err(|error| ControlError::Encoding(error.to_string()));
     }
-    if bytes.len() > MAX_CONTROL_MESSAGE as usize || !bytes.ends_with(b"\n") {
-        return Err(ControlError::InvalidResponse);
-    }
-    serde_json::from_slice(&bytes).map_err(|error| ControlError::Encoding(error.to_string()))
 }
 
 async fn write_response<W>(writer: &mut W, response: &ControlResponse) -> Result<(), ControlError>
@@ -2828,6 +2939,7 @@ fn success() -> ControlResponse {
         ram_disk: None,
         ram_detach: None,
         first_launch: None,
+        progress: None,
     }
 }
 
@@ -2974,8 +3086,8 @@ pub enum ControlError {
     },
     #[error("gateway control I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("the gateway took the request and gave no answer within {within:?}")]
-    Unanswered { within: Duration },
+    #[error(transparent)]
+    Wait(#[from] WaitError),
 }
 
 #[cfg(test)]
@@ -3223,10 +3335,10 @@ mod tests {
         answering.await.expect("the answers");
     }
 
-    /// A daemon that takes the request and never answers is refused once the asker's bound
-    /// elapses, naming the bound; that elapsing is this scenario's event.
-    #[tokio::test]
-    async fn a_daemon_that_takes_status_and_stays_silent_is_unanswered_within_the_bound() {
+    /// A daemon that takes the request and never answers, not even a heartbeat, is named
+    /// `SILENT` once the silence bound elapses; that elapsing is this scenario's event.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_takes_status_and_stays_silent_is_named_silent() {
         let id = Uuid::new_v4().simple().to_string();
         let root = test_fixture_dir::secure_fixture_dir(&format!("csilent-{}", &id[..8]));
         let socket = root.path().join("gateway.sock");
@@ -3243,12 +3355,15 @@ mod tests {
             answered.await.expect("the client's verdict");
             drop(stream);
         });
-        let within = Duration::from_millis(50);
         let client = GatewayControlClient::new(socket).expect("client");
-        let refused = client.status_within(within).await;
+        let refused = client.status().await;
         taken.send(()).expect("release the silent daemon");
         assert!(
-            matches!(refused, Err(ControlError::Unanswered { within: bound }) if bound == within),
+            matches!(
+                &refused,
+                Err(ControlError::Wait(WaitError::Silent(silent)))
+                    if silent.op == "status" && silent.silent_for == deadline::HEARTBEAT_SILENCE
+            ),
             "{refused:?}"
         );
         silent.await.expect("silent daemon");

@@ -81,15 +81,14 @@ Two verbs own the host story, both runnable from any directory:
   finish therefore names, in its last `start` line, the probe it waits in, and in that probe's `waits-on=` whose answer
   is missing. `status=err` means the probe's own query failed; the failure is also its finding. A party that is absent
   or refuses is a typed finding (`gateway-down`, `gateway-status`, `sccache-status`, `project-checks-skipped`, …). A
-  daemon that took doctor's request and stays silent — the gateway's `status` and `cpu-budget`, the sccache server's
-  statistics — is given 60 s (`DOCTOR_PEER_ANSWER`) and then reported as `gateway-unanswered` (error) or
-  `sccache-unanswered` (warning): `<peer> accepted doctor's request at <socket> and gave no answer in 60s`. The bound is
-  long rather than absent because a socket that takes a request and answers late may be a live, saturated gateway
-  (05_gateway.md, "Host CPU budget": only `ENOENT` proves the gateway absent); that gateway answered `status` in 4.6–4.9
-  s on a loaded host, a minute is over ten times that, and it is still well inside the 180 s a caller once gave a silent
-  doctor before killing it. The `gateway-unanswered` hint looks before it restarts, since a restart cuts off every gate
-  the gateway serves. No probe reports an answer it did not get. A caller that asked for its steps (07_api.md) hears
-  every step start and end, however short; `--json` changes stdout only.
+  daemon that took doctor's request and stays silent is reported as `gateway-unanswered` (error) or `sccache-unanswered`
+  (warning): `<peer> accepted doctor's request at <socket> and gave no answer in <bound>`. The gateway heartbeats every
+  answer that is not ready yet (05_gateway.md, "Deadlines"), so a live, saturated gateway that answers `status` late
+  (4.6–4.9 s measured on a loaded host) is never reported; one that says nothing, not even a heartbeat, for the 15 s
+  silence bound is. The sccache server cannot heartbeat, so its statistics get 60 s (`DOCTOR_PEER_ANSWER`), still well
+  inside the 180 s a caller once gave a silent doctor before killing it. The `gateway-unanswered` hint looks before it
+  restarts, since a restart cuts off every gate the gateway serves. No probe reports an answer it did not get. A caller
+  that asked for its steps (07_api.md) hears every step start and end, however short; `--json` changes stdout only.
 
   `first-launch` reads whether workspace jobs pay macOS's first-launch scan (05_gateway.md "The gateway host"). The TCC
   database is unreadable to the user, so it reads behavior: doctor mints a fresh copy of its own executable, signed ad

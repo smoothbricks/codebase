@@ -41,6 +41,7 @@ use cowshed_gateway::{
     GatewayControlClient, GatewayError, GatewayHandle, MirrorCacheConfig, StartupHeal,
     StartupProbe, SupervisorRecovery, WorkspaceSession,
 };
+use cowshed_os::deadline::WaitError;
 use cowshed_os::namespace::HostNamespace;
 use cowshed_os::stdio::Blocking;
 use sha2::{Digest as _, Sha256};
@@ -103,12 +104,10 @@ impl ControlSocket {
             .clear_nx_cache(repo_id)
             .await
             .map_err(|error| match error {
-                ControlError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
-                    CowshedError::environment_missing(
-                        "no gateway is running, so the project's Nx store has no owner to clear it",
-                        GATEWAY_START_HINT,
-                    )
-                }
+                ControlError::Wait(WaitError::Absent { .. }) => CowshedError::environment_missing(
+                    "no gateway is running, so the project's Nx store has no owner to clear it",
+                    GATEWAY_START_HINT,
+                ),
                 ControlError::Rejected {
                     code: ControlFailureCode::Busy,
                     message,
@@ -137,9 +136,7 @@ impl GatewayControl for ControlSocket {
         self.0.status().await.map_err(|error| match error {
             // A missing socket is not a fault: no daemon is running, and the remedy is to start
             // one rather than to report a broken control plane.
-            ControlError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
-                GatewayStatusError::Absent
-            }
+            ControlError::Wait(WaitError::Absent { .. }) => GatewayStatusError::Absent,
             error => GatewayStatusError::Control(error.to_string()),
         })
     }
@@ -1305,12 +1302,9 @@ pub(crate) struct FirstLaunchReading {
     pub(crate) restart: String,
 }
 
-/// Measure a first launch here, then ask the gateway to measure one within `within`. One after
-/// the other: the scans of both would otherwise wait in one queue and charge each other.
-pub(crate) async fn first_launch_within(
-    roots: &CanonicalRoots,
-    within: Duration,
-) -> Result<FirstLaunchReading> {
+/// Measure a first launch here, then ask the gateway to measure one. One after the other: the
+/// scans of both would otherwise wait in one queue and charge each other.
+pub(crate) async fn first_launch(roots: &CanonicalRoots) -> Result<FirstLaunchReading> {
     let gateway_host = HostStableExecutable::new(&canonical_home()?, COWSHED_BINARY_NAME)
         .map_err(launchd_error)?
         .gateway_host();
@@ -1339,7 +1333,7 @@ pub(crate) async fn first_launch_within(
         })?;
     let client = GatewayControlClient::new(roots.control_socket()).map_err(control_error)?;
     let gateway = client
-        .first_launch_within(within)
+        .first_launch()
         .await
         .map_err(|error| error.to_string());
     Ok(FirstLaunchReading {
@@ -1349,26 +1343,20 @@ pub(crate) async fn first_launch_within(
         restart: kickstart_hint(effective_uid(), &roots.namespace().launchd_label("gateway")),
     })
 }
-/// [`service_status`] for `doctor`, from a gateway that must answer within `within` of taking
-/// each request (specs/cowshed/06_cli.md, "doctor"): one that stays silent is [`Unanswered`].
-pub(crate) async fn service_status_within(
+/// [`service_status`] for `doctor` (specs/cowshed/06_cli.md, "doctor"): a gateway that took the
+/// request and then said nothing, not even a heartbeat, for the control silence bound is
+/// [`Unanswered`] (05_gateway.md, "Deadlines").
+pub(crate) async fn doctor_service_status(
     roots: &CanonicalRoots,
-    within: Duration,
 ) -> Result<std::result::Result<CliGatewayStatus, Unanswered>> {
     let socket = roots.control_socket();
     observe_service(roots, |client| async move {
-        match client.status_within(within).await {
-            Ok(status) => {
-                let cpu_budget = match client.cpu_budget_within(within).await {
-                    Ok(ledger) => GatewayCpuBudget::Ledger(ledger),
-                    Err(error) => GatewayCpuBudget::Unanswered(error.to_string()),
-                };
-                Ok(Some((status, cpu_budget)))
-            }
-            Err(ControlError::Unanswered { within }) => Err(Unanswered {
+        match client.status().await {
+            Ok(status) => Ok(Some((status, read_cpu_budget(&client).await))),
+            Err(ControlError::Wait(WaitError::Silent(silent))) => Err(Unanswered {
                 peer: "the gateway daemon",
                 socket,
-                within,
+                within: silent.idle,
             }),
             Err(_) => Ok(None),
         }

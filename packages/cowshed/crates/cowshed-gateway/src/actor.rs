@@ -136,6 +136,14 @@ impl GatewayHandle {
     /// claimed; how many. The daemon calls this once its startup pass has restored every session
     /// (05_gateway.md "Startup contract" step 4): a connection queued on a listener nobody will
     /// accept would wait forever, so it is reset instead, as it was when nothing was carried.
+    /// One round trip through the actor, for a control connection's heartbeat (05_gateway.md,
+    /// "Deadlines"): an actor that stopped turning answers no ping, and the heartbeat stops.
+    pub async fn ping(&self) -> Result<(), GatewayError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Ping { reply }).await?;
+        receive.await.map_err(|_| GatewayError::Stopped)
+    }
+
     pub async fn release_unclaimed_listeners(&self) -> Result<usize, GatewayError> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::ReleaseUnclaimedListeners { reply })
@@ -525,6 +533,10 @@ pub(crate) enum Command {
     },
     ReleaseUnclaimedListeners {
         reply: oneshot::Sender<usize>,
+    },
+    /// Answer at once: a control connection's heartbeat proves the actor still turns.
+    Ping {
+        reply: oneshot::Sender<()>,
     },
     ForceStop,
 }
@@ -1245,6 +1257,9 @@ impl Actor {
                         }
                         Command::Status { reply } => {
                             let _ = reply.send(self.status());
+                        }
+                        Command::Ping { reply } => {
+                            let _ = reply.send(());
                         }
                         Command::ReleaseUnclaimedListeners { reply } => {
                             let released = self.carried.len();

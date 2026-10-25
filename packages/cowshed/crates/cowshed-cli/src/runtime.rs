@@ -1212,14 +1212,12 @@ pub(crate) async fn relay_foreground(
         match presentation {
             ExecPresentation::Control => job.wait().await,
             ExecPresentation::Raw => {
-                let (info, stdout_result, stderr_result) = tokio::join!(
+                let (info, (), ()) = tokio::try_join!(
                     job.wait(),
                     job.relay(JobStream::Stdout, stdout),
                     job.relay(JobStream::Stderr, stderr),
-                );
-                stdout_result?;
-                stderr_result?;
-                info
+                )?;
+                Ok(info)
             }
         }
     };
@@ -5149,7 +5147,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
                 roots.control_socket().display()
             ),
         );
-        gateway_service::service_status_within(&roots, DOCTOR_PEER_ANSWER).await
+        gateway_service::doctor_service_status(&roots).await
     })
     .await;
     let serves = matches!(&gateway, Ok(Ok(status)) if status.running);
@@ -5177,7 +5175,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
                     format_args!("first-launch"),
                     format_args!("the gateway daemon at {}", roots.control_socket().display()),
                 );
-                gateway_service::first_launch_within(&roots, DOCTOR_PEER_ANSWER).await
+                gateway_service::first_launch(&roots).await
             })
             .await,
         ));
@@ -5304,12 +5302,12 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     Ok(findings)
 }
 
-/// How long doctor waits for a daemon that took its request — the gateway, the sccache server —
-/// to answer before it reports that daemon as unanswered (specs/cowshed/06_cli.md, "doctor").
+/// How long doctor waits for the sccache server, which took its request, to answer before it
+/// reports that server as unanswered (specs/cowshed/06_cli.md, "doctor"). The gateway heartbeats
+/// its answers instead, and is unanswered at its silence bound (05_gateway.md, "Deadlines").
 /// Long rather than absent: a socket that takes a request and answers late may be a live,
-/// saturated gateway (05_gateway.md), and on a loaded host the gateway answered status in 4.6 to
-/// 4.9 s; a minute is over ten times that, and still inside the 180 s a caller once gave a silent
-/// doctor before killing it.
+/// saturated server; a minute is still inside the 180 s a caller once gave a silent doctor before
+/// killing it.
 const DOCTOR_PEER_ANSWER: Duration = Duration::from_secs(60);
 
 /// What to do about a gateway that took doctor's request and did not answer: it may be saturated
@@ -6353,6 +6351,49 @@ mod tests {
             assert_eq!(result.end, ExecEnd::Finished);
             assert_eq!(result.info.exit, Some(ExitStatus::Exited { code: 0 }));
             assert_eq!(terminal.contents(), FIRST);
+        }
+
+        /// A job whose wait fails while its output streams stay open: the first failure ends
+        /// the relay. Joining all three instead waited for streams that end only with the job's
+        /// end, which the failed wait means nobody will see.
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_wait_ends_the_relay_while_its_streams_stay_open() {
+            struct Refused;
+            #[async_trait]
+            impl ForegroundJob for Refused {
+                async fn wait(&self) -> Result<JobInfo> {
+                    Err(CowshedError::environment_missing(
+                        "job 7 membership retirement refused",
+                        "retain the job's claims",
+                    ))
+                }
+                async fn status(&self) -> Result<JobInfo> {
+                    Err(CowshedError::internal("a failed wait reads no status"))
+                }
+                async fn detach(&self) -> Result<()> {
+                    Ok(())
+                }
+                async fn kill(&self) -> Result<()> {
+                    Ok(())
+                }
+                async fn relay(&self, _: JobStream, _: &mut (dyn Write + Send)) -> Result<()> {
+                    std::future::pending().await
+                }
+            }
+            let (mut stdout, mut stderr) = (Terminal::default(), Terminal::default());
+            let Err(refused) = relay_foreground(
+                &Refused,
+                None,
+                None,
+                ExecPresentation::Raw,
+                &mut stdout,
+                &mut stderr,
+            )
+            .await
+            else {
+                panic!("the wait failed, so the relay fails");
+            };
+            assert_eq!(refused.message, "job 7 membership retirement refused");
         }
 
         /// The soft timeout fires, and by the time its status read is answered the job has

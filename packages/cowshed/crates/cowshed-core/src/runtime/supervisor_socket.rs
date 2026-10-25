@@ -679,34 +679,94 @@ pub(super) async fn write_json<T: Serialize>(
     write_frame(stream, &bytes, MAX_JSON_FRAME).await
 }
 
-/// Answer a call with `work`, saying every [`deadline::HEARTBEAT`] until it is done that the
-/// call is still being answered, and for a call about `job`, how that job stands
-/// (05_gateway.md, "Deadlines"). The job is read through the supervisor's actor, so an actor that
-/// stops answering stops the heartbeat too, and the caller's silence bound reports it.
-async fn heartbeating<T>(
+/// What one heartbeat reports, read through the supervisor's actor under the authority it serves
+/// now: a call made under an authority that an advance has since replaced still gets its
+/// heartbeat. A call about no job still asks the actor for that authority, so an actor that stops
+/// answering stops every heartbeat, and the caller's silence bound reports it.
+async fn pulse(
+    supervisor: &WorkspaceSupervisorHandle,
+    job: Option<JobId>,
+) -> Result<Option<JobPulse>> {
+    let current = supervisor.with_authority(supervisor.current_authority().await?);
+    match job {
+        Some(job_id) => Ok(Some(JobPulse::of(&current.info(job_id).await?))),
+        None => Ok(None),
+    }
+}
+
+/// The heartbeat writer of a call or stream (05_gateway.md, "Deadlines"): every
+/// [`deadline::HEARTBEAT`], what `probe` reads, as a [`Response::Progress`] frame.
+struct Heartbeat<P> {
+    probe: P,
+    beats: tokio::time::Interval,
+    seq: u64,
+}
+
+impl<P, F> Heartbeat<P>
+where
+    P: FnMut() -> F,
+    F: Future<Output = Result<Option<JobPulse>>>,
+{
+    fn new(probe: P) -> Self {
+        Self {
+            probe,
+            beats: deadline::beats(),
+            seq: 0,
+        }
+    }
+
+    async fn due(&mut self) {
+        self.beats.tick().await;
+    }
+
+    /// Probe and write one heartbeat. A probe that fails writes none: the caller's silence bound
+    /// then names this supervisor, and the probe's error is said here, where it happened. Only a
+    /// failed write is an error: the caller is gone.
+    async fn beat(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+        let job = match (self.probe)().await {
+            Ok(job) => job,
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: a call's heartbeat could not read the supervisor: {}",
+                    error.message
+                );
+                return Ok(());
+            }
+        };
+        self.seq += 1;
+        let seq = self.seq;
+        write_json(writer, &Response::Progress(ProgressWire { seq, job })).await
+    }
+}
+
+/// Answer a call with `work`, heartbeating with `probe` until it is done. The work is never
+/// dropped for a heartbeat: a probe still pending runs beside it, and once a heartbeat cannot be
+/// written (the caller left) the work runs to its end unheartbeated, so an admission or a
+/// retirement it started finishes its bookkeeping as before.
+async fn heartbeating<T, P, F>(
     writer: &mut (impl AsyncWrite + Unpin),
-    job: Option<(&WorkspaceSupervisorHandle, JobId)>,
+    probe: P,
     work: impl Future<Output = T>,
-) -> Result<T> {
+) -> T
+where
+    P: FnMut() -> F,
+    F: Future<Output = Result<Option<JobPulse>>>,
+{
     tokio::pin!(work);
-    let mut beats = tokio::time::interval_at(
-        tokio::time::Instant::now() + deadline::HEARTBEAT,
-        deadline::HEARTBEAT,
-    );
-    beats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut seq = 0_u64;
+    let mut heartbeat = Heartbeat::new(probe);
     loop {
         tokio::select! {
             biased;
-            answer = &mut work => return Ok(answer),
-            _ = beats.tick() => {
-                seq += 1;
-                let job = match job {
-                    Some((supervisor, job_id)) => Some(JobPulse::of(&supervisor.info(job_id).await?)),
-                    None => None,
-                };
-                write_json(writer, &Response::Progress(ProgressWire { seq, job })).await?;
-            }
+            answer = &mut work => return answer,
+            () = heartbeat.due() => {}
+        }
+        let beaten = tokio::select! {
+            biased;
+            answer = &mut work => return answer,
+            beaten = heartbeat.beat(writer) => beaten,
+        };
+        if beaten.is_err() {
+            return work.await;
         }
     }
 }
@@ -753,9 +813,8 @@ fn waited(failure: WaitError) -> CowshedError {
         WaitError::PeerLost { .. } => {
             "read the job's state again; cowshed restarts the workspace supervisor"
         }
-        WaitError::Absent { .. } | WaitError::Io { .. } => {
-            "retry; cowshed restarts the workspace supervisor"
-        }
+        WaitError::Absent { .. } => "retry; cowshed restarts the workspace supervisor",
+        WaitError::Io { .. } => "cowshed doctor --json names the supervisor and its socket",
     };
     CowshedError::environment_missing(failure.to_string(), hint)
 }
@@ -766,9 +825,47 @@ async fn open(
     op: &'static str,
     bound: deadline::Bound,
 ) -> Result<PeerStream<UnixStream>> {
-    PeerStream::connect(SUPERVISOR, path, deadline::start(op, bound))
-        .await
-        .map_err(waited)
+    match PeerStream::connect(SUPERVISOR, path, deadline::start(op, bound)).await {
+        Ok(stream) => Ok(stream),
+        Err(failure) => Err(match refused(path, failure) {
+            Refused::Absent(failure) | Refused::Failed(failure) => waited(failure),
+            Refused::Live(error) => error,
+        }),
+    }
+}
+
+/// What a failed connect to the supervisor socket at `path` means.
+enum Refused {
+    /// Nothing serves the path: no socket file, or one with no socket attached any more
+    /// (`occupant`). A supervisor exiting closes its listener with connections in its queue.
+    Absent(WaitError),
+    /// A socket is still attached and refused anyway: its queue is full, or its holder does
+    /// not accept. A live peer, never proof it stopped.
+    Live(CowshedError),
+    Failed(WaitError),
+}
+
+fn refused(path: &Path, failure: WaitError) -> Refused {
+    match failure {
+        WaitError::Io {
+            op, peer, source, ..
+        } if source.kind() == io::ErrorKind::ConnectionRefused => match occupant(path) {
+            Ok(Occupant::Absent | Occupant::Stopped) => {
+                Refused::Absent(WaitError::Absent { op, peer, source })
+            }
+            Ok(Occupant::Live) => Refused::Live(CowshedError::environment_missing(
+                format!(
+                    "the workspace supervisor socket {} refuses connections while a socket is \
+                     still attached to it: its queue is full, or its holder does not accept",
+                    path.display()
+                ),
+                "retry once the operation holding it finishes; cowshed doctor --json",
+            )),
+            Err(error) => Refused::Live(unavailable(path, &error)),
+        },
+        failure @ WaitError::Absent { .. } => Refused::Absent(failure),
+        failure => Refused::Failed(failure),
+    }
 }
 
 /// Send `request`, and `payload` as its raw frame, within the connection's bound.
@@ -2109,10 +2206,10 @@ async fn serve_membership_call(
     let (reader, mut writer) = stream.split();
     let outcome = heartbeating(
         &mut writer,
-        None,
+        || pulse(supervisor, None),
         membership_request(reader.as_ref(), supervisor, request),
     )
-    .await?;
+    .await;
     let response = match outcome {
         Ok(value) => Response::Ok { value, bytes: 0 },
         Err(error) => Response::Err(error),
@@ -2228,8 +2325,12 @@ async fn serve_call(
             let response = match feed {
                 Some(feed) => Response::Ok {
                     value: to_value(
-                        &heartbeating(&mut stream, None, feed.since(after, COMMITMENT_WAIT))
-                            .await?,
+                        &heartbeating(
+                            &mut stream,
+                            || pulse(supervisor, None),
+                            feed.since(after, COMMITMENT_WAIT),
+                        )
+                        .await,
                     )?,
                     bytes: 0,
                 },
@@ -2260,8 +2361,8 @@ async fn serve_call(
                 Some(advances) => {
                     let (reply, answer) = oneshot::channel();
                     match advances.send(reply).await {
-                        Ok(()) => heartbeating(&mut stream, None, answer)
-                            .await?
+                        Ok(()) => heartbeating(&mut stream, || pulse(supervisor, None), answer)
+                            .await
                             .unwrap_or_else(|_| {
                                 Err(CowshedError::internal(
                                     "the supervisor process stopped before advancing",
@@ -2338,10 +2439,10 @@ async fn serve_call(
         admitted,
     } = match heartbeating(
         &mut stream,
-        reads.map(|(job, _)| (&caller, job)),
+        || pulse(supervisor, reads.map(|(job, _)| job)),
         answer(&caller, streams, *call, payload),
     )
-    .await?
+    .await
     {
         Ok(answer) => answer,
         Err(error) => {
@@ -2415,7 +2516,7 @@ async fn serve_process_events(
         },
     )
     .await?;
-    relay_process_events(stream, events).await
+    relay_process_events(stream, events, || pulse(supervisor, Some(job_id))).await
 }
 
 /// Hold `job_id` for its holder: answer `null` once the hold is in place, then the job's
@@ -2483,7 +2584,18 @@ async fn kill_unheld(supervisor: &WorkspaceSupervisorHandle, job_id: JobId) -> R
     current.kill(job_id).await
 }
 
-async fn relay_process_events(stream: UnixStream, mut events: JobProcessStream) -> Result<()> {
+/// Relay `events` one per demand. While a demand waits for its event, `probe` heartbeats the
+/// stream, so a subscriber can tell a job with nothing to report from a supervisor that stopped.
+async fn relay_process_events<P, F>(
+    stream: UnixStream,
+    mut events: JobProcessStream,
+    probe: P,
+) -> Result<()>
+where
+    P: FnMut() -> F,
+    F: Future<Output = Result<Option<JobPulse>>>,
+{
+    let mut heartbeat = Heartbeat::new(probe);
     let (mut reader, mut writer) = stream.into_split();
     let (send, mut demands) = mpsc::channel(1);
     // Read close even while the source has no event. A complete frame is read by
@@ -2507,19 +2619,22 @@ async fn relay_process_events(stream: UnixStream, mut events: JobProcessStream) 
                 Some(Err(error)) => return Err(error),
                 None => return Ok(()),
             }
-            let event = tokio::select! {
-                biased;
-                demand = demands.recv() => match demand {
-                    Some(Ok(Demand::Close)) => {
-                        return write_process_event(&mut writer, None).await;
-                    }
-                    Some(Ok(Demand::Next)) => {
-                        return Err(protocol_error("process event demanded while one is unanswered"));
-                    }
-                    Some(Err(error)) => return Err(error),
-                    None => return Ok(()),
-                },
-                event = events.next() => event,
+            let event = loop {
+                tokio::select! {
+                    biased;
+                    demand = demands.recv() => match demand {
+                        Some(Ok(Demand::Close)) => {
+                            return write_process_event(&mut writer, None).await;
+                        }
+                        Some(Ok(Demand::Next)) => {
+                            return Err(protocol_error("process event demanded while one is unanswered"));
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => return Ok(()),
+                    },
+                    event = events.next() => break event,
+                    () = heartbeat.due() => heartbeat.beat(&mut writer).await?,
+                }
             };
             match event {
                 Some(Ok(event)) => write_process_event(&mut writer, Some(event)).await?,
@@ -2870,35 +2985,21 @@ pub async fn hello(path: &Path) -> Result<Hello> {
 /// peer's unknown response, malformed protocol, or bounded hello timeout is an error, never proof
 /// it stopped.
 pub async fn hello_if_present(path: &Path) -> Result<Option<Hello>> {
-    let mut stream = match PeerStream::connect(
+    let connected = PeerStream::connect(
         SUPERVISOR,
         path,
         deadline::start("hello", deadline::HANDSHAKE),
     )
-    .await
-    {
+    .await;
+    let mut stream = match connected {
         Ok(stream) => stream,
-        Err(WaitError::Absent { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(None);
-        }
-        Err(WaitError::Absent { source, .. })
-            if source.kind() == io::ErrorKind::ConnectionRefused =>
-        {
-            return match occupant(path) {
-                Ok(Occupant::Absent | Occupant::Stopped) => Ok(None),
-                Ok(Occupant::Live) => Err(CowshedError::environment_missing(
-                    format!(
-                        "the workspace supervisor socket {} refuses connections while a \
-                         socket is still attached to it: its queue is full, or its holder \
-                         does not accept",
-                        path.display()
-                    ),
-                    "retry once the operation holding it finishes; cowshed doctor --json",
-                )),
-                Err(error) => Err(unavailable(path, &error)),
+        Err(failure) => {
+            return match refused(path, failure) {
+                Refused::Absent(_) => Ok(None),
+                Refused::Live(error) => Err(error),
+                Refused::Failed(failure) => Err(waited(failure)),
             };
         }
-        Err(failure) => return Err(waited(failure)),
     };
     // Hello is answered at once, so the whole exchange stays inside the handshake bound.
     let answered = match send(&mut stream, &Request::Hello, &[]).await {
@@ -3173,56 +3274,51 @@ async fn open_process_events(
     job_id: JobId,
     every: SampleInterval,
 ) -> Result<JobProcessStream> {
-    let mut stream = UnixStream::connect(path)
-        .await
-        .map_err(|error| unavailable(path, &error))?;
-    write_json(
-        &mut stream,
-        &Request::Call {
-            authority: authority.into(),
-            call: Box::new(Call::ProcessEvents { job_id, every }),
-            bytes: 0,
-        },
-    )
-    .await?;
-    match read_json::<Response>(&mut stream).await? {
-        Response::Err(error) => return Err(error),
-        Response::Ok { value, bytes: 0 } if value.is_null() => {}
-        Response::Ok { .. } | Response::Progress(_) => {
-            return Err(protocol_error("malformed process subscription answer"));
-        }
+    // The subscription is answered at once; each event after it may take as long as the job
+    // takes to do something, while the supervisor heartbeats the stream.
+    let mut stream = open(path, "process-events", deadline::CONTROL).await?;
+    let request = Request::Call {
+        authority: authority.into(),
+        call: Box::new(Call::ProcessEvents { job_id, every }),
+        bytes: 0,
+    };
+    send(&mut stream, &request, &[]).await?;
+    match answer_of(&mut stream).await? {
+        (value, raw) if value.is_null() && raw.is_empty() => {}
+        _ => return Err(protocol_error("malformed process subscription answer")),
     }
-    let (mut reader, mut writer) = stream.into_split();
-    let (send, receive) = mpsc::channel(1);
+    stream.hold(deadline::idle(
+        "process-events",
+        deadline::HEARTBEAT_SILENCE,
+    ));
+    let (send_event, receive) = mpsc::channel(1);
     tokio::spawn(async move {
         loop {
-            if let Err(error) = write_json(&mut writer, &Demand::Next).await {
-                let _ = send.send(Err(error)).await;
+            if let Err(error) = send(&mut stream, &Demand::Next, &[]).await {
+                let _ = send_event.send(Err(error)).await;
                 break;
             }
-            let response = tokio::select! {
+            let answered = tokio::select! {
                 biased;
-                () = send.closed() => {
-                    if let Err(error) = write_json(&mut writer, &Demand::Close).await {
-                        cowshed_os::eprintln!("cowshed: closing process observation: {error}");
-                    }
-                    break;
-                }
-                response = read_json::<Response>(&mut reader) => response,
+                () = send_event.closed() => None,
+                answered = answer_of(&mut stream) => Some(answered),
             };
-            let event = match response {
-                Ok(Response::Ok { value, bytes: 0 }) => decode::<Option<JobProcessEvent>>(value),
-                Ok(Response::Ok { .. }) => Err(protocol_error("process event carried raw bytes")),
-                Ok(Response::Progress(_)) => {
-                    Err(protocol_error("process event stream sent a call heartbeat"))
+            let Some(answered) = answered else {
+                if let Err(error) = send(&mut stream, &Demand::Close, &[]).await {
+                    cowshed_os::eprintln!("cowshed: closing process observation: {error}");
                 }
-                Ok(Response::Err(error)) | Err(error) => Err(error),
+                break;
+            };
+            let event = match answered {
+                Ok((value, raw)) if raw.is_empty() => decode::<Option<JobProcessEvent>>(value),
+                Ok(_) => Err(protocol_error("process event carried raw bytes")),
+                Err(error) => Err(error),
             };
             let ended = !matches!(event, Ok(Some(_)));
             match event {
                 Ok(Some(event)) => {
-                    if send.send(Ok(event)).await.is_err() {
-                        if let Err(error) = write_json(&mut writer, &Demand::Close).await {
+                    if send_event.send(Ok(event)).await.is_err() {
+                        if let Err(error) = send(&mut stream, &Demand::Close, &[]).await {
                             cowshed_os::eprintln!("cowshed: closing process observation: {error}");
                         }
                         break;
@@ -3230,7 +3326,7 @@ async fn open_process_events(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = send.send(Err(error)).await;
+                    let _ = send_event.send(Err(error)).await;
                 }
             }
             if ended {
@@ -3741,7 +3837,11 @@ mod process_demand_tests {
             .await
             .unwrap();
         drop(events);
-        let relay = tokio::spawn(relay_process_events(server, JobProcessStream::new(receive)));
+        let relay = tokio::spawn(relay_process_events(
+            server,
+            JobProcessStream::new(receive),
+            || async { Ok(None) },
+        ));
         write_json(&mut client, &Demand::Next).await.unwrap();
         let Response::Ok { value, bytes: 0 } = read_json(&mut client).await.unwrap() else {
             panic!("one demand must answer with the event");
@@ -3764,7 +3864,11 @@ mod process_demand_tests {
     async fn closing_an_unanswered_process_demand_drops_the_subscription() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let (events, receive) = mpsc::channel(1);
-        let relay = tokio::spawn(relay_process_events(server, JobProcessStream::new(receive)));
+        let relay = tokio::spawn(relay_process_events(
+            server,
+            JobProcessStream::new(receive),
+            || async { Ok(None) },
+        ));
         write_json(&mut client, &Demand::Next).await.unwrap();
         write_json(&mut client, &Demand::Close).await.unwrap();
         let response = read_json(&mut client).await.unwrap();
@@ -3780,7 +3884,11 @@ mod process_demand_tests {
     async fn a_second_unanswered_process_demand_is_refused() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let (_events, receive) = mpsc::channel(1);
-        let relay = tokio::spawn(relay_process_events(server, JobProcessStream::new(receive)));
+        let relay = tokio::spawn(relay_process_events(
+            server,
+            JobProcessStream::new(receive),
+            || async { Ok(None) },
+        ));
         write_json(&mut client, &Demand::Next).await.unwrap();
         write_json(&mut client, &Demand::Next).await.unwrap();
         let error = relay.await.unwrap().unwrap_err();
@@ -4619,6 +4727,7 @@ mod drain_read_tests {
 #[cfg(test)]
 mod call_deadline_tests {
     use super::*;
+
     use std::time::Duration;
 
     fn job(state: JobState, members: Option<usize>) -> JobPulse {
@@ -4763,7 +4872,7 @@ mod call_deadline_tests {
     async fn the_server_says_a_slow_answer_is_coming_and_then_gives_it() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let answered = tokio::spawn(async move {
-            heartbeating(&mut server, None, async {
+            heartbeating(&mut server, || async { Ok(None) }, async {
                 tokio::time::sleep(Duration::from_secs(12)).await;
                 42
             })
@@ -4775,6 +4884,23 @@ mod call_deadline_tests {
             };
             assert_eq!(pulse, ProgressWire { seq, job: None });
         }
-        assert_eq!(answered.await.unwrap().unwrap(), 42);
+        assert_eq!(answered.await.unwrap(), 42);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_that_fails_writes_no_heartbeat_and_never_drops_the_answer() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let answered = tokio::spawn(async move {
+            let probe = || async { Err(protocol_error("the actor stopped")) };
+            heartbeating(&mut server, probe, async {
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                42
+            })
+            .await
+        });
+        assert_eq!(answered.await.unwrap(), 42);
+        let mut nothing = Vec::new();
+        client.read_to_end(&mut nothing).await.unwrap();
+        assert!(nothing.is_empty(), "no heartbeat frame was written");
     }
 }
