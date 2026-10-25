@@ -48,7 +48,8 @@
   "nx": {
     "name": "nx-cache-server",
     "tags": [
-      "npm:public"
+      "npm:public",
+      "wiring:enforced"
     ],
     "targets": {
       "lint": {},

@@ -40,7 +40,8 @@
   "nx": {
     "name": "statebus-data-loader",
     "tags": [
-      "npm:public"
+      "npm:public",
+      "wiring:enforced"
     ],
     "targets": {
       "lint": {},

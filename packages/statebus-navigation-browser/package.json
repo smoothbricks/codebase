@@ -47,7 +47,8 @@
   "nx": {
     "name": "statebus-navigation-browser",
     "tags": [
-      "npm:public"
+      "npm:public",
+      "wiring:enforced"
     ],
     "targets": {
       "lint": {},

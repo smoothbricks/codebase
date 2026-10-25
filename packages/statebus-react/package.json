@@ -74,7 +74,8 @@
       }
     },
     "tags": [
-      "npm:public"
+      "npm:public",
+      "wiring:enforced"
     ],
     "name": "statebus-react"
   },

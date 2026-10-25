@@ -40,7 +40,8 @@
   "nx": {
     "name": "statebus-navigation-core",
     "tags": [
-      "npm:public"
+      "npm:public",
+      "wiring:enforced"
     ],
     "targets": {
       "lint": {},

@@ -42,7 +42,8 @@
   "nx": {
     "name": "statebus-tanstack-query",
     "tags": [
-      "npm:public"
+      "npm:public",
+      "wiring:enforced"
     ],
     "targets": {
       "lint": {},

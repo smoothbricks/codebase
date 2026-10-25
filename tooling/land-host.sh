@@ -15,6 +15,8 @@
 # 4. Gate the rebased tree on the host: `nx run-many -t gate --nx-bail=false`. The root Nx graph owns
 #    every project's lint/test/build and the host-e2e aggregate. Cached tasks replay unless their inputs changed.
 #    The host, unlike the land sandbox, can run the real-APFS tests. Any nonzero gate exit stops the land.
+#    Before the gate, the wiring check refuses what the rebased tree adds since main's head that no production code
+#    reaches (AGENTS.md rule 13); a refusal stops the land.
 #    A failure summary keeps unique tasks and exact diagnostics; the complete failed output is retained. The reporter
 #    is main's native build of @smoothbricks/failure-summary (dist/bin/<platform>/smoo-nx-failures), which step 5
 #    keeps current.
@@ -206,6 +208,15 @@ gate_workspace() {
   # to stop: drift costs the gate time, not correctness.
   (cd "$checkout" && direnv exec "$checkout" bun "$here/land-cargo-env.ts" "$checkout") >&2 ||
     say "comparing $workspace's Cargo build-script environment with the land shell failed (status $?); the land goes on"
+  # Done means the production path calls what the change adds (AGENTS.md rule 13): the wiring check refuses each item
+  # the rebased tree adds since $base that no production code reaches, by name and file:line. It runs before the gate
+  # it would otherwise wait behind, as a gate job like the gate; a tree it already judged is a cache hit.
+  say "checking that $head wires what it adds since $base"
+  gate_job bun nx run @smoothbricks/codebase:wiring "--args=--base $base" --outputStyle=static-failures-only >&2 || {
+    wiring_status=$?
+    say "the wiring check exited $wiring_status; the land stops: wire or delete each item it names"
+    exit "$wiring_status"
+  }
   output=$(mktemp "${TMPDIR:-/tmp}/land-gate.XXXXXX")
   gate_status=0
   began=$(date +%s)

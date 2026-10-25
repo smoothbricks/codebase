@@ -52,7 +52,8 @@
       }
     },
     "tags": [
-      "npm:public"
+      "npm:public",
+      "wiring:enforced"
     ],
     "name": "arrow-builder"
   },

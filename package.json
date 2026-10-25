@@ -115,7 +115,8 @@
           "...",
           "spec-links",
           "no-unbounded-wait",
-          "forbidden-spellings"
+          "forbidden-spellings",
+          "wiring-lint"
         ],
         "inputs": [
           "...",
@@ -183,6 +184,42 @@
           "command": "bun packages/nx-plugin/src/bin/smoo-nx-forbidden-spellings.ts",
           "cwd": "{workspaceRoot}"
         }
+      },
+      "wiring": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/**/*",
+          {
+            "externalDependencies": [
+              "typescript"
+            ]
+          }
+        ],
+        "outputs": [],
+        "options": {
+          "command": "bun tooling/wiring.fixtures.ts && bun tooling/wiring.ts",
+          "cwd": "{workspaceRoot}"
+        },
+        "//": "WIRING (AGENTS.md rule 13: done means the production path calls it): refuses each item the change adds since --base <commit oid> (an exported value, a Rust pub item, a wire op, a CLI verb, a script or an Nx target) that no production code in the tree reaches, naming it and its file:line. tooling/land-host.sh runs it on the rebased tree against the main head it rebased onto, before the gate; by hand, --args='--base <oid>'. Cached: the inputs are the whole tree and the argument names an immutable commit, so a cached verdict cannot outlive what it judged. The planted fixtures run first, so a judge that stopped resolving cannot pass as a wired change."
+      },
+      "wiring-lint": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/**/*",
+          {
+            "externalDependencies": [
+              "typescript"
+            ]
+          }
+        ],
+        "outputs": [],
+        "options": {
+          "command": "bun tooling/wiring.fixtures.ts && bun tooling/wiring.ts --tree",
+          "cwd": "{workspaceRoot}"
+        },
+        "//": "The root lint's WIRING: every item of every Nx project tagged wiring:enforced is reached by production code. A project carries the tag once it is clean; agent-todo/wiring-sweep.md lists the rest until each is wired or deleted and tagged, so the enforced scope only grows and nothing is exempt. The inputs are the whole tree because removing a caller anywhere changes an enforced verdict."
       },
       "local-registry": {
         "executor": "@nx/js:verdaccio",
