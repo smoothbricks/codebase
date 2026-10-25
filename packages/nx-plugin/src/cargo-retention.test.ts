@@ -17,6 +17,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import typia from 'typia';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
@@ -27,6 +28,7 @@ import {
   fingerprintIdentity,
   RECENT_USE_MS,
   RETENTION_RECEIPT,
+  type RetentionError,
   type RetentionOptions,
   type RetentionOutcome,
   type RetentionReport,
@@ -484,6 +486,78 @@ interface ScanWork {
   readonly children: readonly string[];
 }
 const validateScanWork = typia.createValidateEquals<ScanWork>();
+type RetentionRun =
+  | { readonly ok: true; readonly value: RetentionReport }
+  | { readonly ok: false; readonly error: RetentionError };
+const validateRetentionRun = typia.createValidateEquals<RetentionRun>();
+
+/**
+ * One `retainCargoWorkspace` in a real Node, as Nx runs it, with the perl lock helper unable to start. `denied` throws
+ * EPERM from `spawn`, which is what Node does for an exec a sandbox refuses (it emits 'error' only for the failures it
+ * calls run-time); `missing` runs it where `env` holds no perl. macOS holds its locks in-process, so the platform is
+ * faked once the module is imported to take the perl route there too.
+ */
+function retainWithoutPerl(
+  node: string,
+  workspace: string,
+  apply: boolean,
+  perl: 'denied' | 'missing',
+  env: NodeJS.ProcessEnv,
+): RetentionRun {
+  const compiled = join(import.meta.dir, '..', 'dist', 'cargo-retention.js');
+  const source = lines(
+    'import cp from "node:child_process";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'const spawn = cp.spawn;',
+    'cp.spawn = function(command, ...args) {',
+    '  if (process.argv[1] === "denied" && command === "perl") {',
+    '    throw Object.assign(new Error("spawn EPERM"), { errno: -1, code: "EPERM", syscall: "spawn" });',
+    '  }',
+    '  return spawn.call(this, command, ...args);',
+    '};',
+    'syncBuiltinESMExports();',
+    `const { retainCargoWorkspace } = await import(${JSON.stringify(compiled)});`,
+    'Object.defineProperty(process, "platform", { value: "linux" });',
+    `const result = await retainCargoWorkspace(${JSON.stringify(workspace)}, { apply: process.argv[2] === "apply", now: new Date(${future().getTime()}) });`,
+    'console.log(JSON.stringify(result));',
+  );
+  const child = spawnSync(node, ['--input-type=module', '-e', source, perl, apply ? 'apply' : 'plan'], {
+    cwd: workspace,
+    env,
+    encoding: 'utf8',
+  });
+  expect(child.status, child.stderr).toBe(0);
+  const checked = validateRetentionRun(JSON.parse(child.stdout));
+  if (!checked.success) throw new Error(JSON.stringify(checked.errors));
+  return checked.data;
+}
+
+/**
+ * A Node preload that fails what a sandbox refusing the lock would: `spawn` of each of `commands` throws EPERM, as Node
+ * does for a refused exec, and, where `locks`, so does the `open(2)` carrying macOS's O_EXLOCK bit (0x20).
+ */
+function denyPreload(commands: readonly string[], locks: boolean): string {
+  return lines(
+    'import cp from "node:child_process";',
+    'import fsp from "node:fs/promises";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'const denied = (message, syscall) => Object.assign(new Error(message), { errno: -1, code: "EPERM", syscall });',
+    `const commands = ${JSON.stringify(commands)};`,
+    'const spawn = cp.spawn;',
+    'cp.spawn = function(command, ...args) {',
+    '  if (commands.includes(command)) throw denied("spawn EPERM", "spawn");',
+    '  return spawn.call(this, command, ...args);',
+    '};',
+    'const open = fsp.open;',
+    'fsp.open = function(path, flags, ...rest) {',
+    `  if (${String(locks)} && process.platform === "darwin" && typeof flags === "number" && (flags & 0x20) !== 0) {`,
+    '    return Promise.reject(denied("EPERM: operation not permitted, open " + path, "open"));',
+    '  }',
+    '  return open.call(this, path, flags, ...rest);',
+    '};',
+    'syncBuiltinESMExports();',
+  );
+}
 /** Title of the reclaim case for one mtime-on-use setting; the walk's first pass and the mtime-on-use case share it. */
 const RECLAIM_TITLE = (mtimeOnUse: boolean): string =>
   `reclaims exactly the superseded generations and keeps the next build Fresh (mtime-on-use ${String(mtimeOnUse)})`;
@@ -520,10 +594,11 @@ async function refusesOverUnreadableFingerprint(fx: Churn): Promise<void> {
   check(await snapshot(buildDir)).toEqual(before);
   await writeFile(jsonPath, original);
 }
-
-/** Case: deletes nothing when the flock helper (perl) is unavailable. */
+/** Case: refuses the pass, changing nothing, when a lock cannot be attempted at all. */
 async function refusesWithoutPerl(fx: Churn): Promise<void> {
-  const check = labelled('deletes nothing when the flock helper (perl) is unavailable');
+  const check = labelled('refuses the pass, changing nothing, when a lock cannot be attempted at all');
+  const node = Bun.which('node');
+  if (node === null) throw new Error('node is not on PATH');
   const bin = join(fx.root, 'bin');
   await mkdir(bin);
   for (const tool of ['cargo', 'rustc']) {
@@ -533,14 +608,36 @@ async function refusesWithoutPerl(fx: Churn): Promise<void> {
   }
   const buildDir = join(fx.target, 'debug', 'build');
   const before = await snapshot(buildDir);
-  await withEnv({ PATH: bin }, async () => {
-    for (const apply of [false, true]) {
-      const result = await retainCargoWorkspace(fx.ws, { apply, now: future() });
-      if (result.ok) throw new Error(`retention ran without perl: ${JSON.stringify(result.value)}`);
-      check(result.error.kind, `apply ${apply}`).toBe('lock-helper');
-    }
-  });
+  const refusedBecause = (run: RetentionRun, lock: string, cause: string): void => {
+    if (!run.ok) throw new Error(`the pass failed instead of being refused: ${JSON.stringify(run.error)}`);
+    check(refused(run.value).reason, cause).toBe(`cannot attempt ${lock}: ${cause}`);
+    check(run.value.completed, cause).toBeUndefined();
+  };
+  for (const apply of [false, true]) {
+    const lock = apply ? 'the retention lock' : "Cargo's locks";
+    // A sandbox that refuses the exec: Node throws EPERM from spawn() rather than emitting 'error'.
+    refusedBecause(retainWithoutPerl(node, fx.ws, apply, 'denied', process.env), lock, 'cannot run perl: spawn EPERM');
+    // No perl on PATH at all.
+    refusedBecause(
+      retainWithoutPerl(node, fx.ws, apply, 'missing', { ...process.env, PATH: bin }),
+      lock,
+      'cannot run perl: spawn perl ENOENT',
+    );
+  }
+  check(await exists(join(fx.target, RETENTION_LOCK)), 'no lock file').toBe(false);
+  // A lock file that cannot be opened (a symlink that loops, where it belongs) is no lock held elsewhere, on either
+  // route: open(2) fails with ELOOP. A directory would do on Linux only, where O_CREAT refuses it.
+  await symlink(RETENTION_LOCK, join(fx.target, RETENTION_LOCK));
+  const unopenable = await retain(fx.ws, { apply: true, now: future() });
+  check(refused(unopenable).reason).toMatch(
+    /^cannot attempt the retention lock: .*(ELOOP|too many (levels of )?symbolic links)/i,
+  );
+  // A preview takes no retention lock of its own.
+  check(planned(await retain(fx.ws, { apply: false, now: future() })).kind).toBe('planned');
+  await rm(join(fx.target, RETENTION_LOCK));
   check(await snapshot(buildDir)).toEqual(before);
+  check(await exists(join(fx.target, RETENTION_RECEIPT)), 'no receipt').toBe(false);
+  check(await exists(join(fx.target, 'debug', TRASH)), 'no trash').toBe(false);
 }
 
 /** Case: refuses a legacy-layout profile instead of reporting a clean zero. */
@@ -1423,6 +1520,12 @@ describe('cargo retention against real Cargo target layouts', () => {
                   metadata: { cargoProducer: true },
                   options: { cwd: 'ws', command: 'cargo build --workspace --locked --offline && exit 3' },
                 },
+                'build-uncached': {
+                  executor: 'nx:run-commands',
+                  cache: false,
+                  metadata: { cargoProducer: true },
+                  options: { cwd: 'ws', command: 'cargo build --workspace --locked --offline' },
+                },
               },
             }),
           );
@@ -1430,11 +1533,14 @@ describe('cargo retention against real Cargo target layouts', () => {
           const gen = await churnGenerations(fx);
           await backdate(gen.superseded);
           const env = fixtureNxEnv(workspace, socketDirectory);
-          const runNx = async (target: string) => {
-            const child = Bun.spawn(
-              [process.execPath, join(workspace, 'node_modules', '.bin', 'nx'), 'run', target, '--outputStyle=static'],
-              { cwd: workspace, env, stdout: 'pipe', stderr: 'pipe' },
-            );
+          const runNx = async (target: string, preload?: string) => {
+            const nx = join(workspace, 'node_modules', '.bin', 'nx');
+            // A preload is a Node `--import`: it patches the process the hook runs in, which here is Node itself.
+            const argv =
+              preload === undefined
+                ? [process.execPath, nx, 'run', target, '--outputStyle=static']
+                : ['node', '--import', pathToFileURL(preload).href, nx, 'run', target, '--outputStyle=static'];
+            const child = Bun.spawn(argv, { cwd: workspace, env, stdout: 'pipe', stderr: 'pipe' });
             const [code, stdout, stderr] = await Promise.all([
               child.exited,
               new Response(child.stdout).text(),
@@ -1486,6 +1592,29 @@ describe('cargo retention against real Cargo target layouts', () => {
           expect(reclaimPaths(planned(receipt2))).toEqual(current);
           for (const path of current) expect(await exists(path)).toBe(false);
           await expectFresh(fx.ws);
+          // A sandbox that refuses the lock by every route its platform has: the run still succeeds, and the hook says
+          // why it skipped retention. The EPERM is thrown in a real Node, which is what throws it from spawn().
+          if (receipt2.completed === undefined) throw new Error('second successful hook did not record completion');
+          const preload = join(workspace, 'deny-locks.mjs');
+          await put(preload, denyPreload(['perl'], true));
+          await writeFile(
+            receiptPath,
+            JSON.stringify({
+              ...receipt2,
+              completed: { ...receipt2.completed, at: Date.now() - AUTOMATIC_INTERVAL_MS },
+            }),
+          );
+          const dueReceipt = await readFile(receiptPath, 'utf8');
+          const skipped = await runNx('ws:build-uncached', preload);
+          expect(skipped.code, skipped.log).toBe(0);
+          expect(skipped.log).toMatch(/Cargo retention .*: refused, .*: cannot attempt .*EPERM/);
+          expect(await readFile(receiptPath, 'utf8')).toBe(dueReceipt);
+          // Whatever else escapes a pass is reported as well, never rethrown: here cargo itself cannot be spawned.
+          await put(preload, denyPreload(['cargo'], false));
+          const escaped = await runNx('ws:build-uncached', preload);
+          expect(escaped.code, escaped.log).toBe(0);
+          expect(escaped.log).toMatch(/Cargo retention for .*: unexpected failure: .*EPERM/s);
+          expect(await readFile(receiptPath, 'utf8')).toBe(dueReceipt);
         },
       );
     });

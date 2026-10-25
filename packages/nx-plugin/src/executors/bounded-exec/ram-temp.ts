@@ -19,6 +19,7 @@ import {
 import { Socket } from 'node:net';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { O_EXLOCK } from '../../open-flags.js';
 import { DEADLINE_PATIENCE, describeMembersLeft, killProcessGroup } from '../../process-group.js';
 import { isRecord } from '../../type-guards.js';
 import { diskClassOf, type PhaseShare, recordedShare, takeDiskLease } from './disk-lease.js';
@@ -141,8 +142,6 @@ import type { TempVolumeSpace } from './verdict.js';
  * TMPDIR and says so once on stderr.
  */
 
-/** macOS `open(2)` flag: take an exclusive flock atomically with the open. Absent from `fs.constants`. */
-const O_EXLOCK = 0x20;
 /** Contended opens yield without occupying a filesystem worker needed by the lock holder. */
 const LOCK_RETRY_MS = 50;
 /**

@@ -31,15 +31,30 @@
  * first; it unlinks the trash after letting go of the Cargo locks, under the target's own
  * retention lock, and deletes only manifest entries whose inode matches. Anything this
  * selector cannot read (a legacy layout, an unreadable fingerprint, a profile without
- * `build/` or without Cargo's locks) refuses the whole pass: its edges are unknowable.
+ * `build/` or without Cargo's locks) refuses the whole pass: its edges are unknowable. So does
+ * a lock that cannot be attempted at all (nothing that could hold it starts here, its file will
+ * not open): nothing was read or changed, and the reason is a value, because a maintenance pass
+ * never fails the run it follows.
  *
  * Not reclaimed here: `incremental/`, nested target directories, and the split-debuginfo
  * objects rustc keeps inside current units (rust-lang/rust#161824).
  */
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync } from 'node:fs';
-import { lstat, mkdir, readdir, readFile, realpath, rename, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { constants, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import {
+  type FileHandle,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rmdir,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, normalize, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -47,6 +62,7 @@ import { logger, type ProjectGraph, readCachedProjectGraph } from 'nx/src/devkit
 import type { PostTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import typia, { type tags } from 'typia';
 import { CARGO_ANCESTOR_INPUTS } from './cargo-source-hash.js';
+import { O_EXLOCK } from './open-flags.js';
 
 export type Result<T, E> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E };
 
@@ -54,7 +70,6 @@ export type RetentionError =
   | { readonly kind: 'cargo-metadata'; readonly cwd: string; readonly detail: string }
   | { readonly kind: 'target-not-cargo'; readonly targetDir: string; readonly detail: string }
   | { readonly kind: 'lossless-json-unavailable'; readonly detail: string }
-  | { readonly kind: 'lock-helper'; readonly detail: string }
   | { readonly kind: 'io'; readonly operation: string; readonly path: string; readonly detail: string };
 
 export type ReclaimReason = 'superseded-generation';
@@ -256,8 +271,13 @@ function ioError(operation: string, path: string, error: unknown): RetentionErro
   return { kind: 'io', operation, path, detail: describeCause(error) };
 }
 
-// ---- Cargo's locks, held by a perl child: its flock(2) is the one Cargo takes, it lives as
-// long as its stdin pipe, and the kernel lets go of it however the holder ends. ----
+// ---- Cargo's locks ----
+//
+// Cargo takes flock(2) on its lock files, so a pass takes the same lock: exclusive, never waiting. The kernel lets go
+// of it when the descriptor holding it closes, however its process ends. macOS holds it in-process: `open(2)` with
+// O_EXLOCK | O_NONBLOCK is `flock(LOCK_EX | LOCK_NB)` made with the open, so a sandbox that refuses to exec an
+// interpreter costs the pass nothing. Node has no flock(2) anywhere else, so a perl child holds it there, for as long
+// as its stdin pipe lives. Whichever holds it, an attempt that cannot be made is a value, never an exception.
 
 const LOCK_HELPER = [
   'use strict; use Fcntl qw(:flock O_RDONLY O_CREAT); $| = 1;',
@@ -272,17 +292,56 @@ const LOCK_HELPER = [
   '1 while defined(my $line = <STDIN>);',
 ].join('\n');
 
+type LockMode = 'existing' | 'create';
+
 interface Hold {
   release(): Promise<void>;
 }
-type HoldAttempt = { readonly kind: 'held'; readonly hold: Hold } | { readonly kind: 'busy'; readonly lock: string };
+type HoldAttempt =
+  | { readonly kind: 'held'; readonly hold: Hold }
+  | { readonly kind: 'busy'; readonly lock: string }
+  /** The attempt could not be made at all: nothing is held, and nobody is known to hold the lock. */
+  | { readonly kind: 'unavailable'; readonly reason: string };
 
 /** Every lock in `paths` exclusively and without waiting, in order; the first held one makes it `busy`. */
-async function tryHold(
-  paths: readonly string[],
-  mode: 'existing' | 'create',
-): Promise<Result<HoldAttempt, RetentionError>> {
-  const child = spawn('perl', ['-e', LOCK_HELPER, mode, ...paths], { stdio: ['pipe', 'pipe', 'pipe'] });
+function tryHold(paths: readonly string[], mode: LockMode): Promise<HoldAttempt> {
+  return process.platform === 'darwin' ? holdInProcess(paths, mode) : holdThroughPerl(paths, mode);
+}
+
+/** `open(2)` takes each flock(2) itself: contention fails the open with EAGAIN, and closing the descriptor lets go. */
+async function holdInProcess(paths: readonly string[], mode: LockMode): Promise<HoldAttempt> {
+  const flags =
+    (mode === 'create' ? constants.O_RDONLY | constants.O_CREAT : constants.O_RDONLY) | constants.O_NONBLOCK | O_EXLOCK;
+  const held: FileHandle[] = [];
+  const letGo = async (): Promise<void> => {
+    await Promise.all(held.map((handle) => handle.close()));
+  };
+  for (const path of paths) {
+    try {
+      held.push(await open(path, flags, 0o644));
+    } catch (error) {
+      await letGo();
+      return errorCode(error) === 'EAGAIN'
+        ? { kind: 'busy', lock: path }
+        : { kind: 'unavailable', reason: describeCause(error) };
+    }
+  }
+  return { kind: 'held', hold: { release: letGo } };
+}
+
+function startHelper(mode: LockMode, paths: readonly string[]) {
+  return spawn('perl', ['-e', LOCK_HELPER, mode, ...paths], { stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+/** A perl child takes each flock(2) on its own descriptor and holds it for as long as its stdin pipe lives. */
+async function holdThroughPerl(paths: readonly string[], mode: LockMode): Promise<HoldAttempt> {
+  let child: ReturnType<typeof startHelper>;
+  try {
+    child = startHelper(mode, paths);
+  } catch (error) {
+    // Node throws, not emits 'error', for exec failures it does not class as run-time, such as EPERM from a sandbox.
+    return { kind: 'unavailable', reason: `cannot run perl: ${describeCause(error)}` };
+  }
   const exited = new Promise<void>((resolve) => child.once('close', () => resolve()));
   let stderr = '';
   child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
@@ -296,32 +355,26 @@ async function tryHold(
   });
   if (!first.ok) {
     child.stdin.destroy();
-    return { ok: false, error: { kind: 'lock-helper', detail: first.error } };
+    return { kind: 'unavailable', reason: first.error };
   }
   const [verdict, path, detail] = first.value.split('\t');
   if (verdict === 'held') {
     return {
-      ok: true,
-      value: {
-        kind: 'held',
-        hold: {
-          async release() {
-            child.stdin.end();
-            await exited;
-          },
+      kind: 'held',
+      hold: {
+        async release() {
+          child.stdin.end();
+          await exited;
         },
       },
     };
   }
   child.stdin.end();
   await exited;
-  if (verdict === 'busy' && path !== undefined) return { ok: true, value: { kind: 'busy', lock: path } };
+  if (verdict === 'busy' && path !== undefined) return { kind: 'busy', lock: path };
   return {
-    ok: false,
-    error: {
-      kind: 'lock-helper',
-      detail: verdict === 'error' ? `${path}: ${detail}` : `unexpected answer ${first.value}`,
-    },
+    kind: 'unavailable',
+    reason: verdict === 'error' ? `${path}: ${detail}` : `unexpected answer ${first.value}`,
   };
 }
 
@@ -970,9 +1023,11 @@ export async function retainCargoWorkspace(
   let retention: Hold | undefined;
   if (options.apply) {
     const attempt = await tryHold([join(targetDir, RETENTION_LOCK)], 'create');
-    if (!attempt.ok) return attempt;
-    if (attempt.value.kind === 'busy') return { ok: true, value: report({ kind: 'busy', lock: attempt.value.lock }) };
-    retention = attempt.value.hold;
+    if (attempt.kind === 'busy') return { ok: true, value: report({ kind: 'busy', lock: attempt.lock }) };
+    if (attempt.kind === 'unavailable') {
+      return { ok: true, value: report(lockRefusal(targetDir, 'the retention lock', attempt.reason)) };
+    }
+    retention = attempt.hold;
   }
   try {
     // Another automatic caller may have completed between the first check and our lock acquisition.
@@ -1033,9 +1088,9 @@ async function pass(
   const lockStarted = performance.now();
   const attempt = await tryHold(locks.value, 'existing');
   performance.measure('cargoRetention:locks', { start: lockStarted });
-  if (!attempt.ok) return attempt;
-  if (attempt.value.kind === 'busy') return complete({ kind: 'busy', lock: attempt.value.lock });
-  const cargo = attempt.value.hold;
+  if (attempt.kind === 'busy') return complete({ kind: 'busy', lock: attempt.lock });
+  if (attempt.kind === 'unavailable') return complete(lockRefusal(targetDir, "Cargo's locks", attempt.reason));
+  const cargo = attempt.hold;
   const metas: Meta[] = [];
   const anomalies: Retained[] = [];
   let selection: Selection;
@@ -1109,6 +1164,15 @@ async function pass(
   return complete(outcome('reclaimed', reclaim, Number(linkedBytes), retained));
 }
 
+/** A pass that could not even attempt a lock changed nothing: it is refused, naming why on one line. */
+function lockRefusal(targetDir: string, lock: string, reason: string): RetentionOutcome {
+  return {
+    kind: 'refused',
+    profile: targetDir,
+    reason: `cannot attempt ${lock}: ${reason.replace(/\s+/g, ' ').trim()}`,
+  };
+}
+
 /** `linkedBytes`: planned, the candidates' bytes linked outside them; reclaimed, the inodes still linked after the pass. */
 function outcome(
   kind: 'planned' | 'reclaimed',
@@ -1154,8 +1218,6 @@ export function describeRetentionError(error: RetentionError): string {
       return `${error.targetDir} is not a Cargo target directory: ${error.detail}`;
     case 'lossless-json-unavailable':
       return `cannot read Cargo fingerprints exactly: ${error.detail}`;
-    case 'lock-helper':
-      return `cannot take Cargo's locks: ${error.detail}`;
     case 'io':
       return `cannot ${error.operation} ${error.path}: ${error.detail}`;
   }
@@ -1189,6 +1251,7 @@ export const CARGO_PRODUCER_METADATA = { cargoProducer: true } as const;
  * After a run that executed a Cargo producer task ({@link CARGO_PRODUCER_METADATA}), check whether
  * each Cargo workspace is due for its daily maintenance. A successful receipt schedules only;
  * every due pass reads the current graph under Cargo's locks and is awaited by this Nx process.
+ * Maintenance never fails the run it follows: every outcome, a refused or busy pass included, is only reported.
  */
 export async function postTasksExecution(_options: unknown, context: PostTasksExecutionContext): Promise<void> {
   const executed = Object.values(context.taskResults).filter(({ status }) => ran(status));
@@ -1213,10 +1276,19 @@ export async function postTasksExecution(_options: unknown, context: PostTasksEx
     if (done.some((workspaceRoot) => !relative(workspaceRoot, root).startsWith('..'))) continue;
     const started = performance.now();
     const cpu = process.cpuUsage();
-    const result = await retainCargoWorkspace(root, { apply: true, automatic: true });
-    performance.measure('cargoRetention:total', { start: started });
-    const used = process.cpuUsage(cpu);
-    performance.measure('cargoRetention:cpu', { start: 0, duration: (used.user + used.system) / 1000 });
+    let result: Result<RetentionReport, RetentionError>;
+    try {
+      result = await retainCargoWorkspace(root, { apply: true, automatic: true });
+    } catch (error) {
+      // Maintenance never fails the run it follows: say what escaped, then go on to the next workspace.
+      const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+      logger.warn(`Cargo retention for ${root}: unexpected failure: ${detail}`);
+      continue;
+    } finally {
+      performance.measure('cargoRetention:total', { start: started });
+      const used = process.cpuUsage(cpu);
+      performance.measure('cargoRetention:cpu', { start: 0, duration: (used.user + used.system) / 1000 });
+    }
     if (!result.ok) {
       logger.warn(`Cargo retention for ${root}: ${describeRetentionError(result.error)}`);
       continue;

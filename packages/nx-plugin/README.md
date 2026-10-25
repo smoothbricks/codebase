@@ -203,7 +203,11 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   exactly), every unit used in the last 24 hours (`-Zmtime-on-use` stamps each use), and the transitive dependency
   closure of those across every profile, host and cross alike. A pass holds every profile's Cargo locks without waiting:
   one held lock skips the pass as `busy`, and a profile it cannot read (legacy layout, unreadable fingerprint, missing
-  `build/` or lock) refuses the whole pass. It moves each reclaimed generation into the profile's
+  `build/` or lock) refuses the whole pass. So does a lock it cannot attempt at all, with the reason named: macOS takes
+  its `flock(2)`s in-process (`open(2)` with `O_EXLOCK | O_NONBLOCK`) and starts no helper; other platforms hold them in
+  a perl child, so a sandbox that refuses to exec perl, like a lock file that cannot be opened, refuses the pass instead
+  of failing the run. The hook only reports outcomes and never fails the run it follows: whatever escapes a pass is
+  logged as a warning, and the next workspace is still tried. It moves each reclaimed generation into the profile's
   `.smoo-retention-trash/` under that hold, recording its inode first, and unlinks it after letting go; it writes its
   last report to `<target>/.smoo-cargo-retention.json`. Cargo's root-relative fingerprint paths distinguish cross
   profiles from nested target roots under the lock; mixed, foreign or unprovable cross-profile roots refuse the pass
