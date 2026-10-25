@@ -176,6 +176,11 @@ pub(crate) enum PoolSource {
         host: crate::cpu_budget::CpuBudget,
         checkout: std::sync::Arc<str>,
     },
+    /// A one-token job on probation (05_gateway.md "A one-token job starts on probation"): a
+    /// lent pool of one, its fifo holding no bytes, whose holder's own token is the probation
+    /// token, which no child takes. [`CpuPool::grant_probation`] makes it the job's granted
+    /// token, which the pool then lends as any lent pool of one does.
+    Probation,
 }
 
 /// What a pool's socket children are granted from.
@@ -198,6 +203,8 @@ pub(crate) struct CpuPool {
     fifo: Option<JobserverFifo>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    /// A probation pool's lender, until its grant frees the holder's token to lend.
+    probation: Option<FifoTokens>,
 }
 
 impl CpuPool {
@@ -214,6 +221,7 @@ impl CpuPool {
             PoolSource::Lent(tokens) | PoolSource::Relay { tokens, .. } => Some(
                 JobserverFifo::make(directory.join(opaque_name()), tokens.get())?,
             ),
+            PoolSource::Probation => Some(JobserverFifo::make(directory.join(opaque_name()), 1)?),
             PoolSource::Resident { .. } => None,
         };
         let path = directory.join(opaque_name());
@@ -223,12 +231,19 @@ impl CpuPool {
             tokio::io::unix::AsyncFd::new(listener)
         })?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let made = || {
+            fifo.as_ref()
+                .expect("a lent pool made its fifo above")
+                .path()
+        };
+        let mut probation = None;
         let ledger = match source {
-            PoolSource::Lent(_) => PoolLedger::Fifo(FifoTokens::start(
-                fifo.as_ref()
-                    .expect("a lent pool made its fifo above")
-                    .path(),
-            )?),
+            PoolSource::Lent(_) => PoolLedger::Fifo(FifoTokens::start(made(), true)?),
+            PoolSource::Probation => {
+                let tokens = FifoTokens::start(made(), false)?;
+                probation = Some(tokens.clone());
+                PoolLedger::Fifo(tokens)
+            }
             PoolSource::Relay {
                 host,
                 checkout,
@@ -304,11 +319,20 @@ impl CpuPool {
             fifo,
             stop: Some(stop),
             task: Some(task),
+            probation,
         })
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// A probation pool's job is granted its token: the holder's own token is the job's now, and
+    /// the pool lends it as any lent pool of one does. Any other pool is unchanged.
+    pub(crate) fn grant_probation(&mut self) {
+        if let Some(tokens) = self.probation.take() {
+            tokens.free_implicit();
+        }
     }
 
     /// The make jobserver fifo the pool's own command reads; none for a resident's.
@@ -474,8 +498,10 @@ impl Drop for FifoGrant {
 impl FifoTokens {
     /// Lend the tokens in the fifo at `path` through a descriptor of the lender's own, open for
     /// reading and writing so it never sees end-of-file, and nonblocking so a read takes only
-    /// what is there. The lender runs while any handle or grant of it is alive.
-    fn start(path: &Path) -> io::Result<Self> {
+    /// what is there. The holder's own token is lent too when `implicit` is free, and not while
+    /// it is the probation token ([`Self::free_implicit`]). The lender runs while any handle or
+    /// grant of it is alive.
+    fn start(path: &Path, implicit: bool) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let file = OpenOptions::new()
             .read(true)
@@ -484,8 +510,17 @@ impl FifoTokens {
             .open(path)?;
         let fifo = tokio::io::unix::AsyncFd::with_interest(file, tokio::io::Interest::READABLE)?;
         let (messages, receiver) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(lend(fifo, receiver, messages.downgrade()));
+        tokio::spawn(lend(fifo, receiver, messages.downgrade(), implicit));
         Ok(Self { messages })
+    }
+
+    /// The holder's own token is free to lend from now on: its probation was granted.
+    fn free_implicit(&self) {
+        // A lender that is gone lends nothing.
+        let _ = self.messages.send(FifoMessage::Return {
+            bytes: 0,
+            implicit: true,
+        });
     }
 
     /// Queue for up to `want` tokens. The receiver resolves to the grant; dropping it leaves the
@@ -503,8 +538,8 @@ async fn lend(
     fifo: tokio::io::unix::AsyncFd<File>,
     mut messages: tokio::sync::mpsc::UnboundedReceiver<FifoMessage>,
     returns: tokio::sync::mpsc::WeakUnboundedSender<FifoMessage>,
+    mut implicit: bool,
 ) {
-    let mut implicit = true;
     let mut queue = std::collections::VecDeque::<(
         std::num::NonZeroUsize,
         tokio::sync::oneshot::Sender<FifoGrant>,

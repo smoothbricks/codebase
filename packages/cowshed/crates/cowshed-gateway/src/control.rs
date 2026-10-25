@@ -596,12 +596,32 @@ struct JobserverIn {
     /// The requester's live CPU pool, which the job waits on beside the host ledger: the first
     /// grant serves it.
     parent_pool: Option<String>,
+    /// The requester can start the job before its grant and stop it when its probation ends
+    /// (05_gateway.md "A one-token job starts on probation").
+    #[serde(default)]
+    probation: bool,
 }
 
 struct JobserverOptions {
     admission: crate::cpu_budget::Class,
     pool_job: Option<JobserverJobIn>,
     parent_pool: Option<PathBuf>,
+    /// The requester offered to run the job on probation.
+    probation: bool,
+}
+
+impl JobserverOptions {
+    /// Whether this ask may be lent the probation token (05_gateway.md "A one-token job starts on
+    /// probation"): a background ask for one token, for a job whose pool it asks for, naming no
+    /// requester's pool, from a requester that can stop the job it starts. A larger ask's command
+    /// sizes its runners when it starts, and a grant never grows.
+    fn lendable(&self, want: NonZeroUsize) -> bool {
+        self.probation
+            && want == NonZeroUsize::MIN
+            && self.admission == crate::cpu_budget::Class::Background
+            && self.pool_job.is_some()
+            && self.parent_pool.is_none()
+    }
 }
 
 /// A `resident-pool` request's fields: the checkout its children's asks are for, what the
@@ -1158,10 +1178,14 @@ async fn serve<R, W>(
             let checkout: Arc<str> = Arc::from(checkout);
             let claim = Claim::new(&command, pid);
             let rank = options.admission.rank();
-            let admission =
-                services
-                    .cpu_budget
-                    .ask_jobserver(Arc::clone(&checkout), want, claim, rank);
+            let lendable = options.lendable(want);
+            let admission = services.cpu_budget.ask_jobserver(
+                Arc::clone(&checkout),
+                want,
+                claim,
+                rank,
+                lendable,
+            );
             hold_jobserver(
                 reader,
                 writer,
@@ -1317,11 +1341,12 @@ async fn hold_jobserver<R, W>(
     mut reader: R,
     mut writer: W,
     want: NonZeroUsize,
-    (stake, granted, queued): (
-        crate::cpu_budget::Stake,
-        tokio::sync::oneshot::Receiver<usize>,
-        tokio::sync::oneshot::Receiver<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>,
-    ),
+    crate::cpu_budget::JobserverAsk {
+        stake,
+        granted,
+        queued,
+        lent,
+    }: crate::cpu_budget::JobserverAsk,
     parent: Option<(PathBuf, cowshed_os::fork_lock::Fenced<UnixStream>)>,
     fifos: crate::jobserver::JobserverFifos,
     options: JobserverOptions,
@@ -1393,15 +1418,17 @@ async fn hold_jobserver<R, W>(
             Some((path, stream))
         }
     };
-    /// Which ledger's grant arrived first, and its count.
+    /// Which ledger's grant arrived first, and its count; or the probation token, lent first.
     enum Winner {
         Host(usize),
         Pool(usize),
+        Probation,
     }
+    let mut granted = granted;
     let mut discard = [0_u8; 64];
     let winner = tokio::select! {
         biased;
-        answer = granted => match answer {
+        answer = &mut granted => match answer {
             Ok(tokens) => Winner::Host(tokens),
             Err(_) => {
                 let _ = write_response(&mut writer, &cpu_ask_cut_off(&budget)).await;
@@ -1422,6 +1449,16 @@ async fn hold_jobserver<R, W>(
                 return;
             }
         },
+        // An ask that is granted, or never may be lent, is never told: its sender is dropped.
+        () = async {
+            let told = match lent {
+                Some(lent) => lent.await.is_ok(),
+                None => false,
+            };
+            if !told {
+                std::future::pending::<()>().await;
+            }
+        } => Winner::Probation,
         _ = reader.read(&mut discard) => return,
     };
     let waited = asked.elapsed().as_millis();
@@ -1463,6 +1500,16 @@ async fn hold_jobserver<R, W>(
             return;
         }
         (Winner::Pool(_), None) => unreachable!("only a requester's pool grants from a pool"),
+        (Winner::Probation, None) => {
+            let job = options
+                .pool_job
+                .expect("only an ask for its job's pool is lent the probation token");
+            hold_probation(reader, writer, stake, granted, &fifos, &job, &budget, asked).await;
+            return;
+        }
+        (Winner::Probation, Some(_)) => {
+            unreachable!("an ask naming its requester's pool is never lent the probation token")
+        }
     };
     let source = options.pool_job.as_ref().map(|job| {
         // A gate's children rank as the gate job does, by its age, at every return; background
@@ -1481,7 +1528,16 @@ async fn hold_jobserver<R, W>(
         };
         (source, job)
     });
-    let Some(served) = answer_grant(&mut writer, &fifos, tokens, source, asked).await else {
+    let Some(served) = answer_grant(
+        &mut writer,
+        &fifos,
+        tokens,
+        source,
+        asked,
+        LeaseState::Granted,
+    )
+    .await
+    else {
         return;
     };
     // Hold until the client closes. The fifo keeps the grant's `g − 1` bytes for the grant's
@@ -1491,6 +1547,101 @@ async fn hold_jobserver<R, W>(
     {}
     served.close().await;
     drop(stake);
+}
+
+/// Hold a one-token job on probation (05_gateway.md "A one-token job starts on probation"): serve
+/// its pool, whose holder's own token is the probation token, and answer `probation`; answer
+/// `granted`, naming the same pool and fifo, when the ledger grants the job its one token, and
+/// hold that grant until the client closes. The client's `probation-over` returns the probation
+/// token and keeps the ask's place; its close, or any other line, leaves the queue.
+#[allow(clippy::too_many_arguments)]
+async fn hold_probation<R, W>(
+    reader: R,
+    mut writer: W,
+    stake: crate::cpu_budget::Stake,
+    mut granted: tokio::sync::oneshot::Receiver<usize>,
+    fifos: &crate::jobserver::JobserverFifos,
+    job: &JobserverJobIn,
+    budget: &CpuBudget,
+    asked: std::time::Instant,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(mut served) = answer_grant(
+        &mut writer,
+        fifos,
+        1,
+        Some((crate::jobserver::PoolSource::Probation, job)),
+        asked,
+        LeaseState::Probation,
+    )
+    .await
+    else {
+        return;
+    };
+    let mut lines = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        tokio::select! {
+            biased;
+            answer = &mut granted => match answer {
+                Ok(tokens) => {
+                    if let Served::Pool(pool) = &mut served {
+                        pool.grant_probation();
+                    }
+                    if write_response(&mut writer, &served.answer(tokens, LeaseState::Granted))
+                        .await
+                        .is_err()
+                    {
+                        served.close().await;
+                        return;
+                    }
+                    cowshed_os::eprintln!(
+                        "cowshed: timing lease-grant scheduler=\"jobserver\" elapsed_ns={} tokens={tokens} after=probation",
+                        asked.elapsed().as_nanos(),
+                    );
+                    break;
+                }
+                Err(_) => {
+                    let _ = write_response(&mut writer, &cpu_ask_cut_off(budget)).await;
+                    served.close().await;
+                    return;
+                }
+            },
+            read = async { (&mut lines).take(4097).read_line(&mut line).await } => match read {
+                Ok(read) if read > 0 && line.ends_with('\n') && probation_over(&line) => {
+                    stake.probation_over();
+                }
+                // EOF, a broken socket, or a line a probation client never sends: it is gone
+                // or confused, and either way it leaves the queue.
+                _ => {
+                    served.close().await;
+                    return;
+                }
+            },
+        }
+    }
+    // Hold the grant until the client closes. A `probation-over` that crossed the grant is
+    // discarded with whatever else it sends.
+    let mut discard = [0_u8; 64];
+    while let Ok(read) = lines.read(&mut discard).await
+        && read > 0
+    {}
+    served.close().await;
+    drop(stake);
+}
+
+/// Whether `line` is exactly a probation's end: `{"op":"probation-over"}`.
+fn probation_over(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+        value.as_object().is_some_and(|object| {
+            object.len() == 1
+                && object.get("op").and_then(serde_json::Value::as_str)
+                    == Some(cowshed_gateway_types::PROBATION_OVER_OP)
+        })
+    })
 }
 
 /// What a jobserver grant is served as: a job's private pool, whose make jobserver fifo holds the
@@ -1509,6 +1660,19 @@ impl Served {
         }
     }
 
+    /// The answer naming `tokens` of this grant, its fifo and, for a job, its pool.
+    fn answer(&self, tokens: usize, state: LeaseState) -> ControlResponse {
+        ControlResponse {
+            cpu_pool: match self {
+                Self::Pool(pool) => Some(pool.path().to_string_lossy().into_owned()),
+                Self::Fifo(_) => None,
+            },
+            tokens: Some(tokens),
+            fifo: Some(self.fifo().to_string_lossy().into_owned()),
+            ..lease(state)
+        }
+    }
+
     /// Close the pool and drain and unlink the fifo; tokens a client still holds are its own.
     async fn close(self) {
         match self {
@@ -1523,14 +1687,15 @@ impl Served {
 }
 
 /// Serve a granted jobserver — for a job, its private pool and that pool's fifo; otherwise a
-/// fifo of its own — and answer the grant. `None` once it cannot be made, which is answered, or
-/// the client is gone.
+/// fifo of its own — and answer it as `state`: `granted`, or `probation` for a job lent the
+/// probation token. `None` once it cannot be made, which is answered, or the client is gone.
 async fn answer_grant<W>(
     writer: &mut W,
     fifos: &crate::jobserver::JobserverFifos,
     tokens: usize,
     pool: Option<(crate::jobserver::PoolSource, &JobserverJobIn)>,
     asked: std::time::Instant,
+    state: LeaseState,
 ) -> Option<Served>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -1563,21 +1728,15 @@ where
             return None;
         }
     };
-    let answer = ControlResponse {
-        cpu_pool: match &served {
-            Served::Pool(pool) => Some(pool.path().to_string_lossy().into_owned()),
-            Served::Fifo(_) => None,
-        },
-        tokens: Some(tokens),
-        fifo: Some(served.fifo().to_string_lossy().into_owned()),
-        ..lease(LeaseState::Granted)
-    };
-    if write_response(writer, &answer).await.is_err() {
+    if write_response(writer, &served.answer(tokens, state))
+        .await
+        .is_err()
+    {
         served.close().await;
         return None;
     }
     cowshed_os::eprintln!(
-        "cowshed: timing lease-grant scheduler=\"jobserver\" elapsed_ns={} tokens={tokens}",
+        "cowshed: timing lease-grant scheduler=\"jobserver\" elapsed_ns={} tokens={tokens} lease={state:?}",
         asked.elapsed().as_nanos(),
     );
     Some(served)
@@ -1671,7 +1830,16 @@ async fn hold_parent_grant<R, W>(
             job,
         )
     });
-    let Some(served) = answer_grant(&mut writer, &fifos, tokens, source, asked).await else {
+    let Some(served) = answer_grant(
+        &mut writer,
+        &fifos,
+        tokens,
+        source,
+        asked,
+        LeaseState::Granted,
+    )
+    .await
+    else {
         return;
     };
     let mut served = Some(served);
@@ -1850,6 +2018,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             "pool",
             "job",
             "parentPool",
+            "probation",
         ],
         RESIDENT_POOL_OP => &["op", "checkout", "command", "job"],
         _ => {
@@ -1898,6 +2067,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 pool,
                 job,
                 parent_pool,
+                probation,
             } = serde_json::from_value(value).map_err(encoding)?;
             if let Some(parent) = &parent_pool
                 && (!Path::new(parent).is_absolute()
@@ -1944,6 +2114,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                     admission,
                     pool_job,
                     parent_pool: parent_pool.map(PathBuf::from),
+                    probation,
                 },
             )
         } else {
@@ -1953,6 +2124,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                     admission: crate::cpu_budget::Class::Background,
                     pool_job: None,
                     parent_pool: None,
+                    probation: false,
                 },
             )
         };

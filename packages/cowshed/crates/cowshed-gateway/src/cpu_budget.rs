@@ -42,7 +42,8 @@ use std::time::{Duration, Instant};
 
 use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
-    CpuWaiter, GateWork, InstallRestart, background_cap, background_limit, host_tokens,
+    CpuProbation, CpuWaiter, GateWork, InstallRestart, background_cap, background_limit,
+    host_tokens,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -132,6 +133,9 @@ struct Waiter {
     /// checkout's background queue; at the background limit it is overdue ([`Ledger::overdue`]).
     passed: usize,
     claim: Claim,
+    /// Whether it may still be lent the probation token: its requester can stop the job it
+    /// starts, and it was never lent it ([`Ledger::lend`]).
+    lendable: bool,
 }
 
 impl Waiter {
@@ -160,6 +164,14 @@ struct Holder {
 enum Turn {
     Overdue(Ticket),
     Fair { held: usize, ticket: Ticket },
+}
+
+/// Whom a transition lent the probation token, for the actor to tell and to report.
+#[derive(Debug)]
+pub(crate) struct Lent {
+    ticket: Ticket,
+    checkout: Arc<str>,
+    claim: Claim,
 }
 
 /// The ledger's next step: start the waiter at `position` in `checkout`'s queue with `tokens`.
@@ -192,6 +204,9 @@ pub(crate) struct Ledger {
     free: usize,
     checkouts: HashMap<Arc<str>, Checkout>,
     tickets: HashMap<Ticket, Arc<str>>,
+    /// The waiter the probation token is lent to, and since when: one token beyond `total`, never
+    /// counted in `free` (05_gateway.md "A one-token job starts on probation").
+    lent: Option<(Ticket, Instant)>,
 }
 
 impl Ledger {
@@ -209,6 +224,7 @@ impl Ledger {
             free: total,
             checkouts: HashMap::new(),
             tickets: HashMap::new(),
+            lent: None,
         }
     }
 
@@ -227,6 +243,7 @@ impl Ledger {
     /// `ticket` is done: a holder returns its tokens, a waiter leaves the queue. A ticket the
     /// ledger does not know changes nothing.
     pub(crate) fn leave(&mut self, now: Instant, ticket: Ticket, grants: &mut Vec<Grant>) {
+        self.return_probation(ticket);
         let Some(name) = self.tickets.remove(&ticket) else {
             return;
         };
@@ -307,6 +324,7 @@ impl Ledger {
                 granted: now,
             });
             self.free -= tokens;
+            self.return_probation(waiter.ticket);
             if waiter.class == Class::Background {
                 self.pass_over(waiter.ticket);
             }
@@ -321,6 +339,47 @@ impl Ledger {
                 job: waiter.job,
                 head,
             });
+        }
+    }
+
+    /// Lend the probation token, while it is free, to the oldest waiter that may still take it
+    /// (05_gateway.md "A one-token job starts on probation"). Called after a transition's
+    /// grants, so that waiter is one no free token could serve. It holds no ledger token and keeps
+    /// its place: its grant or its leaving returns the probation token, and so does
+    /// [`Ledger::probation_over`]. A waiter is lent it at most once.
+    pub(crate) fn lend(&mut self, now: Instant) -> Option<Lent> {
+        if self.lent.is_some() {
+            return None;
+        }
+        let (checkout, waiter) = self
+            .checkouts
+            .iter_mut()
+            .flat_map(|(name, checkout)| {
+                checkout
+                    .waiting
+                    .iter_mut()
+                    .map(move |waiter| (name, waiter))
+            })
+            .filter(|(_, waiter)| waiter.lendable)
+            .min_by_key(|(_, waiter)| waiter.ticket)?;
+        waiter.lendable = false;
+        self.lent = Some((waiter.ticket, now));
+        Some(Lent {
+            ticket: waiter.ticket,
+            checkout: Arc::clone(checkout),
+            claim: waiter.claim.clone(),
+        })
+    }
+
+    /// `ticket`'s requester stopped its job on probation without a grant: the probation token
+    /// returns, and the ask waits where it was.
+    pub(crate) fn probation_over(&mut self, ticket: Ticket) {
+        self.return_probation(ticket);
+    }
+
+    fn return_probation(&mut self, ticket: Ticket) {
+        if self.lent.is_some_and(|(lent, _)| lent == ticket) {
+            self.lent = None;
         }
     }
 
@@ -702,6 +761,23 @@ impl Ledger {
                 })
                 .collect(),
             background,
+            probation: self.lent.map(|(ticket, since)| {
+                let name = self
+                    .tickets
+                    .get(&ticket)
+                    .expect("the probation token is lent to a known ticket");
+                let waiter = self.checkouts[name]
+                    .waiting
+                    .iter()
+                    .find(|waiter| waiter.ticket == ticket)
+                    .expect("the probation token is lent to a waiter");
+                CpuProbation {
+                    checkout: name.to_string(),
+                    pid: waiter.claim.pid,
+                    command: waiter.claim.command.to_string(),
+                    lent_ms: millis_since(since, now),
+                }
+            }),
         }
     }
 }
@@ -740,10 +816,16 @@ enum Message {
         job: Ticket,
         granted: oneshot::Sender<usize>,
         queued: Option<oneshot::Sender<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>>,
+        /// Told when the ask is lent the probation token; `None` for an ask that may not be.
+        lent: Option<oneshot::Sender<()>>,
     },
     Leave {
         ticket: Ticket,
         released: Instant,
+    },
+    /// The requester stopped its job on probation without a grant.
+    ProbationOver {
+        ticket: Ticket,
     },
     Status {
         reply: oneshot::Sender<CpuBudgetStatus>,
@@ -764,6 +846,16 @@ pub(crate) struct CpuBudget {
     installing: Arc<std::sync::OnceLock<InstallRestart>>,
 }
 
+/// A jobserver ask's stake and what it hears: its grant, the decision of its admission
+/// transition, and, for an ask that may be lent it, the probation token (05_gateway.md "A
+/// one-token job starts on probation").
+pub(crate) struct JobserverAsk {
+    pub(crate) stake: Stake,
+    pub(crate) granted: oneshot::Receiver<usize>,
+    pub(crate) queued: oneshot::Receiver<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>,
+    pub(crate) lent: Option<oneshot::Receiver<()>>,
+}
+
 /// One request's stake in the budget, waiting or holding. Dropping it returns what it holds.
 #[derive(Debug)]
 pub(crate) struct Stake {
@@ -775,6 +867,16 @@ impl Stake {
     /// The age of the job this stake admits, for the tasks it relays as [`Rank::GateTask`].
     pub(crate) fn job(&self) -> JobAge {
         JobAge(self.ticket)
+    }
+
+    /// This ask's requester stopped its job on probation without a grant: the probation token
+    /// passes on and the ask keeps its place (05_gateway.md "A one-token job starts on
+    /// probation").
+    pub(crate) fn probation_over(&self) {
+        // An actor that is gone lends nothing.
+        let _ = self.messages.send(Message::ProbationOver {
+            ticket: self.ticket,
+        });
     }
 }
 
@@ -814,24 +916,33 @@ impl CpuBudget {
         claim: Claim,
         rank: Rank,
     ) -> (Stake, oneshot::Receiver<usize>) {
-        self.enqueue(checkout, want, claim, rank, None)
+        self.enqueue(checkout, want, claim, rank, None, None)
     }
 
-    /// Jobserver admission also observes the decision made by the very same transition.
+    /// Jobserver admission also observes the decision made by the very same transition. A
+    /// `probation` ask, one a supervisor can stop, also hears when it is lent the probation token.
     pub(crate) fn ask_jobserver(
         &self,
         checkout: Arc<str>,
         want: NonZeroUsize,
         claim: Claim,
         rank: Rank,
-    ) -> (
-        Stake,
-        oneshot::Receiver<usize>,
-        oneshot::Receiver<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>,
-    ) {
+        probation: bool,
+    ) -> JobserverAsk {
         let (queued, decision) = oneshot::channel();
-        let (stake, granted) = self.enqueue(checkout, want, claim, rank, Some(queued));
-        (stake, granted, decision)
+        let (lent, lending) = if probation {
+            let (lent, lending) = oneshot::channel();
+            (Some(lent), Some(lending))
+        } else {
+            (None, None)
+        };
+        let (stake, granted) = self.enqueue(checkout, want, claim, rank, Some(queued), lent);
+        JobserverAsk {
+            stake,
+            granted,
+            queued: decision,
+            lent: lending,
+        }
     }
 
     fn enqueue(
@@ -841,6 +952,7 @@ impl CpuBudget {
         claim: Claim,
         rank: Rank,
         queued: Option<oneshot::Sender<Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>>>,
+        lent: Option<oneshot::Sender<()>>,
     ) -> (Stake, oneshot::Receiver<usize>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
         let (class, job) = match rank {
@@ -861,6 +973,7 @@ impl CpuBudget {
             job,
             granted,
             queued,
+            lent,
         });
         (
             Stake {
@@ -928,6 +1041,8 @@ impl CutOff {
 
 async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>) {
     let mut grants: HashMap<Ticket, oneshot::Sender<usize>> = HashMap::new();
+    // The asks that may be lent the probation token, told when they are.
+    let mut lends: HashMap<Ticket, oneshot::Sender<()>> = HashMap::new();
     let mut cut: Option<CutOff> = None;
     let mut effects = Vec::new();
     while let Some(message) = messages.recv().await {
@@ -935,6 +1050,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
         let transition = match &message {
             Message::Ask { ticket, .. } => Some(("ask", *ticket, None)),
             Message::Leave { ticket, released } => Some(("release", *ticket, Some(*released))),
+            Message::ProbationOver { ticket } => Some(("probation-over", *ticket, None)),
             Message::Status { .. } | Message::CutOff { .. } => None,
         };
         match message {
@@ -947,6 +1063,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 job,
                 granted,
                 queued,
+                lent,
             } => {
                 // After a cut-off no ask is queued: dropping its sender refuses it at once.
                 if let Some(cut) = &mut cut {
@@ -957,6 +1074,10 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                     continue;
                 }
                 grants.insert(ticket, granted);
+                let lendable = lent.is_some();
+                if let Some(lent) = lent {
+                    lends.insert(ticket, lent);
+                }
                 ledger.ask(
                     checkout,
                     Waiter {
@@ -965,6 +1086,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                         asked: Instant::now(),
                         passed: 0,
                         claim,
+                        lendable,
                         class,
                         job,
                     },
@@ -976,11 +1098,13 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             }
             Message::Leave { ticket, .. } => {
                 grants.remove(&ticket);
+                lends.remove(&ticket);
                 ledger.leave(Instant::now(), ticket, &mut effects);
                 if let Some(cut) = &mut cut {
                     cut.left(ticket);
                 }
             }
+            Message::ProbationOver { ticket } => ledger.probation_over(ticket),
             Message::Status { reply } => {
                 let _ = reply.send(ledger.status(Instant::now()));
             }
@@ -988,6 +1112,8 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 // Every sender still here is a queued ask: dropped, its waiter refuses.
                 let waiting: std::collections::HashSet<Ticket> =
                     grants.drain().map(|(ticket, _)| ticket).collect();
+                // Nothing is lent after a cut-off: an install is restarting the gateway.
+                lends.clear();
                 let mut cutting = CutOff {
                     queued: waiting.len(),
                     waiting,
@@ -1000,12 +1126,20 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 cut = Some(cutting);
             }
         }
+        // A waiter this transition left queued may run on the probation token.
+        let lent = cut.is_none().then(|| ledger.lend(Instant::now())).flatten();
+        if let Some(lent) = &lent
+            && let Some(told) = lends.remove(&lent.ticket)
+        {
+            let _ = told.send(());
+        }
         // Deliver all grants before diagnostics: stderr backpressure must not sit between the
         // grants of one transition, and the measured step excludes its own reporting.
         for grant in &effects {
             if let Some(granted) = grants.remove(&grant.ticket) {
                 let _ = granted.send(grant.tokens);
             }
+            lends.remove(&grant.ticket);
         }
         let elapsed = started.elapsed();
         if let Some((cause, ticket, released)) = transition {
@@ -1020,6 +1154,18 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 "cowshed: timing cpu-tokens queue-step cause={cause} ticket={ticket} elapsed_ns={} grants={}",
                 elapsed.as_nanos(),
                 effects.len(),
+            );
+        }
+        if let Some(Lent {
+            ticket,
+            checkout,
+            claim,
+        }) = lent
+        {
+            cowshed_os::eprintln!(
+                "cowshed: timing cpu-tokens probation ticket={ticket} checkout={checkout:?} pid={:?} command={:?}",
+                claim.pid,
+                claim.command,
             );
         }
         for Grant {
@@ -1138,6 +1284,7 @@ mod tests {
                     asked: now,
                     passed: 0,
                     claim: Claim::new(&format!("t{ticket}"), Some(7)),
+                    lendable: false,
                 },
                 &mut self.effects,
             );
@@ -1148,6 +1295,53 @@ mod tests {
             let now = self.origin + Duration::from_millis(ms);
             self.ledger.leave(now, ticket, &mut self.effects);
             self.grants()
+        }
+
+        /// A one-token background ask whose requester can run its job on probation: what its
+        /// transition granted, and whom the probation token was lent to after it.
+        fn ask_lendable(
+            &mut self,
+            ms: u64,
+            ticket: Ticket,
+            checkout: &str,
+        ) -> (Vec<(Ticket, usize)>, Option<Ticket>) {
+            let now = self.origin + Duration::from_millis(ms);
+            self.ledger.ask(
+                Arc::from(checkout),
+                Waiter {
+                    ticket,
+                    class: Class::Background,
+                    job: ticket,
+                    want: 1,
+                    asked: now,
+                    passed: 0,
+                    claim: Claim::new(&format!("t{ticket}"), Some(7)),
+                    lendable: true,
+                },
+                &mut self.effects,
+            );
+            let grants = self.grants();
+            (grants, self.lend(now))
+        }
+
+        /// A leave, and whom the probation token was lent to after it.
+        fn leave_lending(
+            &mut self,
+            ms: u64,
+            ticket: Ticket,
+        ) -> (Vec<(Ticket, usize)>, Option<Ticket>) {
+            let grants = self.leave(ms, ticket);
+            (grants, self.lend(self.origin + Duration::from_millis(ms)))
+        }
+
+        /// `ticket`'s probation ended without a grant: whom the token was lent to next.
+        fn probation_over(&mut self, ms: u64, ticket: Ticket) -> Option<Ticket> {
+            self.ledger.probation_over(ticket);
+            self.lend(self.origin + Duration::from_millis(ms))
+        }
+
+        fn lend(&mut self, now: Instant) -> Option<Ticket> {
+            self.ledger.lend(now).map(|lent| lent.ticket)
         }
 
         /// Each grant as `(ticket, tokens)`; its wait is kept in `waited`.
@@ -1202,6 +1396,49 @@ mod tests {
         fn status(&self, ms: u64) -> CpuBudgetStatus {
             self.ledger.status(self.origin + Duration::from_millis(ms))
         }
+    }
+
+    /// The probation token (05_gateway.md "A one-token job starts on probation"). Long holders
+    /// hold every token: a lendable one-token ask is lent the probation token at once, a second
+    /// waits for it, and the first's leaving lends it on. An ask whose probation ends without a
+    /// grant passes it on and keeps its place: a returned token grants it exactly one token, its
+    /// probation is never lent again, and the ledger never holds more than its total.
+    #[test]
+    fn a_one_token_ask_runs_on_the_probation_token_while_long_holders_hold_every_token() {
+        let mut clock = Clock::new(4);
+        assert_eq!(clock.ask_land(0, 1, "land", 3), [(1, 3)]);
+        assert_eq!(clock.ask(0, 2, "shed", 1), [(2, 1)]);
+        // A short read is lent the probation token at once; the status names it.
+        assert_eq!(clock.ask_lendable(10, 3, "drive"), (vec![], Some(3)));
+        assert_eq!(
+            clock.status(30).probation,
+            Some(CpuProbation {
+                checkout: "drive".into(),
+                pid: Some(7),
+                command: "t3".into(),
+                lent_ms: 20,
+            })
+        );
+        // A second one waits for it, and the read's leaving lends it on.
+        assert_eq!(clock.ask_lendable(40, 4, "drive"), (vec![], None));
+        assert_eq!(clock.leave_lending(50, 3), (vec![], Some(4)));
+        // Ticket 4 turns heavy: its probation ends, the token passes to the next lendable ask.
+        assert_eq!(clock.ask_lendable(60, 5, "other"), (vec![], None));
+        assert_eq!(clock.probation_over(70, 4), Some(5));
+        assert_eq!(
+            clock.ledger.free, 0,
+            "the probation token is beyond the ledger's total"
+        );
+        // A returned token grants 4 in its place, one token; 5 keeps the probation token.
+        assert_eq!(clock.leave_lending(80, 2), (vec![(4, 1)], None));
+        assert_eq!(
+            clock.status(80).probation.map(|lent| lent.command),
+            Some("t5".into())
+        );
+        // 5's grant returns the probation token, and nobody is left to lend it to.
+        assert_eq!(clock.leave_lending(90, 1), (vec![(5, 1)], None));
+        assert_eq!(clock.status(90).probation, None);
+        assert_eq!(clock.ledger.free, 2);
     }
 
     /// Every granted lease is named — its client's pid, its command, its tokens of its want and

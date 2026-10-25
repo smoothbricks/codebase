@@ -119,6 +119,17 @@ fn gate_request(want: usize, checkout: &str, command: &str) -> Value {
     })
 }
 
+/// A supervisor's ask for a one-token background job it can run on probation (05_gateway.md "A
+/// one-token job starts on probation").
+fn probation_request(want: usize, checkout: &str, command: &str, job: u64) -> Value {
+    serde_json::json!({
+        "op": "jobserver", "want": want, "checkout": checkout, "command": command,
+        "class": "background", "pool": true, "probation": true,
+        "job": { "repoId": "owner/drive", "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+            "jobId": job }
+    })
+}
+
 /// One held `cpu-tokens` connection in this process, answered `queued`.
 struct Asker {
     lines: BufReader<tokio::net::unix::OwnedReadHalf>,
@@ -209,6 +220,14 @@ impl Asker {
         let mut line = String::new();
         self.lines.read_line(&mut line).await.expect("answer");
         serde_json::from_str(&line).expect("an answer is JSON")
+    }
+
+    /// Write one more line on the held connection.
+    async fn write(&mut self, line: Value) {
+        self._writer
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write");
     }
 
     /// Absence check: whether a grant arrives within `within`; load only makes `None` pass
@@ -1362,22 +1381,18 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
         .await
         .expect("the holder is granted");
     assert_eq!(holder.tokens(), NonZeroUsize::new(4));
-    // Asked of the host, the holder's child waits behind it: the host is saturated.
-    let mut host_child = Box::pin(admission.admit(exec_ask(1, "/w/scratch", 2, None)));
-    loop {
-        tokio::select! {
-            granted = &mut host_child => panic!("background had no room left: {granted:?}"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-        if ledger(&socket)
-            .await
-            .background
-            .iter()
-            .any(|stake| stake.checkout == "/w/scratch" && !stake.waiters.is_empty())
-        {
-            break;
-        }
-    }
+    // Asked of the host, the holder's child's ask waits behind it: the host is saturated. Its job
+    // runs meanwhile on the probation token ("A one-token job starts on probation"), and its ask
+    // keeps its place in the ledger.
+    let mut host_child = admission
+        .admit(exec_ask(1, "/w/scratch", 2, None))
+        .await
+        .expect("the host child is lent the probation token");
+    assert!(host_child.on_probation(), "{host_child:?}");
+    let host_granted = host_child
+        .probation_outcome()
+        .expect("a probation's wait for its grant");
+    waiters_reach(&socket, "/w/scratch", 1).await;
 
     // Asked with the holder's pool, it is granted from the holder's tokens while the host stays
     // saturated, and its own pool is served in its scope like any job's.
@@ -1421,9 +1436,11 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
     drop((child, second));
     // The holder's pool closes before its tokens return, so once its host child is granted the
     // pool is gone.
-    let host = host_child
+    host_granted
         .await
+        .expect("the probation's wait reports")
         .expect("the host child is granted once room returns");
+    let host = host_child;
     let absent = admission
         .admit(exec_ask(1, "/w/scratch", 6, Some(&holder_pool)))
         .await
@@ -1583,7 +1600,8 @@ async fn a_holders_exec_on_a_full_host_with_a_busy_pool_is_granted_by_whichever_
 }
 
 /// The reader must see the waiting client's stderr while the first connection still owns its
-/// grant. No sleep or elapsed-time assertion can establish that causal boundary.
+/// grant. No sleep or elapsed-time assertion can establish that causal boundary. The waiter asks
+/// two tokens, so it waits rather than run on the probation token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_jobserver_client_names_holders_before_release_and_status_lists_both() {
     use cowshed_core::api::ExecClass;
@@ -1596,13 +1614,13 @@ async fn queued_jobserver_client_names_holders_before_release_and_status_lists_b
             "background" => ExecClass::Background,
             other => panic!("unexpected proof class {other}"),
         };
-        let mut ask = exec_ask(1, "/w/waiter", 2, None);
+        let mut ask = exec_ask(2, "/w/waiter", 2, None);
         ask.class = class;
         let grant = GatewayJobCpu::new(socket.into())
             .admit(ask)
             .await
             .expect("waiter granted");
-        assert_eq!(grant.tokens(), NonZeroUsize::new(1));
+        assert_eq!(grant.tokens(), NonZeroUsize::new(2));
         drop(grant);
         return;
     }
@@ -1726,4 +1744,106 @@ async fn queued_jobserver_client_names_holders_before_release_and_status_lists_b
         }
         gateway.drain().await.expect("drain");
     }
+}
+
+/// The probation token over the real socket (05_gateway.md "A one-token job starts on
+/// probation"). A long holder holds every token: a one-token job's ask is answered `probation`
+/// at once, with a pool that lends its children nothing, and its close lends the token on; a
+/// two-token ask is never lent it. A job whose probation ends without a grant passes the token on
+/// and keeps its place: the returned tokens grant it one token on the same pool and fifo, its
+/// pool lends that token from then on, and the ledger holds no more than its total.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_one_token_job_runs_on_the_probation_token_while_a_long_holder_holds_every_token() {
+    let (gateway, _root, socket) = gateway(2).await;
+    let mut long = Asker::ask(&socket, 2, "/w/gate").await;
+    assert_eq!(long.granted().await, 2);
+
+    let mut read = Asker::send(&socket, probation_request(1, "/w/drive", "git ls-files", 1)).await;
+    let lent = read.answer().await;
+    assert_eq!(
+        (&lent["lease"], &lent["tokens"]),
+        (&"probation".into(), &1.into()),
+        "{lent}"
+    );
+    let status = ledger(&socket).await;
+    assert_eq!(status.held, 2);
+    assert_eq!(
+        status.probation.map(|lent| lent.command),
+        Some("git ls-files".to_owned())
+    );
+    let pool = PathBuf::from(
+        lent["cpuPool"]
+            .as_str()
+            .expect("a probation names its pool"),
+    );
+    let mut child = Asker::child(&pool, 1).await;
+    assert_eq!(
+        child.granted_within(Duration::from_millis(300)).await,
+        None,
+        "a probation's pool lends its children nothing"
+    );
+    drop(child);
+    // The read finished.
+    drop(read);
+
+    // Only a one-token ask is lent it.
+    let mut wide = Asker::send(&socket, probation_request(2, "/w/wide", "cargo build", 2)).await;
+    assert_eq!(wide.granted_within(Duration::from_millis(300)).await, None);
+    drop(wide);
+
+    let mut heavy = Asker::send(
+        &socket,
+        probation_request(1, "/w/drive", "codegraph init", 3),
+    )
+    .await;
+    let lent = heavy.answer().await;
+    assert_eq!(lent["lease"], "probation", "{lent}");
+    let (pool, fifo) = (lent["cpuPool"].clone(), lent["fifo"].clone());
+    let mut next = Asker::send(&socket, probation_request(1, "/w/other", "git show", 4)).await;
+    // The heavy job's probation ends: the next is lent the token, and the heavy one still waits.
+    heavy
+        .write(serde_json::json!({ "op": "probation-over" }))
+        .await;
+    assert_eq!(next.answer().await["lease"], "probation");
+    let status = ledger(&socket).await;
+    assert_eq!(status.held, 2);
+    assert_eq!(
+        status.probation.map(|lent| lent.command),
+        Some("git show".to_owned())
+    );
+    let waiting: Vec<String> = status
+        .background
+        .iter()
+        .flat_map(|stake| &stake.waiters)
+        .map(|waiter| waiter.command.clone())
+        .collect();
+    assert!(
+        waiting.contains(&"codegraph init".to_owned()),
+        "{waiting:?}"
+    );
+
+    // The long holder returns its tokens: each waiter is granted its one token in its place.
+    drop(long);
+    let granted = heavy.answer().await;
+    assert_eq!(
+        (
+            &granted["lease"],
+            &granted["tokens"],
+            &granted["cpuPool"],
+            &granted["fifo"]
+        ),
+        (&"granted".into(), &1.into(), &pool, &fifo),
+        "{granted}"
+    );
+    assert_eq!(next.granted().await, 1);
+    let mut child = Asker::child(Path::new(pool.as_str().expect("a pool path")), 1).await;
+    assert_eq!(
+        child.granted().await,
+        1,
+        "a granted probation's pool lends its token"
+    );
+    let status = ledger(&socket).await;
+    assert_eq!((status.held, status.probation), (2, None));
+    drop((child, heavy, next));
+    gateway.drain().await.expect("drain");
 }

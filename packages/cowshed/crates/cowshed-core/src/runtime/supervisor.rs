@@ -57,7 +57,7 @@ use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::fsio::AnchoredDirectory;
 
 use crate::runtime::child_fence::ChildFence;
-use crate::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant};
+use crate::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant, ProbationOutcome};
 use crate::runtime::job_groups::Birth;
 use crate::runtime::job_progress::{JobProgressStream, ProgressRead};
 use crate::runtime::job_resources::{
@@ -494,6 +494,25 @@ pub struct CheckpointBarrier {
 pub enum ProcessSignal {
     Term,
     Kill,
+    /// Stop the job's processes where they are: its probation ended without a grant
+    /// (05_gateway.md "A one-token job starts on probation").
+    Stop,
+    /// Continue a stopped job: its grant came, or it is being killed.
+    Continue,
+}
+
+/// How long a job runs on the probation token before its grant: until it has used this much CPU
+/// or run this long since its first process, whichever comes first, as the sampling clock reads
+/// it (05_gateway.md "A one-token job starts on probation").
+const PROBATION_CPU: Duration = Duration::from_secs(1);
+const PROBATION_WALL: Duration = Duration::from_secs(2);
+
+/// A job on probation's wall and CPU milliseconds at `sample`, once either reached its bound.
+fn probation_spent(sample: &JobResourceSample) -> Option<(u64, u64)> {
+    let wall = sample.wall_ms.get();
+    let cpu = sample.cpu_user_ms.get() + sample.cpu_sys_ms.get();
+    (u128::from(wall) >= PROBATION_WALL.as_millis() || u128::from(cpu) >= PROBATION_CPU.as_millis())
+        .then_some((wall, cpu))
 }
 
 /// What a spawn runs, in the form the spawner executes it.
@@ -1125,6 +1144,12 @@ pub enum ProcessEvent {
     LaunchFailed {
         job_id: JobId,
         error: CowshedError,
+    },
+    /// A job started on the probation token heard how its wait for its grant ended
+    /// (05_gateway.md "A one-token job starts on probation").
+    Probation {
+        job_id: JobId,
+        outcome: ProbationOutcome,
     },
     /// A script job's text did not parse; nothing ran and its stderr carries the diagnostic.
     ScriptSyntax {
@@ -3062,6 +3087,8 @@ impl RunningProcess for SystemRunningProcess {
             match signal {
                 ProcessSignal::Term => self.cgroup.terminate(),
                 ProcessSignal::Kill => self.cgroup.kill(),
+                ProcessSignal::Stop => self.cgroup.freeze(true),
+                ProcessSignal::Continue => self.cgroup.freeze(false),
             }
             .map_err(cgroup_error)
         }
@@ -3070,6 +3097,8 @@ impl RunningProcess for SystemRunningProcess {
             .signal(match signal {
                 ProcessSignal::Term => libc::SIGTERM,
                 ProcessSignal::Kill => libc::SIGKILL,
+                ProcessSignal::Stop => libc::SIGSTOP,
+                ProcessSignal::Continue => libc::SIGCONT,
             })
             .map_err(crate::runtime::child_fence::NotSignalled::into_error)
     }
@@ -5018,7 +5047,8 @@ impl SupervisorActor {
     /// that failure itself.
     fn sample_jobs(&mut self) {
         let mut live = false;
-        for job in self.jobs.values_mut() {
+        let mut spent = Vec::new();
+        for (job_id, job) in &mut self.jobs {
             let Some(sampler) = job.sampling.live() else {
                 continue;
             };
@@ -5032,11 +5062,84 @@ impl SupervisorActor {
                 #[cfg(target_os = "macos")]
                 job.monitor.as_ref(),
             ) {
+                if let CpuStanding::Granted { grant } = &job.cpu
+                    && grant.on_probation()
+                    && let Some((wall, cpu)) = probation_spent(&sample)
+                {
+                    spent.push((*job_id, wall, cpu));
+                }
                 job.info.resources = Some(sample);
             }
         }
         if !live {
             self.sample_clock = None;
+        }
+        for (job_id, wall, cpu) in spent {
+            self.end_probation(job_id, wall, cpu);
+        }
+    }
+
+    /// A job on probation reached its bound without a grant (05_gateway.md "A one-token job
+    /// starts on probation"): stop its processes where they are, return the probation token, and
+    /// say so on its stderr. Its grant continues it.
+    fn end_probation(&mut self, job_id: JobId, wall_ms: u64, cpu_ms: u64) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let CpuStanding::Granted { grant } = &mut job.cpu else {
+            return;
+        };
+        let stopped = job
+            .process
+            .as_mut()
+            .map(|process| process.signal_process_tree(ProcessSignal::Stop));
+        grant.end_probation();
+        job.info.cpu_tokens = None;
+        let line = match stopped {
+            Some(Ok(())) | None => format!(
+                "cowshed: jobserver probation over after {wall_ms} ms, {cpu_ms} ms CPU; stopped \
+                 until its token is granted\n"
+            ),
+            Some(Err(error)) => format!(
+                "cowshed: jobserver probation over after {wall_ms} ms, {cpu_ms} ms CPU; the job \
+                 could not be stopped ({}), so it runs on outside the budget until its token is \
+                 granted\n",
+                error.message
+            ),
+        };
+        self.process_output(job_id, StreamKind::Stderr, Bytes::from(line));
+    }
+
+    /// A job's probation wait ended: granted, its one token is the job's; or the gateway is gone
+    /// without a grant, and the job runs on unaccounted (05_gateway.md "Crash safety by
+    /// connection"). A job its probation's end stopped is continued either way.
+    fn probation_settled(&mut self, job_id: JobId, outcome: ProbationOutcome) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if job.terminal() {
+            return;
+        }
+        let CpuStanding::Granted { grant } = &mut job.cpu else {
+            return;
+        };
+        let stopped = grant.probation_settled();
+        job.info.cpu_tokens = match outcome {
+            Ok(()) => grant.tokens(),
+            Err(_) => None,
+        };
+        if !stopped {
+            return;
+        }
+        if let Some(process) = job.process.as_mut()
+            && let Err(error) = process.signal_process_tree(ProcessSignal::Continue)
+        {
+            let line = format!(
+                "cowshed: job {} could not be continued after its probation: {}\n",
+                job_id.get(),
+                error.message
+            );
+            self.process_output(job_id, StreamKind::Stderr, Bytes::from(line));
         }
     }
     async fn handle_command(&mut self, command: Command) {
@@ -6320,6 +6423,20 @@ impl SupervisorActor {
         };
         job.info.cpu_tokens = grant.tokens();
         job.info.state = JobState::Running;
+        let mut grant = grant;
+        // A job lent the probation token hears its grant on a task of its own.
+        if let Some(outcome) = grant.probation_outcome() {
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                // A grant dropped before its wait ended reports to a job that has concluded.
+                let outcome = outcome
+                    .await
+                    .unwrap_or_else(|_| Err("the probation's wait was dropped".to_owned()));
+                let _ = events
+                    .send(ProcessEvent::Probation { job_id, outcome })
+                    .await;
+            });
+        }
         job.cpu = CpuStanding::Granted { grant };
         // Read before the job's first process is dispatched, so nothing it writes precedes its
         // baseline: a warm host may start the command before its start is reported here. Its
@@ -7256,6 +7373,9 @@ impl SupervisorActor {
                 end_job_stdin(job);
             }
             ProcessEvent::StdinReady { job_id } => self.flush_stdin(job_id),
+            ProcessEvent::Probation { job_id, outcome } => {
+                self.probation_settled(job_id, outcome);
+            }
             ProcessEvent::StdinBroken { job_id, error } => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     let refusal = stdin_delivery_unknown(job.stdin_delivery.delivered, &error);
@@ -7486,6 +7606,18 @@ impl SupervisorActor {
             job.stderr_eof = true;
             end_job_stdin(job);
             return Ok(());
+        }
+        // A job its probation's end stopped acts on its kill only once continued.
+        if let CpuStanding::Granted { grant } = &job.cpu
+            && grant.probation_stopped()
+            && let Some(process) = job.process.as_mut()
+            && let Err(error) = process.signal_process_tree(ProcessSignal::Continue)
+        {
+            cowshed_os::eprintln!(
+                "cowshed: job {} stopped on probation could not be continued for its kill: {}",
+                job_id.get(),
+                error.message
+            );
         }
         // A command not yet born -- its warm host still activating outside the job's cgroup, or
         // its placement pending -- has not entered the cgroup, so an empty membership proves

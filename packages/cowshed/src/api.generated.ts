@@ -622,6 +622,11 @@ export type CpuBudgetStatus = {
    * served behind the gate jobs.
    */
   readonly background: ReadonlyArray<CpuBackgroundStake>;
+  /**
+   * The request running on the probation token, if one is lent: it holds no ledger token and
+   * still waits in `background` for its own.
+   */
+  readonly probation?: CpuProbation;
 };
 
 export type CpuCheckoutStatus = {
@@ -737,6 +742,26 @@ export type CpuMicrosDelta = number &
  * CPU time in whole milliseconds; only [`CpuMicros::millis`] makes one.
  */
 export type CpuMillis = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * The one request the probation token is lent to: whose job runs before its grant, for which
+ * checkout, and since when (05_gateway.md "A one-token job starts on probation").
+ */
+export type CpuProbation = {
+  readonly checkout: string;
+  /**
+   * The client process, when its socket named one.
+   */
+  readonly pid?: number & tags.Type<'int32'>;
+  /**
+   * What the client said the token is for.
+   */
+  readonly command: string;
+  /**
+   * Milliseconds since the token was lent.
+   */
+  readonly lentMs: number & tags.Type<'uint64'>;
+};
 
 /**
  * User and system CPU time, each cumulative from the start of whatever it counts.

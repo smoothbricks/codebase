@@ -26,6 +26,10 @@ pub const CPU_TOKENS_OP: &str = "cpu-tokens";
 pub const JOBSERVER_OP: &str = "jobserver";
 /// The control operation a resident job asks with: a relay pool and no token of its own.
 pub const RESIDENT_POOL_OP: &str = "resident-pool";
+/// What a job on probation's requester writes on its held connection once it stopped the job
+/// without a grant: the probation token passes on and the ask waits where it was (05_gateway.md
+/// "A one-token job starts on probation").
+pub const PROBATION_OVER_OP: &str = "probation-over";
 /// Where a holder publishes its live CPU pool to the processes it starts, beside its count.
 pub const CPU_POOL_ENV: &str = "BOUNDED_EXEC_CPU_POOL";
 pub const CPU_TOKENS_ENV: &str = "BOUNDED_EXEC_CPU_TOKENS";
@@ -79,6 +83,11 @@ pub struct JobserverRequest<'a> {
     /// repository's host queue; its constructor cannot attach a parent pool.
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_pool: Option<&'a str>,
+    /// The requester can start the job before its grant and stop it when its probation ends, so
+    /// a one-token ask may be lent the probation token (05_gateway.md "A one-token job starts on
+    /// probation"). Only a supervisor, which holds its job's process group, says so.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    probation: bool,
 }
 
 impl<'a> JobserverRequest<'a> {
@@ -98,6 +107,7 @@ impl<'a> JobserverRequest<'a> {
             pool: true,
             job: Some(job),
             parent_pool,
+            probation: true,
         }
     }
     pub const fn gate(
@@ -115,6 +125,7 @@ impl<'a> JobserverRequest<'a> {
             pool: true,
             job: Some(job),
             parent_pool: None,
+            probation: false,
         }
     }
     /// One background token held while a shell activates, before a command exists to use it
@@ -137,6 +148,7 @@ impl<'a> JobserverRequest<'a> {
             pool: false,
             job: None,
             parent_pool,
+            probation: false,
         }
     }
 }
@@ -351,6 +363,10 @@ pub struct CpuBudgetStatus {
     /// Each checkout's background-class stake alone, for the checkouts that have one: what is
     /// served behind the gate jobs.
     pub background: Vec<CpuBackgroundStake>,
+    /// The request running on the probation token, if one is lent: it holds no ledger token and
+    /// still waits in `background` for its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probation: Option<CpuProbation>,
 }
 
 /// One gate job's runners that hold tokens, in one checkout.
@@ -429,6 +445,20 @@ pub struct CpuHolder {
     pub held_ms: u64,
 }
 
+/// The one request the probation token is lent to: whose job runs before its grant, for which
+/// checkout, and since when (05_gateway.md "A one-token job starts on probation").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuProbation {
+    pub checkout: String,
+    /// The client process, when its socket named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// What the client said the token is for.
+    pub command: String,
+    /// Milliseconds since the token was lent.
+    pub lent_ms: u64,
+}
 /// The hold limit: a lease held this long is named first in the gateway's status, by its holder
 /// and age (05_gateway.md "The hold limit"). It is reported, never enforced: a lease is a ledger
 /// entry, not its work's owner, so ending it would return tokens while the work runs on over

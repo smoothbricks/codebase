@@ -349,6 +349,12 @@ export const parseCpuMillis = (json: string): Api.CpuMillis => assertCpuMillis(J
 export const assertCpuMillisList = typia.createAssertEquals<readonly Api.CpuMillis[]>();
 export const parseCpuMillisList = (json: string): readonly Api.CpuMillis[] => assertCpuMillisList(JSON.parse(json));
 
+export const assertCpuProbation = typia.createAssertEquals<Api.CpuProbation>();
+export const parseCpuProbation = (json: string): Api.CpuProbation => assertCpuProbation(JSON.parse(json));
+export const assertCpuProbationList = typia.createAssertEquals<readonly Api.CpuProbation[]>();
+export const parseCpuProbationList = (json: string): readonly Api.CpuProbation[] =>
+  assertCpuProbationList(JSON.parse(json));
+
 export const assertCpuTotals = typia.createAssertEquals<Api.CpuTotals>();
 export const parseCpuTotals = (json: string): Api.CpuTotals => assertCpuTotals(JSON.parse(json));
 export const assertCpuTotalsList = typia.createAssertEquals<readonly Api.CpuTotals[]>();

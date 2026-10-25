@@ -165,6 +165,7 @@ static CPU_BUDGET_STATUS: Reader = Reader::Record(&[
     ("gateJobs", &SEQ__CPU_GATE_JOB),
     ("gateQueue", &SEQ__CPU_GATE_WAITER),
     ("background", &SEQ__CPU_BACKGROUND_STAKE),
+    ("probation", &CPU_PROBATION),
 ]);
 static CPU_CHECKOUT_STATUS: Reader = Reader::Record(&[
     ("checkout", &LEAF),
@@ -194,6 +195,12 @@ static CPU_HOLDER: Reader = Reader::Record(&[
     ("tokens", &LEAF),
     ("want", &LEAF),
     ("heldMs", &LEAF),
+]);
+static CPU_PROBATION: Reader = Reader::Record(&[
+    ("checkout", &LEAF),
+    ("pid", &LEAF),
+    ("command", &LEAF),
+    ("lentMs", &LEAF),
 ]);
 static CPU_TOTALS: Reader = Reader::Record(&[("userUs", &LEAF), ("sysUs", &LEAF)]);
 static CPU_WAITER: Reader = Reader::Record(&[

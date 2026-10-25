@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -227,13 +227,10 @@ impl WorkspaceShells {
             stderr,
             events.clone(),
         ));
-        let control = Arc::new(JobControl {
-            target: Mutex::new(Target::Pending),
-            requested: AtomicI32::new(0),
-            signalled: Notify::new(),
+        let control = Arc::new(JobControl::new(
             #[cfg(target_os = "linux")]
-            cgroup: Arc::clone(&spawn.cgroup),
-        });
+            Arc::clone(&spawn.cgroup),
+        ));
         let (release, released) = oneshot::channel();
         tokio::spawn(drive(
             pool,
@@ -342,6 +339,12 @@ pub(super) struct JobControl {
     requested: AtomicI32,
     /// Woken by each request, for a run still waiting before any target exists.
     signalled: Notify,
+    /// Whether the job is stopped: its probation ended without a grant (05_gateway.md "A
+    /// one-token job starts on probation"). A target published while it is, is stopped too.
+    stopped: AtomicBool,
+    /// The activation hosts a stop reached, continued with the job whatever its target is by
+    /// then: a host stopped just as it finished activating has already published its command.
+    stopped_hosts: Mutex<Vec<Arc<ChildFence>>>,
     #[cfg(target_os = "linux")]
     cgroup: Arc<JobCgroup>,
 }
@@ -385,9 +388,49 @@ impl Target {
             )),
         }
     }
+
+    /// Stop (`SIGSTOP`, or a frozen cgroup) or continue the job's processes where they are.
+    fn suspend(&self, stopped: bool, #[cfg(target_os = "linux")] cgroup: &JobCgroup) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if !matches!(self, Self::Host(_)) {
+            return cgroup
+                .freeze(stopped)
+                .map_err(super::supervisor::cgroup_error);
+        }
+        let signal = if stopped {
+            libc::SIGSTOP
+        } else {
+            libc::SIGCONT
+        };
+        match self {
+            Self::Host(fence) => fence.signal(signal).map_err(NotSignalled::into_error),
+            Self::Command(host) => host.send(signal).map_err(|_| {
+                CowshedError::conflict(
+                    "the job's run no longer forwards signals to its host: the host is gone",
+                    "inspect the job's status",
+                )
+            }),
+            // Stopped as it is published (`JobControl::publish`).
+            Self::Pending => Ok(()),
+            // Nothing of it is left to stop or continue.
+            Self::Finished => Ok(()),
+        }
+    }
 }
 
 impl JobControl {
+    /// A job's control before any target exists: nothing requested, nothing stopped.
+    pub(super) fn new(#[cfg(target_os = "linux")] cgroup: Arc<JobCgroup>) -> Self {
+        Self {
+            target: Mutex::new(Target::Pending),
+            requested: AtomicI32::new(0),
+            signalled: Notify::new(),
+            stopped: AtomicBool::new(false),
+            stopped_hosts: Mutex::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            cgroup,
+        }
+    }
     /// Publish where signals go from now on, delivering the one already requested, if any.
     fn publish(&self, published: Target) -> Result<()> {
         let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
@@ -401,8 +444,54 @@ impl JobControl {
                 &self.cgroup,
             )
         };
+        let stopped = if self.stopped.load(Ordering::SeqCst) {
+            self.stop(&published)
+        } else {
+            Ok(())
+        };
         *target = published;
-        delivered
+        delivered.and(stopped)
+    }
+
+    /// Stop `target`, remembering an activation host it stops so the job's continuation reaches
+    /// it whatever the target is by then.
+    fn stop(&self, target: &Target) -> Result<()> {
+        if let Target::Host(fence) = target {
+            self.stopped_hosts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(fence));
+        }
+        target.suspend(
+            true,
+            #[cfg(target_os = "linux")]
+            &self.cgroup,
+        )
+    }
+
+    /// Stop or continue the job where it is, recording no request: its probation ended without
+    /// a grant, or its grant came, or it is being killed (05_gateway.md "A one-token job starts
+    /// on probation").
+    fn suspend(&self, stopped: bool) -> Result<()> {
+        self.stopped.store(stopped, Ordering::SeqCst);
+        let target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
+        if stopped {
+            return self.stop(&target);
+        }
+        for host in self
+            .stopped_hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+        {
+            // A host that has exited, or been reaped, has nothing left to continue.
+            let _ = host.signal(libc::SIGCONT);
+        }
+        target.suspend(
+            false,
+            #[cfg(target_os = "linux")]
+            &self.cgroup,
+        )
     }
 
     fn finish(&self) {
@@ -480,10 +569,12 @@ impl RunningProcess for PooledProcess {
     }
 
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
-        self.control.signal(match signal {
-            ProcessSignal::Term => libc::SIGTERM,
-            ProcessSignal::Kill => libc::SIGKILL,
-        })
+        match signal {
+            ProcessSignal::Term => self.control.signal(libc::SIGTERM),
+            ProcessSignal::Kill => self.control.signal(libc::SIGKILL),
+            ProcessSignal::Stop => self.control.suspend(true),
+            ProcessSignal::Continue => self.control.suspend(false),
+        }
     }
 }
 

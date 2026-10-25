@@ -836,6 +836,19 @@ impl JobCgroup {
         self.issue_kill()?
     }
 
+    /// Freeze or thaw the complete membership through `cgroup.freeze`: a job whose probation
+    /// ended without a grant waits frozen until its grant (05_gateway.md "A one-token job starts
+    /// on probation"). A process that enters a frozen cgroup is frozen with it.
+    pub fn freeze(&self, frozen: bool) -> Result<()> {
+        let freeze = open_at(self.directory.as_raw_fd(), c"cgroup.freeze", libc::O_WRONLY)
+            .map_err(failed_in("open", &self.path, "cgroup.freeze"))?;
+        write_one(freeze.as_raw_fd(), if frozen { b"1" } else { b"0" }).map_err(failed_in(
+            "write",
+            &self.path,
+            "cgroup.freeze",
+        ))
+    }
+
     /// [`Self::kill`] with its refusal kept apart from what failed beside it: `Err` when
     /// cgroup.kill was not written, so nothing is known to have ended; `Ok(Err(_))` when the kill
     /// was issued, or membership was already empty, but a membership snapshot or population read

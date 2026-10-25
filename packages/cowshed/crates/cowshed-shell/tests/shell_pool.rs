@@ -1541,6 +1541,123 @@ async fn host_controller_a_bare_resident_starts_while_background_holds_every_tok
     ledger.drain().await;
 }
 
+/// `request` as a one-token job, as a coordinator's sandboxed reads ask.
+fn one_token(request: ExecRequest) -> ExecRequest {
+    ExecRequest {
+        want: Some(NonZeroUsize::MIN),
+        ..request
+    }
+}
+
+/// Follow `job`'s stderr until it holds `marker`; what it held by then.
+async fn stderr_reaches(handle: &WorkspaceSupervisorHandle, job: JobId, marker: &str) -> String {
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !String::from_utf8_lossy(&bytes).contains(marker) {
+            let chunk = handle
+                .log_read(
+                    job,
+                    StreamKind::Stderr,
+                    bytes.len().try_into().expect("offset"),
+                    true,
+                )
+                .await
+                .expect("the job's stderr");
+            assert!(
+                !(chunk.eof && chunk.bytes.is_empty()),
+                "the job's stderr ended without {marker}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            bytes.extend_from_slice(&chunk.bytes);
+        }
+    })
+    .await
+    .expect(marker);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The first letter of `ps`'s state for `pid`: `T` for a stopped process.
+fn process_state(pid: u32) -> char {
+    let ps = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&ps.stdout)
+        .trim()
+        .chars()
+        .next()
+        .unwrap_or_else(|| panic!("ps names no process {pid}"))
+}
+
+/// The probation token through a real gateway, supervisor and sandbox (05_gateway.md "A
+/// one-token job starts on probation"). A background job holds every token: a one-token
+/// `git ls-files` runs at once on the probation token and ends, where it waited for the holder
+/// before. A one-token job that turns CPU-heavy is stopped at its bound and stays stopped, the
+/// probation token passed on, until the holder returns its tokens; its grant continues it to its
+/// end.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_one_token_job_runs_on_probation_and_a_heavy_one_waits_stopped() {
+    let ledger = HostLedger::start(2).await;
+    let workspace = Workspace::new("shell-pool-probation", 41_616);
+    let handle = workspace.supervisor_budgeted(Arc::new(ledger.admission()));
+    run(&handle, sh("git init -q && : >tracked && git add tracked"))
+        .await
+        .ok();
+    let holding = started(&handle, holder(RunSandboxMode::ReadWrite)).await;
+    ledger.background_reaches(workspace.mount(), 2, 0).await;
+
+    let asked = std::time::Instant::now();
+    let read = run(&handle, one_token(request(&["git", "ls-files"])))
+        .await
+        .ok();
+    let waited = asked.elapsed();
+    assert_eq!(read.stdout, "tracked\n");
+    assert!(
+        read.stderr.contains("cowshed: jobserver probation start"),
+        "{}",
+        read.stderr
+    );
+    // The measurement's witness: admission to end of a one-token read beside a holder of every
+    // token.
+    cowshed_os::eprintln!(
+        "probation: one-token git ls-files beside a holder of every token ended {waited:?} after its admission"
+    );
+
+    let heavy = handle
+        .exec(
+            None,
+            None,
+            one_token(sh(
+                "i=0; while [ $i -lt 4000000 ]; do i=$((i+1)); done; printf done",
+            )),
+            AdmissionSource::Worker,
+        )
+        .await
+        .expect("admit the heavy job");
+    let over = stderr_reaches(&handle, heavy, "cowshed: jobserver probation over").await;
+    let pid = handle
+        .info(heavy)
+        .await
+        .expect("job info")
+        .pid
+        .expect("the heavy job runs");
+    assert_eq!(process_state(pid), 'T', "stopped at its bound: {over}");
+    let status = ledger.status().await;
+    assert_eq!(
+        (status.held, status.probation),
+        (2, None),
+        "the probation token passed on, and the ledger holds its total"
+    );
+    end_holder(&handle, holding).await;
+    let heavy = ran(&handle, heavy).await.ok();
+    assert_eq!(heavy.stdout, "done");
+    assert!(heavy.stderr.contains("status=ok"), "{}", heavy.stderr);
+    drop(handle);
+    ledger.background_reaches(workspace.mount(), 0, 0).await;
+    ledger.drain().await;
+}
+
 /// The judgment reserves no host. A resident judged to start on an activated host, whose shell's
 /// input changes before its spawn, must activate after all: its spawn queues the stake then, and
 /// the command runs once the shell activated under it.

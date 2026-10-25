@@ -2047,8 +2047,10 @@ fn land_turn_line(queue: &LandTurnQueue) -> String {
 /// its grants, which is the whole host with no gate work (05_gateway.md "Room for a gate"); the
 /// leases held past the hold limit, oldest first, so the first lines answer who holds the host
 /// and since when (05_gateway.md "The hold limit"), each listed again under its own gate job or
-/// stake; the running gate jobs, the head — the oldest — first; the waiting gate-class requests in
-/// the order returned tokens go to them; then each checkout's background stake, served behind
+/// stake; then the request running on the probation token, if one is lent (05_gateway.md "A
+/// one-token job starts on probation"); the running gate jobs, the head — the oldest — first; the
+/// waiting gate-class requests in the order returned tokens go to them; then each checkout's
+/// background stake, served behind
 /// them. Each running gate job and background stake is followed by its leases, oldest grant first,
 /// so the reader sees who holds the tokens and since when rather than guessing from the checkout,
 /// and a background stake by its waiting requests. A queue entry is named by its process and wait
@@ -2079,6 +2081,15 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
         lines.push(format!(
             "gateway cpu hold past {limit_minutes}m: {checkout}: {}",
             lease_words(holder)
+        ));
+    }
+    if let Some(probation) = &ledger.probation {
+        lines.push(format!(
+            "gateway cpu probation: {}: {}, lent {} ago: {}",
+            probation.checkout,
+            pid_words(probation.pid),
+            age_words(probation.lent_ms),
+            probation.command
         ));
     }
     if ledger.gate_jobs.is_empty() {
@@ -5126,6 +5137,7 @@ mod tests {
     mod hold_limit {
         use cowshed_gateway_types::{
             CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuHolder,
+            CpuProbation,
         };
 
         use super::*;
@@ -5188,6 +5200,7 @@ mod tests {
                     holders: vec![background_lease],
                     waiters: Vec::new(),
                 }],
+                probation: None,
             })
         }
 
@@ -5297,6 +5310,7 @@ mod tests {
                     ],
                     waiters: Vec::new(),
                 }],
+                probation: None,
             });
             let lines = cpu_budget_lines(&ledger);
 
@@ -5310,6 +5324,34 @@ mod tests {
                 ]
             );
             assert_eq!(hold_lines(&lines).len(), 3, "{lines:#?}");
+        }
+
+        /// The request running on the probation token is named after the holds, with its pid and
+        /// how long ago the token was lent to it (05_gateway.md "A one-token job starts on
+        /// probation").
+        #[test]
+        fn the_probation_token_names_the_request_running_on_it() {
+            let GatewayCpuBudget::Ledger(mut ledger) =
+                ledger_with_background_lease(granted_ago(2, 0))
+            else {
+                unreachable!("the fixture is a ledger")
+            };
+            ledger.probation = Some(CpuProbation {
+                checkout: "/mnt/app/shed".into(),
+                pid: Some(4242),
+                command: "git ls-files".into(),
+                lent_ms: 1_500,
+            });
+            let lines = cpu_budget_lines(&GatewayCpuBudget::Ledger(ledger));
+
+            assert_eq!(
+                lines[1],
+                "gateway cpu probation: /mnt/app/shed: pid 4242, lent 1s ago: git ls-files"
+            );
+            assert_eq!(
+                lines[2],
+                "gateway gate head: repository=owner/repo /mnt/app/land gate job 7: held 6, running 1"
+            );
         }
     }
 

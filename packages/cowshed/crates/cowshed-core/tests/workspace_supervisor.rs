@@ -7352,6 +7352,9 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 match signal {
                     ProcessSignal::Term => libc::SIGTERM,
                     ProcessSignal::Kill => libc::SIGKILL,
+                    ProcessSignal::Stop | ProcessSignal::Continue => {
+                        unreachable!("this fixture's job is never lent the probation token")
+                    }
                 },
             )
             .expect("signal the fixture's held job group");

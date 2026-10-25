@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use cowshed_gateway_types::{
     INSTALL_RESTART_CODE, InstallRestart, JobserverAnswer, JobserverJob, JobserverRequest,
-    LeaseState, ResidentPoolRequest,
+    LeaseState, PROBATION_OVER_OP, ResidentPoolRequest,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
@@ -79,8 +79,46 @@ impl GatewayJobCpu {
 }
 
 enum Holder {
-    Gateway { _connection: Fenced<UnixStream> },
-    Injected { _owner: Box<dyn Send + Sync> },
+    Gateway {
+        _connection: Fenced<UnixStream>,
+    },
+    /// A probation's connection, held by the task that waits for its grant: dropping the grant
+    /// aborts the task, which closes the connection.
+    Probation {
+        _task: ProbationTask,
+    },
+    Injected {
+        _owner: Box<dyn Send + Sync>,
+    },
+}
+
+/// The task holding a probation's connection; aborted when the grant drops.
+struct ProbationTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ProbationTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// How a probation's wait for its grant ended: granted, or the connection's end without a grant
+/// and why -- the gateway is gone, so the job runs on unaccounted, as any job does across a
+/// gateway restart (05_gateway.md "Crash safety by connection").
+pub type ProbationOutcome = std::result::Result<(), String>;
+
+/// A job started on the probation token, until its grant (05_gateway.md "A one-token job starts
+/// on probation").
+struct Probation {
+    state: ProbationState,
+    /// The grant, or the connection's end without one; the supervisor takes it once.
+    outcome: Option<tokio::sync::oneshot::Receiver<ProbationOutcome>>,
+}
+
+enum ProbationState {
+    /// Running on the probation token; sending ends the probation without a grant.
+    Running(tokio::sync::oneshot::Sender<()>),
+    /// Its probation ended without a grant: the job is stopped until its grant.
+    Stopped,
 }
 
 /// The tokens a job holds and the make jobserver fifo that holds them beside its pool, which the
@@ -101,6 +139,8 @@ pub struct JobCpuGrant {
     /// start ([`Self::started`]).
     start: Option<ActivationStake>,
     _holder: Holder,
+    /// Present while the job runs on the probation token or is stopped awaiting its grant.
+    probation: Option<Probation>,
 }
 impl fmt::Debug for JobCpuGrant {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -121,6 +161,7 @@ impl JobCpuGrant {
             pool,
             start: None,
             _holder: Holder::Injected { _owner: holder },
+            probation: None,
         }
     }
     /// An injected resident standing: a pool and no tokens.
@@ -130,6 +171,7 @@ impl JobCpuGrant {
             pool,
             start: None,
             _holder: Holder::Injected { _owner: holder },
+            probation: None,
         }
     }
     /// This grant, holding `stake` until its command starts.
@@ -157,6 +199,67 @@ impl JobCpuGrant {
     pub fn pool(&self) -> &Path {
         &self.pool
     }
+    /// The job runs on the probation token: not yet granted, and not stopped.
+    pub fn on_probation(&self) -> bool {
+        matches!(
+            self.probation,
+            Some(Probation {
+                state: ProbationState::Running(_),
+                ..
+            })
+        )
+    }
+    /// The job's probation ended without a grant, and the job is stopped until it.
+    pub fn probation_stopped(&self) -> bool {
+        matches!(
+            self.probation,
+            Some(Probation {
+                state: ProbationState::Stopped,
+                ..
+            })
+        )
+    }
+    /// End the job's probation without a grant, once its requester stopped the job: the gateway
+    /// passes the probation token on, and the ask keeps its place. `false` when the job was not
+    /// running on probation.
+    pub fn end_probation(&mut self) -> bool {
+        let Some(probation) = &mut self.probation else {
+            return false;
+        };
+        match std::mem::replace(&mut probation.state, ProbationState::Stopped) {
+            ProbationState::Running(over) => {
+                // A task that is gone has already reported how the probation ended.
+                let _ = over.send(());
+                true
+            }
+            ProbationState::Stopped => false,
+        }
+    }
+    /// The grant, or the connection's end without one, that a probation waits for; taken once.
+    pub fn probation_outcome(
+        &mut self,
+    ) -> Option<tokio::sync::oneshot::Receiver<ProbationOutcome>> {
+        self.probation.as_mut()?.outcome.take()
+    }
+    /// The probation's wait ended, granted or not: whether its job was stopped and must be
+    /// continued.
+    pub fn probation_settled(&mut self) -> bool {
+        matches!(
+            self.probation.take(),
+            Some(Probation {
+                state: ProbationState::Stopped,
+                ..
+            })
+        )
+    }
+}
+
+/// What `exchange` read: the grant or the probation, the connection that holds it, and when the
+/// ask was queued with the request it named, if it waited.
+struct Exchanged {
+    answer: JobserverAnswer,
+    connection: BufReader<Fenced<UnixStream>>,
+    queued: Option<(std::time::Instant, String)>,
 }
 
 /// One background token held while a shell activates ([`JobCpuAdmission::activation`]). The
@@ -254,9 +357,9 @@ fn refused(answer: JobserverAnswer) -> CowshedError {
     })
 }
 
-/// Connect to the gateway at `socket`, write `line`, and read its `queued` then `granted`
-/// answers: the grant and the connection that holds it.
-async fn exchange(socket: &Path, line: &[u8]) -> Result<(JobserverAnswer, Fenced<UnixStream>)> {
+/// Connect to the gateway at `socket`, write `line`, and read its `queued` then `granted` or
+/// `probation` answers: the grant and the connection that holds it.
+async fn exchange(socket: &Path, line: &[u8]) -> Result<Exchanged> {
     let mut connect = std::pin::pin!(UnixStream::connect(socket));
     // Darwin creates a socket then sets CLOEXEC. Fence each poll, never an async wait,
     // so no concurrently spawned child can keep this lease descriptor beyond exec.
@@ -299,32 +402,51 @@ async fn exchange(socket: &Path, line: &[u8]) -> Result<(JobserverAnswer, Fenced
         progress(format!("cowshed: jobserver wait start {queue}")).await;
     }
     let answer = answer(&mut reader).await;
+    let probation = answer
+        .as_ref()
+        .is_ok_and(|answer| answer.ok && answer.lease == Some(LeaseState::Probation));
     if let Some((started, queue)) = &wait {
-        let status = if answer
-            .as_ref()
-            .is_ok_and(|answer| answer.ok && answer.lease == Some(LeaseState::Granted))
-        {
-            "ok"
+        if probation {
+            progress(format!(
+                "cowshed: jobserver probation start elapsed={:?} {}",
+                started.elapsed(),
+                queue.request
+            ))
+            .await;
         } else {
-            "err"
-        };
-        progress(format!(
-            "cowshed: jobserver wait done elapsed={:?} status={status} {}",
-            started.elapsed(),
-            queue.request
-        ))
-        .await;
+            let status = if answer
+                .as_ref()
+                .is_ok_and(|answer| answer.ok && answer.lease == Some(LeaseState::Granted))
+            {
+                "ok"
+            } else {
+                "err"
+            };
+            progress(format!(
+                "cowshed: jobserver wait done elapsed={:?} status={status} {}",
+                started.elapsed(),
+                queue.request
+            ))
+            .await;
+        }
     }
     let granted = answer?;
     if !granted.ok {
         return Err(refused(granted));
     }
-    if granted.lease != Some(LeaseState::Granted) {
+    if !matches!(
+        granted.lease,
+        Some(LeaseState::Granted | LeaseState::Probation)
+    ) {
         return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-            detail: "expected a jobserver grant after queued".to_owned(),
+            detail: "expected a jobserver grant or probation after queued".to_owned(),
         }));
     }
-    Ok((granted, reader.into_inner()))
+    Ok(Exchanged {
+        answer: granted,
+        connection: reader,
+        queued: wait.map(|(started, queue)| (started, queue.request.to_string())),
+    })
 }
 
 /// One request line for the gateway: the request serialised once and newline-terminated, so
@@ -363,10 +485,7 @@ fn gateway_unreachable(error: &CowshedError) -> bool {
 /// outlives an install"): a cut-off ask is sent again, with the same bytes, to the gateway the
 /// install starts, for no longer than the install's `servesWithinMs`. Every other outcome is
 /// returned as it arrived.
-async fn exchange_across_install(
-    socket: &Path,
-    line: &[u8],
-) -> Result<(JobserverAnswer, Fenced<UnixStream>)> {
+async fn exchange_across_install(socket: &Path, line: &[u8]) -> Result<Exchanged> {
     let install = match exchange(socket, line).await {
         Ok(granted) => return Ok(granted),
         Err(error) => match cut_off_install(&error) {
@@ -442,7 +561,12 @@ impl JobCpuAdmission for GatewayJobCpu {
                 }
             };
             let line = request_line(frame)?;
-            let (granted, connection) = exchange_across_install(&socket, &line).await?;
+            let Exchanged {
+                answer: granted,
+                connection,
+                queued,
+            } = exchange_across_install(&socket, &line).await?;
+            let probation = granted.lease == Some(LeaseState::Probation);
             // A token-holding grant names its tokens, its fifo and its pool; a resident's names
             // only its pool, since it holds no token and its children ask the host through it.
             let (held, pool) = match (ask.class, granted.tokens, granted.cpu_pool, granted.fifo) {
@@ -496,13 +620,43 @@ impl JobCpuAdmission for GatewayJobCpu {
                     ask.checkout.display()
                 )
             });
+            if probation
+                && (!matches!(ask.class, ExecClass::Background | ExecClass::Interactive)
+                    || held.as_ref().map(|held| held.tokens) != Some(NonZeroUsize::MIN))
+            {
+                return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+                    detail: "the gateway lent the probation token to an ask that may not take it: \
+                             only a background or interactive ask for one token may"
+                        .to_owned(),
+                }));
+            }
+            let (holder, probation) = if probation {
+                let (over, ending) = tokio::sync::oneshot::channel();
+                let (outcome, told) = tokio::sync::oneshot::channel();
+                let task = spawn_reporting(hold_probation(connection, ending, outcome, queued));
+                (
+                    Holder::Probation {
+                        _task: ProbationTask(task),
+                    },
+                    Some(Probation {
+                        state: ProbationState::Running(over),
+                        outcome: Some(told),
+                    }),
+                )
+            } else {
+                (
+                    Holder::Gateway {
+                        _connection: connection.into_inner(),
+                    },
+                    None,
+                )
+            };
             Ok(JobCpuGrant {
                 held,
                 pool,
                 start: None,
-                _holder: Holder::Gateway {
-                    _connection: connection,
-                },
+                _holder: holder,
+                probation,
             })
         })
     }
@@ -521,7 +675,17 @@ impl JobCpuAdmission for GatewayJobCpu {
                 parent.as_deref(),
             ));
             let line = request_line(frame)?;
-            let (granted, connection) = exchange_across_install(&socket, &line).await?;
+            let Exchanged {
+                answer: granted,
+                connection,
+                ..
+            } = exchange_across_install(&socket, &line).await?;
+            if granted.lease != Some(LeaseState::Granted) {
+                return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+                    detail: "an activation stake is granted, never lent the probation token"
+                        .to_owned(),
+                }));
+            }
             // One token and the fifo that holds it, and no pool: nothing draws on a stake.
             match (granted.tokens, granted.cpu_pool) {
                 (Some(tokens), None) if tokens == NonZeroUsize::MIN => {}
@@ -542,10 +706,87 @@ impl JobCpuAdmission for GatewayJobCpu {
             });
             Ok(ActivationStake {
                 _holder: Holder::Gateway {
-                    _connection: connection,
+                    _connection: connection.into_inner(),
                 },
             })
         })
+    }
+}
+
+/// Run `work` on a task of its own that reports where the current admission reports: a
+/// supervisor's job's stderr, or this process's.
+fn spawn_reporting(work: impl Future<Output = ()> + Send + 'static) -> tokio::task::JoinHandle<()> {
+    match PROGRESS.try_with(|(job, events)| (*job, events.clone())) {
+        Ok(scope) => tokio::spawn(PROGRESS.scope(scope, work)),
+        Err(_) => tokio::spawn(work),
+    }
+}
+
+/// Hold a job's probation (05_gateway.md "A one-token job starts on probation"): write
+/// `probation-over` once the supervisor ends it, and report the grant, or the connection's end
+/// without one, on `outcome` and the job's stderr. Granted, the connection is the job's grant, so
+/// the task holds it until the grant drops, which aborts it.
+async fn hold_probation(
+    mut connection: BufReader<Fenced<UnixStream>>,
+    mut over: tokio::sync::oneshot::Receiver<()>,
+    outcome: tokio::sync::oneshot::Sender<ProbationOutcome>,
+    queued: Option<(std::time::Instant, String)>,
+) {
+    // Kept across iterations: a read the probation's end interrupts keeps what it read.
+    let mut line = Vec::new();
+    let mut ending = true;
+    let ended = loop {
+        tokio::select! {
+            read = async { (&mut connection).take(MAX_ANSWER + 1).read_until(b'\n', &mut line).await } => {
+                break match read {
+                    Ok(_) if line.ends_with(b"\n") => {
+                        match serde_json::from_slice::<JobserverAnswer>(&line) {
+                            Ok(answer) if !answer.ok => Err(refused(answer).message),
+                            Ok(answer)
+                                if answer.lease == Some(LeaseState::Granted)
+                                    && answer.tokens == Some(NonZeroUsize::MIN) =>
+                            {
+                                Ok(())
+                            }
+                            Ok(_) => Err("the gateway answered the probation with other than its \
+                                          one-token grant"
+                                .to_owned()),
+                            Err(error) => Err(format!("the gateway's answer is no JSON line: {error}")),
+                        }
+                    }
+                    Ok(_) => Err("the gateway closed the probation's connection without a grant"
+                        .to_owned()),
+                    Err(error) => Err(format!("the probation's connection failed: {error}")),
+                };
+            }
+            told = &mut over, if ending => {
+                ending = false;
+                if told.is_ok() {
+                    let mut frame = serde_json::json!({ "op": PROBATION_OVER_OP }).to_string();
+                    frame.push('\n');
+                    if let Err(error) = connection.get_mut().write_all(frame.as_bytes()).await {
+                        break Err(format!("cannot end the probation at the gateway: {error}"));
+                    }
+                }
+            }
+        }
+    };
+    let (elapsed, request) = queued
+        .map(|(started, request)| (started.elapsed(), request))
+        .unwrap_or_default();
+    progress(match &ended {
+        Ok(()) => format!("cowshed: jobserver wait done elapsed={elapsed:?} status=ok {request}"),
+        Err(why) => format!(
+            "cowshed: jobserver wait done elapsed={elapsed:?} status=err {request}: {why}; the \
+             job runs on outside the budget until it ends"
+        ),
+    })
+    .await;
+    let granted = ended.is_ok();
+    // A supervisor that no longer listens has let the grant go, which aborts this task.
+    let _ = outcome.send(ended);
+    if granted {
+        std::future::pending::<()>().await;
     }
 }
 

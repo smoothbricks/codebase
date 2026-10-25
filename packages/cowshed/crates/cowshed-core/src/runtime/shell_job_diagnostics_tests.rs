@@ -223,13 +223,10 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
         let (stdin, stdin_writer) = pipe().expect("job stdin");
         let (stdout_reader, stdout) = pipe().expect("job stdout");
         let (stderr_reader, stderr) = pipe().expect("job stderr");
-        let control = Arc::new(JobControl {
-            target: Mutex::new(Target::Pending),
-            requested: AtomicI32::new(0),
-            signalled: tokio::sync::Notify::new(),
+        let control = Arc::new(JobControl::new(
             #[cfg(target_os = "linux")]
-            cgroup: Arc::clone(&cgroup),
-        });
+            Arc::clone(&cgroup),
+        ));
         let (_release, released) = oneshot::channel();
         let (events, mut observed) = mpsc::channel(4);
         #[cfg(target_os = "macos")]

@@ -423,6 +423,7 @@ fn gateway_status_says_an_install_is_pending() {
             gate_jobs: Vec::new(),
             gate_queue: Vec::new(),
             background: Vec::new(),
+            probation: None,
         })
     };
     let rendered = |pending: bool, json: bool| {
@@ -579,6 +580,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 }],
             },
         ],
+        probation: None,
     };
 
     let mut output = Output::new(Vec::new(), Vec::new(), false);
@@ -726,6 +728,7 @@ fn gateway_status_tells_apart_the_tasks_of_one_gate_job_waiting_for_tokens() {
             }],
             waiters: Vec::new(),
         }],
+        probation: None,
     };
 
     let mut output = Output::new(Vec::new(), Vec::new(), false);
@@ -794,6 +797,7 @@ fn gateway_status_names_the_requests_a_background_stake_has_waiting() {
                 },
             ],
         }],
+        probation: None,
     };
 
     let mut output = Output::new(Vec::new(), Vec::new(), false);
@@ -851,6 +855,7 @@ fn gateway_status_says_an_empty_gate_queue_is_empty() {
             gate_queue: Vec::new(),
             gate_jobs: Vec::new(),
             background: Vec::new(),
+            probation: None,
         })),
     )
     .expect("status emits");

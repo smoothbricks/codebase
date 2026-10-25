@@ -55,6 +55,7 @@ type ReaderName =
   | 'CPU_GATE_JOB'
   | 'CPU_GATE_WAITER'
   | 'CPU_HOLDER'
+  | 'CPU_PROBATION'
   | 'CPU_TOTALS'
   | 'CPU_WAITER'
   | 'CREDENTIAL_REPORT'
@@ -584,6 +585,7 @@ const READERS: Readers<ReaderName> = {
       ['gateJobs', 'SEQ__CPU_GATE_JOB'],
       ['gateQueue', 'SEQ__CPU_GATE_WAITER'],
       ['background', 'SEQ__CPU_BACKGROUND_STAKE'],
+      ['probation', 'CPU_PROBATION'],
     ],
   },
   CPU_CHECKOUT_STATUS: {
@@ -625,6 +627,15 @@ const READERS: Readers<ReaderName> = {
       ['tokens', 'LEAF'],
       ['want', 'LEAF'],
       ['heldMs', 'LEAF'],
+    ],
+  },
+  CPU_PROBATION: {
+    kind: 'record',
+    fields: [
+      ['checkout', 'LEAF'],
+      ['pid', 'LEAF'],
+      ['command', 'LEAF'],
+      ['lentMs', 'LEAF'],
     ],
   },
   CPU_TOTALS: {

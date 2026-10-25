@@ -1155,6 +1155,43 @@ core count.
 - **All at once.** A request is granted once and never holds part of a grant while waiting for more, so no two requests
   can deadlock on each other's tokens. A grant never grows (2026-10-19, Danny: "Ok delete"): it runs with the count it
   was granted until its connection closes, and a returned token goes only to a waiting request.
+  - **A one-token job starts on probation** (2026-10-25). A short command's cost is its wait, not its work: measured
+    2026-10-25 on an 18-token host whose tokens other sheds' gates held, a coder drive's sandboxed
+    `git ls-files -z -- specs` (6 ms of work) waited 177 s for its token, `git show` (30 ms) 62 s and `codegraph status`
+    (1 s) 290 s, about 1,200 s of a 1,660 s preparation. So the budget has one token beyond its N, the **probation
+    token**, which the ledger lends to a waiting request whose job may start before its grant: a background-class
+    request (interactive asks as background) for one token, `want` 1, that names no `parentPool` and whose requester can
+    stop the job it starts, which it says with `"probation":true`. The workspace supervisor says so for every background
+    and interactive job, since it started the job's processes and holds their group. A request that stays queued after
+    its admission transition takes the probation token in that transition when it is free; otherwise the oldest such
+    waiter, by admission ticket, takes it when it returns. The gateway answers
+    `{"ok":true,"lease":"probation","tokens":1,"cpuPool":"…","fifo":"…"}` after `queued`, and the job starts at once,
+    sized exactly as its one-token grant: one token's environment, a fifo of no bytes, and a pool that lends nothing
+    until the grant, since the holder's own token is the probation token and no child may take it. The request keeps its
+    place: when the ledger's order reaches it, it is granted its one token as any request is (`granted`, naming the same
+    pool and fifo), its pool lends that token from then on, and the probation token passes on. Its grant does not grow:
+    the job runs on one token on probation and on one after it.
+
+  A probation that is not granted ends once the job has used 1 s of CPU or run 2 s since its first process, whichever
+  comes first, as the supervisor reads it at its sampling boundary (one second, 07_api.md "Job monitoring"). The
+  supervisor then stops the job's processes — `SIGSTOP` to its process group on macOS, `cgroup.freeze` on Linux — and
+  writes `{"op":"probation-over"}` on the connection; the probation token passes on, and the job's ask waits where it
+  was. Its grant continues it (`SIGCONT`, the cgroup thawed). A stopped job that is killed is continued as its kill
+  begins, so it can act on `SIGTERM`. The job's stderr says each step: `cowshed: jobserver probation start` with its
+  queue snapshot, `cowshed: jobserver probation over after <wall> ms, <cpu> ms CPU; stopped until its token is granted`,
+  and `cowshed: jobserver wait done elapsed=<waited> status=ok` at the grant. So nothing runs outside the budget for
+  more than one probation: the host runs at most N + 1 tokens' work, the extra one for at most a sampling period past 1
+  s of CPU or 2 s of wall. A job whose work is brief finishes on the probation token, and one whose work is not waits
+  for its token as it did before, having lost nothing of its place. A stopped probation is not peer work frozen to make
+  room ("Room for a gate"): it is a job that was never granted, stopped by the process that started it, and its runners'
+  bounds start at their own grants, which its pool makes only after its own ("The bounds start at the grant").
+
+  Only a one-token request is lent it. A larger ask's command sizes its runners when it starts — test threads,
+  `BOUNDED_EXEC_CPU_TOKENS` and the ceilings its children inherit — and a grant never grows, so a job started on one
+  token would run on one token for its life, which is the 21-minute `nx run-many` of "The task server owns the live
+  grant and nice". A requester that knows its command is brief asks one token, as a coordinator's sandboxed reads do. A
+  gate asks only its repository's queue and is never lent the token; neither is a request that draws on a requester's
+  pool, an activation stake, or a task a relay pool asks for, none of which a supervisor stops.
 
 - **Gate admission: oldest gate job first, ahead of background, never starving it** (2026-10-17, Danny tg#6693: "The
   gate class is served FIFO at highest priority over all other execs … When gate runs it needs more tickets than
@@ -1258,15 +1295,16 @@ core count.
     admission job number and command. Gate position is in its repository's gate order; background position is in its
     checkout's FIFO on the host's checkout-fair ledger, not an invented repository FIFO or a promised global grant
     order. Holders are separate from queued positions. The snapshot is the broker's decision, not a client-side status
-    poll. A request granted immediately prints no wait. Grant or refusal ends the phase with
-    `cowshed: jobserver wait done elapsed=<waited> status=ok|err`; transport EOF is an error, never a grant. Supervisor
-    admission forwards these lines through the job's live stderr, including before any command exists, so the waiting
-    exec hears them rather than only the daemon log. Cancellation still closes the owning connection and leaves the
-    queue. This adds no admission deadline and changes no grant order. `cowshed gateway status` reads this same ledger
-    without changing it: its existing `cpuBudget` projection shows token grantees, gate requests and background waiters,
-    and every `gateJobs` and `gateQueue` entry names its `repository`, including a repository whose land queue is empty.
-    `--json` preserves that projection in the normal success envelope; text names the repository alongside each gate
-    job, lease and queued request.
+    poll. A request granted immediately prints no wait. A request lent the probation token ends the phase with
+    `cowshed: jobserver probation start elapsed=<waited>` and its grant later with `wait done` ("A one-token job starts
+    on probation"). Grant or refusal ends the phase with `cowshed: jobserver wait done elapsed=<waited> status=ok|err`;
+    transport EOF is an error, never a grant. Supervisor admission forwards these lines through the job's live stderr,
+    including before any command exists, so the waiting exec hears them rather than only the daemon log. Cancellation
+    still closes the owning connection and leaves the queue. This adds no admission deadline and changes no grant order.
+    `cowshed gateway status` reads this same ledger without changing it: its existing `cpuBudget` projection shows token
+    grantees, gate requests and background waiters, and every `gateJobs` and `gateQueue` entry names its `repository`,
+    including a repository whose land queue is empty. `--json` preserves that projection in the normal success envelope;
+    text names the repository alongside each gate job, lease and queued request.
 - **The task server owns the live grant and nice.** Work enters the existing `cowshed exec` / workspace supervisor, not
   a gate-host or taskpolicy wrapper. Its typed request carries class, want and scope. Only a trusted
   coordinator/operator may request Gate or HostGate; a worker request is refused with typed class-not-permitted before
@@ -1464,26 +1502,30 @@ core count.
   waiting gate-class requests in the order returned tokens go to them, each with its `repository`, `checkout`, gate
   `job`, the client's `pid`, the `command` it named, its `want` and `waitedMs`, the milliseconds since it asked; and
   `background`: each checkout's background-class stake alone (`held`, `holders`, and its waiting requests as `waiters`,
-  each with `pid`, `command`, `want` and `waitedMs`), for the checkouts that have one. Every waiting entry is one
-  request: a gate job whose tasks wait is one entry per task — the job identity is the gate `job` number and each entry
-  is a distinct connection — so the queue is never collapsed per job; its pid, command and age tell the entries apart
-  (measured 2026-10-19: fifteen `batch-7 gate job 603 want 1` entries were fifteen of that gate's tasks, and read as
-  duplicates because they named nothing else). `holders` are the granted leases, one per runner holding tokens, oldest
-  grant first, each with the client's `pid` (the socket's peer; absent when the socket names none — a pool-relayed task
-  is named by its own connection to the pool), the `command` it named, the `tokens` it holds now, its `want`, and
-  `heldMs`, the milliseconds since its grant. The age is the lease's, never the process's: a lease is one connection
-  granted once, and a process that asks again holds a new lease with its own age; the ledger never scans processes, and
-  `ps -p <pid>` gives the process's age. Measured 2026-10-18: a ledger that named only
-  `land-test-hang: held 15, running 1` read as an orphan, and a live 34-minute `cargo test …` another unit was waiting
-  on was killed by hand; its holder line would have said what it was and that it was live. `cowshed gateway status`
-  shows this ledger to the operator in the order it serves — its count with what background holds and the cap in force
-  on its grants (`gateway cpu budget: held <h>/<N> tokens, background holds <b>, at most <N> with no gate work`, or
-  `at most <⌊N/2⌋> beside gate work`), the head gate job, the gate jobs behind it, the gate queue, then background, each
-  running gate job and background stake followed by its leases — in its human lines, and verbatim as `cpuBudget` in
-  `--json` (06_cli.md; 07_api.md `GatewayStatus`), whose cap is `total` with neither `gateJobs` nor `gateQueue` and
-  `⌊total/2⌋`, at least one, beside them, so whether queued lands wait behind the head of the queue without loading it,
-  why background waits beside free tokens, and who holds every token since when, is visible rather than inferred; a
-  daemon that does not answer `cpu-budget` is reported as such, never as an empty ledger.
+  each with `pid`, `command`, `want` and `waitedMs`), for the checkouts that have one; and `probation`, while the
+  probation token is lent, naming its request's `checkout`, `pid`, `command` and `lentMs`, the milliseconds since it was
+  lent, a request that still waits in `background` for its own token. Every waiting entry is one request: a gate job
+  whose tasks wait is one entry per task — the job identity is the gate `job` number and each entry is a distinct
+  connection — so the queue is never collapsed per job; its pid, command and age tell the entries apart (measured
+  2026-10-19: fifteen `batch-7 gate job 603 want 1` entries were fifteen of that gate's tasks, and read as duplicates
+  because they named nothing else). `holders` are the granted leases, one per runner holding tokens, oldest grant first,
+  each with the client's `pid` (the socket's peer; absent when the socket names none — a pool-relayed task is named by
+  its own connection to the pool), the `command` it named, the `tokens` it holds now, its `want`, and `heldMs`, the
+  milliseconds since its grant. The age is the lease's, never the process's: a lease is one connection granted once, and
+  a process that asks again holds a new lease with its own age; the ledger never scans processes, and `ps -p <pid>`
+  gives the process's age. Measured 2026-10-18: a ledger that named only `land-test-hang: held 15, running 1` read as an
+  orphan, and a live 34-minute `cargo test …` another unit was waiting on was killed by hand; its holder line would have
+  said what it was and that it was live. `cowshed gateway status` shows this ledger to the operator in the order it
+  serves — its count with what background holds and the cap in force on its grants
+  (`gateway cpu budget: held <h>/<N> tokens, background holds <b>, at most <N> with no gate work`, or
+  `at most <⌊N/2⌋> beside gate work`), the request on the probation token
+  (`gateway cpu probation: <checkout>: pid <pid>, lent <age> ago: <command>`), the head gate job, the gate jobs behind
+  it, the gate queue, then background, each running gate job and background stake followed by its leases — in its human
+  lines, and verbatim as `cpuBudget` in `--json` (06_cli.md; 07_api.md `GatewayStatus`), whose cap is `total` with
+  neither `gateJobs` nor `gateQueue` and `⌊total/2⌋`, at least one, beside them, so whether queued lands wait behind the
+  head of the queue without loading it, why background waits beside free tokens, and who holds every token since when,
+  is visible rather than inferred; a daemon that does not answer `cpu-budget` is reported as such, never as an empty
+  ledger.
 - **The hold limit** (2026-10-19). A lease held past 30 minutes (`HOLD_LIMIT`) is named on the lines right after the
   ledger's count, oldest first, by checkout, pid, tokens, want, age and command
   (`gateway cpu hold past 30m: <checkout>: pid <pid>, <g>/<want> tokens, granted <age> ago: <command>`), so the first
@@ -1519,6 +1561,8 @@ core count.
     its own diagnostic write. All grants of a transition are dispatched before its records are written. Numeric
     durations are nanoseconds, so p50/p99 require no parsing of human duration suffixes. Status reads emit no scheduling
     step. The existing opt-in spans remain available for other lifecycle detail.
+  - `cpu-tokens probation ticket=<id>` names the ask a transition lent the probation token, with checkout, peer pid and
+    command; `lease-grant … lease=Probation` measures its answer, and `lease-grant … after=probation` its grant.
 - **Cargo reads its holder's jobserver** (2026-10-19, Danny: why need cargo wrappers, rather than configure it properly;
   tg#6787, tg#6998, tg#7002). A CPU grant reaches the processes its holder starts as the configuration Cargo and its
   test runners already read; no `cargo` on `PATH` intercepts anything, and nothing installed answers to the name ("The
@@ -1603,14 +1647,20 @@ when asked with the holder's pool, its host ask withdrawn and the host ledger un
 refuses refuses its child and an unreachable one leaves it to the host; a one-token holder whose token a sibling holds
 has its exec granted by the host when the host has room, and the pool's next child is lent the token at once; with the
 host full and the pool busy, the exec waits in the ledger and is granted by whichever frees first, a pool grant leaving
-the ledger's queue); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its
-grant) and `executor.test.ts` (a granted run sized and released, a refused one run as asked, a target's jobserver
-variables ignored for the run's own fifo); `cpu-pool.test.ts` (a request naming `grow` refused like any other unknown
-field) and the gateway's lent-pool test (a pool's fifo holds `g − 1` bytes, a child is lent the implicit token while a
-reader holds the bytes, the next child waits until the reader writes them back, a child's close puts them back);
-`tests/jobserver_fifo.rs` (above); and the band tests: each class runs in its own band at its own nice whatever the
-host's state — interactive above gate above background — and gate work is served returned tokens ahead of interactive
-and background work.
+the ledger's queue; with every token held, a one-token job's ask answered `probation` at once with a pool that lends
+nothing, a two-token ask never lent it, and a job whose probation ended passing the token on, keeping its place and
+granted one token on the same pool and fifo, its pool then lending it); the ledger's probation unit test (lent at once,
+returned by a leave or a probation's end, the probation's ask granted one token in its place, never more than the total
+held); `cowshed-shell`'s `shell_pool.rs` through a real gateway, supervisor and sandbox (a one-token `git ls-files`
+ending on the probation token beside a holder of every token, and a CPU-heavy one stopped at its bound, the token passed
+on, then continued to its end by its grant); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a
+killed holder closing its grant) and `executor.test.ts` (a granted run sized and released, a refused one run as asked, a
+target's jobserver variables ignored for the run's own fifo); `cpu-pool.test.ts` (a request naming `grow` refused like
+any other unknown field) and the gateway's lent-pool test (a pool's fifo holds `g − 1` bytes, a child is lent the
+implicit token while a reader holds the bytes, the next child waits until the reader writes them back, a child's close
+puts them back); `tests/jobserver_fifo.rs` (above); and the band tests: each class runs in its own band at its own nice
+whatever the host's state — interactive above gate above background — and gate work is served returned tokens ahead of
+interactive and background work.
 
 ## The task server schedules work units
 
