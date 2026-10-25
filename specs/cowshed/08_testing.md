@@ -912,11 +912,12 @@ the registered devices, before and after) is the check that no disk-image comman
 be 0. Nothing refuses an attach on the media count: fixtures attach in the kernel, which waits on no IOMedia
 notification (01a_apfs.md, "The IOMedia match-notification ceiling").
 `real_apfs_making_room_detaches_the_least_recently_used_idle_session_and_warns_by_name` proves making room
-(02_workspaces.md) on the real kernel: the cap is its decision input, set just short of the host's own count, and every
-count is read from the registry, never faked. Other users' attaches move the count, so each outcome is checked against
-`plan` on the readings `make_room` decided on. The decision's properties (only idle workspaces, least recently used
-first, enough or none) are proptests of `plan`, and the demand each controller operation reads from its request is a
-unit test of `attach_demand`.
+(02_workspaces.md) on the real kernel: the cap is its decision input, set just short of its namespace's own count, and
+every count is read from the registry, never faked. Its namespace counts only the media its store's images register
+(01_storage.md, "Host namespace"), so other users' attaches move no reading, and each outcome is asserted exactly: the
+workspaces detached and every reading `make_room` decided on. The decision's properties (only idle workspaces, least
+recently used first, enough or none) are proptests of `plan`, and the demand each controller operation reads from its
+request is a unit test of `attach_demand`.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01a_apfs.md, "How the APFS host degrades" §2), so a test pays the fewest

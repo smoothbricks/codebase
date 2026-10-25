@@ -22,6 +22,9 @@
 
 use std::fmt;
 use std::io;
+use std::path::Path;
+
+use cowshed_os::namespace::HostNamespace;
 
 /// XNU's `IOServiceUserNotification::kMaxOutstanding`: the matches one notification queues before
 /// its handler drops the rest (module docs).
@@ -101,6 +104,41 @@ pub fn read() -> io::Result<MediaReading> {
         io::ErrorKind::Unsupported,
         "this kernel has no IOKit match notifications",
     ))
+}
+
+/// The media `namespace` makes room by (01_storage.md, "Host namespace"): production's are the
+/// host's, every user's ([`read`]); a test namespace's are those the images attached from its own
+/// `store` register, so no other user's attach moves a reading its fixture decides on.
+pub fn read_namespace(namespace: HostNamespace, store: &Path) -> io::Result<MediaReading> {
+    match namespace {
+        HostNamespace::Production => read(),
+        HostNamespace::Test(_) => read_store(store),
+    }
+}
+
+/// The IOMedia the images attached from backing files below `store` register, from the I/O
+/// Registry's attachment inventory. Cowshed attaches a store's images in the kernel, never through
+/// a disk tool, so none of them is a running attach [`read`] counts.
+#[cfg(target_os = "macos")]
+fn read_store(store: &Path) -> io::Result<MediaReading> {
+    let mut registered = 0_u64;
+    for attached in crate::io_registry::attached_disk_images()? {
+        if matches!(&attached.source, crate::DiskImageSource::File(image) if image.starts_with(store))
+        {
+            let media = u64::try_from(attached.media.len())
+                .map_err(|_| io::Error::other("more media than a u64 counts"))?;
+            registered = registered.saturating_add(media);
+        }
+    }
+    Ok(MediaReading {
+        registered,
+        attaching: 0,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_store(_store: &Path) -> io::Result<MediaReading> {
+    read()
 }
 
 #[cfg(test)]

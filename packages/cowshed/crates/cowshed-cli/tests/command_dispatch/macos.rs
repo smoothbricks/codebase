@@ -1767,20 +1767,19 @@ async fn real_apfs_a_detached_workspace_keeps_its_port_block_until_it_attaches_a
 
 /// Making room under IOKit's media match-notification ceiling on the real kernel
 /// (02_workspaces.md, "Making room for an attach"), with a small cap as the decision input rather
-/// than a fake registry: every count is the host's own, read by `make_room` itself.
+/// than a fake registry: a test namespace makes room by the media its own store's attached images
+/// register, read from the I/O Registry (01_storage.md, "Host namespace"), so another user's
+/// attach moves no reading this test or `make_room` decides on, and every outcome is exact.
 ///
 /// With both sessions idle (the runtime that served their supervisors shut down), a cap nothing
 /// can meet is said by name and detaches nothing, never failing. A process working in the older
 /// session keeps it attached while the newer one is the command's own: the warning names the
-/// holder's hold, and a
-/// land holding its lease keeps it attached the same way. Once
-/// the holder is gone, a cap one medium short detaches the least recently used session first and
-/// leaves the host under the cap, and the detached session attaches again on its next `exec`. The
-/// host's count moves under other users' attaches, so each outcome is checked against
-/// [`cowshed_core::media_room::plan`] on the readings `make_room` decided on.
+/// holder's hold, and a land holding its lease keeps it attached the same way. Once the holder is
+/// gone, a cap one medium short detaches the least recently used session alone, which leaves the
+/// namespace under the cap, and the detached session attaches again on its next `exec`.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_making_room_detaches_the_least_recently_used_idle_session_and_warns_by_name() {
-    use cowshed_apfs::media_cap::{MediaReading, read};
+    use cowshed_apfs::media_cap::{MediaReading, read_namespace};
     use cowshed_core::media_room::{Demand, Keep, make_room};
 
     let mut fixture = Fixture::with(Project::Plain);
@@ -1841,7 +1840,12 @@ async fn real_apfs_making_room_detaches_the_least_recently_used_idle_session_and
                 .collect(),
         }),
     };
-    // One medium past the cap as this test reads the host.
+    // The namespace's media now: what `make_room` reads on this fixture's storage.
+    let media = || {
+        read_namespace(fixture.storage.namespace(), fixture.storage.store())
+            .expect("read the namespace's media")
+    };
+    // One medium past the cap as the namespace stands.
     let one_short = |reading: MediaReading| reading.excess(0, 1) - 1;
 
     // Nothing can meet a cap of zero: said by name, nothing detached, never a failure.
@@ -1873,60 +1877,45 @@ async fn real_apfs_making_room_detaches_the_least_recently_used_idle_session_and
         "a shortfall detaches nothing"
     );
 
-    // A process working in the older session holds it, and the newer one is the command's own.
+    // A process working in the older session holds it, and the newer one is the command's own:
+    // the plan picks the older one, its unmount is refused, and the media read again are unmoved.
     let mut host = HostProcesses(Vec::new());
     host.start(&older, None);
-    let cap = one_short(read().expect("read the host's media"));
+    let reading = media();
+    let cap = one_short(reading);
     let made = make_room(&fixture.storage, &demand(&["newer"]), cap, gateway.as_ref()).await;
-    match &made.unmet {
-        Some(refusal) => {
-            cowshed_os::eprintln!("making room: short for a held mount: {}", refusal.message);
-            assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
-            assert!(made.detached.is_empty(), "{made:?}");
-            let message = &refusal.message;
-            assert!(
-                entry(message, "fixture/dispatch/older").ends_with("(a process holds its mount)"),
-                "{message}"
-            );
-            assert!(
-                entry(message, "fixture/dispatch/newer").ends_with("(this command's own)"),
-                "{message}"
-            );
-        }
-        // The host's count fell between this test's reading and make_room's: nothing to do.
-        None => {
-            cowshed_os::eprintln!("making room: the host fit before the held mount: {made:?}");
-            assert!(made.detached.is_empty(), "{made:?}");
-            assert_eq!(made.readings.len(), 1, "{made:?}");
-            assert_eq!(made.readings[0].excess(cap, 1), 0, "{made:?}");
-        }
-    }
+    assert!(made.detached.is_empty(), "{made:?}");
+    assert_eq!(made.readings, [reading, reading], "{made:?}");
+    let refusal = made.unmet.expect("a held mount frees nothing");
+    assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
+    assert!(
+        entry(&refusal.message, "fixture/dispatch/older").ends_with("(a process holds its mount)"),
+        "{}",
+        refusal.message
+    );
+    assert!(
+        entry(&refusal.message, "fixture/dispatch/newer").ends_with("(this command's own)"),
+        "{}",
+        refusal.message
+    );
     assert!(mounted(&older), "the held session stays attached");
     host.end();
 
     // A land of the older session holds its land lease: making room counts it busy too.
     let landing = land_lease::take(&layout.project().sessions, "older", Holding::Land)
         .expect("hold the older session's land lease");
-    let cap = one_short(read().expect("read the host's media"));
+    let reading = media();
+    let cap = one_short(reading);
     let made = make_room(&fixture.storage, &demand(&["newer"]), cap, gateway.as_ref()).await;
-    match &made.unmet {
-        Some(refusal) => {
-            cowshed_os::eprintln!("making room: short for a land lease: {}", refusal.message);
-            assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
-            assert!(made.detached.is_empty(), "{made:?}");
-            assert!(
-                entry(&refusal.message, "fixture/dispatch/older")
-                    .ends_with("(a land or removal holds it)"),
-                "{}",
-                refusal.message
-            );
-        }
-        None => {
-            cowshed_os::eprintln!("making room: the host fit before the land lease: {made:?}");
-            assert!(made.detached.is_empty(), "{made:?}");
-            assert_eq!(made.readings[0].excess(cap, 1), 0, "{made:?}");
-        }
-    }
+    assert!(made.detached.is_empty(), "{made:?}");
+    assert_eq!(made.readings, [reading, reading], "{made:?}");
+    let refusal = made.unmet.expect("a held land lease frees nothing");
+    assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
+    assert!(
+        entry(&refusal.message, "fixture/dispatch/older").ends_with("(a land or removal holds it)"),
+        "{}",
+        refusal.message
+    );
     assert!(mounted(&older), "the landing session stays attached");
     drop(landing);
 
@@ -1936,39 +1925,22 @@ async fn real_apfs_making_room_detaches_the_least_recently_used_idle_session_and
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800),
     );
     written("newer", SystemTime::now() + Duration::from_secs(86_400));
-    let cap = one_short(read().expect("read the host's media"));
+    let reading = media();
+    let cap = one_short(reading);
     let made = make_room(&fixture.storage, &demand(&[]), cap, gateway.as_ref()).await;
     assert_eq!(made.unmet, None, "an idle session frees enough: {made:?}");
-    cowshed_os::eprintln!(
-        "making room: detached {:?} on readings {:?}",
-        made.detached,
-        made.readings
-    );
-    let first = made.readings[0];
-    if first.excess(cap, 1) == 0 {
-        assert!(made.detached.is_empty(), "{made:?}");
-    } else {
-        assert_eq!(made.detached.first(), Some(&key("older")), "{made:?}");
-        assert!(
-            made.detached.len() == 1 || made.detached == [key("older"), key("newer")],
-            "{made:?}"
-        );
-        // One reading before the first round, one after each round, and a round detaches one
-        // workspace or more.
-        assert!(
-            (2..=made.detached.len() + 1).contains(&made.readings.len()),
-            "{made:?}"
-        );
-    }
-    let last = made.readings[made.readings.len() - 1];
+    assert_eq!(made.detached, [key("older")], "{made:?}");
+    let [first, last] = made.readings[..] else {
+        panic!("one reading before the round and one after it: {made:?}");
+    };
+    assert_eq!(first, reading, "{made:?}");
+    assert!(last.registered < first.registered, "{made:?}");
     assert_eq!(last.excess(cap, 1), 0, "room was made: {made:?}");
-    for (name, mount) in [("older", &older), ("newer", &newer)] {
-        assert_eq!(
-            mounted(mount),
-            !made.detached.contains(&key(name)),
-            "{name}: {made:?}"
-        );
-    }
+    assert!(
+        !mounted(&older),
+        "the least recently used session was detached"
+    );
+    assert!(mounted(&newer), "the newer session stays attached");
 
     // A detached session attaches again on its next use.
     let mut service = fixture.reopen().await;
@@ -1978,10 +1950,6 @@ async fn real_apfs_making_room_detaches_the_least_recently_used_idle_session_and
         .expect("serve the project again");
     succeed(&mut service, ["exec", "older", "--", "/usr/bin/true"]).await;
     assert!(mounted(&older), "exec attached the older session again");
-    cowshed_os::eprintln!(
-        "making room: exec found older mounted again (it was detached: {})",
-        made.detached.contains(&key("older"))
-    );
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }

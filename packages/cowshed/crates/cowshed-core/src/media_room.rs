@@ -405,7 +405,7 @@ mod native {
         cap: u64,
         made: &mut Made,
     ) -> Result<()> {
-        let Some(mut reading) = read().await? else {
+        let Some(mut reading) = read(storage).await? else {
             return Ok(());
         };
         made.readings.push(reading);
@@ -451,7 +451,7 @@ mod native {
                             }
                         }
                     }
-                    reading = read().await?.ok_or_else(|| {
+                    reading = read(storage).await?.ok_or_else(|| {
                         CowshedError::internal("the kernel's IOKit media count vanished mid-way")
                     })?;
                     made.readings.push(reading);
@@ -460,10 +460,13 @@ mod native {
         }
     }
 
-    /// The media now, read off the async runtime: the registry walk and the process table scan
-    /// block. `None` where the kernel has no IOKit match notifications, and so no cap.
-    async fn read() -> Result<Option<MediaReading>> {
-        match dispatch_blocking(cowshed_apfs::media_cap::read)
+    /// The media `storage`'s namespace decides on ([`cowshed_apfs::media_cap::read_namespace`]),
+    /// read off the async runtime: the registry walk and the process table scan block. `None`
+    /// where the kernel has no IOKit match notifications, and so no cap.
+    async fn read(storage: &ValidatedHostStorage) -> Result<Option<MediaReading>> {
+        let namespace = storage.namespace();
+        let store = std::sync::Arc::clone(storage.roots().shared_store());
+        match dispatch_blocking(move || cowshed_apfs::media_cap::read_namespace(namespace, &store))
             .await
             .map_err(|error| {
                 CowshedError::internal(format!("the media reading stopped: {error}"))

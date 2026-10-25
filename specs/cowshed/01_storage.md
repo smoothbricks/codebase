@@ -194,6 +194,7 @@ another instant, and a later run then reclaims the root.
 | Port partition | host, 32768–45055 | fixture, 45056–49151 |
 | Disk-lifecycle lease | production's gateway | the gateway at `<ns root>/gateway.sock`, or none |
 | launchd labels | `dev.cowshed.<service>` | `dev.cowshed-test-<ns>.<service>` |
+| Media making room counts | the host's, every user's (02_workspaces.md, "Making room for an attach") | those the images attached from its store register |
 
 Production's inventories, sweeps and collection read only production's names: store walkers walk its store, session
 mount checks its mount root, the RAM temp volume its own paths and the port allocator its partition. No test object can

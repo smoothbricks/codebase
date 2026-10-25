@@ -1569,9 +1569,11 @@ operation's route has authorized and validated its request, so a refused request
 (`cowshed_core::media_room`); the CLI, N-API clients, the gateway and a coordinator's `cowshed controller` get the same
 step, and `mount main` makes the same call before it attaches a detached main. It counts the registered IOMedia,
 subclasses included; three for each image attach running on the host, any user's; and 16 kept for disks the host
-attaches on its own, and makes room when the images would bring that to 1024. `doctor`'s `media-notification-cap`
-reports the same count, what it commits of the ceiling and how many more images fit: a warning while fewer than 20 do,
-past the ceiling too, never an error.
+attaches on its own, and makes room when the images would bring that to 1024. A test namespace counts only the IOMedia
+the images attached from its own store register, with the same 16 kept (01_storage.md, "Host namespace"), so another
+user's attach never moves a fixture's decision. `doctor`'s `media-notification-cap` reports the same count, what it
+commits of the ceiling and how many more images fit: a warning while fewer than 20 do, past the ceiling too, never an
+error.
 
 An operation's demand is read from its request alone (`cowshed_core::media_room::attach_demand`). One that works in a
 workspace (attach, exec, a shell, a checkpoint, a push, a restore, a land or rebase, a grant, a defragment, a rekey, an
