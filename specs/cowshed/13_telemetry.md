@@ -95,11 +95,15 @@ newly named clone's allocation, **not** newly allocated unique blocks. A release
 source image) compares the image at its name before it with what is left there once it answers: a release commits the
 whole image to its deleting directory before it answers, so the image is `absent` at its name after and its delta reads
 as everything it held, though a rename frees no extents or allocated bytes: a background deletion frees them later
-(05_gateway.md, "Deleting released images"). A recovery retirement compares the canonical file with the renamed file in
-trash: a rename frees no extents or allocated bytes. Missing files are explicitly `absent`; failed measurements are null
-with their cause, never zero. The extent count comes from `storage/apfs/extents.rs::count_extents`, the existing native
-`F_LOG2PHYS_EXT` walker. Allocation reuses that module's `allocated_bytes` (`st_blocks * 512`). Neither measures the
-mounted filesystem's contents, shared-block exclusivity, or bytes written.
+(05_gateway.md, "Deleting released images"). A release walks no extent map: it reads the allocation alone, and its
+extent columns are null with the cause "a release does not walk its image's extent map". Its commit never opens the
+image (05_gateway.md), and a released build image's map runs to 880,000 extents, which took 2.5-10.6 s per image to walk
+inside `rm` (measured 2026-10-25), before the verb could answer. A recovery retirement compares the canonical file with
+the renamed file in trash: a rename frees no extents or allocated bytes. Missing files are explicitly `absent`; failed
+measurements are null with their cause, never zero. The extent count comes from
+`storage/apfs/extents.rs::count_extents`, the existing native `F_LOG2PHYS_EXT` walker. Allocation reuses that module's
+`allocated_bytes` (`st_blocks * 512`). Neither measures the mounted filesystem's contents, shared-block exclusivity, or
+bytes written.
 
 The custom columns are:
 

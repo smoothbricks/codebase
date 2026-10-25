@@ -41,6 +41,21 @@ pub(super) struct Image<'a> {
     pub after: &'a Path,
 }
 
+/// What a snapshot reads of an image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Layout {
+    /// The extent map and the allocation: a capture, a first write, a recovery retirement.
+    Walked,
+    /// The allocation alone (`st_blocks`): a release, whose commit never opens the image
+    /// (05_gateway.md, "Deleting released images"). A released build image's map runs to
+    /// 880,000 extents, and walking it cost 2.5-10.6 s per image inside `rm` (measured
+    /// 2026-10-25), all of it before the verb could answer.
+    Allocation,
+}
+
+/// The cause a release's null extent columns carry.
+const UNWALKED: &str = "a release does not walk its image's extent map";
+
 #[derive(Debug)]
 struct Snapshot {
     extents: Option<u64>,
@@ -50,7 +65,7 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn read(path: &Path) -> Self {
+    fn read(path: &Path, layout: Layout) -> Self {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self {
                 extents: Some(0),
@@ -71,15 +86,22 @@ impl Snapshot {
                 error: Some("image is not a regular file".into()),
             },
             Ok(_) => {
-                let count = extents::count_extents(path);
                 let allocation = extents::allocated_bytes(path);
-                let error = match (&count, &allocation) {
-                    (Ok(_), Ok(_)) => None,
-                    (Err(error), Ok(_)) | (Ok(_), Err(error)) => Some(error.to_string()),
-                    (Err(count), Err(allocation)) => Some(format!("{count}; {allocation}")),
+                let (extents, unwalked) = match layout {
+                    Layout::Walked => match extents::count_extents(path) {
+                        Ok(count) => (Some(count.get()), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    },
+                    Layout::Allocation => (None, Some(UNWALKED.to_owned())),
+                };
+                let error = match (unwalked, &allocation) {
+                    (None, Ok(_)) => None,
+                    (Some(error), Ok(_)) => Some(error),
+                    (None, Err(error)) => Some(error.to_string()),
+                    (Some(count), Err(allocation)) => Some(format!("{count}; {allocation}")),
                 };
                 Self {
-                    extents: count.ok().map(|count| count.get()),
+                    extents,
                     allocated: allocation.ok(),
                     state: "present",
                     error,
@@ -245,9 +267,34 @@ impl ImageTelemetry {
         images: &[Image<'_>],
         work: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
+        self.measure_with(operation, images, Layout::Walked, work)
+    }
+
+    /// `work`, the release of `image`, as a `retire` span that reads the image's allocation and
+    /// walks no extent map (13_telemetry.md, "Native image observations").
+    pub fn measure_release<T, E: fmt::Display>(
+        &self,
+        image: &Path,
+        work: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let images = [Image {
+            role: "image",
+            before: image,
+            after: image,
+        }];
+        self.measure_with("retire", &images, Layout::Allocation, work)
+    }
+
+    fn measure_with<T, E: fmt::Display>(
+        &self,
+        operation: &'static str,
+        images: &[Image<'_>],
+        layout: Layout,
+        work: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
         let measuring = Instant::now();
         let before: Vec<_> = images.iter().map(|image| {
-            let snapshot = Snapshot::read(image.before);
+            let snapshot = Snapshot::read(image.before, layout);
             cowshed_os::eprintln!("cowshed: image {operation} before image={} role={} extents={:?} allocated_bytes={:?} state={} measurement_error={:?}",
                 image.before.display(), image.role, snapshot.extents, snapshot.allocated, snapshot.state, snapshot.error);
             if let Some(reason) = warning(&snapshot, None) {
@@ -274,7 +321,7 @@ impl ImageTelemetry {
                     } else {
                         image.after
                     };
-                Snapshot::read(path)
+                Snapshot::read(path, layout)
             })
             .collect();
         let measurement_us = before_us + micros(measuring.elapsed());
@@ -818,6 +865,39 @@ mod tests {
             unsigned(batch, "thread_id", 0),
             unsigned(batch, "thread_id", 2)
         );
+    }
+
+    /// A release reads the image's allocation and never walks its extent map: its commit never
+    /// opens the image, and a released build image's map took 2.5-10.6 s to walk inside `rm`.
+    /// The extent columns are null with their cause; the allocation is measured.
+    #[test]
+    fn image_telemetry_release_reads_allocation_and_walks_no_extents() {
+        let fixture = Fixture::new();
+        let image = fixture.0.join("image.dmg");
+        fs::write(&image, [0x5a; 8192]).unwrap();
+        let entry = fixture.0.join("released.dmg");
+        let telemetry = ImageTelemetry::new(&fixture.0);
+        telemetry
+            .measure_release(&image, || fs::rename(&image, &entry))
+            .unwrap();
+        drop(telemetry);
+        let batches = fixture.batches();
+        let batch = &batches[0];
+        let ended = (0..batch.num_rows())
+            .find(|&row| kind(batch, row) == "span-ok")
+            .unwrap();
+        assert!(
+            batch
+                .column_by_name("extents_before")
+                .unwrap()
+                .is_null(ended)
+        );
+        assert_eq!(
+            text(batch, "measurement_error_before", ended),
+            Some(UNWALKED)
+        );
+        assert!(unsigned(batch, "allocated_bytes_before", ended) > 0);
+        assert_eq!(text(batch, "image_state_after", ended), Some("absent"));
     }
 
     #[test]

@@ -2820,18 +2820,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             workspace.name(),
             workspace.incarnation(),
         );
-        let released = self.image_telemetry.measure(
-            "retire",
-            &[Image {
-                role: "image",
-                before: image,
-                after: image,
-            }],
-            || {
-                super::release::commit_release(image, &entry)
-                    .map_err(|error| io_error("release a retired workspace image", image, error))
-            },
-        )?;
+        let released = self.image_telemetry.measure_release(image, || {
+            super::release::commit_release(image, &entry)
+                .map_err(|error| io_error("release a retired workspace image", image, error))
+        })?;
         if released {
             self.delete_in_background(&entry)?;
             deletion_log::log_deletion_for_image(

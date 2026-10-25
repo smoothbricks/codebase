@@ -690,19 +690,11 @@ where
             }
             self.backend.detach(&attachment, DetachIntent::Release)?;
         }
-        let removed = self.image_telemetry.measure(
-            "retire",
-            &[Image {
-                role: "image",
-                before: &image,
-                after: &image,
-            }],
-            || {
-                layout
-                    .release_image(id)
-                    .map_err(|error| io_error("release a build volume image", &image, error))
-            },
-        )?;
+        let removed = self.image_telemetry.measure_release(&image, || {
+            layout
+                .release_image(id)
+                .map_err(|error| io_error("release a build volume image", &image, error))
+        })?;
         if removed {
             layout.journal_release(id, recorded.as_ref(), true);
             self.delete_in_background(&layout.released(id))?;
