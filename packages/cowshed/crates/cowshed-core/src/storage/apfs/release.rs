@@ -321,8 +321,74 @@ enum Entry {
     NotImage,
 }
 
-/// Open the entry `name` of `directory` for release without following a link at it.
+/// What the name `name` in `directory` is, read with `fstatat(2)` without following a link and
+/// without opening it: a release's commit needs no access to an image's bytes.
+fn classify(directory: &File, name: &CStr) -> io::Result<Kind> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the held directory descriptor and the NUL-terminated name outlive the call, and
+    // `stat` is written whole on success.
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(Kind::Absent),
+            _ => Err(error),
+        };
+    }
+    // SAFETY: fstatat succeeded, so it filled `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Ok(if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+        Kind::Image {
+            writable: stat.st_mode & (libc::S_IRUSR | libc::S_IWUSR)
+                == libc::S_IRUSR | libc::S_IWUSR,
+        }
+    } else {
+        Kind::NotImage
+    })
+}
+
+/// What a name a release reads turned out to be, without opening it.
+enum Kind {
+    Absent,
+    /// A regular file; `writable` when its owner may read and write it.
+    Image {
+        writable: bool,
+    },
+    /// A link, a directory or anything else that is not a regular file.
+    NotImage,
+}
+
+/// Open the committed entry `name` of `directory` to free it, without following a link at it.
+/// An entry its owner may not read and write (an image made unreadable while it was live) is made
+/// so first: it is the deleter's to free, and the commit that put it here never opened it.
 fn open_entry(directory: &File, name: &CStr) -> io::Result<Entry> {
+    match classify(directory, name)? {
+        Kind::Absent => return Ok(Entry::Absent),
+        Kind::NotImage => return Ok(Entry::NotImage),
+        Kind::Image { writable: true } => {}
+        Kind::Image { writable: false } => {
+            // SAFETY: the held directory descriptor and the NUL-terminated name outlive the call;
+            // NOFOLLOW changes a link planted since, never its target, and the open below refuses it.
+            if unsafe {
+                libc::fchmodat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::S_IRUSR | libc::S_IWUSR,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
     // SAFETY: the held directory descriptor and the NUL-terminated name outlive the call.
     // NOFOLLOW refuses a link at the name; NONBLOCK keeps a planted FIFO from holding the open.
     let fd = unsafe {
@@ -435,9 +501,9 @@ pub const DELETING_DIRECTORY: &str = ".deleting";
 ///
 /// The commit is one rename of `image` to `entry`, with every directory it touched synced: before
 /// it the image is its owner's and untouched, after it nothing finds the image by its name, so a
-/// cut never lands on an image that can still be mounted, forked or read. The image is opened and
-/// locked before the rename and stays locked through the rename's syncs, so a deleter that lists
-/// the entry leaves it until the rename is durable. Then the lock is dropped and this returns: the
+/// cut never lands on an image that can still be mounted, forked or read. The image is never
+/// opened: the commit reads none of its bytes and needs no access to it, and every deleter makes
+/// the rename durable itself before its first cut. Once the syncs are done this returns: the
 /// caller removes the owner record at once, and the bytes wait for the background deletion
 /// ([`drain`]). Every directory is held by descriptor and no entry is opened through a link: a link
 /// or any other non-regular file at either name refuses, untouched.
@@ -448,11 +514,10 @@ pub const DELETING_DIRECTORY: &str = ".deleting";
 /// file it replaces in one go.
 pub fn commit_release(image: &Path, entry: &Path) -> io::Result<bool> {
     let anchors = Anchors::open(image, entry)?;
-    // The commit's syncs made the entry durable; dropping its descriptor unlocks it for the
-    // deleter.
-    match anchors.commit()? {
-        Some(_committed) => Ok(true),
-        None => anchors.confirm_left(),
+    if anchors.commit()? {
+        Ok(true)
+    } else {
+        anchors.confirm_left()
     }
 }
 
@@ -504,10 +569,10 @@ impl Anchors {
     /// process's lock says it is releasing the entry, not that the rename is durable yet. Syncing
     /// a directory cuts nothing, so it needs no lock and waits for no releaser.
     fn confirm_left(&self) -> io::Result<bool> {
-        match open_entry(&self.journal, &self.entry_name)? {
-            Entry::Absent => return Ok(false),
-            Entry::NotImage => return Err(not_image(self.entry_name.to_string_lossy())),
-            Entry::Image(_) => {}
+        match classify(&self.journal, &self.entry_name)? {
+            Kind::Absent => return Ok(false),
+            Kind::NotImage => return Err(not_image(self.entry_name.to_string_lossy())),
+            Kind::Image { .. } => {}
         }
         sync_held_directory(&self.journal)?;
         sync_held_directory(&self.image_directory)?;
@@ -515,41 +580,34 @@ impl Anchors {
         Ok(true)
     }
 
-    /// Commit the image: open and lock it, rename it into the journal and make the rename
-    /// durable. Answers the entry's descriptor, still locked, or `None` when no image is there.
-    /// An image another process has locked refuses rather than waits: nothing but a release
-    /// locks one.
-    fn commit(&self) -> io::Result<Option<Fenced<File>>> {
-        let file = match open_entry(&self.image_directory, &self.image_name)? {
-            Entry::Absent => return Ok(None),
-            Entry::NotImage => return Err(not_image(self.image_name.to_string_lossy())),
-            Entry::Image(file) => file,
-        };
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ResourceBusy,
-                    format!(
-                        "{} is locked by another process, so it is not released",
-                        self.image_name.to_string_lossy()
-                    ),
-                ));
-            }
-            Err(fs::TryLockError::Error(error)) => return Err(error),
+    /// Commit the image: rename it into the journal, never replacing a file there, and make the
+    /// rename durable. `false` when no image is there. The image is never opened, so the commit
+    /// reads none of its bytes and needs no access to it; a deleter that lists the entry before
+    /// these syncs makes the rename durable itself before its first cut ([`drain`],
+    /// [`free_committed`]).
+    fn commit(&self) -> io::Result<bool> {
+        match classify(&self.image_directory, &self.image_name)? {
+            Kind::Absent => return Ok(false),
+            Kind::NotImage => return Err(not_image(self.image_name.to_string_lossy())),
+            Kind::Image { .. } => {}
         }
-        rename_noreplace(
+        match rename_noreplace(
             self.image_directory.as_raw_fd(),
             &self.image_name,
             self.journal.as_raw_fd(),
             &self.entry_name,
-        )?;
+        ) {
+            Ok(()) => {}
+            // Another release of the same image renamed it first.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
         // The entry, the image's departure, and the journal's own name, which an earlier attempt
         // may have made without syncing.
         sync_held_directory(&self.journal)?;
         sync_held_directory(&self.image_directory)?;
         sync_held_directory(&self.journal_parent)?;
-        Ok(Some(file))
+        Ok(true)
     }
 }
 
@@ -570,7 +628,6 @@ impl Drained {
 
 /// directory it left where it was, with why. Values, not lines on stderr: its caller says them
 /// (the gateway's startup scan) or acts on them (an unbinding's plan).
-/// passes every few seconds and says each left entry once, not once a pass.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Pass {
     pub drained: Drained,
@@ -916,8 +973,8 @@ mod tests {
         );
     }
 
-    /// The crash the deleting directory exists for. While the owner holds its committed entry,
-    /// from before its rename through the rename's syncs, a deleter leaves it uncut and names it
+    /// The crash the deleting directory exists for. While another deleter holds a committed
+    /// entry, a pass leaves it uncut and names it
     /// busy. Then a deleter makes the first cut and stops (a gateway restart): nothing finds the
     /// image by its name, and the next pass finishes the release from what the cut left. The
     /// owner's retry after that finds nothing to release.
@@ -933,8 +990,9 @@ mod tests {
         assert!(count_extents(&image).expect("count").get() >= 256);
         let entry = root.0.join(DELETING_DIRECTORY).join("image.dmg");
         let journal = entry.parent().expect("deleting directory").to_owned();
-        let anchors = Anchors::open(&image, &entry).expect("anchors");
-        let committed = anchors.commit().expect("commit").expect("the image");
+        assert!(commit_release(&image, &entry).expect("commit"));
+        let committed = fs::File::open(&entry).expect("another deleter's descriptor");
+        committed.lock().expect("another deleter holds the entry");
         assert!(!image.exists(), "the commit takes the image off its name");
         let length = fs::metadata(&entry).expect("stat").len();
         let beside_owner = drain(&journal, any).expect("a deleter beside the owner");
@@ -949,12 +1007,12 @@ mod tests {
         assert_eq!(
             fs::metadata(&entry).expect("stat").len(),
             length,
-            "a deleter never cuts an entry its owner holds"
+            "a deleter never cuts an entry another holds"
         );
         drop(committed);
 
         let Opened::Release(mut stopped) = Release::open(&entry, step(32)).expect("open") else {
-            panic!("the committed entry opens for a deleter once its owner lets go");
+            panic!("the committed entry opens for a deleter once the other lets go");
         };
         let cut = stopped.step().expect("cut").expect("a cut is left");
         assert!(cut < length, "the first cut shortens the entry");
@@ -1009,6 +1067,42 @@ mod tests {
         let pass = drain(entry.parent().expect("deleting directory"), any).expect("drain");
         assert_eq!(pass.drained.images, 1);
         assert!(!entry.exists(), "the deleter frees the committed release");
+        fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A release commits an image its owner made unreadable (gc never reads an image it
+    /// reclaims): the commit opens nothing. The deleter, whose entry it now is, frees it.
+    #[test]
+    fn a_release_commits_an_unreadable_image_and_the_deleter_frees_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-release-unreadable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let images = root.join("images");
+        fs::create_dir_all(&images).expect("images");
+        let image = images.join("image.dmg");
+        fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o000)).expect("unreadable");
+        let entry = images.join(DELETING_DIRECTORY).join("image.dmg");
+
+        assert!(commit_release(&image, &entry).expect("a commit needs no access to the image"));
+        assert!(!image.exists());
+        assert_eq!(
+            fs::metadata(&entry)
+                .expect("the entry")
+                .permissions()
+                .mode()
+                & 0o777,
+            0,
+            "the commit leaves the image as it was"
+        );
+        let pass = drain(entry.parent().expect("deleting directory"), |name| {
+            name.ends_with(".dmg")
+        })
+        .expect("drain");
+        assert_eq!(pass.drained.images, 1, "{pass:?}");
+        assert!(!entry.exists(), "the deleter frees the unreadable entry");
         fs::remove_dir_all(&root).expect("clean up");
     }
 

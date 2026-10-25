@@ -2883,12 +2883,20 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let (Some(owner), Some(repo)) = (parts.next(), parts.next()) else {
             return Err(outside());
         };
-        let sessions = self
-            .config
-            .store_root
-            .join(owner)
-            .join(repo)
-            .join(SESSIONS_DIRECTORY);
+        let project = self.config.store_root.join(owner).join(repo);
+        let sessions = project.join(SESSIONS_DIRECTORY);
+        // A project with nothing but staging has no sessions directory yet; its `.deleting` is
+        // made by the commit below.
+        let held = cowshed_os::fsio::open_directory_nofollow(&project)
+            .map_err(|error| io_error("open the project of an unowned image", &project, error))?;
+        let leaf = std::ffi::CString::new(SESSIONS_DIRECTORY)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let (_, created) = cowshed_os::fsio::open_or_create_child_directory(&held, &leaf)
+            .map_err(|error| io_error("make the project's sessions directory", &sessions, error))?;
+        if created {
+            cowshed_os::fsio::sync_held_directory(&held)
+                .map_err(|error| io_error("sync the project directory", &project, error))?;
+        }
         let name = WorkspaceName::new("reclaimed")
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         let incarnation = WorkspaceIncarnation::new(uuid::Uuid::new_v4().simple().to_string())

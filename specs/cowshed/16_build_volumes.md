@@ -985,18 +985,19 @@ delta incrementally, as an edit would.
   the rename the volume is its owner's, after it no hold, mount or fork reaches it, and a hold taken after it finds no
   image, as before. A rename the kernel refuses across volumes is the release's error, never a copy. The rename never
   replaces a file: an id is never reused, so an entry already under its name is the same image's own committed release,
-  and a rename over a file would free the file it replaces in one go. The operation locks the image (`flock`) before its
-  rename and keeps that descriptor through the rename's syncs, so no deletion cuts the entry before the rename is
-  durable. Once it is, the operation starts the deletion in the background (below), removes the owner record, hold file
-  and mountpoint, appends its deletion-log line and answers, none of it waiting for the free. No verb frees a byte of an
-  image and none finishes another operation's entry. Nothing depends on those bytes being freed: no record, link, hold
-  or mount names the entry, and nothing mounts, forks or reads it. Only space lags: until the background deletion
-  finishes the entry the store's container still holds the image's allocation, so free-space figures and the container's
-  extent count lag the commit, and an entry whose deletion did not run waits for the next gateway start. A failure
-  refuses with its path and cause, a deletion child that cannot be spawned included: before the rename the owner record
-  stays for the same operation's retry, after it the entry stays for its deletion or the startup scan and the retry
-  finds the commit already made, makes its rename durable and answers. A held job retains its registered volume
-  ownership; a later sweep is not a substitute for completing the owning lifecycle operation.
+  and a rename over a file would free the file it replaces in one go. The commit never opens the image: it reads none of
+  its bytes and needs no access to it, and every deletion syncs the `.deleting` directory and its parent before its
+  first cut, so none cuts the entry before the rename is durable. Once the rename is durable, the operation starts the
+  deletion in the background (below), removes the owner record, hold file and mountpoint, appends its deletion-log line
+  and answers, none of it waiting for the free. No verb frees a byte of an image and none finishes another operation's
+  entry. Nothing depends on those bytes being freed: no record, link, hold or mount names the entry, and nothing mounts,
+  forks or reads it. Only space lags: until the background deletion finishes the entry the store's container still holds
+  the image's allocation, so free-space figures and the container's extent count lag the commit, and an entry whose
+  deletion did not run waits for the next gateway start. A failure refuses with its path and cause, a deletion child
+  that cannot be spawned included: before the rename the owner record stays for the same operation's retry, after it the
+  entry stays for its deletion or the startup scan and the retry finds the commit already made, makes its rename durable
+  and answers. A held job retains its registered volume ownership; a later sweep is not a substitute for completing the
+  owning lifecycle operation.
 - The free is not a verb's work, because the verb waits for it and keeps its turn and locks meanwhile. Cutting at a
   bound (below) bounds what the container's other writers wait for, not what the verb that cuts waits for. So the free
   runs in a background child of the verb that holds no turn and no lock but the image's own, and the gateway's startup

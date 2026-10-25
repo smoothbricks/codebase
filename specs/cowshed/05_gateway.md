@@ -1731,10 +1731,11 @@ collects (a retired workspace's trash, an orphan session or staging image, an ex
 the release with one `rename(2)` of the detached image, never replacing a file, into a `.deleting` directory beside it:
 `build/.deleting/<id>.dmg` for a build volume, and for any other image of the project `sessions/.deleting/`, a removed
 workspace's as `<ws>-<incarnation>.dmg` and any other as `reclaimed-<fresh 32-hex>.dmg`. It syncs the directories it
-touched (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5). The image is `flock`ed before the
-rename and through its syncs, so no deletion cuts an entry before its rename is durable. No verb frees the bytes itself,
-because a verb that frees holds its turn and its locks, a land its land turn and an `rm` its workspace's locks, for as
-long as the free takes.
+touched (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5). The commit never opens the image, so
+it reads none of its bytes and needs no access to it; every deletion syncs the `.deleting` directory and its parent
+before its first cut, so none cuts an entry before its rename is durable. No verb frees the bytes itself, because a verb
+that frees holds its turn and its locks, a land its land turn and an `rm` its workspace's locks, for as long as the free
+takes.
 
 - **A background child, started once the rename is durable.** The releasing process starts the deletion in the
   background and returns without waiting: it spawns itself, the running executable (`std::env::current_exe()`, which the
@@ -1764,8 +1765,8 @@ long as the free takes.
   scan syncs the directory and its parent in full, because an owner may have died between its rename and the rename's
   syncs; a scan that cuts nothing syncs nothing.
 - **The gateway does nothing else for it.** After that scan the gateway does no work for released images: no control
-  request, queue, polling, timer or environment variable. Each image's own `flock` is the whole of the exclusion between
-  an owner, a child and a scan.
+  request, queue, polling, timer or environment variable. A deletion's own `flock` on the entry is the whole of the
+  exclusion between a child and a scan.
 
 Space lags. Until a child or the startup scan finishes an entry the store's container still holds its allocation, so
 free-space figures and extent counts lag the commit by the free's own duration, and an entry whose child did not run

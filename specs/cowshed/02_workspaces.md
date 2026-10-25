@@ -1367,22 +1367,21 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    dirty/in-progress, HEAD-stability and all-branch containment fences, detach the exact source and remove its scoped
    checkpoints, restore artifacts, temporary directory and empty mountpoint through the existing retirement checks. Then
    commit the release with one rename of the canonical source image, never replacing a file, to
-   `sessions/.deleting/<ws>-<incarnation>.dmg` and sync both directories: the image is `flock`ed before the rename and
-   through its syncs, before the rename the workspace is whole, and after it nothing mounts, forks, fences or reads the
-   image again. Right after the rename is durable the removal starts the deletion in the background, a detached
-   `__delete-released` child (the running executable) that frees the entry in bounded steps, unlinks it and syncs the
-   directory (05_gateway.md, "Deleting released images"), removes the CA companion, grants sidecar and facts and
-   answers; it frees no byte of the image and never waits for the free (16_build_volumes.md, "Garbage collection"), so
-   no reply of this verb waits for source-image bytes, and until the child has finished, the store's container still
-   holds the image's allocation: free space lags the removal. If the child cannot be spawned the removal fails with its
-   rename already durable, and its retry finds the release committed; a child that ends badly is said on stderr by its
-   reaper, and the next gateway start frees what it left. A failure before the rename refuses with the owner metadata
-   and mutating intent kept for the same removal to retry. `sessions/.deleting/` holds released images waiting to be
-   freed, not a crash journal: a crash after the rename leaves the entry, which nothing names, for the gateway's next
-   start, and the next lifecycle open or recovery reconciles the record the rename left imageless without waiting for
-   the entry or freeing it, because the reconcile of a canonical sidecar whose image is gone never depended on the bytes
-   being freed. The removal's retry finds the workspace already gone. An open confined to other workspaces neither reads
-   nor waits for it.
+   `sessions/.deleting/<ws>-<incarnation>.dmg` and sync both directories, opening no byte of the image: before the
+   rename the workspace is whole, and after it nothing mounts, forks, fences or reads the image again. Right after the
+   rename is durable the removal starts the deletion in the background, a detached `__delete-released` child (the
+   running executable) that frees the entry in bounded steps, unlinks it and syncs the directory (05_gateway.md,
+   "Deleting released images"), removes the CA companion, grants sidecar and facts and answers; it frees no byte of the
+   image and never waits for the free (16_build_volumes.md, "Garbage collection"), so no reply of this verb waits for
+   source-image bytes, and until the child has finished, the store's container still holds the image's allocation: free
+   space lags the removal. If the child cannot be spawned the removal fails with its rename already durable, and its
+   retry finds the release committed; a child that ends badly is said on stderr by its reaper, and the next gateway
+   start frees what it left. A failure before the rename refuses with the owner metadata and mutating intent kept for
+   the same removal to retry. `sessions/.deleting/` holds released images waiting to be freed, not a crash journal: a
+   crash after the rename leaves the entry, which nothing names, for the gateway's next start, and the next lifecycle
+   open or recovery reconciles the record the rename left imageless without waiting for the entry or freeing it, because
+   the reconcile of a canonical sidecar whose image is gone never depended on the bytes being freed. The removal's retry
+   finds the workspace already gone. An open confined to other workspaces neither reads nor waits for it.
 
    Gitignored or hidden content is not rebuildable merely because Git calls the tree clean. What cowshed itself made in
    the checkout is not its content: `.cowshed/`, the volume's own bookkeeping (`.fseventsd`, the Spotlight, trash,
