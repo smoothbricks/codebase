@@ -90,7 +90,7 @@ export async function runScriptcNative(
 }
 
 /**
- * Every member access on a binding imported from `typia` in the emitted JavaScript under `root`. The transform
+ * Every call through a binding of a `typia` import in the emitted JavaScript under `root`. The transform
  * replaces each such call with the code it generates; one that survives means ttsc never loaded the typia plugin.
  */
 export function untransformedTypiaCalls(root: string): UntransformedTypiaCall[] {
@@ -106,21 +106,12 @@ export function untransformedTypiaCalls(root: string): UntransformedTypiaCall[] 
     const bindings = typiaBindings(source);
     if (bindings.size === 0) continue;
     const visit = (node: ts.Node): void => {
-      if (
-        (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
-        ts.isIdentifier(node.expression) &&
-        bindings.has(node.expression.text)
-      ) {
-        // `typia.json.assertParse` is one call: name the whole chain at the binding.
-        let chain: ts.Node = node;
-        while (
-          (ts.isPropertyAccessExpression(chain.parent) || ts.isElementAccessExpression(chain.parent)) &&
-          chain.parent.expression === chain
-        ) {
-          chain = chain.parent;
+      if (ts.isCallExpression(node)) {
+        const root = chainRoot(node.expression);
+        if (root !== undefined && bindings.has(root.text)) {
+          const { line, character } = source.getLineAndCharacterOfPosition(node.expression.getStart(source));
+          calls.push({ file, line: line + 1, column: character + 1, text: node.expression.getText(source) });
         }
-        const { line, character } = source.getLineAndCharacterOfPosition(node.getStart(source));
-        calls.push({ file, line: line + 1, column: character + 1, text: chain.getText(source) });
       }
       ts.forEachChild(node, visit);
     };
@@ -129,7 +120,17 @@ export function untransformedTypiaCalls(root: string): UntransformedTypiaCall[] 
   return calls;
 }
 
-/** The default and namespace bindings of the module's `typia` imports: the names a typia call is made through. */
+/** The identifier a member chain starts at: `typia` for `typia.json.assertParse`, `t` for `t['is']`. */
+function chainRoot(expression: ts.Expression): ts.Identifier | undefined {
+  let node = expression;
+  while (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) node = node.expression;
+  return ts.isIdentifier(node) ? node : undefined;
+}
+
+/**
+ * Every name a typia call can be made through: the default, namespace and named bindings of the module's `typia`
+ * imports, and, in source order, each name destructured from one of those (`const { createIs } = typia`).
+ */
 function typiaBindings(source: ts.SourceFile): Set<string> {
   const bindings = new Set<string>();
   for (const statement of source.statements) {
@@ -137,11 +138,25 @@ function typiaBindings(source: ts.SourceFile): Set<string> {
     const specifier = statement.moduleSpecifier.text;
     if (specifier !== 'typia' && !specifier.startsWith('typia/')) continue;
     const clause = statement.importClause;
-    if (clause?.name !== undefined) bindings.add(clause.name.text);
-    if (clause?.namedBindings !== undefined && ts.isNamespaceImport(clause.namedBindings)) {
-      bindings.add(clause.namedBindings.name.text);
+    if (clause === undefined || clause.isTypeOnly) continue;
+    if (clause.name !== undefined) bindings.add(clause.name.text);
+    const named = clause.namedBindings;
+    if (named !== undefined && ts.isNamespaceImport(named)) bindings.add(named.name.text);
+    if (named !== undefined && ts.isNamedImports(named)) {
+      for (const element of named.elements) if (!element.isTypeOnly) bindings.add(element.name.text);
     }
   }
+  if (bindings.size === 0) return bindings;
+  const destructure = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer !== undefined) {
+      const root = chainRoot(node.initializer);
+      if (root !== undefined && bindings.has(root.text)) {
+        for (const element of node.name.elements) if (ts.isIdentifier(element.name)) bindings.add(element.name.text);
+      }
+    }
+    ts.forEachChild(node, destructure);
+  };
+  destructure(source);
   return bindings;
 }
 

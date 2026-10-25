@@ -87,10 +87,7 @@ function writeTypeScriptFiles(
     references: [{ path: './tsconfig.lib.json' }],
   });
 
-  tree.write(
-    `${projectRoot}/bunfig.toml`,
-    '[test]\ntimeout = 30000\npreload = ["@smoothbricks/validation/bun/preload"]\n',
-  );
+  tree.write(`${projectRoot}/bunfig.toml`, '[test]\npreload = ["@smoothbricks/validation/bun/preload"]\n');
 
   tree.write(`${projectRoot}/src/index.ts`, '');
 }

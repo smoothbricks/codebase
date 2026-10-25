@@ -84,7 +84,8 @@ describe('create-package generator', () => {
       // bunfig.toml
       const bunfig = tree.read('packages/duration/bunfig.toml', 'utf-8');
       expect(bunfig).toContain('[test]');
-      expect(bunfig).toContain('timeout = 30000');
+      // Bun ignores a bunfig [test] timeout; the bounded test command removes the deadline.
+      expect(bunfig).not.toContain('timeout');
       expect(bunfig).toContain('preload = ["@smoothbricks/validation/bun/preload"]');
 
       // src/index.ts

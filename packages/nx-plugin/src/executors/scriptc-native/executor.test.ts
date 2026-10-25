@@ -37,7 +37,7 @@ const options = {
 };
 
 describe('scriptc-native', () => {
-  it('names every member access on a typia import binding that the transform left behind', () => {
+  it('names every call through a typia binding that the transform left behind, and no runtime member read', () => {
     const { project } = workspace({
       'bin/smoo-nx-tool.js': "import { run } from '../tool.js';\nrun();\n",
       'tool.js': [
@@ -45,10 +45,23 @@ describe('scriptc-native', () => {
         'export const isEntry = typia.createIs();',
         'export function run(raw) {',
         '  return typia.json.assertParse(raw) instanceof TypeGuardError;',
+        '  if (raw instanceof typia.TypeGuardError) throw new typia.TypeGuardError(raw);',
         '}',
         '',
       ].join('\n'),
-      'namespace.js': "import * as t from 'typia/lib/index.js';\nexport const check = t['assert'];\n",
+      'namespace.js': "import * as t from 'typia/lib/index.js';\nexport const check = t['assert'](input);\n",
+      'named.js': [
+        "import { createIs, TypeGuardError } from 'typia';",
+        'export const isEntry = createIs();',
+        'export const isError = (error) => error instanceof TypeGuardError;',
+        '',
+      ].join('\n'),
+      'destructured.js': [
+        "import typia from 'typia';",
+        'const { assertParse } = typia.json;',
+        'export const parse = (raw) => assertParse(raw);',
+        '',
+      ].join('\n'),
       // ttsc keeps the import after replacing every call; a kept import is not a call.
       'transformed.js': "import typia from 'typia';\nexport const is = (input) => typeof input === 'string';\n",
       // A name the module never imported from typia, and the text of a call, are not calls.
@@ -60,6 +73,8 @@ describe('scriptc-native', () => {
         (call) => `${call.file.slice(project.length + 1)}:${call.line}:${call.column} ${call.text}`,
       ),
     ).toEqual([
+      'dist/ts/destructured.js:3:31 assertParse',
+      'dist/ts/named.js:2:24 createIs',
       "dist/ts/namespace.js:2:22 t['assert']",
       'dist/ts/tool.js:2:24 typia.createIs',
       'dist/ts/tool.js:4:10 typia.json.assertParse',

@@ -925,18 +925,18 @@ Concrete targets come from concrete files:
   `@smoothbricks/cowshed`'s launcher reads); the platform is a target option, so each host's build has its own cache
   entry. Such a package emits its JavaScript into `dist/ts` (`tsconfig.lib.json` `outDir`; inference refuses `dist`
   itself or `dist/bin`) and its bins point there, so the JavaScript and the executables are disjoint outputs. scriptc
-  type-checks emitted JavaScript under the nearest `tsconfig.json`, and the workspace's refuses untyped code, so the
-  target writes `dist/tsconfig.json` (strict, `nodenext`) beside `bin`. Before compiling, it fails on any member access
-  through a `typia` import binding left in the emitted JavaScript (`file:line:column` and the call): ttsc emits a typia
-  call untransformed, without an error, when the emitting package does not list `typia` itself, and such a call throws
-  at run time. The package keeps its JavaScript bin for every other platform; a caller that wants the native executable
-  names `dist/bin/<platform>/<name>` and depends on this target. A run compiles only its host's executable (scriptc 0.4
-  has no cross-compilation target), and a published tarball carries only what the publishing host built, so commands
-  this plugin infers for other workspaces (`smoo-nx-nextest-extract`, `smoo-nx-build-inputs`) keep running the tool
-  package's JavaScript bin through `node`; native executables serve callers in the workspace that builds them (the
-  land's failure summary, cowshed's own targets). The next unit publishes all four: one `scriptc-native` run per
-  platform on that platform's runner, collected into one tarball as cowshed's `cli-<arch>-<os>` targets are, after which
-  inferred commands name `dist/bin/<platform>/<name>`.
+  type-checks emitted JavaScript under the nearest `tsconfig.json`, and the workspace config refuses untyped code, so
+  the target writes `dist/tsconfig.json` (strict, `nodenext`) beside `bin`. Before compiling, it fails on any call
+  through a `typia` import binding (default, namespace, named, or destructured from one) left in the emitted JavaScript
+  (`file:line:column` and the call): ttsc emits a typia call untransformed, without an error, when the emitting package
+  does not list `typia` itself, and such a call throws at run time. The package keeps its JavaScript bin for every other
+  platform; a caller that wants the native executable names `dist/bin/<platform>/<name>` and depends on this target. A
+  run compiles only its host's executable (scriptc 0.4 has no cross-compilation target), and a published tarball carries
+  only what the publishing host built, so commands this plugin infers for other workspaces (`smoo-nx-nextest-extract`,
+  `smoo-nx-build-inputs`) keep running the tool package's JavaScript bin through `node`; native executables serve
+  callers in the workspace that builds them (the land's failure summary, cowshed's own targets). The next unit publishes
+  all four: one `scriptc-native` run per platform on that platform's runner, collected into one tarball as cowshed's
+  `cli-<arch>-<os>` targets are, after which inferred commands name `dist/bin/<platform>/<name>`.
 - `typecheck` is inferred from `tsconfig.lib.json` and runs the native compiler `SMOO_TYPECHECK_TSC` names (built by
   `devenv.smoo.nix` from a pinned TypeScript revision) as `-p tsconfig.lib.json --noEmit`, directly rather than through
   `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them.

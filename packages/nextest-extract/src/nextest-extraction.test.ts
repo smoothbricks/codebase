@@ -81,9 +81,8 @@ describe('ensureNextestArchiveExtracted', () => {
         await writeFile(archive, 'rebuilt archive bytes');
       };
 
-      // Nothing else holds the lock, so no staleness bound can decide this case.
-      const timing = { ...FAST, staleAfterMs: Number.POSITIVE_INFINITY };
-      await expect(ensureNextestArchiveExtracted(archive, paths.root, rebuiltMidway, () => {}, timing)).rejects.toThrow(
+      // Nothing else holds the lock, so its staleness bound never applies here.
+      await expect(ensureNextestArchiveExtracted(archive, paths.root, rebuiltMidway, () => {}, FAST)).rejects.toThrow(
         /changed while it was being extracted/,
       );
       // No directory under the old key, no staging left over, no lock held.

@@ -10,7 +10,6 @@
     "./package.json": "./package.json",
     ".": {
       "types": "./dist/ts/failure-summary.d.ts",
-      "development": "./src/failure-summary.ts",
       "import": "./dist/ts/failure-summary.js",
       "default": "./dist/ts/failure-summary.js"
     }

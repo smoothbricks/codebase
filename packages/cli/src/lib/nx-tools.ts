@@ -39,5 +39,10 @@ export function runNxTool(tool: string, args: readonly string[]): number {
     process.stderr.write(`smoo: could not run ${script}: ${run.error.message}\n`);
     return 1;
   }
-  return run.status ?? 128 + (run.signal === null ? 0 : constants.signals[run.signal]);
+  return toolExitStatus(run.status, run.signal);
+}
+
+/** A child's ending as a shell reports it: its status, or 128 plus the number of the signal that ended it. */
+export function toolExitStatus(status: number | null, signal: NodeJS.Signals | null): number {
+  return signal === null ? (status ?? 1) : 128 + constants.signals[signal];
 }
