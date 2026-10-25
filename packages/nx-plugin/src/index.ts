@@ -3,7 +3,6 @@ import { readdir, readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CARGO_PRODUCER_METADATA, postTasksExecution as postCargoRetention } from '@smoothbricks/cargo-retain';
 import {
   type CreateDependencies,
   type CreateNodesContextV2,
@@ -32,6 +31,7 @@ import {
   isCargoLockInput,
   resolveCargoClosureSource,
 } from './cargo-closure-input.js';
+import { CARGO_PRODUCER_METADATA, postTasksExecution as postCargoRetention } from './cargo-retention-hook.js';
 import {
   CARGO_TOOLCHAIN_NAMED_INPUT,
   CARGO_TOOLCHAIN_PIN_INPUTS,

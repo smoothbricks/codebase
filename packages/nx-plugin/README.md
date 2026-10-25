@@ -191,12 +191,12 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 - **Retention:** Cargo never deletes a unit generation a later build superseded, so a busy checkout's target directory
   only grows. After each Nx run that executed a Cargo producer (an inferred target that builds, checks or tests into the
   target directory, marked by its `cargoProducer` metadata: `cargo-test-archive`, `cargo-test`, `cargo-lint`,
-  `cargo-lint-cross`, mutation, bench, and the napi and wasm builds), the plugin's `postTasksExecution` runs
-  `@smoothbricks/cargo-retain`'s hook, which checks whether each Cargo workspace is due for maintenance. Automatic
-  passes run at most once per 24 hours after a successful completed pass, one that reclaimed in every root; its existing
-  receipt records completion time and configuration/workspace/target identity. A not-due hook reports that scheduling
-  decision without locks, a fingerprint scan, cleanup or receipt replacement. It does not claim newer outputs were
-  inspected or the graph is unchanged. Busy, refused, invalid, foreign or backward-clock receipt evidence never
+  `cargo-lint-cross`, mutation, bench, and the napi and wasm builds), the plugin's `postTasksExecution` runs its Cargo
+  retention hook, which calls `@smoothbricks/cargo-retain` for each Cargo workspace that is due for maintenance.
+  Automatic passes run at most once per 24 hours after a successful completed pass, one that reclaimed in every root;
+  its existing receipt records completion time and configuration/workspace/target identity. A not-due hook reports that
+  scheduling decision without locks, a fingerprint scan, cleanup or receipt replacement. It does not claim newer outputs
+  were inspected or the graph is unchanged. Busy, refused, invalid, foreign or backward-clock receipt evidence never
   postpones the next attempt. The first executed producer after the interval runs a current pass; cache replays, fetch
   and noop tasks start none. Manual preview and apply always run fresh. Due passes reclaim superseded generations under
   `<profile>/build/<package>/<META>/`. They keep the newest generation, by last use, of each unit identity of a

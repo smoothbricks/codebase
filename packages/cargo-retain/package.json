@@ -51,7 +51,6 @@
     "test": "nx run cargo-retain:test --outputStyle=stream"
   },
   "dependencies": {
-    "nx": "latest",
     "tslib": "^2.8.1",
     "typia": "14.0.6"
   },
