@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use cowshed_os::process::ExitWatch;
+
 use super::process_tree::ProcessIdentity;
 use crate::api::dto::ExitStatus;
 
@@ -1493,7 +1495,7 @@ impl Process {
     /// pid's running process read after the registration carries this process's pid version,
     /// which no other process is given: it ran throughout, and the watch names it.
     pub fn watch_exit(&self) -> io::Result<ExitWatch> {
-        let queue = exit_queue(self.pid).map_err(|error| {
+        let watch = ExitWatch::register(self.pid).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -1503,9 +1505,7 @@ impl Process {
             )
         })?;
         match running_identity(self.pid)? {
-            Some(identity) if identity.id_version.cast_unsigned() == self.version => {
-                Ok(ExitWatch(queue))
-            }
+            Some(identity) if identity.id_version.cast_unsigned() == self.version => Ok(watch),
             Some(_) => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -1547,45 +1547,6 @@ impl Process {
     }
 }
 
-/// A kqueue with `pid`'s exit registered on it, reported once. A pid whose process has begun to
-/// exit is refused (`ESRCH`), as is one no process holds.
-#[cfg(target_os = "macos")]
-fn exit_queue(pid: i32) -> io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
-    // SAFETY: kqueue takes nothing and returns a new descriptor.
-    let queue = unsafe { libc::kqueue() };
-    if queue < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a fresh descriptor this function alone owns.
-    let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
-    let change = libc::kevent {
-        ident: usize::try_from(pid).map_err(io::Error::other)?,
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_ONESHOT,
-        fflags: libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    // SAFETY: one change read from live memory, no event list, on a live queue. With no room
-    // for events a failed registration is the call's own error.
-    let registered = unsafe {
-        libc::kevent(
-            queue.as_raw_fd(),
-            &change,
-            1,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-        )
-    };
-    if registered != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(queue)
-}
-
 /// One process through every image it runs: its pid and the unique id the kernel never gives
 /// another process (`p_uniqueid`). An exec gives the pid a new version, which ends a [`Process`]
 /// held from before it, but keeps the unique id, so a life is found again after one.
@@ -1613,12 +1574,12 @@ impl Life {
     /// running process read after the registration still carries this life's unique id: it ran
     /// throughout, and the watch names it.
     pub(crate) fn watch_exit(self) -> io::Result<Option<ExitWatch>> {
-        let queue = match exit_queue(self.pid) {
-            Ok(queue) => queue,
+        let watch = match ExitWatch::register(self.pid) {
+            Ok(watch) => watch,
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
             Err(error) => return Err(error),
         };
-        Ok(self.current()?.map(|_| ExitWatch(queue)))
+        Ok(self.current()?.map(|_| watch))
     }
 }
 /// A process the trusted ledger proves is a job's own: a member of a recorded group whose
@@ -1669,132 +1630,6 @@ pub(crate) fn owned_process(path: &Path, pid: i32) -> io::Result<Option<OwnedGro
     Ok(None)
 }
 
-/// A process's exit, watched from a moment it ran (`Process::watch_exit`). The kernel reports
-/// it only once the process has released what it held, every descriptor included (measured on
-/// Darwin: a listener it alone held is detached from its socket file by NOTE_EXIT; Linux makes
-/// a pidfd readable in `exit_notify`, after `exit_files` and the deferred closes it queued).
-pub struct ExitWatch(std::os::fd::OwnedFd);
-
-impl ExitWatch {
-    /// Block until the process has exited.
-    pub fn wait(&self) -> io::Result<()> {
-        self.exited(None).map(|_| ())
-    }
-
-    /// Block until the process has exited or `within` passes; whether it exited.
-    pub fn within(&self, within: Duration) -> io::Result<bool> {
-        self.exited(Some(within))
-    }
-}
-
-impl ExitWatch {
-    /// Watch the exit of the process `pid` names now, from this moment, so a later process given
-    /// the same pid is never mistaken for it; `None` when no process holds `pid`. For a process
-    /// this one does not own, such as a launchd agent's: taken before it is signalled, its exit
-    /// is never missed.
-    pub fn of(pid: u32) -> io::Result<Option<Self>> {
-        let pid = i32::try_from(pid).map_err(io::Error::other)?;
-        match Self::open(pid) {
-            Ok(watch) => Ok(Some(watch)),
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn open(pid: i32) -> io::Result<Self> {
-        exit_queue(pid).map(Self)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn open(pid: i32) -> io::Result<Self> {
-        use std::os::fd::FromRawFd as _;
-        // SAFETY: pidfd_open takes plain integers; a non-negative answer is a new descriptor.
-        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if opened < 0 {
-            let error = io::Error::last_os_error();
-            // A pid whose process was reaped while its process group lives on is EINVAL to
-            // pidfd_open, not ESRCH: the kernel keeps the number for the group, with no process
-            // to open (`pidfd_prepare` finds no thread-group leader on it). No process holds it.
-            return Err(match error.raw_os_error() {
-                Some(libc::EINVAL) => io::Error::from_raw_os_error(libc::ESRCH),
-                _ => error,
-            });
-        }
-        let descriptor = i32::try_from(opened).map_err(io::Error::other)?;
-        // SAFETY: a fresh descriptor this function alone owns.
-        Ok(Self(unsafe {
-            std::os::fd::OwnedFd::from_raw_fd(descriptor)
-        }))
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl ExitWatch {
-    fn exited(&self, within: Option<Duration>) -> io::Result<bool> {
-        use std::os::fd::AsRawFd as _;
-
-        let timeout = within
-            .map(|within| {
-                Ok::<_, io::Error>(libc::timespec {
-                    tv_sec: libc::time_t::try_from(within.as_secs()).map_err(io::Error::other)?,
-                    tv_nsec: libc::c_long::from(within.subsec_nanos()),
-                })
-            })
-            .transpose()?;
-        // SAFETY: `event` is plain data the call may write; the queue and timeout are live.
-        let (returned, event) = unsafe {
-            let mut event = std::mem::zeroed::<libc::kevent>();
-            let returned = libc::kevent(
-                self.0.as_raw_fd(),
-                std::ptr::null(),
-                0,
-                &mut event,
-                1,
-                timeout
-                    .as_ref()
-                    .map_or(std::ptr::null(), std::ptr::from_ref),
-            );
-            (returned, event)
-        };
-        match returned {
-            ..0 => Err(io::Error::last_os_error()),
-            0 => Ok(false),
-            _ if event.flags & libc::EV_ERROR != 0 => Err(i32::try_from(event.data)
-                .map_or_else(io::Error::other, io::Error::from_raw_os_error)),
-            _ => Ok(true),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl ExitWatch {
-    fn exited(&self, within: Option<Duration>) -> io::Result<bool> {
-        use std::os::fd::AsRawFd as _;
-
-        let timeout = within.map_or(-1, |within| {
-            i32::try_from(within.as_millis()).unwrap_or(i32::MAX)
-        });
-        let mut exited = libc::pollfd {
-            fd: self.0.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live pollfd entry.
-        let waited = unsafe { libc::poll(&mut exited, 1, timeout) };
-        if waited < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(waited > 0)
-    }
-}
-
-impl std::os::fd::AsRawFd for ExitWatch {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        std::os::fd::AsRawFd::as_raw_fd(&self.0)
-    }
-}
-
 /// How a process's exit was seen ([`Process::exited`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1826,12 +1661,12 @@ impl Process {
     /// refuses a new watch of an exiting process (`ESRCH`), and a pid whose running process no
     /// longer carries this version names another.
     fn watch_running(&self) -> io::Result<Option<ExitWatch>> {
-        let queue = match exit_queue(self.pid) {
-            Ok(queue) => queue,
+        let watch = match ExitWatch::register(self.pid) {
+            Ok(watch) => watch,
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
             Err(error) => return Err(error),
         };
-        Ok(self.running()?.then_some(ExitWatch(queue)))
+        Ok(self.running()?.then_some(watch))
     }
 }
 
@@ -2113,7 +1948,7 @@ impl Process {
 
     /// Watch for this process's exit: its pidfd names it alone, whenever it is polled.
     pub fn watch_exit(&self) -> io::Result<ExitWatch> {
-        self.handle.try_clone().map(ExitWatch)
+        self.handle.try_clone().map(ExitWatch::from_pidfd)
     }
 
     /// The bytes this process holds resident now; `None` once it has exited. The read names

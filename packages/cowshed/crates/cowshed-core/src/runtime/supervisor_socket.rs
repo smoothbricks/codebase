@@ -3132,7 +3132,7 @@ pub struct Drained {
     pub process: super::job_groups::Process,
     /// Its exit, watched from before it was asked to drain: a supervisor with no running job
     /// retires at once, and an exit that began before a watch could not be awaited to its end.
-    pub exit: super::job_groups::ExitWatch,
+    pub exit: cowshed_os::process::ExitWatch,
 }
 
 impl Drained {

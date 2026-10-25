@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::process::{ExitStatus, Output};
+use std::time::Duration;
 
 /// A prepared replacement for a controller's standard streams after its command inherits them.
 /// Preparation happens before spawn. Release happens before acknowledging the handoff on a
@@ -268,6 +269,324 @@ pub fn running(pid: libc::pid_t) -> io::Result<bool> {
     Ok(!matches!(state, "Z" | "X"))
 }
 
+/// What the kernel shows a process doing, as `ps` names its state. A wait on a process that gave
+/// up names it, so the reader tells a process stuck in the kernel apart from one merely running
+/// long: an `Uninterruptible` one is in a kernel call no signal ends, SIGKILL included, until
+/// that call returns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunState {
+    Running,
+    Sleeping,
+    Uninterruptible,
+    Stopped,
+    /// Exited, not yet reaped by its parent.
+    Zombie,
+    /// No process has the pid.
+    Gone,
+    /// The kernel's answer could not be read; why.
+    Unread(String),
+}
+
+impl fmt::Display for RunState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Running => formatter.write_str("running"),
+            Self::Sleeping => formatter.write_str("sleeping"),
+            Self::Uninterruptible => formatter.write_str("in an uninterruptible kernel wait"),
+            Self::Stopped => formatter.write_str("stopped"),
+            Self::Zombie => formatter.write_str("exited, not reaped"),
+            Self::Gone => formatter.write_str("gone"),
+            Self::Unread(why) => write!(formatter, "state unread: {why}"),
+        }
+    }
+}
+
+/// [`RunState`] of the process `pid` names, read as `ps` reads it on Darwin: a zombie or a
+/// stopped process by its status; otherwise by its threads, where any running thread makes it
+/// run and else any thread in an uninterruptible wait puts it in one.
+#[cfg(target_os = "macos")]
+pub fn run_state(pid: libc::pid_t) -> RunState {
+    darwin_run_state(pid).unwrap_or_else(|error| RunState::Unread(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_run_state(pid: libc::pid_t) -> io::Result<RunState> {
+    // xnu `bsd/sys/proc_info.h`: the thread handles of a process, one `u64` each.
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(io::Error::other)?;
+    // Argument 1 answers for a zombie too (xnu `proc_pidinfo`: `findzomb`), which argument 0
+    // reports as `ESRCH` like a reaped pid.
+    // SAFETY: `info` is writable storage of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        if written > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("proc_pidinfo returned {written} bytes, expected {size}"),
+            ));
+        }
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(RunState::Gone),
+            _ => Err(error),
+        };
+    }
+    // SAFETY: proc_pidinfo filled all `size` bytes.
+    match unsafe { info.assume_init() }.pbi_status {
+        libc::SZOMB => return Ok(RunState::Zombie),
+        libc::SSTOP => return Ok(RunState::Stopped),
+        _ => {}
+    }
+    let mut threads = [0_u64; 64];
+    let capacity =
+        libc::c_int::try_from(std::mem::size_of_val(&threads)).map_err(io::Error::other)?;
+    // SAFETY: `threads` is writable storage of exactly `capacity` bytes.
+    let listed = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDLISTTHREADS,
+            0,
+            threads.as_mut_ptr().cast(),
+            capacity,
+        )
+    };
+    if listed <= 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(RunState::Gone),
+            _ => Err(error),
+        };
+    }
+    let count = usize::try_from(listed).map_err(io::Error::other)? / std::mem::size_of::<u64>();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_threadinfo>())
+        .map_err(io::Error::other)?;
+    let mut uninterruptible = false;
+    for &thread in &threads[..count] {
+        let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::zeroed();
+        // SAFETY: `info` is writable storage of exactly `size` bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTHREADINFO,
+                thread,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        // A thread that ended since it was listed says nothing.
+        if written != size {
+            continue;
+        }
+        // SAFETY: proc_pidinfo filled all `size` bytes.
+        match unsafe { info.assume_init() }.pth_run_state {
+            libc::TH_STATE_RUNNING => return Ok(RunState::Running),
+            libc::TH_STATE_UNINTERRUPTIBLE => uninterruptible = true,
+            _ => {}
+        }
+    }
+    Ok(if uninterruptible {
+        RunState::Uninterruptible
+    } else {
+        RunState::Sleeping
+    })
+}
+
+/// [`run_state`] from procfs: the state letter after the command name's closing parenthesis.
+#[cfg(target_os = "linux")]
+pub fn run_state(pid: libc::pid_t) -> RunState {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return RunState::Gone,
+        Err(error) => return RunState::Unread(error.to_string()),
+    };
+    match stat
+        .rfind(')')
+        .and_then(|closing| stat[closing + 1..].split_whitespace().next())
+    {
+        Some("R") => RunState::Running,
+        Some("S" | "I") => RunState::Sleeping,
+        Some("D") => RunState::Uninterruptible,
+        Some("T" | "t") => RunState::Stopped,
+        Some("Z" | "X") => RunState::Zombie,
+        other => RunState::Unread(format!("process stat state {other:?}")),
+    }
+}
+
+/// A process's exit, watched from a moment it ran. The kernel reports it only once the process
+/// has released what it held, every descriptor included (measured on Darwin: a listener it alone
+/// held is detached from its socket file by NOTE_EXIT; Linux makes a pidfd readable in
+/// `exit_notify`, after `exit_files` and the deferred closes it queued). On Darwin it is a kqueue
+/// with the process's `NOTE_EXIT` registered once; on Linux, the process's pidfd.
+pub struct ExitWatch(std::os::fd::OwnedFd);
+
+impl ExitWatch {
+    /// Watch the exit of the process `pid` names now, from this moment, so a later process given
+    /// the same pid is never mistaken for it; `None` when no process holds `pid`, or (Darwin)
+    /// the one that does has begun to exit. For a process this one does not own, such as a
+    /// launchd agent's: taken before it is signalled, its exit is never missed.
+    pub fn of(pid: u32) -> io::Result<Option<Self>> {
+        let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+        match Self::register(pid) {
+            Ok(watch) => Ok(Some(watch)),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`Self::of`], answering `ESRCH` for a pid whose process has begun to exit, or that no
+    /// process holds: Darwin refuses to watch an unreaped zombie (measured).
+    #[cfg(target_os = "macos")]
+    pub fn register(pid: libc::pid_t) -> io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        // SAFETY: kqueue takes nothing and returns a new descriptor.
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor this function alone owns.
+        let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+        let change = libc::kevent {
+            ident: usize::try_from(pid).map_err(io::Error::other)?,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: one change read from live memory, no event list, on a live queue. With no room
+        // for events a failed registration is the call's own error.
+        let registered = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if registered != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(queue))
+    }
+
+    /// [`Self::of`], answering `ESRCH` for a pid no process holds.
+    #[cfg(target_os = "linux")]
+    pub fn register(pid: libc::pid_t) -> io::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: pidfd_open takes plain integers; a non-negative answer is a new descriptor.
+        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if opened < 0 {
+            let error = io::Error::last_os_error();
+            // A pid whose process was reaped while its process group lives on is EINVAL to
+            // pidfd_open, not ESRCH: the kernel keeps the number for the group, with no process
+            // to open (`pidfd_prepare` finds no thread-group leader on it). No process holds it.
+            return Err(match error.raw_os_error() {
+                Some(libc::EINVAL) => io::Error::from_raw_os_error(libc::ESRCH),
+                _ => error,
+            });
+        }
+        let descriptor = i32::try_from(opened).map_err(io::Error::other)?;
+        // SAFETY: a fresh descriptor this function alone owns.
+        Ok(Self(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(descriptor)
+        }))
+    }
+
+    /// The watch on the process `pidfd` names, exited or not.
+    #[cfg(target_os = "linux")]
+    pub fn from_pidfd(pidfd: std::os::fd::OwnedFd) -> Self {
+        Self(pidfd)
+    }
+
+    /// Block until the process has exited.
+    pub fn wait(&self) -> io::Result<()> {
+        self.exited(None).map(|_| ())
+    }
+
+    /// Block until the process has exited or `within` passes; whether it exited.
+    pub fn within(&self, within: Duration) -> io::Result<bool> {
+        self.exited(Some(within))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ExitWatch {
+    fn exited(&self, within: Option<Duration>) -> io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+
+        let timeout = within
+            .map(|within| {
+                Ok::<_, io::Error>(libc::timespec {
+                    tv_sec: libc::time_t::try_from(within.as_secs()).map_err(io::Error::other)?,
+                    tv_nsec: libc::c_long::from(within.subsec_nanos()),
+                })
+            })
+            .transpose()?;
+        // SAFETY: `event` is plain data the call may write; the queue and timeout are live.
+        let (returned, event) = unsafe {
+            let mut event = std::mem::zeroed::<libc::kevent>();
+            let returned = libc::kevent(
+                self.0.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &mut event,
+                1,
+                timeout
+                    .as_ref()
+                    .map_or(std::ptr::null(), std::ptr::from_ref),
+            );
+            (returned, event)
+        };
+        match returned {
+            ..0 => Err(io::Error::last_os_error()),
+            0 => Ok(false),
+            _ if event.flags & libc::EV_ERROR != 0 => Err(i32::try_from(event.data)
+                .map_or_else(io::Error::other, io::Error::from_raw_os_error)),
+            _ => Ok(true),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ExitWatch {
+    fn exited(&self, within: Option<Duration>) -> io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+
+        let timeout = within.map_or(-1, |within| {
+            i32::try_from(within.as_millis()).unwrap_or(i32::MAX)
+        });
+        let mut exited = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live pollfd entry.
+        let waited = unsafe { libc::poll(&mut exited, 1, timeout) };
+        if waited < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(waited > 0)
+    }
+}
+
+impl std::os::fd::AsRawFd for ExitWatch {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.0)
+    }
+}
 /// The bytes the process `pid` names holds resident now; `None` once the kernel says no such
 /// process runs. An exited process never counts as holding memory: this reads
 /// `pti_resident_size` of `proc_pidinfo(PROC_PIDTASKINFO)`, which answers `ESRCH` once the
@@ -1343,6 +1662,33 @@ impl fmt::Display for Holder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state a process is read in follows its life: a sleeping child sleeps, an exited and
+    /// unreaped one is a zombie, a reaped one is gone.
+    #[test]
+    fn a_childs_run_state_follows_its_life() {
+        use crate::fork_lock::Spawn as _;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn_locked()
+            .expect("spawn sleep");
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+        let exit = ExitWatch::of(child.id())
+            .expect("watch sleep")
+            .expect("sleep runs");
+        // Asleep in nanosleep once it has started; until then it may still be running its start.
+        let state = run_state(pid);
+        assert!(
+            matches!(state, RunState::Sleeping | RunState::Running),
+            "{state}"
+        );
+        child.kill().expect("kill sleep");
+        exit.wait().expect("sleep exits");
+        assert_eq!(run_state(pid), RunState::Zombie);
+        child.wait().expect("reap sleep");
+        assert_eq!(run_state(pid), RunState::Gone);
+    }
 
     /// A procfs TCP table names a port only for a `LISTEN` row whose socket the process holds:
     /// a connected socket on the same port, another process's listener and a time-wait row are

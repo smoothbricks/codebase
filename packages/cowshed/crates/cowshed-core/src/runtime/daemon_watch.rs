@@ -28,7 +28,9 @@ use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
-use super::job_groups::{ExitWatch, Life};
+use cowshed_os::process::ExitWatch;
+
+use super::job_groups::Life;
 use super::process_events::{Darwin, ProcessReads as _};
 
 /// A daemon's exit and the children it forked, watched from a moment it ran.

@@ -26,7 +26,6 @@ use cowshed_core::land_turn as turns;
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
 use cowshed_core::repository::RepoId;
-use cowshed_core::runtime::job_groups::ExitWatch;
 use cowshed_core::runtime::supervisor_manager::{
     self, ProgramSpawner, SocketPeers, SupervisorManager,
 };
@@ -678,7 +677,7 @@ where
         return Ok(());
     };
     let exit = match agent.pid {
-        Some(pid) => ExitWatch::of(pid)
+        Some(pid) => cowshed_os::process::ExitWatch::of(pid)
             .map_err(|error| {
                 ActivationError::Failed(CowshedError::internal(format!(
                     "could not watch the exit of {}'s process {pid}: {error}",

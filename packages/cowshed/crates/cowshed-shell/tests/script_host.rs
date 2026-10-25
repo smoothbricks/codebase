@@ -1659,7 +1659,7 @@ fn submit_adoption(host: &Host, request: &[u8]) -> OwnedFd {
 #[cfg(target_os = "macos")]
 #[test]
 fn an_adopted_tail_s_escaped_descendant_ends_when_control_closes() {
-    use cowshed_core::runtime::job_groups::ExitWatch;
+    use cowshed_os::process::ExitWatch;
     use std::os::unix::process::ExitStatusExt as _;
 
     let mut host = Host::start("adopt-orphan");

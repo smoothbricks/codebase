@@ -845,7 +845,7 @@ const OTHER_BUILD_GRACE: Duration = Duration::from_secs(5);
 /// may still be open (measured on Darwin), which a socket bound next would find still attached.
 fn terminate(
     process: &super::job_groups::Process,
-    exit: &super::job_groups::ExitWatch,
+    exit: &cowshed_os::process::ExitWatch,
     grace: Duration,
 ) -> io::Result<()> {
     for signal in [libc::SIGTERM, libc::SIGKILL] {

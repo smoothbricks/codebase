@@ -30,7 +30,6 @@ use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_cpu::{
     ActivationStake, GatewayJobCpu, HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant,
 };
-use cowshed_core::runtime::job_groups::ExitWatch;
 use cowshed_core::runtime::shell_host::ShellHostProgram;
 use cowshed_core::runtime::shell_pool::ShellPoolConfig;
 use cowshed_core::runtime::supervisor::{
@@ -49,6 +48,7 @@ use cowshed_gateway::{
 };
 use cowshed_gateway_types::{CpuBudgetStatus, WorkspaceToken};
 use cowshed_os::host_load::HostLoad;
+use cowshed_os::process::ExitWatch;
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
 
