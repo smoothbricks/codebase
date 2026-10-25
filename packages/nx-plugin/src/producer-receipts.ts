@@ -3,7 +3,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -40,6 +39,7 @@ import {
   type CensusRead,
   censusFileHashes,
   censusStart,
+  directoryMembers,
   graphInstallationCensus,
   movedNodes,
   type NodeWitness,
@@ -156,6 +156,17 @@ function recordedTool(tools: readonly EnsureBuiltProducerTool[]): (path: string)
     return node !== undefined && same(receiptNode(path, path), node);
   };
 }
+/**
+ * The first tool nodes that moved since `tools` recorded them ({@link movedNodes}), or null when none did. A node whose
+ * ctime alone moved, and a directory whose membership may have, is compared with what `tools` recorded of it.
+ */
+export function movedToolNodes(
+  nodes: readonly NodeWitness[],
+  tools: readonly EnsureBuiltProducerTool[],
+): string | null {
+  const recorded = recordedTool(tools);
+  return movedNodes(nodes, recorded, recorded);
+}
 function missing(paths: readonly string[]): boolean {
   return paths.every((path) => {
     try {
@@ -243,7 +254,7 @@ export function installedClosureTool(
     }
     paths.add(path);
     if (stats.isSymbolicLink()) paths.add(realpathSync(path));
-    if (stats.isDirectory()) for (const name of readdirSync(path)) paths.add(join(path, name));
+    if (stats.isDirectory()) for (const name of directoryMembers(path)) paths.add(join(path, name));
   }
   const resolutions: ToolResolution[] = [];
   for (const [from, name, target] of installation.resolutions) {
@@ -360,7 +371,7 @@ function verifyTools(tools: readonly EnsureBuiltProducerTool[]): ReceiptEvidence
       if (!same(nodes, tool.nodes) || sha(nodes) !== tool.sha256)
         return { ok: false, detail: `Producer tool/module bytes changed: ${tool.name}` };
     }
-    const moved = movedNodes(observed, recordedTool(tools));
+    const moved = movedToolNodes(observed, tools);
     return moved === null
       ? { ok: true, value: observed }
       : { ok: false, detail: `Producer tool nodes changed during readonly validation: ${moved}` };
@@ -503,7 +514,7 @@ export async function postTasksExecution(
     }
     const tasks = completed.value;
     let detail: string | undefined;
-    const execution = movedNodes(frame.value.toolNodes, recordedTool(frame.value.tools));
+    const execution = movedToolNodes(frame.value.toolNodes, frame.value.tools);
     if (execution !== null) {
       refuse(`Producer tool/module nodes changed between capture and the end of execution: ${execution}`);
       continue;
@@ -576,7 +587,7 @@ export async function postTasksExecution(
       refuse(result.reason.detail);
       continue;
     }
-    const census = movedNodes(frame.value.toolNodes, recordedTool(frame.value.tools));
+    const census = movedToolNodes(frame.value.toolNodes, frame.value.tools);
     if (census !== null) {
       refuse(`Producer tools changed during post-execution product census: ${census}`);
       continue;
@@ -702,7 +713,7 @@ function validatedReceipt(root: string, target: string): ReceiptEvidence<EnsureB
             ? 'Public product bytes differ from actual producer receipt'
             : census.reason.detail,
       };
-    const moved = movedNodes(tools.value, recordedTool(receipt.producer.tools));
+    const moved = movedToolNodes(tools.value, receipt.producer.tools);
     if (moved !== null)
       return { ok: false, detail: `Producer tool namespace changed during independent product validation: ${moved}` };
     return { ok: true, value: receipt };

@@ -657,11 +657,23 @@ describe('a stamp move is judged by the two stamps alone', () => {
     );
   });
 
-  it('reads a move of device, inode, mode, size or mtime as moved, whatever the ctime did', () => {
+  it("reads a move of device, inode or mode, or of a non-directory's size or mtime, as moved, whatever the ctime did", () => {
     fc.assert(
       fc.property(fields, identity, u64, u64, (stats, field, value, ctimeNs) => {
         fc.pre(value !== stats[field]);
-        return stampMove(nodeStamp(stats), nodeStamp({ ...stats, [field]: value, ctimeNs })) === 'moved';
+        const members = (stats.mode & 0o170000n) === 0o040000n && (field === 'size' || field === 'mtimeNs');
+        const move = stampMove(nodeStamp(stats), nodeStamp({ ...stats, [field]: value, ctimeNs }));
+        return move === (members ? 'members' : 'moved');
+      }),
+    );
+  });
+
+  it("reads a move of a directory's size or mtime as a membership move, whatever the ctime did", () => {
+    fc.assert(
+      fc.property(fields, fc.constantFrom('size', 'mtimeNs'), u64, u64, (stats, field, value, ctimeNs) => {
+        const directory = { ...stats, mode: (stats.mode & ~0o170000n) | 0o040000n };
+        fc.pre(value !== directory[field]);
+        return stampMove(nodeStamp(directory), nodeStamp({ ...directory, [field]: value, ctimeNs })) === 'members';
       }),
     );
   });

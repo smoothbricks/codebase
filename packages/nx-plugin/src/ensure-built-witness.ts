@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { expandOutputs, FileData, WorkspaceContext } from 'nx/src/native';
@@ -42,14 +42,36 @@ export function stampMode(stamp: string): string {
 /**
  * How an observed stamp compares with the recorded one: `same`; `ctime` when device, inode, mode, size and mtime are
  * kept and only the ctime moved (a same-mode chmod, which Bun's bin linking does to a shared store file on any
- * checkout's install) or was recorded `unproven` ({@link recordedStamp}); otherwise `moved`. A function of the two
- * stamps alone, so no filesystem or clock decides it.
+ * checkout's install) or was recorded `unproven` ({@link recordedStamp}); `members` when a directory keeps its
+ * device, inode and mode and its size or mtime moved: an entry was added, removed or renamed in it since, and only its
+ * listing can say whether its membership is the one recorded (the Nx daemon's watcher probe comes and goes in
+ * `node_modules`, {@link directoryMembers}); otherwise `moved`. A function of the two stamps alone, so no filesystem
+ * or clock decides it.
  */
-export function stampMove(recorded: string, observed: string): 'same' | 'ctime' | 'moved' {
+export function stampMove(recorded: string, observed: string): 'same' | 'ctime' | 'members' | 'moved' {
   if (observed === recorded) return 'same';
   // nodeStamp ends with the ctime: everything before it is the identity a same-mode chmod keeps.
   const kept = observed.slice(0, observed.lastIndexOf(':')) === recorded.slice(0, recorded.lastIndexOf(':'));
-  return kept ? 'ctime' : 'moved';
+  if (kept) return 'ctime';
+  // nodeStamp starts with device, inode and mode: the identity a directory keeps while entries come and go in it.
+  const [dev, ino, mode] = observed.split(':', 3);
+  const identity = recorded.split(':', 3);
+  const directory = (BigInt(mode) & 0o170000n) === 0o040000n;
+  return directory && identity[0] === dev && identity[1] === ino && identity[2] === mode ? 'members' : 'moved';
+}
+
+/**
+ * The patched Nx daemon's macOS watcher probe, `nx-watch-probe-<pid>-<n>` (patches/README.md, "A stopped watcher
+ * stream is never served from"): an empty file the daemon creates in the workspace's `node_modules` where `.nxignore`
+ * hides `.nx` and `.git`, and removes once its stream reports it. Any nx command's first daemon request writes one,
+ * at any moment of another command's run. It is no module and no member of the namespace a resolution searches.
+ */
+const WATCH_PROBE = /^nx-watch-probe-\d+-\d+$/;
+
+/** The sorted listing a receipt records as a directory's membership: a `node_modules` without its {@link WATCH_PROBE}s. */
+export function directoryMembers(path: string): string[] {
+  const names = readdirSync(path);
+  return (basename(path) === 'node_modules' ? names.filter((name) => !WATCH_PROBE.test(name)) : names).sort();
 }
 
 /**
@@ -202,18 +224,22 @@ export function nodesUnchanged(nodes: readonly NodeWitness[]): boolean {
  * gone one with its error code, and how many more), or null when none moved. A node whose device, inode, mode, size
  * and mtime are unchanged and only its ctime moved (a same-mode chmod, which Bun's bin linking does to a shared store
  * file on any checkout's install), or whose ctime was recorded unproven ({@link recordedStamp}), asks for a comparison,
- * not a verdict: `same` re-reads it, and one it finds as recorded has not changed. Without `same` every move counts.
+ * not a verdict: `same` re-reads it, and one it finds as recorded has not changed. A directory whose size or mtime
+ * moved (`members`, {@link stampMove}) asks `members` whether its membership is still the recorded one. Without
+ * them every move counts.
  */
 export function movedNodes(
   nodes: readonly NodeWitness[],
   same: (path: string) => boolean = () => false,
+  members: (path: string) => boolean = () => false,
 ): string | null {
   const moved: string[] = [];
   for (const node of nodes) {
     try {
       const move = stampMove(node.stamp, nodeStamp(lstatSync(node.path, { bigint: true })));
       if (move === 'same') continue;
-      if (move === 'moved' || !same(node.path)) moved.push(node.path);
+      const unchanged = move === 'ctime' ? same(node.path) : move === 'members' && members(node.path);
+      if (!unchanged) moved.push(node.path);
     } catch (error) {
       if (!systemError(error)) throw error;
       moved.push(`${node.path} (${error.code})`);
@@ -441,7 +467,7 @@ export function graphInstallationCensus(
       walk(physical);
     } else if (stats.isDirectory()) {
       const visible = expandedRoots.has(path) ? undefined : selected;
-      const entries = readdirSync(path).sort();
+      const entries = directoryMembers(path);
       reads?.set(path, { stats, start, entries });
       for (const name of entries) {
         const child = join(path, name);

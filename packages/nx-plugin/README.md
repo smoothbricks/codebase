@@ -1200,13 +1200,18 @@ stable through publication, and every refusal that one moved names the first nod
 node whose device, inode, mode, size and mtime are unchanged and only its ctime moved is re-read and compared with its
 recorded bytes, link text and membership, as any moved stamp requires a full comparison: under `globalStore` the closure
 lives in Bun's install cache, which every checkout on the machine shares, and linking a package's bin on any of their
-installs re-chmods the store file to the mode it already has. A source, tool or output node the census read in the tick
-it changed in, as a task's last writes are, is recorded unproven and re-read the same way. The command's stdout/stderr
-digest is not a product digest. The bound tool/module inputs are the installed closures of Nx, this plugin, TypeScript
-and local graph plugins, and the producer executables. A task's npm external inputs (`AllExternalDependencies` and the
-npm nodes of its project's dependency closure) are Nx's lockfile identities: the task's hash details and the committed
-`bun.lock` bind them, and no installed closure is resolved for them, since under Bun's isolated linker most of them do
-not resolve from the task's project.
+installs re-chmods the store file to the mode it already has. A directory whose size or mtime moved while its device,
+inode and mode stayed is compared with its recorded membership: an entry came or went in it. The membership a receipt
+records of a `node_modules` leaves out the patched Nx daemon's macOS watcher probe, `nx-watch-probe-<pid>-<n>`
+(`patches/README.md`, "A stopped watcher stream is never served from"), which any nx command's first daemon request
+creates there and removes at any moment of another command's run; since the stability check spans the whole run, from
+capture to the post-execution census, a probe counted as a member refused producer runs that changed no tool. A source,
+tool or output node the census read in the tick it changed in, as a task's last writes are, is recorded unproven and
+re-read the same way. The command's stdout/stderr digest is not a product digest. The bound tool/module inputs are the
+installed closures of Nx, this plugin, TypeScript and local graph plugins, and the producer executables. A task's npm
+external inputs (`AllExternalDependencies` and the npm nodes of its project's dependency closure) are Nx's lockfile
+identities: the task's hash details and the committed `bun.lock` bind them, and no installed closure is resolved for
+them, since under Bun's isolated linker most of them do not resolve from the task's project.
 
 The pre-task hook stats every node of that installed closure on every run, and that is what lets it skip reading bytes.
 The census is a function of the nodes' stamps (device, inode, mode, size, and mtime and ctime in nanoseconds), not of

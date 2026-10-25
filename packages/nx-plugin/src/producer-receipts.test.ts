@@ -20,6 +20,7 @@ import {
 import {
   completedProducerTasks,
   installedClosureTool,
+  movedToolNodes,
   PRODUCER_RECORDS,
   postTasksExecution,
   preTasksExecution,
@@ -290,5 +291,40 @@ describe("the producer hook's installed-closure census", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  // The patched Nx daemon's macOS watcher probe (patches/README.md, "A stopped watcher stream is never served from"):
+  // where .nxignore hides .nx and .git, any nx command's first daemon request creates one in node_modules and removes
+  // it once the stream reports it, at any moment of a producer run, from its capture to its post-execution census.
+  it("takes the Nx daemon's watcher probes in node_modules for no tool change, and a new module for one", async () => {
+    const { root } = await developerLinkedWorkspace();
+    try {
+      const record = join(root, 'census.json');
+      const modules = join(root, 'node_modules');
+      const probe = (n: number) => join(modules, `nx-watch-probe-${process.pid}-${n}`);
+      await pastTick();
+      // One is out while the capture lists node_modules, one comes and goes during the run, one is out at the census.
+      await writeFile(probe(1), '');
+      const captured: NodeWitness[] = [];
+      const tools = [closure(root, record, captured)];
+      expect(captured.map(({ path }) => path)).toContain(modules);
+      await rm(probe(1));
+      await writeFile(probe(2), '');
+      await rm(probe(2));
+      await writeFile(probe(3), '');
+      expect(movedToolNodes(captured, tools)).toBeNull();
+      await rm(probe(3));
+      await mkdir(join(modules, 'left-pad'));
+      expect(movedToolNodes(captured, tools)).toBe(modules);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('knows the probe by the name the installed patched watcher gives it, in the node_modules it writes it to', async () => {
+    const watcher = await readFile(fileURLToPath(import.meta.resolve('nx/src/daemon/server/watcher.js')), 'utf8');
+    expect(watcher).toContain("const PROBE_NAME = 'nx-watch-probe-';");
+    expect(watcher).toContain('`${probeDirectory}/${PROBE_NAME}${process.pid}-${++probeSequence}`');
+    expect(watcher).toContain("(0, path_1.join)(workspace_root_1.workspaceRoot, 'node_modules'),");
   });
 });

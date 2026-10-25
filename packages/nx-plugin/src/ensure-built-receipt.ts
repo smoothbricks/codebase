@@ -24,6 +24,7 @@ import type {
 import {
   type CensusRead,
   censusStart,
+  directoryMembers,
   movedNodes,
   type NodeWitness,
   recordedStamp,
@@ -171,7 +172,7 @@ export function receiptNode(
     };
   if (stats.isSymbolicLink()) return { path: name, type: 'symlink', mode, linkText: readlinkSync(path) };
   if (stats.isDirectory()) {
-    const entries = known?.entries ?? readdirSync(path).sort();
+    const entries = known?.entries ?? directoryMembers(path);
     return {
       path: name,
       type: 'directory',
