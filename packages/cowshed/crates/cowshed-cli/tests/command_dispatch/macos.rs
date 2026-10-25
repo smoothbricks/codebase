@@ -4494,8 +4494,9 @@ async fn a_land_carries_mains_nx_entries_into_the_volume_main_adopts(
 
 /// An ungated fold of a unit into its lane base is Git alone (02_workspaces.md "Lanes";
 /// 16_build_volumes.md, "Ungated folds"). Main refuses `--ungated` by name, before anything runs.
-/// Into the lane base, the rebase carries nothing and the land fast-forwards the lane base and
-/// retires the unit, with no check, carry, seed freeze or adoption: every build volume record but
+/// Into the lane base, the rebase carries nothing; a lane-mate's commit then moves the lane base past
+/// the unit, and the land rebases the unit onto it, fast-forwards the lane base and retires the
+/// unit in one call, with no check, carry, seed freeze or adoption: every build volume record but
 /// the unit's is byte-for-byte what it was, so the lane base keeps its volume and seed, and the
 /// unit's volume is released with the unit.
 async fn an_ungated_fold_into_a_lane_base_is_git_alone(
@@ -4580,7 +4581,11 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
     );
     let unit_head = git_stdout(&unit, &["rev-parse", "HEAD"]);
     assert_eq!(rebased.oid.as_str(), unit_head);
-
+    // A lane-mate's work lands in the lane base after that rebase, so the unit is behind it again.
+    fs::write(lane.join("lane.txt"), b"lane-mate\n").unwrap();
+    git(&lane, &["add", "lane.txt"]);
+    git(&lane, &["commit", "-q", "-m", "lane-mate"]);
+    let lane_tip = git_stdout(&lane, &["rev-parse", "HEAD"]);
     let (stdout, _) = succeed(
         service,
         ["--json", "land", "unit", "--into", "lane", "--ungated"],
@@ -4600,8 +4605,20 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
         }
     );
     assert!(landed.retired);
-    assert_eq!(landed.landed_head.as_str(), unit_head);
-    assert_eq!(git_stdout(&lane, &["rev-parse", "HEAD"]), unit_head);
+    assert_ne!(
+        landed.landed_head.as_str(),
+        unit_head,
+        "the land replayed the unit onto the lane-mate's commit"
+    );
+    assert_eq!(
+        git_stdout(&lane, &["rev-parse", "HEAD"]),
+        landed.landed_head.as_str()
+    );
+    assert_eq!(
+        git_stdout(&lane, &["rev-parse", "HEAD^"]),
+        lane_tip,
+        "the landed head sits on the lane-mate's commit"
+    );
     assert_eq!(
         git_stdout(&main, &["rev-parse", "HEAD"]),
         main_head,

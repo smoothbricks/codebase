@@ -1262,33 +1262,42 @@ database another process holds carries nothing and names that process. The hash 
 that asks for one CPU token at background class; `--gate` asks at gate class instead, for a land's rebase, which its
 lander runs under the land lock: queued behind background work, it would hold up every land waiting for that lock.
 
-`--ungated`, with `--into <lane>`, is the rebase before an ungated land: it fetches and replays as above and then stops,
-computing no hash and carrying nothing; `buildVolume` is `{kind:"skipped", reason:{kind:"ungated"}}`. Without `--into`,
-or with `--into main`, it is refused (exit 2, naming main), and so is `--gate` beside it: an ungated rebase runs no job.
+`--ungated`, with `--into <lane>`, is the replay an ungated land runs before its fast-forward, run on its own for a unit
+that takes its lane-mates' work before it lands; the land rebases by itself, so this step is optional. It fetches and
+replays as above and then stops, computing no hash and carrying nothing; `buildVolume` is
+`{kind:"skipped", reason:{kind:"ungated"}}`. Without `--into`, or with `--into main`, it is refused (exit 2, naming
+main), and so is `--gate` beside it: an ungated rebase runs no job.
 
 ### `cowshed land <name> [--into <lane> [--ungated]] [--check <cmd>] [--ref-lock <file>]`
 
 The full close-out in one primitive: validate (`--check`) inside the sandbox, fast-forward the target's checkout to the
 workspace's branch, retire the workspace. The target is main, or with `--into <lane>` the lane base `<lane>`. A dirty
 tree, read the way `rm` reads it, is refused before the check runs: the check sees the working tree but only the commit
-lands. Land does not rebase; when the target has moved past the workspace's base the fast-forward is refused, and
-`cowshed rebase <name>` (with the same `--into`) is the next step. Any failing step before the fast-forward exits 4 with
-the workspace intact. A retire refused after the fast-forward keeps the workspace and exits with that refusal, whose
-message starts with what landed, so the retry is `cowshed rm`, not another land. The retire measures the workspace
-against the branch it just landed on, so a lane unit retires once its lane base holds its commits. The target branch
-(`--target`, default the branch the target's checkout has checked out) must be the checked-out one. `--into` refuses the
-workspace itself (exit 2). `--no-retire` keeps the workspace. For review-gated flows, `--push-only` validates and
-installs the exact head in `refs/cowshed/<name>/heads/<branch>`, without moving the target, adopting build state,
-recording a land outcome, collecting volumes or retiring the workspace, even when retirement is left at its default. Its
-text output is the preservation ref and source SHA; `--json` returns `kind: delivered` with the existing push-report
-fields. An ordinary land returns `kind: landed` with its target, build-volume and retirement report.
+lands. A gated land does not rebase; when the target has moved past the workspace's base the fast-forward is refused,
+and `cowshed rebase <name>` (with the same `--into`) is the next step. An ungated land rebases first (below). Any
+failing step before the fast-forward exits 4 with the workspace intact. A retire refused after the fast-forward keeps
+the workspace and exits with that refusal, whose message starts with what landed, so the retry is `cowshed rm`, not
+another land. The retire measures the workspace against the branch it just landed on, so a lane unit retires once its
+lane base holds its commits. The target branch (`--target`, default the branch the target's checkout has checked out)
+must be the checked-out one. `--into` refuses the workspace itself (exit 2). `--no-retire` keeps the workspace. For
+review-gated flows, `--push-only` validates and installs the exact head in `refs/cowshed/<name>/heads/<branch>`, without
+moving the target, adopting build state, recording a land outcome, collecting volumes or retiring the workspace, even
+when retirement is left at its default. Its text output is the preservation ref and source SHA; `--json` returns
+`kind: delivered` with the existing push-report fields. An ordinary land returns `kind: landed` with its target,
+build-volume and retirement report.
 
 `--ungated`, with `--into <lane>`, folds a unit into its lane base by Git alone: no check, no Nx cache initialization,
-carry, seed freeze or build-volume adoption. It fast-forwards the lane base and retires the unit, whose volume and seed
-are released with it; the lane base keeps its volume and seed. The report is `kind: landed` with seed
-`{kind:"unchanged"}` and adoption `{kind:"skipped", reason:{kind:"ungated"}}`, recorded as the land's outcome. Only a
-land into main gates, so main refuses `--ungated` (exit 2, naming main); `--check` and `--push-only` are refused with it
-(exit 2). With `--no-retire` it keeps the unit and collects nothing, since it released no volume.
+carry, seed freeze or build-volume adoption. First it rebases the unit onto the lane base's checked-out branch, as
+`rebase --into <lane> --ungated` does; a unit whose head already holds that branch's tip is based on it and lands as it
+is, with no fetch and no replay. `--expected-source-head` names the unit's head before that rebase, and the report's
+`landedHead` is the head after it. A conflict rolls the replay back and refuses with exit 4, naming the conflicted
+paths, with the unit as it was and the lane base unmoved. Then it fast-forwards the lane base and retires the unit,
+whose volume and seed are released with it; the lane base keeps its volume and seed. A lane base that moves between the
+rebase and the fast-forward refuses the fast-forward, and its hint is to run the ungated land again. The report is
+`kind: landed` with seed `{kind:"unchanged"}` and adoption `{kind:"skipped", reason:{kind:"ungated"}}`, recorded as the
+land's outcome. Only a land into main gates, so main refuses `--ungated` (exit 2, naming main); `--check` and
+`--push-only` are refused with it (exit 2). With `--no-retire` it keeps the unit and collects nothing, since it released
+no volume.
 
 `--preflight` runs only the fences land runs before its check, with the same arguments, and stops: the plan, the
 workspace and its incarnation, the target, the source head, the dirty tree, the target branch and the target head. When

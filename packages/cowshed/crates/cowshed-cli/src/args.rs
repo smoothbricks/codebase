@@ -4010,7 +4010,7 @@ const REBASE: CommandSpec = CommandSpec {
         "Brings the workspace branch up to current main: fetches main's checkout into the workspace and rebases onto it. A dirty tree is refused before anything moves; commit or discard the uncommitted work first. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in.",
         "With `--into <lane>`, the destination is what the unit lands into instead: the branch the lane base <lane> has checked out, fetched from its mount, so a unit forked from a lane base catches up with what its lane-mates have landed there.",
         "Then stock Nx computes task hashes at the rebased tree, and the workspace's build volume takes only missing target cache entries with those hashes, not the target's entire historical cache. A failed hash computation carries nothing and names the root and reason. Row, byte and free-space bounds stop a carry before it fills the volume, reporting what was kept and why it stopped; the rebase still stands. The new head prints on stdout and what was carried on stderr. The carry stops each side's idle Nx daemon, which restarts on its next client; a side whose task database another process holds carries nothing and says which process.",
-        "With `--ungated` (and `--into <lane>`), the rebase is Git alone: it computes no task hash and carries nothing, as the ungated land that follows it carries no build volume. Main refuses `--ungated`.",
+        "With `--ungated` (and `--into <lane>`), the rebase is Git alone: it computes no task hash and carries nothing. It is the rebase an ungated land runs itself, alone, for a unit that takes its lane-mates' work before it lands. Main refuses `--ungated`.",
     ],
     options: &[
         Opt {
@@ -4033,7 +4033,7 @@ const REBASE: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--ungated",
-            meaning: "the rebase before an ungated land: Git alone, with no task hashing and no carry; needs --into <lane>, and conflicts with --gate",
+            meaning: "the rebase an ungated land runs itself, alone: Git alone, with no task hashing and no carry; needs --into <lane>, and conflicts with --gate",
         },
     ],
 };
@@ -4064,12 +4064,12 @@ const LAND: CommandSpec = CommandSpec {
     trailing: "",
     summary: "land a workspace",
     about: &[
-        "The whole close-out as one primitive: run the checks inside the sandbox, fast-forward main's checkout to the workspace's branch, retire the workspace. The target must be the branch main's checkout has checked out, and a dirty tree is refused before the checks run, since they see the working tree but only the commit lands. Land does not rebase: when main has moved past the workspace's base, the fast-forward is refused and `cowshed rebase <ws>` is the next step. Any step that fails before the fast-forward leaves the workspace intact; a retire refused after it says what landed, and the next step is `cowshed rm`.",
+        "The whole close-out as one primitive: run the checks inside the sandbox, fast-forward main's checkout to the workspace's branch, retire the workspace. The target must be the branch main's checkout has checked out, and a dirty tree is refused before the checks run, since they see the working tree but only the commit lands. A gated land does not rebase: when main has moved past the workspace's base, the fast-forward is refused and `cowshed rebase <ws>` is the next step. Any step that fails before the fast-forward leaves the workspace intact; a retire refused after it says what landed, and the next step is `cowshed rm`.",
         "Before running any --check command, land synchronizes the gateway with current workspace grants. If synchronization fails, no check runs and the target branch is unchanged. Landing without --check does not require this preflight.",
         "Landing is also what `rm` measures against: the ancestry gate a removal enforces is satisfied by the branch this command delivers to.",
         "An adopted build volume is renamed `[cowshed] <project> — build <target>` in the background. The target's previous volume is released before land returns, including with --no-retire, unless a running job's hold owns it. Release uses an unforced unmount with bounded grace, then force if needed, naming initial holders and every collection deferral. Seeds are never mounted or named: mounting one just to rename it would advance the image mtime used for seed freshness.",
         "With `--into <lane>`, the unit lands into the lane base <lane> instead of main: the lane base's checked-out branch is fast-forwarded, and the unit retires once the lane base holds its commits. The lane itself reaches main with `cowshed rebase <lane>` and `cowshed land <lane>`.",
-        "With `--into <lane> --ungated`, the fold is Git alone: no check, no Nx cache initialization, carry, seed freeze or build-volume adoption. The lane base keeps its build volume and seed, and the unit's volume is released with the unit. Only a land into main gates, so main refuses `--ungated`.",
+        "With `--into <lane> --ungated`, the fold is Git alone and one command: land first rebases the unit onto the branch the lane base has checked out, as `cowshed rebase <ws> --into <lane> --ungated` does, and a unit already based on that branch lands as it is, with nothing fetched or replayed. A conflict stops the land before anything moves, leaves the unit as it was and names the conflicted paths. --expected-source-head names the head before that rebase; the landed head is reported. Then no check, no Nx cache initialization, carry, seed freeze or build-volume adoption. The lane base keeps its build volume and seed, and the unit's volume is released with the unit. Only a land into main gates, so main refuses `--ungated`.",
         "With `--preflight`, land runs only the fences it runs before its check, with the same arguments, and stops: the plan, the workspace and its incarnation, the target, the source head, the dirty-tree refusal, the target branch and the target head. It exits 4 with land's own refusal when land would refuse, and 0 with what it read otherwise. It takes no land lease and no ref lock, attaches nothing, synchronizes no gateway, runs no check and finishes no interrupted work, so it runs beside a land of the same workspace; a detached lane base it cannot read without attaching is exit 5.",
     ],
     options: &[
@@ -4105,7 +4105,7 @@ const LAND: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--ungated",
-            meaning: "fold into the lane base by Git alone: fast-forward and retire, with no check and no build-volume carry or adoption; needs --into <lane>, and conflicts with --check and --push-only",
+            meaning: "fold into the lane base by Git alone: rebase onto its branch (nothing when already based), fast-forward and retire, with no check and no build-volume carry or adoption; needs --into <lane>, and conflicts with --check and --push-only",
         },
         Opt {
             spelling: "--preflight",

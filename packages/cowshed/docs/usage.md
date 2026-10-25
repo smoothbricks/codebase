@@ -240,8 +240,7 @@ cowshed fork "$LANE" --project "$PROJECT"
 cowshed fork "$LANE" "$LANE-schema" --project "$PROJECT"
 cowshed fork "$LANE" "$LANE-api" --project "$PROJECT"
 
-# each unit, when its work is done: Git alone, no check, no build-volume carry
-cowshed rebase "$LANE-schema" --into "$LANE" --ungated --project "$PROJECT"
+# each unit, when its work is done: rebase onto the lane base and fold, Git alone: no check, no build-volume carry
 cowshed land "$LANE-schema" --into "$LANE" --ungated --project "$PROJECT"
 
 # the lane, when every unit has landed into it:
@@ -249,11 +248,13 @@ cowshed rebase "$LANE" --project "$PROJECT"
 cowshed land "$LANE" --check 'just verify' --project "$PROJECT"
 ```
 
-`rebase --into` catches a unit up with what its lane-mates have already landed in the lane base, and `land --into` moves
-the lane base's checked-out branch and retires the unit once the lane base holds its commits. Cowshed keeps no record of
-the lane: `--into` names a workspace, and your script is what knows which units belong to it. If the lane base is
-removed and recreated under the same name while units are in flight, their lands refuse it rather than land into a
-workspace they were not forked from.
+An ungated land first rebases the unit onto the lane base's checked-out branch, so the unit takes what its lane-mates
+have already landed there; then it moves that branch and retires the unit once the lane base holds its commits. A
+conflict refuses the land, names the conflicted paths and leaves the unit as it was: resolve them in the unit, then land
+again. `rebase --into <lane> --ungated` is that replay on its own, for a unit that wants its lane-mates' work before it
+lands. Cowshed keeps no record of the lane: `--into` names a workspace, and your script is what knows which units belong
+to it. If the lane base is removed and recreated under the same name while units are in flight, their lands refuse it
+rather than land into a workspace they were not forked from.
 
 `--ungated` makes a unit's fold Git alone: the rebase computes no task hash and carries nothing, and the land runs no
 check, initializes or carries no Nx cache, freezes no seed and adopts no build volume. The lane base keeps its build

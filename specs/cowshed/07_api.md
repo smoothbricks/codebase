@@ -559,7 +559,7 @@ pub struct RebaseOptions {
     pub expected_source_head: Option<GitOid>,
     pub expected_onto_head: Option<GitOid>,
     pub gate: bool,                      // a land's rebase: the carry's jobs run as gate-class work (05)
-    pub mode: LandMode,                  // Ungated: the rebase before an ungated fold carries nothing (02, "Lanes")
+    pub mode: LandMode,                  // Ungated: an ungated land's own rebase, alone, carries nothing (02, "Lanes")
 }
 
 pub struct LandOptions {
@@ -571,7 +571,7 @@ pub struct LandOptions {
     pub expected_source_head: Option<GitOid>,
     pub expected_target_head: Option<ExpectedRefHead>,
     pub ref_lock: Option<RefLockPath>,   // absolute; held only for the head fence and fast-forward (02, land step 3)
-    pub mode: LandMode,                  // Ungated: a lane fold by Git alone; refused into main (02, "Lanes")
+    pub mode: LandMode,                  // Ungated: a lane fold by Git alone, rebasing first; refused into main (02, "Lanes")
     pub preflight: bool,                 // land's fences before its check only, mutating nothing; absent when false (02)
 }
 

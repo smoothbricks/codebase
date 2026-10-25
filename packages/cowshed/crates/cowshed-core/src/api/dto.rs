@@ -3642,8 +3642,8 @@ pub struct RebaseOptions {
     /// gate job (05_gateway.md, "A land is a gate job"). Any other rebase is background work.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub gate: bool,
-    /// `Ungated` is the rebase before an ungated land into a lane base: Git alone, no carry
-    /// (02_workspaces.md "Lanes"). Refused with `gate`, and when the target is main.
+    /// `Ungated` is the rebase an ungated land into a lane base runs itself, alone: Git alone, no
+    /// carry (02_workspaces.md "Lanes"). Refused with `gate`, and when the target is main.
     #[serde(skip_serializing_if = "LandMode::is_gated")]
     pub mode: LandMode,
 }
@@ -3668,9 +3668,10 @@ pub struct LandOptions {
     /// "`cowshed land`" step 3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_lock: Option<RefLockPath>,
-    /// `Ungated` folds a unit into its lane base by Git alone: no check, no carry, no seed
-    /// freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with `check`, and with
-    /// `push_only`.
+    /// `Ungated` folds a unit into its lane base by Git alone: it rebases the unit onto the lane
+    /// base's branch (nothing when already based), then fast-forwards and retires, with no check,
+    /// no carry, no seed freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with
+    /// `check`, and with `push_only`.
     #[serde(skip_serializing_if = "LandMode::is_gated")]
     pub mode: LandMode,
     /// Run only land's fences before its check and stop, mutating nothing: no land lease, no
@@ -3705,7 +3706,8 @@ pub enum LandMode {
     /// The full close-out: checks, carry, seed freeze and adoption into the target.
     #[default]
     Gated,
-    /// A unit's fold into its lane base: the fast-forward and the retire, Git alone. The lane
+    /// A unit's fold into its lane base: the rebase onto its branch, the fast-forward and the
+    /// retire, Git alone. The lane
     /// base keeps its build volume and seed; the unit's volume retires with the unit. Only a
     /// land into main gates, so main refuses it.
     Ungated,

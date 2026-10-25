@@ -2094,9 +2094,10 @@ export type LandOptions = {
    */
   readonly refLock?: RefLockPath;
   /**
-   * `Ungated` folds a unit into its lane base by Git alone: no check, no carry, no seed
-   * freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with `check`, and with
-   * `push_only`.
+   * `Ungated` folds a unit into its lane base by Git alone: it rebases the unit onto the lane
+   * base's branch (nothing when already based), then fast-forwards and retires, with no check,
+   * no carry, no seed freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with
+   * `check`, and with `push_only`.
    */
   readonly mode?: LandMode;
   /**
@@ -2953,8 +2954,8 @@ export type RebaseOptions = {
    */
   readonly gate?: boolean;
   /**
-   * `Ungated` is the rebase before an ungated land into a lane base: Git alone, no carry
-   * (02_workspaces.md "Lanes"). Refused with `gate`, and when the target is main.
+   * `Ungated` is the rebase an ungated land into a lane base runs itself, alone: Git alone, no
+   * carry (02_workspaces.md "Lanes"). Refused with `gate`, and when the target is main.
    */
   readonly mode?: LandMode;
 };

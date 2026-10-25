@@ -10983,7 +10983,9 @@ mod rebase_recovery_tests {
             error.message
         );
         assert!(
-            error.hint.contains("rolled back") && error.hint.contains("git rebase main"),
+            error.hint.contains("rolled back")
+                && error.hint.contains("git rebase main")
+                && error.hint.contains("it conflicted in README.md"),
             "the hint names the by-hand replay, not markers the rollback removed: {}",
             error.hint
         );
@@ -11174,6 +11176,7 @@ mod rebase_recovery_tests {
                 head: &unit_head,
             },
             "cowshed/lane",
+            LandPlan::Gated,
             None,
         )
         .await
@@ -11232,6 +11235,7 @@ mod rebase_recovery_tests {
                 head: &head,
             },
             "cowshed/lane",
+            LandPlan::Gated,
             None,
         )
         .await
@@ -11997,6 +12001,7 @@ mod rebase_recovery_tests {
                 head: &validated,
             },
             "cowshed/lane",
+            LandPlan::Gated,
             None,
         )
         .await
@@ -12032,6 +12037,7 @@ mod rebase_recovery_tests {
                 head: &first_head,
             },
             "cowshed/lane",
+            LandPlan::Gated,
             None,
         )
         .await
@@ -12052,6 +12058,7 @@ mod rebase_recovery_tests {
                 head: &second_head,
             },
             "cowshed/lane",
+            LandPlan::Gated,
             None,
         )
         .await
@@ -12097,6 +12104,7 @@ mod rebase_recovery_tests {
                 head: &rebased,
             },
             "cowshed/lane",
+            LandPlan::Gated,
             None,
         )
         .await
@@ -12107,6 +12115,205 @@ mod rebase_recovery_tests {
         );
     }
 
+    /// `cowshed land unit --into lane --ungated` with the lane base moved past the unit's base
+    /// (02_workspaces.md "`cowshed land`", `--ungated`): the land's rebase replays the unit onto
+    /// the lane base's tip, and the same land fast-forwards the lane base to it. Had the lane base
+    /// moved again after that rebase, the fast-forward refuses, naming the ungated land's own
+    /// retry rather than a separate rebase.
+    #[tokio::test]
+    async fn an_ungated_land_rebases_a_unit_behind_its_lane_base_and_fast_forwards_it() {
+        let lane = Lane::new("ungated-behind");
+        let store_root = lane.store.shared();
+        let unit = lane.unit("unit");
+        unit_commit(&unit, "unit.txt", "unit work");
+        let source_head = git_oid(store_root, &unit).await.expect("unit head");
+        unit_commit(&lane.lane, "lane.txt", "lane-mate work");
+        let lane_tip = git_oid(store_root, &lane.lane).await.expect("lane head");
+        // The ungated land's fast-forward of `head` into the lane base.
+        async fn fold(lane: &Lane, unit: &Path, head: &GitOid) -> Result<()> {
+            deliver_into(
+                &Lane::name("lane"),
+                &crate::git::GitRepository::from_root(lane.store.shared(), &lane.lane),
+                NativeLandingSource {
+                    mount: unit,
+                    workspace: &Lane::name("unit"),
+                    branch: "cowshed/unit",
+                    head,
+                },
+                "cowshed/lane",
+                LandPlan::Ungated,
+                None,
+            )
+            .await
+        }
+
+        let behind = fold(&lane, &unit, &source_head)
+            .await
+            .expect_err("the unit is not based on the lane base's tip");
+        assert_eq!(
+            behind.fence_source(),
+            Some(&FenceRefusal::NotFastForward {
+                target_head: lane_tip.clone()
+            })
+        );
+        assert!(
+            behind
+                .hint
+                .contains("retry cowshed land unit --into lane --ungated"),
+            "an ungated land rebases on its own, so its retry is the next move: {}",
+            behind.hint
+        );
+
+        let landing = rebase_onto_target_branch(
+            store_root,
+            &unit,
+            &lane.lane,
+            &Lane::name("lane"),
+            "cowshed/lane",
+            &source_head,
+        )
+        .await
+        .expect("the land's rebase replays the unit onto the lane base");
+        assert_ne!(landing, source_head, "the unit's commit was replayed");
+        assert_eq!(
+            git_oid(store_root, &unit).await.expect("unit head"),
+            landing
+        );
+        assert_eq!(
+            git_revision_oid(store_root, &unit, "HEAD^")
+                .await
+                .expect("parent"),
+            lane_tip,
+            "the unit now sits on the lane base's tip"
+        );
+        fold(&lane, &unit, &landing)
+            .await
+            .expect("the rebased unit fast-forwards the lane base");
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            landing
+        );
+        assert!(lane.lane.join("lane.txt").exists() && lane.lane.join("unit.txt").exists());
+    }
+
+    /// An ungated land of a unit already based on its lane base's tip does no rebase work: it
+    /// fetches nothing and replays nothing, and lands the unit's own head.
+    #[tokio::test]
+    async fn an_ungated_land_of_a_unit_based_on_its_lane_base_lands_its_own_head() {
+        let lane = Lane::new("ungated-based");
+        let store_root = lane.store.shared();
+        let unit = lane.unit("unit");
+        unit_commit(&unit, "unit.txt", "unit work");
+        let source_head = git_oid(store_root, &unit).await.expect("unit head");
+
+        let landing = rebase_onto_target_branch(
+            store_root,
+            &unit,
+            &lane.lane,
+            &Lane::name("lane"),
+            "cowshed/lane",
+            &source_head,
+        )
+        .await
+        .expect("a based unit needs no rebase");
+        assert_eq!(landing, source_head);
+        assert!(
+            !git(
+                &unit,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/cowshed/targets/lane/cowshed/lane"
+                ]
+            )
+            .status
+            .success(),
+            "the lane base's branch was never fetched into the unit"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&git(&unit, &["reflog", "-1", "--format=%gs", "HEAD"]).stdout)
+                .trim(),
+            "commit: unit work",
+            "nothing was replayed: the unit's last move is its own commit"
+        );
+        deliver_into(
+            &Lane::name("lane"),
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
+            NativeLandingSource {
+                mount: &unit,
+                workspace: &Lane::name("unit"),
+                branch: "cowshed/unit",
+                head: &landing,
+            },
+            "cowshed/lane",
+            LandPlan::Ungated,
+            None,
+        )
+        .await
+        .expect("the based unit fast-forwards the lane base");
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            source_head
+        );
+    }
+
+    /// An ungated land whose rebase conflicts refuses as `rebase` does: the replay is rolled
+    /// back, the unit is exactly as it was, the refusal names the conflicted path, and the lane
+    /// base has not moved, since the fast-forward never ran.
+    #[tokio::test]
+    async fn an_ungated_land_whose_rebase_conflicts_names_the_paths_and_changes_nothing() {
+        let lane = Lane::new("ungated-conflict");
+        let store_root = lane.store.shared();
+        let unit = lane.unit("unit");
+        commit_file(&unit, "unit\n", "unit rewrites the readme");
+        let source_head = git_oid(store_root, &unit).await.expect("unit head");
+        commit_file(&lane.lane, "lane\n", "lane-mate rewrites the readme");
+        let lane_tip = git_oid(store_root, &lane.lane).await.expect("lane head");
+
+        let refused = rebase_onto_target_branch(
+            store_root,
+            &unit,
+            &lane.lane,
+            &Lane::name("lane"),
+            "cowshed/lane",
+            &source_head,
+        )
+        .await
+        .expect_err("the replay conflicts");
+        assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
+        assert_eq!(
+            refused.fence_source(),
+            Some(&FenceRefusal::ReplayConflicted {
+                rolled_back_to: source_head.clone()
+            })
+        );
+        assert!(
+            refused.hint.contains("it conflicted in README.md")
+                && refused
+                    .hint
+                    .contains("git rebase refs/cowshed/targets/lane/cowshed/lane"),
+            "the refusal names the conflicted path and the by-hand replay: {}",
+            refused.hint
+        );
+        assert_eq!(
+            git_oid(store_root, &unit).await.expect("unit head"),
+            source_head
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&git(&unit, &["symbolic-ref", "--short", "HEAD"]).stdout)
+                .trim(),
+            "cowshed/unit"
+        );
+        assert!(git(&unit, &["status", "--porcelain"]).stdout.is_empty());
+        assert!(
+            !unit.join(".git/rebase-merge").exists() && !unit.join(".git/rebase-apply").exists()
+        );
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            lane_tip
+        );
+    }
     #[test]
     fn a_lane_base_recreated_under_its_name_is_refused() {
         let resolved = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
@@ -12218,6 +12425,7 @@ mod rebase_recovery_tests {
                 head: &unit_head,
             },
             "cowshed/lane",
+            LandPlan::Gated,
             None,
         )
         .await
@@ -15188,6 +15396,43 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .await?;
             return Ok(LandReport::Delivered(delivered));
         }
+        // An ungated land validates nothing, so it lands no head a caller had to name: it first
+        // replays the unit onto its lane base's branch by Git alone, as `rebase --into <lane>
+        // --ungated` does, and a unit already based on that branch lands as it is
+        // (02_workspaces.md "`cowshed land`", `--ungated`). A gated land never rebases: it lands
+        // the head its check validated.
+        let source_head = match plan {
+            LandPlan::Gated => source_head,
+            LandPlan::Ungated => {
+                let landing = timed_async(
+                    "land",
+                    "rebase",
+                    rebase_onto_target_branch(
+                        store_root,
+                        &source_mount,
+                        &into.root,
+                        &into.name,
+                        &target_branch,
+                        &source_head,
+                    ),
+                )
+                .await
+                .map_err(|mut refused| {
+                    refused.message = format!(
+                        "an ungated land of {workspace} replays it onto {}'s {target_branch} first, and that rebase was refused: {}",
+                        into.name, refused.message
+                    );
+                    refused
+                })?;
+                if landing != source_head {
+                    cowshed_os::eprintln!(
+                        "cowshed: rebased {workspace} onto {}'s {target_branch}: landing {landing}, replayed from {source_head}",
+                        into.name
+                    );
+                }
+                landing
+            }
+        };
         // The ref fence (02_workspaces.md "`cowshed land`" step 3). The caller's ref lock, when it
         // names one, is held from re-reading the target head through the fast-forward and for
         // nothing else: the checks and Nx cache initialization before it and the adoption and
@@ -15219,6 +15464,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     head: &source_head,
                 },
                 &target_branch,
+                plan,
                 ref_lock.as_ref().map(super::ref_lock::RefLock::descriptor),
             )
             .await
@@ -18917,6 +19163,7 @@ async fn deliver_into(
     repository: &crate::git::GitRepository,
     source: NativeLandingSource<'_>,
     target_branch: &str,
+    plan: LandPlan,
     fence: Option<std::os::fd::RawFd>,
 ) -> Result<()> {
     let NativeLandingSource {
@@ -18957,18 +19204,25 @@ async fn deliver_into(
     // Read again at the merge: the check can run for minutes, and the target's checkout can be
     // switched to another branch while it does.
     require_target_checked_out(store_root, target_root, target_branch).await?;
-    // A target that moved past the unit's base cannot fast-forward. The next move is the unit's
-    // rebase onto that target, and for a lane unit a bare `cowshed rebase` would rebase onto main,
-    // so the hint names the destination.
+    // A target that moved past the unit's base cannot fast-forward. A gated land's next move is
+    // the unit's rebase onto that target, and for a lane unit a bare `cowshed rebase` would rebase
+    // onto main, so the hint names the destination. An ungated land rebased the unit itself, so
+    // the target moved after that rebase, and its retry rebases again.
     if let Some(tip) = repository.branch_tip(target_branch).await?
         && !repository
             .commit_is_ancestor(tip.as_str(), source_head.as_str())
             .await?
     {
-        let into = if target.is_main() {
-            String::new()
-        } else {
-            format!(" --into {target}")
+        let next = match plan {
+            LandPlan::Gated if target.is_main() => {
+                format!("cowshed rebase {unit}, re-run the check, then retry land")
+            }
+            LandPlan::Gated => {
+                format!("cowshed rebase {unit} --into {target}, re-run the check, then retry land")
+            }
+            LandPlan::Ungated => format!(
+                "retry cowshed land {unit} --into {target} --ungated, which rebases onto the moved {target_branch} first"
+            ),
         };
         return Err(CowshedError::fence_refusal(
             crate::error::FenceRefusal::NotFastForward {
@@ -18978,7 +19232,7 @@ async fn deliver_into(
                 "{target}'s {target_branch} is at {tip}, which workspace {unit} is not based on, so \
                  it cannot fast-forward"
             ),
-            format!("cowshed rebase {unit}{into}, re-run the check, then retry land"),
+            next,
         ));
     }
     let merge = fence_git(
@@ -19189,6 +19443,19 @@ async fn fetch_target_branch(
     target: &WorkspaceName,
 ) -> Result<String> {
     let branch = target_checked_out_branch(store_root, target_root, target).await?;
+    fetch_target_ref(store_root, unit_root, target_root, target, &branch).await
+}
+
+/// Fetch `branch` of the lane base at `target_root` into the unit at `unit_root`, as
+/// `refs/cowshed/targets/<target>/<branch>`, and answer that ref.
+#[cfg(target_os = "macos")]
+async fn fetch_target_ref(
+    store_root: &std::sync::Arc<Path>,
+    unit_root: &Path,
+    target_root: &Path,
+    target: &WorkspaceName,
+    branch: &str,
+) -> Result<String> {
     let reference = format!("refs/cowshed/targets/{target}/{branch}");
     run_git_fetch(
         store_root,
@@ -19205,6 +19472,44 @@ async fn fetch_target_branch(
     )
     .await?;
     Ok(reference)
+}
+
+/// An ungated land's rebase (02_workspaces.md "`cowshed land`", `--ungated`), answering the head
+/// the land fast-forwards its lane base to. A unit whose head already holds the tip of the lane
+/// base's `target_branch`, or whose target branch has no commit yet, is based on it and lands as
+/// it is: nothing is fetched and nothing replayed. Otherwise the branch is fetched into the unit,
+/// as `rebase --into` fetches it, and the unit is replayed onto it by Git alone; a replay that
+/// conflicts is rolled back and refused as the rebase refuses it, naming the conflicted paths,
+/// with the unit as it was.
+#[cfg(target_os = "macos")]
+async fn rebase_onto_target_branch(
+    store_root: &std::sync::Arc<Path>,
+    unit_root: &Path,
+    target_root: &Path,
+    target: &WorkspaceName,
+    target_branch: &str,
+    source_head: &GitOid,
+) -> Result<GitOid> {
+    let tip = git_optional_ref_oid(
+        store_root,
+        target_root,
+        &format!("refs/heads/{target_branch}"),
+    )
+    .await?;
+    let based = match tip {
+        None => true,
+        Some(tip) => {
+            crate::git::GitRepository::from_root(store_root, unit_root)
+                .commit_is_ancestor(tip.as_str(), source_head.as_str())
+                .await?
+        }
+    };
+    if based {
+        return Ok(source_head.clone());
+    }
+    let onto = fetch_target_ref(store_root, unit_root, target_root, target, target_branch).await?;
+    run_git_rebase_atomically(store_root, unit_root, &onto, source_head).await?;
+    git_oid(store_root, unit_root).await
 }
 
 /// A rebase has one destination: what the unit lands into, or an explicit revision.
@@ -19243,7 +19548,7 @@ fn require_distinct_target(unit: &WorkspaceName, target: &WorkspaceName) -> Resu
 enum RebasePlan {
     /// Hash the rebased tree's tasks as `class` jobs and carry the target's entries they name.
     Carry { class: crate::api::dto::ExecClass },
-    /// The replay alone: the rebase before an ungated fold carries nothing.
+    /// The replay alone: an ungated rebase, alone or an ungated land's own, carries nothing.
     GitOnly,
 }
 
@@ -19254,8 +19559,8 @@ enum RebasePlan {
 enum LandPlan {
     /// Nx cache initialization, the checks, carry, seed freeze, adoption and output restoration.
     Gated,
-    /// The fast-forward and the retire alone: the target keeps its build volume and seed, and
-    /// the unit's volume retires with the unit.
+    /// The rebase onto the lane base's branch, the fast-forward and the retire, by Git alone: the
+    /// target keeps its build volume and seed, and the unit's volume retires with the unit.
     Ungated,
 }
 
@@ -19538,6 +19843,14 @@ async fn run_git_rebase_atomically(
         return Err(primary);
     }
 
+    // A replay conflict's paths are read before the rollback removes them: git prints them on
+    // stdout, which the failure above does not carry, and the refusal names them
+    // (02_workspaces.md "`cowshed rebase`"). Reading them never stops the rollback.
+    let unmerged = if replay_conflicted {
+        Some(unmerged_paths(store_root, root).await)
+    } else {
+        None
+    };
     // Abort is the lossless path because Git owns the sequencer state. A damaged sequencer may
     // refuse abort, so cowshed then removes only the two rebase directories it just created and
     // restores the exact ref and commit captured before mutation.
@@ -19574,14 +19887,17 @@ async fn run_git_rebase_atomically(
         Err(error) => failures.push(format!("cannot resolve restored HEAD: {}", error.message)),
     }
 
-    if failures.is_empty() && replay_conflicted {
+    if failures.is_empty()
+        && let Some(unmerged) = unmerged
+    {
         Err(CowshedError::fence_refusal(
             crate::error::FenceRefusal::ReplayConflicted {
                 rolled_back_to: source_head.clone(),
             },
             primary.message,
             format!(
-                "the rebase was rolled back and the workspace is as it was: run `git rebase {onto}` inside the workspace, resolve the conflicts git names, and finish that rebase there"
+                "the rebase was rolled back and the workspace is as it was; {}: run `git rebase {onto}` inside the workspace, resolve the conflicts git names, and finish that rebase there",
+                conflicted_paths(unmerged)
             ),
         ))
     } else if failures.is_empty() {
@@ -19595,6 +19911,49 @@ async fn run_git_rebase_atomically(
             ),
             "inspect git status and run cowshed doctor --json",
         ))
+    }
+}
+
+/// The unmerged paths of a replay that stopped on a conflict.
+#[cfg(target_os = "macos")]
+async fn unmerged_paths(store_root: &std::sync::Arc<Path>, root: &Path) -> Result<Vec<String>> {
+    let output = invoke_git(
+        store_root,
+        root,
+        &["diff", "--name-only", "--diff-filter=U", "-z"],
+    )
+    .await?;
+    require_git_success("list conflicted paths", &output)?;
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
+}
+
+/// How a replay conflict's refusal names its paths: ten, then a count of the rest.
+#[cfg(target_os = "macos")]
+fn conflicted_paths(unmerged: Result<Vec<String>>) -> String {
+    const NAMED: usize = 10;
+    match unmerged {
+        Ok(paths) if paths.is_empty() => "git listed no unmerged path".to_owned(),
+        Ok(paths) => {
+            let named = paths
+                .iter()
+                .take(NAMED)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            match paths.len().saturating_sub(NAMED) {
+                0 => format!("it conflicted in {named}"),
+                rest => format!("it conflicted in {named} and {rest} more"),
+            }
+        }
+        Err(error) => format!(
+            "its conflicted paths could not be listed: {}",
+            error.message
+        ),
     }
 }
 
