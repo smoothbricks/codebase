@@ -549,7 +549,7 @@ pub enum RecoveryScope {
     /// [`Self::Workspaces`] of its one workspace observes, finishing nothing, as [`Self::Inspect`]
     /// does, so it takes no image lock. The command that asked for the supervisor opened under its
     /// own scope first and finished what was its; a lock held now is a live lifecycle operation's
-    /// (a fork holds its source's, `main`'s included, through its whole clone), and residue left
+    /// (a fork holds its source's, `main`'s included, while it clones it), and residue left
     /// since is that operation's, or the next ordinary command's, to finish.
     Supervisor(WorkspaceName),
     /// Inspection (`doctor` without `--repair`): the opening finishes nothing. No lifecycle intent
@@ -4062,7 +4062,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 // opening recovers a selected workspace only under its image lock, taken before
                 // recovery reads any sidecar, and waits for none: a lock another process holds is
                 // a live lifecycle operation's (a fork holds its source's, `main`'s included,
-                // through its clone), and that workspace's publication is the holder's, or the
+                // while it clones it), and that workspace's publication is the holder's, or the
                 // next opening's, to finish (07_api.md, "Authority model"). So `ls`, `exec` and
                 // every verb that names a workspace never wait on another's fork of main.
                 let mut held = Vec::with_capacity(publication_locks.len());

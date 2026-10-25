@@ -1787,7 +1787,11 @@ mounts are restored. In order:
    of its own — `startup-heal discover`, `startup-heal open <repo>`, `startup-heal mount <repo>/main` — so a slow pass
    reads as the step that spent the time. Session workspaces are not attached by the pass: a session the kernel still
    holds (a gateway restart without a reboot) stays attached, and every other session stays detached until a verb uses
-   it.
+   it. The pass takes each main's image lock without waiting. A held lock is a live lifecycle operation's, a fork of
+   main or another command's, whose process may itself be waiting on this starting gateway, so a wait would hold the
+   start until that process ended. A main that already stands mounted at its checkout is served as it stands under the
+   held lock; one that needs healing is reported as left to the holder, and a background wait, holding no other lock,
+   heals it once the holder lets go. The pass goes on either way.
 4. Restore every attached workspace's session into the gateway. A session whose endpoint an install carried serves on
    that listener, connections queued on it included; any other binds its endpoint. Once every session is restored, each
    carried listener no session claimed is closed, so its queued connections are reset rather than left waiting for
@@ -1800,16 +1804,17 @@ missing checkout, marker or process; a failed or busy retirement remains fenced 
 healthy projects' mount restoration.
 
 Until step 4 ends, status carries `healing`: `{ mounting: { projects: N } }` with the projects not yet mounted (never 0;
-a project counts once its main is mounted), then `restoringSessions`; it is absent once the pass is over, and
-`cowshed gateway status`, `doctor` (`gateway-starting`), and `gateway start`'s wait say so in those words. Everything
-that depends on what the pass restores is refused by type meanwhile, never reported as an absent gateway: a session
-`install` or `remove` on the control socket with failure code `healing`, every command's reconcile with a `Conflict`
-carrying `healing` and the `cowshed gateway status` hint, and every supervisor ensure likewise. Sessions are restored
-from the attachment facts the pass is still changing, so a session installed or removed before it ends would race that
-restore; a supervisor would start in a workspace the pass may not have mounted yet. The supervisors listed in step 2 are
-recovered once the control socket is bound, all at once and in the background, alongside steps 3 and 4 (11_shell.md
-"Supervisor recovery"): while any is still being recovered, status carries `recovering: { supervisors: N }` (never 0;
-absent once none is left), and only a command for one of those workspaces is refused, by the typed recovering refusal.
+a project counts once its main is mounted or left to its lock's holder), then `restoringSessions`; it is absent once the
+pass is over, and `cowshed gateway status`, `doctor` (`gateway-starting`), and `gateway start`'s wait say so in those
+words. Everything that depends on what the pass restores is refused by type meanwhile, never reported as an absent
+gateway: a session `install` or `remove` on the control socket with failure code `healing`, every command's reconcile
+with a `Conflict` carrying `healing` and the `cowshed gateway status` hint, and every supervisor ensure likewise.
+Sessions are restored from the attachment facts the pass is still changing, so a session installed or removed before it
+ends would race that restore; a supervisor would start in a workspace the pass may not have mounted yet. The supervisors
+listed in step 2 are recovered once the control socket is bound, all at once and in the background, alongside steps 3
+and 4 (11_shell.md "Supervisor recovery"): while any is still being recovered, status carries
+`recovering: { supervisors: N }` (never 0; absent once none is left), and only a command for one of those workspaces is
+refused, by the typed recovering refusal.
 
 Serving before the pass ends does not weaken it: the guarantee below is about the checkout path, which no request to the
 gateway makes appear any sooner or later, and answering at once is what lets every client tell "still starting" from

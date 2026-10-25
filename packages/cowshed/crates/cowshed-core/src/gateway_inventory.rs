@@ -224,6 +224,13 @@ pub enum GatewayInventoryError {
     },
     #[error("adopted project {0} records no main workspace to mount")]
     MissingMainWorkspace(RepoId),
+    #[error(
+        "{repo}/{workspace}'s image lock is held by another process and its mount needs healing; startup does not wait for it, and heals it once that process lets go"
+    )]
+    HealLeftToLockHolder {
+        repo: RepoId,
+        workspace: WorkspaceName,
+    },
     #[error(transparent)]
     OwnerScan(#[from] crate::storage::bootstrap::OwnerScanError),
     #[error(transparent)]
@@ -586,23 +593,78 @@ impl ProjectMounts for NativeProjectMounts {
             .collect())
     }
 
+    /// The startup heal of `workspace` (05_gateway.md, "Startup", step 3), which never waits for
+    /// its image lock: a holder is a live lifecycle operation's, and a client may hold main's while
+    /// it waits on this gateway, so a wait here would hold the start until that client is killed.
+    /// A main standing settled under the held lock is served as it stands; one that needs healing
+    /// is left to a background wait for the lock, which holds nothing else and heals it once the
+    /// holder lets go.
     async fn mount(
         &self,
         workspace: &LifecycleWorkspace,
     ) -> Result<PathBuf, GatewayInventoryError> {
-        crate::project_retirement::require_project_active(
-            &self.substrate.config().store_root,
-            &self.repo,
-        )
-        .map_err(|error| GatewayInventoryError::InvalidMetadata {
-            path: self.substrate.config().store_root.clone(),
-            message: error.to_string(),
-        })?;
-        Ok(self
-            .substrate
-            .ensure_mounted(workspace, MountIntent { browse: false })
-            .await?)
+        require_active(&self.substrate, &self.repo)?;
+        if let Some(mount) = self.substrate.mount_without_waiting(workspace).await? {
+            return Ok(mount);
+        }
+        let substrate = self.substrate.clone();
+        let repo = self.repo.clone();
+        let deferred = workspace.clone();
+        tokio::spawn(async move {
+            match heal_once_released(&substrate, &repo, &deferred).await {
+                Ok(mount) => cowshed_os::eprintln!(
+                    "cowshed: {repo}: {} mounted at {} once its image lock's holder let go",
+                    deferred.name(),
+                    mount.display()
+                ),
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: {repo}: {} is not mounted after its image lock's holder let go: {error}",
+                        deferred.name()
+                    );
+                    cowshed_os::eprintln!("next: cowshed doctor");
+                }
+            }
+        });
+        Err(GatewayInventoryError::HealLeftToLockHolder {
+            repo: self.repo.clone(),
+            workspace: workspace.name().clone(),
+        })
     }
+}
+
+/// Refuse the heal of a project whose retirement owns it.
+fn require_active(
+    substrate: &ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+    repo: &RepoId,
+) -> Result<(), GatewayInventoryError> {
+    crate::project_retirement::require_project_active(&substrate.config().store_root, repo).map_err(
+        |error| GatewayInventoryError::InvalidMetadata {
+            path: substrate.config().store_root.clone(),
+            message: error.to_string(),
+        },
+    )
+}
+
+/// A startup heal left to the holder of its image lock: under a project reader lease of its own,
+/// as the pass's open holds one, it waits for the lock and settles the mount.
+async fn heal_once_released(
+    substrate: &ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+    repo: &RepoId,
+    workspace: &LifecycleWorkspace,
+) -> Result<PathBuf, GatewayInventoryError> {
+    let store = &substrate.config().store_root;
+    let _lease =
+        crate::project_retirement::acquire_project_reader(store, repo).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: store.clone(),
+                message: error.to_string(),
+            }
+        })?;
+    require_active(substrate, repo)?;
+    Ok(substrate
+        .ensure_mounted(workspace, MountIntent { browse: false })
+        .await?)
 }
 
 /// One project prepared for heal, with nothing mounted yet.

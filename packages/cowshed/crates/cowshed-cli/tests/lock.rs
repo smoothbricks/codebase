@@ -1300,7 +1300,7 @@ const IMAGE_STORE_ENV: &str = "COWSHED_TEST_IMAGE_STORE";
 const IMAGE_WORKSPACE_ENV: &str = "COWSHED_TEST_IMAGE_WORKSPACE";
 
 /// Not a test of its own: another process's lifecycle operation taking one image lock, as a fork
-/// takes its source's (`main.dmg.lock`) for its whole clone. Run as this binary with
+/// takes its source's (`main.dmg.lock`) while it clones it. Run as this binary with
 /// [`IMAGE_LOCK_ENV`] set, it takes the lock through a directory store's execution host, the
 /// path every lifecycle operation's image lock takes, for a fork of the workspace
 /// [`IMAGE_WORKSPACE_ENV`] names, says `held` on stderr once it holds it, and holds it until its

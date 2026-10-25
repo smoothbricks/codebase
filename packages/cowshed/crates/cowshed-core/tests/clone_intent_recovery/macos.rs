@@ -1416,6 +1416,48 @@ async fn an_ordinary_opening_waits_for_no_image_lock_another_process_holds() {
         .expect("stop the reopened runtime");
 }
 
+/// Gateway startup's heal of main waits for no image lock another process holds (05_gateway.md,
+/// "Startup", step 3): such a process can itself be waiting on the starting gateway. At two
+/// installs the start sat at "mounting 2 adopted projects", its heal in `flock` on
+/// `main.dmg.lock`, until the clients holding it were killed. With another process holding
+/// main's lock, the heal answers at once: main served as it stands when it is settled, or its heal
+/// left to the lock's holder, never a wait.
+#[tokio::test]
+async fn gateway_startup_heals_main_without_waiting_for_another_process_holding_its_lock() {
+    let fixture = Fixture::new("heal-locks");
+    let runtime = fixture.adopt().await;
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the controller that adopted main");
+    let lock = fixture
+        .layout()
+        .canonical_image(&WorkspaceName::main())
+        .expect("main's image")
+        .lock()
+        .to_owned();
+    let scratch = fixture.checkout.parent().expect("the scratch root");
+    let holder = LockHolder::hold(scratch, fixture.storage.store(), &lock);
+
+    let inventory = cowshed_core::NativeGatewayInventory::new(fixture.storage.clone());
+    let progress = cowshed_core::StartupHealState::mounting(1);
+    let outcomes = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        inventory.heal(vec![fixture.repo.clone()], &progress),
+    )
+    .await
+    .expect("the heal waits for no lock another process holds");
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    match &outcomes[0].main {
+        Ok(mount) => assert!(mount.is_dir(), "main's mount {}", mount.display()),
+        Err(cowshed_core::GatewayInventoryError::HealLeftToLockHolder { workspace, .. }) => {
+            assert_eq!(*workspace, WorkspaceName::main());
+        }
+        Err(error) => panic!("the heal neither served main nor left it to its holder: {error}"),
+    }
+    holder.release();
+}
+
 /// Names the scratch root of the fixture whose `served` workspace this test binary serves when it
 /// runs as [`supervisor_process`].
 const SUPERVISOR_SCRATCH_ENV: &str = "COWSHED_TEST_SUPERVISOR_SCRATCH";
