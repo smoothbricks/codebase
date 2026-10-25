@@ -2172,6 +2172,30 @@ where
             .await
     }
 
+    /// Wait until no other process holds `workspace`'s image lock, then let go of it at once.
+    /// A caller that [`Self::mount_without_waiting`] answered `None` waits so, holding no lease,
+    /// before it takes its lease and mounts without waiting again (05_gateway.md, "Startup",
+    /// step 3; 01_storage.md, "Lock order").
+    pub(crate) async fn wait_for_mount_lock(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<(), ApfsStorageError> {
+        let lock = workspace_lock_path(&self.config, workspace.repo(), workspace.name())?;
+        let holding = LockHolding::of(LockOperation::Mount, workspace.name());
+        let host = Arc::clone(&self.host);
+        self.lane
+            .dispatch(move || {
+                lock_images_in(
+                    host.as_ref(),
+                    std::slice::from_ref(&lock),
+                    LockMode::Wait,
+                    &holding,
+                )
+                .map(drop)
+            })
+            .await
+    }
+
     /// Mount `workspace` for the start of its supervisor (11_shell.md, "Supervisor"):
     /// [`Self::mount_without_waiting`], and a mount that needs the held lock waits for it in
     /// `flock` once it has said on stderr which processes hold it. The wait has no deadline of

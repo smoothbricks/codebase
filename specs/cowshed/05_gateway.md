@@ -1925,8 +1925,10 @@ mounts are restored. In order:
    it. The pass takes each main's image lock without waiting. A held lock is a live lifecycle operation's, a fork of
    main or another command's, whose process may itself be waiting on this starting gateway, so a wait would hold the
    start until that process ended. A main that already stands mounted at its checkout is served as it stands under the
-   held lock; one that needs healing is reported as left to the holder, and a background wait, holding no other lock,
-   heals it once the holder lets go. The pass goes on either way.
+   held lock; one that needs healing is reported as left to the holder, and the pass goes on. A background task heals it
+   in the shape of startup recovery's wait (01_storage.md, "Lock order"): it waits for that lock alone, holding no
+   lease, then takes the project's reader lease, refuses a project whose retirement owns it by then, and mounts main
+   without waiting, letting go of the lease to wait again if another process took the lock meanwhile.
 4. Restore every attached workspace's session into the gateway. A session whose endpoint an install carried serves on
    that listener, connections queued on it included; any other binds its endpoint. Once every session is restored, each
    carried listener no session claimed is closed, so its queued connections are reset rather than left waiting for

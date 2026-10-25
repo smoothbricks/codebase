@@ -26,8 +26,8 @@ use crate::storage::apfs::{
 use crate::storage::bootstrap::ValidatedHostStorage;
 use crate::storage::directory::DirectoryExecutionHost;
 use crate::storage::lifecycle::{
-    CheckpointFact, DerivationError, DerivedWorkspace, LifecycleWorkspace, MountIntent, MountJoin,
-    MountState, StorageFact, Substrate, derive_workspaces,
+    CheckpointFact, DerivationError, DerivedWorkspace, LifecycleWorkspace, MountJoin, MountState,
+    StorageFact, Substrate, derive_workspaces,
 };
 use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
@@ -528,61 +528,89 @@ trait HealSource: Send + Sync {
     ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError>;
 }
 
+/// The heal of a store whose workspaces are kernel volumes.
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeHealSource;
 
 #[async_trait]
 impl HealSource for NativeHealSource {
-    /// A project with no adopted checkout path is refused rather than defaulted.
-    ///
-    /// Heal exists to put main where the user's tree expects it; without that path there is no
-    /// such place, and mounting main anywhere else would create the dangling checkout this pass is
-    /// here to prevent.
     async fn open(
         &self,
         storage: &ValidatedHostStorage,
         repo: &RepoId,
     ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError> {
-        let retirement_lease =
-            crate::project_retirement::acquire_project_reader(storage.store(), repo).map_err(
-                |error| GatewayInventoryError::InvalidMetadata {
-                    path: storage.store().to_owned(),
-                    message: error.to_string(),
-                },
-            )?;
-        let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
-            GatewayInventoryError::InvalidMetadata {
-                path: storage.store().to_owned(),
-                message: error.to_string(),
-            }
-        })?;
-        let checkout_path = authoritative_checkout_path(&layout, repo)?.ok_or_else(|| {
-            GatewayInventoryError::InvalidMetadata {
-                path: layout.project().project_root.clone(),
-                message: "project records no adopted checkout path".to_owned(),
-            }
-        })?;
-        let config = project_substrate_config(storage, checkout_path);
-        let host = MacOsApfsExecutionHost::new(
-            SystemCommandRunner::new(config.namespace),
-            config.clone(),
-        )?;
-        Ok(Arc::new(NativeProjectMounts {
-            repo: repo.clone(),
-            substrate: ApfsSubstrate::new(config, host),
-            _retirement_lease: retirement_lease,
-        }))
+        open_project_mounts(storage, repo, |config| {
+            Ok(MacOsApfsExecutionHost::new(
+                SystemCommandRunner::new(config.namespace),
+                config.clone(),
+            )?)
+        })
     }
 }
 
-struct NativeProjectMounts {
+/// The heal of a caller-owned directory store: it mounts through the directory host, whose mount
+/// records [`DirectoryInventorySource`] reads, never through the kernel.
+#[derive(Clone, Copy, Debug, Default)]
+struct DirectoryHealSource;
+
+#[async_trait]
+impl HealSource for DirectoryHealSource {
+    async fn open(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+    ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError> {
+        open_project_mounts(storage, repo, |config| {
+            Ok(DirectoryExecutionHost::new(config.clone())?)
+        })
+    }
+}
+
+/// Open `repo`'s mount side, under a project reader lease, on the host `host` builds from the
+/// project's substrate configuration.
+///
+/// A project with no adopted checkout path is refused rather than defaulted. Heal exists to put
+/// main where the user's tree expects it; without that path there is no such place, and mounting
+/// main anywhere else would create the dangling checkout this pass is here to prevent.
+fn open_project_mounts<H: ApfsExecutionHost>(
+    storage: &ValidatedHostStorage,
+    repo: &RepoId,
+    host: impl FnOnce(&ApfsSubstrateConfig) -> Result<H, GatewayInventoryError>,
+) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError> {
+    let retirement_lease = crate::project_retirement::acquire_project_reader(storage.store(), repo)
+        .map_err(|error| GatewayInventoryError::InvalidMetadata {
+            path: storage.store().to_owned(),
+            message: error.to_string(),
+        })?;
+    let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
+        GatewayInventoryError::InvalidMetadata {
+            path: storage.store().to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let checkout_path = authoritative_checkout_path(&layout, repo)?.ok_or_else(|| {
+        GatewayInventoryError::InvalidMetadata {
+            path: layout.project().project_root.clone(),
+            message: "project records no adopted checkout path".to_owned(),
+        }
+    })?;
+    let config = project_substrate_config(storage, checkout_path);
+    let host = host(&config)?;
+    Ok(Arc::new(SubstrateMounts {
+        repo: repo.clone(),
+        substrate: ApfsSubstrate::new(config, host),
+        _retirement_lease: retirement_lease,
+    }))
+}
+
+struct SubstrateMounts<H> {
     repo: RepoId,
-    substrate: ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+    substrate: ApfsSubstrate<H>,
     _retirement_lease: crate::project_retirement::ProjectReadLease,
 }
 
 #[async_trait]
-impl ProjectMounts for NativeProjectMounts {
+impl<H: ApfsExecutionHost> ProjectMounts for SubstrateMounts<H> {
     async fn workspaces(&self) -> Result<Vec<LifecycleWorkspace>, GatewayInventoryError> {
         Ok(self
             .substrate
@@ -597,8 +625,8 @@ impl ProjectMounts for NativeProjectMounts {
     /// its image lock: a holder is a live lifecycle operation's, and a client may hold main's while
     /// it waits on this gateway, so a wait here would hold the start until that client is killed.
     /// A main standing settled under the held lock is served as it stands; one that needs healing
-    /// is left to a background wait for the lock, which holds nothing else and heals it once the
-    /// holder lets go.
+    /// is left to [`heal_once_released`] in the background, which waits for the lock holding no
+    /// lease and heals it once the holder lets go.
     async fn mount(
         &self,
         workspace: &LifecycleWorkspace,
@@ -611,20 +639,23 @@ impl ProjectMounts for NativeProjectMounts {
         let repo = self.repo.clone();
         let deferred = workspace.clone();
         tokio::spawn(async move {
+            let name = deferred.name();
             match heal_once_released(&substrate, &repo, &deferred).await {
-                Ok(mount) => cowshed_os::eprintln!(
-                    "cowshed: {repo}: {} mounted at {} once its image lock's holder let go",
-                    deferred.name(),
-                    mount.display()
-                ),
-                Err(error) => {
+                Ok(mount) => {
                     cowshed_os::eprintln!(
-                        "cowshed: {repo}: {} is not mounted after its image lock's holder let go: {error}",
-                        deferred.name()
+                        "cowshed: {repo}: {name} mounted at {} once its image lock's holder let go",
+                        mount.display()
                     );
-                    cowshed_os::eprintln!("next: cowshed doctor");
+                    return;
                 }
+                Err(DeferredHealError::Wait(error)) => cowshed_os::eprintln!(
+                    "cowshed: {repo}: {name} is not mounted: waiting for its image lock failed: {error}"
+                ),
+                Err(DeferredHealError::Heal(error)) => cowshed_os::eprintln!(
+                    "cowshed: {repo}: {name} is not mounted after its image lock's holder let go: {error}"
+                ),
             }
+            cowshed_os::eprintln!("next: cowshed doctor");
         });
         Err(GatewayInventoryError::HealLeftToLockHolder {
             repo: self.repo.clone(),
@@ -634,8 +665,8 @@ impl ProjectMounts for NativeProjectMounts {
 }
 
 /// Refuse the heal of a project whose retirement owns it.
-fn require_active(
-    substrate: &ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+fn require_active<H: ApfsExecutionHost>(
+    substrate: &ApfsSubstrate<H>,
     repo: &RepoId,
 ) -> Result<(), GatewayInventoryError> {
     crate::project_retirement::require_project_active(&substrate.config().store_root, repo).map_err(
@@ -646,25 +677,47 @@ fn require_active(
     )
 }
 
-/// A startup heal left to the holder of its image lock: under a project reader lease of its own,
-/// as the pass's open holds one, it waits for the lock and settles the mount.
-async fn heal_once_released(
-    substrate: &ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+/// Why a startup heal left to the holder of its image lock mounted nothing.
+#[derive(Debug)]
+enum DeferredHealError {
+    /// The wait for the lock failed; nothing ran after it.
+    Wait(ApfsStorageError),
+    /// The holder let go, and the heal that followed failed.
+    Heal(GatewayInventoryError),
+}
+
+/// A startup heal left to the holder of its image lock, in the shape of startup recovery's wait
+/// for one (01_storage.md, "Lock order"): it waits for that lock holding no lease, then takes a
+/// project reader lease of its own, as the pass's open holds one, refuses a project whose
+/// retirement owns it by then, and mounts without waiting. A lock another process took again
+/// meanwhile is waited for again, the lease let go first.
+async fn heal_once_released<H: ApfsExecutionHost>(
+    substrate: &ApfsSubstrate<H>,
     repo: &RepoId,
     workspace: &LifecycleWorkspace,
-) -> Result<PathBuf, GatewayInventoryError> {
+) -> Result<PathBuf, DeferredHealError> {
     let store = &substrate.config().store_root;
-    let _lease =
-        crate::project_retirement::acquire_project_reader(store, repo).map_err(|error| {
-            GatewayInventoryError::InvalidMetadata {
-                path: store.clone(),
-                message: error.to_string(),
-            }
-        })?;
-    require_active(substrate, repo)?;
-    Ok(substrate
-        .ensure_mounted(workspace, MountIntent { browse: false })
-        .await?)
+    loop {
+        substrate
+            .wait_for_mount_lock(workspace)
+            .await
+            .map_err(DeferredHealError::Wait)?;
+        let _lease =
+            crate::project_retirement::acquire_project_reader(store, repo).map_err(|error| {
+                DeferredHealError::Heal(GatewayInventoryError::InvalidMetadata {
+                    path: store.clone(),
+                    message: error.to_string(),
+                })
+            })?;
+        require_active(substrate, repo).map_err(DeferredHealError::Heal)?;
+        let mounted = substrate
+            .mount_without_waiting(workspace)
+            .await
+            .map_err(|error| DeferredHealError::Heal(error.into()))?;
+        if let Some(mount) = mounted {
+            return Ok(mount);
+        }
+    }
 }
 
 /// One project prepared for heal, with nothing mounted yet.
@@ -939,13 +992,14 @@ impl NativeGatewayInventory {
     }
 
     /// Inventory over a caller-owned directory store: mount facts come from the mount
-    /// records the directory host proves, never from the kernel mount table. Only a
-    /// caller that opened a directory runtime selects this; native stores keep [`Self::new`].
+    /// records the directory host proves, never from the kernel mount table, and its startup
+    /// heal mounts through that host. Only a caller that opened a directory runtime selects
+    /// this; native stores keep [`Self::new`].
     pub fn for_directory_store(storage: ValidatedHostStorage) -> Self {
         Self {
             storage,
             source: Arc::new(DirectoryInventorySource),
-            heal: Arc::new(NativeHealSource),
+            heal: Arc::new(DirectoryHealSource),
         }
     }
 

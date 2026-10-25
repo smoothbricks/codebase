@@ -1419,12 +1419,11 @@ async fn an_ordinary_opening_waits_for_no_image_lock_another_process_holds() {
 /// Gateway startup's heal of main waits for no image lock another process holds (05_gateway.md,
 /// "Startup", step 3): such a process can itself be waiting on the starting gateway. At two
 /// installs the start sat at "mounting 2 adopted projects", its heal in `flock` on
-/// `main.dmg.lock`, until the clients holding it were killed. With another process holding
-/// main's lock, the heal answers at once: main served as it stands when it is settled, or its heal
-/// left to the lock's holder, never a wait.
+/// `main.dmg.lock`, until the clients holding it were killed. A main standing settled at its
+/// checkout, as adoption leaves it, is served as it stands while another process holds its lock.
 #[tokio::test]
-async fn gateway_startup_heals_main_without_waiting_for_another_process_holding_its_lock() {
-    let fixture = Fixture::new("heal-locks");
+async fn gateway_startup_serves_a_settled_main_while_another_process_holds_its_lock() {
+    let fixture = Fixture::new("heal-settled");
     let runtime = fixture.adopt().await;
     runtime
         .shutdown()
@@ -1439,20 +1438,187 @@ async fn gateway_startup_heals_main_without_waiting_for_another_process_holding_
     let scratch = fixture.checkout.parent().expect("the scratch root");
     let holder = LockHolder::hold(scratch, fixture.storage.store(), &lock);
 
-    let inventory = cowshed_core::NativeGatewayInventory::new(fixture.storage.clone());
+    let inventory =
+        cowshed_core::NativeGatewayInventory::for_directory_store(fixture.storage.clone());
     let progress = cowshed_core::StartupHealState::mounting(1);
     // The heal answers at once; one that waited on the holder would be named by the leg's
     // no-progress bound, never by a clock of this test's own (README "Test Clock Policy").
     let outcomes = inventory.heal(vec![fixture.repo.clone()], &progress).await;
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    let mount = outcomes[0]
+        .main
+        .as_ref()
+        .unwrap_or_else(|error| panic!("the heal serves settled main as it stands: {error}"));
+    assert_eq!(
+        fs::read(mount.join("tracked")).expect("main's mount, served under the held lock"),
+        b"tracked\n"
+    );
+    holder.release();
+}
+
+/// Names the scratch root of the fixture whose project this test binary heals when it runs as
+/// [`gateway_heal_process`].
+const GATEWAY_HEAL_SCRATCH_ENV: &str = "COWSHED_TEST_GATEWAY_HEAL_SCRATCH";
+/// What [`gateway_heal_process`] says on stderr once its heal has left main to the lock's holder.
+const LEFT_TO_HOLDER: &str = "gateway heal: main left to its lock's holder";
+
+/// A main that needs healing while another process holds its image lock is left to that holder
+/// at once (05_gateway.md, "Startup", step 3), and a background wait mounts it once the holder
+/// lets go. The heal runs in a gateway process of its own, [`gateway_heal_process`], whose
+/// stderr orders each step: the holder is released only once the heal has left main to it, and
+/// the background heal's own line ends the wait for the mount.
+#[tokio::test]
+async fn gateway_startup_leaves_an_unsettled_main_to_its_lock_holder_and_heals_it_once_released() {
+    let fixture = Fixture::new("heal-held");
+    let runtime = fixture.adopt().await;
+    fixture
+        .call(
+            &runtime,
+            "coordinator.detach",
+            json!({ "repoId": fixture.repo, "workspace": "main" }),
+        )
+        .await
+        .expect("detach main, so the heal has to mount it");
+    runtime
+        .shutdown()
+        .await
+        .expect("stop the controller that detached main");
+    let tracked = fixture.checkout.join("tracked");
+    assert!(!tracked.exists(), "detached main leaves its checkout empty");
+    let lock = fixture
+        .layout()
+        .canonical_image(&WorkspaceName::main())
+        .expect("main's image")
+        .lock()
+        .to_owned();
+    let scratch = fixture.checkout.parent().expect("the scratch root");
+    let holder = LockHolder::hold(scratch, fixture.storage.store(), &lock);
+    let mut gateway =
+        tokio::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", "macos::gateway_heal_process", "--nocapture"])
+            .env(GATEWAY_HEAL_SCRATCH_ENV, scratch)
+            .current_dir(scratch)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("start the gateway heal process");
+    let mut said =
+        tokio::io::BufReader::new(gateway.stderr.take().expect("the heal process's stderr"));
+    let mut transcript = String::new();
+    if read_said(&mut said, &mut transcript, LEFT_TO_HOLDER)
+        .await
+        .is_none()
+    {
+        panic!(
+            "the heal process ended before it left main to its lock's holder; it said: {transcript}"
+        );
+    }
+    assert!(
+        !tracked.exists(),
+        "main stays unmounted while the holder holds its lock"
+    );
+
+    holder.release();
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        read_said(
+            &mut said,
+            &mut transcript,
+            &format!("cowshed: {}: main ", fixture.repo),
+        ),
+    )
+    .await;
+    let line = match answered {
+        Ok(Some(line)) => line,
+        Ok(None) => panic!(
+            "the heal process ended before main's background heal answered; it said: {transcript}"
+        ),
+        Err(_) => panic!(
+            "main's background heal did not answer within 60 s of the holder letting go; the heal process said: {transcript}"
+        ),
+    };
+    assert!(
+        line.starts_with(&format!("cowshed: {}: main mounted at ", fixture.repo))
+            && line
+                .trim_end()
+                .ends_with(" once its image lock's holder let go"),
+        "main is mounted once the holder lets go; the heal process said: {transcript}"
+    );
+    assert_eq!(
+        fs::read(&tracked).expect("main's checkout, healed once the holder let go"),
+        b"tracked\n"
+    );
+    drop(gateway.stdin.take());
+    let status = gateway.wait().await.expect("wait for the heal process");
+    assert!(
+        status.success(),
+        "the heal process failed: {status}; it said: {transcript}"
+    );
+}
+
+/// Reads `said` line by line into `transcript` until a line that starts with `prefix`, and
+/// answers that line, or `None` once the stream ends without one.
+async fn read_said(
+    said: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    transcript: &mut String,
+    prefix: &str,
+) -> Option<String> {
+    use tokio::io::AsyncBufReadExt as _;
+    loop {
+        let start = transcript.len();
+        let read = said
+            .read_line(transcript)
+            .await
+            .expect("the process's stderr");
+        if read == 0 {
+            return None;
+        }
+        if transcript[start..].starts_with(prefix) {
+            return Some(transcript[start..].to_owned());
+        }
+    }
+}
+
+/// Not a test of its own: the gateway of
+/// [`gateway_startup_leaves_an_unsettled_main_to_its_lock_holder_and_heals_it_once_released`].
+/// Run as this binary with [`GATEWAY_HEAL_SCRATCH_ENV`] set, it makes the startup heal of that
+/// fixture's project, requires that main was left to its lock's holder without a wait, says
+/// [`LEFT_TO_HOLDER`] on stderr, and keeps its runtime serving the background heal until its
+/// stdin closes. Run any other way it does nothing.
+#[tokio::test]
+async fn gateway_heal_process() {
+    let Some(scratch) = std::env::var_os(GATEWAY_HEAL_SCRATCH_ENV).map(PathBuf::from) else {
+        return;
+    };
+    // Its own namespace suffices: a directory store carries no volume labels or disk-tool leases.
+    let namespace = TestNamespace::mint().expect("a test namespace");
+    let inventory = cowshed_core::NativeGatewayInventory::for_directory_store(fixture_storage(
+        namespace, &scratch,
+    ));
+    let progress = cowshed_core::StartupHealState::mounting(1);
+    let outcomes = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        inventory.heal(vec![fixture_repo()], &progress),
+    )
+    .await
+    .expect("the heal waits for no lock another process holds");
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     match &outcomes[0].main {
-        Ok(mount) => assert!(mount.is_dir(), "main's mount {}", mount.display()),
         Err(cowshed_core::GatewayInventoryError::HealLeftToLockHolder { workspace, .. }) => {
             assert_eq!(*workspace, WorkspaceName::main());
         }
-        Err(error) => panic!("the heal neither served main nor left it to its holder: {error}"),
+        other => panic!("the heal did not leave unsettled main to its lock's holder: {other:?}"),
     }
-    holder.release();
+    // On stderr, which libtest neither captures nor frames (see [`LockHolder::hold`]).
+    std::io::stderr()
+        .write_all(format!("{LEFT_TO_HOLDER}\n").as_bytes())
+        .expect("say main was left to its lock's holder");
+    tokio::task::spawn_blocking(|| std::io::copy(&mut std::io::stdin(), &mut std::io::sink()))
+        .await
+        .expect("read stdin")
+        .expect("wait for stdin to close");
 }
 
 /// Names the scratch root of the fixture whose `served` workspace this test binary serves when it
