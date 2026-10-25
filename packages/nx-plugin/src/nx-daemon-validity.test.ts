@@ -1256,3 +1256,73 @@ it('fails every later request at once once the daemon is lost under a request an
     FIXTURE_WORKSPACE,
   );
 });
+
+/** A client of the installed daemon client that asks once and says how the request ended. */
+const ASK_ONCE = `
+const { writeSync } = require('node:fs');
+const { daemonClient } = require(process.env.NX_DAEMON_CLIENT);
+daemonClient.glob(['*.json'], []).then(
+  () => writeSync(1, 'asked\\tanswered\\n'),
+  (error) => writeSync(1, 'asked\\tfailed\\t' + String(error?.message ?? error).split('\\n')[0] + '\\n'),
+).then(() => process.exit(0));
+`;
+
+/**
+ * A client that sent its request to a socket whose daemon is gone (2026-10-25: a client waited at no CPU for a daemon
+ * whose process no longer existed). Something else still holds the socket and accepts, and nothing answers. The
+ * request fails once the client sees that the pid its record names is not running, naming that pid and the socket,
+ * instead of waiting out the 20-minute keep-alive.
+ */
+it('fails a request naming the pid and socket when the recorded daemon is gone and its socket still accepts', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-gone-',
+    async ({ socketDirectory, workspace }) => {
+      await fixtureWorkspace(workspace);
+      const socketPath = join(socketDirectory, 'd.sock');
+      await mkdir(socketDirectory, { recursive: true });
+      // The listener a surviving process kept: it takes every connection and never writes.
+      const listening = Promise.withResolvers<void>();
+      const leftover = createServer(() => {}).once('error', listening.reject);
+      leftover.listen(socketPath, listening.resolve);
+      await listening.promise;
+      // The daemon the record names: a process that has ended.
+      const ended = spawn('node', ['-e', ''], { stdio: 'ignore' });
+      const gonePid = ended.pid;
+      if (gonePid === undefined) throw new Error('could not start the process the record names');
+      await guardEvent(once(ended, 'exit'), `the recorded daemon ${gonePid} to end`, () => '');
+      await mkdir(dirname(recordPath(workspace)), { recursive: true });
+      const { version } = await installedManifest();
+      await writeFile(recordPath(workspace), JSON.stringify({ processId: gonePid, socketPath, nxVersion: version }));
+      try {
+        const client = spawn('node', ['-e', ASK_ONCE], {
+          cwd: workspace,
+          env: { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_DAEMON_CLIENT: daemonClient },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let printed = '';
+        const append = (text: string): void => {
+          printed += text;
+        };
+        client.stdout.setEncoding('utf8').on('data', append);
+        client.stderr.setEncoding('utf8').on('data', append);
+        const [code] = await guardEvent(
+          once(client, 'exit'),
+          'the client asking the gone daemon to exit',
+          () => printed,
+        );
+        const asked = printed.split('\n').find((line) => line.startsWith('asked\t'));
+        expect(asked, printed).toBe(
+          `asked\tfailed\tNx daemon process ${gonePid} is not running, but its socket ${socketPath} took this client's GLOB request: nothing will answer it.`,
+        );
+        expect(code, printed).toBe(0);
+      } finally {
+        // The record names a pid nothing holds; the fixture's retirement must not signal a reuse of it.
+        await rm(recordPath(workspace), { force: true });
+        const closed = Promise.withResolvers<void>();
+        leftover.close(() => closed.resolve());
+        await closed.promise;
+      }
+    },
+    FIXTURE_WORKSPACE,
+  );
+});

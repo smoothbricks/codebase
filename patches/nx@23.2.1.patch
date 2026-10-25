@@ -384,7 +384,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..6b982fae848cc82a310eee9a1036be1a
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb6564074a011 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..efa1a128d3e1bb3d46fb29e6ceb086b8b94eeb30 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -395,7 +395,16 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const tmp_dir_1 = require("../tmp-dir");
  const sandbox_socket_hint_1 = require("../sandbox-socket-hint");
-@@ -92,6 +91,8 @@ class DaemonClient {
+@@ -53,6 +52,8 @@ var DaemonStatus;
+     DaemonStatus[DaemonStatus["DISCONNECTED"] = 1] = "DISCONNECTED";
+     DaemonStatus[DaemonStatus["CONNECTED"] = 2] = "CONNECTED";
+ })(DaemonStatus || (DaemonStatus = {}));
++/** How often a request waiting on the daemon checks that the daemon its record names still runs. */
++const DAEMON_LIVENESS_MS = 5000;
+ const WAIT_FOR_SERVER_CONFIG = {
+     delayMs: 10,
+     maxAttempts: 6000, // 6000 * 10ms = 60 seconds
+@@ -92,6 +93,8 @@ class DaemonClient {
          this.projectGraphListenerFramingFailures = 0;
          this.projectGraphListenerCallbacks = new Map();
          this.envReflectionSent = false;
@@ -404,7 +413,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
          try {
              this.nxJson = (0, configuration_1.readNxJson)();
          }
-@@ -135,12 +136,55 @@ class DaemonClient {
+@@ -135,12 +138,55 @@ class DaemonClient {
                  });
                  this._enabled = false;
              }
@@ -460,7 +469,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
      reset() {
          this.socketMessenger?.close();
          this.socketMessenger = null;
-@@ -157,6 +201,23 @@ class DaemonClient {
+@@ -157,6 +203,23 @@ class DaemonClient {
          this._daemonStatus = DaemonStatus.DISCONNECTED;
          this._waitForDaemonReady = new Promise((resolve) => (this._daemonReady = resolve));
      }
@@ -484,7 +493,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
      getSocketPath() {
          const daemonProcessJson = (0, cache_1.readDaemonProcessJsonCache)();
          if (daemonProcessJson?.socketPath) {
-@@ -668,27 +729,6 @@ class DaemonClient {
+@@ -668,27 +731,6 @@ class DaemonClient {
          };
          return this.sendToDaemonViaQueue(message);
      }
@@ -512,7 +521,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
-@@ -813,8 +853,15 @@ class DaemonClient {
+@@ -813,8 +855,15 @@ class DaemonClient {
                  }
              }
              if (!probe.available) {
@@ -530,7 +539,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
              }
              this.setUpConnection();
              this._daemonStatus = DaemonStatus.CONNECTED;
-@@ -825,19 +872,38 @@ class DaemonClient {
+@@ -825,19 +874,38 @@ class DaemonClient {
          }
          else if (this._daemonStatus == DaemonStatus.CONNECTING) {
              await this._waitForDaemonReady;
@@ -576,7 +585,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
      }
      setUpConnection() {
          const socketPath = this.getSocketPath();
-@@ -846,7 +912,13 @@ class DaemonClient {
+@@ -846,7 +914,13 @@ class DaemonClient {
          // sendMessageToDaemon method uses a keep-alive setTimeout to
          // explicitly hold the event loop open while awaiting a response.
          socket.unref();
@@ -591,7 +600,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
              // it's ok for the daemon to terminate if the client doesn't wait on
              // any messages from the daemon
              if (this.queue.isEmpty()) {
-@@ -892,12 +964,22 @@ class DaemonClient {
+@@ -892,12 +966,22 @@ class DaemonClient {
              else {
                  error = daemonProcessException(err.toString());
              }
@@ -614,7 +623,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
          // Create a new ready promise for new requests to wait on
          this._waitForDaemonReady = new Promise((resolve) => (this._daemonReady = resolve));
          // Set status to CONNECTING so new requests will wait for reconnection
-@@ -911,9 +993,7 @@ class DaemonClient {
+@@ -911,9 +995,7 @@ class DaemonClient {
          catch (err) {
              if (err instanceof daemon_socket_messenger_1.VersionMismatchError) {
                  // New daemon has different version - reject with error so caller can handle
@@ -625,7 +634,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
                  return;
              }
              throw err;
-@@ -934,10 +1014,8 @@ class DaemonClient {
+@@ -934,10 +1016,8 @@ class DaemonClient {
              }
          }
          else {
@@ -638,7 +647,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
          }
      }
      establishConnection() {
-@@ -998,6 +1076,9 @@ class DaemonClient {
+@@ -998,6 +1078,9 @@ class DaemonClient {
          return { available: false, refusal };
      }
      async sendMessageToDaemon(message, force) {
@@ -648,7 +657,49 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
          // the first message sent to the daemon includes an env prop
          // that updates the process.env values on the daemon.
          if (!this.envReflectionSent && !global.NX_PLUGIN_WORKER) {
-@@ -1055,7 +1136,13 @@ class DaemonClient {
+@@ -1005,7 +1088,15 @@ class DaemonClient {
+             this.envReflectionSent = true;
+         }
+         await this.startDaemonIfNecessary();
++        // The request waits on the daemon its record names. Its socket can outlive it: a
++        // listener a surviving child inherited accepts the request and never answers, and the
++        // keep-alive below would wait 20 min at no CPU. So while the request waits, that pid is
++        // checked every DAEMON_LIVENESS_MS, and a daemon that is gone ends the request naming
++        // its pid and socket (smoothbricks specs/cowshed/05_gateway.md, "Deadlines").
++        const daemonPid = (0, cache_1.getDaemonProcessIdSync)();
++        const socketPath = (0, cache_1.readDaemonProcessJsonCache)()?.socketPath ?? null;
+         let keepAlive;
++        let liveness;
+         return new Promise((resolve, reject) => {
+             perf_hooks_1.performance.mark('sendMessageToDaemon-start');
+             // An open promise isn't enough to keep the event loop
+@@ -1016,12 +1107,25 @@ class DaemonClient {
+             keepAlive = setTimeout(() => {
+                 reject(new Error('The daemon timed out while processing ' + message.type));
+             }, 20 * 60 * 1000);
++            liveness = Number.isInteger(daemonPid) && setInterval(() => {
++                if (daemonRuns(daemonPid)) {
++                    return;
++                }
++                const error = daemonGone(daemonPid, socketPath, message.type);
++                this.loseDaemon(process.env.NX_DAEMON_START === 'never' ? daemonStartForbidden(error) : error);
++            }, DAEMON_LIVENESS_MS);
++            if (liveness) {
++                liveness.unref();
++            }
+             this.currentMessage = message;
+             this.currentResolve = resolve;
+             this.currentReject = reject;
+             this.socketMessenger.sendMessage(message, force);
+         }).finally(() => {
+             clearTimeout(keepAlive);
++            if (liveness) {
++                clearInterval(liveness);
++            }
+         });
+     }
+     async registerDaemonProcessWithMetricsService(daemonPid) {
+@@ -1055,7 +1159,13 @@ class DaemonClient {
                  console[parsedResult.level](parsedResult.message);
                  return;
              }
@@ -663,7 +714,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
                  this.currentReject(parsedResult.error);
              }
              else {
-@@ -1132,8 +1219,11 @@ class DaemonClient {
+@@ -1132,8 +1242,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -677,7 +728,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1161,19 +1251,31 @@ class DaemonClient {
+@@ -1161,19 +1274,31 @@ class DaemonClient {
              ].join('\n'));
          }
      }
@@ -719,18 +770,23 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
              }
          }
          (0, tmp_dir_1.removeSocketDir)();
-@@ -1200,6 +1302,26 @@ function isDocker() {
+@@ -1200,6 +1325,44 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
 +/**
-+ * Whether the process the daemon record names still runs. Read only under
-+ * NX_DAEMON_START=never, before any request, to choose between that daemon and
++ * Whether the process the daemon record names still runs. Read under
++ * NX_DAEMON_START=never before any request, to choose between that daemon and
 + * none: a record whose daemon has gone is a reason to run without one, never to
 + * start one.
 + */
 +function recordedDaemonRuns() {
-+    const pid = (0, cache_1.getDaemonProcessIdSync)();
++    return daemonRuns((0, cache_1.getDaemonProcessIdSync)());
++}
++/**
++ * Whether process `pid` runs. A record that names no pid names nothing to wait on.
++ */
++function daemonRuns(pid) {
 +    if (!Number.isInteger(pid) || pid < 1) {
 +        return false;
 +    }
@@ -743,10 +799,23 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..1edcf31bc1c96114868dcf1f127bb656
 +        return err.code === 'EPERM';
 +    }
 +}
++/**
++ * The daemon a request waited on is gone while its socket still took the request:
++ * nothing will answer it. Names the pid and the socket, so the reader needs no
++ * second run to see which daemon and which leftover listener.
++ */
++function daemonGone(pid, socketPath, type) {
++    const error = new Error([
++        `Nx daemon process ${pid ?? '(none recorded)'} is not running, but its socket ${socketPath ?? '(none recorded)'} took this client's ${type} request: nothing will answer it.`,
++        'A process that outlived the daemon may still hold its socket; nx daemon --stop removes the socket directory.',
++    ].join('\n'));
++    error.daemonGone = true;
++    return error;
++}
  /**
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
-@@ -1226,6 +1348,21 @@ function daemonPermissionException(socketPath, cause) {
+@@ -1226,6 +1389,21 @@ function daemonPermissionException(socketPath, cause) {
      error.daemonPermissionError = true;
      return error;
  }
