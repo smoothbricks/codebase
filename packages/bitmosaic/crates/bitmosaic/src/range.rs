@@ -444,7 +444,7 @@ impl Range for ContainerRange<'_> {
                 *remaining -= skip;
             }
             Self::Array(values) => {
-                *values = &values[values.partition_point(|value| *value < target)..];
+                *values = &values[crate::array::rank(values, target)..];
             }
             _ => {
                 while !self.empty() && self.front() < target {

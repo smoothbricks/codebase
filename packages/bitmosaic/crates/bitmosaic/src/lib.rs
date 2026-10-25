@@ -25,6 +25,7 @@
 // the BTreeSet differential oracle in tests and the roaring-rs oracle in
 // benches/ops.rs.
 
+mod array;
 mod ef;
 mod patch;
 mod range;
@@ -522,7 +523,7 @@ impl Container {
                 let hi = ((guess + margin + 1) as usize).min(residuals.len());
                 (lo..hi).any(|i| Self::cone_value(*first, *scale, residuals, i) == v)
             }
-            Container::Array(values) => values.binary_search(&v).is_ok(),
+            Container::Array(values) => array::contains(&values[..], v),
             // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS = 1024.
             Container::Words { words, .. } => unsafe {
                 *words.get_unchecked((v >> 6) as usize) >> (v & 63) & 1 == 1
@@ -577,7 +578,7 @@ impl Container {
                 }
                 at as u32
             }
-            Container::Array(values) => values.partition_point(|x| *x < v) as u32,
+            Container::Array(values) => array::rank(&values[..], v) as u32,
             Container::Words { words, dir, .. } => {
                 let word = (v >> 6) as usize;
                 // SAFETY: word <= 1023, so word / DIR_STRIDE <= 255 <

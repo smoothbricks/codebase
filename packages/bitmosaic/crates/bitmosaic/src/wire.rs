@@ -1669,6 +1669,11 @@ fn cone_window(first: u16, scale: u64, eps: u8, n: usize, v: u16) -> (usize, usi
 }
 
 /// Binary search over an unaligned little-endian `u16` plane.
+///
+/// Early exit, not the owned plane's counted search (`crate::array`): over
+/// borrowed bytes the count won independent probes 2× but lost dependent
+/// chains by 2–30% (`array-search-*` cells in `benches/ops.rs`), so the
+/// borrowed plane keeps the search that wins where a seek waits on it.
 #[inline(always)]
 fn array_search(values: &[u8], v: u16) -> Result<usize, usize> {
     let (mut lo, mut hi) = (0usize, values.len() / 2);
@@ -1682,7 +1687,6 @@ fn array_search(values: &[u8], v: u16) -> Result<usize, usize> {
     }
     Err(lo)
 }
-
 // ── borrowed AND ─────────────────────────────────────────────────────────
 
 fn and_count(a: &CView<'_>, b: &CView<'_>) -> u32 {
