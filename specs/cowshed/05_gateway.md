@@ -866,6 +866,7 @@ and writes and the timer onto them is `cowshed-os::deadline` (`PeerStream`, `wit
 | control   | connecting to a running daemon and sending it one request  | 5 s   |
 | handshake | connecting to a peer that should be running, and its hello | 10 s  |
 | reap      | a child's exit once its pipes closed or it was killed      | 5 s   |
+| ffi       | the image lease a disk-image command holds for its run     | 120 s |
 
 A control or handshake bound covers establishing the connection and sending the request, which the kernel completes
 whatever the peer's load. The answer itself is bounded by the heartbeat silence below, never by a total, so a saturated
@@ -908,6 +909,17 @@ the handshake bound.
     the child and the stream. A failed read of either stream is a typed failure, never empty output. In both cases the
     child, and whatever holds its pipe, is left as it is. Every disk child's run takes both waits
     (`SystemCommandRunner`).
+- **A short lock is a request.** A lock taken for one short critical section is waited for within its class's bound. The
+  job records lock (11_shell.md, "Job control") is held for work the retained recovery budget (64 MiB of records)
+  bounds: an open's recovery of the records, a refresh, one record-sequence allocation and its append, and a
+  checkpoint's hash of the records and its manifest append. Its wait is therefore control class. A free lock is taken
+  without blocking. A held one is waited for on a helper thread that blocks in `flock(2)` and hands the locked
+  descriptor back, so nothing polls. At the bound the wait fails `TIMEOUT`, naming the lock path and its holders as the
+  held-lock census reads them then (02_workspaces.md, "Held locks"); a supervisor answers it as a wait on another
+  process, never as damage to the store. The holder is never signalled, and a lock the helper takes after its waiter
+  left is released at once. The image lease is held for one disk-image command's run, so its wait is class `ffi` bounded
+  by that command's own deadline, 120 s (`DISK_CHILD_DEADLINE`), and it names the pid its holder recorded. The shell is
+  `cowshed-os::flock::exclusive`.
 - **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
   with the failure's message.
 

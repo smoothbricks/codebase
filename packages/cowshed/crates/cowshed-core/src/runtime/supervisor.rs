@@ -8990,7 +8990,7 @@ fn missing_artifact_token(job_id: JobId) -> CowshedError {
 
 /// A store refusal as the caller reports it: records a newer cowshed wrote are a version
 /// conflict this build must not touch, and a key another writer bound first is the caller's to
-/// look up; anything else is damage to the store.
+/// look up; a records lock held past its bound is a wait on the process the census names; anything else is damage to the store.
 pub(super) fn map_artifact_error(error: ArtifactError) -> CowshedError {
     match error {
         ArtifactError::NewerLayout { .. } => CowshedError::conflict(
@@ -9004,6 +9004,10 @@ pub(super) fn map_artifact_error(error: ArtifactError) -> CowshedError {
         ArtifactError::HistoryUnprovable { set_aside } => {
             CowshedError::admission_refusal(AdmissionRefusal::Unprovable { set_aside })
         }
+        ArtifactError::LockExpired(_) => CowshedError::environment_missing(
+            error.to_string(),
+            "the process the message names holds the job records lock and was not signalled; cowshed lock-holders names it again",
+        ),
         error => CowshedError::integrity(error.to_string(), "cowshed doctor --json"),
     }
 }
@@ -11790,4 +11794,34 @@ fn membership_peer(
                 "retain the subtree claim and retry while the requesting process is alive",
             )
         })
+}
+
+#[cfg(test)]
+mod artifact_error_tests {
+    use super::*;
+
+    /// A records lock held past its bound is reported as the wait it is, naming the lock and its
+    /// holder, and never sends the operator to repair a store that is intact.
+    #[test]
+    fn a_records_lock_expiry_is_a_wait_on_its_holder_not_store_damage() {
+        let expired =
+            cowshed_os::deadline::start("job-records-lock", cowshed_os::deadline::CONTROL).expired(
+                cowshed_os::flock::LockHolder {
+                    lock: "/w/.cowshed/job/records.lock".into(),
+                    holder: "pid 7 (cowshed) holds it".into(),
+                },
+                cowshed_os::deadline::Progress::Nothing,
+                cowshed_os::deadline::clock(),
+            );
+        let error = map_artifact_error(ArtifactError::LockExpired(Box::new(expired)));
+        assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
+        assert!(
+            error.message.starts_with(
+                "TIMEOUT: job-records-lock on lock /w/.cowshed/job/records.lock held by pid 7 (cowshed) holds it"
+            ),
+            "{}",
+            error.message
+        );
+        assert!(!error.hint.contains("doctor"), "{}", error.hint);
+    }
 }

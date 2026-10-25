@@ -42,6 +42,8 @@ use crate::api::resources::{
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
+use cowshed_os::deadline::{Bound, CONTROL, Expired};
+use cowshed_os::flock::{LockError, LockHolder};
 use cowshed_os::fsio::Durability;
 mod publication;
 use crate::storage::verify_no_symlinks;
@@ -230,6 +232,11 @@ pub enum ArtifactError {
     InvalidConfig(&'static str),
     #[error("artifact I/O failed for {path}: {message}")]
     Io { path: PathBuf, message: String },
+    /// The records lock another process held past the wait's bound (05_gateway.md, "Deadlines"):
+    /// code `TIMEOUT`, terminal. It names the lock and its holders as the held-lock census read
+    /// them at the bound.
+    #[error("{0}")]
+    LockExpired(Box<Expired<LockHolder>>),
     #[error("artifact Arrow IPC failure: {0}")]
     Arrow(String),
     #[error("artifact integrity failure at byte {offset}: {message}")]
@@ -1277,7 +1284,7 @@ impl ArtifactStore {
         config.validate()?;
         let workspace_root = workspace_root.into();
         let records_path = records_path(&workspace_root);
-        let lock = RecordsLock::acquire(&records_path)?;
+        let lock = RecordsLock::acquire(&records_path, CONTROL)?;
         let mut recovery =
             recover_records_with_budget_under_lock(&lock, config.retained_recovery_budget_bytes)?;
         validate_recovered_authority(&owned_repo_ids, &workspace_incarnation, &config, &recovery)?;
@@ -1384,7 +1391,7 @@ impl ArtifactStore {
     pub fn sealed(&mut self, job_id: JobId) -> Result<Option<&JobArtifactRecord>, ArtifactError> {
         if !self.committed_jobs.contains_key(&job_id) {
             let path = records_path(&self.workspace_root);
-            let lock = RecordsLock::acquire(&path)?;
+            let lock = RecordsLock::acquire(&path, CONTROL)?;
             self.refresh_under_lock(&lock)?;
         }
         if let Some(record) = self.committed_jobs.get(&job_id) {
@@ -1646,7 +1653,7 @@ impl ArtifactStore {
         record: JobArtifactRecord,
     ) -> Result<(JobArtifactRecord, Sha256Digest), ArtifactError> {
         let path = records_path(&self.workspace_root);
-        let lock = RecordsLock::acquire(&path)?;
+        let lock = RecordsLock::acquire(&path, CONTROL)?;
         self.refresh_under_lock(&lock)?;
         let duplicate_terminal = record.state.is_terminal()
             && record.workspace_incarnation == self.workspace_incarnation
@@ -1700,7 +1707,7 @@ impl ArtifactStore {
             visible.insert(job_id, commitment);
         }
         let path = records_path(&self.workspace_root);
-        let lock = RecordsLock::acquire(&path)?;
+        let lock = RecordsLock::acquire(&path, CONTROL)?;
         self.refresh_under_lock(&lock)?;
         for record in self.committed_jobs.values() {
             visible
@@ -3018,7 +3025,8 @@ fn records_path(workspace_root: &Path) -> PathBuf {
         .join(RECORDS_FILE)
 }
 
-/// The records `flock`, fenced so another store instance takes it as soon as this one drops it
+/// The records `flock`, waited for within a bound, fenced so another store instance takes it as soon
+/// as this one drops it
 /// (`fork_lock`).
 struct RecordsLock<'path> {
     _file: cowshed_os::fork_lock::Fenced<File>,
@@ -3026,7 +3034,9 @@ struct RecordsLock<'path> {
 }
 
 impl<'path> RecordsLock<'path> {
-    fn acquire(records: &'path Path) -> Result<Self, ArtifactError> {
+    /// Take the records lock within `bound`: production passes [`CONTROL`], since the lock is held
+    /// for one sequence allocation and its append (05_gateway.md, "Deadlines").
+    fn acquire(records: &'path Path, bound: Bound) -> Result<Self, ArtifactError> {
         verify_records_layout(records)?;
         let workspace_root = records
             .parent()
@@ -3058,17 +3068,14 @@ impl<'path> RecordsLock<'path> {
         reject_hardlink(&path, &metadata)?;
         verify_private_file_mode(&path, &metadata, false)?;
         #[cfg(unix)]
-        loop {
-            use std::os::fd::AsRawFd;
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if result == 0 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(io_error(&path, error));
-            }
-        }
+        let file = {
+            let deadline = cowshed_os::deadline::start("job-records-lock", bound);
+            cowshed_os::flock::exclusive(file, &path, &deadline, crate::held_lock::holders)
+                .map_err(|error| match error {
+                    LockError::Expired(expired) => ArtifactError::LockExpired(expired),
+                    LockError::Io { source, .. } => io_error(&path, source),
+                })?
+        };
         #[cfg(not(unix))]
         return Err(ArtifactError::InvalidConfig(
             "cross-process artifact locking requires Unix flock",
@@ -3532,7 +3539,7 @@ fn append_framed_batch_impl(
     digest: Sha256Digest,
     fail_after_bytes: Option<usize>,
 ) -> Result<(), ArtifactError> {
-    let lock = RecordsLock::acquire(path)?;
+    let lock = RecordsLock::acquire(path, CONTROL)?;
     append_framed_batch_under_lock(
         &lock,
         payload,
@@ -3666,7 +3673,7 @@ pub fn recover_records_with_budget(
     path: &Path,
     retained_budget_bytes: usize,
 ) -> Result<RecoveryReport, ArtifactError> {
-    let lock = RecordsLock::acquire(path)?;
+    let lock = RecordsLock::acquire(path, CONTROL)?;
     recover_records_with_budget_under_lock(&lock, retained_budget_bytes)
 }
 
@@ -6541,7 +6548,7 @@ pub fn repair_workspace_record_sequences(
     retained_budget_bytes: usize,
 ) -> Result<(), ArtifactError> {
     let path = records_path(workspace_root);
-    let lock = RecordsLock::acquire(&path)?;
+    let lock = RecordsLock::acquire(&path, CONTROL)?;
     // The manifest authenticates the exact serialized prefix. Rewriting sequences changes that
     // identity, while recomputing the in-file digest would let the rewrite attest to itself.
     // Holding the append lock makes the diagnosis stable; preserving identity requires refusal.
@@ -6595,6 +6602,87 @@ mod tests {
 
     fn store_at(root: &Path, config: ArtifactConfig) -> ArtifactStore {
         ArtifactStore::open(root, OwnedRepoIds::sole(repo()), incarnation(), config).unwrap()
+    }
+
+    /// A records lock another process holds is waited for within its bound: the wait ends naming the
+    /// lock and the holder the census reads, never the holder; once the holder lets go, the lock
+    /// is free again, the one the abandoned wait took late included.
+    #[test]
+    fn a_held_records_lock_fails_its_wait_at_the_bound_naming_the_holder() {
+        use cowshed_os::fork_lock::Spawn as _;
+        use std::io::BufRead as _;
+
+        let root = temp_root("records-lock-held");
+        drop(store_at(&root, ArtifactConfig::default()));
+        let records = records_path(&root);
+        let lock = records.with_file_name("records.lock");
+        let mut holder = std::process::Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                r#"use Fcntl qw(:flock);
+                open(my $h, '+<', $ARGV[0]) or die "open $ARGV[0]: $!";
+                flock($h, LOCK_EX) or die "flock $ARGV[0]: $!";
+                $| = 1; print "locked\n";
+                <STDIN>;"#,
+            ])
+            .arg(&lock)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let mut locked = String::new();
+        std::io::BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut locked)
+            .unwrap();
+        assert_eq!(locked, "locked\n");
+
+        let bound = Bound::new(
+            cowshed_os::deadline::LatencyClass::Control,
+            std::time::Duration::from_millis(200),
+        );
+        let started = std::time::Instant::now();
+        let expired = match RecordsLock::acquire(&records, bound) {
+            Err(ArtifactError::LockExpired(expired)) => expired,
+            Err(error) => panic!("the wait for a held records lock failed otherwise: {error}"),
+            Ok(_) => panic!("the records lock another process holds was granted"),
+        };
+        let waited = started.elapsed();
+        assert_eq!(expired.op, "job-records-lock");
+        assert_eq!(expired.bound, bound.within);
+        assert!(
+            waited >= bound.within && expired.elapsed >= bound.within,
+            "{expired}"
+        );
+        assert!(
+            waited < CONTROL.within,
+            "the injected bound, not the production one, ended the wait: {expired}"
+        );
+        assert_eq!(expired.peer.lock, lock);
+        assert!(
+            expired
+                .peer
+                .holder
+                .contains(&format!("pid {} (", holder.id())),
+            "{expired}"
+        );
+        let message = ArtifactError::LockExpired(expired).to_string();
+        assert!(
+            message.starts_with("TIMEOUT: job-records-lock on lock "),
+            "{message}"
+        );
+        assert!(message.contains(lock.to_str().unwrap()), "{message}");
+
+        drop(holder.stdin.take());
+        assert!(holder.wait().unwrap().success());
+        let backstop = Bound::new(
+            cowshed_os::deadline::LatencyClass::Control,
+            cowshed_os::test_backstop::NO_PROGRESS,
+        );
+        drop(
+            RecordsLock::acquire(&records, backstop)
+                .expect("the abandoned wait let its late lock go"),
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn inline_stream(bytes: &[u8]) -> StreamInfo {

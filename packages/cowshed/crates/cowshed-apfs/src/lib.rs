@@ -18,6 +18,7 @@ pub mod template;
 
 use crate::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 use crate::mounts::{NativeUnmountError, PostUnmountFd, UnmountEffect, UnmountMode};
+use cowshed_os::deadline::{Bound, LatencyClass};
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::host_load::HostLoad;
 use cowshed_os::namespace::HostNamespace;
@@ -522,6 +523,12 @@ pub trait CommandRunner {
 /// enclosing per-operation budgets even when a pass pays it once per workspace; tests
 /// override it through [`SystemCommandRunner::run_with_deadline`].
 pub const DISK_CHILD_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The wait for an image lease another disk-image command holds (05_gateway.md, "Deadlines"). Its
+/// holder holds it for that command's run, so the wait gets the disk child's own deadline,
+/// [`DISK_CHILD_DEADLINE`], as class `ffi`: a disk-image command is a call into the system's disk
+/// services.
+pub const IMAGE_LEASE: Bound = Bound::new(LatencyClass::Ffi, DISK_CHILD_DEADLINE);
 
 /// How often a disk-image command past [`DISK_CHILD_DEADLINE`] says what it is still waiting on.
 pub const DISK_IMAGE_WARNING_INTERVAL: Duration = Duration::from_secs(30);
@@ -1103,7 +1110,7 @@ impl CommandRunner for SystemCommandRunner {
     fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
         let lease = image_lease_path(identity)?;
         let file = open_image_lease(&lease)?;
-        acquire_image_lease(file, &lease, identity, DISK_CHILD_DEADLINE).map(Some)
+        acquire_image_lease(file, &lease, identity, IMAGE_LEASE).map(Some)
     }
     fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>> {
         // A live raw-device descriptor pins this IOMedia, including against forced image detach.
@@ -1329,61 +1336,23 @@ fn open_private_file(path: &Path, what: &str) -> io::Result<File> {
     Ok(file)
 }
 
-/// Lock `file`, the lease at `lease` for `identity`, within `deadline`.
+/// Lock `file`, the lease at `lease` for `identity`, within `bound`, and record this process as its
+/// holder.
 ///
-/// An uncontended lease is taken without blocking. A contended one is waited for on a helper
-/// thread that hands the locked descriptor back the moment the holder releases it; nothing
-/// polls. At the deadline the wait fails naming the lease, the image and the holder's recorded
-/// pid. The helper keeps its descriptor, so the lock it takes after a timed-out caller left is
-/// released again as soon as it is taken.
+/// The wait is [`cowshed_os::flock::exclusive`]'s: at the bound it fails `TIMEOUT` naming the
+/// lease, the image and the pid the holder recorded, and a lease its helper takes after the caller
+/// left is released as soon as it is taken.
 fn acquire_image_lease(
     file: Fenced<File>,
     lease: &Path,
     identity: &Path,
-    deadline: Duration,
+    bound: Bound,
 ) -> io::Result<Fenced<File>> {
-    match lock_file(&file, libc::LOCK_EX | libc::LOCK_NB) {
-        Ok(()) => return record_lease_holder(file),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-        Err(error) => return Err(error),
-    }
-    let (locked, waiter) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("cowshed-apfs-image-lease".into())
-        .spawn(move || {
-            // A caller that timed out has dropped `waiter`: the failed send returns the
-            // descriptor inside its error, and dropping that releases the lock just taken.
-            let _ = locked.send(lock_file(&file, libc::LOCK_EX).map(|()| file));
-        })?;
-    match waiter.recv_timeout(deadline) {
-        Ok(result) => record_lease_holder(result?),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "APFS image lease {} for {} is still held after {deadline:?} by {}",
-                lease.display(),
-                identity.display(),
-                lease_holder(lease)
-            ),
-        )),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
-            "APFS image lease waiter for {} exited without an answer",
-            identity.display()
-        ))),
-    }
-}
-
-fn lock_file(file: &File, operation: libc::c_int) -> io::Result<()> {
-    loop {
-        // SAFETY: `file` owns this descriptor for the whole call; flock does not consume it.
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
+    let deadline = cowshed_os::deadline::start("image-lease", bound);
+    let file = cowshed_os::flock::exclusive(file, lease, &deadline, |lease| {
+        format!("{} for image {}", lease_holder(lease), identity.display())
+    })?;
+    record_lease_holder(file)
 }
 
 /// Record this process's pid in a lease it now holds, so a waiter that times out can name it.
@@ -10748,11 +10717,9 @@ mod tests {
             format!("{}\n", std::process::id())
         );
         let probe = open_image_lease(&own_lease).unwrap();
-        assert_eq!(
-            lock_file(&probe, libc::LOCK_EX | libc::LOCK_NB)
-                .expect_err("the identity is held")
-                .kind(),
-            io::ErrorKind::WouldBlock
+        assert!(
+            !cowshed_os::flock::try_exclusive(&probe).unwrap(),
+            "the identity is held"
         );
         drop(probe);
         assert!(
@@ -10764,7 +10731,7 @@ mod tests {
             open_image_lease(&own_lease).unwrap(),
             &own_lease,
             &own,
-            Duration::ZERO,
+            Bound::new(LatencyClass::Ffi, Duration::ZERO),
         )
         .expect_err("a held identity cannot be taken within a zero bound");
         assert_eq!(timed_out.kind(), io::ErrorKind::TimedOut);
@@ -11373,9 +11340,7 @@ mod tests {
             fn grow_image(&self, image: &Path, _: ImageCapacity) -> io::Result<()> {
                 let identity = attachment_inventory_path(image).expect("identity");
                 let probe = open_image_lease(&image_lease_path(&identity)?)?;
-                let contended = lock_file(&probe, libc::LOCK_EX | libc::LOCK_NB)
-                    .err()
-                    .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock);
+                let contended = !cowshed_os::flock::try_exclusive(&probe)?;
                 self.held_while_growing.set(contended);
                 Ok(())
             }
