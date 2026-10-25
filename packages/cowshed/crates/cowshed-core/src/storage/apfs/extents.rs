@@ -765,10 +765,36 @@ pub(crate) mod tests {
         let file = File::create(&path).expect("create");
         file.set_len(8 * MIB).expect("hole");
         assert_eq!(count_extents(&path).expect("count").get(), 0);
-        file.write_all_at(&pattern(4 * MIB, MIB), 4 * MIB)
-            .expect("write");
-        file.sync_all().expect("flush");
-        assert!(count_extents(&path).expect("count").get() >= 1);
+        // A write past a hole lets APFS zero-fill the hole (the store volume does, under load):
+        // the count would then walk allocated zeros whose blocks may not have device offsets yet.
+        // Holes are punched, as in [`fragmented_sparse_file`], and proven before the count.
+        drop(file);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for writing");
+        file.write_all_at(&pattern(0, 8 * MIB), 0).expect("write");
+        file.sync_all().expect("flush the data");
+        punch_hole(&file, 0, 4 * MIB).expect("leading hole");
+        punch_hole(&file, 5 * MIB, 3 * MIB).expect("trailing hole");
+        file.sync_all().expect("flush the holes");
+        assert_eq!(
+            data_regions(&path),
+            [(4 * MIB, 5 * MIB)],
+            "the holes are holes"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("stat").blocks() * 512,
+            MIB,
+            "only the data is allocated"
+        );
+        // One 8 MiB write is laid out as one run (`COPY_CHUNK_BYTES`), so the MiB left between the
+        // holes is one run too; a hole counted as a run would add to it.
+        assert_eq!(
+            count_extents(&path).expect("count").get(),
+            1,
+            "the data region alone is counted"
+        );
     }
 
     #[test]
