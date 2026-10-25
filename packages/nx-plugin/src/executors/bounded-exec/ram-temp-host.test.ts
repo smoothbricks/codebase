@@ -778,6 +778,7 @@ async function aFailedStepRollsBackOnAStandIn(): Promise<void> {
         ...ramTempPaths(userInfo(), testNamespace(process.pid, 0)),
         root,
         mountpoint: join(root, 'ram'),
+        leaseBytesMax: Number.MAX_SAFE_INTEGER,
         staging: join(root, 'ram-new'),
         lockFile: join(parent, 'v.lock'),
       };

@@ -1857,15 +1857,16 @@ The volume mounts at `/private/var/folders/cowshed/<uid>/ram3`. The parent is th
 `/private/var/folders/cowshed/<uid>`, a 0700 directory of the user's; the leaf carries the protocol's revision, so two
 revisions never mount on one directory. A test namespace's volume mounts at
 `/private/var/folders/cowshed/<uid>/<ns>/ram3`, in the 0700 directory of its name that its fixture makes in that root,
-so it is below `/var/folders/` too. Spotlight's `mds` admits no volume whose kernel-resolved mount path contains
-`/var/folders/`, and keeps one IOKit right for every volume it admits for as long as it runs, with no way to release it
-(`specs/cowshed/01a_apfs.md`, "Spotlight media references"). Measured 2026-10-22: a RAM volume mounted at `/Volumes` or
-`/private/tmp` left `mds` one right; the same mount under `/private/var/folders` left none. A task refuses to create the
-volume while that root is missing, is a link, or is not a 0700 directory the user owns, and its error says to run
-`cowshed setup`. The kernel mounts the volume there: `mount_apfs` needs no administrator, where
-`diskutil mount -mountPoint` escalated to an administrator dialog that blocked every `diskutil` on the host. The mount
-is `noowners`, and launchd refuses a plist from it, so a test that bootstraps a launchd job keeps the plist outside
-`TMPDIR`.
+so it is below `/var/folders/` too. Every lease below either is at most 65 bytes, leaving 38 for a socket's names, and a
+longer one is refused before it is made (`specs/cowshed/01_storage.md`, "RAM temp path budget"). Spotlight's `mds`
+admits no volume whose kernel-resolved mount path contains `/var/folders/`, and keeps one IOKit right for every volume
+it admits for as long as it runs, with no way to release it (`specs/cowshed/01a_apfs.md`, "Spotlight media references").
+Measured 2026-10-22: a RAM volume mounted at `/Volumes` or `/private/tmp` left `mds` one right; the same mount under
+`/private/var/folders` left none. A task refuses to create the volume while that root is missing, is a link, or is not a
+0700 directory the user owns, and its error says to run `cowshed setup`. The kernel mounts the volume there:
+`mount_apfs` needs no administrator, where `diskutil mount -mountPoint` escalated to an administrator dialog that
+blocked every `diskutil` on the host. The mount is `noowners`, and launchd refuses a plist from it, so a test that
+bootstraps a launchd job keeps the plist outside `TMPDIR`.
 
 The volume is created under its final name, `smoo-ram3-<uid>` (a test namespace's is `smoo-ram3-<uid>-<ns>`), and is
 never renamed. It is mounted and marked at a private staging directory, `/private/var/folders/cowshed/<uid>/ram3-new`

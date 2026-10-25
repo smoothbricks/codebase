@@ -208,6 +208,19 @@ or spaces out production's; `storagekitd`, which every attach shares physically,
 an image's behavior is what it proves (08_testing.md). Doctor's kernel-wide counts (attach budget, departed volume
 references, orphaned disk-image helpers) count devices and processes, not names, and so include a test's.
 
+### RAM temp path budget
+
+A RAM temp lease, the `TMPDIR` a `bounded-exec` task gets, is `<RAM temp mountpoint>/<pid>-<6 random>`, and is at most
+**65 bytes**. That leaves **38** of the 103 pathname bytes Darwin's `sun_path` admits for the names below it. 65 is the
+layout's worst case, a test namespace's at the largest uid and pid: `/private/var/folders/cowshed/` (29), a u32 uid
+(10), `/<ns>` (8), `/ram3` (5), `/<pid ≤ 99999>-` (7) and the random suffix (6); production's worst case is 57. A lease
+that would be longer is refused before anything is made (`lease-path-budget`,
+`packages/nx-plugin/src/executors/bounded-exec/ram-temp.ts`), so a layout change that breaks the rule fails at the
+lease, never at a later bind. The per-user root bounds it from below: its 39 bytes are `cowshed setup`'s, and mds keeps
+a right for any volume mounted outside `/var/folders/` (01a_apfs.md). 38 bytes hold no fixture tree, so a test that
+binds a socket for a fixture below `TMPDIR` binds it through a short runtime alias (08_testing.md, "Fixtures";
+04_sandbox.md, "Fixture roots under /tmp"), as Nx's own 95-byte socket check requires too.
+
 ## Runtime state: derived, never stored
 
 | Question                | Source of truth                                                                                                                              |

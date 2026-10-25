@@ -20,6 +20,7 @@ function fixture() {
     ...ramTempPaths(userInfo(), testNamespace(process.pid, 0)),
     root,
     mountpoint: join(root, 'owned'),
+    leaseBytesMax: Number.MAX_SAFE_INTEGER,
     staging: join(root, 'owned-new'),
     lockFile: join(parent, 'v.lock'),
   };

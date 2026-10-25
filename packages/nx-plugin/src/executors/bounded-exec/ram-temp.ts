@@ -181,6 +181,24 @@ export const RAM_TEMP_CAPACITY_BYTES = 8 * GIB + RAM_TEMP_REVISION * SECTOR_BYTE
 const FULL_FREE_BYTES = 64 * MIB;
 /** `<pid>-<mkdtemp suffix>`: the pid says whether the lease's task is alive. */
 const LEASE_NAME = /^(\d+)-[A-Za-z0-9]{6}$/;
+/** The random suffix `mkdtemp` gives a lease name. */
+const LEASE_SUFFIX_BYTES = 6;
+/** Darwin's `sockaddr_un.sun_path` holds 104 bytes, the last a NUL: a socket's path is at most 103. */
+const SOCKET_PATH_BYTES = 103;
+/**
+ * The one length rule of the RAM temp layout (specs/cowshed/01_storage.md, "RAM temp path budget"): a lease directory,
+ * the TMPDIR its task gets, is at most this many bytes. It is the layout's worst case, a test namespace's at the largest
+ * uid and pid: `/private/var/folders/cowshed/` (29), a u32 uid (10), `/<ns>` (8), `/ram3` (5), `/<pid ≤ 99999>-` (7)
+ * and the suffix (6). Production's worst case is 57.
+ */
+export const RAM_TMPDIR_MAX_BYTES = 65;
+/** What the rule leaves below a lease for a socket's `/<names>`: 38 bytes. */
+export const RAM_TMPDIR_SOCKET_BUDGET_BYTES = SOCKET_PATH_BYTES - RAM_TMPDIR_MAX_BYTES;
+
+/** The length in bytes of the lease directory process `pid` makes below `mountpoint`. */
+export function leaseDirectoryBytes(mountpoint: string, pid: number): number {
+  return Buffer.byteLength(`${mountpoint}/${pid}-`) + LEASE_SUFFIX_BYTES;
+}
 const MARKER_FILE = '.smoo-ram';
 /**
  * The scratch of a run that did not pass, moved out of its lease when the lease is reclaimed: a directory beside the
@@ -318,8 +336,8 @@ export interface RamTempPaths {
   /** The user that must own `root`. */
   uid: number;
   /**
-   * Where the kernel mounts the volume: `<root>/ram<revision>`, so no two revisions stack on one directory. Short:
-   * a socket below a lease must fit sun_path (104 bytes).
+   * Where the kernel mounts the volume: `<root>/ram<revision>`, so no two revisions stack on one directory. Its length
+   * bounds every lease's, which {@link RAM_TMPDIR_MAX_BYTES} caps.
    */
   mountpoint: string;
   /**
@@ -331,6 +349,12 @@ export interface RamTempPaths {
   volumeName: string;
   /** Where the volume is mounted to be marked before it is mounted at `mountpoint`. */
   staging: string;
+  /**
+   * The longest lease directory, a task's TMPDIR, this layout admits: {@link RAM_TMPDIR_MAX_BYTES} for every layout
+   * `ramTempPaths` makes. A unit fixture that moves the volume into its own scratch makes no TMPDIR and states
+   * `Number.MAX_SAFE_INTEGER`, which survives JSON as Infinity does not.
+   */
+  leaseBytesMax: number;
 }
 
 /**
@@ -354,6 +378,7 @@ export function ramTempPaths(user: { uid: number }, namespace: HostNamespace): R
     lockFile: production ? `/private/tmp/${own}.lock` : `${mountpoint}.lock`,
     volumeName: production ? own : `${own}-${namespace.name}`,
     staging: `${mountpoint}-new`,
+    leaseBytesMax: RAM_TMPDIR_MAX_BYTES,
   };
 }
 
@@ -445,7 +470,9 @@ export type RamTempError =
    * The root the volume mounts below, the per-user root or a test namespace's directory, is missing or is not the
    * user's 0700 directory.
    */
-  | { kind: 'root-unready'; root: string; detail: string };
+  | { kind: 'root-unready'; root: string; detail: string }
+  /** The lease this caller would make is longer than its layout admits: refused before anything is made. */
+  | { kind: 'lease-path-budget'; mountpoint: string; pid: number; bytes: number; most: number };
 
 export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
 
@@ -461,6 +488,8 @@ export function describeRamTempError(error: RamTempError): string {
       return `RAM temp volume: lease ${error.lease} was lost while its task held it: ${error.detail}; what the task wrote to its TMPDIR went with it`;
     case 'root-unready':
       return `RAM temp volume: ${error.root} ${error.detail}; run "cowshed setup", which makes it a directory of yours with mode 0700`;
+    case 'lease-path-budget':
+      return `RAM temp volume: a lease below ${error.mountpoint} for pid ${error.pid} would be ${error.bytes} bytes, past the ${error.most} its layout admits, leaving ${SOCKET_PATH_BYTES - error.most} below it for a socket's names within sun_path (specs/cowshed/01_storage.md, "RAM temp path budget")`;
   }
 }
 
@@ -673,6 +702,19 @@ export class RamTempVolume {
    * lease found on the way is settled through `subtrees`, the supervisor that owns the caller.
    */
   async acquire(subtrees: SubtreeOwner): Promise<Result<RamTempAcquisition, RamTempError>> {
+    const bytes = leaseDirectoryBytes(this.paths.mountpoint, this.pid);
+    if (bytes > this.paths.leaseBytesMax) {
+      return {
+        ok: false,
+        error: {
+          kind: 'lease-path-budget',
+          mountpoint: this.paths.mountpoint,
+          pid: this.pid,
+          bytes,
+          most: this.paths.leaseBytesMax,
+        },
+      };
+    }
     const readiness = await rootReadiness(this.paths);
     if (!readiness.ok) return readiness;
     const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, subtrees, claimed: false, made: null };
@@ -2357,6 +2399,7 @@ function alsoFailed(primary: RamTempError, cleanup: readonly RamTempError[]): Ra
       return { ...primary, detail: `${primary.detail}; ${after}` };
     case 'volume-full':
     case 'lease-lost':
+    case 'lease-path-budget':
       return { kind: 'provision-failed', step: 'cleanup', detail: `${describeRamTempError(primary)}; ${after}` };
   }
 }

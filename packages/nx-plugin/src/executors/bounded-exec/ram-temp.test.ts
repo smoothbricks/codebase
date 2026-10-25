@@ -22,10 +22,13 @@ import {
   diskCommand,
   type HostCommands,
   imagesBackedUnder,
+  leaseDirectoryBytes,
   mountsBelow,
   operationDisk,
   PRODUCTION,
   RAM_TEMP_CAPACITY_BYTES,
+  RAM_TMPDIR_MAX_BYTES,
+  RAM_TMPDIR_SOCKET_BUDGET_BYTES,
   type RamDisk,
   type RamTempError,
   RamTempVolume,
@@ -116,7 +119,7 @@ describe('RAM temp volume output parsing', () => {
   });
 
   it('mounts below the per-user cowshed root, where mds keeps no right for it, short enough to hold sockets', () => {
-    // sun_path is 104 bytes; a lease directory leaves room for nested fixture paths. mds admits no
+    // A lease below it keeps the RAM TMPDIR rule (the budget cases below). mds admits no
     // volume whose mount path contains /var/folders/ (specs/cowshed/01a_apfs.md, "Spotlight media references").
     expect(ramTempPaths({ uid: 501 }, PRODUCTION)).toEqual({
       root: '/private/var/folders/cowshed/501',
@@ -125,6 +128,7 @@ describe('RAM temp volume output parsing', () => {
       lockFile: '/private/tmp/smoo-ram3-501.lock',
       volumeName: 'smoo-ram3-501',
       staging: '/private/var/folders/cowshed/501/ram3-new',
+      leaseBytesMax: 65,
     });
   });
 
@@ -136,6 +140,7 @@ describe('RAM temp volume output parsing', () => {
       lockFile: '/private/var/folders/cowshed/501/0214h03/ram3.lock',
       volumeName: 'smoo-ram3-501-0214h03',
       staging: '/private/var/folders/cowshed/501/0214h03/ram3-new',
+      leaseBytesMax: 65,
     });
   });
 
@@ -148,6 +153,18 @@ describe('RAM temp volume output parsing', () => {
       expect(() => testNamespace(refused, 0)).toThrow('does not fit');
       expect(() => testNamespace(1, refused)).toThrow('does not fit');
     }
+  });
+
+  it('keeps every lease within the 65-byte RAM TMPDIR rule, leaving 38 bytes of sun_path below it', () => {
+    // The layout's worst case: a u32 uid, macOS's largest pid (PID_MAX, 99999) and a test namespace, whose name is
+    // always seven bytes (specs/cowshed/01_storage.md, "RAM temp path budget").
+    const uid = 2 ** 32 - 1;
+    const pid = 99_999;
+    const worst = ramTempPaths({ uid }, testNamespace(36 ** 5 - 1, 36 ** 2 - 1));
+    expect(leaseDirectoryBytes(worst.mountpoint, pid)).toBe(RAM_TMPDIR_MAX_BYTES);
+    expect(Buffer.byteLength(`${worst.mountpoint}/${pid}-aBcDeF`)).toBe(65);
+    expect(leaseDirectoryBytes(ramTempPaths({ uid }, PRODUCTION).mountpoint, pid)).toBe(57);
+    expect(RAM_TMPDIR_SOCKET_BUDGET_BYTES).toBe(38);
   });
 
   it("counts a RAM disk as the volume's only by its exact name where mounted, or by an exact record", () => {
@@ -221,6 +238,7 @@ describe('the root the RAM temp volume mounts below', () => {
           ...ramTempPaths({ uid }, NAMESPACE),
           root,
           mountpoint: join(root, 'ram'),
+          leaseBytesMax: Number.MAX_SAFE_INTEGER,
           staging: join(root, 'ram-new'),
           lockFile: join(parent, `${name}.lock`),
         };
@@ -253,6 +271,54 @@ describe('the root the RAM temp volume mounts below', () => {
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }
+  });
+});
+
+describe('the RAM temp path budget', () => {
+  it('refuses a lease longer than the rule before it checks the root or runs a command', async () => {
+    // A mountpoint 40 bytes longer than the layout's, below a root this host's user does not have: only the budget
+    // refusal can answer first.
+    const paths = {
+      ...ramTempPaths({ uid: 501 }, NAMESPACE),
+      root: '/private/var/folders/cowshed/501',
+      mountpoint: `/private/var/folders/cowshed/501/${'x'.repeat(40)}`,
+    };
+    const volume = new RamTempVolume(
+      paths,
+      512,
+      {
+        async run(file) {
+          throw new Error(`${file} ran before the lease's length was checked`);
+        },
+        async detachRam() {
+          throw new Error('no disk exists');
+        },
+        async attachRam() {
+          throw new Error("a RAM disk was attached before the lease's length was checked");
+        },
+      },
+      99_999,
+    );
+    const error: RamTempError = {
+      kind: 'lease-path-budget',
+      mountpoint: paths.mountpoint,
+      pid: 99_999,
+      bytes: 86,
+      most: 65,
+    };
+    expect(
+      await volume.acquire({
+        rootArgv() {
+          throw new Error('the budget refusal must precede command admission');
+        },
+        async retire() {
+          throw new Error('the budget refusal must precede subtree retirement');
+        },
+      }),
+    ).toEqual({ ok: false, error });
+    expect(describeRamTempError(error)).toBe(
+      `RAM temp volume: a lease below ${paths.mountpoint} for pid 99999 would be 86 bytes, past the 65 its layout admits, leaving 38 below it for a socket's names within sun_path (specs/cowshed/01_storage.md, "RAM temp path budget")`,
+    );
   });
 });
 
@@ -849,6 +915,7 @@ describe('creating the RAM temp volume', () => {
       ...ramTempPaths(userInfo(), NAMESPACE),
       root,
       mountpoint: join(root, 'ram'),
+      leaseBytesMax: Number.MAX_SAFE_INTEGER,
       staging: join(root, 'ram-new'),
       lockFile: join(parent, 'v.lock'),
     };
@@ -900,6 +967,7 @@ describe('creating the RAM temp volume', () => {
       ...ramTempPaths(userInfo(), NAMESPACE),
       root,
       mountpoint: join(root, 'ram'),
+      leaseBytesMax: Number.MAX_SAFE_INTEGER,
       staging: join(root, 'ram-new'),
       lockFile: join(parent, 'v.lock'),
     };
@@ -950,6 +1018,7 @@ describe('creating the RAM temp volume', () => {
       ...ramTempPaths(userInfo(), NAMESPACE),
       root,
       mountpoint: join(root, 'ram'),
+      leaseBytesMax: Number.MAX_SAFE_INTEGER,
       staging: join(root, 'ram-new'),
       lockFile: join(parent, 'v.lock'),
     };
@@ -1010,6 +1079,7 @@ async function detachCustodyFixture(mode: 'stray' | 'rollback' = 'stray', boundM
     ...ramTempPaths(userInfo(), NAMESPACE),
     root,
     mountpoint: join(root, 'ram'),
+    leaseBytesMax: Number.MAX_SAFE_INTEGER,
     staging: join(root, 'ram-new'),
     lockFile: join(directory, 'v.lock'),
   };
