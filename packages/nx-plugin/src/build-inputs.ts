@@ -20,7 +20,8 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
-import { join, posix, relative, sep } from 'node:path';
+import { join, relative, sep } from 'node:path';
+import { normalize as normalizePosix } from 'node:path/posix';
 
 /** The record's file name inside each output directory. */
 export const BUILD_INPUTS_FILE = '.build-inputs.json';
@@ -43,7 +44,7 @@ export function pathspecFiles(workspaceRoot: string, pathspecs: readonly string[
   const run = spawnSync(
     'git',
     ['-C', workspaceRoot, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...pathspecs],
-    { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 },
+    { encoding: 'utf8' },
   );
   if (run.error !== undefined || run.status !== 0) {
     throw new Error(`git ls-files ${pathspecs.join(' ')} in ${workspaceRoot}: ${run.error?.message ?? run.stderr}`);
@@ -72,7 +73,7 @@ export function depInfoFiles(workspaceRoot: string, depInfo: string): string[] {
     for (const raw of line.slice(colon + 2).split(/(?<!\\) /)) {
       const path = raw.replaceAll('\\ ', ' ').trim();
       if (path.length === 0) continue;
-      const normalized = posix.normalize(path.split(sep).join('/'));
+      const normalized = normalizePosix(path.split(sep).join('/'));
       for (let at = normalized.indexOf('/'); at >= 0; at = normalized.indexOf('/', at + 1)) {
         const file = normalized.slice(at + 1);
         if (!tracked.has(file)) continue;
@@ -124,7 +125,7 @@ export function globPathspec(workspaceRelativeGlob: string, exclude = false): st
 
 /** `path` relative to `workspaceRoot` in the record's spelling (forward slashes). */
 export function workspacePath(workspaceRoot: string, path: string): string {
-  return posix.normalize(relative(workspaceRoot, path).split(sep).join('/'));
+  return normalizePosix(relative(workspaceRoot, path).split(sep).join('/'));
 }
 
 /** The Git work tree `directory` is in, physically resolved, or null outside one: a build there records nothing. */

@@ -13,7 +13,8 @@
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, posix, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
+import { dirname as dirnamePosix, join as joinPosix } from 'node:path/posix';
 import {
   buildInputRecord,
   depInfoFiles,
@@ -38,10 +39,10 @@ function flag(name: string): string {
   return value;
 }
 
-function run(command: string, args: readonly string[], cwd: string): string {
-  const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+function run(command: string, args: readonly string[]): string {
+  const result = spawnSync(command, args, { encoding: 'utf8' });
   if (result.error !== undefined || result.status !== 0) {
-    fail(`${command} ${args.join(' ')} in ${cwd}: ${result.error?.message ?? result.stderr.trim()}`);
+    fail(`${command} ${args.join(' ')} in ${process.cwd()}: ${result.error?.message ?? result.stderr.trim()}`);
   }
   return result.stdout.trim();
 }
@@ -52,7 +53,7 @@ const depInfoPath = flag('--dep-info');
 const output = resolve(cwd, flag('--output'));
 const workspaceRoot = gitWorkspaceRoot(cwd) ?? fail(`${cwd} is not in a Git work tree, so no input can be named`);
 const metadata: unknown = JSON.parse(
-  run('cargo', ['metadata', '--no-deps', '--format-version', '1', '--offline', '--manifest-path', manifestPath], cwd),
+  run('cargo', ['metadata', '--no-deps', '--format-version', '1', '--offline', '--manifest-path', manifestPath]),
 );
 const targetDirectory =
   typeof metadata === 'object' && metadata !== null ? Reflect.get(metadata, 'target_directory') : undefined;
@@ -68,8 +69,8 @@ if (sources.length === 0) fail(`${depInfo} names no file of ${workspaceRoot}`);
 const tracked = new Set(pathspecFiles(workspaceRoot, ['.']));
 const manifests = new Set<string>();
 for (const source of sources) {
-  for (let directory = posix.dirname(source); directory !== '.'; directory = posix.dirname(directory)) {
-    const manifest = posix.join(directory, 'Cargo.toml');
+  for (let directory = dirnamePosix(source); directory !== '.'; directory = dirnamePosix(directory)) {
+    const manifest = joinPosix(directory, 'Cargo.toml');
     if (tracked.has(manifest)) {
       manifests.add(manifest);
       break;

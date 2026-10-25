@@ -16,12 +16,16 @@ if (crate === undefined || crate.startsWith('-') || reports.length === 0) {
 }
 const cases = reports.flatMap((report) => junitCaseTimes(readFileSync(report, 'utf-8')));
 const timed = measuredTimings(cases, crate, NEXTEST_TIMED_MIN_MS);
-const manifest = readNextestTimings(NEXTEST_TIMINGS_PATH);
-const { [crate]: previous, ...others } = manifest;
-const next = Object.keys(timed).length === 0 ? others : { ...others, [crate]: timed };
-const sorted = Object.fromEntries(Object.entries(next).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
-writeFileSync(NEXTEST_TIMINGS_PATH, `${JSON.stringify(sorted, null, 2)}\n`);
+const manifest = new Map(Object.entries(readNextestTimings(NEXTEST_TIMINGS_PATH)));
+const previous = manifest.get(crate);
+if (Object.keys(timed).length === 0) {
+  manifest.delete(crate);
+} else {
+  manifest.set(crate, timed);
+}
+const sorted = [...manifest].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+writeFileSync(NEXTEST_TIMINGS_PATH, `${JSON.stringify(Object.fromEntries(sorted), null, 2)}\n`);
 process.stderr.write(
   `smoo-nx-nextest-timings: ${crate}: ${Object.keys(timed).length} tests of at least ${NEXTEST_TIMED_MIN_MS} ms ` +
-    `(was ${Object.keys(previous ?? {}).length}) from ${cases.length} timed cases in ${reports.length} reports\n`,
+    `(was ${previous === undefined ? 0 : Object.keys(previous).length}) from ${cases.length} timed cases in ${reports.length} reports\n`,
 );

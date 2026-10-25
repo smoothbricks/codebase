@@ -14,9 +14,12 @@ import typia, { type tags } from 'typia';
 export const NEXTEST_TIMINGS_PATH = '.config/nextest-timings.json';
 
 /** Crate name → nextest test name → milliseconds, as `smoo-nx-nextest-timings` writes it. */
-export type NextestTimings = Record<string, Record<string, number & tags.Type<'uint32'>>>;
+export type NextestTimings = Record<string, Record<string, number>>;
 
-const validateNextestTimings = typia.createValidate<NextestTimings>();
+/** The manifest as validated on read: every duration is a uint32 of milliseconds. */
+type ValidatedNextestTimings = Record<string, Record<string, number & tags.Type<'uint32'>>>;
+
+const validateNextestTimings = typia.createValidate<ValidatedNextestTimings>();
 
 /**
  * A name `test(=…)` matches literally, so it carries none of the filterset's own syntax: Rust test

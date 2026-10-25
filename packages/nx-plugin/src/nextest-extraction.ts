@@ -1,7 +1,6 @@
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { once } from 'node:events';
-import { createReadStream } from 'node:fs';
+import { closeSync, createReadStream, openSync, writeSync } from 'node:fs';
 import { mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -104,7 +103,7 @@ export async function nextestExtractionRoot(cwd: string): Promise<string> {
   const chunks: Buffer[] = [];
   child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
   // 'close', not 'exit': stdout may still hold unread metadata when the process exits.
-  const [code, signal]: unknown[] = await once(child, 'close');
+  const { code, signal } = await childSettled(child, 'close');
   if (code !== 0) {
     throw new Error(
       `cargo ${args.join(' ')} ${code === null ? `died of ${String(signal)}` : `exited with status ${String(code)}`}`,
@@ -253,7 +252,12 @@ interface HeldLock {
 async function acquireLock(path: string, heartbeatMs: number): Promise<HeldLock | undefined> {
   const token = `${process.pid} ${randomUUID()}`;
   try {
-    await writeFile(path, `${token}\n`, { flag: 'wx' });
+    const fd = openSync(path, 'wx');
+    try {
+      writeSync(fd, `${token}\n`);
+    } finally {
+      closeSync(fd);
+    }
   } catch (error) {
     if (errorCode(error) === 'EEXIST') {
       return undefined;
@@ -340,7 +344,7 @@ export const extractWithNextest: NextestArchiveExtractor = async (archive, desti
     // The binary list on stdout is not wanted; nextest's progress and errors are on stderr.
     const child = spawn('cargo', args, { stdio: ['ignore', 'ignore', 'inherit'] });
     // Rejects with the spawn error when cargo cannot be started at all.
-    const [code, signal]: unknown[] = await once(child, 'exit');
+    const { code, signal } = await childSettled(child, 'exit');
     if (code !== 0) {
       throw new Error(
         `cargo ${args.join(' ')} ${code === null ? `died of ${String(signal)}` : `exited with status ${String(code)}`}`,
@@ -350,6 +354,27 @@ export const extractWithNextest: NextestArchiveExtractor = async (archive, desti
     await rm(config, { force: true });
   }
 };
+
+/** The exit `child` reports on `event`, or its spawn error when it cannot be started at all. */
+function childSettled(
+  child: ChildProcess,
+  event: 'close' | 'exit',
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve, reject) => {
+    function onError(error: Error) {
+      if (event === 'close') child.removeListener('close', onSettled);
+      else child.removeListener('exit', onSettled);
+      reject(error);
+    }
+    function onSettled(code: number | null, signal: NodeJS.Signals | null) {
+      child.removeListener('error', onError);
+      resolve({ code, signal });
+    }
+    child.once('error', onError);
+    if (event === 'close') child.once('close', onSettled);
+    else child.once('exit', onSettled);
+  });
+}
 
 async function isDirectory(path: string): Promise<boolean> {
   return (await statOrUndefined(path))?.isDirectory() ?? false;
