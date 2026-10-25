@@ -1630,6 +1630,18 @@ fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process
         .find(|lockfile| lockfile.is_file())
         .expect("the workspace lockfile");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // The probe lives under CARGO_TARGET_TMPDIR, which resolves into the build volume, and no
+    // ancestor of that holds this repository's `.cargo/config.toml`: without it the probe builds
+    // without the workspace's checksum freshness, linker and `[env]`, in units of a second
+    // freshness mode beside the workspace's (16_build_volumes.md, "One Cargo environment on every
+    // path"). It reads the files a Cargo started in cowshed-core's directory reads, shallowest
+    // first: a later `--config` wins, as a deeper file does.
+    let mut workspace_configs: Vec<PathBuf> = manifest_dir
+        .ancestors()
+        .map(|directory| directory.join(".cargo").join("config.toml"))
+        .filter(|config| config.is_file())
+        .collect();
+    workspace_configs.reverse();
     // The probe's own `[workspace]` detaches it from the outer workspace, whose members it must
     // not join and whose lints and profiles it must not inherit — each snippet is meant to fail on
     // visibility, and nothing else. `serde` is here because one snippet names a serde trait to
@@ -1664,6 +1676,11 @@ fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process
         fs::write(crate_dir.join("src/lib.rs"), source(name)).expect("probe source");
     }
     Command::new(&cargo)
+        .args(
+            workspace_configs
+                .iter()
+                .flat_map(|config| [std::ffi::OsStr::new("--config"), config.as_os_str()]),
+        )
         .arg("check")
         .arg("--workspace")
         .arg("--keep-going")
