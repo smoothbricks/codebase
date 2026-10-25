@@ -1662,13 +1662,13 @@ A census asks nothing of a process a cowshed lifecycle operation runs in. The wo
 (`lease_holder`). A pid is passed over only while a lease file of the host store names it with the unique id its process
 has now: a record that names no process, or whose pid another process has since taken, names nothing. This is positive
 evidence the holder wrote under its own lock, not a guess from the process tree. Such a process can sit in one kernel
-call for a minute holding one of its descriptors' vnodes (a fork's `first-write`, "`cowshed fork`" step 3), and it is no
-foreign holder: the operation's own leases and image locks already refuse the operations a census guards. The census's
-own process is always asked, whatever its leases say. Every census on macOS starts from this one list of pids, the
-volume census included, which walks the processes itself rather than through libproc's `proc_listpidspath`. The leases
-read are the host store's (`/private/cowshed/store/<owner>/<repo>/sessions`) only: a lifecycle operation in a test
-fixture's store elsewhere records its lease there, which no census reads, so it is asked like any other process and can
-still stall a concurrent census. Linux records no unique id and its census asks every process.
+call for minutes holding one of its descriptors' vnodes (a fork's first mount of its clone, "`cowshed fork`" step 3),
+and it is no foreign holder: the operation's own leases and image locks already refuse the operations a census guards.
+The census's own process is always asked, whatever its leases say. Every census on macOS starts from this one list of
+pids, the volume census included, which walks the processes itself rather than through libproc's `proc_listpidspath`.
+The leases read are the host store's (`/private/cowshed/store/<owner>/<repo>/sessions`) only: a lifecycle operation in a
+test fixture's store elsewhere records its lease there, which no census reads, so it is asked like any other process and
+can still stall a concurrent census. Linux records no unique id and its census asks every process.
 
 Nor does the tree census ask a released image's deletion child (05_gateway.md, "Deleting released images") about its
 descriptors when its entry cannot be in the tree. The child is known by the arguments the kernel holds for it,
@@ -1831,8 +1831,12 @@ it, stay. A holder that finds the path naming another inode once granted refuses
   The owner is the record's pid holding a proven grant. Darwin exposes no lock state per descriptor (`proc_pidfdinfo`
   carries none, and `F_GETLK` answers a `flock` conflict with no pid): the life the record names, proven by its kernel
   unique id and a descriptor on the inode, is the owner (`recorded`), and every other descriptor on the inode is named
-  `unexposed`, never counted a holder. A process of another user whose descriptors this user cannot read shows none;
-  `locked` still says the inode is held.
+  `unexposed`, never counted a holder. On Darwin no descriptor of a process a cowshed lifecycle lease names is read
+  ("Holders cowshed does not run"): a fork's first mount of its clone holds the image's vnode for minutes, and every
+  per-descriptor query of the fork, `lock-holders`' included, waits that long. When the record names such a process, its
+  kernel unique id alone proves it the owner; any other such process is not listed. `fd-holders` counts them in
+  `uninspected`. A process of another user whose descriptors this user cannot read shows none; `locked` still says the
+  inode is held.
 - **An image lock is a held lock.** Every lifecycle lock a store takes through its image-lock acquisition
   (`main.dmg.lock` and `sessions/<ws>.dmg.lock`, 01_storage.md, the store's template lock among them) carries the held
   lock's record and, beside it, the request the lock is held for:

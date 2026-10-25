@@ -9,7 +9,7 @@
 //!
 //! A process-table census asks nothing of a process such a record names ([`running_lifecycle`]).
 //! Such a process can sit in one kernel call for a minute while it holds one of its descriptors'
-//! vnodes: a fork rewrites its new build image's first block to pay the clone's extent-map copy
+//! vnodes: a fork's read-write mount of a new clone pays the clone's extent-map copy
 //! (16_build_volumes.md), and every per-descriptor query of that process waits as long. It is no
 //! foreign holder: the operation's own leases and image locks already refuse the operations a
 //! census guards.

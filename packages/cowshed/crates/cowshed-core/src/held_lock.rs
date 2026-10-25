@@ -491,7 +491,7 @@ pub fn observe(path: &Path) -> io::Result<Observation> {
     file.read_to_end(&mut record)?;
     let recorded = serde_json::from_slice::<lease_holder::Process>(&record).ok();
     let own = i32::try_from(std::process::id()).map_err(io::Error::other)?;
-    let (locked, seen) = kernel_view(&file, inode)?;
+    let (locked, seen) = kernel_view(&file, inode, recorded.as_ref())?;
     let (owner, descriptors) = judge(seen, recorded.as_ref(), own);
     // A request is believed only as far as its owner is proven.
     let holding = owner
@@ -512,7 +512,11 @@ pub fn observe(path: &Path) -> io::Result<Observation> {
 /// whether the kernel's lock table shows the inode locked (`/proc/locks`, which also covers a
 /// holder of another user whose descriptors this user cannot read).
 #[cfg(target_os = "linux")]
-fn kernel_view(_file: &File, inode: Inode) -> io::Result<(bool, Vec<Seen>)> {
+fn kernel_view(
+    _file: &File,
+    inode: Inode,
+    _recorded: Option<&lease_holder::Process>,
+) -> io::Result<(bool, Vec<Seen>)> {
     let mut seen = Vec::new();
     for (holder, fds) in crate::build_volume::nx::inode_holders((inode.dev.get(), inode.ino.get()))?
     {
@@ -607,9 +611,17 @@ fn lock_line_holds(line: &str, major: u64, minor: u64, ino: u64) -> bool {
 
 /// Darwin: each process with a descriptor on `inode` and its kernel unique id, and whether
 /// `F_GETLK` shows the inode exclusively locked: a `flock(2)` conflicts with the shared lock it
-/// asks about.
+/// asks about. The descriptor census asks no process a cowshed lifecycle operation runs in
+/// ([`crate::build_volume::nx::inode_holders`]): a fork's first mount of its new image holds its vnode
+/// for minutes. The lock's `recorded` holder, when it is such a process, is seen by its unique id
+/// alone, which the process table answers without reading a descriptor, so a fork holding
+/// `main.dmg.lock` is still its proven owner.
 #[cfg(target_os = "macos")]
-fn kernel_view(file: &File, inode: Inode) -> io::Result<(bool, Vec<Seen>)> {
+fn kernel_view(
+    file: &File,
+    inode: Inode,
+    recorded: Option<&lease_holder::Process>,
+) -> io::Result<(bool, Vec<Seen>)> {
     let mut seen = Vec::new();
     for (holder, _fds) in
         crate::build_volume::nx::inode_holders((inode.dev.get(), inode.ino.get()))?
@@ -619,6 +631,20 @@ fn kernel_view(file: &File, inode: Inode) -> io::Result<(bool, Vec<Seen>)> {
             pid: holder.pid,
             command: holder.command,
             view: KernelView::Identity { unique_id },
+        });
+    }
+    if let Some(recorded) = recorded
+        && let Ok(pid) = i32::try_from(recorded.pid)
+        && !seen.iter().any(|process| process.pid == pid)
+        && lease_holder::running_lifecycle().contains(&pid)
+        && let Some(record) = job_groups::process_record(pid)?
+    {
+        seen.push(Seen {
+            pid,
+            command: recorded.command.clone(),
+            view: KernelView::Identity {
+                unique_id: Some(record.unique_id),
+            },
         });
     }
     // SAFETY: an all-zero `flock` is a valid value of the plain C struct.

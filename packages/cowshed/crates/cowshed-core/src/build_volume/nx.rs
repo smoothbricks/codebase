@@ -698,14 +698,18 @@ fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
 }
 
 /// Every process with a vnode descriptor on the inode `(device, inode)`, with those descriptors:
-/// each live pid the kernel lists ([`all_pids`], not a census that skips lifecycle processes, since
-/// a lock's custody misses no holder), each vnode descriptor's device and inode
-/// (`PROC_PIDFDVNODEINFO`). Event-only opens hold nothing.
+/// each process [`census_pids`] asks about, each vnode descriptor's device and inode
+/// (`PROC_PIDFDVNODEINFO`). Event-only opens hold nothing. A process a cowshed lifecycle operation
+/// runs in is not asked: a fork's first mount of its new image holds that image's vnode for up to
+/// minutes, and every per-descriptor query of the fork waits that long (measured 2026-10-25: 245
+/// extent-map copies of 50-221 s, the `image-lock wait` holder line and `lsof` stalled behind them).
+/// A lock's custody takes such a holder from the lock's own record instead
+/// (`held_lock::kernel_view`).
 #[cfg(target_os = "macos")]
 pub(crate) fn inode_holders(identity: (u64, u64)) -> io::Result<Vec<(Holder, Vec<i32>)>> {
     let vinfo_size = c_size::<VnodeFdinfo>()?;
     let mut holders = Vec::new();
-    for pid in all_pids()? {
+    for pid in census_pids()? {
         let descriptors: Vec<i32> = vnode_descriptors(pid)?
             .into_iter()
             .filter(|&fd| vnode_fd_identity(pid, fd, vinfo_size) == Some(identity))
@@ -738,20 +742,22 @@ pub struct ObjectHold<K> {
 pub struct ObjectCensus<K> {
     /// Every process it read that holds one of the objects, in pid listing order.
     pub holds: Vec<ObjectHold<K>>,
-    /// The processes whose descriptors the kernel withheld from this user (another user's, unless
-    /// the census runs as root). Any of them may hold an object, so they are counted, never
-    /// reported as holding none.
+    /// The processes whose descriptors were not read: those the kernel withheld from this user
+    /// (another user's, unless the census runs as root) and, on Darwin, those a cowshed lifecycle
+    /// operation runs in, which the census never asks. Any of them may hold an object, so they are
+    /// counted, never reported as holding none.
     pub uninspected: u32,
 }
 
 /// Every process with a descriptor on one of `objects`, each named as
 /// [`cowshed_os::process::descriptor_name`] names it (lsof's `d` or `i`), with the caller's key
-/// for it. One pass over every live pid the kernel lists ([`all_pids`], a lifecycle operation's
-/// process included, since a holder missed is a holder never reported), reading only the names the
+/// for it. One pass over every live pid the kernel lists ([`all_pids`]), reading only the names the
 /// objects need ([`NameKinds`]). A process found holding one is confirmed: its life is read, its
 /// descriptors read again, then its life again, so the descriptors reported are that life's and
 /// never a later process's given the pid. A process that exits during the census holds nothing;
-/// one whose descriptors or life the kernel withholds is counted in `uninspected`.
+/// one whose descriptors or life the kernel withholds is counted in `uninspected`, and so, on
+/// Darwin, is one a cowshed lifecycle operation runs in, whose descriptors are never read: a
+/// fork's first mount of its new image holds that vnode for minutes ([`inode_holders`]).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn object_holders<K: Copy>(objects: &[(DescriptorName, K)]) -> io::Result<ObjectCensus<K>> {
     use crate::runtime::job_groups::life_of;
@@ -793,7 +799,16 @@ pub fn object_holders<K: Copy>(objects: &[(DescriptorName, K)]) -> io::Result<Ob
     let mut holds = Vec::new();
     let mut uninspected = 0_usize;
     let mut unread = |unread: Unread| uninspected += usize::from(unread == Unread::Withheld);
+    #[cfg(target_os = "macos")]
+    let lifecycle = crate::lease_holder::running_lifecycle();
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut unasked = 0_usize;
     for pid in all_pids()? {
+        #[cfg(target_os = "macos")]
+        if lifecycle.contains(&pid) {
+            unasked += 1;
+            continue;
+        }
         match on_objects(pid)? {
             Ok(held) if held.is_empty() => continue,
             Ok(_) => {}
@@ -836,7 +851,7 @@ pub fn object_holders<K: Copy>(objects: &[(DescriptorName, K)]) -> io::Result<Ob
     }
     Ok(ObjectCensus {
         holds,
-        uninspected: u32::try_from(uninspected).map_err(io::Error::other)?,
+        uninspected: u32::try_from(uninspected + unasked).map_err(io::Error::other)?,
     })
 }
 
@@ -1291,8 +1306,8 @@ const O_EVTONLY: u32 = 0x0000_8000;
 
 /// The processes a census asks about: every live pid but those a cowshed lifecycle operation runs
 /// in, as its lease records them ([`crate::lease_holder::running_lifecycle`]). Such a process can
-/// hold one of its descriptors' vnodes in one kernel call for a minute -- a fork rewriting its new
-/// build image's first block -- and every per-descriptor query of it waits that long; the
+/// hold one of its descriptors' vnodes in one kernel call for a minute -- a fork's read-write mount
+/// of a new clone, which pays the clone's extent-map copy -- and every per-descriptor query of it waits that long; the
 /// operation's own leases and image locks already refuse what a census guards. The one walker
 /// every macOS census starts from, counted once per census ([`walk_begins`]).
 #[cfg(target_os = "macos")]
@@ -3091,10 +3106,10 @@ mod tests {
 
     /// A census asks nothing of a process a held lifecycle lease names with the unique id it has
     /// now: [`census_pids`], the one walker, passes over it, so the descriptor, tree and volume
-    /// censuses never query a descriptor of it (a fork in its build image's first write held one
-    /// for 54-90 s). A foreign holder of the same file is still found by each census, this process
-    /// is asked whatever its lease says, and a record whose unique id another life has names
-    /// nothing, so a reused pid is asked again.
+    /// censuses never query a descriptor of it (a fork in its new build image's first write, which
+    /// its read-write mount makes, held one for 54-90 s). A foreign holder of the same file is
+    /// still found by each census, this process is asked whatever its lease says, and a record
+    /// whose unique id another life has names nothing, so a reused pid is asked again.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_census_asks_nothing_of_a_process_a_held_lifecycle_lease_names() {

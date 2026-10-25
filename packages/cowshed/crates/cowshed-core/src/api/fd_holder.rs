@@ -64,9 +64,10 @@ pub struct FdHolder {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FdHolders {
     pub holders: Vec<FdHolder>,
-    /// The processes whose descriptors the kernel withheld from this user (another user's, unless
-    /// the census runs as root). Any of them may hold an object: counted, never reported as
-    /// holding none.
+    /// The processes whose descriptors were not read: those the kernel withheld from this user
+    /// (another user's, unless the census runs as root) and, on Darwin, those a cowshed lifecycle
+    /// operation runs in, which a census never asks (a fork's first mount of its new image holds its
+    /// vnode for minutes). Any of them may hold an object: counted, never reported as holding none.
     pub uninspected: u32,
 }
 
