@@ -3607,6 +3607,19 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::NxDaemonKeeper { reply }).await
     }
 
+    /// Stop the shed's Nx daemon keeper from starting a daemon until the shed is used again, and
+    /// end the start it has in flight, answered once that start concluded: a lifecycle verb asks
+    /// before its census of the mount (02_workspaces.md, "Holders cowshed does not run"). A start
+    /// whose daemon the checkout's record names live is serving and is left to the supervisor's
+    /// stop. Main's supervisor keeps none, so it has nothing to stop.
+    pub async fn stop_nx_keeper(&self) -> Result<()> {
+        self.call(|reply| Command::StopNxKeeper {
+            authority: self.authority.clone(),
+            reply,
+        })
+        .await
+    }
+
     /// Retire now: every running job is stopped (TERM, grace, KILL).
     pub async fn retire(&self, nx_daemon: NxDaemonRetirement) -> Result<()> {
         self.retire_when(nx_daemon, RetireWhen::Now).await
@@ -3954,6 +3967,11 @@ pub(super) enum Command {
     /// The keeper's decision at its next probe.
     NxDaemonKeeper {
         reply: oneshot::Sender<Result<Option<super::NxKeeperState>>>,
+    },
+    /// Stop the keeper's starts until the shed's next use, ending its start in flight.
+    StopNxKeeper {
+        authority: WorkspaceAuthoritySnapshot,
+        reply: oneshot::Sender<Result<()>>,
     },
 }
 
@@ -5429,6 +5447,7 @@ impl SupervisorActor {
                     let _ = reply.send(Ok(keeper.as_ref().map(NxDaemonKeeper::state)));
                 }
             },
+            Command::StopNxKeeper { authority, reply } => self.stop_nx_keeper(&authority, reply),
         }
     }
 
@@ -6642,6 +6661,10 @@ impl SupervisorActor {
         if daemon == Probe::Live || running {
             return;
         }
+        // A census of the mount stopped the keeper's starts until the shed's next use.
+        if keeper.stopped() {
+            return;
+        }
         // The job's `node` is found as its own exec would find it: on the PATH it gets.
         let path = match read_write.capabilities.contribution.shell {
             Some(_) => None,
@@ -6916,7 +6939,17 @@ impl SupervisorActor {
             let _ = reply.send(Err(error));
             return;
         }
-        if let Err(error) = self.begin_kill(job_id, KillReason::Requested) {
+        self.kill_answering(job_id, KillReason::Requested, reply);
+    }
+
+    /// End `job_id` for `reason`, answering `reply` once it concluded.
+    fn kill_answering(
+        &mut self,
+        job_id: JobId,
+        reason: KillReason,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
+        if let Err(error) = self.begin_kill(job_id, reason) {
             let _ = reply.send(Err(error));
             return;
         }
@@ -6928,6 +6961,49 @@ impl SupervisorActor {
             let _ = reply.send(job.terminal_outcome().map(|_| ()));
         } else {
             job.kill_waiters.push(reply);
+        }
+    }
+
+    /// A lifecycle verb is about to take its census of the mount (02_workspaces.md, "Holders
+    /// cowshed does not run"): the keeper starts no daemon until the shed is used again, and the
+    /// start it has in flight ends through the job it is, answered once that job concluded with
+    /// its processes reaped and its plugin workers ended. A start whose daemon the checkout's
+    /// record names live serves, perhaps a host run, so it is left: the census exempts it by that
+    /// record, and the census must not end what it measures.
+    fn stop_nx_keeper(
+        &mut self,
+        authority: &WorkspaceAuthoritySnapshot,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
+        if let Err(error) = self.validate_authority(authority) {
+            let _ = reply.send(Err(error));
+            return;
+        }
+        let (read_write, _) = self
+            .policy
+            .child(crate::api::dto::RunSandboxMode::ReadWrite);
+        let (Some(keeper), Some(project_root)) = (
+            &mut self.nx_daemon,
+            super::nx_daemon::kept_project(read_write).map(Path::to_path_buf),
+        ) else {
+            let _ = reply.send(Ok(()));
+            return;
+        };
+        keeper.stop_starts(&project_root);
+        let in_flight = keeper
+            .starting
+            .filter(|id| self.jobs.get(id).is_some_and(|job| !job.terminal()));
+        match in_flight {
+            Some(job_id)
+                if super::nx_daemon::probe(&crate::capabilities::nx::daemon_record(
+                    &project_root,
+                )) != Probe::Live =>
+            {
+                self.kill_answering(job_id, KillReason::Retire, reply);
+            }
+            _ => {
+                let _ = reply.send(Ok(()));
+            }
         }
     }
 

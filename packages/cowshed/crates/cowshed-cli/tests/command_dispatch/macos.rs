@@ -7228,6 +7228,135 @@ async fn land_skips_an_unverifiable_daemon_record_before_quiesce(
     }
 }
 
+/// Every job admission the controller committed under `telemetry`: its workspace incarnation and
+/// job id. A job's admission is committed before its first process is spawned.
+fn admissions(telemetry: &Path) -> std::collections::BTreeSet<(String, u64)> {
+    controller_commitments(telemetry)
+        .into_iter()
+        .filter_map(|value| match value {
+            cowshed_core::api::dto::ControllerCommitment::Admission(admission) => Some((
+                admission.workspace_incarnation.as_str().to_owned(),
+                admission.job_id.get(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The pids the stand-in daemon starts appended to `log`, once it names at least `count`.
+async fn logged_starts(log: &Path, count: usize) -> Vec<libc::pid_t> {
+    let read = || -> Vec<libc::pid_t> {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.parse().expect("a logged pid"))
+            .collect()
+    };
+    eventually(|| read().len() >= count).await;
+    read()
+}
+
+/// A keeper start in its restart backoff never outlives an `rm`'s census of the mount, and the
+/// keeper starts none after (02_workspaces.md, "Holders cowshed does not run"). The census asks
+/// whether each holder descends from the supervisor, and a start that exits before its parents
+/// are walked is not shown cowshed's: under gate load an `rm` refused over the keeper's own
+/// `start.js --kept`, admitted as the one before it failed. So the verb stops the keeper and
+/// reaps its start in flight before the census, and the shed's next use resumes it.
+///
+/// The checkout's `start.js` is a stand-in this test drives: each start appends its pid to a log,
+/// records no daemon, and fails once the test releases it through a FIFO. The first fails, so the
+/// keeper starts another, 2 of 3 (04_sandbox.md, the kept daemon). While that one waits, a host
+/// process holding the mount refuses an `rm` at its census: the refusal names the host process
+/// alone, and the keeper's start is already gone, ended by the supervisor that ran it. Once
+/// nothing holds the mount the workspace retires, and no job was admitted after the first `rm`
+/// began.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_apfs_rm_reaps_the_keepers_start_in_its_restart_backoff_before_its_census() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    let topic = new_workspace(&mut service, "outputs").await;
+    let log = topic.join("keeper-starts");
+    let release = topic.join("keeper-release");
+    let fifo = std::ffi::CString::new(release.as_os_str().as_bytes()).expect("a FIFO path");
+    // SAFETY: a NUL-terminated path and a mode; -1 is an error.
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}: {}",
+        release.display(),
+        std::io::Error::last_os_error()
+    );
+    let start = topic.join("node_modules/nx/dist/src/daemon/server/start.js");
+    fs::remove_file(&start).expect("the checkout's own start.js");
+    fs::write(
+        &start,
+        format!(
+            "const fs = require('fs');\n\
+             fs.appendFileSync({}, process.pid + '\\n');\n\
+             fs.readFileSync({});\n\
+             process.exit(1);\n",
+            serde_json::to_string(&log).unwrap(),
+            serde_json::to_string(&release).unwrap(),
+        ),
+    )
+    .unwrap();
+    // A job is use: the keeper starts its daemon alongside it.
+    sh(&mut service, "outputs", "true").await;
+    let first = logged_starts(&log, 1).await;
+    let releasing = release.clone();
+    // Opening a FIFO to write waits for its reader: the start, blocked reading it.
+    tokio::task::spawn_blocking(move || fs::write(releasing, b""))
+        .await
+        .expect("the release's thread")
+        .expect("release the first start");
+    let pids = logged_starts(&log, first.len() + 1).await;
+    let waiting = *pids.last().expect("the second start");
+    let admitted = admissions(fixture.storage.telemetry());
+
+    let mut holders = HostProcesses(Vec::new());
+    let holder = holders.start(&topic, None);
+    let (refused, _, stderr) = run(&mut service, ["--json", "rm", "--force", "outputs"]).await;
+    let refused = refused.expect_err(&format!(
+        "a host process holds the mount; {}",
+        String::from_utf8_lossy(&stderr)
+    ));
+    assert_eq!(refused.code, ErrorCode::Conflict, "{refused}");
+    assert!(
+        refused.message.contains(&format!(
+            "held by 1 process cowshed does not run: pid {holder} ("
+        )),
+        "the census names the host process alone: {}",
+        refused.message
+    );
+    // SAFETY: signal 0 checks for the process and sends nothing.
+    let alive = unsafe { libc::kill(waiting, 0) } == 0;
+    assert!(
+        !alive,
+        "the keeper's start {waiting} in flight outlived the census of the refused rm"
+    );
+    holders.end();
+    let (retired, _, stderr) = run(&mut service, ["rm", "--force", "outputs"]).await;
+    retired.unwrap_or_else(|error| {
+        panic!(
+            "retire once nothing holds it: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+    assert_eq!(
+        admissions(fixture.storage.telemetry()),
+        admitted,
+        "the keeper started no daemon after the first rm began"
+    );
+    drop(service);
+    fixture.stop_gateway().await;
+}
+
 /// The managed `bun` is the Bun the workspace declares (15_capabilities.md, "Bootstrap
 /// executables"). With a real `.envrc` putting the declared program on PATH, a sandboxed
 /// `bun --version` answers the declaration, as the host route's shell does, not the host's

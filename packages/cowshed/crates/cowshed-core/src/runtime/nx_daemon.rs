@@ -454,6 +454,10 @@ pub enum NxKeeperHold {
         pause: Duration,
         cap: Duration,
     },
+    /// A lifecycle verb about to take its census of the mount stopped the keeper's starts and
+    /// ended the start it had in flight: none starts until the shed is used again -- a job
+    /// admitted or a named session opened.
+    Stopped,
 }
 
 /// The keeper's own record of why it starts nothing.
@@ -558,6 +562,9 @@ pub(crate) struct NxDaemonKeeper {
     starting_served: bool,
     /// Why the keeper starts nothing now. Said each time it changes.
     hold: Option<Hold>,
+    /// Whether a lifecycle verb's census of the mount stopped the keeper's starts
+    /// ([`Self::stop_starts`]): none starts until the shed's next use ([`Self::used`]).
+    stopped: bool,
     /// The length of the next pause ([`FIRST_PAUSE`], doubling to [`PAUSE_CAP`]).
     next_pause: Duration,
     /// Stops of the idle shed's live daemon in a row that failed ([`STOP_ATTEMPTS`]); a probe
@@ -598,6 +605,7 @@ impl NxDaemonKeeper {
                     failed_starts: 0,
                     starting_served: false,
                     hold: None,
+                    stopped: false,
                     next_pause: FIRST_PAUSE,
                     failed_stops: 0,
                 })
@@ -657,16 +665,20 @@ impl NxDaemonKeeper {
     pub(crate) fn state(&self) -> NxKeeperState {
         NxKeeperState {
             starting: self.starting,
-            held: self.hold.as_ref().map(|hold| match hold {
-                Hold::Refused(why) => NxKeeperHold::Refused { why: why.clone() },
-                Hold::Paused { why, until, pause } => NxKeeperHold::Paused {
-                    why: why.clone(),
-                    failures: self.failed_starts,
-                    resumes_in: until.saturating_duration_since(Instant::now()),
-                    pause: *pause,
-                    cap: PAUSE_CAP,
-                },
-            }),
+            held: if self.stopped {
+                Some(NxKeeperHold::Stopped)
+            } else {
+                self.hold.as_ref().map(|hold| match hold {
+                    Hold::Refused(why) => NxKeeperHold::Refused { why: why.clone() },
+                    Hold::Paused { why, until, pause } => NxKeeperHold::Paused {
+                        why: why.clone(),
+                        failures: self.failed_starts,
+                        resumes_in: until.saturating_duration_since(Instant::now()),
+                        pause: *pause,
+                        cap: PAUSE_CAP,
+                    },
+                })
+            },
         }
     }
 
@@ -700,6 +712,10 @@ impl NxDaemonKeeper {
         daemon: Probe,
     ) {
         let served = std::mem::take(&mut self.starting_served);
+        // The census's stop ended it ([`Self::stop_starts`]): no failed start, and no successor.
+        if self.stopped {
+            return;
+        }
         let what = |ending: &str| {
             format!(
                 "Nx daemon start job {} for {} {ending}, and the daemon is {daemon}",
@@ -728,8 +744,34 @@ impl NxDaemonKeeper {
     /// the next probe is due at once. A job that ends before the next tick counts all the same;
     /// otherwise a short command would never be seen as use.
     pub(crate) fn used(&mut self) {
+        if std::mem::take(&mut self.stopped) {
+            cowshed_os::eprintln!(
+                "cowshed: the shed is in use again, so its Nx daemon keeper starts daemons again"
+            );
+        }
         self.clock.use_at(Instant::now());
         self.probes.reset_immediately();
+    }
+
+    /// A lifecycle verb is about to take its census of the mount before it stops the supervisor
+    /// (02_workspaces.md, "Holders cowshed does not run"): the keeper starts no daemon until the
+    /// shed is used again ([`Self::used`]). A start that exits while the census reads the process
+    /// table is a holder the census cannot prove cowshed's, and one admitted after the census is a
+    /// process no census looked at. Said once.
+    pub(crate) fn stop_starts(&mut self, project_root: &Path) {
+        if !self.stopped {
+            cowshed_os::eprintln!(
+                "cowshed: the Nx daemon keeper of {} starts no daemon while a census of its mount \
+                 decides a retirement; the shed's next job or session resumes it",
+                project_root.display()
+            );
+        }
+        self.stopped = true;
+    }
+
+    /// Whether a census stopped the keeper's starts ([`Self::stop_starts`]).
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped
     }
 
     /// A job of the ledger other than the keeper's own start ended: the shed's idle interval

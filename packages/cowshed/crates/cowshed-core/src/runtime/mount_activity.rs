@@ -63,7 +63,7 @@ impl std::fmt::Display for MountHeld {
 }
 
 impl MountHeld {
-    /// `Conflict` naming every holder. Nothing was stopped, and the hint names no override:
+    /// `Conflict` naming every holder. No holder was stopped, and the hint names no override:
     /// there is none.
     pub(crate) fn refusal(&self, workspace: &WorkspaceName) -> CowshedError {
         let pids = self
@@ -75,8 +75,8 @@ impl MountHeld {
         CowshedError::conflict(
             format!("{workspace} is in use: {self}"),
             format!(
-                "cowshed stopped nothing: let pid {pids} finish, or stop it or move its working \
-                 directory off {}, then retry",
+                "cowshed stopped none of them: let pid {pids} finish, or stop it or move its \
+                 working directory off {}, then retry",
                 self.mount.display()
             ),
         )

@@ -1642,15 +1642,21 @@ A holder check belongs in front of a destructive operation and, but for the one 
 operation, in that operation's own context, never on an interval and never inside a supervisor's actor. `detach`, `rm`,
 the retirement a `land` ends with (which is `rm`'s), `mv` and gc's retirement of an abandoned unpublished clone consult
 this census. Each asks before the supervisor stops, with the serving supervisor exempt. Stopping the supervisor first
-would end the keeper's Nx daemon that a host run may be using, so the census itself would disrupt what it measures. A
-retirement asks again once the supervisor has stopped, before the image is retired. A held mount refuses with
-`conflict`, naming each holder's pid, command, and what it holds where
-(`pid 4242 (nx run-many -t test), working directory /…/raven/packages`). It names ten holders and counts the rest.
-Nothing is stopped, and no flag overrides the refusal (11_shell.md, "Teardown ordering"). A supervisor's idle retirement
-and the Nx keeper's daemon stop (04_sandbox.md) run on timers and consult the supervisor's ledger alone: a supervisor
-retires once its ledger has held nothing for its idle bound, whatever else is on the mount, since retiring it unmounts
-nothing. gc's build-volume collection is a separate gate with its own grace (16_build_volumes.md) and does not consult
-it.
+would end the keeper's Nx daemon that a host run may be using, so the census itself would disrupt what it measures. Nor
+may a process of the keeper's own come or go while the census reads the process table: a start that exits before the
+census walks its parents is not shown cowshed's, and on 2026-10-25 a land gate's `rm --force`, issued as one failed
+start was followed by the next, refused over that `start.js --kept`. So each verb first asks the supervisor to stop its
+keeper's starts and to end the start it has in flight as the job it is, answered once that job concluded
+(`WorkspaceSupervisorHandle::stop_nx_keeper`). A start whose daemon the checkout's record names live is serving and is
+left, exempt by that record. A refused verb leaves the keeper stopped until the shed's next job or session, as an idle
+shed's keeper starts none until then (04_sandbox.md, "The Nx daemon stays on"). A retirement asks again once the
+supervisor has stopped, before the image is retired. A held mount refuses with `conflict`, naming each holder's pid,
+command, and what it holds where (`pid 4242 (nx run-many -t test), working directory /…/raven/packages`). It names ten
+holders and counts the rest. No holder is stopped, and no flag overrides the refusal (11_shell.md, "Teardown ordering").
+A supervisor's idle retirement and the Nx keeper's daemon stop (04_sandbox.md) run on timers and consult the
+supervisor's ledger alone: a supervisor retires once its ledger has held nothing for its idle bound, whatever else is on
+the mount, since retiring it unmounts nothing. gc's build-volume collection is a separate gate with its own grace
+(16_build_volumes.md) and does not consult it.
 
 One census is admitted outside a destructive operation, and only this one: the head of a land-turn queue waiting for its
 `--outside-lock` names the processes with that lock file open (05_gateway.md, "Land turns"). It runs on that

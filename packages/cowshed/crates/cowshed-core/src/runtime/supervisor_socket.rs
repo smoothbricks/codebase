@@ -384,6 +384,9 @@ enum Call {
         nx_daemon: NxDaemonRetirement,
         when: RetireWhen,
     },
+    /// Stop the Nx daemon keeper's starts and end its start in flight before a census of the
+    /// mount (`WorkspaceSupervisorHandle::stop_nx_keeper`).
+    StopNxKeeper,
     /// Name the build volume a land or refork moved the checkout's link onto.
     #[serde(rename_all = "camelCase")]
     NameBuildVolume {
@@ -2515,6 +2518,10 @@ async fn answer(
             supervisor.name_build_volume(build_volume).await?;
             (unit()?, Bytes::new())
         }
+        Call::StopNxKeeper => {
+            supervisor.stop_nx_keeper().await?;
+            (unit()?, Bytes::new())
+        }
     };
     Ok(Answer {
         value,
@@ -3344,6 +3351,9 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 )
                 .await,
             );
+        }
+        Command::StopNxKeeper { authority, reply } => {
+            let _ = reply.send(call(path, &authority, Call::StopNxKeeper, Bytes::new()).await);
         }
         Command::NameBuildVolume {
             authority,

@@ -6905,8 +6905,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             )
         };
         if mounted(&self.current(workspace).await?) {
-            let supervisor = self.serving_supervisor(workspace).await?;
-            self.require_mount_unheld(workspace, &mount, supervisor)
+            self.require_mount_unheld_before_stop(workspace, &mount)
                 .await?;
         }
         let stopped = self
@@ -9618,6 +9617,47 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
     }
 
+    /// The census a verb takes of `workspace`'s mount at `mount` before it stops the supervisor
+    /// ([`Self::require_mount_unheld`], the serving supervisor exempt). The supervisor's Nx daemon
+    /// keeper is stopped first and the start it has in flight ended as the supervisor's own job
+    /// ([`super::supervisor::WorkspaceSupervisorHandle::stop_nx_keeper`]): a keeper start that
+    /// exits while the census reads the process table is not shown cowshed's, and one the keeper
+    /// admits after the census is a process no census looked at. A refusal leaves the keeper
+    /// stopped until the shed's next job or session.
+    async fn require_mount_unheld_before_stop(
+        &self,
+        workspace: &WorkspaceName,
+        mount: &Path,
+    ) -> Result<()> {
+        self.stop_nx_keeper(workspace).await?;
+        let supervisor = self.serving_supervisor(workspace).await?;
+        self.require_mount_unheld(workspace, mount, supervisor)
+            .await
+    }
+
+    /// Stop the Nx daemon keeper of the supervisor serving `workspace`, when one serves
+    /// ([`Self::require_mount_unheld_before_stop`]). A supervisor of another cowshed build has no
+    /// such call; the stop that follows the census ends it, its keeper with it.
+    async fn stop_nx_keeper(&self, workspace: &WorkspaceName) -> Result<()> {
+        let handle = match self.supervisors.get(workspace) {
+            Some(handle) => handle.clone(),
+            None => {
+                let socket = super::supervisor_socket::socket_path(
+                    self.descriptor.storage.store(),
+                    &self.descriptor.repo_id,
+                    workspace,
+                );
+                match super::supervisor_socket::hello_if_present(&socket).await {
+                    Ok(Some(hello)) => super::supervisor_socket::connect(socket, hello.authority),
+                    Ok(None) => return Ok(()),
+                    Err(error) if error.code == ErrorCode::Conflict => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        handle.stop_nx_keeper().await
+    }
+
     /// One request, so the supervisor retires whatever becomes of this process: a quiesce and
     /// a retire sent apart left it refusing work for good when the caller went away between them
     /// (11_shell.md "Supervisor").
@@ -10020,8 +10060,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             containment,
                         )
                         .await?;
-                        let supervisor = this.serving_supervisor(workspace).await?;
-                        this.require_mount_unheld(workspace, &stage.mount_point, supervisor)
+                        this.require_mount_unheld_before_stop(workspace, &stage.mount_point)
                             .await?;
                         let _stopped = this
                             .stop_supervisor_with_mode(
@@ -13660,8 +13699,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
         ) {
-            let supervisor = self.serving_supervisor(&workspace).await?;
-            self.require_mount_unheld(&workspace, &mount, supervisor)
+            self.require_mount_unheld_before_stop(&workspace, &mount)
                 .await?;
         }
         let _stopped = self.stop_supervisor(&workspace).await?;
