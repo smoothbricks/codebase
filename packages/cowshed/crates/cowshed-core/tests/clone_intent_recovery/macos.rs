@@ -6,7 +6,9 @@ use std::process::{Command, Stdio};
 
 use arrow_ipc::reader::StreamReader;
 use cowshed_core::api::ControllerCommitment;
-use cowshed_core::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RevisionTarget};
+use cowshed_core::api::dto::{
+    AdoptOptions, ForkOptions, LandMode, LandOptions, RemoveOptions, RevisionTarget,
+};
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
 use cowshed_core::metadata::{
@@ -76,6 +78,7 @@ async fn clean_landed_source_is_physically_deleted_before_reply_and_crash_replay
                 force: true,
                 ..RemoveOptions::default()
             },
+            containment: None,
             origin: None,
         });
         journal.mark_mutating(&name("landed"))
@@ -98,6 +101,131 @@ async fn clean_landed_source_is_physically_deleted_before_reply_and_crash_replay
     restarted.shutdown().await.expect("stop restarted runtime");
 }
 
+/// A land's retire measures the unit against the branch it landed on and journals that
+/// containment, so a retire cut off after its `Mutating` mark — the client running the land
+/// timed out — is finished by the replay against the lane base, not refused against main, which
+/// holds no lane unit's commits until the lane itself lands (02_workspaces.md, "Lanes" and
+/// "Removal persists its exact options"). Measured 2026-10-25: a unit's land into its lane base
+/// delivered, and every replay of its retire refused, naming main.
+#[tokio::test]
+async fn an_interrupted_lane_land_retire_replays_against_the_lane_base() {
+    let fixture = Fixture::new("lane-retire-replay");
+    let runtime = fixture.adopt().await;
+    let lane = fixture
+        .mint(&runtime, "lane", ForkOptions::default())
+        .await
+        .expect("fork the lane base");
+    fixture.lane_unit(&runtime, &lane, "landed").await;
+    fixture
+        .land_into(&runtime, "landed", &lane, true)
+        .await
+        .expect("land the first unit and retire it");
+    // What a land journals for its retire, which a cut-off land leaves unfinished.
+    let journaled = fixture.intent("landed").expect("the land's retire request");
+    assert!(
+        matches!(
+            journaled.completion,
+            Some(LifecycleIntentCompletion::Retire(_))
+        ),
+        "{journaled:?}"
+    );
+    fixture.lane_unit(&runtime, &lane, "interrupted").await;
+    fixture
+        .land_into(&runtime, "interrupted", &lane, false)
+        .await
+        .expect("land the second unit, keeping it");
+    runtime.shutdown().await.expect("stop the landing runtime");
+    let mut request = serde_json::to_value(&journaled.operation).expect("retire request JSON");
+    request["workspace"] = json!("interrupted");
+    let request: LifecycleIntent =
+        serde_json::from_value(request).expect("the second unit's retire request");
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(request);
+        journal.mark_mutating(&name("interrupted"))
+    })
+    .expect("cut the land's retire off after its Mutating mark");
+
+    let recovered = fixture.gc().await;
+    let record = fixture.intent("interrupted").expect("the replayed request");
+    assert!(
+        matches!(
+            record.completion,
+            Some(LifecycleIntentCompletion::Retire(_))
+        ),
+        "the replay finished the retire against the lane base: {record:?}"
+    );
+    assert_eq!(fixture.listed(&recovered).await, ["lane", "main"]);
+    recovered
+        .shutdown()
+        .await
+        .expect("stop the recovering runtime");
+}
+
+/// `--abandon` is the sole authorization for destroying work main does not hold, and a named
+/// `rm` grants it even while the workspace's own retirement is unfinished. A retire request an
+/// earlier build journaled names no containment, so every replay measures the lane unit against
+/// main and refuses; the `rm` supersedes that request with its caller's options instead of
+/// answering with its refusal (02_workspaces.md, `rm` step 1 and "Removal persists its exact
+/// options"). Measured 2026-10-25: `cowshed rm <unit> --abandon` refused with "next: land the
+/// workspace" after the unit's land into its lane base had delivered.
+#[tokio::test]
+async fn a_named_rm_abandon_supersedes_its_targets_refused_unfinished_retire() {
+    let fixture = Fixture::new("lane-retire-abandon");
+    let runtime = fixture.adopt().await;
+    let lane = fixture
+        .mint(&runtime, "lane", ForkOptions::default())
+        .await
+        .expect("fork the lane base");
+    fixture.lane_unit(&runtime, &lane, "unit").await;
+    fixture
+        .land_into(&runtime, "unit", &lane, false)
+        .await
+        .expect("land the unit, keeping it");
+    runtime.shutdown().await.expect("stop the landing runtime");
+    // Exactly the record such a journal holds for the unit.
+    let request: LifecycleIntent = serde_json::from_value(json!({
+        "kind": "retire",
+        "workspace": "unit",
+        "options": { "force": false, "restore": false, "abandon": false },
+    }))
+    .expect("an earlier build's retire request");
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(request);
+        journal.mark_mutating(&name("unit"))
+    })
+    .expect("cut the land's retire off after its Mutating mark");
+
+    let rm = fixture
+        .open_removing("unit")
+        .await
+        .expect("a refused retirement of the target never fails its own rm");
+    let abandoned = fixture
+        .call(
+            &rm,
+            "coordinator.destroy",
+            json!({
+                "repoId": fixture.repo, "workspace": "unit",
+                "options": RemoveOptions { abandon: true, force: true, ..RemoveOptions::default() },
+            }),
+        )
+        .await
+        .expect("--abandon retires the unit whose commits main does not hold");
+    assert!(abandoned["abandoned"].is_object(), "{abandoned}");
+    let record = fixture.intent("unit").expect("the superseding request");
+    assert!(
+        matches!(
+            record.completion,
+            Some(LifecycleIntentCompletion::Retire(_))
+        ),
+        "{record:?}"
+    );
+    assert!(
+        matches!(&record.operation, LifecycleIntent::Retire { options, .. } if options.abandon),
+        "the journal holds the request that ran: {record:?}"
+    );
+    assert_eq!(fixture.listed(&rm).await, ["lane", "main"]);
+    rm.shutdown().await.expect("stop the removing runtime");
+}
 /// Neither a hidden name nor gitignore proves rebuildability. Only-copy source bytes keep
 /// their complete recovery image across shutdown, startup, plain gc and bundle-only gc.
 #[tokio::test]
@@ -430,6 +558,42 @@ impl Fixture {
         .await
     }
 
+    /// Forks `unit` from the lane base `lane` and commits work there that main does not hold.
+    async fn lane_unit(&self, runtime: &ProjectRuntime, lane: &Value, unit: &str) {
+        let source = lane["info"]["workspace"].as_str().expect("lane base name");
+        let view = self
+            .fork(runtime, source, unit)
+            .await
+            .expect("fork a lane unit");
+        let mount = PathBuf::from(view["info"]["mount"].as_str().expect("unit mount"));
+        fs::write(mount.join(unit), format!("{unit}'s work\n")).expect("unit work");
+        git(&mount, &["add", unit]);
+        git(&mount, &["commit", "-q", "-m", &format!("{unit}'s work")]);
+    }
+
+    /// `cowshed land <unit> --into <lane> --ungated`, and `--no-retire` unless `retire`.
+    async fn land_into(
+        &self,
+        runtime: &ProjectRuntime,
+        unit: &str,
+        lane: &Value,
+        retire: bool,
+    ) -> Result<Value> {
+        self.call(
+            runtime,
+            "coordinator.land",
+            json!({
+                "repoId": self.repo,
+                "workspace": unit,
+                "into": {
+                    "workspace": lane["info"]["workspace"],
+                    "incarnation": incarnation_of(lane),
+                },
+                "options": LandOptions { retire, mode: LandMode::Ungated, ..LandOptions::default() },
+            }),
+        )
+        .await
+    }
     async fn listed(&self, runtime: &ProjectRuntime) -> Vec<String> {
         let listed = self
             .call(runtime, "project.list", json!({ "repoId": self.repo }))

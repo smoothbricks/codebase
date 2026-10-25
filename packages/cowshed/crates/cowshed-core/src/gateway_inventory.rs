@@ -4632,6 +4632,7 @@ mod tests {
                         restore: true,
                         ..Default::default()
                     },
+                    containment: None,
                     origin: None,
                 });
                 journal.mark_mutating(&WorkspaceName::main())
@@ -4754,6 +4755,7 @@ mod tests {
                         restore,
                         ..Default::default()
                     },
+                    containment: None,
                     origin: None,
                 });
                 if mutating {
@@ -4777,6 +4779,7 @@ mod tests {
                     restore: true,
                     ..Default::default()
                 },
+                containment: None,
                 origin: None,
             });
             journal.mark_mutating(&WorkspaceName::main())

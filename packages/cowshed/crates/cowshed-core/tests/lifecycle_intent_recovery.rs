@@ -230,6 +230,7 @@ fn intent(operation: &str) -> LifecycleIntent {
                 force: true,
                 ..RemoveOptions::default()
             },
+            containment: None,
             origin: None,
         },
         other => panic!("unknown crash fixture operation {other}"),
@@ -239,6 +240,7 @@ fn retire(name: &str, options: RemoveOptions) -> LifecycleIntent {
     LifecycleIntent::Retire {
         workspace: workspace(name),
         options,
+        containment: None,
         origin: None,
     }
 }
@@ -554,6 +556,7 @@ fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_author
         journal.begin(LifecycleIntent::Retire {
             workspace: name.clone(),
             options: RemoveOptions::default(),
+            containment: None,
             origin: Some(Box::new(clone.clone())),
         });
         Ok(())
@@ -569,6 +572,7 @@ fn refused_pending_retirement_restores_the_clone_and_a_new_removal_can_be_author
                 abandon: true,
                 ..RemoveOptions::default()
             },
+            containment: None,
             origin: Some(Box::new(clone.clone())),
         });
         reopened

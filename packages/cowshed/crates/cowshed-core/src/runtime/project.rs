@@ -4480,7 +4480,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         operation: &crate::storage::recovery::LifecycleIntent,
     ) -> Option<&RemoveReport> {
         let record = self.lifecycle_intents.get(operation.target())?;
-        if record.operation != *operation {
+        if record.operation != *operation && !record.operation.retires_same_session(operation) {
             return None;
         }
         match record.completion.as_ref()? {
@@ -4608,7 +4608,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// first read and the claim, or while the pass waited for an image lock, and its result is the
     /// record to act on. `false` when nothing is left to replay. A replay refused an image lock it
     /// would have waited for stays an error, for [`Self::finish_residue`] to wait on alone; any
-    /// other failure of residue is reported and the record kept for a later pass.
+    /// other failure of residue is reported and the record kept for a later pass. So is a failed
+    /// retirement of a named `rm`'s own target, which that `rm` then supersedes under its
+    /// caller's options.
     async fn replay_unfinished_intent(&mut self, workspace: &WorkspaceName) -> Result<bool> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::recovery::{
@@ -4630,6 +4632,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // whatever stopped the clone — a duplicate port block, a start revision the source
             // lost — would stop the replay again, and the name could never be removed.
             let retiring = self.recovery_scope.removal_target() == Some(&workspace);
+            // A named `rm` of this workspace supersedes its own unfinished retirement when the
+            // replay refuses it: the rm reruns every safety fence under its caller's options and
+            // measures against main, as any standalone `rm` does (02_workspaces.md, "Lanes"), so a
+            // journaled request's refusal never stands between the caller and an explicit
+            // removal, its `--abandon` above all. An unpublished clone's retirement is not one:
+            // its origin, not the caller, decides what the rm retires.
+            let superseded = retiring
+                && matches!(
+                    &record.operation,
+                    LifecycleIntent::Retire { origin: None, .. }
+                );
             let replayed: Result<()> = async {
                 let phase = record.phase;
                 match record.operation {
@@ -4758,6 +4771,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     LifecycleIntent::Retire {
                         workspace,
                         options: _,
+                        containment: _,
                         origin,
                     } if phase == LifecycleIntentPhase::Prepared => {
                         let expected_mount = self.workspace_mount_path(&workspace)?;
@@ -4811,6 +4825,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     LifecycleIntent::Retire {
                         workspace,
                         options,
+                        containment,
                         origin,
                     } => match self.current(&workspace).await {
                         Ok(_) if origin.is_some() => {
@@ -4821,8 +4836,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         }
                         Ok(_) => {
                             // Authorized before it was journaled Mutating: the replay finishes it, and
-                            // a workspace's youth no longer decides anything.
-                            let containment = self.main_containment()?;
+                            // a workspace's youth no longer decides anything. It measures what its
+                            // request measured: a land's retire, the branch the unit landed on.
+                            let containment = self.recorded_containment(containment.as_ref())?;
                             self.remove_contained_in(
                                 workspace,
                                 options,
@@ -4842,7 +4858,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             {
                                 // Authorized before it was journaled Mutating: the replay finishes it, and
                                 // a workspace's youth no longer decides anything.
-                                let containment = self.main_containment()?;
+                                let containment = self.recorded_containment(containment.as_ref())?;
                                 self.remove_contained_in(
                                     workspace,
                                     options,
@@ -4869,6 +4885,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 Ok(()) => {}
                 // Not the intent's failure: the pass waits for the lock alone and replays it again.
                 Err(error) if error.image_locks_held_source().is_some() => return Err(error),
+                Err(error) if superseded => cowshed_os::eprintln!(
+                    "cowshed: unfinished {verb} of {workspace} could not be completed ({}: {}); this rm supersedes it with its own options",
+                    error.code.as_str(),
+                    error.message
+                ),
                 Err(error) if replay == IntentReplay::Residue => cowshed_os::eprintln!(
                     "cowshed: unfinished {verb} of {workspace} could not be completed ({}: {}); it stays journaled for a later pass",
                     error.code.as_str(),
@@ -7144,11 +7165,27 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// Main as the branch a session's work has to reach: what `rm` measures against.
     fn main_containment(&self) -> Result<NativeContainment> {
         Ok(NativeContainment {
+            target: main_name(),
             mount: self.workspace_mount_path(&main_name())?,
             branch: DEFAULT_LANDING_BRANCH.to_owned(),
         })
     }
 
+    /// What a journaled retirement measures against: the branch its request recorded, in that
+    /// workspace's repository, or main's `main` when it recorded none.
+    fn recorded_containment(
+        &self,
+        recorded: Option<&crate::storage::recovery::RetireContainment>,
+    ) -> Result<NativeContainment> {
+        let Some(recorded) = recorded else {
+            return self.main_containment();
+        };
+        Ok(NativeContainment {
+            target: recorded.workspace.clone(),
+            mount: self.workspace_mount_path(&recorded.workspace)?,
+            branch: recorded.branch.clone(),
+        })
+    }
     /// Resolve what `unit` lands into, or rebases onto: main when `into` is `None`, otherwise the
     /// named workspace, but only at the incarnation `into` was resolved at and never `unit`
     /// itself. A detached target is attached, since delivering into it means running Git in it,
@@ -8038,12 +8075,23 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let intent = crate::storage::recovery::LifecycleIntent::Retire {
             workspace: workspace.clone(),
             options,
+            containment: containment.recorded(),
             origin: None,
         };
-        let was_pending = self
+        let unfinished = self
             .lifecycle_intents
             .get(&workspace)
-            .is_some_and(|record| record.operation == intent && record.completion.is_none());
+            .filter(|record| record.completion.is_none())
+            .map(|record| &record.operation);
+        // This exact request, journaled by an earlier attempt, is not journaled again; any other
+        // request is, before its first mutation, so the record always holds the options and
+        // containment of the retirement actually running (02_workspaces.md, `rm`).
+        let journaled = unfinished == Some(&intent);
+        // An unfinished retirement of this session under any options or containment: a land's
+        // retire a client never saw end, which this removal supersedes, or finishes when the
+        // workspace is already gone.
+        let was_pending = journaled
+            || unfinished.is_some_and(|operation| operation.retires_same_session(&intent));
         if let Some(report) = self.completed_retire_intent(&intent).cloned()
             && self
                 .current(&workspace)
@@ -8141,6 +8189,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         crate::storage::recovery::LifecycleIntent::Retire {
                             workspace: workspace.clone(),
                             options,
+                            containment: None,
                             origin: Some(Box::new(origin)),
                         },
                     )
@@ -8204,7 +8253,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     // with it the last image naming this checkout; a restore stranded before the
                     // record existed gets it here, before anything else can fail.
                     self.record_checkout_root().await?;
-                    if !was_pending {
+                    if !journaled {
                         self.begin_lifecycle_intent(intent.clone()).await?;
                     }
                     self.mark_lifecycle_intent_mutating(&workspace).await?;
@@ -8288,7 +8337,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             let current = self.current(&workspace).await?;
             Self::require_exact_incarnation(&current, &incarnation)?;
             let rollback_state = self.adopt_rollback_state(&current, &pre_cowshed).await?;
-            if !was_pending {
+            if !journaled {
                 self.begin_lifecycle_intent(intent.clone()).await?;
             }
             self.mark_lifecycle_intent_mutating(&workspace).await?;
@@ -8369,7 +8418,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     young.of(&current)?.as_ref(),
                 )
                 .await?;
-            if !was_pending {
+            if !journaled {
                 self.begin_lifecycle_intent(intent).await?;
             }
             self.mark_lifecycle_intent_mutating(&workspace).await?;
@@ -10152,6 +10201,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let retire_intent = crate::storage::recovery::LifecycleIntent::Retire {
             workspace: workspace.clone(),
             options,
+            containment: None,
             origin: Some(Box::new(origin)),
         };
         let previous = self
@@ -10811,11 +10861,26 @@ struct NativeLandedState {
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeContainment {
+    /// The workspace whose repository holds `branch`: main, or the lane base a unit landed in.
+    target: WorkspaceName,
     /// The target repository's canonical mount, whose object store the measurement borrows.
     mount: PathBuf,
     branch: String,
 }
 
+#[cfg(target_os = "macos")]
+impl NativeContainment {
+    /// What a retire intent journals of this containment for its replay: nothing for main's
+    /// `main`, which an absent record means.
+    fn recorded(&self) -> Option<crate::storage::recovery::RetireContainment> {
+        (!self.target.is_main() || self.branch != DEFAULT_LANDING_BRANCH).then(|| {
+            crate::storage::recovery::RetireContainment {
+                workspace: self.target.clone(),
+                branch: self.branch.clone(),
+            }
+        })
+    }
+}
 /// What a unit lands into or rebases onto: main, or a lane base.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10840,6 +10905,7 @@ impl NativeLandingInto {
 
     fn containment(&self, branch: String) -> NativeContainment {
         NativeContainment {
+            target: self.name.clone(),
             mount: self.mount.clone(),
             branch,
         }

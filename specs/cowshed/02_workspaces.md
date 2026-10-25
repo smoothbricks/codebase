@@ -1278,7 +1278,9 @@ relies on its rebase's carry.
 The caller (an external coordinator) tracks the tree; cowshed stores nothing about lanes. `--into` names a workspace,
 and every lane rule is read off that workspace at the moment of the call: its checked-out branch is the target, its
 repository is where the unit's commits are fetched and fast-forwarded, and its branch is what the retire measures
-against. A standalone `cowshed rm` of a unit still measures against main.
+against. A standalone `cowshed rm` of a unit still measures against main. The one lane fact cowshed keeps is the land's
+own retire request, which journals the lane base and branch it measured against so that its replay measures the same
+("`cowshed rm <ws>`", "Removal persists its exact options").
 
 `--into` refuses the unit itself (exit 2), and `--into main` is the default. In the API the lane is a `WorkspaceRef`
 rather than a name: the reference carries the incarnation it was resolved at, and land and rebase refuse (exit 4, naming
@@ -1511,6 +1513,16 @@ retirement but before acknowledging the call, startup observes the workspace abs
 retiring it twice. A prepared request that never crossed the safety fence is discarded, not a deferred deletion; an
 authorized mutating request reruns the safety fences and retirement. Cancellation cannot discard the journal while the
 blocking release commit finishes.
+
+The request also records what the retirement measures against: nothing for main's `main`, which every `rm` measures
+against and every record from before the field means, and for a `land`'s retire the workspace and branch the unit landed
+on ("Lanes"). A replay measures what its request measured, so a lane unit whose land delivered but whose retire was cut
+off is retired against its lane base, never refused against main. A named `rm` first replays its target's own unfinished
+retirement; one that replay cannot finish — a refusal, an unreadable target — is reported on stderr and superseded: the
+`rm` journals its own options and containment (main, as any standalone `rm`) before its first mutation and reruns every
+fence under them, so a journaled request's refusal never stands between the caller and an explicit removal, and
+`--abandon` authorizes destroying what main lacks. A removal re-issued after a session's retirement finished, by a
+replay or an earlier call, answers with that retirement's report, whichever options either carried.
 
 A named `rm` can retire an unfinished fork without activating it. The exact pending image is mounted and validated under
 its image lock, then receives the same dirty-state, HEAD-stability and landed-work checks as an active workspace. A

@@ -668,6 +668,12 @@ pub enum LifecycleIntent {
     Retire {
         workspace: WorkspaceName,
         options: RemoveOptions,
+        /// What the retirement measures the workspace's work against when it is not main's
+        /// `main`: the branch a `land` just moved, in the workspace it moved (02_workspaces.md,
+        /// "Lanes"). Absent is main's `main`, what every `rm` measures against and what every
+        /// record written before this field meant, so a replay measures what its request did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        containment: Option<RetireContainment>,
         /// Original create/fork intent when retiring an unpublished clone. Its source is
         /// needed to verify the pending image after a crash; ordinary retirements omit it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -677,6 +683,16 @@ pub enum LifecycleIntent {
 
 fn not_rename(rename: &bool) -> bool {
     !*rename
+}
+
+/// The branch a land's retire measured its workspace against, in the repository of the
+/// workspace it landed into: a lane base, or main under `--target`. Recorded by name, not by
+/// mount: the mount is derived again when the record replays.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetireContainment {
+    pub workspace: WorkspaceName,
+    pub branch: String,
 }
 
 impl LifecycleIntent {
@@ -697,6 +713,20 @@ impl LifecycleIntent {
             Self::Fork { rename: false, .. } => "fork",
             Self::Retire { .. } => "retire",
         }
+    }
+
+    /// Whether `self` and `other` retire the same published session, whatever options or
+    /// containment each request carried: the later request supersedes the earlier one while it is
+    /// unfinished and is answered by it once it has finished (02_workspaces.md, `rm`). A main
+    /// restore and an unpublished clone's retirement answer only their exact request.
+    pub fn retires_same_session(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                Self::Retire { workspace, origin: None, .. },
+                Self::Retire { workspace: other, origin: None, .. },
+            ) if workspace == other && !workspace.is_main()
+        )
     }
 
     /// The detached metadata this intent carries for the workspace it rebuilds. A re-adoption's
