@@ -59,6 +59,7 @@ Find the symptom in the left column and follow the link.
 | A cowshed volume is indexed by Spotlight; `mdutil -s` reports `unknown indexing state`                                                                                                                   | [Spotlight indexing opt-outs](#spotlight-indexing-opt-outs)                                                                                     |
 | `dev.cowshed.storage` exits 1 at `merge Spotlight Search Privacy exclusions`; `mkstemp failed on /System/Volumes/Data/.Spotlight-V100/…`                                                                 | [Spotlight indexing opt-outs](#spotlight-indexing-opt-outs)                                                                                     |
 | `fseventsd` load; a root-owned `.fseventsd` in a volume root                                                                                                                                             | [`fseventsd` keeps a persistent event log per volume](#fseventsd-keeps-a-persistent-event-log-per-volume)                                       |
+| A watcher probe never comes back (`watcher stream stopped`); `fseventsd` holds gigabytes and its router thread stays busy                                                                                | [`fseventsd` slows with uptime](#fseventsd-slows-with-uptime)                                                                                   |
 | `root-held-event-debris`; a retired mountpoint cowshed cannot delete                                                                                                                                     | [A root-owned `.fseventsd` lands on a bare mountpoint](#a-root-owned-fseventsd-lands-on-a-bare-mountpoint)                                      |
 | Rewritten image blocks stay allocated; `tmutil` reports the store excluded                                                                                                                               | [Time Machine and local snapshots](#time-machine-and-local-snapshots)                                                                           |
 | After a reboot the store is absent; a DiskUnlock dialog at login; `environment-missing` naming the store                                                                                                 | [The store volume mounts before login](#the-store-volume-mounts-before-login)                                                                   |
@@ -127,7 +128,7 @@ Find the symptom in the left column and follow the link.
   [05_gateway.md §Host CPU budget](./05_gateway.md#host-cpu-budget) (CPU-pool endpoints);
   [05_gateway.md §The installed cowshed](./05_gateway.md#the-installed-cowshed) (`listener-handoff.sock`). Code:
   [`cowshed-core/src/sandbox.rs`] `workspace_runtime_link`; [`cowshed-core/src/runtime/supervisor_socket.rs`]
-  `socket_path`; [`cowshed-gateway-types/src/lib.rs`] `control_socket_path`; [`cowshed-apfs/src/disk_lease.rs`]
+  `socket_path`; [`cowshed-gateway-types/src/lib.rs`] `production_control_socket`; [`cowshed-apfs/src/disk_lease.rs`]
   `connect`. See also [`/usr/bin/rsync` is openrsync](#usrbinrsync-is-openrsync).
 
 ### `/tmp` and `/var` are symlinks into `/private`
@@ -542,12 +543,12 @@ Find the symptom in the left column and follow the link.
   state” either way, and neither opt-out stops the `mds` port leak above (_owner text_). The `Exclusions` live in
   `/System/Volumes/Data/.Spotlight-V100`, which refuses writes even to a root LaunchDaemon: the boot script's `mktemp`
   there failed `Operation not permitted` on each of 26,970 launchd runs, and `mdutil -i off` refuses a `nobrowse` mount
-  with `-400` (_measured_, macOS 26.6.2, 2026-10-25).
+  with `-400` (_measured_, macOS 26.6.2).
 - **Rule.** Cowshed plants neither opt-out and writes no Spotlight policy at adopt, setup or boot: the session mount
   root keeps session and build volumes unindexed
   ([01a_apfs.md §Stable workspace mount root](./01a_apfs.md#stable-workspace-mount-root)). Volumes adopted while adopt
-  planted `.metadata_never_index` (until 2026-10-25) still carry it, and git excludes it there. `mds` is never restarted
-  and indexing never toggled.
+  planted `.metadata_never_index` still carry it, and git excludes it there. `mds` is never restarted and indexing never
+  toggled.
 - **Owners.** [01a_apfs.md §Images](./01a_apfs.md#images), “Spotlight”;
   [01a_apfs.md §Mount and per-volume policy](./01a_apfs.md#mount-and-per-volume-policy) (the Spotlight indexing row);
   [01b_zfs.md §Mount root and Spotlight](./01b_zfs.md#mount-root-and-spotlight). Code: [`cowshed-apfs/src/lib.rs`]
@@ -569,7 +570,24 @@ Find the symptom in the left column and follow the link.
   [01a_apfs.md §Mount and per-volume policy](./01a_apfs.md#mount-and-per-volume-policy);
   [02_workspaces.md §The safe-to-clone-main invariant](./02_workspaces.md#the-safe-to-clone-main-invariant) (root-owned
   volume bookkeeping in a clone). Code: [`cowshed-apfs/src/lib.rs`] `opt_out_of_event_log`,
-  `retire_inherited_event_log`, `EVENT_LOG_OPT_OUT`.
+  `retire_inherited_event_log`, `EVENT_LOG_OPT_OUT`. See also
+  [`fseventsd` slows with uptime](#fseventsd-slows-with-uptime).
+
+### `fseventsd` slows with uptime
+
+- **Fact.** `fseventsd` interns event paths in one shared string table (its `PathStringZone`) created with 4096 buckets
+  and never resized, so each lookup under a global mutex walks a chain of about stored strings ÷ 4096 entries
+  (_measured_: disassembly of `fseventsd` on macOS 26.6.2), and the cost grows with uptime until `fseventsd` restarts
+  (`sudo -n killall fseventsd`; launchd respawns it): an instance up three days held 12.4–12.8 GB, kept its router
+  thread busy in every sample and left a test stream's touch undelivered after 89 s, while a restarted instance held
+  4.2–4.4 MB at 0–9 % router load and answered probes in 0.2–42 ms with the same clients, so no client causes it
+  (_measured_ by thread sampling).
+- **Rule.** A watcher probe that does not come back within the validity interval stops the daemon and the command
+  continues without it, and cowshed never restarts `fseventsd`.
+- **Owners.** _No spec owner_ for the path table and the restart.
+  [16_build_volumes.md §The Nx daemon stays on](./16_build_volumes.md#the-nx-daemon-stays-on), “A daemon answers from
+  the files as they are” (the lost-probe rule). Code: [`packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts`].
+  See also [`fseventsd` keeps a persistent event log per volume](#fseventsd-keeps-a-persistent-event-log-per-volume).
 
 ### A root-owned `.fseventsd` lands on a bare mountpoint
 
@@ -803,12 +821,15 @@ Find the symptom in the left column and follow the link.
   workspace supervisor and every job, so one Developer Tools entry exempts them all, and `doctor` times a fresh
   executable's first and second launch to report `first-launch-exempt`, `first-launch-scan` or
   `first-launch-unmeasured`.
-- **Owners.** _Unlanded._ The owner text is `05_gateway.md` “The gateway host” and its `first-launch` control op, the
-  `first-launch` check of `06_cli.md` “Onboarding and repair” and the `docs/troubleshooting.md` section “New binaries
-  start slowly in `cowshed exec`, or `cowshed doctor` warns `first-launch-scan`”, with
-  `cowshed-cli/src/gateway_host.rs`, `first_launch.rs`, `code_signing.rs` and the doctor check `first_launch_finding` in
-  `runtime.rs`; all of it arrives with the commit “run the gateway through a fixed-path signed host and measure the
-  first-launch scan”, and main has none of it.
+- **Owners.** [05_gateway.md §The installed cowshed](./05_gateway.md#the-installed-cowshed), “The gateway host” (the
+  responsible process and the host);
+  [05_gateway.md §Control plane (Unix socket + optional 7644)](./05_gateway.md#control-plane-unix-socket--optional-7644),
+  “{"op":"first-launch"}” (the `first-launch` op);
+  [06_cli.md §Onboarding and repair](./06_cli.md#onboarding-and-repair), “`first-launch` reads whether” (the
+  `first-launch` check);
+  [docs/troubleshooting.md §New binaries start slowly in `cowshed exec`, or `cowshed doctor` warns `first-launch-scan`](../../packages/cowshed/docs/troubleshooting.md#new-binaries-start-slowly-in-cowshed-exec-or-cowshed-doctor-warns-first-launch-scan).
+  Code: [`cowshed-cli/src/gateway_host.rs`] `VERB`; [`cowshed-cli/src/first_launch.rs`] `measure`, `judge`;
+  [`cowshed-cli/src/runtime.rs`] `first_launch_finding`.
 
 ### The Developer Tools exemption keys on path and designated requirement
 
@@ -824,28 +845,29 @@ Find the symptom in the left column and follow the link.
   cowshed code-signing identity, whose designated requirement
   `identifier "dev.cowshed.gateway-host" and certificate leaf = H"<sha1>"` is the same for every build, so the operator
   adds the host to Developer Tools once and `doctor` reports whether the entry holds.
-- **Owners.** _Unlanded._ The owner text is `05_gateway.md` “The gateway host” and its `first-launch` control op, the
-  `first-launch` check of `06_cli.md` “Onboarding and repair” and the `docs/troubleshooting.md` section “New binaries
-  start slowly in `cowshed exec`, or `cowshed doctor` warns `first-launch-scan`”, with
-  `cowshed-cli/src/gateway_host.rs`, `first_launch.rs`, `code_signing.rs` and the doctor check `first_launch_finding` in
-  `runtime.rs`; all of it arrives with the commit “run the gateway through a fixed-path signed host and measure the
-  first-launch scan”, and main has none of it.
+- **Owners.** [05_gateway.md §The installed cowshed](./05_gateway.md#the-installed-cowshed), “The gateway host” (the
+  host's path, signature and designated requirement);
+  [06_cli.md §Onboarding and repair](./06_cli.md#onboarding-and-repair), “`first-launch` reads whether” (the
+  `first-launch` check);
+  [docs/troubleshooting.md §New binaries start slowly in `cowshed exec`, or `cowshed doctor` warns `first-launch-scan`](../../packages/cowshed/docs/troubleshooting.md#new-binaries-start-slowly-in-cowshed-exec-or-cowshed-doctor-warns-first-launch-scan).
+  Code: [`cowshed-cli/src/code_signing.rs`] `GATEWAY_HOST_IDENTIFIER`; [`cowshed-cli/src/gateway_host.rs`] `VERB`;
+  [`cowshed-cli/src/first_launch.rs`] `judge`.
 
 ### `codesign` prompts for a key whose partition list lacks it
 
 - **Fact.** A key's partition list limits access by an application's code signature and changing it needs that
   keychain's password, and `codesign` needs `apple:` in it (`security(1)`, `set-key-partition-list`); a key imported
-  into the login keychain made `codesign` raise a keychain dialog (observed on macOS 26.6; _owner text_).
+  into the login keychain carries `security`'s partition, and `codesign` then raises a keychain dialog (observed on
+  macOS 26.6; _owner text_).
 - **Rule.** The signing identity lives in cowshed's own empty-password keychain
   `~/Library/Keychains/cowshed-signing.keychain`, imported with an access list naming `codesign` and a partition list
   set with that password, so signing raises no dialog and the login keychain is never written, while a dedicated
   account's signing keys are specified to follow the `security set-key-partition-list` recipe.
-- **Owners.** _Unlanded_ for the login-keychain observation in the Fact and the own-keychain clause of the Rule:
-  `05_gateway.md` “The gateway host”, the `setup` clause of `06_cli.md` “Onboarding and repair” and
-  `cowshed-cli/src/code_signing.rs` arrive with the commit “run the gateway through a fixed-path signed host and measure
-  the first-launch scan”, and main has none of it. The recipe clause is on main:
+- **Owners.** [05_gateway.md §The installed cowshed](./05_gateway.md#the-installed-cowshed), “The gateway host” (the
+  signing identity and its keychain);
   [14_nix.md §iOS, Xcode, and simulators (posture B)](./14_nix.md#ios-xcode-and-simulators-posture-b) (the
-  `set-key-partition-list` recipe).
+  `set-key-partition-list` recipe). Code: [`cowshed-cli/src/code_signing.rs`] `KEYCHAIN_NAME`, `prepare`,
+  `create_identity`.
 
 ### Gatekeeper quarantines downloaded apps; copying adds no quarantine
 
@@ -1237,7 +1259,10 @@ Find the symptom in the left column and follow the link.
 [`cowshed-apfs/src/release_authority.rs`]: ../../packages/cowshed/crates/cowshed-apfs/src/release_authority.rs
 [`cowshed-apfs/src/template.rs`]: ../../packages/cowshed/crates/cowshed-apfs/src/template.rs
 [`cowshed-cli/src/agent_cycle.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/agent_cycle.rs
+[`cowshed-cli/src/code_signing.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/code_signing.rs
 [`cowshed-cli/src/disk_command.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/disk_command.rs
+[`cowshed-cli/src/first_launch.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/first_launch.rs
+[`cowshed-cli/src/gateway_host.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/gateway_host.rs
 [`cowshed-cli/src/gateway_service.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/gateway_service.rs
 [`cowshed-cli/src/launchd.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/launchd.rs
 [`cowshed-cli/src/runtime.rs`]: ../../packages/cowshed/crates/cowshed-cli/src/runtime.rs
@@ -1306,4 +1331,6 @@ Find the symptom in the left column and follow the link.
   ../../packages/nx-plugin/src/executors/bounded-exec/ram-detach.ts
 [`packages/nx-plugin/src/executors/bounded-exec/ram-temp.ts`]:
   ../../packages/nx-plugin/src/executors/bounded-exec/ram-temp.ts
+[`packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts`]:
+  ../../packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts
 [`packages/nx-plugin/src/process-group.ts`]: ../../packages/nx-plugin/src/process-group.ts
