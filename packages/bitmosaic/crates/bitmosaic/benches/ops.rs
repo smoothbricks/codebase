@@ -261,6 +261,112 @@ fn bench_ops(c: &mut Criterion) {
     }
 }
 
+/// The `Array` container's search (D19/D56 of the ordered-index study): one
+/// chunk of `n` irregular members, so every probe searches one Array plane,
+/// owned and borrowed. Half the probes are members, half any value in the
+/// chunk. `throughput` sums independent searches; `chain` picks each probe
+/// by the previous answer, so a search's latency is on the clock. The chain
+/// is index-only: an early-exit search whose branches predict well can run
+/// ahead of it (handbook §22.2's confound), and the plane is L1-resident.
+fn bench_array_search(c: &mut Criterion) {
+    const PROBES: usize = 1024;
+    for n in [64usize, 512, 4096] {
+        let mut state = 0xA11A_0000_u64 + n as u64;
+        let mut seen = vec![false; 1 << 16];
+        let mut values = Vec::with_capacity(n);
+        while values.len() < n {
+            let v = (xorshift(&mut state) & 0xFFFF) as u32;
+            if !std::mem::replace(&mut seen[v as usize], true) {
+                values.push(v);
+            }
+        }
+        values.sort_unstable();
+        let owned = bitmosaic::Bitmosaic::from_sorted(values.iter().copied());
+        assert_eq!(
+            owned.container_census(),
+            (0, 0, 1, 0, 0),
+            "array-search-{n}: one Array chunk"
+        );
+        let bytes = owned.to_forest_bytes();
+        let view = bitmosaic::BitmosaicView::open(&bytes).expect("attach");
+        assert!(!view.is_elias_fano(), "array-search-{n}: a forest root");
+        let probes: Vec<u32> = (0..PROBES)
+            .map(|i| {
+                let r = xorshift(&mut state);
+                if i % 2 == 0 {
+                    values[(r % n as u64) as usize]
+                } else {
+                    (r & 0xFFFF) as u32
+                }
+            })
+            .collect();
+        for &p in &probes {
+            let rank = values.partition_point(|v| *v < p) as u64;
+            let member = values.binary_search(&p).is_ok();
+            assert_eq!(owned.rank(p), rank, "array-search-{n}: owned rank({p})");
+            assert_eq!(view.rank(p), rank, "array-search-{n}: view rank({p})");
+            assert_eq!(
+                owned.contains(p),
+                member,
+                "array-search-{n}: owned contains({p})"
+            );
+            assert_eq!(
+                view.contains(p),
+                member,
+                "array-search-{n}: view contains({p})"
+            );
+        }
+
+        let mut group = c.benchmark_group(format!("array-search-{n}"));
+        group.bench_function("rank/owned/throughput", |b| {
+            b.iter(|| black_box(throughput(&probes, |p| owned.rank(p))))
+        });
+        group.bench_function("rank/owned/chain", |b| {
+            b.iter(|| black_box(chain(&probes, |p| owned.rank(p))))
+        });
+        group.bench_function("rank/view/throughput", |b| {
+            b.iter(|| black_box(throughput(&probes, |p| view.rank(p))))
+        });
+        group.bench_function("rank/view/chain", |b| {
+            b.iter(|| black_box(chain(&probes, |p| view.rank(p))))
+        });
+        group.bench_function("contains/owned/throughput", |b| {
+            b.iter(|| black_box(throughput(&probes, |p| u64::from(owned.contains(p)))))
+        });
+        group.bench_function("contains/owned/chain", |b| {
+            b.iter(|| black_box(chain(&probes, |p| u64::from(owned.contains(p)))))
+        });
+        group.bench_function("contains/view/throughput", |b| {
+            b.iter(|| black_box(throughput(&probes, |p| u64::from(view.contains(p)))))
+        });
+        group.bench_function("contains/view/chain", |b| {
+            b.iter(|| black_box(chain(&probes, |p| u64::from(view.contains(p)))))
+        });
+        group.finish();
+    }
+}
+
+/// Independent searches: each probe's address is known before the last
+/// answer arrives.
+fn throughput(probes: &[u32], search: impl Fn(u32) -> u64) -> u64 {
+    probes
+        .iter()
+        .fold(0u64, |acc, &p| acc.wrapping_add(search(black_box(p))))
+}
+
+/// Dependent searches: the next probe's index comes from this answer.
+/// `probes.len()` is a power of two.
+fn chain(probes: &[u32], search: impl Fn(u32) -> u64) -> u64 {
+    let mask = probes.len() - 1;
+    let (mut at, mut acc) = (0usize, 0u64);
+    for _ in 0..probes.len() {
+        let answer = search(probes[at]);
+        acc = acc.wrapping_add(answer);
+        at = (at + 1 + (answer & 1) as usize) & mask;
+    }
+    acc
+}
+
 fn bench_u64(c: &mut Criterion) {
     use roaring::RoaringTreemap;
     // The engine's EntityId shape: dense ordinal-derived u64 ids.
@@ -348,5 +454,5 @@ fn bench_u64(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_ops, bench_u64);
+criterion_group!(benches, bench_ops, bench_u64, bench_array_search);
 criterion_main!(benches);
