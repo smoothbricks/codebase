@@ -194,7 +194,12 @@
         ],
         "inputs": [
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/lmao",
+              "bun-lock:packages/lmao"
+            ]
+          },
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
           "{projectRoot}/.cargo/config.toml",
@@ -286,7 +291,12 @@
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/lmao",
+              "bun-lock:packages/lmao"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
           "{projectRoot}/justfile",
@@ -320,7 +330,11 @@
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/lmao"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
           {

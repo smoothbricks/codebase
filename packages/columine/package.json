@@ -77,7 +77,12 @@
           "{workspaceRoot}/packages/bitmosaic/crates/**/*.rs",
           "{workspaceRoot}/packages/*/crates/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/columine",
+              "bun-lock:packages/columine"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/justfile"
         ],

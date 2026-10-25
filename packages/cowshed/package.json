@@ -109,7 +109,11 @@
         ],
         "inputs": [
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/**/*",
           "cargoToolchain",
@@ -138,7 +142,11 @@
         ],
         "inputs": [
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/cowshed-api-gen/**/*",
           "cargoToolchain",
@@ -162,7 +170,12 @@
         ],
         "inputs": [
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed",
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/cowshed-api-gen/**/*",
           "{projectRoot}/crates/cowshed-core/**/*.rs",
@@ -199,7 +212,12 @@
         ],
         "inputs": [
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed",
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/cowshed-api-gen/**/*",
           "{projectRoot}/crates/cowshed-core/**/*.rs",
@@ -281,13 +299,21 @@
           "{projectRoot}/crates/**/*.js",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
-          "{workspaceRoot}/bun.lock",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "cargoToolchain"
         ],
         "outputs": [
@@ -312,13 +338,21 @@
           "{projectRoot}/crates/**/*.js",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
-          "{workspaceRoot}/bun.lock",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "cargoToolchain"
         ],
         "outputs": [
@@ -343,12 +377,20 @@
           "{projectRoot}/crates/**/*.js",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
-          "{workspaceRoot}/bun.lock",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "cargoToolchain"
         ],
         "outputs": [
@@ -376,12 +418,20 @@
           "{projectRoot}/crates/**/*.js",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
-          "{workspaceRoot}/bun.lock",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "cargoToolchain"
         ],
         "outputs": [
@@ -404,6 +454,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "default",
           "^dependencyDefault"
         ],
@@ -428,6 +483,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "default",
           "^dependencyDefault"
         ],
@@ -451,6 +511,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "default",
           "^dependencyDefault"
         ],
@@ -481,7 +546,12 @@
         ],
         "inputs": [
           "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed",
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "{projectRoot}/crates/cowshed-core/**/*.rs",
           "{projectRoot}/crates/cowshed-core/Cargo.toml",
           "{projectRoot}/crates/cowshed-napi/**/*.rs",
@@ -570,6 +640,11 @@
           "wire-warmup"
         ],
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "default",
           "^production",
           "{workspaceRoot}/biome.json",
@@ -592,6 +667,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
           "default",
           "^dependencyDefault"
         ],

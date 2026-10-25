@@ -5,7 +5,7 @@
     "lint": {
       "executor": "nx:run-commands",
       "cache": true,
-      "inputs": ["default", "{workspaceRoot}/biome.json"],
+      "inputs": ["default", "{workspaceRoot}/biome.json", { "externalDependencies": ["bun-lock:."] }],
       "options": {
         "command": "biome check packages/statebus-core/scripts/consumer",
         "cwd": "{workspaceRoot}"

@@ -50,6 +50,11 @@
           "cwd": "{projectRoot}"
         },
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:targets/lmao-docs"
+            ]
+          },
           "default",
           "^dependencyDefault"
         ],

@@ -86,6 +86,11 @@
         "executor": "nx:run-commands",
         "cache": true,
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/nx-cache-server"
+            ]
+          },
           "{projectRoot}/src/**/*.ts",
           "!{projectRoot}/src/**/__tests__/**",
           "{projectRoot}/package.json",

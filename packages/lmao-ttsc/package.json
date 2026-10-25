@@ -64,6 +64,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/lmao-ttsc"
+            ]
+          },
           "{projectRoot}/plugin/**/*.go",
           "{projectRoot}/plugin/go.mod",
           "{projectRoot}/scripts/gen-go-work.mjs"
@@ -79,6 +84,11 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/lmao-ttsc"
+            ]
+          },
           "{projectRoot}/plugin/**/*.go",
           "{projectRoot}/plugin/go.mod",
           "{projectRoot}/scripts/gen-go-work.mjs"

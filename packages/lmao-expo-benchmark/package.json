@@ -45,6 +45,11 @@
           "^build"
         ],
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/lmao-expo-benchmark"
+            ]
+          },
           "default",
           "pluginScenarioSources"
         ],
@@ -57,6 +62,11 @@
       },
       "typecheck-tests": {
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/lmao-expo-benchmark"
+            ]
+          },
           "default",
           "pluginScenarioSources"
         ]
@@ -81,6 +91,11 @@
       "lint": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "inputs": [
+          {
+            "externalDependencies": [
+              "bun-lock:packages/lmao-expo-benchmark"
+            ]
+          },
           "default",
           "^dependencyDefault"
         ],

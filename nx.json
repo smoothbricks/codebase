@@ -42,13 +42,14 @@
       "{workspaceRoot}/tooling/direnv/nixpkgs-overlay/_sources/generated.nix",
       {
         "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --revision"
-      }
+      },
+      { "externalDependencies": ["bun-lock:."] }
     ]
   },
   "targetDefaults": {
     "build": {
       "cache": true,
-      "inputs": ["default", "^dependencyDefault"]
+      "inputs": ["default", "^dependencyDefault", { "externalDependencies": [] }]
     },
     "typecheck": {
       "cache": true,
@@ -59,7 +60,7 @@
       "inputs": ["default", "^dependencyDefault", "bunToolchain"]
     },
     "cargo-test": {
-      "inputs": ["default", "^dependencyDefault"]
+      "inputs": ["default", "^dependencyDefault", { "externalDependencies": [] }]
     },
     "cargo-lint": {
       "inputs": [{ "externalDependencies": [] }]
