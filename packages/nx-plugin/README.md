@@ -287,7 +287,8 @@ reported versions. The pin is `devenv.lock`, hashed as an ordinary file input at
 every cargo command inherits, so bumping it invalidates every cached cargo target. Workspace test runners additionally
 hash the manifest of every package the workspace build compiles inside the Nx workspace (a member's, and a path
 package's that reaches the build only as some crate's dev-dependency), because those affect unified features, and the
-nextest executable/configuration.
+nextest executable/configuration. While the build compiles a path package outside the Nx workspace, every runner also
+names `externalRustCrates`, which then must be declared: a runner's key does not follow the archive's outputs.
 
 Nothing machine-local takes part. The ambient cargo environment and the global `$CARGO_HOME/config.toml` are
 deliberately not hashed: their values carry absolute store paths and per-checkout state directories, which would make

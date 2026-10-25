@@ -386,20 +386,32 @@ async function deriveCargoPackageTestInputs(
   // Arbitrary build-script reads outside package trees, custom output trees,
   // and ambient tools/environment require explicit target or named inputs.
   if (external.size > 0) {
-    if (readNxJson(workspaceRoot).namedInputs?.[EXTERNAL_RUST_CRATES_INPUT] === undefined) {
-      const listed = [...external]
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([name, dir]) => `${name} -> ${dir}`)
-        .join(', ');
-      throw new Error(
-        `${memberDir}/Cargo.toml references inputs outside the Nx workspace (${listed}) that no fileset can hash; ` +
-          `declare namedInputs.${EXTERNAL_RUST_CRATES_INPUT} in ${join(workspaceRoot, 'nx.json')} ` +
-          'with runtime inputs that hash those external sources and configuration',
-      );
-    }
+    requireExternalRustCratesInput(workspaceRoot, `${memberDir}/Cargo.toml`, external);
     inputs.add(EXTERNAL_RUST_CRATES_INPUT);
   }
   return [...inputs];
+}
+
+/**
+ * Refuses inputs outside the Nx workspace that `nx.json` gives no `externalRustCrates` runtime hash for: no fileset
+ * can hash them, and a key without them would replay a verdict across their edits. `external` maps each input's name
+ * to its path.
+ */
+export function requireExternalRustCratesInput(
+  workspaceRoot: string,
+  manifest: string,
+  external: ReadonlyMap<string, string>,
+): void {
+  if (readNxJson(workspaceRoot).namedInputs?.[EXTERNAL_RUST_CRATES_INPUT] !== undefined) return;
+  const listed = [...external]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, dir]) => `${name} -> ${dir}`)
+    .join(', ');
+  throw new Error(
+    `${manifest} references inputs outside the Nx workspace (${listed}) that no fileset can hash; ` +
+      `declare namedInputs.${EXTERNAL_RUST_CRATES_INPUT} in ${join(workspaceRoot, 'nx.json')} ` +
+      'with runtime inputs that hash those external sources and configuration',
+  );
 }
 
 /** Every directory beneath `root` that holds its own `Cargo.toml`, the walk stopping at each. */

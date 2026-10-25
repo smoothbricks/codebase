@@ -50,12 +50,14 @@ import {
   cargoTestGroupTargetName,
   cargoTestPackageTargetName,
   createCargoInputsCache,
+  EXTERNAL_RUST_CRATES_INPUT,
   exceptionalTestFilter,
   listCargoCrossTestTargets,
   listCargoWorkspacePackages,
   NEXTEST_REPO_CONFIG_PATH,
   nextestToolConfigArg,
   PLUGIN_NEXTEST_CONFIG_PATH,
+  requireExternalRustCratesInput,
   type SerialTestGroup,
   serialTestGroups,
 } from './cargo-workspace.js';
@@ -2859,17 +2861,27 @@ async function cargoTestRunnerInputs(
       }),
     ),
   );
+  // The archive unifies every built package's manifest into every test binary, and a runner's key does not follow the
+  // archive's outputs, so each runner names them all: the ones Nx holds as files, the rest through the repository's
+  // runtime hash of external sources.
+  const manifests: string[] = [];
+  const external = new Map<string, string>();
+  for (const pkg of workspace.closureSource.cargo.local) {
+    const manifest = relative(workspace.closureSource.root, pkg.manifest);
+    if (manifest === '..' || manifest.startsWith(`..${sep}`) || isAbsolute(manifest)) {
+      external.set(pkg.name, pkg.directory);
+    } else {
+      manifests.push(posix.join('{workspaceRoot}', manifest.split(sep).join('/')));
+    }
+  }
+  if (external.size > 0) {
+    requireExternalRustCratesInput(workspaceRoot, posix.join(workspace.projectRoot, 'Cargo.toml'), external);
+  }
   return [
     ...new Set([
       ...sources.flat(),
-      ...workspace.closureSource.cargo.local.flatMap((pkg) => {
-        const manifest = relative(workspace.closureSource.root, pkg.manifest);
-        // A manifest outside the Nx workspace is no fileset; only a crate whose own closure reaches it keys it,
-        // through `externalRustCrates`.
-        return manifest === '..' || manifest.startsWith(`..${sep}`) || isAbsolute(manifest)
-          ? []
-          : [posix.join('{workspaceRoot}', manifest.split(sep).join('/'))];
-      }),
+      ...manifests,
+      ...(external.size > 0 ? [EXTERNAL_RUST_CRATES_INPUT] : []),
       posix.join(inputRoot, NEXTEST_REPO_CONFIG_PATH),
     ]),
     fileHashInput(PLUGIN_NEXTEST_CONFIG_PATH),

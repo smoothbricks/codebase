@@ -2701,6 +2701,49 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   });
+
+  // A path package outside the Nx workspace that only some member's tests build is no fileset, yet the workspace
+  // archive unifies its manifest's features into every test binary, and a runner's key does not follow the archive's
+  // outputs. Every runner therefore names the repository's runtime hash of external sources.
+  it('keys every runner on externalRustCrates while the workspace builds a path package outside Nx', async () => {
+    const outside = await realpath(await mkdtemp(join(tmpdir(), 'smoothbricks-nx-plugin-outside-')));
+    const workspace = await createWorkspace(outside);
+    try {
+      await writeApfsSplitFixture(workspace, APFS_SPLIT_GROUPS);
+      await workspace.write('nx.json', JSON.stringify({ namedInputs: { externalRustCrates: [] } }));
+      await mkdir(join(outside, 'external/src'), { recursive: true });
+      await writeFile(join(outside, 'external/Cargo.toml'), '[package]\nname = "external"\n\n[workspace]\n');
+      await writeFile(join(outside, 'external/src/lib.rs'), '');
+      // Only cowshed-core's tests build it.
+      await workspace.write(
+        'packages/cowshed/crates/cowshed-core/Cargo.toml',
+        [
+          '[package]',
+          'name = "cowshed-core"',
+          '',
+          '[dependencies]',
+          'cowshed-apfs = { path = "../cowshed-apfs" }',
+          'cowshed-os = { path = "../cowshed-os" }',
+          '',
+          '[dev-dependencies]',
+          `external = { path = ${JSON.stringify(join(outside, 'external'))} }`,
+          '',
+        ].join('\n'),
+      );
+      const inferred = await inferApfsSplit(workspace);
+      const cowshed = inferred.get('packages/cowshed') ?? {};
+      const runners = {
+        cli: cowshed['cargo-test-cowshed-cli'],
+        core: cowshed['cargo-test-cowshed-core'],
+        lmao: inferred.get('packages/lmao')?.['cargo-test-lmao-core'],
+      };
+      for (const [name, runner] of Object.entries(runners)) {
+        expect(runner?.inputs, name).toContain('externalRustCrates');
+      }
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
   it('refuses a serial group scoped to a package that is not a member of the Cargo workspace', async () => {
     const workspace = await createWorkspace();
     try {
