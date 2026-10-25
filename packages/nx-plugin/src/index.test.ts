@@ -419,6 +419,72 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it("hands a scriptc package's FFI to every platform target and hashes the files it is built from", async () => {
+    const workspace = await createWorkspace();
+    try {
+      const packs = {
+        '@scriptc/runtime-darwin-arm64': '0.4.4',
+        '@scriptc/runtime-darwin-x64': '0.4.4',
+        '@scriptc/runtime-linux-arm64-musl': '0.4.4',
+        '@scriptc/runtime-linux-x64-musl': '0.4.4',
+      };
+      const ffi = { manifest: 'ffi.json', declarations: { 'src/ffi.d.ts': 'ffi.d.ts' }, sources: ['native/lock.c'] };
+      const manifest = {
+        name: '@scope/tool',
+        bin: { 'smoo-nx-tool': './dist/ts/bin/smoo-nx-tool.js' },
+        devDependencies: { ...packs, scriptc: '0.4.4' },
+        scriptc: { ffi },
+      };
+      await workspace.write(
+        'packages/tool/tsconfig.lib.json',
+        '{"compilerOptions":{"rootDir":"src","outDir":"dist/ts"}}\n',
+      );
+      await workspace.write('packages/tool/package.json', JSON.stringify(manifest));
+      const targets = await inferProjectTargets(workspace, 'packages/tool/package.json');
+      const names = ['scriptc-arm64-macos', 'scriptc-x64-macos', 'scriptc-arm64-linux', 'scriptc-x64-linux'];
+      for (const name of names) {
+        expect(targets[name]?.options).toMatchObject({ ffi });
+        // Change the manifest, a declaration or a C source and the executable is stale.
+        for (const input of ['{projectRoot}/ffi.json', '{projectRoot}/src/ffi.d.ts', '{projectRoot}/native/lock.c']) {
+          expect(targets[name]?.inputs).toContain(input);
+        }
+      }
+      // A package that declares no FFI passes no option and no extra input.
+      await workspace.write('packages/tool/package.json', JSON.stringify({ ...manifest, scriptc: undefined }));
+      const plain = await inferProjectTargets(workspace, 'packages/tool/package.json');
+      for (const name of names) {
+        expect(plain[name]?.options).not.toHaveProperty('ffi');
+        expect(plain[name]?.inputs).not.toContain('{projectRoot}/ffi.json');
+      }
+      const refusal = async (scriptc: unknown): Promise<string | undefined> => {
+        await workspace.write('packages/tool/package.json', JSON.stringify({ ...manifest, scriptc }));
+        const failure = await inferProjectTargets(workspace, 'packages/tool/package.json').then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        if (!(failure instanceof AggregateCreateNodesError)) {
+          throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+        }
+        return failure.errors[0]?.[1]?.message;
+      };
+      expect(await refusal({ ffi: { ...ffi, manifest: 7 } })).toMatch(/scriptc\.ffi needs a manifest path/);
+      expect(await refusal({ ffi: { ...ffi, declarations: { 'src/ffi.d.ts': 7 } } })).toMatch(
+        /scriptc\.ffi needs declarations mapping each source file to its staged path \(src\/ffi\.d\.ts is not\)/,
+      );
+      expect(await refusal({ ffi: { ...ffi, sources: 'native/lock.c' } })).toMatch(
+        /scriptc\.ffi needs sources, a list of C files/,
+      );
+      expect(await refusal({ ffi: { ...ffi, sources: ['../outside.c'] } })).toMatch(
+        /scriptc\.ffi names "\.\.\/outside\.c", which is not a path beneath the project/,
+      );
+      expect(await refusal({ ffi: { ...ffi, declarations: { 'src/ffi.d.ts': '/tmp/ffi.d.ts' } } })).toMatch(
+        /scriptc\.ffi names "\/tmp\/ffi\.d\.ts", which is not a path beneath the emitted JavaScript's root/,
+      );
+      expect(await refusal({})).toMatch(/scriptc\.ffi must be an object/);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   it('hashes the manifests without their versions for checks, raw for artifacts', async () => {
     const workspace = await createWorkspace();
     try {

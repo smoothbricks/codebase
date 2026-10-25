@@ -27,6 +27,32 @@
       "additionalProperties": {
         "type": "string"
       }
+    },
+    "ffi": {
+      "type": "object",
+      "description": "The package's foreign functions: its declarations are staged beside the emitted JavaScript, its C sources compiled for the triple into an archive, and scriptc is handed a staged copy of the manifest that links it",
+      "properties": {
+        "manifest": {
+          "type": "string",
+          "description": "The FFI manifest, relative to cwd, listing no libraries"
+        },
+        "declarations": {
+          "type": "object",
+          "description": "Each ambient declaration file, relative to cwd, to where it is staged beside the emitted JavaScript",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "description": "C sources, relative to cwd, compiled for the triple into the archive the staged manifest links",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": ["manifest", "declarations", "sources"],
+      "additionalProperties": false
     }
   },
   "required": ["cwd", "tsConfig", "triple", "outputDirectory", "entries"],

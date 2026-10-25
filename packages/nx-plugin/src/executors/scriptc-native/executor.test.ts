@@ -4,12 +4,16 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import {
+  type ArchiveInvocation,
   type EmitInvocation,
   runScriptcNative,
   type ScriptcInvocation,
   type ScriptcRunner,
+  scriptcBuildArguments,
   untransformedTypiaCalls,
+  zigArchiveCommands,
 } from './executor.js';
+import { ffiPathProblem } from './ffi-paths.js';
 
 const roots: string[] = [];
 
@@ -42,23 +46,44 @@ const options = {
 };
 
 /** A runner whose emit writes `emitted` into the staging directory, recording what each step saw. */
-function fake(emitted: Record<string, string>, builds: (count: number) => boolean) {
+function fake(
+  emitted: Record<string, string>,
+  builds: (count: number) => boolean,
+  archived: (count: number) => boolean = () => true,
+) {
   const emits: Array<EmitInvocation & { overlay: unknown }> = [];
-  const runs: Array<ScriptcInvocation & { staged: string[] }> = [];
+  const archives: ArchiveInvocation[] = [];
+  const runs: Array<ScriptcInvocation & { staged: string[]; manifest?: unknown; declaration?: string | undefined }> =
+    [];
   const runner: ScriptcRunner = {
     emit: async (invocation) => {
       emits.push({ ...invocation, overlay: JSON.parse(readFileSync(invocation.tsconfig, 'utf8')) });
       write(invocation.outDir, emitted);
       return true;
     },
+    archive: async (invocation) => {
+      archives.push(invocation);
+      const compiled = archived(archives.length);
+      if (compiled) writeFileSync(invocation.archive, '');
+      return compiled;
+    },
     build: async (invocation) => {
-      runs.push({ ...invocation, staged: readdirSync(dirname(dirname(invocation.entry))).sort() });
+      const staging = dirname(dirname(invocation.entry));
+      runs.push({
+        ...invocation,
+        staged: readdirSync(staging).sort(),
+        // What scriptc is handed, read while the run's staging still exists.
+        manifest: invocation.ffi === undefined ? undefined : JSON.parse(readFileSync(invocation.ffi, 'utf8')),
+        declaration: existsSync(join(staging, 'ffi.d.ts'))
+          ? readFileSync(join(staging, 'ffi.d.ts'), 'utf8')
+          : undefined,
+      });
       const built = builds(runs.length);
       if (built) writeFileSync(invocation.output, '');
       return built;
     },
   };
-  return { runner, emits, runs };
+  return { runner, emits, archives, runs };
 }
 
 describe('scriptc-native', () => {
@@ -172,5 +197,169 @@ describe('scriptc-native', () => {
     expect(readdirSync(join(project, 'dist/bin/linux-arm64'))).toEqual([]);
     expect(readdirSync(join(project, '.cache/scriptc'))).toEqual([]);
     expect(readdirSync(project).sort()).toEqual(['.cache', 'dist', 'tsconfig.lib.json']);
+  });
+
+  describe("a package that calls C through scriptc's FFI", () => {
+    const ffi = { manifest: 'ffi.json', declarations: { 'src/ffi.d.ts': 'ffi.d.ts' }, sources: ['native/lock.c'] };
+    const manifest = {
+      ffi_format: 6,
+      functions: [{ name: 'tryLockFd', symbol: 'try_lock', params: ['i32'], returns: 'i32' }],
+      libraries: [],
+      system_libraries: [],
+    };
+    const files = {
+      'ffi.json': JSON.stringify(manifest),
+      'src/ffi.d.ts': 'declare function tryLockFd(fd: number): number;\n',
+      'native/lock.c': 'int try_lock(int fd) { return fd; }\n',
+    };
+
+    it('passes the staged manifest to scriptc as --ffi, and nothing for a package without C', () => {
+      const build = {
+        entry: '/stage/bin/tool.js',
+        output: '/p/dist/bin/tool',
+        cwd: '/p',
+        triple: 'aarch64-linux-musl',
+      };
+      const base = ['build', '/stage/bin/tool.js', '-o', '/p/dist/bin/tool', '--strip', '--no-keep-llvm'];
+      expect(scriptcBuildArguments(build)).toEqual(base);
+      expect(scriptcBuildArguments({ ...build, ffi: '/stage/ffi.json' })).toEqual([
+        ...base,
+        '--ffi',
+        '/stage/ffi.json',
+      ]);
+    });
+
+    it('compiles each C source for the triple with zig, then archives the objects in one step', () => {
+      expect(
+        zigArchiveCommands({
+          sources: ['/p/native/a.c', '/p/native/b.c'],
+          archive: '/stage/native/ffi.a',
+          cwd: '/p',
+          triple: 'aarch64-linux-musl',
+        }),
+      ).toEqual([
+        ['cc', '-target', 'aarch64-linux-musl', '-c', '/p/native/a.c', '-o', '/stage/native/ffi.a.0.o'],
+        ['cc', '-target', 'aarch64-linux-musl', '-c', '/p/native/b.c', '-o', '/stage/native/ffi.a.1.o'],
+        ['ar', 'rcs', '/stage/native/ffi.a', '/stage/native/ffi.a.0.o', '/stage/native/ffi.a.1.o'],
+      ]);
+    });
+
+    it('stages the declarations, compiles the C once for the triple, and hands scriptc a manifest that links the archive', async () => {
+      const { root, project } = workspace();
+      write(project, files);
+      const { runner, archives, runs } = fake({ 'bin/smoo-nx-tool.js': 'console.log(1);\n' }, () => true);
+      expect(await runScriptcNative({ ...options, ffi }, { root }, runner)).toEqual({ success: true });
+      const staging = dirname(dirname(runs[0]?.entry ?? ''));
+      expect(archives).toEqual([
+        {
+          sources: [join(project, 'native/lock.c')],
+          archive: join(staging, 'native/ffi.a'),
+          cwd: project,
+          triple: 'aarch64-linux-musl',
+        },
+      ]);
+      // The declaration sits beside the emitted JavaScript, where the module that references it looks.
+      expect(runs[0]?.staged).toEqual(['bin', 'ffi.d.ts', 'ffi.json', 'native', 'package.json', 'tsconfig.json']);
+      expect(runs[0]?.declaration).toBe(files['src/ffi.d.ts']);
+      // scriptc gets a copy of the manifest: every field kept, and the archive this run built linked as its only
+      // library.
+      expect(runs[0]?.ffi).toBe(join(staging, 'ffi.json'));
+      expect(runs[0]?.manifest).toEqual({
+        ...manifest,
+        libraries: [join(staging, 'native/ffi.a')],
+      });
+      expect(readdirSync(join(project, '.cache/scriptc'))).toEqual([]);
+    });
+
+    it('compiles each bin against that one manifest, and compiles no C for a package that has none', async () => {
+      const { root, project } = workspace();
+      write(project, files);
+      const two = { ...options, entries: { ...options.entries, other: 'bin/other.js' } };
+      const { runner, archives, runs } = fake({ 'bin/smoo-nx-tool.js': '', 'bin/other.js': '' }, () => true);
+      expect(await runScriptcNative({ ...two, ffi }, { root }, runner)).toEqual({ success: true });
+      expect(archives).toHaveLength(1);
+      expect(runs.map((run) => run.ffi)).toEqual([runs[0]?.ffi, runs[0]?.ffi]);
+      const plain = fake({ 'bin/smoo-nx-tool.js': '' }, () => true);
+      expect(await runScriptcNative(options, { root }, plain.runner)).toEqual({ success: true });
+      expect(plain.archives).toEqual([]);
+      expect(plain.runs[0]?.ffi).toBeUndefined();
+    });
+
+    it('builds nothing and writes no executable when the C does not compile', async () => {
+      const { root, project } = workspace();
+      write(project, files);
+      const { runner, archives, runs } = fake(
+        { 'bin/smoo-nx-tool.js': '' },
+        () => true,
+        () => false,
+      );
+      expect(await runScriptcNative({ ...options, ffi }, { root }, runner)).toEqual({ success: false });
+      expect(archives).toHaveLength(1);
+      expect(runs).toEqual([]);
+      expect(existsSync(join(project, 'dist'))).toBe(false);
+      expect(readdirSync(join(project, '.cache/scriptc'))).toEqual([]);
+    });
+
+    it('refuses a manifest that names a prebuilt library: every platform builds the one manifest', async () => {
+      const { root, project } = workspace();
+      write(project, { ...files, 'ffi.json': JSON.stringify({ ...manifest, libraries: ['./vendor/libextra.a'] }) });
+      const { runner, archives, runs } = fake({ 'bin/smoo-nx-tool.js': '' }, () => true);
+      await expect(runScriptcNative({ ...options, ffi }, { root }, runner)).rejects.toThrow(
+        `${join(project, 'ffi.json')}: lists libraries (./vendor/libextra.a)`,
+      );
+      expect(archives).toEqual([]);
+      expect(runs).toEqual([]);
+      expect(readdirSync(join(project, '.cache/scriptc'))).toEqual([]);
+    });
+
+    it('names the first path that leaves its root, and accepts one that winds but stays beneath it', () => {
+      expect(ffiPathProblem(ffi)).toBeUndefined();
+      expect(ffiPathProblem({ ...ffi, sources: ['./native/../native/lock.c', '..lock.c'] })).toBeUndefined();
+      for (const path of ['', '.', '..', '../lock.c', 'native/../../lock.c', '/tmp/lock.c', '..\\lock.c']) {
+        expect(ffiPathProblem({ ...ffi, sources: [path] })).toBe(
+          `names ${JSON.stringify(path)}, which is not a path beneath the project`,
+        );
+      }
+      expect(ffiPathProblem({ ...ffi, manifest: '../ffi.json' })).toBe(
+        'names "../ffi.json", which is not a path beneath the project',
+      );
+      expect(ffiPathProblem({ ...ffi, declarations: { '../ffi.d.ts': 'ffi.d.ts' } })).toBe(
+        'names "../ffi.d.ts", which is not a path beneath the project',
+      );
+      expect(ffiPathProblem({ ...ffi, declarations: { 'src/ffi.d.ts': '../../escape.d.ts' } })).toBe(
+        'names "../../escape.d.ts", which is not a path beneath the emitted JavaScript\'s root',
+      );
+    });
+
+    it('refuses a path that leaves its root before it creates or copies anything', async () => {
+      const { root, project } = workspace();
+      write(project, files);
+      const { runner, archives } = fake({ 'bin/smoo-nx-tool.js': '' }, () => true);
+      await expect(
+        runScriptcNative(
+          { ...options, ffi: { ...ffi, declarations: { 'src/ffi.d.ts': '../../escape.d.ts' } } },
+          { root },
+          runner,
+        ),
+      ).rejects.toThrow(
+        'scriptc-native: ffi names "../../escape.d.ts", which is not a path beneath the emitted JavaScript\'s root',
+      );
+      await expect(
+        runScriptcNative({ ...options, ffi: { ...ffi, sources: ['/tmp/lock.c'] } }, { root }, runner),
+      ).rejects.toThrow('scriptc-native: ffi names "/tmp/lock.c", which is not a path beneath the project');
+      expect(archives).toEqual([]);
+      // No staging, no overlay, and nothing beside them for the run's cleanup to miss.
+      expect(existsSync(join(project, '.cache'))).toBe(false);
+    });
+    it('refuses a manifest that lists no libraries, naming the file, and leaves no staging behind', async () => {
+      const { root, project } = workspace();
+      write(project, { ...files, 'ffi.json': '{"ffi_format":6}' });
+      const { runner, archives } = fake({ 'bin/smoo-nx-tool.js': '' }, () => true);
+      await expect(runScriptcNative({ ...options, ffi }, { root }, runner)).rejects.toThrow(
+        `${join(project, 'ffi.json')}: an FFI manifest lists its libraries`,
+      );
+      expect(archives).toEqual([]);
+      expect(readdirSync(join(project, '.cache/scriptc'))).toEqual([]);
+    });
   });
 });

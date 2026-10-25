@@ -938,7 +938,15 @@ Concrete targets come from concrete files:
   `dist/bin`), so that JavaScript and the executables are disjoint outputs. Before compiling, a run fails on any call
   through a `typia` import binding (default, namespace, named, or destructured from one) left in the staged JavaScript
   (`file:line:column` and the call): ttsc emits a typia call untransformed, without an error, when the emitting package
-  does not list `typia` itself, and such a call throws at run time.
+  does not list `typia` itself, and such a call throws at run time. A package whose executables call C through scriptc's
+  FFI declares it in `package.json#scriptc.ffi` (`manifest`, the FFI manifest; `declarations`, each ambient `.d.ts`
+  mapped to where it is staged beside the emitted JavaScript; `sources`, the C files): every run copies the declarations
+  there, compiles the sources for its triple with zig (`zig cc -target <triple>`, then `zig ar`) into one archive, and
+  hands scriptc (`--ffi`) a staged copy of the manifest that keeps its fields and links that archive. The manifest lists
+  no `libraries` (every platform builds it, and a prebuilt archive holds one triple's code), and every path stays
+  beneath its root (the project; for a declaration's staged path, the emitted JavaScript's root) or inference and the
+  run refuse it by name. The manifest, declarations and sources are inputs of every platform target (a header a source
+  includes is not one, so keep the C self-contained), and a failed compile writes no executable.
 - Commands this plugin infers run the tool packages' executables for the inferring host,
   `node_modules/@smoothbricks/nx-plugin/../<tool>/dist/bin/<platform>/<bin>`: `smoo-nx-build-inputs` after a napi build.
   When the tool package is a project of the workspace being inferred, the command's target depends on that tool's

@@ -83,6 +83,8 @@ import type { EslintFileSet } from './eslint-file-set.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import { GATEWAY_SOCKET } from './executors/bounded-exec/gateway-lease.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
+import { ffiPathProblem } from './executors/scriptc-native/ffi-paths.js';
+import type { ScriptcNativeFfi } from './executors/scriptc-native/schema.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
 import { NEXTEST_TIMINGS_PATH, namedTestsFilter, readNextestTimings, timedShardMembers } from './nextest-timings.js';
 import {
@@ -1161,6 +1163,8 @@ interface PackageJson {
   napi?: Record<string, unknown>;
   /** npm's own "never published" flag, which is what makes a package a deployable target rather than a library. */
   private?: boolean;
+  /** What a scriptc package declares beyond its dependencies: the C its executables call (`ffi`). */
+  scriptc?: unknown;
   scripts?: Record<string, unknown>;
   nx?: {
     name?: string;
@@ -1223,6 +1227,62 @@ const SCRIPTC_PLATFORMS: readonly (NapiPlatform & { readonly triple: string; rea
   },
 ];
 
+/**
+ * `package.json#scriptc.ffi`: the C a package's executables call through scriptc's FFI, which every platform run stages
+ * beside the emitted JavaScript and builds for its triple. Absent for a package that calls no C.
+ */
+function scriptcFfi(packageJson: PackageJson, packageJsonPath: string): ScriptcNativeFfi | undefined {
+  if (packageJson.scriptc === undefined) {
+    return undefined;
+  }
+  const refusal = (what: string): Error =>
+    new Error(
+      `${packageJsonPath}: scriptc.ffi ${what}; it is { "manifest": "<ffi.json>", "declarations": ` +
+        '{ "<source .d.ts>": "<path beside the emitted JavaScript>" }, "sources": ["<C file>"] }',
+    );
+  const ffi = isRecord(packageJson.scriptc) ? packageJson.scriptc.ffi : undefined;
+  if (!isRecord(ffi)) {
+    throw refusal('must be an object');
+  }
+  const { manifest, declarations, sources } = ffi;
+  if (typeof manifest !== 'string' || manifest.length === 0) {
+    throw refusal('needs a manifest path');
+  }
+  if (!isRecord(declarations)) {
+    throw refusal('needs declarations mapping each source file to its staged path');
+  }
+  const staged: Record<string, string> = {};
+  for (const [source, destination] of Object.entries(declarations)) {
+    if (typeof destination !== 'string') {
+      throw refusal(`needs declarations mapping each source file to its staged path (${source} is not)`);
+    }
+    staged[source] = destination;
+  }
+  if (!Array.isArray(sources)) {
+    throw refusal('needs sources, a list of C files');
+  }
+  const files: string[] = [];
+  for (const source of sources) {
+    if (typeof source !== 'string') {
+      throw refusal('needs sources, a list of C files');
+    }
+    files.push(source);
+  }
+  const declared = { manifest, declarations: staged, sources: files };
+  const problem = ffiPathProblem(declared);
+  if (problem !== undefined) {
+    throw refusal(problem);
+  }
+  return declared;
+}
+
+/** The files a target's FFI is built from: change one and every platform's executable is stale. */
+function scriptcFfiInputs(ffi: ScriptcNativeFfi | undefined): string[] {
+  return ffi === undefined
+    ? []
+    : [ffi.manifest, ...Object.keys(ffi.declarations), ...ffi.sources].map((path) => `{projectRoot}/${path}`);
+}
+
 /** The scriptc target writing `platform`'s executables; its suffix is the platform family the publish legs select. */
 function scriptcTargetName(platform: NapiPlatform): string {
   return `scriptc-${platform.architecture}-${platform.targetFamily}`;
@@ -1282,6 +1342,7 @@ function scriptcPlatformTargets(
     }
     modules[name] = emitted.slice(javascriptRoot.length + 1);
   }
+  const ffi = scriptcFfi(packageJson, packageJsonPath);
   const targets: Record<string, TargetConfiguration> = {};
   for (const platform of SCRIPTC_PLATFORMS) {
     const outputDirectory = `dist/bin/${EXECUTABLE_PLATFORM_DIRECTORY[platform.targetFamily][platform.architecture]}`;
@@ -1294,6 +1355,7 @@ function scriptcPlatformTargets(
         ...toolchainInputs,
         '{projectRoot}/tsconfig.lib.json',
         { externalDependencies: ['scriptc', platform.runtimePack] },
+        ...scriptcFfiInputs(ffi),
       ],
       outputs: [...entries.keys()].map((name) => `{projectRoot}/${outputDirectory}/${name}`),
       // The emit type-checks against its dependencies' emitted JavaScript, as tsc-js does.
@@ -1304,6 +1366,7 @@ function scriptcPlatformTargets(
         triple: platform.triple,
         outputDirectory,
         entries: modules,
+        ...(ffi === undefined ? {} : { ffi }),
       },
     };
   }
@@ -2659,6 +2722,7 @@ async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
     ...(typeof parsed.name === 'string' ? { name: parsed.name } : {}),
     ...(isRecord(parsed.napi) ? { napi: parsed.napi } : {}),
     ...(typeof parsed.private === 'boolean' ? { private: parsed.private } : {}),
+    ...('scriptc' in parsed ? { scriptc: parsed.scriptc } : {}),
     ...(isRecord(parsed.scripts) ? { scripts: parsed.scripts } : {}),
     ...(rawNx
       ? {
