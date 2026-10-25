@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { constants, type Stats } from 'node:fs';
+import { type BigIntStats, constants, type Stats } from 'node:fs';
 import {
   type FileHandle,
   lstat,
@@ -140,9 +140,10 @@ import type { TempVolumeSpace } from './verdict.js';
  * entry's absence proves it safe. A dead caller alone proves neither; its death only
  * turns queueing into reporting. The facade pid is a diagnostic, never authority.
  *
- * A cowshed sandbox denies writes to /private/tmp (EPERM on the lock), and
- * cannot attach disk images at all; there the task keeps the workspace's own
- * TMPDIR and says so once on stderr.
+ * A cowshed sandbox denies the volume's paths (EPERM reading its mountpoint or
+ * marker, or opening the lock in /private/tmp) and cannot attach disk images at
+ * all; whichever refusal comes first, the task keeps the workspace's own TMPDIR
+ * and says so once on stderr.
  */
 
 /** Contended opens yield without occupying a filesystem worker needed by the lock holder. */
@@ -1057,7 +1058,9 @@ export class RamTempVolume {
     try {
       const observed = await this.observe();
       if (!observed.ok) {
-        return { kind: 'unread', lease: directory, mountpoint, detail: describeRamTempError(observed.error) };
+        const detail =
+          observed.error.kind === 'lock-denied' ? observed.error.detail : describeRamTempError(observed.error);
+        return { kind: 'unread', lease: directory, mountpoint, detail };
       }
       const held = leaseOn(lease, observed.value);
       if ('lost' in held) {
@@ -1341,7 +1344,7 @@ export class RamTempVolume {
    * names this attach: the root's and the marker's identity and birth, and the marker's change
    * time, which nothing changes once it is written. The root's own times change with every lease.
    */
-  private async observe(): Promise<Result<MountedVolume | null, RamTempError>> {
+  private async observe(): Promise<Result<MountedVolume | null, LockedError>> {
     const markerPath = join(this.paths.mountpoint, MARKER_FILE);
     let markerText: string;
     try {
@@ -1352,7 +1355,8 @@ export class RamTempVolume {
         await handle.close();
       }
     } catch (error) {
-      return errorCode(error) === 'ENOENT' ? { ok: true, value: null } : failed('provenance', errorText(error));
+      if (errorCode(error) === 'ENOENT') return { ok: true, value: null };
+      return errorCode(error) === 'EPERM' ? denied(markerPath, error) : failed('provenance', errorText(error));
     }
     if (markerText.trim() === this.paths.volumeName) {
       return {
@@ -1380,11 +1384,19 @@ export class RamTempVolume {
     ) {
       return failed('provenance', 'the marker is not version-1 gateway provenance for this volume');
     }
-    const [root, parent, mark] = await Promise.all([
-      stat(this.paths.mountpoint, { bigint: true }),
-      stat(join(this.paths.mountpoint, '..'), { bigint: true }),
-      lstat(markerPath, { bigint: true }),
-    ]);
+    let root: BigIntStats;
+    let parent: BigIntStats;
+    let mark: BigIntStats;
+    try {
+      [root, parent, mark] = await Promise.all([
+        stat(this.paths.mountpoint, { bigint: true }),
+        stat(join(this.paths.mountpoint, '..'), { bigint: true }),
+        lstat(markerPath, { bigint: true }),
+      ]);
+    } catch (error) {
+      if (errorCode(error) === 'EPERM') return denied(this.paths.mountpoint, error);
+      throw error;
+    }
     if (root.dev === parent.dev || !mark.isFile())
       return failed('provenance', 'gateway marker is not on a separately mounted RAM volume');
     const names = await readdir(this.paths.mountpoint);
@@ -2823,6 +2835,15 @@ function processIsAlive(pid: number): boolean {
     // EPERM: alive, owned by someone else.
     return errorCode(error) === 'EPERM';
   }
+}
+
+/**
+ * A cowshed sandbox's refusal of one of the volume's own paths: the same answer as its refusal of the lock, so the task
+ * keeps its workspace TMPDIR (`sandboxed`) whichever path the sandbox refuses first. A job's sandbox admits no part of
+ * the RAM volume it cannot use, and this module reads that refusal rather than a second rule saying where it runs.
+ */
+function denied<T>(path: string, error: unknown): Result<T, LockedError> {
+  return { ok: false, error: { kind: 'lock-denied', detail: `${path}: ${errorText(error)}` } };
 }
 
 function failed<T>(step: string, detail: string): Result<T, ProvisionFailed> {

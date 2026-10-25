@@ -1665,8 +1665,9 @@ cowshed counts (`specs/cowshed/01a_apfs.md`, "How the APFS host degrades"). The 
 cowshed gateway does (`ram-attach`, `specs/cowshed/05_gateway.md`, "RAM disks"). The disk lives in a `diskimages-helper`
 process, and a helper the task's own job forked would be retired when that job ends, taking the volume from under every
 other job's lease, whose open files then read EIO. The helper belongs to the gateway; no job's retirement reaches it. A
-target's own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`,
-the task keeps its inherited `TMPDIR` and says so once.
+target's own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which refuses the volume's own paths (its
+mountpoint and marker, and the lock in `/private/tmp`), the task keeps its inherited `TMPDIR` and says so once,
+whichever refusal it meets first.
 
 Every owned `bounded-exec` target attempts the lease, test targets included. Explicit RAM unavailability uses a unique
 owned ordinary directory beside the RAM lock that answer was taken under, in the system temp directory `/private/tmp`.
