@@ -1105,9 +1105,9 @@ mod tests {
         host.release_build_volume(&layout, &seed).unwrap();
         assert!(!layout.image(&clone).exists() && !layout.image(&seed).exists());
         assert_eq!(
-            fs::read_dir(layout.releasing()).unwrap().count(),
-            0,
-            "each release frees its image before it answers"
+            fs::read_dir(layout.deleting()).unwrap().count(),
+            2,
+            "each release commits its image to build/.deleting and answers"
         );
         drop(host);
         let batches = fixture.batches();

@@ -741,7 +741,8 @@ positive receipt, detaches each of the project's backing images **without force*
 into `.retired-projects/<operation-id>` in the store. That tree holds the Git repositories inside the images, the grants
 and the resource evidence, unchanged: nothing is deleted, rewritten or copied, and an archive that already exists is
 never overwritten. The images stay in it, detached, so no disk space is freed. An archive is reserved host storage — no
-cowshed command lists, heals or reclaims it.
+cowshed command lists, heals or reclaims it. Only a released image already waiting in the project's `.deleting`
+directories is freed there, by the gateway when it next starts; it is no evidence.
 
 Nothing is forced. A supervisor that has not finished draining, an owner that still holds the project, or a holder that
 keeps an image busy — an open file, a working directory, a running job — refuses its step with exit 4 and leaves the
@@ -1018,12 +1019,12 @@ terminated and the old volume is never forcibly unmounted.
 
 Bare stdout is the removed image's allocated byte count (`0` with `--dry-run`); guidance stays on stderr. `--json`
 returns the frozen success envelope with
-`ReseedResult { workspace, from, previousVolume, seed, replacementVolume?, previousBytes, replacementBytes, freedBytes, dryRun }`.
+`ReseedResult { workspace, from, previousVolume, seed, replacementVolume?, previousBytes, replacementBytes, releasedBytes, dryRun }`.
 Preview changes no link, mount, image or seed: `replacementVolume` is omitted, `replacementBytes` estimates the new
-allocation from the seed and `freedBytes` is zero. Execution reports actual replacement allocation and removed old-image
-allocation. The signed preview reduction is `previousBytes - replacementBytes`, not execution's stdout. These are
-GC-style allocated image bytes, not unique physical bytes: APFS shares extents, so no corresponding increase in physical
-free space is promised.
+allocation from the seed and `releasedBytes` is zero. Execution reports actual replacement allocation and removed
+old-image allocation. The signed preview reduction is `previousBytes - replacementBytes`, not execution's stdout. These
+are GC-style allocated image bytes, not unique physical bytes: APFS shares extents, so no corresponding increase in
+physical free space is promised.
 
 ### `cowshed cache clear [<name|main>]`
 
@@ -1745,8 +1746,9 @@ instead ([APFS ownership](../../../specs/cowshed/01a_apfs.md#ownership-identity-
 
 ### `cowshed gc`
 
-Deletes retired and orphaned images and stale mountpoint dirs, prunes expired checkpoints, and reports what it freed.
-Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
+Releases retired and orphaned images for background deletion, removes stale mountpoint dirs, prunes expired checkpoints,
+and reports the allocated bytes of the images it released, not bytes freed: their deletions free the space after the
+command returns. Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
 
 Every `gc` also retires the refs `rm --abandon` kept in main, `refs/cowshed/<ws>/abandoned/<head>/`, once main holds
 every tip, by ancestry, content or patch identity: a cherry-pick, a squash or a pick whose conflict was resolved counts,
@@ -1774,10 +1776,20 @@ The image, its grants sidecar and its CA companion move into `~/recovered/raven-
 which names the project, the workspace, its incarnation and why the removal kept it. Nothing is copied or deleted. The
 directory must be outside the store, on the store's filesystem; a retry after an interruption finishes the same move.
 
+Every other image a command lets go of — a clean removal's image, the build volumes `rm`, `land`, `reseed` and `gc`
+release, the seeds a fork or land replaces, an orphan or expired image `gc` collects, the staged image a failed restore
+or creation leaves — is renamed into the project's `sessions/.deleting/` or `build/.deleting/`, and the command starts a
+background process, its own executable, that frees that one image, a bounded step at a time, and answers at once; free
+space catches up while that process runs, not when the command returns. If the process cannot be spawned, the command
+fails with the image already released, and a retry finds it so; if it ends badly, its reaper says so on stderr and the
+gateway frees what it left when it next starts. Removing the whole project with `cowshed rm main --restore` frees
+nothing itself either: it moves its released images into the store's `.deleting/` and starts each one's deletion before
+it deletes the project's store directory.
+
 An image under `sessions/` without its grants sidecar is skipped by other commands with a named warning; `doctor`
-reports it, and `gc` can reclaim it as an orphan after mount and lock checks. `gc` keeps going when an individual
-candidate cannot be reclaimed, names it as deferred on stderr and in the `deferred` JSON array, and reports only space
-actually freed by successful candidates.
+reports it, and `gc` can release it as an orphan after mount and lock checks. `gc` keeps going when an individual
+candidate cannot be released, names it as deferred on stderr and in the `deferred` JSON array, and reports only the
+allocated bytes of the images it released for deletion.
 
 An older logged volume can leave root's `0700` `.fseventsd` on its bare mountpoint after unmount. If that is the only
 entry, gc renames the user-owned mountpoint aside to a hidden, same-parent `.root-held-<uuid>` name instead of trying to

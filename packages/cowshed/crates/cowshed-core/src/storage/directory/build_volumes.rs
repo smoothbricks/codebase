@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     DirectoryExecutionHost, MountPointState, bind, host_error, mount_point_state, observed_mount,
-    observed_payload_root, remove_payload_tree, unbind, unsupported,
+    observed_payload_root, unbind, unsupported,
 };
 use crate::build_volume::{
     BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
@@ -29,7 +29,7 @@ use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, io_error, path_exists,
     sync_parent_path,
 };
-use crate::storage::apfs::release::{Drained, Reclaim};
+use crate::storage::apfs::release::Drained;
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_os::fsio::AnchoredDirectory;
@@ -168,11 +168,15 @@ fn held_images(layout: &BuildVolumeLayout) -> Result<File, ApfsStorageError> {
 /// The project's build journal held by descriptor, absent when missing. Every component
 /// is opened without following links; the pathname is never used again for its entries.
 fn held_journal(layout: &BuildVolumeLayout) -> Result<Option<AnchoredDirectory>, ApfsStorageError> {
-    let journal = layout.releasing();
+    let journal = layout.deleting();
     match AnchoredDirectory::open(&journal) {
         Ok(held) => Ok(Some(held)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(io_error("open the build release journal", &journal, error)),
+        Err(error) => Err(io_error(
+            "open the build deleting directory",
+            &journal,
+            error,
+        )),
     }
 }
 
@@ -562,7 +566,7 @@ impl DirectoryExecutionHost {
                     return Ok(BuildVolumeRelease::Held { open });
                 }
                 Ok(BuildVolumeRelease::Deleted {
-                    refused: self.release_claimed(layout, claim, Reclaim::Now)?,
+                    refused: self.release_claimed(layout, claim)?,
                 })
             }
             BuildVolumeClaim::Held { open } => Ok(BuildVolumeRelease::Held { open }),
@@ -624,18 +628,14 @@ impl DirectoryExecutionHost {
     }
 
     /// Unbind and release the volume `claim` claimed, deleting its record, mark, hold and
-    /// mountpoint, journaled in the project's deletion log. With [`Reclaim::Now`] the tree is
-    /// deleted before this answers, and a process that still has anything open inside it
-    /// refuses the release before anything changes: there is no forced fallback, so a held seed
-    /// is never deleted from under its holder. With [`Reclaim::Journaled`] the tree is only
-    /// renamed into the project's build journal, which deletes nothing, so a holder keeps what
-    /// it has open and [`Self::finish_build_releases`] waits it out. A release that goes
+    /// mountpoint, journaled in the project's deletion log. The tree is only renamed into the
+    /// project's `build/.deleting`, which deletes nothing, so a holder keeps what it has open and
+    /// [`Self::finish_build_releases`], this store's deleter, waits it out. A release that goes
     /// through has no refusal to report.
     pub fn release_claimed(
         &self,
         layout: &BuildVolumeLayout,
         claim: ReleaseClaim,
-        reclaim: Reclaim,
     ) -> Result<Option<BuildVolumeRefusal>, ApfsStorageError> {
         let id = claim.id();
         let image = layout.image(id);
@@ -647,34 +647,18 @@ impl DirectoryExecutionHost {
             .ok()
             .flatten()
             .map(|record| record.role);
-        if present && reclaim == Reclaim::Now {
-            let open = holders_of(&image)?;
-            if !open.is_empty() {
-                return Err(ApfsStorageError::BuildVolumeHeld {
-                    hold: layout.hold_path(id),
-                    image,
-                    holds: hold_owners(layout, id)?,
-                    open,
-                });
-            }
-        }
-        if reclaim == Reclaim::Journaled {
-            // The journal is the store's own: reached through a link, nothing is unbound or moved.
-            self.require_store_image(&layout.released(id))?;
-        }
-        // An unforced unmount is the whole release: a deletion finds no holder (just checked),
-        // and a journal rename deletes nothing. An image already gone has nothing to unbind: a
-        // journaled retry confirms the commit an earlier attempt made, and otherwise its record
-        // alone is retired, said as such.
+        // The deleting directory is the store's own: reached through a link, nothing is unbound
+        // or moved.
+        self.require_store_image(&layout.released(id))?;
+        // An unforced unmount is the whole release, and the rename deletes nothing. An image
+        // already gone has nothing to unbind: a retry confirms the commit an earlier attempt
+        // made, and otherwise its record alone is retired, said as such.
         let committed = if present {
             unbind(&image, &mount, cowshed_apfs::DetachIntent::Release)?;
-            match reclaim {
-                Reclaim::Now => remove_payload_tree(&image)?,
-                Reclaim::Journaled => self.journal_payload_tree(layout, id)?,
-            }
+            self.journal_payload_tree(layout, id)?;
             true
         } else {
-            reclaim == Reclaim::Journaled && self.confirm_journaled_tree(layout, id)?
+            self.confirm_journaled_tree(layout, id)?
         };
         if committed {
             layout.journal_release(id, recorded.as_ref(), true);
@@ -700,7 +684,7 @@ impl DirectoryExecutionHost {
     }
 
     /// Commit the release of `id`'s unbound payload tree: one rename, refusing to replace
-    /// anything, from the images directory into the project's build journal, both held by
+    /// anything, from the images directory into the project's `build/.deleting`, both held by
     /// descriptor and synced. The journal is created when missing; a link or a non-directory at
     /// either refuses, untouched; its caller has refused a journal reached through a link. Nothing
     /// is deleted until [`Self::finish_build_releases`].
@@ -712,24 +696,28 @@ impl DirectoryExecutionHost {
         let entry = layout.released(id);
         let images = held_images(layout)?;
         let (journal, _) =
-            cowshed_os::fsio::open_or_create_child_directory(&images, &leaf(&layout.releasing())?)
+            cowshed_os::fsio::open_or_create_child_directory(&images, &leaf(&layout.deleting())?)
                 .map_err(|error| {
-                    io_error("open the build release journal", &layout.releasing(), error)
-                })?;
+                io_error(
+                    "open the build deleting directory",
+                    &layout.deleting(),
+                    error,
+                )
+            })?;
         let name = leaf(&entry)?;
         cowshed_os::fsio::rename_noreplace(images.as_raw_fd(), &name, journal.as_raw_fd(), &name)
             .map_err(|error| {
             io_error(
-                "commit a build volume release to the journal",
+                "commit a build volume release to build/.deleting",
                 &entry,
                 error,
             )
         })?;
         let synced = |directory: &File, path: &Path| {
             cowshed_os::fsio::sync_held_directory(directory)
-                .map_err(|error| io_error("sync the build release journal", path, error))
+                .map_err(|error| io_error("sync the build deleting directory", path, error))
         };
-        synced(&journal, &layout.releasing())?;
+        synced(&journal, &layout.deleting())?;
         synced(&images, layout.images())
     }
 
@@ -763,15 +751,19 @@ impl DirectoryExecutionHost {
             Err(error) => return Err(io_error("open a released build volume", &entry, error)),
         }
         journal.sync().map_err(|error| {
-            io_error("sync the build release journal", &layout.releasing(), error)
+            io_error(
+                "sync the build deleting directory",
+                &layout.deleting(),
+                error,
+            )
         })?;
         cowshed_os::fsio::sync_held_directory(images)
             .map_err(|error| io_error("sync the build images directory", layout.images(), error))?;
         Ok(true)
     }
 
-    /// Finish every release committed to the project's build journal: delete each `<id>.dmg`
-    /// payload tree a [`Reclaim::Journaled`] release moved there. The journal is the store's
+    /// Finish every release committed to the project's `build/.deleting`: delete each `<id>.dmg`
+    /// payload tree a release moved there. The journal is the store's
     /// own: one reached through a link refuses, untouched. A tree a process still holds anything
     /// inside is said and left for a later pass, never deleted from under its holder; any other
     /// name, or anything that is not a directory, is said and left, untouched.
@@ -779,7 +771,7 @@ impl DirectoryExecutionHost {
         &self,
         layout: &BuildVolumeLayout,
     ) -> Result<Drained, ApfsStorageError> {
-        let journal = layout.releasing();
+        let journal = layout.deleting();
         self.verify_controller_path(&journal)?;
         let Some(held) = held_journal(layout)? else {
             return Ok(Drained::default());
@@ -794,7 +786,7 @@ impl DirectoryExecutionHost {
         images: &File,
         held: &AnchoredDirectory,
     ) -> Result<Drained, ApfsStorageError> {
-        let journal = layout.releasing();
+        let journal = layout.deleting();
         let mut drained = Drained::default();
         held.visit_entries(|name| {
             let entry = journal.join(OsStr::from_bytes(name.to_bytes()));
@@ -809,7 +801,7 @@ impl DirectoryExecutionHost {
             let open = held_tree_holders(held, name, &metadata)?;
             if !open.is_empty() {
                 cowshed_os::eprintln!(
-                    "cowshed: released build volume {} stays while {} process(es) hold it; a later release or cowshed gc deletes it",
+                    "cowshed: released build volume {} stays while {} process(es) hold it; a later pass of this deleter deletes it",
                     entry.display(), open.len()
                 );
                 return Ok(ControlFlow::Continue(()));
@@ -822,10 +814,10 @@ impl DirectoryExecutionHost {
             let bytes = DirectoryRelease::prepare(images, held, name, tree)?.finish()?;
             drained.add(Drained { images: 1, bytes });
             Ok(ControlFlow::Continue(()))
-        }).map_err(|error| io_error("drain the held build release journal", &journal, error))?;
+        }).map_err(|error| io_error("drain the held build deleting directory", &journal, error))?;
         if drained.images > 0 {
             held.sync()
-                .map_err(|error| io_error("sync the build release journal", &journal, error))?;
+                .map_err(|error| io_error("sync the build deleting directory", &journal, error))?;
         }
         Ok(drained)
     }
@@ -1004,7 +996,7 @@ mod journal_tests {
         )
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
-        fs::create_dir_all(layout.releasing()).unwrap();
+        fs::create_dir_all(layout.deleting()).unwrap();
         (root, host, layout)
     }
 
@@ -1018,8 +1010,8 @@ mod journal_tests {
         fs::create_dir_all(foreign.join(format!("{theirs}.dmg"))).unwrap();
         let images = held_images(&layout).unwrap();
         let journal = held_journal(&layout).unwrap().unwrap();
-        fs::rename(layout.releasing(), root.join("held-journal")).unwrap();
-        std::os::unix::fs::symlink(&foreign, layout.releasing()).unwrap();
+        fs::rename(layout.deleting(), root.join("held-journal")).unwrap();
+        std::os::unix::fs::symlink(&foreign, layout.deleting()).unwrap();
 
         assert!(
             !host
@@ -1059,8 +1051,8 @@ mod journal_tests {
         .unwrap();
         let journal = held_journal(&layout).unwrap().unwrap();
         let retained = root.join("held-journal");
-        fs::rename(layout.releasing(), &retained).unwrap();
-        std::os::unix::fs::symlink(&foreign, layout.releasing()).unwrap();
+        fs::rename(layout.deleting(), &retained).unwrap();
+        std::os::unix::fs::symlink(&foreign, layout.deleting()).unwrap();
 
         let images = held_images(&layout).unwrap();
         let drained = host
@@ -1070,7 +1062,7 @@ mod journal_tests {
         assert_eq!(drained.images, 1);
         assert!(!retained.join(format!("{ours}.dmg")).exists());
         assert!(
-            fs::symlink_metadata(layout.releasing())
+            fs::symlink_metadata(layout.deleting())
                 .unwrap()
                 .is_symlink()
         );
@@ -1124,10 +1116,10 @@ mod journal_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// The build journal is the store's own. A link planted at `build/.releasing` is never
-    /// followed: a journaled release refuses with the seed, its record and the foreign tree
+    /// The build journal is the store's own. A link planted at `build/.deleting` is never
+    /// followed: a release refuses with the seed, its record and the foreign tree
     /// intact, and a finisher refuses without deleting the foreign tree's children. In a real
-    /// journal a name that is not a released volume's is left. A journaled retry that finds the
+    /// journal a name that is not a released volume's is left. A retry that finds the
     /// tree its earlier attempt renamed but never synced makes the rename durable (the journal
     /// and the images directory) before the record goes, and frees none of it.
     #[test]
@@ -1173,13 +1165,10 @@ mod journal_tests {
         let foreign_child = foreign.join(format!("{}.dmg", BuildVolumeId::mint()));
         fs::create_dir_all(&foreign_child).unwrap();
         fs::write(foreign_child.join("kept"), b"not the store's").unwrap();
-        std::os::unix::fs::symlink(&foreign, layout.releasing()).unwrap();
+        std::os::unix::fs::symlink(&foreign, layout.deleting()).unwrap();
 
         let claim = layout.claim_release(&id).unwrap().unwrap();
-        assert!(
-            host.release_claimed(&layout, claim, Reclaim::Journaled)
-                .is_err()
-        );
+        assert!(host.release_claimed(&layout, claim).is_err());
         assert_eq!(fs::read(image.join("warm")).unwrap(), b"superseded seed\n");
         assert!(
             layout.record(&id).exists(),
@@ -1192,9 +1181,9 @@ mod journal_tests {
         );
         assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1);
 
-        fs::remove_file(layout.releasing()).unwrap();
-        fs::create_dir(layout.releasing()).unwrap();
-        let stray = layout.releasing().join("stray");
+        fs::remove_file(layout.deleting()).unwrap();
+        fs::create_dir(layout.deleting()).unwrap();
+        let stray = layout.deleting().join("stray");
         fs::create_dir(&stray).unwrap();
         fs::rename(&image, layout.released(&id)).unwrap();
         cowshed_os::fsio::take_syncs();
@@ -1205,11 +1194,7 @@ mod journal_tests {
             "the journal and the images directory are synced before the commit is answered"
         );
         let claim = layout.claim_release(&id).unwrap().unwrap();
-        assert_eq!(
-            host.release_claimed(&layout, claim, Reclaim::Journaled)
-                .unwrap(),
-            None
-        );
+        assert_eq!(host.release_claimed(&layout, claim).unwrap(), None);
         assert!(!layout.record(&id).exists());
         assert_eq!(
             fs::read(layout.released(&id).join("warm")).unwrap(),
@@ -1337,10 +1322,7 @@ mod detach_tests {
         host.mount_build_volume(&layout, &id).unwrap();
         assert_eq!(fs::read(mount.join("warm")).unwrap(), b"old build state\n");
         host.detach_claimed_build_volume(&layout, &claim).unwrap();
-        assert_eq!(
-            host.release_claimed(&layout, claim, Reclaim::Now).unwrap(),
-            None
-        );
+        assert_eq!(host.release_claimed(&layout, claim).unwrap(), None);
         for path in [
             image,
             layout.record(&id),

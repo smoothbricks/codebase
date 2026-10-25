@@ -217,7 +217,8 @@ held mount-root/source identity before publication (01a_apfs.md, "Mounts"). Ther
 fallback or stale-family selection. Release unmounts each exact currently-owned mounted volume with `funmount` on its
 held, proven root descriptor, then guarded `hdiutil detach` of the exact physical whole device, retaining the existing
 grace/force/refusal contract (01a_apfs.md, "Release and device custody"). Detached checkpoint verification and resize,
-and blank-image formatting, intentionally attach without mounting. Deletion unlinks one file. Clones are logically
+and blank-image formatting, intentionally attach without mounting. Deletion renames one file into a `.deleting`
+directory, and a background deletion frees it later (05_gateway.md, "Deleting released images"). Clones are logically
 independent of their source (no GC coupling), but inherit its extent map, so a fragmented main makes every clone's first
 write slow until `cowshed defrag main` (01a_apfs.md, "Clone cost follows extents, not size"), and they share its blocks
 until every sharer is released (01a_apfs.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance

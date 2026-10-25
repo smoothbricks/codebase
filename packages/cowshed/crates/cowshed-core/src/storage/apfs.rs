@@ -1,3 +1,4 @@
+pub mod deleter;
 pub mod extents;
 pub mod native;
 pub mod rekey;
@@ -41,6 +42,9 @@ pub struct ApfsSubstrateConfig {
     /// and main's mountpoint.
     pub checkout_path: PathBuf,
     pub capacity: ImageCapacity,
+    /// The program a release starts its deletion child with (05_gateway.md, "Deleting released
+    /// images"); none starts no child, and the gateway's startup scan frees the entry.
+    pub deletion_child: Option<PathBuf>,
 }
 
 impl ApfsSubstrateConfig {
@@ -54,6 +58,19 @@ impl ApfsSubstrateConfig {
             store_root: store_root.into(),
             checkout_path: checkout_path.into(),
             capacity: DEFAULT_IMAGE_CAPACITY,
+            deletion_child: None,
+        }
+    }
+
+    /// The config of a project in the validated store `storage`, whose releases start the deletion
+    /// child that store names.
+    pub fn for_storage(
+        storage: &crate::storage::bootstrap::ValidatedHostStorage,
+        checkout_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            deletion_child: storage.roots().deletion_child().map(Path::to_owned),
+            ..Self::new(storage.namespace(), storage.store(), checkout_path)
         }
     }
 
@@ -4003,16 +4020,16 @@ pub(crate) fn retired_image_below(
         .join(retired_file_name(workspace, incarnation))
 }
 
-/// `<sessions>/.releasing/<name>-<incarnation>.dmg`: where a workspace image's release is
-/// committed and, until the same operation has freed it, journaled (02_workspaces.md, `rm` step
-/// 5; [`release::JOURNAL_DIRECTORY`]). Named like its trash entry, so an incarnation names one.
-pub(super) fn releasing_image_below(
+/// `<sessions>/.deleting/<name>-<incarnation>.dmg`: where a workspace image's release is committed
+/// and waits for the background deletion (02_workspaces.md, `rm` step 5;
+/// [`release::DELETING_DIRECTORY`]). Named like its trash entry, so an incarnation names one.
+pub(super) fn deleting_image_below(
     sessions: &Path,
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,
 ) -> PathBuf {
     sessions
-        .join(release::JOURNAL_DIRECTORY)
+        .join(release::DELETING_DIRECTORY)
         .join(retired_file_name(workspace, incarnation))
 }
 
@@ -4024,22 +4041,21 @@ fn retired_file_name(workspace: &WorkspaceName, incarnation: &WorkspaceIncarnati
     )
 }
 
-/// Whether `name` is a workspace image's journal name, `<name>-<incarnation>.dmg`.
-pub(crate) fn is_releasing_image_name(name: &str) -> bool {
+/// Whether `name` is a released workspace image's name, `<name>-<incarnation>.dmg`.
+pub(crate) fn is_deleting_image_name(name: &str) -> bool {
     name.strip_suffix(&format!(".{IMAGE_EXTENSION}"))
         .and_then(split_retired_stem)
         .is_some()
 }
 
-/// Finish every workspace image release a crash cut short in the store at `store`: each
-/// project's `sessions/.releasing`. The daemon runs this once at its start; a project's next
-/// lifecycle open does the same for its own.
-pub fn drain_store_session_releases(store: &Path) -> release::Drained {
+/// The gateway's startup scan of the workspace images of every project in the store at `store`
+/// (05_gateway.md, "Deleting released images"): each project's `sessions/.deleting`.
+pub fn drain_store_session_releases(store: &Path) -> release::Pass {
     release::drain_store(
         store,
         crate::repository::SESSIONS_DIRECTORY,
-        release::JOURNAL_DIRECTORY,
-        is_releasing_image_name,
+        release::DELETING_DIRECTORY,
+        is_deleting_image_name,
     )
 }
 

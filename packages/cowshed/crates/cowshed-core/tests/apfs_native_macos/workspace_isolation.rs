@@ -12,10 +12,11 @@ fn published_session(layout: &StorageLayout, workspace: &str, incarnation: &str)
     image
 }
 
-/// Canonical unlink is the retirement commit for clean, recoverable source images. A real
-/// immutable-file refusal must keep its authority, and retry must release bytes without trash.
+/// The rename into `sessions/.deleting` is the retirement commit for a clean, recoverable source
+/// image. A real immutable-file refusal must keep its authority; the retry commits the image, frees
+/// none of it (the background deletion does) and makes no trash.
 #[test]
-fn clean_source_release_unlinks_physically_and_keeps_authority_when_unlink_refuses() {
+fn clean_source_release_commits_to_deleting_and_keeps_authority_when_the_commit_refuses() {
     const LIVE: &str = "00000000000000000000000000000024";
     let fixture = Fixture::new("direct-source-release");
     let config = fixture.config();
@@ -44,10 +45,10 @@ fn clean_source_release_unlinks_physically_and_keeps_authority_when_unlink_refus
     set_file_flags(&canonical, libc::UF_IMMUTABLE);
     let error = host
         .release_workspace(&config, &retired)
-        .expect_err("unlink refuses");
+        .expect_err("the commit refuses");
     assert!(
         canonical.exists(),
-        "failed unlink must preserve the source image: {error}"
+        "a failed commit must preserve the source image: {error}"
     );
     assert_eq!(std::fs::read(sidecar_path(&canonical)).unwrap(), record);
     assert_eq!(std::fs::read(ca_key_path(&canonical)).unwrap(), key);
@@ -55,8 +56,16 @@ fn clean_source_release_unlinks_physically_and_keeps_authority_when_unlink_refus
     set_file_flags(&canonical, 0);
     drop(flags);
     host.release_workspace(&config, &retired)
-        .expect("retry physically releases");
+        .expect("retry commits the release");
     assert!(!canonical.exists());
+    assert!(
+        layout
+            .project()
+            .sessions
+            .join(format!(".deleting/raven-{LIVE}.dmg"))
+            .is_file(),
+        "the image waits in sessions/.deleting; a fixture store starts no deletion child"
+    );
     assert!(!sidecar_path(&canonical).exists());
     assert!(!ca_key_path(&canonical).exists());
     assert!(!layout.project().sessions.join(".trash").exists());
@@ -365,12 +374,12 @@ fn locked_recovery_settles_only_its_own_workspace_and_never_reads_a_broken_neigh
         std::fs::create_dir_all(record.parent().expect("record parent")).expect("record parent");
         std::fs::write(record, CORRUPT).expect("corrupt neighbour record");
     }
-    // A neighbour's committed release that cannot even be opened: a pass that read it would
-    // refuse, and one that freed it would block on a release that is not its own.
+    // A neighbour's committed release that cannot even be opened: recovery reads no released
+    // image (the background deletion frees them), so a pass that read it would refuse.
     let neighbour_release = broken_canonical
         .parent()
         .expect("sessions")
-        .join(".releasing")
+        .join(".deleting")
         .join(format!("broken-{SIBLING}.dmg"));
     std::fs::create_dir_all(neighbour_release.parent().expect("journal")).expect("journal");
     std::fs::write(&neighbour_release, CORRUPT).expect("neighbour release");

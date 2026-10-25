@@ -1079,7 +1079,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         reclaimed: 0,
         retained_pinned: 1,
         retained_active: 1,
-        freed_bytes: 0,
+        released_bytes: 0,
         dry_run: true,
         candidates: [
             GcReason::RetiredWorkspace,
@@ -1163,7 +1163,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         reclaimed: 5,
         retained_pinned: 1,
         retained_active: 0,
-        freed_bytes: 21_504,
+        released_bytes: 21_504,
         dry_run: false,
         candidates: Vec::new(),
         deferred: vec![GcDeferred {

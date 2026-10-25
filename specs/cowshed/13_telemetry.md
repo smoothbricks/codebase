@@ -92,13 +92,14 @@ The APFS host records `cowshed.image.write_first`, `cowshed.image.seed_capture`,
 
 Each capture observes both the source and the destination. An absent destination starts at zero; its delta describes the
 newly named clone's allocation, **not** newly allocated unique blocks. A release (a build image's, a clean removal's
-source image) compares the image before it with what is left once it answers: a release frees the whole image before it
-answers, so the image is `absent` after and its delta is everything it held. A recovery retirement compares the
-canonical file with the renamed file in trash: a rename frees no extents or allocated bytes. Missing files are
-explicitly `absent`; failed measurements are null with their cause, never zero. The extent count comes from
-`storage/apfs/extents.rs::count_extents`, the existing native `F_LOG2PHYS_EXT` walker. Allocation reuses that module's
-`allocated_bytes` (`st_blocks * 512`). Neither measures the mounted filesystem's contents, shared-block exclusivity, or
-bytes written.
+source image) compares the image at its name before it with what is left there once it answers: a release commits the
+whole image to its deleting directory before it answers, so the image is `absent` at its name after and its delta reads
+as everything it held, though a rename frees no extents or allocated bytes: a background deletion frees them later
+(05_gateway.md, "Deleting released images"). A recovery retirement compares the canonical file with the renamed file in
+trash: a rename frees no extents or allocated bytes. Missing files are explicitly `absent`; failed measurements are null
+with their cause, never zero. The extent count comes from `storage/apfs/extents.rs::count_extents`, the existing native
+`F_LOG2PHYS_EXT` walker. Allocation reuses that module's `allocated_bytes` (`st_blocks * 512`). Neither measures the
+mounted filesystem's contents, shared-block exclusivity, or bytes written.
 
 The custom columns are:
 
@@ -479,14 +480,13 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   remount cannot be masked. `doctor` flags it when non-empty. The gateway, every workspace supervisor and their children
   write it at once, so each cowshed process writes each line in one `write(2)` (`cowshed_os::eprintln!`; clippy refuses
   `std::eprintln!`/`eprint!` in the cowshed crates). `std` writes a line one formatted piece at a time, and pieces of
-  concurrent processes splice: measured 2026-10-21, an install's `supervisor-recovery drain` spans and its supervisors'
-  "retires after draining" lines interleaved mid-word, so no line said which supervisor waited on what. A daemon (the
-  gateway, each workspace supervisor) never writes it from the thread that serves: that thread runs the daemon's whole
-  runtime, and the file shares the store's APFS container, so one write the container stalls stops every request.
-  Measured 2026-10-22, the installed gateway's main thread waited in `write(2)` on this file in all 728 samples while
-  the build-volume trash freed an image, and every `cowshed fork` and `ls` on the host hung. So a daemon queues each
-  whole line for one writer thread of its own (`cowshed_os::stderr::detach`), up to 4,096 lines. A line that finds the
-  queue full is dropped and counted, never waited for, and the writer's next write first says
+  concurrent processes splice: an install's `supervisor-recovery drain` spans and its supervisors' "retires after
+  draining" lines interleave mid-word, so no line says which supervisor waited on what. A daemon (the gateway, each
+  workspace supervisor) never writes it from the thread that serves: that thread runs the daemon's whole runtime, and
+  the file shares the store's APFS container, so one write the container stalls stops every request. A free in progress
+  stalls such a write, and every `cowshed fork` and `ls` on the host hangs behind the thread that waits in it. So a
+  daemon queues each whole line for one writer thread of its own (`cowshed_os::stderr::detach`), up to 4,096 lines. A
+  line that finds the queue full is dropped and counted, never waited for, and the writer's next write first says
   `cowshed: <n> stderr line(s) dropped: the log took no writes while the queue was full`. A line the log itself refuses
   (`EIO`, `ENOSPC`, a closed descriptor) is a different loss, counted apart: the next write the log takes says
   `cowshed: <n> stderr line(s) lost: the log refused them: <error>`, naming the error that refused the first of them,

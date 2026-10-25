@@ -1331,7 +1331,7 @@ export type GcReport = {
    * Staging entries an operation still holds the lifecycle lock for: not garbage yet.
    */
   readonly retainedActive: number & tags.Type<'uint64'>;
-  readonly freedBytes: number & tags.Type<'uint64'>;
+  readonly releasedBytes: number & tags.Type<'uint64'>;
   readonly dryRun: boolean;
   readonly candidates: ReadonlyArray<GcCandidate>;
   readonly deferred: ReadonlyArray<GcDeferred>;
@@ -3154,7 +3154,7 @@ export type ReseedResult = {
   readonly replacementVolume?: string;
   readonly previousBytes: number & tags.Type<'uint64'>;
   readonly replacementBytes: number & tags.Type<'uint64'>;
-  readonly freedBytes: number & tags.Type<'uint64'>;
+  readonly releasedBytes: number & tags.Type<'uint64'>;
   readonly dryRun: boolean;
 };
 

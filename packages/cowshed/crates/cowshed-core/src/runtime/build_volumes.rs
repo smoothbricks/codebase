@@ -36,7 +36,6 @@ use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, MacOsApfsExecutionHost,
 };
-use crate::storage::apfs::release::{Drained, Reclaim};
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
 use cowshed_apfs::SystemCommandRunner;
@@ -509,7 +508,7 @@ pub(crate) enum Discovered {
 pub(crate) struct Collection {
     pub examined: u64,
     pub reclaimed: u64,
-    pub freed_bytes: u64,
+    pub released_bytes: u64,
     pub candidates: Vec<GcCandidate>,
     pub deferred: Vec<Deferred>,
 }
@@ -1620,14 +1619,13 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// under the target, and that job's end releases it
     /// ([`Self::release_superseded`]); a failed release keeps that record too and is the land's
     /// error. It needs no target lock: no fork or reseed of the target that took the lock after
-    /// the move reads it, and none that held it before the land took it still runs. A
-    /// release-purpose step, it then finishes the project's build journal ([`finish_journal`]).
+    /// the move reads it, and none that held it before the land took it still runs. The
+    /// release commits the image to `build/.deleting` and returns; the gateway frees its bytes.
     pub async fn release_previous(&self, previous: Superseded) -> Result<()> {
         self.blocking(move |host, layout| {
             let Superseded { id, owner } = previous;
             let release = host.release_build_volume(layout, &id).map_err(storage)?;
             say_release(&id, &format!("{}'s previous", owner.name), &release);
-            finish_journal(host, layout);
             Ok(())
         })
         .await
@@ -1663,8 +1661,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// volume recorded as `owner`'s at its incarnation: its seeds and its superseded previous
     /// volumes, and whatever a creation it registered left unfinished. A volume that stays
     /// refuses, naming why, so an image is never retired ahead of the volumes it owned and
-    /// nothing is left for a later sweep to find ownerless. A release-purpose step, it then
-    /// finishes the project's build journal ([`finish_journal`]).
+    /// nothing is left for a later sweep to find ownerless. Each release commits its image to
+    /// `build/.deleting` and returns; the gateway frees the bytes.
     pub async fn release_owned(&self, owner: Owner, checkout: PathBuf) -> Result<()> {
         let linked = self.layout.linked(&checkout)?;
         self.blocking(move |host, layout| {
@@ -1711,7 +1709,6 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     }
                 }
             }
-            finish_journal(host, layout);
             Ok(())
         })
         .await
@@ -1905,25 +1902,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// by its exact id now, as the open's own step, never left for a periodic or manual pass. One
     /// still forming (a create, fork or adopt in any process, a first touch a detached checkout
     /// may still finish) is its registrant's, and one a creator still holds defers under the
-    /// release's claim. The build journal is not the open's to finish: every verb opens the
-    /// project, so a fork would pay for freeing the seed the fork before it superseded
-    /// ([`Self::finish_releases`]).
+    /// release's claim. Nothing here frees image bytes: the background deletion
+    /// frees what releases commit (05_gateway.md, "Deleting released images").
     pub async fn recover_registered(
         &self,
         registered: Vec<BuildVolumeId>,
         links: Links,
     ) -> Result<Collection> {
         self.blocking(move |host, layout| collect_planned(host, layout, &registered, &links, false))
-            .await
-    }
-
-    /// Finish every release committed to the project's build journal (16_build_volumes.md,
-    /// "Garbage collection"): the superseded seeds a fork's refresh journaled and the entries a
-    /// crash cut short, each in bounded steps. `gc` runs this and refuses on its failure; an
-    /// entry another process is freeing, or a directory store's tree a process still holds, is
-    /// left to a later pass.
-    pub async fn finish_releases(&self) -> Result<Drained> {
-        self.blocking(move |host, layout| host.finish_build_releases(layout).map_err(storage))
             .await
     }
 }
@@ -1986,7 +1972,7 @@ fn collect_planned(
         match deferral {
             None => {
                 collection.candidates.push(candidate);
-                collection.freed_bytes = collection.freed_bytes.saturating_add(bytes);
+                collection.released_bytes = collection.released_bytes.saturating_add(bytes);
             }
             Some(deferral) => {
                 // A collection names what it tried to release; a volume a checkout links is
@@ -2057,9 +2043,7 @@ fn release_if_still_doomed(
     if let Some(deferral) = still_doomed(layout, links, doomed)? {
         return Ok(Err(deferral));
     }
-    host.release_claimed(layout, claim, Reclaim::Now)
-        .map(Ok)
-        .map_err(storage)
+    host.release_claimed(layout, claim).map(Ok).map_err(storage)
 }
 
 /// Why collection leaves a build volume for a later pass instead of deleting it.
@@ -2536,7 +2520,7 @@ fn seal(
     }
     match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), registration) {
         Ok(()) => {
-            retire_seeds(host, layout, target, previous, Reclaim::Now)?;
+            retire_seeds(host, layout, target, previous)?;
             Ok(Ok(Freeze::Frozen))
         }
         Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => Ok(Ok(Freeze::SealBusy {
@@ -2559,17 +2543,16 @@ fn volume_busy_reason(image: &Path, open: &[cowshed_os::process::Holder]) -> Str
     )
 }
 
-/// Release `previous`, the seeds of `target` a new one replaced, as `reclaim` says
-/// (16_build_volumes.md, "Garbage collection"): a land frees them before it answers, and a
-/// fork's seed refresh only commits them to the build journal, so the fork never waits on
-/// freeing a seed nothing reads any more. A seed is never mounted and no job is admitted on
-/// one, so a hold on it is an integrity fault.
+/// Release `previous`, the seeds of `target` a new one replaced (16_build_volumes.md, "Garbage
+/// collection"): each is committed to `build/.deleting` and its owner record retired, and the
+/// gateway's deleter frees the bytes, so neither a land nor a fork's seed refresh waits on freeing
+/// a seed nothing reads any more. A seed is never mounted and no job is admitted on one, so a hold
+/// on it is an integrity fault.
 fn retire_seeds(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     previous: Vec<BuildVolumeId>,
-    reclaim: Reclaim,
 ) -> Result<()> {
     let held = |old: &BuildVolumeId| {
         CowshedError::integrity(
@@ -2585,7 +2568,7 @@ fn retire_seeds(
             BuildVolumeClaim::Claimed(claim) => claim,
             BuildVolumeClaim::Held { .. } => return Err(held(&old)),
         };
-        let refused = match host.release_claimed(layout, claim, reclaim) {
+        let refused = match host.release_claimed(layout, claim) {
             Ok(refused) => refused,
             Err(ApfsStorageError::BuildVolumeHeld { .. }) => return Err(held(&old)),
             Err(error) => return Err(storage(error)),
@@ -2595,35 +2578,8 @@ fn retire_seeds(
             &format!("{}'s superseded seed", target.name),
             &BuildVolumeRelease::Deleted { refused },
         );
-        let entry = layout.released(&old);
-        if reclaim == Reclaim::Journaled && entry.exists() {
-            cowshed_os::eprintln!(
-                "cowshed: {}'s superseded seed {old} is released to {}; its space is freed by the next rm, land, gc or daemon start",
-                target.name,
-                entry.display()
-            );
-        }
     }
     Ok(())
-}
-
-/// Finish the project's build journal after a release-purpose operation's own release
-/// (16_build_volumes.md, "Garbage collection"), saying what it freed. Its failure is said, not
-/// the operation's: that operation's own release is done, and the entries stay for `gc` or the
-/// daemon's start.
-fn finish_journal(host: &impl RuntimeStorageHost, layout: &BuildVolumeLayout) {
-    match host.finish_build_releases(layout) {
-        Ok(drained) if drained.images > 0 => cowshed_os::eprintln!(
-            "cowshed: finished releasing {} build volume image(s), {} bytes, that a fork's seed refresh or an interrupted operation committed",
-            drained.images,
-            drained.bytes
-        ),
-        Ok(_) => {}
-        Err(error) => cowshed_os::eprintln!(
-            "cowshed: build releases committed in {} stay for cowshed gc or the daemon's start: {error}",
-            layout.releasing().display()
-        ),
-    }
 }
 
 /// The capacity main's first build volume is minted at beside its image, from `source`'s
@@ -2883,8 +2839,8 @@ fn reseed(
 }
 
 /// Freeze `source`, recorded at `tree`, as `target`'s seed after Nx and existing Cargo profiles
-/// admit capture, then commit every older seed of `target` to the build journal
-/// ([`Reclaim::Journaled`]): the fork this refresh serves never waits on freeing them, and no
+/// admit capture, then commit every older seed of `target` to `build/.deleting`
+/// ([`retire_seeds`]): the fork this refresh serves never waits on freeing them, and no
 /// step of it reads them again. Measured on build 48a8ffff, an inline free of one 300 GiB
 /// superseded seed held a provision about 12 minutes in `ftruncate`. The elapsed milliseconds. Their
 /// guards and the exclusive build hold stay alive through mounted capture and publication.
@@ -2972,7 +2928,7 @@ fn capture(
         }
         Err(error) => return Err(storage(error)),
     }
-    retire_seeds(host, layout, target, previous, Reclaim::Journaled)?;
+    retire_seeds(host, layout, target, previous)?;
     let elapsed_ms = millis(started.elapsed());
     cowshed_os::timing::event("build-volume", || {
         format!("seed {} from {source} in {elapsed_ms} ms", target.name)
@@ -4689,7 +4645,7 @@ mod tests {
             .unwrap();
         let report = preview.preview();
         assert!(report.dry_run);
-        assert_eq!(report.freed_bytes, 0);
+        assert_eq!(report.released_bytes, 0);
         assert!(report.previous_bytes > 0);
         assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old.clone()));
 
@@ -4747,8 +4703,8 @@ mod tests {
         let completed = scratch.volumes.execute_reseed(plan).await.unwrap();
         let replacement =
             BuildVolumeId::parse(completed.replacement_volume.as_ref().unwrap()).unwrap();
-        assert_eq!(completed.freed_bytes, completed.previous_bytes);
-        assert!(completed.freed_bytes > 0);
+        assert_eq!(completed.released_bytes, completed.previous_bytes);
+        assert!(completed.released_bytes > 0);
         assert!(!completed.dry_run);
         assert_eq!(
             scratch.layout.linked(&checkout).unwrap(),
@@ -4810,7 +4766,7 @@ mod tests {
             "{log}"
         );
         scratch.release_all();
-        (expected_deleted, completed.freed_bytes)
+        (expected_deleted, completed.released_bytes)
     }
 
     #[cfg(target_os = "macos")]
@@ -5403,7 +5359,7 @@ mod tests {
         );
         let collected = scratch.volumes.collect(ids, links, false).await.unwrap();
         assert_eq!(collected.reclaimed, 1);
-        assert_eq!(collected.freed_bytes, 0);
+        assert_eq!(collected.released_bytes, 0);
         assert!(!scratch.layout.record(&seed).exists());
         let log = fs::read_to_string(
             scratch
@@ -6097,8 +6053,8 @@ fn main() {
     /// A fork's seed refresh never waits on freeing the seed it supersedes (16_build_volumes.md,
     /// "Garbage collection"). A process works inside the old seed's tree, which keeps any
     /// deletion of it from running; the refresh still publishes the new seed and answers, the
-    /// old one committed to the build journal with its owner record retired and none of its bytes
-    /// deleted. The journal's finisher leaves it while it is held and deletes it once it is not.
+    /// old one committed to `build/.deleting` with its owner record retired and none of its bytes
+    /// deleted. The store's deleter leaves it while it is held and deletes it once it is not.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_refresh_journals_a_held_superseded_seed_that_recovery_finishes() {
@@ -6154,7 +6110,7 @@ fn main() {
             old.exists(),
             fs::read(scratch.layout.released(&previous).join("old-seed")),
             scratch.layout.read_record_present(&previous).unwrap(),
-            scratch.volumes.finish_releases().await,
+            scratch.host.finish_build_releases(&scratch.layout),
         );
         holder.kill().unwrap();
         holder.wait().unwrap();
@@ -6178,11 +6134,11 @@ fn main() {
         assert_eq!(journaled.2, None, "the commit retires its owner record");
         assert_eq!(
             journaled.3.unwrap(),
-            Drained::default(),
+            crate::storage::apfs::release::Drained::default(),
             "nothing is deleted from under its holder"
         );
-        let finished = scratch.volumes.finish_releases().await.unwrap();
-        assert_eq!(finished.images, 1, "recovery finishes the journal entry");
+        let finished = scratch.host.finish_build_releases(&scratch.layout).unwrap();
+        assert_eq!(finished.images, 1, "the deleter frees the committed seed");
         assert!(finished.bytes > 0, "{finished:?}");
         assert!(!scratch.layout.released(&previous).exists());
         scratch.release_all();
@@ -7809,7 +7765,7 @@ fn main() {
             .await
             .unwrap();
         assert_eq!(
-            (collected.reclaimed, collected.freed_bytes),
+            (collected.reclaimed, collected.released_bytes),
             (1, 0),
             "{:?}",
             collected.deferred

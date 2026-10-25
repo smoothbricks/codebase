@@ -169,8 +169,8 @@
       "deferred": [],
       "dryRun": true,
       "examined": 7,
-      "freedBytes": 0,
       "reclaimed": 0,
+      "releasedBytes": 0,
       "retainedActive": 1,
       "retainedPinned": 1
     },
@@ -205,8 +205,8 @@
       ],
       "dryRun": false,
       "examined": 7,
-      "freedBytes": 21504,
       "reclaimed": 5,
+      "releasedBytes": 21504,
       "retainedActive": 0,
       "retainedPinned": 1
     }

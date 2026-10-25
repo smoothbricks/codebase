@@ -179,8 +179,9 @@ none:
    promote leaves an unlinked dataset that the next collection releases and destroys as above.
 
 **Destroy does not stall the pool.** ZFS frees a destroyed dataset's blocks in the background over later transaction
-groups (`async_destroy`), so a destroy returns without walking the dataset's blocks, and no trash daemon or chunked free
-(01a_apfs.md, "Freeing an image") is needed. The pool's `freeing` property reports what is still being freed.
+groups (`async_destroy`), so a destroy returns without walking the dataset's blocks, and no background deletion or
+chunked free (05_gateway.md, "Deleting released images"; 01a_apfs.md, "Freeing an image") is needed. The pool's
+`freeing` property reports what is still being freed.
 
 ## No disk per dataset
 

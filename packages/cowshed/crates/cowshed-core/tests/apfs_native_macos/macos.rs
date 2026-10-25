@@ -1260,7 +1260,7 @@ fn gc_reclaims_abandon_bundles_only_under_the_abandoned_sweep() {
         "a plain sweep never names an abandon bundle: {default_plan:?}"
     );
     let report = host.execute_gc(&config, default_plan).expect("plain sweep");
-    assert_eq!(report.freed_bytes, 0, "a plain sweep frees nothing here");
+    assert_eq!(report.released_bytes, 0, "a plain sweep frees nothing here");
     assert!(
         bundle.exists(),
         "a plain gc leaves the abandoned commits fetchable"
@@ -1319,7 +1319,7 @@ fn gc_reclaims_abandon_bundles_only_under_the_abandoned_sweep() {
     let report = host.execute_gc(&config, plan).expect("abandoned sweep");
     assert_eq!(report.reclaimed, 1, "the bundle is the only candidate");
     assert_eq!(
-        report.freed_bytes, expected,
+        report.released_bytes, expected,
         "the report names the bytes the bundle held"
     );
     assert!(!bundle.exists(), "the abandoned commits are reclaimed");
@@ -4505,14 +4505,15 @@ fn an_imageless_sibling_publication_is_reconciled_instead_of_failing_every_other
         .expect("repeated recovery is idempotent");
 }
 
-/// The crash a workspace release's journal exists for (02_workspaces.md, `rm` step 5): the release
-/// renamed the clean source image to `sessions/.releasing/<ws>-<incarnation>.dmg`, made its first
-/// bounded cut and died with its grants sidecar and CA key still canonical. The next open's
-/// recovery finishes the release from what the cut left before it reconciles the record the
-/// rename left imageless, and the workspace stays gone.
+/// The crash the deleting directory exists for (02_workspaces.md, `rm` step 5): the release
+/// renamed the clean source image to `sessions/.deleting/<ws>-<incarnation>.dmg` and died with its
+/// grants sidecar and CA key still canonical, and the background deletion made its first bounded cut
+/// and stopped. The next open's recovery reconciles the record the rename left imageless without
+/// touching the entry, the workspace stays gone, and the gateway's next pass frees what the cut
+/// left.
 #[test]
-fn a_workspace_release_cut_short_after_its_first_cut_is_finished_by_recovery() {
-    use cowshed_core::storage::apfs::release::{JOURNAL_DIRECTORY, Release, StepExtents};
+fn a_workspace_release_is_reconciled_by_recovery_and_finished_by_the_next_deleter_pass() {
+    use cowshed_core::storage::apfs::release::{DELETING_DIRECTORY, Opened, Release, StepExtents};
     use cowshed_os::fork_lock::Run as _;
     use std::os::unix::fs::FileExt;
 
@@ -4559,12 +4560,12 @@ fn a_workspace_release_cut_short_after_its_first_cut_is_finished_by_recovery() {
     drop(image);
     std::fs::remove_file(&holder).expect("drop the clone");
 
-    // The release's commit, its first cut, and the crash.
+    // The release's commit, the deleter's first cut, and the stop.
     let entry = canonical
         .image()
         .parent()
         .expect("sessions")
-        .join(JOURNAL_DIRECTORY)
+        .join(DELETING_DIRECTORY)
         .join(format!(
             "{}-{}.dmg",
             name.as_str(),
@@ -4573,9 +4574,12 @@ fn a_workspace_release_cut_short_after_its_first_cut_is_finished_by_recovery() {
     std::fs::create_dir_all(entry.parent().expect("journal")).expect("journal");
     std::fs::rename(canonical.image(), &entry).expect("commit");
     let length = std::fs::metadata(&entry).expect("entry").len();
-    let mut release = Release::open_waiting(&entry, StepExtents::new(std::num::NonZeroU64::MIN))
-        .expect("open the release")
-        .expect("the committed entry");
+    let Opened::Release(mut release) =
+        Release::open(&entry, StepExtents::new(std::num::NonZeroU64::MIN))
+            .expect("open the release")
+    else {
+        panic!("the committed entry opens for the deleter");
+    };
     let cut = release.step().expect("cut").expect("a cut is left");
     assert!(
         cut > 0 && cut < length,
@@ -4585,8 +4589,12 @@ fn a_workspace_release_cut_short_after_its_first_cut_is_finished_by_recovery() {
 
     let host = native_host(&fixture, RecordingRunner::default());
     host.recover_pending(&fixture.config(), &[])
-        .expect("recovery finishes the committed release");
-    assert!(!entry.exists(), "recovery frees and unlinks the entry");
+        .expect("recovery reconciles the committed release");
+    assert_eq!(
+        std::fs::metadata(&entry).expect("the entry stays").len(),
+        cut,
+        "recovery frees nothing: the background deletion does"
+    );
     assert!(
         !sidecar_path(canonical.image()).exists() && !ca_key_path(canonical.image()).exists(),
         "the record goes once its image is gone"
@@ -4603,6 +4611,13 @@ fn a_workspace_release_cut_short_after_its_first_cut_is_finished_by_recovery() {
     );
     host.recover_pending(&fixture.config(), &[])
         .expect("repeated recovery is idempotent");
+    let pass = cowshed_core::storage::apfs::drain_store_session_releases(&fixture.root);
+    assert_eq!(pass.drained.images, 1, "{pass:?}");
+    assert!(pass.left.is_empty(), "{pass:?}");
+    assert!(
+        !entry.exists(),
+        "the deleter's next pass frees and unlinks the entry"
+    );
 }
 
 /// A session create that died between its grants sidecar and its CA key leaves a staged image with

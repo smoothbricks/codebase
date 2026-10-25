@@ -1039,15 +1039,25 @@ pub struct CanonicalRoots {
     telemetry: PathBuf,
     namespace: HostNamespace,
     ports: PortPartition,
+    /// The program a release starts its deletion child with (05_gateway.md, "Deleting released
+    /// images"): the PATH-resolved `cowshed` for the host store, none for a fixture store unless its
+    /// test names its own built binary ([`Self::with_deletion_child`]).
+    deletion_child: Option<Arc<Path>>,
 }
 
 impl CanonicalRoots {
     pub fn global() -> Self {
-        Self::new(
-            PathBuf::from(STORE_ROOT),
-            HostNamespace::Production,
-            PortPartition::Host,
-        )
+        Self {
+            // Every release this process makes starts its deletion child as this executable: the
+            // cowshed CLI, the gateway or a supervisor, never a library host (05_gateway.md,
+            // "Deleting released images").
+            deletion_child: std::env::current_exe().ok().map(Arc::from),
+            ..Self::new(
+                PathBuf::from(STORE_ROOT),
+                HostNamespace::Production,
+                PortPartition::Host,
+            )
+        }
     }
 
     /// `namespace`'s fixture store at `store`; it holds the claims on its detached blocks for as
@@ -1067,11 +1077,24 @@ impl CanonicalRoots {
             telemetry,
             namespace,
             ports,
+            deletion_child: None,
         }
     }
 
     pub fn store(&self) -> &Path {
         &self.store
+    }
+
+    /// This fixture store's releases start their deletion child with `program`, the test's own
+    /// built cowshed binary.
+    pub fn with_deletion_child(mut self, program: &Path) -> Self {
+        self.deletion_child = Some(Arc::from(program));
+        self
+    }
+
+    /// The program a release starts its deletion child with, if any.
+    pub fn deletion_child(&self) -> Option<&Path> {
+        self.deletion_child.as_deref()
     }
 
     /// The store root shared, so a project's identity answer names it without copying it.

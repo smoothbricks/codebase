@@ -96,7 +96,7 @@ even if compromised — escalation is strictly a decision made one level up.
 | `grant` / `revoke`  | `name`, `read[]?`, `write[]?`, `egress[]?`, `repo[]?`, `sim[]?`, `servicePorts?`, `all?`, `expectedRevision?` | new grant revision                                       |
 | `slot_assign`       | `name`, `slot`                                                                                                | ok (recycled mount path for the slot)                    |
 | `mint_worker`       | `name`                                                                                                        | 256-bit, 30-second, one-use worker connection descriptor |
-| `gc`                | `dryRun?`                                                                                                     | reclaimed bytes/report                                   |
+| `gc`                | `dryRun?`                                                                                                     | released bytes/report                                    |
 | `repo_mirror`       | `name`, `url`                                                                                                 | controller-owned read-only mirror path                   |
 
 A coordinator-scoped telemetry query tool (selector/SQL over controller commitments and telemetry, 13_telemetry.md) is

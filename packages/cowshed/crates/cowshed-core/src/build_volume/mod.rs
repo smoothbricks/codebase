@@ -35,7 +35,7 @@ use crate::capabilities::BuildStatePath;
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::repository::ProjectPaths;
 use crate::storage::StorageLayoutError;
-use crate::storage::apfs::release::{Drained, Reclaim};
+use crate::storage::apfs::release::{Pass, drain_store};
 use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_os::fork_lock::Fenced;
 
@@ -51,11 +51,6 @@ pub(crate) const RECORD_SUFFIX: &str = ".json";
 /// The lock beside each image that every job admitted on the volume holds shared for its whole
 /// run, and that a release takes exclusively: `<id>.dmg.hold` ([`BuildVolumeHold`]).
 pub(crate) const HOLD_SUFFIX: &str = ".hold";
-/// Where a released volume's image waits to be deleted: `build/.trash/<id>.dmg`, inside the
-/// images directory and so on its volume, so moving an image there is one `rename(2)`
-/// (16_build_volumes.md, "Garbage collection"). Deleting a written image frees its whole extent
-/// tree, which took minutes inside a land (measured 2026-10-21); the move takes none of that.
-pub(crate) const TRASH_DIRECTORY: &str = ".trash";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
@@ -714,34 +709,25 @@ impl BuildVolumeLayout {
         self.images.join(format!("{id}.{IMAGE_EXTENSION}"))
     }
 
-    /// Historical build-volume trash: releases earlier builds committed by renaming their images
-    /// there, finished by the daemon's start and by `gc` ([`drain_released`]). No release of
-    /// this build moves an image there.
-    pub fn trash(&self) -> PathBuf {
-        self.images.join(TRASH_DIRECTORY)
-    }
-
-    /// The journal of the releases committed in this project's images directory and not yet
-    /// finished, `build/.releasing` ([`crate::storage::apfs::release::JOURNAL_DIRECTORY`]).
-    pub fn releasing(&self) -> PathBuf {
+    /// Where this project's released images wait for the background deletion, `build/.deleting`
+    /// ([`crate::storage::apfs::release::DELETING_DIRECTORY`]).
+    pub fn deleting(&self) -> PathBuf {
         self.images
-            .join(crate::storage::apfs::release::JOURNAL_DIRECTORY)
+            .join(crate::storage::apfs::release::DELETING_DIRECTORY)
     }
 
-    /// `id`'s entry in [`Self::releasing`] once its release is committed.
+    /// `id`'s entry in [`Self::deleting`] once its release is committed.
     pub fn released(&self, id: &BuildVolumeId) -> PathBuf {
-        self.releasing().join(format!("{id}.{IMAGE_EXTENSION}"))
+        self.deleting().join(format!("{id}.{IMAGE_EXTENSION}"))
     }
 
     /// Release `id`'s detached image inside the operation that retires or replaces it, and say
     /// whether an image was there (16_build_volumes.md, "Garbage collection"): one rename into
-    /// [`Self::releasing`] commits it. With [`Reclaim::Now`] it is then freed in bounded steps
-    /// and unlinked, all before this returns, so the caller removes the owner record only once
-    /// the bytes are gone; with [`Reclaim::Journaled`] the entry stays for the journal's next
-    /// drain. A failure before the rename leaves the image and record for the same operation's
-    /// retry; one after it leaves the journal entry for recovery.
-    pub fn release_image(&self, id: &BuildVolumeId, reclaim: Reclaim) -> io::Result<bool> {
-        crate::storage::apfs::release::release_owned(&self.image(id), &self.released(id), reclaim)
+    /// [`Self::deleting`] commits it, and this returns once that rename is
+    /// durable, freeing nothing; the background deletion frees the bytes. A failure before the rename leaves the image
+    /// and record for the same operation's retry.
+    pub fn release_image(&self, id: &BuildVolumeId) -> io::Result<bool> {
+        crate::storage::apfs::release::commit_release(&self.image(id), &self.released(id))
     }
 
     pub fn record(&self, id: &BuildVolumeId) -> PathBuf {
@@ -1207,39 +1193,25 @@ impl ReleaseClaim {
     }
 }
 
-/// Finish every release committed in `directory`, a project's [`BuildVolumeLayout::releasing`]
-/// journal or its historical [`BuildVolumeLayout::trash`], one image at a time on the calling
-/// thread, each in bounded steps at normal disk priority ([`crate::storage::apfs::release`]): no
-/// step frees more than [`STEP_EXTENTS`](crate::storage::apfs::release::STEP_EXTENTS) extents,
-/// so no deletion is one free of a whole extent tree that every other writer of the store's
-/// container waits behind. An image another process is releasing is left to it, and an image a
-/// crash left half-released is finished from its length. A directory that does not exist is
-/// empty. Only `<id>.dmg` files are released; anything else there is left and said.
+/// The gateway's startup scan of the build images of every project in the store at `store`
+/// (05_gateway.md, "Deleting released images"): each `<store>/<owner>/<repo>/build/.deleting`.
+/// Each image is freed one at a time on the calling thread, in bounded steps at normal disk
+/// priority ([`crate::storage::apfs::release`]): no step frees more than
+/// [`STEP_EXTENTS`](crate::storage::apfs::release::STEP_EXTENTS) extents, so no deletion is one free
+/// of a whole extent tree that every other writer of the store's container waits behind. An image
+/// another process holds is left to it, and one a crash or a stopped deleter left half-released
+/// is finished from its length. Only `<id>.dmg` files are released; anything else is left and
+/// named in the pass, as is a directory that cannot be read.
 ///
-/// Normal priority, not background (`IOPOL_THROTTLE`): measured 2026-10-22, a throttled thread
-/// freeing a 131,072-extent clone took 53 s against 7.6 s unthrottled, and the writers beside it
-/// waited 10.6 ms at the median instead of 0.2 ms; the installed gateway's throttled unlink did
-/// 1,213 throttled 4 KiB metadata reads at a 20 ms median in 21 s. A throttled free holds the
-/// container's work while its own reads wait, so it slows every writer instead of yielding.
-pub fn drain_released(directory: &Path) -> io::Result<Drained> {
-    crate::storage::apfs::release::drain(directory, is_image_name, |_| true)
-}
-
-/// [`drain_released`] for every project in the store at `store`: each
-/// `<store>/<owner>/<repo>/build/.releasing` and historical `build/.trash`. The daemon runs this
-/// once at its start: the recovery of releases a crash cut short while no process owned them,
-/// and of the superseded seeds a fork's refresh committed and left. A
-/// project whose directory cannot be drained is said and skipped.
-pub fn drain_store_released(store: &Path) -> Drained {
-    use crate::storage::apfs::release::{JOURNAL_DIRECTORY, drain_store};
-    let mut drained = drain_store(store, IMAGES_DIRECTORY, JOURNAL_DIRECTORY, is_image_name);
-    drained.add(drain_store(
+/// Normal priority, not background (`IOPOL_THROTTLE`): a throttled free holds the container's work
+/// while its own metadata reads wait, so it slows every writer instead of yielding.
+pub fn drain_store_released(store: &Path) -> Pass {
+    drain_store(
         store,
         IMAGES_DIRECTORY,
-        TRASH_DIRECTORY,
+        crate::storage::apfs::release::DELETING_DIRECTORY,
         is_image_name,
-    ));
-    drained
+    )
 }
 
 /// Whether `name` is a build image's file name, `<id>.dmg`.
@@ -1912,7 +1884,7 @@ mod tests {
         drop(kept);
 
         let released = hold_behind_claim(&layout, &id, || {
-            assert!(layout.release_image(&id, Reclaim::Now).unwrap());
+            assert!(layout.release_image(&id).unwrap());
             fs::remove_file(layout.hold_path(&id)).unwrap();
         })
         .unwrap_err();
@@ -1986,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn release_frees_the_image_before_its_owner_record_is_removed() {
+    fn release_commits_the_image_and_frees_nothing_before_its_owner_record_is_removed() {
         let root =
             std::env::temp_dir().join(format!("cowshed-build-unlink-{}", uuid::Uuid::new_v4()));
         let project = ProjectPaths::with_mount_root(
@@ -2001,69 +1973,112 @@ mod tests {
         fs::write(layout.image(&id), vec![7_u8; 64 * 1024]).unwrap();
         fs::write(layout.record(&id), b"retained ownership").unwrap();
 
-        assert!(layout.release_image(&id, Reclaim::Now).unwrap());
-        assert!(!layout.image(&id).exists(), "release physically frees");
-        assert_eq!(
-            fs::read_dir(layout.releasing()).unwrap().count(),
-            0,
-            "the operation finishes its own journal entry before it answers"
-        );
+        assert!(layout.release_image(&id).unwrap());
         assert!(
-            !layout.trash().exists(),
-            "release creates no deferred trash"
+            !layout.image(&id).exists(),
+            "the commit takes the image off its name"
+        );
+        assert_eq!(
+            fs::read(layout.released(&id)).unwrap(),
+            vec![7_u8; 64 * 1024],
+            "the release frees nothing before it answers"
         );
         assert_eq!(fs::read(layout.record(&id)).unwrap(), b"retained ownership");
         assert!(
-            !layout.release_image(&id, Reclaim::Now).unwrap(),
-            "a retry is idempotent"
+            layout.release_image(&id).unwrap(),
+            "a retry answers the commit already made"
+        );
+        fs::remove_file(layout.released(&id)).unwrap();
+        assert!(
+            !layout.release_image(&id).unwrap(),
+            "with no image and no entry, nothing is released"
         );
 
         // A real refusal must preserve the ownership evidence and the image's name.
         fs::create_dir(layout.image(&id)).unwrap();
         fs::write(layout.image(&id).join("held"), b"not a regular image").unwrap();
-        assert!(layout.release_image(&id, Reclaim::Now).is_err());
+        assert!(layout.release_image(&id).is_err());
         assert!(layout.image(&id).join("held").exists());
         assert_eq!(fs::read(layout.record(&id)).unwrap(), b"retained ownership");
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The gateway's startup scan frees every build image a project's deleting directory holds, and
+    /// only build images: a stray is left and named, a link is never followed, and an unreadable
+    /// directory is named rather than reported empty.
     #[test]
-    fn draining_releases_only_build_images() {
+    fn the_store_pass_deletes_only_build_images_in_every_deleting_directory() {
+        use crate::storage::apfs::release::{Drained, Left, Why};
+
         let root =
             std::env::temp_dir().join(format!("cowshed-build-trash-{}", uuid::Uuid::new_v4()));
+        let store = root.join("store");
         let project = ProjectPaths::with_mount_root(
-            root.join("store"),
+            &store,
             root.join("mounts"),
             &RepoId::parse("acme/widget").unwrap(),
         )
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
-        for directory in [layout.trash(), layout.releasing()] {
-            fs::create_dir_all(&directory).unwrap();
+        let directories = [layout.deleting()];
+        let mut strays = Vec::new();
+        for directory in &directories {
+            fs::create_dir_all(directory).unwrap();
             let image = directory.join(format!("{}.dmg", BuildVolumeId::mint()));
             fs::write(&image, vec![7_u8; 64 * 1024]).unwrap();
             let stray = directory.join("notes.txt");
             fs::write(&stray, b"not an image").unwrap();
+            strays.push(Left {
+                path: stray,
+                why: Why::NotImage,
+            });
+        }
+        strays.sort();
 
-            let drained = drain_released(&directory).unwrap();
-            assert_eq!(drained.images, 1);
-            assert!(drained.bytes > 0);
-            assert!(!image.exists());
-            assert!(stray.exists(), "only build images are released");
-            assert_eq!(drain_released(&directory).unwrap(), Drained::default());
-            let refused = directory.join(format!("{}.dmg", BuildVolumeId::mint()));
-            std::os::unix::fs::symlink(&stray, &refused).unwrap();
-            fs::remove_file(&stray).unwrap();
-            // A dangling entry is not a regular image and is never followed or released.
-            assert_eq!(drain_released(&directory).unwrap(), Drained::default());
-            assert!(fs::symlink_metadata(&refused).is_ok());
-            fs::remove_dir_all(&directory).unwrap();
-            fs::write(&directory, b"not a directory").unwrap();
-            assert!(
-                drain_released(&directory).is_err(),
-                "an unreadable directory must refuse, not report nothing to release"
+        let mut pass = drain_store_released(&store);
+        assert_eq!(pass.drained.images, 1, "{pass:?}");
+        assert!(pass.drained.bytes > 0);
+        pass.left.sort();
+        assert_eq!(
+            pass.left, strays,
+            "only build images are freed; a stray is named"
+        );
+        for directory in &directories {
+            assert_eq!(
+                fs::read_dir(directory).unwrap().count(),
+                1,
+                "only the stray stays"
             );
         }
+        assert_eq!(
+            drain_store_released(&store).drained,
+            Drained::default(),
+            "nothing is left to free"
+        );
+
+        // A dangling entry is not a regular image and is never followed or released.
+        let refused = layout.released(&BuildVolumeId::mint());
+        std::os::unix::fs::symlink(&strays[0].path, &refused).unwrap();
+        let pass = drain_store_released(&store);
+        assert_eq!(pass.drained, Drained::default());
+        assert!(
+            pass.left.contains(&Left {
+                path: refused.clone(),
+                why: Why::NotImage
+            }),
+            "{pass:?}"
+        );
+        assert!(fs::symlink_metadata(&refused).is_ok());
+
+        fs::remove_dir_all(layout.deleting()).unwrap();
+        fs::write(layout.deleting(), b"not a directory").unwrap();
+        let pass = drain_store_released(&store);
+        assert!(
+            pass.left
+                .iter()
+                .any(|left| left.path == layout.deleting() && matches!(left.why, Why::Failed(_))),
+            "an unreadable directory is named, not reported as nothing to release: {pass:?}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

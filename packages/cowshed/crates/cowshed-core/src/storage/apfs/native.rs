@@ -52,9 +52,8 @@ use super::super::{
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, COMPANION_SUFFIX, LockMode,
     MarkerExpectation, MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError,
-    ResumableClone, companion_path, extents, layout, main_aware_mount_point,
-    recovery_staging_mount, releasing_image_below, retired_image_below, split_retired_stem,
-    volume_key,
+    ResumableClone, companion_path, deleting_image_below, extents, layout, main_aware_mount_point,
+    recovery_staging_mount, retired_image_below, split_retired_stem, volume_key,
 };
 use cowshed_os::timing::timed;
 use image_telemetry::{Image, ImageTelemetry};
@@ -2801,13 +2800,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(retained)
     }
 
-    /// Free `image`, the retired workspace's canonical or trashed image, through the project's
-    /// release journal (02_workspaces.md, `rm` step 5): one rename to
-    /// `sessions/.releasing/<ws>-<incarnation>.dmg` commits it, so nothing mounts, forks or reads
-    /// it again, then it is freed in bounded steps and unlinked before this returns. Its CA
-    /// companion, facts and grants sidecar stay for [`ApfsExecutionHost::reclaim_image`] to remove
-    /// after it: the record goes only once the bytes are gone. A crash after the rename leaves the
-    /// entry for [`ApfsExecutionHost::recover_pending`] or the daemon's start to finish.
+    /// Release `image`, the retired workspace's canonical or trashed image (02_workspaces.md, `rm`
+    /// step 5): one rename to `sessions/.deleting/<ws>-<incarnation>.dmg` commits it, so nothing
+    /// mounts, forks or reads it again, and this returns once that rename is durable; its deletion
+    /// child, or the gateway's startup scan, frees the bytes (05_gateway.md, "Deleting released
+    /// images"). Its CA companion, facts and grants sidecar are then removed by
+    /// [`ApfsExecutionHost::reclaim_image`]. A crash after the rename leaves the entry, which nothing
+    /// names, for that scan.
     fn release_retired_image(
         &self,
         project: &Path,
@@ -2816,7 +2815,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
         let workspace = authority.workspace();
-        let entry = releasing_image_below(
+        let entry = deleting_image_below(
             &project.join(SESSIONS_DIRECTORY),
             workspace.name(),
             workspace.incarnation(),
@@ -2829,11 +2828,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 after: image,
             }],
             || {
-                super::release::release_owned(image, &entry, super::release::Reclaim::Now)
+                super::release::commit_release(image, &entry)
                     .map_err(|error| io_error("release a retired workspace image", image, error))
             },
         )?;
         if released {
+            self.delete_in_background(&entry)?;
             deletion_log::log_deletion_for_image(
                 image,
                 DeletionOp::ReclaimImage,
@@ -2842,6 +2842,64 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             );
         }
         Ok(())
+    }
+
+    /// Start freeing `entry`, a release this host just committed, in a detached child running the
+    /// program its config names (05_gateway.md, "Deleting released images"). A spawn failure is the
+    /// release's error. A config that names none (a fixture store no test gave a binary) starts
+    /// nothing, says so once, and leaves the entry to the gateway's startup scan.
+    pub(super) fn delete_in_background(&self, entry: &Path) -> Result<(), ApfsStorageError> {
+        match &self.config.deletion_child {
+            Some(program) => super::deleter::delete_in_background(program, entry)
+                .map_err(|error| io_error("start a released image's deletion", entry, error)),
+            None => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    cowshed_os::eprintln!(
+                        "cowshed: this store names no deletion child; its released images wait in .deleting for the gateway's startup scan"
+                    )
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Release `image`, an image file nothing owns any more (a gc orphan, a reclaimed checkpoint, a
+    /// failed restore's staged image), as every release is: one rename into its project's
+    /// `sessions/.deleting` under a fresh name, then its deletion in the background. Answers whether
+    /// an image was there; one outside a project of this store refuses, untouched.
+    fn release_image_file(&self, image: &Path) -> Result<bool, ApfsStorageError> {
+        let outside = || {
+            ApfsStorageError::Host(format!(
+                "{} is not an image of a project in the store {}",
+                image.display(),
+                self.config.store_root.display()
+            ))
+        };
+        let mut parts = image
+            .strip_prefix(&self.config.store_root)
+            .map_err(|_| outside())?
+            .components();
+        let (Some(owner), Some(repo)) = (parts.next(), parts.next()) else {
+            return Err(outside());
+        };
+        let sessions = self
+            .config
+            .store_root
+            .join(owner)
+            .join(repo)
+            .join(SESSIONS_DIRECTORY);
+        let name = WorkspaceName::new("reclaimed")
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let incarnation = WorkspaceIncarnation::new(uuid::Uuid::new_v4().simple().to_string())
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let entry = deleting_image_below(&sessions, &name, &incarnation);
+        let released = super::release::commit_release(image, &entry)
+            .map_err(|error| io_error("release an image nothing owns", image, error))?;
+        if released {
+            self.delete_in_background(&entry)?;
+        }
+        Ok(released)
     }
 
     fn retired_trash_images(&self, trash: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
@@ -3643,8 +3701,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         )? {
                             report.root_held_mountpoints.push(retained);
                         }
-                        report.freed_bytes =
-                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        report.released_bytes =
+                            report.released_bytes.checked_add(candidate.bytes()).ok_or(
                                 ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                             )?;
                     }
@@ -3668,8 +3726,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             }
                         }
                         self.reclaim_image(candidate.path())?;
-                        report.freed_bytes =
-                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        report.released_bytes =
+                            report.released_bytes.checked_add(candidate.bytes()).ok_or(
                                 ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                             )?;
                     }
@@ -3798,8 +3856,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             ));
                         }
                         self.reclaim_image(candidate.path())?;
-                        report.freed_bytes =
-                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        report.released_bytes =
+                            report.released_bytes.checked_add(candidate.bytes()).ok_or(
                                 ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                             )?;
                     }
@@ -3883,8 +3941,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     }
                     StorageGcReason::ExpiredCheckpoint => {
                         self.reclaim_image(candidate.path())?;
-                        report.freed_bytes =
-                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        report.released_bytes =
+                            report.released_bytes.checked_add(candidate.bytes()).ok_or(
                                 ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                             )?;
                     }
@@ -3917,8 +3975,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             candidate.path(),
                         );
                         sync_parent_path(candidate.path())?;
-                        report.freed_bytes =
-                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        report.released_bytes =
+                            report.released_bytes.checked_add(candidate.bytes()).ok_or(
                                 ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                             )?;
                     }
@@ -3944,8 +4002,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             );
                         }
                         sync_parent_path(candidate.path())?;
-                        report.freed_bytes =
-                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        report.released_bytes =
+                            report.released_bytes.checked_add(candidate.bytes()).ok_or(
                                 ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                             )?;
                     }
@@ -5815,7 +5873,7 @@ where
         })?;
         fs::rename(&undo_sidecar, &canonical_sidecar)
             .map_err(|error| io_error("restore displaced metadata", &canonical_sidecar, error))?;
-        self.backend.delete_image(staged)?;
+        self.release_image_file(staged)?;
         Self::remove_sidecar(staged)?;
         Self::remove_companion(staged)?;
         fs::remove_file(&undo_companion)
@@ -5885,7 +5943,7 @@ where
         self.verify_controller_path(image)?;
         match fs::symlink_metadata(image) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                self.backend.delete_image(image)?;
+                self.release_image_file(image)?;
                 deletion_log::log_deletion_for_image(
                     image,
                     DeletionOp::ReclaimImage,
@@ -6043,19 +6101,6 @@ where
             .projects(&config.store_root)?;
         for (project, workspaces) in projects {
             let sessions = project.join(SESSIONS_DIRECTORY);
-            // Image releases a crash cut short after their commit are nobody's any more: finished
-            // before a canonical sidecar their rename left imageless is read below.
-            let journal = sessions.join(super::release::JOURNAL_DIRECTORY);
-            super::release::drain(&journal, super::is_releasing_image_name, |name| {
-                // A confined pass finishes only its own workspaces' releases, as it does their
-                // stages: a sibling's entry is neither read nor waited for.
-                workspaces.as_ref().is_none_or(|workspaces| {
-                    name.strip_suffix(&format!(".{IMAGE_EXTENSION}"))
-                        .and_then(split_retired_stem)
-                        .is_some_and(|(workspace, _)| workspaces.contains(&workspace))
-                })
-            })
-            .map_err(|error| io_error("finish committed image releases", &journal, error))?;
             for directory in [project.as_path(), sessions.as_path()] {
                 for canonical_sidecar in
                     canonical_recovery_sidecars(directory, &project, workspaces.as_ref())?
@@ -6380,7 +6425,7 @@ where
                     }
                     if undo.exists() {
                         if staged.exists() {
-                            self.backend.delete_image(&staged)?;
+                            self.release_image_file(&staged)?;
                         }
                     } else if staged.exists() {
                         let displaced_companion =
@@ -6534,7 +6579,7 @@ where
                 }
 
                 if staged.exists() {
-                    self.backend.delete_image(&staged)?;
+                    self.release_image_file(&staged)?;
                 }
                 Self::remove_sidecar(&staged)?;
                 Self::remove_companion(&staged)?;

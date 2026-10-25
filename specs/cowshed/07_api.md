@@ -894,10 +894,11 @@ workspace-ref or project-discovery capability serves it. Rust `Coordinator::rese
 `reseed(workspace, from, dryRun)` use the same operation and result.
 
 `ReseedResult` is the named core DTO with `workspace`, `from`, `previousVolume`, `seed`, optional `replacementVolume`,
-`previousBytes`, `replacementBytes`, `freedBytes`, and `dryRun`. Preview omits `replacementVolume`, observes the old
-allocated image bytes, estimates replacement bytes from the seed and frees zero. Execution reports the actual new image
-allocation and removed old image allocation. These counts use GC allocation accounting, not unique physical bytes; APFS
-shared extents mean neither the counts nor their signed difference promise physical free space.
+`previousBytes`, `replacementBytes`, `releasedBytes`, and `dryRun`. Preview omits `replacementVolume`, observes the old
+allocated image bytes, estimates replacement bytes from the seed and releases nothing. Execution reports the actual new
+image allocation and removed old image allocation. These counts use GC allocation accounting, not unique physical bytes;
+APFS shared extents mean neither the counts nor their signed difference promise physical free space, and the release of
+the old image only commits it: a background deletion frees it later (16_build_volumes.md, "Garbage collection").
 
 The operation discards only live build-volume contents and atomically replaces the excluded `.cowshed/build` link.
 Source files, HEAD, index, dirty and untracked files remain untouched. Missing incremental work rebuilds cold. Only the
@@ -1544,11 +1545,15 @@ supervisor that ran the job retires.
   `"info" | "warning" | "error"`. `GcCandidate = { identity: Sha256Digest, path, bytes, reason }`, where reason is the
   closed
   `retiredWorkspace | orphanSessionImage | orphanStagingImage | orphanStagingMetadata | orphanStagingMount | orphanMountpoint | expiredCheckpoint | abandonedBundle`
-  enum. `GcReport = { examined, reclaimed, retainedPinned, retainedActive, freedBytes, dryRun, candidates, deferred }`.
-  `deferred` contains `{ path, diagnostic }` for each candidate this run left behind; one deferral does not stop later
-  candidates. Dry-run candidates are the exact immutable substrate plan and never mutable handles; execution revalidates
-  the plan under the same sweep options before the first effect. `abandonedBundle` names a regular recovery bundle in
-  `sessions/.trash` only when `GcOptions.abandoned` is explicitly true; a default sweep never names or reclaims one.
+  enum.
+  `GcReport = { examined, reclaimed, retainedPinned, retainedActive, releasedBytes, dryRun, candidates, deferred }`.
+  `reclaimed` counts the candidates the run collected and `releasedBytes` the allocated bytes of the images among them
+  that it released for deletion; their background deletions free the space after the report (05_gateway.md, "Deleting
+  released images"). `deferred` contains `{ path, diagnostic }` for each candidate this run left behind; one deferral
+  does not stop later candidates. Dry-run candidates are the exact immutable substrate plan and never mutable handles;
+  execution revalidates the plan under the same sweep options before the first effect. `abandonedBundle` names a regular
+  recovery bundle in `sessions/.trash` only when `GcOptions.abandoned` is explicitly true; a default sweep never names
+  or reclaims one.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, resources?, containment?, outlived?, outlivedIncomplete?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.

@@ -2082,7 +2082,7 @@ where
                 output.success(report.clone()).map_err(output_error)?;
             } else {
                 output
-                    .bare_line(report.freed_bytes.to_string().as_bytes())
+                    .bare_line(report.released_bytes.to_string().as_bytes())
                     .map_err(output_error)?;
             }
             if report.dry_run {
@@ -2098,7 +2098,7 @@ where
                         report.examined,
                         report.candidates.len(),
                         candidate_noun,
-                        report.freed_bytes
+                        report.released_bytes
                     ))
                     .map_err(output_error)?;
             }
@@ -2215,7 +2215,7 @@ where
                 output
                     .guidance(&format!(
                         "repair examined {} objects; reclaimed {}, {} bytes freed, {} retained for a running operation",
-                        swept.examined, swept.reclaimed, swept.freed_bytes, swept.retained_active
+                        swept.examined, swept.reclaimed, swept.released_bytes, swept.retained_active
                     ))
                     .map_err(output_error)?;
             }
@@ -3118,8 +3118,7 @@ async fn attach_project_sessions_from_store(
 ) -> Result<Vec<WorkspaceInfo>> {
     let layout = StorageLayout::new(storage.store(), &project.repo_id)
         .map_err(attach_store_storage_error)?;
-    let config =
-        ApfsSubstrateConfig::new(storage.namespace(), storage.store(), &project.project_root);
+    let config = ApfsSubstrateConfig::for_storage(storage, &project.project_root);
     let host =
         MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config.clone())
             .map_err(attach_store_storage_error)?;
@@ -3320,8 +3319,7 @@ async fn detach_project_sessions_from_store(
     storage: &ValidatedHostStorage,
     project: &AdoptedProject,
 ) -> Result<usize> {
-    let config =
-        ApfsSubstrateConfig::new(storage.namespace(), storage.store(), &project.project_root);
+    let config = ApfsSubstrateConfig::for_storage(storage, &project.project_root);
     let host =
         MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config.clone())
             .map_err(detach_store_storage_error)?;
@@ -3589,7 +3587,7 @@ fn emit_reseed_result<W: Write, E: Write>(
                 result.seed,
                 result.previous_bytes,
                 result.replacement_bytes,
-                result.freed_bytes,
+                result.released_bytes,
             ))
             .map_err(output_error)?;
     }
@@ -3607,7 +3605,7 @@ fn emit_reseed_result<W: Write, E: Write>(
         output.success(result).map_err(output_error)
     } else {
         output
-            .bare_line(result.freed_bytes.to_string().as_bytes())
+            .bare_line(result.released_bytes.to_string().as_bytes())
             .map_err(output_error)
     }
 }
@@ -5646,7 +5644,7 @@ mod tests {
                         replacement_volume: (!dry_run).then(|| "replacement-volume".into()),
                         previous_bytes: 128,
                         replacement_bytes: 256,
-                        freed_bytes: if dry_run { 0 } else { 128 },
+                        released_bytes: if dry_run { 0 } else { 128 },
                         dry_run,
                     };
                     let expected = result.clone();

@@ -1,0 +1,211 @@
+//! Deleting released images (05_gateway.md, "Deleting released images").
+//!
+//! A verb releases an image by renaming it into a `.deleting` directory ([`super::release`]),
+//! then starts its deletion in the background ([`delete_in_background`]) and returns: a detached
+//! child of the cowshed process frees that one entry in bounded steps ([`dispatch`]). Should the
+//! child die, or never start, the gateway's startup pass ([`startup_pass`]) finishes the entry.
+//! Nothing polls and nothing is queued.
+
+use std::io;
+use std::os::unix::process::CommandExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use cowshed_os::fork_lock::Spawn as _;
+
+use super::release::{DELETING_DIRECTORY, Pass, Released, drain, free_committed};
+
+/// `<store>/.deleting`: where a project's final unbinding moves the released images its tree still
+/// holds, so the tree goes at once and they are freed by their deletion children or the startup
+/// scan. Entries are named `<fresh id>.dmg` ([`crate::build_volume::BuildVolumeId`]).
+pub fn store_deleting(store: &Path) -> PathBuf {
+    store.join(DELETING_DIRECTORY)
+}
+
+/// The argument a deletion child is started with, before the entry it frees.
+pub const DELETE_VERB: &str = "__delete-released";
+
+/// Run as the deletion child when the arguments say so, before anything else starts: free the
+/// one entry named and answer the exit status. `None` when this process is not one.
+pub fn dispatch() -> Option<i32> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next()? != DELETE_VERB {
+        return None;
+    }
+    let (Some(entry), None) = (arguments.next(), arguments.next()) else {
+        cowshed_os::eprintln!("cowshed: {DELETE_VERB} takes exactly one released image");
+        return Some(2);
+    };
+    Some(if delete(Path::new(&entry)) { 0 } else { 1 })
+}
+
+/// Free `entry`, saying a failure; the entry then stays for the gateway's next start.
+fn delete(entry: &Path) -> bool {
+    match free_committed(entry) {
+        Ok(Released::Freed { .. } | Released::Absent | Released::Busy) => true,
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: released image {} stays for the gateway's next start: {error}",
+                entry.display()
+            );
+            false
+        }
+    }
+}
+
+/// Start freeing `entry`, a release this process just committed, and return at once. The
+/// deletion runs in a detached child, `<program> __delete-released <entry>` (its own process
+/// group, so the verb's terminal signals do not reach it), that outlives this process. A child
+/// that cannot start is the release's error; one that ends badly is said, and the gateway's next
+/// start frees what it left.
+pub fn delete_in_background(program: &Path, entry: &Path) -> io::Result<()> {
+    let mut child = Command::new(program)
+        .arg(DELETE_VERB)
+        .arg(entry)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .process_group(0)
+        .spawn_locked()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot start {} to delete released image {}: {error}",
+                    program.display(),
+                    entry.display()
+                ),
+            )
+        })?;
+    // Reaped here while this process lives, a bad end said; reparented to launchd once this
+    // process exits.
+    let entry = entry.to_owned();
+    std::thread::Builder::new()
+        .name("image-deleter-reaper".to_owned())
+        .spawn(move || match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => cowshed_os::eprintln!(
+                "cowshed: the deletion child of released image {} ended {status}; the gateway's next start frees what it left",
+                entry.display()
+            ),
+            Err(error) => cowshed_os::eprintln!(
+                "cowshed: the deletion child of released image {} cannot be reaped: {error}",
+                entry.display()
+            ),
+        })?;
+    Ok(())
+}
+
+/// The gateway's startup scan of the store at `store`: every project's `build/.deleting` and
+/// `sessions/.deleting` (archived projects under `.retired-projects/` included) and the store's own
+/// `.deleting`. It finishes whatever a deletion child left (it died, or never started); an entry
+/// another process holds is left to it.
+pub fn startup_pass(store: &Path) -> Pass {
+    let mut pass = crate::build_volume::drain_store_released(store);
+    pass.add(super::drain_store_session_releases(store));
+    let deleting = store_deleting(store);
+    match drain(&deleting, crate::build_volume::is_image_name) {
+        Ok(store_level) => pass.add(store_level),
+        Err(error) => pass.left.push(super::release::Left {
+            path: deleting,
+            why: super::release::Why::Failed(error.to_string()),
+        }),
+    }
+    pass
+}
+
+/// What the startup pass says: what it freed, and each entry or directory it left.
+pub fn startup_report(pass: &Pass) -> Vec<String> {
+    let freed = (pass.drained.images > 0).then(|| {
+        format!(
+            "cowshed: deleted {} released image(s), {} bytes, left from before this gateway",
+            pass.drained.images, pass.drained.bytes
+        )
+    });
+    freed
+        .into_iter()
+        .chain(pass.left.iter().map(|left| format!("cowshed: {left}")))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn store(label: &str) -> PathBuf {
+        let root = PathBuf::from(format!(
+            "/private/tmp/csdel-{label}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        fs::create_dir_all(&root).expect("store");
+        root
+    }
+
+    fn released(path: &Path) {
+        fs::create_dir_all(path.parent().expect("deleting directory")).expect("directory");
+        fs::write(path, vec![7_u8; 64 * 1024]).expect("released image");
+    }
+
+    fn volume(store: &Path) -> PathBuf {
+        store.join(format!(
+            "acme/widget/build/.deleting/{}.dmg",
+            crate::build_volume::BuildVolumeId::mint()
+        ))
+    }
+
+    /// The startup pass finishes every release left from before the gateway, in every project's,
+    /// every archived project's and the store's own deleting directory, names a stray, and leaves a
+    /// legacy `.releasing` alone; an owner marker is no project.
+    #[test]
+    fn the_startup_pass_frees_every_leftover() {
+        let store = store("startup");
+        let left = [
+            volume(&store),
+            store.join(format!(
+                ".deleting/{}.dmg",
+                crate::build_volume::BuildVolumeId::mint()
+            )),
+            store.join(format!(
+                "acme/widget/sessions/.deleting/topic-{}.dmg",
+                "1".repeat(32)
+            )),
+            store.join(format!(
+                ".retired-projects/0123/build/.deleting/{}.dmg",
+                crate::build_volume::BuildVolumeId::mint()
+            )),
+        ];
+        for entry in &left {
+            released(entry);
+        }
+        let stray = store.join("acme/widget/sessions/.deleting/notes.txt");
+        fs::write(&stray, b"not an image").expect("stray");
+        fs::write(store.join("acme/.cowshed-owner"), b"owner").expect("owner marker");
+        fs::write(store.join(".retired-projects/0123.json"), b"{}").expect("archive record");
+        let legacy = store.join(format!(
+            "acme/widget/build/.releasing/{}.dmg",
+            crate::build_volume::BuildVolumeId::mint()
+        ));
+        released(&legacy);
+
+        let pass = startup_pass(&store);
+        assert_eq!(pass.drained.images, left.len(), "{pass:?}");
+        assert!(left.iter().all(|entry| !entry.exists()));
+        assert!(legacy.exists(), "no legacy directory is scanned");
+        assert_eq!(
+            startup_report(&pass),
+            vec![
+                format!(
+                    "cowshed: deleted {} released image(s), {} bytes, left from before this gateway",
+                    left.len(),
+                    pass.drained.bytes
+                ),
+                format!(
+                    "cowshed: {} is not a released image; it is left",
+                    stray.display()
+                ),
+            ]
+        );
+        fs::remove_dir_all(&store).expect("cleanup");
+    }
+}

@@ -1083,15 +1083,33 @@ impl DirectoryExecutionHost {
         }
     }
 
-    /// Delete a payload inside the store, unmounting it first if it is mounted: the mount
-    /// record goes back to being the payload directory, which is then removed. Its records stay
-    /// for the caller.
+    /// Release a payload inside the store as every release is (05_gateway.md, "Deleting released
+    /// images"): unmount it if it is mounted (the mount record goes back to being the payload
+    /// directory), rename it into its project's `sessions/.deleting` under a name no other entry
+    /// has. Nothing is deleted: a directory store starts no deletion child (said once per process),
+    /// and a released payload stays in `.deleting`, named by nothing, until its test store goes.
+    /// Its records stay for the caller.
     fn delete_payload(&self, image: &Path) -> Result<bool, ApfsStorageError> {
         self.require_store_image(image)?;
         match fs::symlink_metadata(image) {
             Ok(metadata) if metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
                 release_mount(image, DetachIntent::Release)?;
-                remove_payload_tree(image)?;
+                let entry = self.deleting_entry(image)?;
+                let deleting = entry
+                    .parent()
+                    .expect("an entry lies in its deleting directory");
+                fs::create_dir_all(deleting)
+                    .map_err(|error| io_error("create the deleting directory", deleting, error))?;
+                fs::rename(image, &entry)
+                    .map_err(|error| io_error("release a payload to .deleting", image, error))?;
+                sync_parent_path(image)?;
+                sync_parent_path(&entry)?;
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    cowshed_os::eprintln!(
+                        "cowshed: a directory store starts no deletion child; its released payloads wait in .deleting"
+                    )
+                });
                 Ok(true)
             }
             Ok(_) => Err(ApfsStorageError::Host(format!(
@@ -1101,6 +1119,39 @@ impl DirectoryExecutionHost {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error("inspect payload", image, error)),
         }
+    }
+
+    /// `<project>/sessions/.deleting/reclaimed-<fresh incarnation>.dmg` for a payload of a project
+    /// in this store: a name no other entry has.
+    fn deleting_entry(&self, image: &Path) -> Result<PathBuf, ApfsStorageError> {
+        let store = &self.config().store_root;
+        let outside = || {
+            ApfsStorageError::Host(format!(
+                "{} is not a payload of a project in the store {}",
+                image.display(),
+                store.display()
+            ))
+        };
+        let mut parts = image
+            .strip_prefix(store)
+            .map_err(|_| outside())?
+            .components();
+        let (Some(owner), Some(repo)) = (parts.next(), parts.next()) else {
+            return Err(outside());
+        };
+        let name = crate::metadata::WorkspaceName::new("reclaimed")
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let incarnation =
+            crate::metadata::WorkspaceIncarnation::new(uuid::Uuid::new_v4().simple().to_string())
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        Ok(super::apfs::deleting_image_below(
+            &store
+                .join(owner)
+                .join(repo)
+                .join(crate::repository::SESSIONS_DIRECTORY),
+            &name,
+            &incarnation,
+        ))
     }
 
     fn checkpoint_label(image: &Path) -> Result<&str, ApfsStorageError> {

@@ -1148,7 +1148,7 @@ impl ProjectRuntimeHost for FakeHost {
             reclaimed: 0,
             retained_pinned: 0,
             retained_active: 0,
-            freed_bytes: 0,
+            released_bytes: 0,
             dry_run: options.dry_run,
             candidates: Vec::new(),
             deferred: Vec::new(),

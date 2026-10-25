@@ -158,16 +158,8 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         &self,
         layout: &BuildVolumeLayout,
         claim: ReleaseClaim,
-        reclaim: crate::storage::apfs::release::Reclaim,
     ) -> Result<Option<BuildVolumeRefusal>, ApfsStorageError> {
-        DirectoryExecutionHost::release_claimed(self, layout, claim, reclaim)
-    }
-
-    fn finish_build_releases(
-        &self,
-        layout: &BuildVolumeLayout,
-    ) -> Result<crate::storage::apfs::release::Drained, ApfsStorageError> {
-        DirectoryExecutionHost::finish_build_releases(self, layout)
+        DirectoryExecutionHost::release_claimed(self, layout, claim)
     }
 
     fn build_volume_capacity(

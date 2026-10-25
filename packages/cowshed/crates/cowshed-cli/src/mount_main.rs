@@ -212,11 +212,7 @@ impl MainMountBackend for NativeMainMountBackend {
             .await?;
             runtime.shutdown().await?;
         }
-        let config = ApfsSubstrateConfig::new(
-            self.storage.namespace(),
-            self.storage.store(),
-            &resolved.checkout_path,
-        );
+        let config = ApfsSubstrateConfig::for_storage(&self.storage, &resolved.checkout_path);
         let host =
             MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config.clone())
                 .map_err(storage_error)?;

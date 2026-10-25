@@ -1431,32 +1431,21 @@ async fn refuse_restart_while_busy(
     }
 }
 
-/// Finish, once, at the daemon's start, on a thread of its own, every image release no process
-/// owns any more (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5):
-/// each project's `build/.releasing` and `sessions/.releasing` entries a crash cut short after
-/// their operation committed them, the superseded seeds a fork's refresh committed to
-/// `build/.releasing` without freeing them, and the `build/.trash` earlier builds renamed images
-/// into. Each image is released in bounded steps at normal disk priority, so no free stalls the
-/// store's container, and an interrupted release resumes from the image's length. Between starts
-/// a project finishes its own the same way: its next lifecycle open its `sessions/.releasing`,
-/// and its next `rm` retirement, land release or `cowshed gc` its `build/.releasing`.
-fn finish_interrupted_releases(store: PathBuf) {
+/// Finish, once, on a thread of its own, every released image the store's deleting directories
+/// still hold when the gateway starts (05_gateway.md, "Deleting released images"): those whose
+/// deletion child died or never started, and those earlier builds left. Nothing runs after it.
+fn finish_released_images_at_start(store: PathBuf) {
     let started = std::thread::Builder::new()
-        .name("image-release-recovery".to_owned())
+        .name("image-deleter".to_owned())
         .spawn(move || {
-            let mut drained = cowshed_core::build_volume::drain_store_released(&store);
-            drained.add(cowshed_core::storage::apfs::drain_store_session_releases(&store));
-            if drained.images > 0 {
-                cowshed_os::eprintln!(
-                    "cowshed: finished releasing {} image(s), {} bytes, that an interrupted operation or an earlier build left",
-                    drained.images,
-                    drained.bytes
-                );
+            let pass = cowshed_core::storage::apfs::deleter::startup_pass(&store);
+            for line in cowshed_core::storage::apfs::deleter::startup_report(&pass) {
+                cowshed_os::eprintln!("{line}");
             }
         });
     if let Err(error) = started {
         cowshed_os::eprintln!(
-            "cowshed: committed image releases are not finished by this daemon ({error}); each project's next open finishes its sessions entries, and its next rm, land or `cowshed gc` its build entries"
+            "cowshed: released images left in each project's build/.deleting and sessions/.deleting are not finished by this gateway: {error}"
         );
     }
 }
@@ -1583,11 +1572,12 @@ async fn run_daemon() -> Result<()> {
     // Detached and concurrent: each recovery reports its own span, status counts what is left,
     // and nothing below waits for it.
     drop(recovery.start(Arc::new(SocketPeers)));
-    finish_interrupted_releases(store_root.clone());
     reap_scratch_from_now_on(store_root.clone());
     let handle = OwnedGateway::new(gateway.handle());
     let started = async {
         serve_supervisors(&store_root, manager).await?;
+        // Both host sockets serve before the startup scan of released images begins.
+        finish_released_images_at_start(store_root.clone());
         // Both host sockets are serving before storage recovery can wait on an owned process.
         // Only pre-existing positive authorizations resume; a refusal leaves that project
         // fenced and cannot prevent unrelated projects from healing.

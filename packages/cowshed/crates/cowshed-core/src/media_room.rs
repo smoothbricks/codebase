@@ -546,8 +546,7 @@ mod native {
         mounted: &std::collections::BTreeSet<std::path::PathBuf>,
     ) -> std::result::Result<(Project, Vec<(Candidate<Key>, Attached)>), String> {
         let text = |error: &dyn Display| error.to_string();
-        let config =
-            ApfsSubstrateConfig::new(storage.namespace(), storage.store(), &repo.project_root);
+        let config = ApfsSubstrateConfig::for_storage(storage, &repo.project_root);
         let substrate = ApfsSubstrate::new(
             config.clone(),
             Host::new(SystemCommandRunner::new(config.namespace), config.clone())

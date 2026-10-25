@@ -495,7 +495,7 @@ fn project_substrate_config(
     storage: &ValidatedHostStorage,
     checkout_path: PathBuf,
 ) -> ApfsSubstrateConfig {
-    ApfsSubstrateConfig::new(storage.namespace(), storage.store(), checkout_path)
+    ApfsSubstrateConfig::for_storage(storage, checkout_path)
 }
 
 /// One project's mount side, opened once and mounting nothing on its own.
@@ -4643,6 +4643,7 @@ mod tests {
         let error = crate::runtime::project::finish_restored_project_unbinding(
             layout.project(),
             &binding,
+            None,
             &mut |step| {
                 if step == crate::runtime::project::UnbindCheckpoint::BindingRemoved {
                     return Err(crate::CowshedError::internal(
@@ -4709,6 +4710,7 @@ mod tests {
         crate::runtime::project::finish_restored_project_unbinding(
             layout.project(),
             &binding,
+            None,
             &mut |_| Ok(()),
         )
         .unwrap();

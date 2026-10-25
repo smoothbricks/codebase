@@ -148,17 +148,18 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Foreign-session isolation and atomic retirement**: directory-backed fixtures keep sibling grants missing or corrupt
   while the selected workspace remains inspectable and reconciles without evicting sibling gateway sessions. The
   controller admits and observes 100 live jobs while project enumeration refuses its foreign inventory fault. Retirement
-  fixtures prove clean landed sources physically disappear before the removal reply without a trash rename, a real
-  immutable-file unlink refusal preserves source grants/CA authority, and dirty, unlanded and only-copy ignored content
-  survives in its live or recovery image, even after the recovery sidecar is removed and startup/GC runs again.
-  Cancellation and post-unlink crash replay retain the mutating intent until physical release finishes; recovery-image
-  rename fixtures still require complete grants/CA at commit. The directory cutover runs the real controller and gateway
-  with corrupt/missing sibling grants, named mount/marker fences and held-lock recovery, plus prepared-retirement retry
-  and post-commit recovery. Cold named and removal opens ignore broken sibling sidecars, preserve session-origin
-  validation, and still refuse selected corruption; full Store/Inspect opens and project enumeration retain their
-  malformed-inventory refusals. Ordinary worker and trusted Gate exec share the core scoped preparation boundary. A
-  fixture restarting a bare gateway explicitly restores project sessions through maintenance before work; job admission
-  never repairs port allocation. These witnesses acquire no physical disk-image capability.
+  fixtures prove clean landed sources are committed to `sessions/.deleting` before the removal reply, none to the
+  recovery trash and no byte of one freed by the removal, a real immutable-file refusal of that release preserves source
+  grants/CA authority, and dirty, unlanded and only-copy ignored content survives in its live or recovery image, even
+  after the recovery sidecar is removed and startup/GC runs again. Cancellation and post-rename crash replay retain the
+  mutating intent until the release's owner metadata is removed; recovery-image rename fixtures still require complete
+  grants/CA at commit. The directory cutover runs the real controller and gateway with corrupt/missing sibling grants,
+  named mount/marker fences and held-lock recovery, plus prepared-retirement retry and post-commit recovery. Cold named
+  and removal opens ignore broken sibling sidecars, preserve session-origin validation, and still refuse selected
+  corruption; full Store/Inspect opens and project enumeration retain their malformed-inventory refusals. Ordinary
+  worker and trusted Gate exec share the core scoped preparation boundary. A fixture restarting a bare gateway
+  explicitly restores project sessions through maintenance before work; job admission never repairs port allocation.
+  These witnesses acquire no physical disk-image capability.
 - **MCP capability/auth codecs**: coordinator authority can be read only from the designated inherited FD/socketpair and
   never argv/environment/stderr; worker descriptors are 256-bit, 30-second, one-use, memory-only, atomic-consume,
   restart-invalidated, workspace/socket/peer-bound. Missing, expired, replayed, mismatched, or insufficient authority
@@ -465,21 +466,42 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   enumeration never returns one — the "derived state" promise holds under partial writes.
 - **Idempotent recovery/gc**: replaying a crash-recovery or `gc` pass over any generated interrupted-state fixture
   converges to the same result as running it once (crash points from the adopt/new/rm recovery tables, 02).
-- **Bounded image release** (16_build_volumes.md, "Garbage collection"): over generated run layouts and step bounds,
-  every cut shortens the file and frees at most one step of runs, the cuts end at zero and free every run exactly once
-  in as few cuts as the bound allows, and a release resumed after any cut plans exactly the cuts left. Its real boundary
-  is a fragmented file on the host's filesystem, cut a few steps, abandoned, and finished by a second release that
-  counts only what was left. The release journal's crash point is witnessed the same way: an image committed to
-  `.releasing/`, cut once and abandoned is finished by the journal's recovery drain and by its owner's retry, and a
-  workspace image left so is finished by project recovery, which then reconciles the record its rename left imageless. A
-  journaled release returns with its entry whole and unlocked, and a drain finishes it; a directory store's seed refresh
-  whose superseded seed a process holds publishes the new seed and answers with the old tree committed whole, and the
-  journal's finisher leaves that tree while it is held and deletes it once it is not. An unsynced native entry held by
-  another releaser still requires all rename syncs before a journaled retry answers. Directory regressions replace the
-  journal pathname after acquisition: neither retry confirmation nor the drain may follow the foreign tree. The drain
-  syncs both held directories while the unsynced entry is still intact, then deletes through those descriptors; a
-  replaced opened child and foreign symlink targets remain untouched. A real self-held payload stays, but the drain's
-  own observation does not retain it.
+- **Bounded image release** (16_build_volumes.md, "Garbage collection"; 05_gateway.md, "Deleting released images"): over
+  generated run layouts and step bounds, every cut shortens the file and frees at most one step of runs, the cuts end at
+  zero and free every run exactly once in as few cuts as the bound allows, and a release resumed after any cut plans
+  exactly the cuts left. Its real boundary is a fragmented file on the host's filesystem, cut a few steps, abandoned,
+  and finished by a second release that counts only what was left. The deleting directory's crash points are witnessed
+  the same way. A release returns with its entry whole and unlocked and frees nothing, whatever it releases (a build
+  volume, a removed workspace's image, an orphan session or staging image, an expired checkpoint, a failed restore's
+  staged clone) and whether or not its store names a child: the image is off its name, every byte waits in `.deleting`,
+  and a retry finds the commit already made, makes its rename durable and answers. A link in place of the deleting
+  directory refuses. A directory store's release of a tree a process holds anything inside answers with the tree
+  committed whole to its `.deleting` directory, deletes nothing and starts no child, and `finish_build_releases` leaves
+  a build-volume tree while it is held and deletes it once it is not. An unsynced native entry still requires all rename
+  syncs before its owner's retry answers. Directory regressions replace the deleting directory's pathname after
+  acquisition: neither retry confirmation nor the finisher may follow the foreign tree. The finisher syncs both held
+  directories while the unsynced entry is still intact, then deletes through those descriptors; a replaced opened child
+  and foreign symlink targets remain untouched. A real self-held payload stays, but the finisher's own observation does
+  not retain it.
+- **Released images are deleted in the background and swept at the gateway's start** (05_gateway.md, "Deleting released
+  images"). A release through a store naming no child (a function call over a fixture store without a binary) returns
+  with its entry whole in `.deleting` and says so once per process. The deletion child is one real `__delete-released`
+  process of a built binary (a cowshed-cli test passes `CARGO_BIN_EXE_cowshed` to its fixture store; a core test has
+  none), started once over a planted entry and shared as a fixture: it waits out a process that holds the entry's lock,
+  its stderr holder line being the event the test waits for, frees the entry once that process lets go, refuses a link
+  untouched, and has a usage error given no entry. The wait names its holder: a function call passing a 1 ms bound waits
+  behind a held entry and its stderr lines are read from a channel, never slept for, naming the holder, read afresh at
+  each bound, until the holder lets go. The startup scan frees leftovers: a function call over a scratch store with
+  released images planted in each project's `build/.deleting` and `sessions/.deleting`, in an archived project's
+  (`.retired-projects/<operation-id>/build/.deleting` and `…/sessions/.deleting`) and in the store's own `.deleting`,
+  workspace and build images alike, frees them in one pass, leaves a legacy `.releasing` alone, names each stray, each
+  entry another process holds and each unreadable directory, leaves every other file of an archive untouched, skips the
+  receipt files beside the archives, and syncs nothing when it leaves only strays; a deletion that stops after its first
+  cut is finished by the next scan from the file's length. The unbinding moves each released image of its project into
+  `<store>/.deleting` and frees none, a child that holds one moving with it. The gateway thread is only the scan's
+  caller, so no witness starts a gateway. A workspace image left in `sessions/.deleting` does not delay project
+  recovery, which reconciles the record its rename left imageless without waiting for the image; the startup scan frees
+  it.
 - **A supervisor's opening finishes nothing and waits for no image lock** (07_api.md, "Authority model"): for any
   generated workspace and probe name, a `Supervisor` opening observes what a `Workspaces` opening naming that one
   workspace observes, replays no intent, selects no rename and has no retirement target; over generated scopes it and
@@ -1085,9 +1107,10 @@ Covered flows:
   canonical-flag remount, 01a_apfs.md), stub `.envrc`;
 - lazy volume creation at adopt: the store volume created idempotently before the first image;
 - rm-while-busy (open file handle → grace → force detach);
-- gc: trash drain, checkpoint pruning, orphan mountpoint removal; real root-owned `0700` event-log debris on an
-  unmounted directory is retained by a no-replace, same-parent rename, never blocks image reclamation or healthy doctor
-  info, and mixed work, symlink substitutions, collisions and mounted filesystems remain protected;
+- gc: release of retired trash, orphan session and staging images and expired checkpoints for background deletion,
+  orphan mountpoint removal; real root-owned `0700` event-log debris on an unmounted directory is retained by a
+  no-replace, same-parent rename, never blocks image reclamation or healthy doctor info, and mixed work, symlink
+  substitutions, collisions and mounted filesystems remain protected;
 - gateway: mirror hit/miss against a local fixture registry, token→policy mapping, 403 hint body, audit records, CONNECT
   allow/deny, `repo mirror` fetch into a read-only bare mirror;
 - **Linux connector end to end**: for an attached workspace, assert exactly one connector exists in its private netns,
@@ -1215,7 +1238,7 @@ registration.
 | Operation                        | Budget (median, local)  | Basis                                                                                          |
 | -------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------- |
 | `cowshed fork` cold              | ≤ 1 s                   | clonefile + first write + attach + `fsck_apfs -q` + `mount_apfs`                               |
-| `cowshed rm` complete retirement | No measured bound       | required detach and physical image unlink finish before success; no background deletion credit |
+| `cowshed rm` complete retirement | No measured bound       | detach and the release's rename finish before success; a background child frees it, off-budget |
 | `cowshed checkpoint`             | ≤ 1 s                   | descriptor-clone path                                                                          |
 | `cowshed path` / `ls`            | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design                                   |
 | exec sandbox overhead            | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                                              |

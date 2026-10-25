@@ -1653,7 +1653,10 @@ mounts are restored. In order:
 2. Take the workspace listeners an install carried across the restart ("An install never refuses a client connection"),
    before anything binds. Then count the recorded projects and list the workspace supervisors still serving from before
    this daemon, then serve: the control socket and the supervisor manager answer from the first moment. Status answers
-   throughout, and so do the audit, mirror, and simulator requests, none of which reads a workspace mount.
+   throughout, and so do the audit, mirror, and simulator requests, none of which reads a workspace mount. Once it
+   serves, the daemon starts the `image-deleter` thread, which makes one pass over the released images a crash or a
+   failed deletion left, and ends ("Deleting released images", below). It reads no mount and waits for neither step 3
+   nor step 4.
 3. Eagerly heal every recorded project's main: attached and mounted at its checkout path. Each step is a lifecycle span
    of its own — `startup-heal discover`, `startup-heal open <repo>`, `startup-heal mount <repo>/main` — so a slow pass
    reads as the step that spent the time. Session workspaces are not attached by the pass: a session the kernel still
@@ -1717,6 +1720,72 @@ attestation friction to automount that cowshed cannot satisfy without further pr
 second mount pathway that every existing invariant — kernel mount facts, marker validation, flag canonicalization,
 crash-window classification — would have to be reconciled against, for mounts cowshed did not perform and cannot fence.
 One mount pathway cowshed owns end to end is worth more than the eager pass it would save.
+
+## Deleting released images
+
+A released image is deleted in the background by a process the releasing verb starts, and the gateway's startup scan
+finishes what that process did not. Every image a cowshed operation removes is released, never unlinked by the verb: a
+retirement (`rm`), the volume and seed a land or a `reseed` replaces, a superseded volume a job's end releases, a fork's
+seed refresh, the staged clone a failed creation or restore leaves, a staged copy a re-adoption leaves, and what `gc`
+collects (a retired workspace's trash, an orphan session or staging image, an expired checkpoint). The operation commits
+the release with one `rename(2)` of the detached image, never replacing a file, into a `.deleting` directory beside it:
+`build/.deleting/<id>.dmg` for a build volume, and for any other image of the project `sessions/.deleting/`, a removed
+workspace's as `<ws>-<incarnation>.dmg` and any other as `reclaimed-<fresh 32-hex>.dmg`. It syncs the directories it
+touched (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5). The image is `flock`ed before the
+rename and through its syncs, so no deletion cuts an entry before its rename is durable. No verb frees the bytes itself,
+because a verb that frees holds its turn and its locks, a land its land turn and an `rm` its workspace's locks, for as
+long as the free takes.
+
+- **A background child, started once the rename is durable.** The releasing process starts the deletion in the
+  background and returns without waiting: it spawns itself, the running executable (`std::env::current_exe()`, which the
+  host store's roots carry), as `<exe> __delete-released <entry>`, detached in its own process group, with stdin and
+  stdout null and stderr inherited. Nothing looks `cowshed` up on PATH: the CLI, the gateway and the supervisors spawn
+  themselves, and the N-API addon makes no release in-process, since its verbs run in the cowshed binary. A spawn
+  failure is the release's error: the verb fails with its rename already durable, and its retry finds the release
+  committed. A child that ends badly, with a non-zero status or a signal, is said on stderr by its reaper, and the next
+  gateway start frees what it left. A store whose configuration names no child, a fixture store without a binary, starts
+  none, says so on stderr once per process, and its entries wait for the startup scan. The child frees that one entry
+  with the bounded release: at most 1,024 physical runs per `ftruncate` cut from the end of the file, at normal disk
+  priority, then `unlink`, the file's length being the resume journal (16_build_volumes.md, "Garbage collection";
+  01a_apfs.md, "Freeing an image"). It first waits out (a blocking `flock`) a process that holds the entry, its owner
+  still syncing the commit, and while it waits it names its holder on stderr, read afresh at each 90 s bound, the bound
+  being a parameter of the wait. It exits once the entry is gone, or with a usage error when it is given no entry. No
+  queue, control request, timer or poll stands between the verb and the child.
+- **A startup scan finishes what a child did not.** When the store names no child or the child ended badly, the entry
+  stays in its `.deleting` directory for the gateway's startup scan. Once, right after the gateway starts serving
+  ("Startup contract", step 2), it starts one thread, `image-deleter`, which passes over every project of this gateway's
+  store, each one's `build/.deleting` and `sessions/.deleting`, the same two directories of every archived project
+  (`.retired-projects/<operation-id>/`, where `forget` renamed the project's tree with its released images in it,
+  02_workspaces.md; the receipt files beside an archive are skipped), and the store's own `<store>/.deleting`. It frees
+  each entry it finds as the child does, one image at a time, names each stray, each entry another process holds and
+  each unreadable directory, and ends. It looks nowhere else. An archive's released images are no evidence: they were
+  released before the archive's rename, and the scan opens nothing else in an archive. So a gateway restart or a reboot
+  (the gateway is `RunAtLoad`) finishes every entry left, an image cut short mid-free included. Before its first cut the
+  scan syncs the directory and its parent in full, because an owner may have died between its rename and the rename's
+  syncs; a scan that cuts nothing syncs nothing.
+- **The gateway does nothing else for it.** After that scan the gateway does no work for released images: no control
+  request, queue, polling, timer or environment variable. Each image's own `flock` is the whole of the exclusion between
+  an owner, a child and a scan.
+
+Space lags. Until a child or the startup scan finishes an entry the store's container still holds its allocation, so
+free-space figures and extent counts lag the commit by the free's own duration, and an entry whose child did not run
+waits for the next gateway start. Nothing references an entry: no record, link, hold or mount names it, and nothing
+mounts, forks or reads it.
+
+Two cases start no child. A store whose configuration names none, a fixture store without a binary (core tests have
+none; cowshed-cli tests pass their built binary), says so on stderr once per process, and the startup scan frees its
+entries. A directory store, the test substrate, only renames: its release moves the payload into
+`<project>/sessions/.deleting/<name>` (a build volume into `build/.deleting`), the verb deletes nothing and starts no
+child (said once per process), and a released payload stays in `.deleting` until its test store goes, because a tree can
+be freed only with the directory host's holder census, which runs in-process;
+`DirectoryExecutionHost::finish_build_releases` can finish build-volume trees, leaving one a process still holds
+(16_build_volumes.md, "Garbage collection").
+
+A project's final unbinding (`rm main --restore`, 02_workspaces.md, "Checkout layouts") frees nothing either. Its store
+tree goes with it, so before it plans terminal storage it moves each released image of its project, from
+`build/.deleting` and `sessions/.deleting`, into `<store>/.deleting/<fresh id>.dmg` and starts each one's deletion
+child. A child that holds an entry moves with it, since it holds the open file, and a stray left in those directories
+still refuses the plan.
 
 ## Availability and offline behavior
 

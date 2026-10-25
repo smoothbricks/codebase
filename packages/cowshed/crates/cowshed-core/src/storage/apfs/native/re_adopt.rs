@@ -263,18 +263,17 @@ where
         Ok(())
     }
 
-    /// Detach without force and delete a lost build volume's staged copy, then its emptied
-    /// staging mountpoint. A copy already gone is a replay's finished step.
+    /// Detach without force and release a lost build volume's staged copy (rename into
+    /// `sessions/.deleting`, its deletion in the background), then its emptied staging mountpoint.
+    /// A copy already gone is a replay's finished step.
     fn discard_staged_build(&self, build: &ReAdoptBuild) -> Result<(), ApfsStorageError> {
         let staged = &build.replacement_image;
         self.verify_controller_path(staged)?;
         if exists(staged)? {
             self.detach_without_force(staged)?;
-            fs::remove_file(staged)
-                .map_err(|error| io_error("discard a lost build's staged copy", staged, error))?;
-            sync_parent_path(staged)?;
+            self.release_image_file(staged)?;
             cowshed_os::eprintln!(
-                "cowshed: re-adoption discarded {}, a staged copy of a build volume whose retained \
+                "cowshed: re-adoption released {}, a staged copy of a build volume whose retained \
              image is gone",
                 staged.display()
             );

@@ -150,16 +150,8 @@ where
         &self,
         layout: &BuildVolumeLayout,
         claim: ReleaseClaim,
-        reclaim: crate::storage::apfs::release::Reclaim,
     ) -> Result<Option<BuildVolumeRefusal>, ApfsStorageError> {
-        MacOsApfsExecutionHost::release_claimed(self, layout, claim, reclaim)
-    }
-
-    fn finish_build_releases(
-        &self,
-        layout: &BuildVolumeLayout,
-    ) -> Result<crate::storage::apfs::release::Drained, ApfsStorageError> {
-        MacOsApfsExecutionHost::finish_build_releases(self, layout)
+        MacOsApfsExecutionHost::release_claimed(self, layout, claim)
     }
 
     fn build_volume_capacity(

@@ -16,7 +16,6 @@ use crate::build_volume::{
     LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
-use crate::storage::apfs::release::{Drained, Reclaim};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
@@ -473,8 +472,8 @@ where
             .map(|mounted| mounted.source_device))
     }
 
-    /// Unmount and detach build volume `id`, then delete its image, record, hold and mountpoint
-    /// (16_build_volumes.md, "Garbage collection"). Only cowshed's own claims keep a volume: a job
+    /// Unmount and detach build volume `id`, then commit its image to `build/.deleting`
+    /// and delete its record, hold and mountpoint (16_build_volumes.md, "Garbage collection"); the background deletion frees the image. Only cowshed's own claims keep a volume: a job Only cowshed's own claims keep a volume: a job
     /// admitted on it holds it ([`BuildVolumeLayout::hold`]), which answers [`Release::Held`] and
     /// touches nothing. Anything else that has it open does not own it: when the kernel refuses
     /// the unforced unmount, the holders are named, given the detach grace to let go, and then
@@ -486,7 +485,7 @@ where
     ) -> Result<Release, ApfsStorageError> {
         match self.claim_build_volume(layout, id)? {
             Claim::Claimed(claim) => Ok(Release::Deleted {
-                refused: self.release_claimed(layout, claim, Reclaim::Now)?,
+                refused: self.release_claimed(layout, claim)?,
             }),
             Claim::Held { open } => Ok(Release::Held { open }),
         }
@@ -643,16 +642,14 @@ where
     }
 
     /// Release the volume while retaining its claim and ownership record until its detached
-    /// image's release is committed to the journal and, with [`Reclaim::Now`], physically
-    /// unlinked. A failure refuses the retirement with its record intact. With
-    /// [`Reclaim::Journaled`] the record goes once the commit is durable and the entry waits
-    /// for [`Self::finish_build_releases`]. The deletion log names the owner read before the
+    /// image's release is committed to `build/.deleting`, durably; then the record, hold and
+    /// mountpoint go and this answers, the bytes left to the background deletion. A failure refuses
+    /// the retirement with its record intact. The deletion log names the owner read before the
     /// image and record are removed.
     pub fn release_claimed(
         &self,
         layout: &BuildVolumeLayout,
         claim: ReleaseClaim,
-        reclaim: Reclaim,
     ) -> Result<Option<Refusal>, ApfsStorageError> {
         let id = claim.id();
         let image = layout.image(id);
@@ -702,12 +699,13 @@ where
             }],
             || {
                 layout
-                    .release_image(id, reclaim)
+                    .release_image(id)
                     .map_err(|error| io_error("release a build volume image", &image, error))
             },
         )?;
         if removed {
             layout.journal_release(id, recorded.as_ref(), true);
+            self.delete_in_background(&layout.released(id))?;
         }
         // A volume whose image was already gone is retired by its record alone, said as such.
         if remove_if_present(&layout.record(id))? && !removed {
@@ -723,18 +721,6 @@ where
         }
         drop(claim);
         Ok(refused)
-    }
-
-    /// Finish every release committed to the project's build journal
-    /// ([`crate::build_volume::drain_released`]): the superseded seeds a fork's refresh journaled
-    /// and the entries a crash cut short. An entry another process is freeing is left to it.
-    pub fn finish_build_releases(
-        &self,
-        layout: &BuildVolumeLayout,
-    ) -> Result<Drained, ApfsStorageError> {
-        let journal = layout.releasing();
-        crate::build_volume::drain_released(&journal)
-            .map_err(|error| io_error("finish the build image releases", &journal, error))
     }
 
     /// Mount what `workspace`'s checkout links, whose build link names `linked`, once the link
@@ -1646,10 +1632,7 @@ mod tests {
             "publication rollback can restore the old volume"
         );
         host.detach_claimed_build_volume(&layout, &claim).unwrap();
-        assert_eq!(
-            host.release_claimed(&layout, claim, Reclaim::Now).unwrap(),
-            None
-        );
+        assert_eq!(host.release_claimed(&layout, claim).unwrap(), None);
         for path in [&image, &layout.record(&id), &layout.hold_path(&id), &mount] {
             assert!(
                 !path.exists(),
@@ -1658,8 +1641,8 @@ mod tests {
             );
         }
         assert!(
-            !layout.trash().exists(),
-            "successful release leaves no image for a later collector"
+            layout.released(&id).is_file(),
+            "the image waits in build/.deleting; a fixture store starts no deletion child"
         );
     }
 

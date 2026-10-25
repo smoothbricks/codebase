@@ -7,6 +7,11 @@ use cowshed_cli::run::{Ending, prepare, run_interruptible};
 const INTERRUPTED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 fn main() {
+    // A deletion child frees its one released image and exits, before anything else starts
+    // (05_gateway.md, "Deleting released images").
+    if let Some(code) = cowshed_core::storage::apfs::deleter::dispatch() {
+        std::process::exit(code);
+    }
     // Before the runtime starts any thread: this binary is also every workspace's warm
     // exec host, and in that role it never returns from here.
     if let Err(error) = cowshed_shell::dispatch() {

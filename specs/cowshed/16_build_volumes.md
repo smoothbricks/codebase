@@ -524,13 +524,14 @@ replacement at its next job admission, as after a land; it is not restarted to t
 
 Byte accounting is the same as build-volume garbage collection: each RAW image contributes `st_blocks * 512`, a
 directory backend its allocated tree bytes. Dry-run reports the old image's allocated bytes and the seed clone's
-allocation estimate; execution reports the actual replacement allocation and the old image's allocation when deleted as
-`freedBytes`. A seal may flush more blocks than preview observed. These are **per-image allocated bytes**, not a promise
-of that much unique physical free space: APFS clones and retained seeds can share extents. Subtracting the replacement
-allocation gives a per-image net estimate, not a container-free-space measurement.
+allocation estimate; execution reports the actual replacement allocation and, as `releasedBytes`, the old image's
+allocation once its release is committed (a background deletion frees the bytes later). A seal may flush more blocks
+than preview observed. These are **per-image allocated bytes**, not a promise of that much unique physical free space:
+APFS clones and retained seeds can share extents. Subtracting the replacement allocation gives a per-image net estimate,
+not a container-free-space measurement.
 
 - **Enforced by**: directory-host and real-APFS tests that refuse and name shared job holds, exclusive land claims and
-  filesystem readers; then replace the volume, report deleted allocation and verify dirty tracked source, untracked
+  filesystem readers; then replace the volume, report released allocation and verify dirty tracked source, untracked
   files, Git state and index bytes unchanged. A stale source seed is used without refreshing or mounting it. Focused
   directory tests refuse absent seeds, unfinished lifecycle journal entries, held image locks and stale plans.
 
@@ -688,9 +689,10 @@ runs none of steps 2 and 4 to 7 ("Ungated folds", below).
       before land returns (GC below), unless a running job's hold still owns it, in which case it stays the target's and
       that job's end releases it. This applies with `--no-retire` too. Nothing links it any more, so its release runs
       beside what the land does in the target next (its supervisor, a kept workspace's fresh clone, the adoption check
-      of step 7), so the release's unmount, detach and delete can overlap them. It needs no image lock: a fork or reseed
-      that takes the lock after the rename reads the adopted volume, and none that held it before the land took it still
-      runs.
+      of step 7), so the release's unmount, detach and commit rename can overlap them. It frees no byte before land
+      returns: a background deletion frees the committed image beside the land and after it, and the land never waits
+      for it (GC below). It needs no image lock: a fork or reseed that takes the lock after the rename reads the adopted
+      volume, and none that held it before the land took it still runs.
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until
@@ -975,96 +977,102 @@ delta incrementally, as an edit would.
   image. At the initial unforced refusal it records the holders and names each pid and command, distinguishing release
   within the grace from a forced unmount. Editors or indexers without a cowshed job hold cannot retain a retiring build
   volume indefinitely. Force revokes their access to the volume; it does not kill them.
-- Physical collection belongs to the operation that retires the owner or replaces the volume, and there is no periodic
-  deletion worker. The operation commits the release with one `rename(2)` of the detached image to
-  `build/.releasing/<id>.dmg`, inside the images directory and so on the store volume, and syncs both directories:
-  before the rename the volume is its owner's, after it no hold, mount or fork reaches it, and a hold taken after it
-  finds no image, as before. A rename the kernel refuses across volumes is the release's error, never a copy. An
-  operation whose purpose is the release (`rm`'s retirement, `gc`, a land's release of its target's previous volume and
-  of the seed its seal replaced, `cowshed reseed`'s release of the volume it replaced, a job's end releasing a
-  superseded volume, a failed creation's release of what it registered) then frees the image in bounded steps (below),
-  unlinks it and syncs the journal directory, and only then removes the owner record, hold file and mountpoint and
-  reports success. A fork's seed refresh (Fork step 2, "Which volume a seed holds") is not such an operation: the seeds
-  it supersedes are garbage on its way to the fork, so once each one's rename is durable it removes that seed's owner
-  record, hold file and mountpoint, appends its deletion-log line and proceeds, leaving the entry in the journal.
-  Nothing depends on those bytes being freed: no record, link, hold or mount names the entry, and the fork clones the
-  new seed. Only space lags: until the entry is finished the store's container still holds the old seed's allocation, so
-  free-space figures and the container's extent count lag the commit. Measured on build 48a8ffff, a provision's inline
-  free of one 300 GiB superseded seed sat about 12 minutes in `ftruncate` with the disk near idle. A failure refuses
-  with its path and cause: before the rename the owner record stays for the same operation's retry, after it the journal
-  entry stays for recovery. A held job retains its registered volume ownership; a later sweep is not a substitute for
-  completing the owning lifecycle operation.
-- `build/.releasing/` is the journal of committed releases: an entry exists from its operation's rename to its unlink. A
-  release-purpose operation unlinks its own entry before it answers, so that entry outlives it only after a crash; a
-  fork's seed refresh leaves its entries by design. `cowshed gc` and the daemon's start finish every entry with the same
-  bounded release, and so do `rm`'s retirement and a land's release of its target's previous volume after their own
-  releases, where failing to finish another operation's entry is said and left for `gc` or the daemon's start, not their
-  error. The project's open finishes none: every verb opens the project, so a fork would wait on freeing the seed the
-  fork before it superseded. An entry a crash orphaned is therefore finished exactly as a seed refresh's is, by the
-  project's next `rm` retirement, land release or `gc`, or the daemon's next start, whichever comes first; until then it
-  holds space and nothing else. An entry another process is releasing is left to that process, and a release-purpose
-  operation waits for such a releaser of its own entry to finish instead of answering early. The operation locks the
-  image (`flock`) before its rename and keeps that descriptor through every cut (a seed refresh, through the rename's
-  syncs), so a recovery finds its entry locked and leaves it: no cut lands before the rename is durable. In a directory
-  store an entry is the released payload tree, renamed whole; every finisher names and leaves a tree a process still
-  holds anything inside, never deleting it from under its holder. Whoever finishes an entry its operation left syncs the
-  journal and the directories around it, under the entry's lock, before the first cut, because that operation may have
-  died before syncing its rename. Nothing mounts, forks or reads an entry, and nothing is opened through a link: the
-  images directory and the journal are held by descriptor, a link or any other non-regular file at the image's name or
-  an entry's refuses or is named and left, untouched. An operation about to commit over an entry a crash left finishes
-  that entry first, because a rename over a file frees the file it replaces in one go. For the directory substrate,
-  retry confirmation and the drain's listing, accounting and recursive deletion resolve each child against its held
-  parent descriptor, never the journal's replaceable pathname. Holder discovery uses the held journal's current kernel
-  name with entry-identity checks around the census; a changed name refuses the drain. The payload is opened only after
-  that census (so the observer is not itself a holder), checked against the observed identity, and both the journal and
-  source directory are synced for that entry before its first deletion.
-- Releasing an image never frees it in one go. One `unlink` of a written image is one free of its whole extent tree, and
-  every writer of the store's APFS container waits behind it: measured 2026-10-22, the installed daemon's trash thread
-  sat in one `unlink` of a 300 GiB image (its first 100,000 runs held 778 MiB, a median run of 4 KiB) while its main
-  thread waited on a write to its own log and every `cowshed fork` and `ls` on the host hung. So a release cuts the
-  image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut, and unlinks it once it
-  is empty. The 1,024 is measured: over a 131,072-extent clone on the store's container a cut of 1,024 extents took 0.1
-  s to 0.3 s at the median, and from there a cut's length grows with its extents; the table is `STEP_EXTENTS` in
-  `storage/apfs/release.rs`. The bound is on runs reclaimed, not time inside a kernel call. On 2026-10-23 a materialized
-  485,830-run clone made 475 cuts at 44.125 ms median / 217.100 ms maximum; independent probes on the store/Data volumes
-  and inside an attached image reached 61.668 ms. Two concurrent releases reached 1.444 s per cut and 0.972 s per probe.
-  A separate 300 GiB sparse-file experiment (524,289 runs, 8 GiB allocated) measured 16.027 ms median / 1.141 s maximum
-  with no pause and 10.051 / 97.748 ms with a 1 ms inter-step sleep; these sequential observations do not prove a
-  yield-caused improvement or a latency ceiling. Crucially, a fresh clone's first cut of just **one run** took 5.086 s
-  (9.733 s in another per-step-only run); the earlier seed clone's first 454-run cut took 50.074 s. This is whole-map
-  first-mutation work inside one syscall, which a step limit or yield cannot split. An observed shared-map flag does not
-  retain its other owner, so no flag-based shortcut bypasses the cuts. See 01a_apfs.md, "Freeing an image", for probe
-  windows, last-close timing, remaining options and limitations. Raw receipts and timings: the external
-  `release-stall-bound/` evidence directory. The image's length is the release's journal: a cut ends on a run boundary,
-  so an interrupted release leaves a shorter image that the next pass walks and finishes, and nothing else records
-  progress. A release holds the image's `flock` for its whole run. It runs at normal disk priority: a thread throttled
-  to background priority (`IOPOL_THROTTLE`) holds the container's work while its own metadata reads wait, so measured
-  the same day it freed the same clone in 53 s instead of 7.6 s and the writers beside it waited 10.6 ms at the median
-  instead of 0.2 ms; the installed daemon's throttled `unlink` made 1,213 throttled 4 KiB metadata reads at a 20 ms
-  median in 21 s.
-- Historical `build/.trash/<id>.dmg` entries, renamed there by the releases of earlier builds, are committed releases
-  too: the daemon's start and `cowshed gc` finish them the same way, and gc refuses when one cannot be freed. No release
-  of this build moves an image there. Only `<id>.dmg` files qualify; anything else is named and left. Workspace images
-  containing the only copy of dirty or unlanded content keep their separate recovery rules; rebuildable build images do
-  not use that preservation mechanism.
-- Every release that deletes an image, a seed's or another volume's, whatever asked for it (collection, a land's release
-  of the target's previous volume or superseded seed, a reseed, a fork that never staged), appends one line for the
-  image to the project's `deletion-log.jsonl` (01_storage.md): op `release-build-volume`, kind `build-seed` when its
-  sidecar recorded it as a seed and `build-volume` otherwise, and the workspace that sidecar named, read before anything
-  is deleted. A target's previous volume is recorded superseded under the target before its release, so its line names
-  that target. A held volume is not released and leaves no line; a release that finds the image already gone deletes
-  none and leaves none. The record such a release retires is journaled by a line of its own,
-  `release-imageless-build-volume`: its artifact is the sidecar record it deletes (which names the volume's id) and its
-  image the missing path, so the journal says the record went because its image was absent, not because collection
-  reclaimed it. Without this journal, an `rm` that releases the volume a land has just moved main onto leaves no trace
-  of it.
-- Each target keeps only its latest seed; a superseded seed is released when replaced (by a fork's seed refresh,
-  committed to the journal and freed by its next finisher, above), and a target's seed is released when the target
-  retires. Detached seeds do not need an attach or a rename to be deleted. Main retires last, in `rm main --restore`
-  (and `--restore --purge`): its unbinding collects once main's image is retired, so main's linked volume and seed are
+- A release commits and frees nothing. The operation that retires the owner or replaces the volume (`rm`'s retirement,
+  `gc`, a land's release of its target's previous volume and of the seed its seal replaced, `cowshed reseed`'s release
+  of the volume it replaced, a job's end releasing a superseded volume, a failed creation's release of what it
+  registered, a fork's seed refresh) detaches the image and commits its release with one `rename(2)` of it to
+  `build/.deleting/<id>.dmg`, inside the images directory and so on the store volume, and syncs both directories: before
+  the rename the volume is its owner's, after it no hold, mount or fork reaches it, and a hold taken after it finds no
+  image, as before. A rename the kernel refuses across volumes is the release's error, never a copy. The rename never
+  replaces a file: an id is never reused, so an entry already under its name is the same image's own committed release,
+  and a rename over a file would free the file it replaces in one go. The operation locks the image (`flock`) before its
+  rename and keeps that descriptor through the rename's syncs, so no deletion cuts the entry before the rename is
+  durable. Once it is, the operation starts the deletion in the background (below), removes the owner record, hold file
+  and mountpoint, appends its deletion-log line and answers, none of it waiting for the free. No verb frees a byte of an
+  image and none finishes another operation's entry. Nothing depends on those bytes being freed: no record, link, hold
+  or mount names the entry, and nothing mounts, forks or reads it. Only space lags: until the background deletion
+  finishes the entry the store's container still holds the image's allocation, so free-space figures and the container's
+  extent count lag the commit, and an entry whose deletion did not run waits for the next gateway start. A failure
+  refuses with its path and cause, a deletion child that cannot be spawned included: before the rename the owner record
+  stays for the same operation's retry, after it the entry stays for its deletion or the startup scan and the retry
+  finds the commit already made, makes its rename durable and answers. A held job retains its registered volume
+  ownership; a later sweep is not a substitute for completing the owning lifecycle operation.
+- The free is not a verb's work, because the verb waits for it and keeps its turn and locks meanwhile. Cutting at a
+  bound (below) bounds what the container's other writers wait for, not what the verb that cuts waits for. So the free
+  runs in a background child of the verb that holds no turn and no lock but the image's own, and the gateway's startup
+  scan finishes what a child did not (05_gateway.md, "Deleting released images").
+- `build/.deleting/` holds the committed releases of build volumes and seeds: an entry exists from its operation's
+  rename to its unlink. Every other image of the project (a removed workspace's, a checkpoint's, a staged clone's, an
+  orphan `gc` collects) commits the same way into `sessions/.deleting/`, a removed workspace's as
+  `<ws>-<incarnation>.dmg` and any other as `reclaimed-<fresh 32-hex>.dmg` (05_gateway.md, "Deleting released images").
+  Right after the rename is durable the releasing process starts the deletion in the background and returns without
+  waiting: it spawns itself, the running executable (`std::env::current_exe()`, which the host store's roots carry), as
+  `<exe> __delete-released <entry>`, detached in its own process group, with stdin and stdout null and stderr inherited,
+  and with no PATH lookup. A spawn failure is the release's error (its rename is already durable and a retry finds it
+  committed); a child that ends badly is said on stderr by its reaper. The child frees that one entry with the bounded
+  release below, after it waits out (a blocking `flock`) a process that holds it, its owner still syncing the commit,
+  naming its holder on stderr, read afresh at each 90 s bound, while it waits, and it exits once the entry is gone.
+  Nothing mounts, forks or reads an entry, and nothing is opened through a link: the images directory and the deleting
+  directory are held by descriptor, a link or any other non-regular file at the image's name or an entry's refuses or is
+  named and left, untouched.
+- When the store names no child (a fixture store without a binary says so on stderr once per process) or the child ended
+  badly, the entry stays for the gateway's startup scan. Once, when the gateway starts, its `image-deleter` thread
+  passes over every project of this gateway's store, each one's `build/.deleting` and `sessions/.deleting`, the same two
+  directories of every archived project (`.retired-projects/<operation-id>/`) and the store's own `<store>/.deleting`,
+  frees each entry with the same bounded release, names each stray, each entry another process holds and each unreadable
+  directory, and ends; so a gateway restart or a reboot frees every entry left, an image cut short mid-free included.
+  Before its first cut the scan syncs the directory and its parent, because the operation may have died before syncing
+  its rename; a scan that cuts nothing syncs nothing. The gateway does nothing after that for released images: no
+  control request, queue, polling, timer or environment variable.
+- In a directory store (the test substrate, 08_testing.md "directory_*") a release only renames the payload tree into a
+  `.deleting` directory (a workspace-side payload into `<project>/sessions/.deleting/<name>`, a build volume into
+  `build/.deleting/<id>.dmg`) and refuses no holder: a process holding anything inside keeps what it has open. The verb
+  deletes nothing and starts no child (it says so once per process), because a tree can be freed only with the directory
+  host's holder census, which runs in-process. A released payload stays in `.deleting` until its test store goes, and
+  `DirectoryExecutionHost::finish_build_releases` can finish build-volume trees, which names and leaves a tree a process
+  still holds anything inside, never deleting it from under its holder. For this substrate, retry confirmation and the
+  finisher's listing, accounting and recursive deletion resolve each child against its held parent descriptor, never the
+  deleting directory's replaceable pathname. Holder discovery uses the held directory's current kernel name with
+  entry-identity checks around the census; a changed name refuses the pass. The payload is opened only after that census
+  (so the observer is not itself a holder), checked against the observed identity, and both the deleting directory and
+  the source directory are synced for that entry before its first deletion.
+- Freeing an image never takes one go. One `unlink` of a written image is one free of its whole extent tree, and every
+  writer of the store's APFS container waits behind it: a long free hangs every `cowshed fork` and `ls` on the host. So
+  a deletion cuts the image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut,
+  and unlinks it once it is empty; the table is `STEP_EXTENTS` in `storage/apfs/release.rs`. A cut of 1,024 runs takes a
+  fraction of a second and a longer cut's length grows with its extents, which is why 1,024 is the bound. The bound is
+  on runs reclaimed, not time inside a kernel call. A fresh clone's first cut does whole-map first-mutation work inside
+  one syscall, which a step limit or yield cannot split. An observed shared-map flag does not retain its other owner, so
+  no flag-based shortcut bypasses the cuts. See 01a_apfs.md, "Freeing an image", for the reasons and limitations. The
+  image's length is the free's journal: a cut ends on a run boundary, so a free that did not finish (a crash, a stopped
+  child, a gateway restart) leaves a shorter image that the next gateway start's scan walks and finishes, and nothing
+  else records progress. A deletion holds the image's `flock` for the whole free. It runs at normal disk priority: a
+  thread throttled to background priority (`IOPOL_THROTTLE`) holds the container's work while its own metadata reads
+  wait, so the same free takes longer and the writers beside it wait longer.
+- Workspace images containing the only copy of dirty or unlanded content keep their separate recovery rules; rebuildable
+  build images do not use that preservation mechanism.
+- Every release that commits an image, a seed's or another volume's, whatever asked for it (collection, a land's release
+  of the target's previous volume or superseded seed, a reseed, a fork's seed refresh, a fork that never staged),
+  appends one line for the image to the project's `deletion-log.jsonl` (01_storage.md) once its rename is durable: op
+  `release-build-volume`, kind `build-seed` when its sidecar recorded it as a seed and `build-volume` otherwise, and the
+  workspace that sidecar named, read before the owner record is removed. A target's previous volume is recorded
+  superseded under the target before its release, so its line names that target. A held volume is not released and
+  leaves no line; a release that finds neither the image nor its committed entry commits none and leaves none. The
+  record such a release retires is journaled by a line of its own, `release-imageless-build-volume`: its artifact is the
+  sidecar record it deletes (which names the volume's id) and its image the missing path, so the journal says the record
+  went because its image was absent, not because collection reclaimed it. Without this journal, an `rm` that releases
+  the volume a land has just moved main onto leaves no trace of it.
+- Each target keeps only its latest seed; a superseded seed is released when replaced (by a land's seal or a fork's seed
+  refresh, committed to `build/.deleting` like every release, above), and a target's seed is released when the target
+  retires. Detached seeds need no attach or label rename to be released. Main retires last, in `rm main --restore` (and
+  `--restore --purge`): its unbinding collects once main's image is retired, so main's linked volume and seed are
   released with every volume an earlier collection left, and a volume that stays refuses the unbinding while the project
-  is still bound (02_workspaces.md, "Checkout layouts"). With no volume left, the unbinding deletes `build/` (then only
-  empty directories and zero-length holds) and the project's `.build/<owner>/<repo>` mount tree.
+  is still bound (02_workspaces.md, "Checkout layouts"). The unbinding is the project's last act and its store tree goes
+  with it, so before it plans what it deletes it moves each released image of its project, from `build/.deleting` and
+  `sessions/.deleting`, into `<store>/.deleting/<fresh id>.dmg` and starts each one's deletion child; it frees nothing
+  itself, and a child that holds an entry moves with it, holding the open file. Anything there that is not a released
+  image stays, and the terminal plan then refuses, naming it. With no volume left, the unbinding deletes `build/` (then
+  only empty directories and zero-length holds) and the project's `.build/<owner>/<repo>` mount tree.
 - GC also enumerates sidecars whose images are already gone: every seed's, and every other record collection would
   release with its image: one recorded superseded, registered and interrupted, or naming a checkout that no longer links
   it. An image that does not exist cannot be waiting for anything, so deferring its record would defer it on every pass

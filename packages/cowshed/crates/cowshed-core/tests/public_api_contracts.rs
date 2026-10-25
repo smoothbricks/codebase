@@ -554,7 +554,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
         reclaimed: 3,
         retained_pinned: 2,
         retained_active: 0,
-        freed_bytes: 4096,
+        released_bytes: 4096,
         dry_run: true,
         candidates: vec![GcCandidate {
             identity: gc_identity,
@@ -572,7 +572,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
             "reclaimed":3,
             "retainedPinned":2,
             "retainedActive":0,
-            "freedBytes":4096,
+            "releasedBytes":4096,
             "dryRun":true,
             "candidates":[{
                 "identity":gc_identity.to_string(),

@@ -60,8 +60,10 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
                                      #   that upgrades to exclusive with no record beside it (02_workspaces.md)
     <repo>.run                       # one retirement execution, fenced to the exact recorded generation
   .retired-projects/                  # preserved, detached evidence; never discovered as live projects
-    <operation-id>/                  # the complete former project store tree, renamed without copying or deleting
+    <operation-id>/                  # the complete former project store tree, renamed without copying or deleting; the gateway's startup scan frees the released images waiting in it
     <operation-id>.json              # completed retirement receipt
+  .deleting/                         # released images a project's unbinding moved out of its tree
+    <id>.dmg                         # a fresh id, waiting for its background deletion
   <owner>/                           # a project owner, and the only store-root entry discovery reads
     .cowshed-owner                   # empty: makes this directory an owner (written when its first project is provisioned)
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
@@ -86,15 +88,14 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <workspace>.intent.lock        # flock the process executing <workspace>'s lifecycle intent holds
       <workspace>.land.lock          # flock a land or an rm of <workspace> holds for its run (02 "A land and an rm of one workspace exclude each other")
       .trash/                        # recovery images of dirty, unlanded or only-copy removals, kept until gc --recover
-      .releasing/<ws>-<inc>.dmg      # a clean removal's committed release, freed by that removal or, after a crash, recovery
+      .deleting/<name>.dmg           # committed releases of the project's other images (a removed workspace's as <ws>-<inc>.dmg, any other as reclaimed-<fresh 32-hex>.dmg), each waiting for its background deletion
     checkpoints/
       <workspace>/<label>.dmg        # clonefile snapshot
     build/
       <id>.dmg                       # one build volume: Cargo target dirs + Nx cache and task DB (16_build_volumes.md)
       <id>.dmg.json                  # its sidecar: built-at tree, linking checkout, checked-out tree when placed, seed flag, created
       <id>.dmg.hold                  # flock each job on the volume holds shared; a release claims it exclusive, then deletes it
-      .releasing/<id>.dmg            # a committed release, freed by its own operation; a seed a fork's refresh superseded, or one a crash left, by the next rm/land release, gc or daemon start
-      .trash/<id>.dmg                # earlier builds' releases only; the daemon's start and `gc` finish them
+      .deleting/<id>.dmg             # a committed release, waiting for its background deletion
     tmp/
       <workspace>/                   # its TMPDIR, 0700: writable by its own sandbox only; reclaimed with its retired image,
                                      #   read-only directories its tools sealed made owner-writable first (`go clean -modcache`)
@@ -313,15 +314,18 @@ The APFS adapter's interrupted image/metadata publication protocol is specified 
 
 Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces, abandon bundles, ZFS origin pins
 (09_substrates.md), and APFS image-size ratchet all grow silently. `cowshed gc` enforces retention conventions.
-Background reclamation handles only explicitly released build images and provably dead scratch, never idle workspaces:
+Reclaiming an image, whatever reclaims it, is releasing it: one rename into a `.deleting` directory, then a deletion in
+the background (05_gateway.md, "Deleting released images"). Background deletion handles only explicitly released images
+(build volumes, the sources of clean removals, the orphan, expired and staged images that `gc` and failed verbs release)
+and provably dead scratch, never idle workspaces:
 
 | Object                                       | Default retention                                                                      | Exempt / override                                                                                                                                                            |
 | -------------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Checkpoints                                  | all younger than 14 days **plus the newest five per workspace, whichever keeps more**  | explicit pin from a label or `cowshed checkpoint --keep`; pins never expire until unpinned                                                                                   |
 | CI failure checkpoints                       | same checkpoint rule as above                                                          | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                                                                                                    |
 | Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**          | landing/removal is always explicit                                                                                                                                           |
-| Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are unlinked by retirement, not put here |
-| Historical build trash (`build/.trash/…`)    | no new entries; build images unlink inside the operation that retires or replaces them | the daemon's start and `cowshed gc` finish old entries; gc refuses if one cannot be freed                                                                                    |
+| Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are released to `.deleting`, not here    |
+| Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background | a detached child of the releasing verb frees each entry; the gateway's startup scan frees leftovers (05_gateway.md); no verb frees one: `rm`, `land` and `gc` only commit it |
 | Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository      | explicit `cowshed gc --abandoned`                                                                                                                                            |
 | Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry, content or patch identity | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                                                                                                     |
 | Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`   | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                                                                                     |
@@ -340,13 +344,14 @@ Background reclamation handles only explicitly released build images and provabl
   of exact candidates with stable SHA-256 identity, host path, allocated bytes, and closed reason. The plan records its
   sweep options. Pinned checkpoints are retained and never become candidates. `execute_gc(plan)` acquires all plan locks
   without waiting, re-enumerates at the plan's observation time under the same options, and rejects a
-  pin/incarnation/path/byte/concurrency change as stale before any mutation. Only an unchanged plan drains trash, orphan
-  staging/session images and mountpoints, prunes expired checkpoints, and, only under `--abandoned`, reclaims abandon
-  bundles; execution reports actual freed bytes. Nothing compacts an image: guest-freed space stays allocated, so an
-  image's allocation tracks its high-water mark ([APFS Images](./01a_apfs.md#images), "Space reclamation"). A candidate
-  whose own cleanup cannot finish is deferred by path and diagnostic while the sweep attempts the others. Uncertain
-  ownership, invalid identity, or a stale whole plan still refuse: proceeding through those could delete data that does
-  not belong to the candidate.
+  pin/incarnation/path/byte/concurrency change as stale before any mutation. Only an unchanged plan releases retired
+  workspaces' trash, orphan staging and session images and expired checkpoints for background deletion (05_gateway.md,
+  "Deleting released images"), removes orphan mountpoints and staging metadata, and, only under `--abandoned`, reclaims
+  abandon bundles; execution reports the allocated bytes of the images it released, which their deletions free after it
+  answers. Nothing compacts an image: guest-freed space stays allocated, so an image's allocation tracks its high-water
+  mark ([APFS Images](./01a_apfs.md#images), "Space reclamation"). A candidate whose own cleanup cannot finish is
+  deferred by path and diagnostic while the sweep attempts the others. Uncertain ownership, invalid identity, or a stale
+  whole plan still refuse: proceeding through those could delete data that does not belong to the candidate.
 - Abandon bundles are regular `*.bundle` files directly in `sessions/.trash`; staged `.partial` siblings and symlinks
   are not bundle candidates. Plain `gc`, opportunistic collection, and `doctor --repair` never authorize their
   reclamation. Only explicit `--abandoned` (`GcOptions.abandoned: true`) adds the `abandonedBundle` category to the
@@ -376,12 +381,12 @@ Background reclamation handles only explicitly released build images and provabl
   touched.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
-  trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, checkpoint
-  facts, and every associated artifact under the workspace lock; any change makes the plan stale before mutation.
-  Cleanup deletes the retirement trash metadata last so an interrupted pass retains authority for the next idempotent GC
-  pass. A missing canonical image or orphan checkpoint fact alone never authorizes deletion. APFS-specific handling of
-  late root-owned filesystem event logs is specified in
-  [Retired mountpoint debris](./01a_apfs.md#retired-mountpoint-debris).
+  trash image and empty mountpoint, each image released for background deletion (05_gateway.md, "Deleting released
+  images"). Preview and execution validate the repository, workspace, incarnation, checkpoint facts, and every
+  associated artifact under the workspace lock; any change makes the plan stale before mutation. Cleanup deletes the
+  retirement trash metadata last so an interrupted pass retains authority for the next idempotent GC pass. A missing
+  canonical image or orphan checkpoint fact alone never authorizes deletion. APFS-specific handling of late root-owned
+  filesystem event logs is specified in [Retired mountpoint debris](./01a_apfs.md#retired-mountpoint-debris).
 - `cowshed du` reports **written vs referenced** bytes per workspace and per checkpoint (the number that matters for CoW
   substrates — referenced is shared with the base, written is the true cost). `--json` for fleet dashboards. This is how
   a coordinator decides which long-lived workspaces to `cowshed rebase --fresh` (02_workspaces.md) to shed accumulated
@@ -389,13 +394,13 @@ Background reclamation handles only explicitly released build images and provabl
 
 ### Shared temporary scratch
 
-The daemon sweeps at startup and every **60 seconds**, independently of build-image deletion. `gc` runs the same sweep
-before answering, including a read-only preview for `--dry-run`. Each pass examines at most **256 directory entries**,
-not 256 successful deletions; a retained directory cannot make the pass unbounded. The daemon keeps its directory
-cursors between passes, so live entries at the front do not starve dead entries behind them. Each root gets a turn, and
-a complete scan restarts on the next pass. Sixty seconds amortizes idle polling; 256 bounds filesystem and process
-probes even when the shared temp root contains thousands of other tools' entries. Background archive deletion has its
-own 256-entry budget and never synchronously walks an entire output tree.
+The daemon sweeps at startup and every **60 seconds**, independently of the deletion of released images (05_gateway.md,
+"Deleting released images"). `gc` runs the same sweep before answering, including a read-only preview for `--dry-run`.
+Each pass examines at most **256 directory entries**, not 256 successful deletions; a retained directory cannot make the
+pass unbounded. The daemon keeps its directory cursors between passes, so live entries at the front do not starve dead
+entries behind them. Each root gets a turn, and a complete scan restarts on the next pass. Sixty seconds amortizes idle
+polling; 256 bounds filesystem and process probes even when the shared temp root contains thousands of other tools'
+entries. Background archive deletion has its own 256-entry budget and never synchronously walks an entire output tree.
 
 Multiwriter runtime ownership is the private `.cowshed-owner` record in the scratch directory, containing
 `cowshed-scratch-v1`, one positive pid per line, and a final `end` line. The terminator makes an interrupted publication

@@ -21,11 +21,12 @@
 //! The plan is a pure function of the run starts ([`ReleasePlan`]); [`Release`] is the shell that
 //! walks the runs, takes the file's lock and makes the cuts.
 //!
-//! An image a lifecycle operation owns is released through a journal ([`release_owned`]): one
-//! rename into the [`JOURNAL_DIRECTORY`] beside it commits the release, so no cut ever lands
-//! on an image anything can still find. An operation whose purpose is the release then frees it
-//! before it answers ([`Reclaim::Now`]); one that only superseded it leaves the entry
-//! ([`Reclaim::Journaled`]). A crash leaves the entry too. Either is finished by [`drain`].
+//! An image a lifecycle operation owns is released by one rename into the [`DELETING_DIRECTORY`]
+//! beside it ([`commit_release`]), so no cut ever lands on an image anything can still find, and
+//! the operation answers once that rename is durable. Its bytes are freed off every verb's path,
+//! by a detached deletion child the releasing process starts ([`super::deleter`]), and whatever a
+//! crash or a dead child left by the gateway's startup scan ([`drain`], 05_gateway.md "Deleting
+//! released images").
 
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
@@ -34,7 +35,9 @@ use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use cowshed_os::fork_lock::Fenced;
 use cowshed_os::fsio::{
@@ -216,20 +219,6 @@ impl Release {
         Self::plan(directory, name, file, step).map(Opened::Release)
     }
 
-    /// Open the file at `path` for release on behalf of the operation that owns it, which
-    /// answers only once the file is gone: a release another process holds is waited out, and
-    /// what it left is planned. `None` when no file is there.
-    pub fn open_waiting(path: &Path, step: StepExtents) -> io::Result<Option<Self>> {
-        let (directory, name) = anchor(path)?;
-        let file = match open_entry(&directory, &name)? {
-            Entry::Absent => return Ok(None),
-            Entry::NotImage => return Err(not_image(path.display())),
-            Entry::Image(file) => file,
-        };
-        file.lock()?;
-        Self::plan(directory, name, file, step).map(Some)
-    }
-
     /// Plan the cuts of `file`, locked, from the runs its data occupies now.
     fn plan(
         directory: File,
@@ -292,7 +281,36 @@ pub fn release_file(path: &Path, step: StepExtents) -> io::Result<Released> {
         Opened::Busy => Ok(Released::Busy),
     }
 }
-
+/// Free the one committed release at `entry` in bounded steps and unlink it: the deletion child a
+/// releasing process starts on its entry (05_gateway.md, "Deleting released images"). A process
+/// that holds the entry is waited out, its holder named once per bound ([`lock_naming_holder`]),
+/// and what it left is finished: nothing, when it was another deletion that unlinked it
+/// ([`Released::Absent`], as when nothing is there). The
+/// directory and its parent are synced before the first cut and the directory after the unlink,
+/// as [`drain`] does. A link or any other non-regular file at `entry` refuses, untouched.
+pub fn free_committed(entry: &Path) -> io::Result<Released> {
+    let (directory, name) = match anchor(entry) {
+        Ok(anchored) => anchored,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Released::Absent),
+        Err(error) => return Err(error),
+    };
+    let file = match open_entry(&directory, &name)? {
+        Entry::Absent => return Ok(Released::Absent),
+        Entry::NotImage => return Err(not_image(entry.display())),
+        Entry::Image(file) => file,
+    };
+    lock_naming_holder(&file, entry, HOLDER_REPORT, say)?;
+    if file.metadata()?.nlink() == 0 {
+        return Ok(Released::Absent);
+    }
+    sync_held_directory(&directory)?;
+    if let Some(parent) = entry.parent().and_then(Path::parent) {
+        sync_held_directory(&open_directory_nofollow(parent)?)?;
+    }
+    let released = Release::plan(directory.try_clone()?, name, file, STEP_EXTENTS)?.finish()?;
+    sync_held_directory(&directory)?;
+    Ok(released)
+}
 /// What a directory entry a release would open turned out to be.
 enum Entry {
     Absent,
@@ -359,71 +377,82 @@ fn anchor(path: &Path) -> io::Result<(File, CString)> {
     ))
 }
 
+/// How long a wait for a released image's lock stays silent before it names the holder again.
+const HOLDER_REPORT: Duration = Duration::from_secs(90);
+
+/// Write one holder line on stderr.
+fn say(line: String) {
+    cowshed_os::eprintln!("{line}");
+}
+
+/// Wait in `flock(2)` for `file`, the released image at `entry`, which another process may hold.
+/// While it waits, `say` gets a line naming the holder at once and again at every `bound`, the
+/// holder read anew each time from the kernel, until the holder lets go and the lock is granted.
+fn lock_naming_holder(
+    file: &File,
+    entry: &Path,
+    bound: Duration,
+    say: impl Fn(String) + Send + 'static,
+) -> io::Result<()> {
+    match file.try_lock() {
+        Ok(()) => return Ok(()),
+        Err(fs::TryLockError::WouldBlock) => {}
+        Err(fs::TryLockError::Error(error)) => return Err(error),
+    }
+    let (granted, waiting) = mpsc::channel::<()>();
+    let path = entry.to_owned();
+    let reporter = std::thread::Builder::new()
+        .name("released-image-wait".to_owned())
+        .spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = {
+                say(format!(
+                    "cowshed: waiting for released image {}, which another process frees: {}",
+                    path.display(),
+                    crate::held_lock::holders(&path)
+                ));
+                waiting.recv_timeout(bound)
+            } {}
+        })?;
+    let locked = file.lock();
+    drop(granted);
+    let _ = reporter.join();
+    locked
+}
+
 fn c_name(name: &[u8]) -> io::Result<CString> {
     CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL"))
 }
 
-/// The directory, beside the images it journals, that holds each release an operation has
-/// committed and not yet finished: `build/.releasing/<id>.dmg`, `sessions/.releasing/<ws>-<inc>.dmg`
-/// (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5). An entry
-/// outlives its operation when a crash cut it short, or when the operation committed it
-/// [`Reclaim::Journaled`]; a [`drain`] finishes either.
-pub const JOURNAL_DIRECTORY: &str = ".releasing";
+/// The directory, beside the images it holds, where each released image waits for its deletion
+/// child, or the gateway's startup scan: `build/.deleting/<id>.dmg`, `sessions/.deleting/<name>.dmg`
+/// (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5; 05_gateway.md,
+/// "Deleting released images"). An entry exists from its operation's rename to its unlink; nothing
+/// mounts, forks, reads or names it in between.
+pub const DELETING_DIRECTORY: &str = ".deleting";
 
-/// Who frees an image whose release an operation commits (16_build_volumes.md, "Garbage
-/// collection").
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Reclaim {
-    /// The operation exists to release the image (`rm`, `gc`, a land's release of its target's
-    /// previous volume): it frees the image in bounded steps and unlinks it before it answers.
-    Now,
-    /// The operation only superseded the image on its way to something else (a fork's seed
-    /// refresh): the durable rename is the whole release, and the unlocked entry waits for the
-    /// next release-purpose operation of the project, `cowshed gc` or the daemon's start to
-    /// [`drain`] it. Nothing reaches the image after the rename, so nothing depends on its bytes
-    /// being freed; only the store's free space lags.
-    Journaled,
-}
-
-/// Release `image` inside the operation that owns it, crash-safely, and say whether an image was
-/// released.
+/// Commit the release of `image`, owned by the calling operation, to `entry` in its directory's
+/// [`DELETING_DIRECTORY`], crash-safely, and say whether an image was released.
 ///
-/// The commit is one rename of `image` to `entry`, in its directory's [`JOURNAL_DIRECTORY`],
-/// with every directory it touched synced: before it the image is its owner's and untouched,
-/// after it nothing finds the image by its name, so a cut never lands on an image that can still
-/// be mounted, forked or read. The image is opened and locked before the rename and stays locked
-/// through the rename's syncs, so a recovery that finds the entry leaves it until this operation
-/// is done with it: no cut lands before the rename is durable. With [`Reclaim::Now`] this
-/// operation keeps the lock, frees the image in bounded steps, unlinks it and syncs the journal,
-/// all before it returns, so its caller removes the owner record only once the bytes are gone.
-/// With [`Reclaim::Journaled`] it unlocks the durable entry and returns: its caller removes the
-/// owner record while the bytes wait in the journal. Every directory is held by descriptor and
-/// no entry is opened through a link: a link or any other non-regular file at either name
-/// refuses, untouched.
+/// The commit is one rename of `image` to `entry`, with every directory it touched synced: before
+/// it the image is its owner's and untouched, after it nothing finds the image by its name, so a
+/// cut never lands on an image that can still be mounted, forked or read. The image is opened and
+/// locked before the rename and stays locked through the rename's syncs, so a deleter that lists
+/// the entry leaves it until the rename is durable. Then the lock is dropped and this returns: the
+/// caller removes the owner record at once, and the bytes wait for the background deletion
+/// ([`drain`]). Every directory is held by descriptor and no entry is opened through a link: a link
+/// or any other non-regular file at either name refuses, untouched.
 ///
-/// An entry already under `entry` is the same image's committed release (an id and an
-/// incarnation are never reused). [`Reclaim::Now`] finishes it first, waiting out a recovery
-/// that has it: renaming over it would free it in one go. A retry after such a crash therefore
-/// finds no `image` and still answers `true`, as a [`Reclaim::Journaled`] retry does without
-/// freeing it.
-pub fn release_owned(image: &Path, entry: &Path, reclaim: Reclaim) -> io::Result<bool> {
+/// An entry already under `entry` is the same image's committed release (an id and an incarnation
+/// are never reused): a retry that finds no `image` makes that rename durable and still answers
+/// `true`, freeing nothing. The rename never replaces a file, because a rename over one frees the
+/// file it replaces in one go.
+pub fn commit_release(image: &Path, entry: &Path) -> io::Result<bool> {
     let anchors = Anchors::open(image, entry)?;
-    match reclaim {
-        Reclaim::Now => {
-            let left = anchors.finish_left()?;
-            let Some(file) = anchors.commit()? else {
-                return Ok(left);
-            };
-            anchors.release(file, STEP_EXTENTS)?.finish()?;
-            sync_held_directory(&anchors.journal)?;
-            Ok(true)
-        }
-        // The commit's syncs made the entry durable; dropping its descriptor unlocks it for
-        // whoever drains the journal.
-        Reclaim::Journaled => match anchors.commit()? {
-            Some(_committed) => Ok(true),
-            None => anchors.confirm_left(),
-        },
+    // The commit's syncs made the entry durable; dropping its descriptor unlocks it for the
+    // deleter.
+    match anchors.commit()? {
+        Some(_committed) => Ok(true),
+        None => anchors.confirm_left(),
     }
 }
 
@@ -468,29 +497,6 @@ impl Anchors {
         })
     }
 
-    /// Finish the entry a crash left under this release's name: `false` when none is there.
-    fn finish_left(&self) -> io::Result<bool> {
-        let file = match open_entry(&self.journal, &self.entry_name)? {
-            Entry::Absent => return Ok(false),
-            Entry::NotImage => return Err(not_image(self.entry_name.to_string_lossy())),
-            Entry::Image(file) => file,
-        };
-        file.lock()?;
-        // Its owner may have died between the rename and its syncs: made durable before a cut.
-        sync_held_directory(&self.journal)?;
-        sync_held_directory(&self.image_directory)?;
-        sync_held_directory(&self.journal_parent)?;
-        Release::plan(
-            self.journal.try_clone()?,
-            self.entry_name.clone(),
-            file,
-            STEP_EXTENTS,
-        )?
-        .finish()?;
-        sync_held_directory(&self.journal)?;
-        Ok(true)
-    }
-
     /// Make durable, without freeing it, the entry an earlier attempt committed under this
     /// release's name: `false` when none is there. That attempt may have died, or failed a sync,
     /// between its rename and the rename's syncs, and its caller removes the owner record once
@@ -507,16 +513,6 @@ impl Anchors {
         sync_held_directory(&self.image_directory)?;
         sync_held_directory(&self.journal_parent)?;
         Ok(true)
-    }
-
-    /// Plan the release of the entry [`Self::commit`] renamed, from its locked descriptor.
-    fn release(&self, file: Fenced<File>, step: StepExtents) -> io::Result<Release> {
-        Release::plan(
-            self.journal.try_clone()?,
-            self.entry_name.clone(),
-            file,
-            step,
-        )
     }
 
     /// Commit the image: open and lock it, rename it into the journal and make the rename
@@ -557,7 +553,7 @@ impl Anchors {
     }
 }
 
-/// What draining a directory of committed releases freed.
+/// What deleting released images freed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Drained {
     pub images: usize,
@@ -572,119 +568,156 @@ impl Drained {
     }
 }
 
-/// Finish every committed release in `directory` (a [`JOURNAL_DIRECTORY`], or a historical
-/// trash) whose name `selected` accepts, one at a time on the calling thread, each in bounded
-/// steps at normal disk priority. The directory is held by descriptor and refused when it is a
-/// link; each entry is opened in it without following a link. Only regular files whose names
-/// `is_entry` accepts are released; anything else is said and left, untouched. An entry another
-/// process is releasing is left to it, and one a crash left half-released is finished from its
-/// length. A directory that does not exist is empty; one that cannot be read refuses.
+/// directory it left where it was, with why. Values, not lines on stderr: its caller says them
+/// (the gateway's startup scan) or acts on them (an unbinding's plan).
+/// passes every few seconds and says each left entry once, not once a pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Pass {
+    pub drained: Drained,
+    pub left: Vec<Left>,
+}
+
+impl Pass {
+    pub fn add(&mut self, other: Self) {
+        self.drained.add(other.drained);
+        self.left.extend(other.left);
+    }
+
+    fn leave(&mut self, path: PathBuf, why: Why) {
+        self.left.push(Left { path, why });
+    }
+}
+
+/// An entry, or a whole directory of them, a deleter's pass left untouched.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Left {
+    pub path: PathBuf,
+    pub why: Why,
+}
+
+/// Why a deleter's pass left [`Left::path`].
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Why {
+    /// Not a regular file named as a released image: never opened through a link, never freed.
+    NotImage,
+    /// Another process holds the entry's lock: its owner's commit is still syncing, or another
+    /// deleter is freeing it.
+    Busy,
+    /// The directory could not be read or finished; its entries stay for the next pass.
+    Failed(String),
+}
+
+impl std::fmt::Display for Left {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = self.path.display();
+        match &self.why {
+            Why::NotImage => write!(formatter, "{path} is not a released image; it is left"),
+            Why::Busy => write!(
+                formatter,
+                "released image {path} is held by another process; it is left to that process"
+            ),
+            Why::Failed(error) => write!(formatter, "released images in {path} stay: {error}"),
+        }
+    }
+}
+
+/// Free every committed release in `directory` (a [`DELETING_DIRECTORY`]), one at a time on the
+/// calling thread, each in bounded steps at normal disk priority. The directory is held by
+/// descriptor and refused when it is a link; each entry is opened in it without following a link.
+/// Only regular files whose names `is_entry` accepts are released; anything else is left,
+/// untouched, and named in the pass. An entry another process holds is left to it, and one a crash
+/// or a stopped deleter left half-released is finished from its length. A directory that does not
+/// exist is empty; one that cannot be read refuses.
 ///
-/// Before its first cut the journal and its parent are synced: an entry's owner may have died
-/// between its rename and that rename's syncs, and a cut that outlived a rename a crash then
-/// undid would leave the image's own name on shortened bytes. A rename is one APFS transaction,
-/// which a full sync of the directory it entered makes durable; every entry listed was renamed
-/// before the listing, so one sync after it covers them all.
-pub fn drain(
-    directory: &Path,
-    is_entry: impl Fn(&str) -> bool,
-    selected: impl Fn(&str) -> bool,
-) -> io::Result<Drained> {
-    let held = match open_directory_nofollow(directory) {
-        Ok(held) => held,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Drained::default()),
+/// Before its first cut the directory and its parent are synced: an entry's owner may have died
+/// between its rename and that rename's syncs, and a cut that outlived a rename a crash then undid
+/// would leave the image's own name on shortened bytes. A rename is one APFS transaction, which a
+/// full sync of the directory it entered makes durable; every entry listed was renamed before the
+/// listing, so one sync after it covers them all. A pass that cuts nothing syncs nothing, so a
+/// deleter that finds only what it leaves costs a listing.
+pub fn drain(directory: &Path, is_entry: impl Fn(&str) -> bool) -> io::Result<Pass> {
+    let directory_fd = match open_directory_nofollow(directory) {
+        Ok(directory_fd) => directory_fd,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Pass::default()),
         Err(error) => return Err(error),
     };
     let entries = fs::read_dir(directory)?.collect::<io::Result<Vec<_>>>()?;
-    if !entries.is_empty() {
-        sync_held_directory(&held)?;
-        if let Some(parent) = directory.parent() {
-            sync_held_directory(&open_directory_nofollow(parent)?)?;
-        }
-    }
-    let mut drained = Drained::default();
+    let mut pass = Pass::default();
+    let mut synced = false;
     for entry in entries {
         let path = entry.path();
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
-            cowshed_os::eprintln!(
-                "cowshed: {} is not a released image; it is left",
-                path.display()
-            );
+            pass.leave(path, Why::NotImage);
             continue;
         };
-        if !selected(name) {
-            continue;
-        }
-        let file = match is_entry(name).then(|| open_entry(&held, &c_name(name.as_bytes())?)) {
-            Some(Ok(Entry::Absent)) => continue,
-            Some(Ok(Entry::Image(file))) => file,
-            Some(Ok(Entry::NotImage)) | None => {
-                cowshed_os::eprintln!(
-                    "cowshed: {} is not a released image; it is left",
-                    path.display()
-                );
-                continue;
-            }
-            Some(Err(error)) => return Err(error),
-        };
+        let file =
+            match is_entry(name).then(|| open_entry(&directory_fd, &c_name(name.as_bytes())?)) {
+                Some(Ok(Entry::Absent)) => continue,
+                Some(Ok(Entry::Image(file))) => file,
+                Some(Ok(Entry::NotImage)) | None => {
+                    pass.leave(path, Why::NotImage);
+                    continue;
+                }
+                Some(Err(error)) => return Err(error),
+            };
         match file.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
-                cowshed_os::eprintln!(
-                    "cowshed: released image {} is being freed by another process; it is left to that release",
-                    path.display()
-                );
+                pass.leave(path, Why::Busy);
                 continue;
             }
             Err(fs::TryLockError::Error(error)) => return Err(error),
         }
+        if !synced {
+            sync_held_directory(&directory_fd)?;
+            if let Some(parent) = directory.parent() {
+                sync_held_directory(&open_directory_nofollow(parent)?)?;
+            }
+            synced = true;
+        }
         let release = Release::plan(
-            held.try_clone()?,
+            directory_fd.try_clone()?,
             c_name(name.as_bytes())?,
             file,
             STEP_EXTENTS,
         )?;
         if let Released::Freed { bytes, .. } = release.finish()? {
-            drained.add(Drained { images: 1, bytes });
+            pass.drained.add(Drained { images: 1, bytes });
         }
     }
-    if drained.images > 0 {
-        sync_held_directory(&held)?;
+    if pass.drained.images > 0 {
+        sync_held_directory(&directory_fd)?;
     }
-    Ok(drained)
+    Ok(pass)
 }
 
 /// [`drain`] the directory `<project>/<images>/<namespace>` of every project in the store at
-/// `store` (`<store>/<owner>/<repo>`), summed. A project whose directory cannot be drained is
-/// said and skipped, so one unreadable project never holds back the rest.
+/// `store` (`<store>/<owner>/<repo>`), summed. A directory that cannot be listed or drained is
+/// left in the pass, so one unreadable project never holds back the rest.
 pub fn drain_store(
     store: &Path,
     images: &str,
     namespace: &str,
     is_entry: impl Fn(&str) -> bool,
-) -> Drained {
-    let mut drained = Drained::default();
+) -> Pass {
+    let mut pass = Pass::default();
+    let failed = |path: &Path, error: io::Error| Left {
+        path: path.to_owned(),
+        why: Why::Failed(error.to_string()),
+    };
     let owners = match fs::read_dir(store) {
         Ok(owners) => owners,
         Err(error) => {
-            cowshed_os::eprintln!(
-                "cowshed: cannot list the store {} for released images: {error}",
-                store.display()
-            );
-            return drained;
+            pass.left.push(failed(store, error));
+            return pass;
         }
-    };
-    let skipped = |what: &str, error: io::Error| {
-        cowshed_os::eprintln!(
-            "cowshed: released images under {what} stay: it cannot be listed: {error}"
-        );
     };
     for owner in owners {
         let owner = match owner {
             Ok(owner) => owner.path(),
             Err(error) => {
-                skipped(&store.display().to_string(), error);
+                pass.left.push(failed(store, error));
                 continue;
             }
         };
@@ -693,29 +726,28 @@ pub fn drain_store(
             // A file beside the owners (`host.json`) holds no projects.
             Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => continue,
             Err(error) => {
-                skipped(&owner.display().to_string(), error);
+                pass.left.push(failed(&owner, error));
                 continue;
             }
         };
         for repo in repos {
-            let repo = match repo {
-                Ok(repo) => repo.path(),
+            let repo = match repo.and_then(|repo| Ok((repo.file_type()?, repo.path()))) {
+                // A file beside an owner's projects (`.cowshed-owner`) holds no project.
+                Ok((kind, _)) if !kind.is_dir() => continue,
+                Ok((_, repo)) => repo,
                 Err(error) => {
-                    skipped(&owner.display().to_string(), error);
+                    pass.left.push(failed(&owner, error));
                     continue;
                 }
             };
             let directory = repo.join(images).join(namespace);
-            match drain(&directory, &is_entry, |_| true) {
-                Ok(project) => drained.add(project),
-                Err(error) => cowshed_os::eprintln!(
-                    "cowshed: released images in {} stay: {error}",
-                    directory.display()
-                ),
+            match drain(&directory, &is_entry) {
+                Ok(project) => pass.add(project),
+                Err(error) => pass.left.push(failed(&directory, error)),
             }
         }
     }
-    drained
+    pass
 }
 
 #[cfg(test)]
@@ -884,114 +916,115 @@ mod tests {
         );
     }
 
-    /// The crash the journal exists for: an owner commits its image, makes the first cut and
-    /// dies. Nothing finds the image by its name any more; recovery finishes the release from
-    /// what the cut left, and so does the owner's own retry, which still answers that it
-    /// released the image. While the owner holds the committed entry, from before its rename,
-    /// recovery leaves it uncut.
+    /// The crash the deleting directory exists for. While the owner holds its committed entry,
+    /// from before its rename through the rename's syncs, a deleter leaves it uncut and names it
+    /// busy. Then a deleter makes the first cut and stops (a gateway restart): nothing finds the
+    /// image by its name, and the next pass finishes the release from what the cut left. The
+    /// owner's retry after that finds nothing to release.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_release_cut_short_after_its_first_cut_is_finished_by_recovery_or_its_retry() {
+    fn a_release_a_stopped_deleter_cut_short_is_finished_by_the_next_pass() {
         use crate::storage::apfs::extents::count_extents;
         use crate::storage::apfs::extents::tests::{fragmented_sparse_file, scratch};
 
         let any = |name: &str| name.ends_with(".dmg");
-        let crash_after_first_cut = |test: &str| {
-            let root = scratch(test);
-            let (image, _) = fragmented_sparse_file(&root.0);
-            assert!(count_extents(&image).expect("count").get() >= 256);
-            let entry = root.0.join(JOURNAL_DIRECTORY).join("image.dmg");
-            let anchors = Anchors::open(&image, &entry).expect("anchors");
-            let committed = anchors.commit().expect("commit").expect("the image");
-            let mut owner = anchors.release(committed, step(32)).expect("plan");
-            assert!(!image.exists(), "the commit takes the image off its name");
-            let length = fs::metadata(&entry).expect("stat").len();
-            let journal = entry.parent().expect("journal");
-            assert_eq!(
-                drain(journal, any, any).expect("a recovery beside the owner"),
-                Drained::default()
-            );
-            assert_eq!(
-                fs::metadata(&entry).expect("stat").len(),
-                length,
-                "recovery never cuts an entry its owner holds"
-            );
-            let cut = owner.step().expect("cut").expect("a cut is left");
-            assert!(cut < length, "the first cut shortens the entry");
-            drop(owner);
-            assert!(entry.exists(), "the crash leaves the entry");
-            (root, image, entry)
+        let root = scratch("deleting-restart");
+        let (image, _) = fragmented_sparse_file(&root.0);
+        assert!(count_extents(&image).expect("count").get() >= 256);
+        let entry = root.0.join(DELETING_DIRECTORY).join("image.dmg");
+        let journal = entry.parent().expect("deleting directory").to_owned();
+        let anchors = Anchors::open(&image, &entry).expect("anchors");
+        let committed = anchors.commit().expect("commit").expect("the image");
+        assert!(!image.exists(), "the commit takes the image off its name");
+        let length = fs::metadata(&entry).expect("stat").len();
+        let beside_owner = drain(&journal, any).expect("a deleter beside the owner");
+        assert_eq!(beside_owner.drained, Drained::default());
+        assert_eq!(
+            beside_owner.left,
+            vec![Left {
+                path: entry.clone(),
+                why: Why::Busy
+            }]
+        );
+        assert_eq!(
+            fs::metadata(&entry).expect("stat").len(),
+            length,
+            "a deleter never cuts an entry its owner holds"
+        );
+        drop(committed);
+
+        let Opened::Release(mut stopped) = Release::open(&entry, step(32)).expect("open") else {
+            panic!("the committed entry opens for a deleter once its owner lets go");
         };
+        let cut = stopped.step().expect("cut").expect("a cut is left");
+        assert!(cut < length, "the first cut shortens the entry");
+        drop(stopped);
+        assert!(entry.exists(), "the stop leaves the entry");
 
-        let (_recovered, image, entry) = crash_after_first_cut("journal-recovery");
-        let journal = entry.parent().expect("journal");
-        let drained = drain(journal, any, any).expect("recover");
-        assert_eq!(drained.images, 1);
-        assert!(drained.bytes > 0, "recovery frees what the cut left");
-        assert!(!entry.exists(), "recovery finishes the release");
+        let pass = drain(&journal, any).expect("the next pass");
+        assert_eq!(pass.drained.images, 1);
         assert!(
-            !release_owned(&image, &entry, Reclaim::Now).expect("a later retry"),
-            "nothing is left for a retry after recovery"
+            pass.drained.bytes > 0,
+            "the next pass frees what the cut left"
         );
-
-        let (_retried, image, entry) = crash_after_first_cut("journal-retry");
+        assert!(pass.left.is_empty(), "{pass:?}");
+        assert!(!entry.exists(), "the next pass finishes the release");
         assert!(
-            release_owned(&image, &entry, Reclaim::Now).expect("retry"),
-            "the owner's retry finishes its own committed release"
+            !commit_release(&image, &entry).expect("a later retry"),
+            "nothing is left for the owner's retry"
         );
-        assert!(!entry.exists() && !image.exists());
     }
 
-    /// A journaled release is committed when it returns and freed later: the image is off its
-    /// name, the entry keeps every byte and its lock is free, so the next drain finishes it
-    /// rather than leaving it to an owner that has moved on. A retry finds the commit and frees
-    /// nothing.
+    /// A release is committed when it returns and freed later: the image is off its name, the
+    /// entry keeps every byte and its lock is free, so the deleter's next pass frees it rather than
+    /// leaving it to an owner that has moved on. A retry finds the commit and frees nothing.
     #[test]
-    fn a_journaled_release_commits_and_leaves_the_entry_whole_for_the_drain() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-release-journaled-{}",
-            uuid::Uuid::new_v4()
-        ));
+    fn a_release_commits_and_leaves_the_entry_whole_for_the_deleter() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-release-commit-{}", uuid::Uuid::new_v4()));
         let images = root.join("images");
         fs::create_dir_all(&images).expect("images");
         let image = images.join("image.dmg");
         fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
-        let entry = images.join(JOURNAL_DIRECTORY).join("image.dmg");
+        let entry = images.join(DELETING_DIRECTORY).join("image.dmg");
 
-        assert!(release_owned(&image, &entry, Reclaim::Journaled).expect("commit"));
+        assert!(commit_release(&image, &entry).expect("commit"));
         assert!(!image.exists(), "the commit takes the image off its name");
         assert_eq!(
             fs::read(&entry).expect("the entry"),
             vec![9_u8; 64 * 1024],
-            "a journaled release frees nothing before it returns"
+            "a release frees nothing before it returns"
         );
         fs::File::open(&entry)
             .expect("open the entry")
             .try_lock()
-            .expect("the entry is left unlocked for the drain");
+            .expect("the entry is left unlocked for the deleter");
         assert!(
-            release_owned(&image, &entry, Reclaim::Journaled).expect("retry"),
+            commit_release(&image, &entry).expect("retry"),
             "a retry answers the commit already made"
         );
-        assert!(entry.exists(), "a journaled retry frees nothing either");
+        assert!(entry.exists(), "a retry frees nothing either");
 
         let any = |name: &str| name.ends_with(".dmg");
-        let drained = drain(entry.parent().expect("journal"), any, any).expect("drain");
-        assert_eq!(drained.images, 1);
-        assert!(!entry.exists(), "the drain finishes the journaled release");
+        let pass = drain(entry.parent().expect("deleting directory"), any).expect("drain");
+        assert_eq!(pass.drained.images, 1);
+        assert!(!entry.exists(), "the deleter frees the committed release");
         fs::remove_dir_all(&root).expect("clean up");
     }
 
-    /// A link at the entry's name, at the image's name, or in place of the journal never leads a
-    /// release to another file: each refuses, or is left by recovery, and the file it names keeps
-    /// every byte. Nor does anything but a regular file get committed.
+    /// A link at the entry's name, at the image's name, or in place of the deleting directory never
+    /// leads a release to another file: each refuses, or is left by the deleter and named, and the
+    /// file it names keeps every byte. Nor does anything but a regular file get committed. A pass
+    /// that frees nothing syncs nothing, so a deleter passing over what it leaves costs a listing.
     #[test]
     fn a_release_never_frees_through_a_link_or_anything_but_a_regular_file() {
+        use cowshed_os::fsio::take_syncs;
+
         let root =
             std::env::temp_dir().join(format!("cowshed-release-links-{}", uuid::Uuid::new_v4()));
         let images = root.join("images");
-        let journal = images.join(JOURNAL_DIRECTORY);
-        fs::create_dir_all(&journal).expect("journal");
+        let journal = images.join(DELETING_DIRECTORY);
+        fs::create_dir_all(&journal).expect("deleting directory");
         let foreign = root.join("foreign.dmg");
         fs::write(&foreign, vec![7_u8; 64 * 1024]).expect("foreign file");
         let image = images.join("image.dmg");
@@ -1001,50 +1034,62 @@ mod tests {
             assert_eq!(fs::read(path).expect("read"), vec![byte; 64 * 1024]);
         };
 
-        // A link where a crash's entry would be.
+        // A link where an earlier commit's entry would be.
         std::os::unix::fs::symlink(&foreign, &entry).expect("entry link");
-        assert!(release_owned(&image, &entry, Reclaim::Now).is_err());
+        assert!(commit_release(&image, &entry).is_err());
         intact(&foreign, 7);
         intact(&image, 9);
         let any = |name: &str| name.ends_with(".dmg");
+        take_syncs();
         assert_eq!(
-            drain(&journal, any, any).expect("recovery"),
-            Drained::default()
+            drain(&journal, any).expect("the deleter"),
+            Pass {
+                drained: Drained::default(),
+                left: vec![Left {
+                    path: entry.clone(),
+                    why: Why::NotImage
+                }],
+            }
+        );
+        assert_eq!(
+            take_syncs().full,
+            0,
+            "a pass that frees nothing syncs nothing"
         );
         intact(&foreign, 7);
         assert!(
             fs::symlink_metadata(&entry).is_ok(),
-            "recovery leaves the link"
+            "the deleter leaves the link"
         );
         fs::remove_file(&entry).expect("drop the entry link");
 
         // A link at the image's name.
         fs::remove_file(&image).expect("drop the image");
         std::os::unix::fs::symlink(&foreign, &image).expect("image link");
-        assert!(release_owned(&image, &entry, Reclaim::Now).is_err());
+        assert!(commit_release(&image, &entry).is_err());
         intact(&foreign, 7);
         assert!(!entry.exists(), "nothing was committed");
         fs::remove_file(&image).expect("drop the image link");
 
         // A directory at the image's name.
         fs::create_dir(&image).expect("image directory");
-        assert!(release_owned(&image, &entry, Reclaim::Now).is_err());
+        assert!(commit_release(&image, &entry).is_err());
         assert!(image.is_dir() && !entry.exists());
         fs::remove_dir(&image).expect("drop the image directory");
 
-        // A link in place of the journal.
+        // A link in place of the deleting directory.
         fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
         let elsewhere = root.join("elsewhere");
         fs::create_dir(&elsewhere).expect("elsewhere");
-        fs::remove_dir(&journal).expect("drop the journal");
-        std::os::unix::fs::symlink(&elsewhere, &journal).expect("journal link");
-        assert!(release_owned(&image, &entry, Reclaim::Now).is_err());
+        fs::remove_dir(&journal).expect("drop the deleting directory");
+        std::os::unix::fs::symlink(&elsewhere, &journal).expect("deleting directory link");
+        assert!(commit_release(&image, &entry).is_err());
         intact(&image, 9);
         assert_eq!(fs::read_dir(&elsewhere).expect("elsewhere").count(), 0);
         fs::write(elsewhere.join("other.dmg"), b"kept").expect("other");
         assert!(
-            drain(&journal, any, any).is_err(),
-            "a linked journal refuses"
+            drain(&journal, any).is_err(),
+            "a linked deleting directory refuses"
         );
         assert_eq!(
             fs::read(elsewhere.join("other.dmg")).expect("other"),
@@ -1054,9 +1099,10 @@ mod tests {
     }
 
     /// An owner that died between its commit's rename and that rename's syncs leaves an entry a
-    /// crash could still put back under the image's name. Recovery and the owner's own retry each
-    /// sync the journal and the directories around it, under the entry's lock, before their first
-    /// cut, and the journal again once the entry is unlinked.
+    /// crash could still put back under the image's name. The deleter syncs the deleting directory
+    /// and its parent, under the entry's lock, before its first cut, and the directory again once
+    /// the entry is unlinked. The owner's retry answers its earlier commit only once that rename
+    /// is durable, and frees none of it.
     #[test]
     fn a_rename_its_owner_never_synced_is_made_durable_before_the_first_cut() {
         use cowshed_os::fsio::take_syncs;
@@ -1064,8 +1110,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("cowshed-release-unsynced-{}", uuid::Uuid::new_v4()));
         let images = root.join("images");
-        let journal = images.join(JOURNAL_DIRECTORY);
-        fs::create_dir_all(&journal).expect("journal");
+        let journal = images.join(DELETING_DIRECTORY);
+        fs::create_dir_all(&journal).expect("deleting directory");
         let image = images.join("image.dmg");
         let entry = journal.join("image.dmg");
         let any = |name: &str| name.ends_with(".dmg");
@@ -1073,53 +1119,35 @@ mod tests {
         fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
         fs::rename(&image, &entry).expect("the owner's rename, never synced");
         take_syncs();
-        let drained = drain(&journal, any, any).expect("recover");
-        assert_eq!(drained.images, 1);
+        let pass = drain(&journal, any).expect("the deleter");
+        assert_eq!(pass.drained.images, 1);
         assert!(!entry.exists());
         let syncs = take_syncs();
         assert_eq!(
             syncs.full, 3,
-            "the journal and its parent before the cut, the journal after the unlink: {syncs:?}"
+            "the directory and its parent before the cut, the directory after the unlink: {syncs:?}"
         );
 
         fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
         fs::rename(&image, &entry).expect("the owner's rename, never synced");
         take_syncs();
-        assert!(release_owned(&image, &entry, Reclaim::Now).expect("the owner's retry"));
-        assert!(!entry.exists());
-        let syncs = take_syncs();
-        assert_eq!(
-            syncs.full, 4,
-            "the journal, the image's directory and the journal's parent before the cut, the journal after: {syncs:?}"
-        );
-
-        // A journaled owner's retry answers its earlier commit only once that rename is durable,
-        // and frees none of it.
-        fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
-        fs::rename(&image, &entry).expect("the journaled owner's rename, never synced");
-        take_syncs();
-        assert!(
-            release_owned(&image, &entry, Reclaim::Journaled).expect("the journaled owner's retry")
-        );
+        assert!(commit_release(&image, &entry).expect("the owner's retry"));
         let syncs = take_syncs();
         assert_eq!(
             syncs.full, 3,
-            "the journal, the image's directory and the journal's parent: {syncs:?}"
+            "the deleting directory, the image's directory and their parent: {syncs:?}"
         );
         assert_eq!(fs::read(&entry).expect("the entry"), vec![9_u8; 64 * 1024]);
 
-        // Another releaser holding the entry, paused before its own syncs, is no proof the rename
-        // is durable: the retry still makes it so before it answers, and cuts nothing.
+        // A deleter holding the entry, paused before its own syncs, is no proof the rename is
+        // durable: the retry still makes it so before it answers, and cuts nothing.
         fs::remove_file(&entry).expect("drop the entry");
         fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
         fs::rename(&image, &entry).expect("a rename nobody synced");
-        let releaser = fs::File::open(&entry).expect("the other releaser's descriptor");
-        releaser.lock().expect("the other releaser holds the entry");
+        let releaser = fs::File::open(&entry).expect("the deleter's descriptor");
+        releaser.lock().expect("the deleter holds the entry");
         take_syncs();
-        assert!(
-            release_owned(&image, &entry, Reclaim::Journaled)
-                .expect("the retry beside a held entry")
-        );
+        assert!(commit_release(&image, &entry).expect("the retry beside a held entry"));
         let syncs = take_syncs();
         assert_eq!(
             syncs.full, 3,
@@ -1127,6 +1155,47 @@ mod tests {
         );
         assert_eq!(fs::read(&entry).expect("the entry"), vec![9_u8; 64 * 1024]);
         drop(releaser);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A wait for a released image another process holds names that holder at once and again at
+    /// every bound until the holder lets go; then the lock is granted. The lines are read as they
+    /// arrive, with the bound set to a millisecond.
+    #[test]
+    fn a_lock_wait_names_its_holder_once_per_bound_until_it_lets_go() {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-release-holder-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("root");
+        let entry = root.join("image.dmg");
+        fs::write(&entry, vec![9_u8; 4096]).expect("entry");
+        let holder = fs::File::open(&entry).expect("the holder's descriptor");
+        holder.lock().expect("the holder takes the entry");
+
+        let (lines, said) = mpsc::channel();
+        let waiter = std::thread::spawn({
+            let entry = entry.clone();
+            move || {
+                let file = fs::File::open(&entry).expect("the waiter's descriptor");
+                lock_naming_holder(&file, &entry, Duration::from_millis(1), move |line| {
+                    let _ = lines.send(line);
+                })
+            }
+        });
+        for _ in 0..2 {
+            let line = said.recv().expect("a holder line");
+            assert!(
+                line.starts_with(&format!(
+                    "cowshed: waiting for released image {}",
+                    entry.display()
+                )),
+                "{line}"
+            );
+        }
+        drop(holder);
+        waiter
+            .join()
+            .expect("the waiter")
+            .expect("the lock is granted once the holder lets go");
         fs::remove_dir_all(&root).expect("cleanup");
     }
 }

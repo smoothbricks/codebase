@@ -1624,9 +1624,10 @@ impl DirectoryExecutionHost {
                         .reclaimed
                         .checked_add(1)
                         .ok_or(ApfsStorageError::InvalidPlan("GC count overflow"))?;
-                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
-                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
-                    )?;
+                    report.released_bytes =
+                        report.released_bytes.checked_add(candidate.bytes()).ok_or(
+                            ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                        )?;
                 }
                 Err(error) if gc_candidate_failure_is_fatal(&error) => return Err(error),
                 Err(error) => report.deferred.push(StorageGcDeferred {

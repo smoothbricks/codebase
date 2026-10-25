@@ -3169,17 +3169,114 @@ enum ReleasedFirst {
     /// Every build volume's image and record, which the unbinding releases once main is retired,
     /// main's linked volume and seed included.
     BuildVolumes,
+    /// Only its deleting directories, whose entries the unbinding moves out first
+    /// ([`move_terminal_releases`]).
+    Deleting,
 }
 
 #[cfg(target_os = "macos")]
 impl ReleasedFirst {
-    fn exempts(self, entry: &std::ffi::OsStr) -> bool {
-        match self {
-            Self::Nothing => false,
-            Self::MainsOwn => entry == main_name().as_str(),
-            Self::BuildVolumes => crate::build_volume::VolumeFile::of(entry).is_some(),
+    fn exempts(self, tree: &str, entry: &std::ffi::OsStr) -> bool {
+        let deleting = TERMINAL_DELETING
+            .iter()
+            .any(|deleting| deleting.tree == tree && entry == deleting.directory);
+        deleting
+            || match self {
+                Self::Nothing | Self::Deleting => false,
+                Self::MainsOwn => entry == main_name().as_str(),
+                Self::BuildVolumes => crate::build_volume::VolumeFile::of(entry).is_some(),
+            }
+    }
+}
+
+/// Every directory of a project's store tree that released images wait in, with the names of
+/// those images (05_gateway.md, "Deleting released images").
+#[cfg(target_os = "macos")]
+const TERMINAL_DELETING: [DeletingDirectory; 2] = [
+    DeletingDirectory {
+        tree: crate::build_volume::IMAGES_DIRECTORY,
+        directory: crate::storage::apfs::release::DELETING_DIRECTORY,
+        is_entry: crate::build_volume::is_image_name,
+    },
+    DeletingDirectory {
+        tree: crate::repository::SESSIONS_DIRECTORY,
+        directory: crate::storage::apfs::release::DELETING_DIRECTORY,
+        is_entry: crate::storage::apfs::is_deleting_image_name,
+    },
+];
+
+/// One directory released images wait in: the terminal storage tree it is in, its name there, and
+/// which of its entries are released images.
+#[cfg(target_os = "macos")]
+struct DeletingDirectory {
+    tree: &'static str,
+    directory: &'static str,
+    is_entry: fn(&str) -> bool,
+}
+
+/// Move every released image the project's tree still holds into the store's own `.deleting`
+/// under a fresh name, and start each one's deletion child with `deletion_child` (05_gateway.md,
+/// "Deleting released images"): the unbinding deletes these trees, and frees nothing itself. One a
+/// child is freeing moves with it: the child holds the open file, not the name. Anything there that
+/// is not a released image stays, for the terminal plan to refuse naming it.
+#[cfg(target_os = "macos")]
+fn move_terminal_releases(project_root: &Path, deletion_child: Option<&Path>) -> Result<()> {
+    let failed = |what: &str, path: &Path, error: std::io::Error| {
+        CowshedError::environment_missing(
+            format!("cannot {what} {}: {error}", path.display()),
+            "check controller storage permissions and retry",
+        )
+    };
+    let store = project_root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            CowshedError::internal(format!(
+                "{} is not a project of a store",
+                project_root.display()
+            ))
+        })?;
+    let target = crate::storage::apfs::deleter::store_deleting(store);
+    for deleting in TERMINAL_DELETING {
+        let directory = project_root.join(deleting.tree).join(deleting.directory);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(failed("list released images in", &directory, error)),
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| failed("list released images in", &directory, error))?;
+            let released = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| (deleting.is_entry)(name))
+                && entry
+                    .file_type()
+                    .is_ok_and(|kind| kind.is_file() || kind.is_dir());
+            if !released {
+                continue;
+            }
+            std::fs::create_dir_all(&target).map_err(|error| failed("create", &target, error))?;
+            let moved = target.join(format!(
+                "{}.{}",
+                crate::build_volume::BuildVolumeId::mint(),
+                cowshed_apfs::image::IMAGE_EXTENSION
+            ));
+            std::fs::rename(entry.path(), &moved)
+                .map_err(|error| failed("move the released image", &entry.path(), error))?;
+            for synced in [&target, &directory] {
+                cowshed_os::fsio::open_directory_nofollow(synced)
+                    .and_then(|held| cowshed_os::fsio::sync_held_directory(&held))
+                    .map_err(|error| failed("sync", synced, error))?;
+            }
+            if let Some(program) = deletion_child {
+                crate::storage::apfs::deleter::delete_in_background(program, &moved)
+                    .map_err(|error| failed("start the deletion of", &moved, error))?;
+            }
         }
     }
+    Ok(())
 }
 
 /// The project store trees an unbinding deletes once main is retired and its build volumes are
@@ -3200,7 +3297,7 @@ const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
     ),
     (
         crate::repository::SESSIONS_DIRECTORY,
-        ReleasedFirst::Nothing,
+        ReleasedFirst::Deleting,
     ),
     (
         crate::build_volume::IMAGES_DIRECTORY,
@@ -3249,7 +3346,7 @@ fn require_terminal_storage(project_root: &Path) -> Result<()> {
                         "check controller storage permissions and retry",
                     )
                 })?;
-                if !released.exempts(&entry.file_name()) {
+                if !released.exempts(name, &entry.file_name()) {
                     plan_terminal_storage_tree(&entry.path(), &mut plan)?;
                 }
             }
@@ -3274,7 +3371,12 @@ fn require_terminal_storage(project_root: &Path) -> Result<()> {
 /// planned before one entry is removed, so a refusal names what blocks it and leaves the rest as
 /// it found it.
 #[cfg(target_os = "macos")]
-fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result<()> {
+fn clean_terminal_project_storage(
+    project_root: &Path,
+    binding: &Path,
+    deletion_child: Option<&Path>,
+) -> Result<()> {
+    move_terminal_releases(project_root, deletion_child)?;
     let mut plan = Vec::new();
     for (name, _) in TERMINAL_STORAGE_TREES {
         plan_terminal_storage_tree(&project_root.join(name), &mut plan)?;
@@ -3343,6 +3445,7 @@ fn remove_project_mount_trees(paths: &crate::repository::ProjectPaths) -> Result
 pub(crate) fn finish_restored_project_unbinding(
     paths: &crate::repository::ProjectPaths,
     expected: &RepositoryBinding,
+    deletion_child: Option<&Path>,
     observe: &mut impl FnMut(UnbindCheckpoint) -> Result<()>,
 ) -> Result<()> {
     let path = &paths.repository_binding;
@@ -3398,7 +3501,7 @@ pub(crate) fn finish_restored_project_unbinding(
         }
     };
     // Failure-prone storage and mount cleanup happens while controller authority still exists.
-    clean_terminal_project_storage(&paths.project_root, path)?;
+    clean_terminal_project_storage(&paths.project_root, path, deletion_child)?;
     remove_project_mount_trees(paths)?;
     if bound {
         observe(UnbindCheckpoint::BeforeBindingRemoval)?;
@@ -3884,11 +3987,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 )
             })?;
         }
-        let config = crate::storage::apfs::ApfsSubstrateConfig::new(
-            storage.namespace(),
-            storage.store(),
-            &git_root,
-        );
+        let config = crate::storage::apfs::ApfsSubstrateConfig::for_storage(&storage, &git_root);
         let host = host_factory(config.clone()).map_err(native_storage_error)?;
         let lifecycle_intents_path = layout
             .project()
@@ -8583,8 +8682,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();
+        let deletion_child = self.substrate.config().deletion_child.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            finish_restored_project_unbinding(&paths, expected.as_ref(), &mut |_| Ok(()))
+            finish_restored_project_unbinding(
+                &paths,
+                expected.as_ref(),
+                deletion_child.as_deref(),
+                &mut |_| Ok(()),
+            )
         })
         .await
         .map_err(|error| {
@@ -14286,7 +14391,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             let abandoned_refs = self
                 .sweep_abandoned_refs(options.supersede.as_ref(), false)
                 .await?;
-            let freed_bytes = candidates
+            let released_bytes = candidates
                 .iter()
                 .try_fold(0_u64, |sum, candidate| sum.checked_add(candidate.bytes))
                 .ok_or_else(|| CowshedError::internal("GC candidate byte accounting overflow"))?;
@@ -14299,7 +14404,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 retained_active: u64::try_from(plan.retained_active())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
-                freed_bytes: freed_bytes.saturating_add(build.freed_bytes),
+                released_bytes: released_bytes.saturating_add(build.released_bytes),
                 dry_run: true,
                 deferred: build
                     .deferred
@@ -14402,35 +14507,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 crate::exec::profile_directory(&store_root).display()
             ),
         }
-        // Finish, before answering, the build releases a fork's seed refresh journaled or a crash
-        // cut short, and the historical trash earlier builds left: failure here must not report a
-        // completed physical collection.
-        let mut drained = self.build_volumes()?.finish_releases().await?;
-        let trash = self.build_volume_layout()?.trash();
-        drained.add(
-            tokio::task::spawn_blocking(move || {
-                crate::build_volume::drain_released(&trash).map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot finish releasing build images in {}: {error}",
-                            trash.display()
-                        ),
-                        "repair the named path, then retry cowshed gc",
-                    )
-                })
-            })
-            .await
-            .map_err(|error| {
-                CowshedError::internal(format!("build image release task failed: {error}"))
-            })??,
-        );
-        if drained.images > 0 {
-            cowshed_os::eprintln!(
-                "cowshed: gc released {} build volume image(s), {} bytes, that an interrupted operation or an earlier build left",
-                drained.images,
-                drained.bytes
-            );
-        }
         Ok(GcReport {
             examined: u64::try_from(report.examined)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?
@@ -14442,7 +14518,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
             retained_active: u64::try_from(report.retained_active)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
-            freed_bytes: report.freed_bytes.saturating_add(build.freed_bytes),
+            released_bytes: report.released_bytes.saturating_add(build.released_bytes),
             dry_run: false,
             candidates: candidates.into_iter().chain(build.candidates).collect(),
             abandoned_refs,
@@ -26519,7 +26595,7 @@ mod terminal_project_cleanup_tests {
         std::fs::write(&binding, b"binding").expect("binding");
         std::fs::write(root.join("policy.json"), b"preserve").expect("policy");
 
-        clean_terminal_project_storage(&root, &binding).expect("terminal cleanup");
+        clean_terminal_project_storage(&root, &binding, None).expect("terminal cleanup");
         assert!(binding.is_file());
         assert_eq!(
             std::fs::read(root.join("policy.json")).expect("policy"),
@@ -26541,7 +26617,7 @@ mod terminal_project_cleanup_tests {
         std::fs::write(&image, b"image").expect("retained image");
         std::fs::write(&binding, b"binding").expect("binding");
 
-        let error = clean_terminal_project_storage(&root, &binding)
+        let error = clean_terminal_project_storage(&root, &binding, None)
             .expect_err("unreclaimed image must block binding cleanup");
         assert_eq!(error.code.as_str(), "integrity");
         assert_eq!(std::fs::read(&image).expect("image preserved"), b"image");
@@ -26560,7 +26636,7 @@ mod terminal_project_cleanup_tests {
     }
 
     fn finish_unbinding(paths: &ProjectPaths) -> crate::Result<()> {
-        finish_restored_project_unbinding(paths, &test_binding(), &mut |_| Ok(()))
+        finish_restored_project_unbinding(paths, &test_binding(), None, &mut |_| Ok(()))
     }
     /// A store root and a mount root side by side under one scratch directory, the way the
     /// host lays them out, holding one project each.
@@ -26651,7 +26727,7 @@ mod terminal_project_cleanup_tests {
             std::fs::write(&paths.checkout_root, b"checkout root").unwrap();
             let journal = paths.project_root.join("lifecycle-intents.json");
             let before = std::fs::read(&journal).unwrap();
-            let result = finish_restored_project_unbinding(&paths, &binding, &mut |step| {
+            let result = finish_restored_project_unbinding(&paths, &binding, None, &mut |step| {
                 if step == stop {
                     return Err(crate::CowshedError::internal("interrupted unbinding"));
                 }
@@ -26669,7 +26745,7 @@ mod terminal_project_cleanup_tests {
             );
             assert!(paths.checkout_root.is_file());
             let mut observed_durable = false;
-            finish_restored_project_unbinding(&paths, &binding, &mut |step| {
+            finish_restored_project_unbinding(&paths, &binding, None, &mut |step| {
                 if step == UnbindCheckpoint::BindingDurable {
                     observed_durable = true;
                     assert!(!paths.repository_binding.exists());
@@ -26811,7 +26887,7 @@ mod terminal_project_cleanup_tests {
             .expect("stale image lock record");
         require_terminal_storage(&paths.project_root)
             .expect("a recorded lease or image lock is a lock, not a retained artifact");
-        clean_terminal_project_storage(&paths.project_root, &paths.repository_binding)
+        clean_terminal_project_storage(&paths.project_root, &paths.repository_binding, None)
             .expect("the purge removes every lease and image lock as a lock");
         assert!(!stale.exists() && !main_lease.exists());
         assert!(!held_image.exists() && !stale_image.exists());
@@ -26852,9 +26928,66 @@ mod terminal_project_cleanup_tests {
             .expect("orphan hold");
         std::fs::write(&binding, b"binding").expect("binding");
 
-        clean_terminal_project_storage(&root, &binding).expect("terminal cleanup");
+        clean_terminal_project_storage(&root, &binding, None).expect("terminal cleanup");
         assert!(!build.exists(), "build/ outlives the unbinding");
         assert!(binding.is_file());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Released images waiting for their deletion in the project's deleting directories never
+    /// refuse main's restore: the unbinding moves them into the store's own `.deleting` before it
+    /// deletes their trees, frees none of them, and leaves no tree behind. A stray among them
+    /// still refuses, named, with the released images already moved and everything else kept.
+    #[test]
+    fn the_unbinding_moves_its_released_images_out_and_refuses_a_stray_among_them() {
+        let (root, paths) = project("released-images");
+        let binding = paths.project_root.join("repository.json");
+        let released = [
+            paths
+                .project_root
+                .join(format!("build/.deleting/{VOLUME}.dmg")),
+            paths
+                .project_root
+                .join(format!("sessions/.deleting/raven-{VOLUME}.dmg")),
+        ];
+        for image in &released {
+            std::fs::create_dir_all(image.parent().expect("deleting directory"))
+                .expect("directory");
+            std::fs::write(image, vec![7_u8; 64 * 1024]).expect("released image");
+        }
+        require_terminal_storage(&paths.project_root)
+            .expect("released images do not refuse main's restore");
+
+        let stray = paths.project_root.join("sessions/.deleting/notes.txt");
+        std::fs::write(&stray, b"not an image").expect("stray");
+        std::fs::write(&binding, b"binding").expect("binding");
+        let error = clean_terminal_project_storage(&paths.project_root, &binding, None)
+            .expect_err("a stray in a deleting directory refuses the unbinding");
+        assert!(error.message.contains("notes.txt"), "{}", error.message);
+        for image in &released {
+            assert!(
+                !image.exists(),
+                "{} moved out before the plan",
+                image.display()
+            );
+        }
+        let store_deleting = crate::storage::apfs::deleter::store_deleting(&paths.store_root);
+        let moved: Vec<_> = std::fs::read_dir(&store_deleting)
+            .expect("the store's .deleting")
+            .map(|entry| std::fs::read(entry.expect("entry").path()).expect("moved bytes"))
+            .collect();
+        assert_eq!(
+            moved,
+            vec![vec![7_u8; 64 * 1024]; released.len()],
+            "the unbinding frees none of them"
+        );
+        assert_eq!(std::fs::read(&stray).expect("stray kept"), b"not an image");
+
+        std::fs::remove_file(&stray).expect("drop the stray");
+        clean_terminal_project_storage(&paths.project_root, &binding, None)
+            .expect("terminal cleanup");
+        assert!(!paths.project_root.join("build").exists());
+        assert!(!paths.project_root.join("sessions").exists());
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -26871,7 +27004,7 @@ mod terminal_project_cleanup_tests {
         std::fs::write(&lock, b"").expect("lock");
         std::fs::write(&binding, b"binding").expect("binding");
 
-        let error = clean_terminal_project_storage(&root, &binding)
+        let error = clean_terminal_project_storage(&root, &binding, None)
             .expect_err("a build volume left in build/ must block the unbinding");
         assert_eq!(error.code.as_str(), "integrity");
         assert!(error.message.contains(VOLUME), "{}", error.message);
@@ -26908,7 +27041,7 @@ mod terminal_project_cleanup_tests {
         let journal = paths.project_root.join("lifecycle-intents.json");
         let before = std::fs::read(&journal).unwrap();
         let retained = paths.project_root.join("binding-before-refusal");
-        let result = finish_restored_project_unbinding(&paths, &binding, &mut |step| {
+        let result = finish_restored_project_unbinding(&paths, &binding, None, &mut |step| {
             if step == UnbindCheckpoint::BeforeBindingRemoval {
                 std::fs::rename(&paths.repository_binding, &retained).unwrap();
                 std::fs::create_dir(&paths.repository_binding).unwrap();

@@ -322,7 +322,7 @@ static GC_REPORT: Reader = Reader::Record(&[
     ("reclaimed", &LEAF),
     ("retainedPinned", &LEAF),
     ("retainedActive", &LEAF),
-    ("freedBytes", &LEAF),
+    ("releasedBytes", &LEAF),
     ("dryRun", &LEAF),
     ("candidates", &SEQ__GC_CANDIDATE),
     ("deferred", &SEQ__GC_DEFERRED),
@@ -914,7 +914,7 @@ static RESEED_RESULT: Reader = Reader::Record(&[
     ("replacementVolume", &LEAF),
     ("previousBytes", &LEAF),
     ("replacementBytes", &LEAF),
-    ("freedBytes", &LEAF),
+    ("releasedBytes", &LEAF),
     ("dryRun", &LEAF),
 ]);
 static RESIZE_RESULT: Reader = Reader::Record(&[

@@ -222,7 +222,7 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
         answer(message.id, {
           workspace, from, previousVolume: 'previous-volume', seed: 'existing-seed',
           ...(!dryRun ? { replacementVolume: 'replacement-volume' } : {}),
-          previousBytes: 8192, replacementBytes: 4096, freedBytes: dryRun ? 0 : 8192, dryRun,
+          previousBytes: 8192, replacementBytes: 4096, releasedBytes: dryRun ? 0 : 8192, dryRun,
         });
       } else if (message.method === 'job.progress') {
         heard.push('open every ' + message.params.everyMs);
@@ -386,7 +386,7 @@ describe('Cowshed Node-API bindings', () => {
         seed: 'existing-seed',
         previousBytes: 8192,
         replacementBytes: 4096,
-        freedBytes: 0,
+        releasedBytes: 0,
         dryRun: true,
       },
       replacement: {
@@ -397,7 +397,7 @@ describe('Cowshed Node-API bindings', () => {
         replacementVolume: 'replacement-volume',
         previousBytes: 8192,
         replacementBytes: 4096,
-        freedBytes: 8192,
+        releasedBytes: 8192,
         dryRun: false,
       },
       workerCanReseed: false,

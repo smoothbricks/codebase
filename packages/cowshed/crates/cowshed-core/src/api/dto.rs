@@ -1143,7 +1143,7 @@ pub struct GcReport {
     pub retained_pinned: u64,
     /// Staging entries an operation still holds the lifecycle lock for: not garbage yet.
     pub retained_active: u64,
-    pub freed_bytes: u64,
+    pub released_bytes: u64,
     pub dry_run: bool,
     pub candidates: Vec<GcCandidate>,
     pub deferred: Vec<GcDeferred>,
@@ -3513,7 +3513,7 @@ pub struct ReseedResult {
     pub replacement_volume: Option<String>,
     pub previous_bytes: u64,
     pub replacement_bytes: u64,
-    pub freed_bytes: u64,
+    pub released_bytes: u64,
     pub dry_run: bool,
 }
 

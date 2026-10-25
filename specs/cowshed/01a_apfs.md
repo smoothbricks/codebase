@@ -74,51 +74,51 @@ links back to the sections here.
 - **Clone cost follows extents, not size**: `clonefile` shares the source file's extent map, and the first write to
   either file copies that map. First-write cost scales with extent count; `fork` pays it in its own `first-write` step
   before attach. `image.write_first` reads and rewrites the same 4 KiB at offset zero; that single write can materialize
-  the shared extent map. Measured 2026-10-23 on file-only clones of a 485,830-run build seed, a source-file write plus
-  fsync took 99.035 s while the clone's first write took 79.763 s. Leaving the clone unwritten moved the cost to the
-  source: 47.137 s, then 0.1 ms for the clone's write. An unrelated store-file write plus fsync reached 19.273 s in the
-  former experiment, but continued completing during most of it. These distinguish clone-family contention from
-  intermittent container-wide stalls; correlation with a live Nx freeze does not by itself identify which overlapping
-  image operation caused it. Fewer extents reduce map-copy work; yielding outside the syscall cannot split it ("Freeing
-  an image"). When a clone or checkpoint shares an image's blocks, rewritten blocks move to new runs. Writes into a
-  workspace do not rewrite main's extent map. Build state lives on volumes replaced at each land rather than in main's
-  image (16_build_volumes.md, "Why two volumes"). `doctor` counts each workspace source, live build source and build
-  seed with one `F_LOG2PHYS_EXT` query per contiguous run, reporting `main-extents`/`source-extents`,
-  `pending-source-extents`, `build-source-extents` and `build-seed-extents` against the actual image path. Build
-  diagnostics select published images of current owners; a retired incarnation is not the current owner's fork source or
-  its defrag target. At **7,141 extents** doctor warns and names `cowshed defrag <workspace>`; 7,140 is the standalone
-  first-write sensitivity bound from 60.845084042 s / 434,462 = 140.046964 µs/extent, not a whole-fork guarantee
-  (08_testing.md); the RAW observation's cause is unattributed. Before its first write, each fresh workspace or build
-  clone measures its actual detached generation against this bound, not a cached estimate of its still-writing source;
-  past it the fork warns, naming the measured first-write cost and `cowshed defrag <workspace>`, and proceeds: the bound
-  is advisory and never refuses a fork. A resumed pending clone is proved again. Workspace initialization is followed by
-  a flush and a second bounded proof before activation; build seeds prove their final generation after their freshness
-  mark, before publication, and revalidate it across publication. Device/inode, length, allocated blocks, and nanosecond
-  mtime/ctime bind a proof to the physical write generation, not HEAD; missing, changing images cannot claim fork
-  readiness; an oversized one only warns. The fork's walk stops counting at 7,141 runs, so its warning reports lower
-  bounds; doctor's full diagnostic walk is explicit. Proof collection is additional work. `defrag` is the remedy: it
-  rewrites every published seed of the named incarnation and its registered live build source, as well as the workspace
-  image. Each build rewrite retains its exclusive admission claim, closes Nx, refuses holders without force, restores
-  the mount state and preserves a detached seed's build-freshness time. Per-build-image counts and copied bytes are
-  reported separately from the workspace result. It detaches the workspace as `resize` does — a busy volume refuses
-  before the image is touched — copies the image's data regions with plain `pread`/`pwrite` into `<image>.defrag` beside
-  it (never `clonefile`, `copyfile(3)`, or `std::fs::copy`, all of which clone on APFS and would share the old map),
-  punches interior holes after each following write and the trailing hole after sizing the copy (APFS may allocate zero
-  blocks when extending it), `F_FULLFSYNC`s it, renames it over the image, syncs the directory, and verifies the result
-  by attaching it before restoring the mount state it found. The copy runs at 3.1–5.4 GB/s on the store volume (8.9 GiB
-  in 1.8–3.1 s, an 8,871-extent image back to 579). Nothing rewrites an attached image: a DiskImages2 attachment's
-  helper holds an exclusive lock on the file (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and
-  `diskutil image resize` and `diskutil image create from` refuse it as well; an in-kernel attachment takes no lock
-  ("Mounts"), and the verb's own detach and the registry exclude it. The copy needs, and keeps, free space equal to the
-  image's allocated bytes while earlier clones and checkpoints still share the old blocks; the verb refuses before
-  detaching when the store volume lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next
-  `defrag` replaces one an interrupted run left, and `doctor` names it until then. Mains are never detached implicitly
-  (the gateway keeps them mounted), so no path rewrites main on its own. A refused resumed clone remains pending because
-  it may contain the only copy of dirty or unlanded work. Its hint names `cowshed defrag <pending-destination>`, not its
-  source: the command opens without replaying the failed fork, claims the existing creator-intent lease, revalidates the
-  exact pending metadata under its image lock, and rewrites the same payload without activating it or changing its
-  journal phase. A live creator refuses the rewrite. Retrying the original fork then resumes those same bytes; nothing
-  deletes a pending image to satisfy an extent budget.
+  the shared extent map, and the first write to either file of a clone family pays the whole copy: writing both files at
+  once makes both wait, and a clone left unwritten leaves the copy to the source's next write, after which the clone's
+  first write is cheap. Writers of unrelated files on the container keep completing during most of it, so this is
+  clone-family contention, not an intermittent container-wide stall; correlation with a live Nx freeze does not by
+  itself identify which overlapping image operation caused it. Fewer extents reduce map-copy work; yielding outside the
+  syscall cannot split it ("Freeing an image"). When a clone or checkpoint shares an image's blocks, rewritten blocks
+  move to new runs. Writes into a workspace do not rewrite main's extent map. Build state lives on volumes replaced at
+  each land rather than in main's image (16_build_volumes.md, "Why two volumes"). `doctor` counts each workspace source,
+  live build source and build seed with one `F_LOG2PHYS_EXT` query per contiguous run, reporting
+  `main-extents`/`source-extents`, `pending-source-extents`, `build-source-extents` and `build-seed-extents` against the
+  actual image path. Build diagnostics select published images of current owners; a retired incarnation is not the
+  current owner's fork source or its defrag target. At **7,141 extents** doctor warns and names
+  `cowshed defrag <workspace>`; 7,140 is the standalone first-write sensitivity bound from 60.845084042 s / 434,462 =
+  140.046964 µs/extent, not a whole-fork guarantee (08_testing.md); the RAW observation's cause is unattributed. Before
+  its first write, each fresh workspace or build clone measures its actual detached generation against this bound, not a
+  cached estimate of its still-writing source; past it the fork warns, naming the measured first-write cost and
+  `cowshed defrag <workspace>`, and proceeds: the bound is advisory and never refuses a fork. A resumed pending clone is
+  proved again. Workspace initialization is followed by a flush and a second bounded proof before activation; build
+  seeds prove their final generation after their freshness mark, before publication, and revalidate it across
+  publication. Device/inode, length, allocated blocks, and nanosecond mtime/ctime bind a proof to the physical write
+  generation, not HEAD; missing, changing images cannot claim fork readiness; an oversized one only warns. The fork's
+  walk stops counting at 7,141 runs, so its warning reports lower bounds; doctor's full diagnostic walk is explicit.
+  Proof collection is additional work. `defrag` is the remedy: it rewrites every published seed of the named incarnation
+  and its registered live build source, as well as the workspace image. Each build rewrite retains its exclusive
+  admission claim, closes Nx, refuses holders without force, restores the mount state and preserves a detached seed's
+  build-freshness time. Per-build-image counts and copied bytes are reported separately from the workspace result. It
+  detaches the workspace as `resize` does — a busy volume refuses before the image is touched — copies the image's data
+  regions with plain `pread`/`pwrite` into `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or
+  `std::fs::copy`, all of which clone on APFS and would share the old map), punches interior holes after each following
+  write and the trailing hole after sizing the copy (APFS may allocate zero blocks when extending it), `F_FULLFSYNC`s
+  it, renames it over the image, syncs the directory, and verifies the result by attaching it before restoring the mount
+  state it found. The copy runs at 3.1–5.4 GB/s on the store volume (8.9 GiB in 1.8–3.1 s, an 8,871-extent image back to
+  579). Nothing rewrites an attached image: a DiskImages2 attachment's helper holds an exclusive lock on the file
+  (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and `diskutil image resize` and
+  `diskutil image create from` refuse it as well; an in-kernel attachment takes no lock ("Mounts"), and the verb's own
+  detach and the registry exclude it. The copy needs, and keeps, free space equal to the image's allocated bytes while
+  earlier clones and checkpoints still share the old blocks; the verb refuses before detaching when the store volume
+  lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next `defrag` replaces one an interrupted
+  run left, and `doctor` names it until then. Mains are never detached implicitly (the gateway keeps them mounted), so
+  no path rewrites main on its own. A refused resumed clone remains pending because it may contain the only copy of
+  dirty or unlanded work. Its hint names `cowshed defrag <pending-destination>`, not its source: the command opens
+  without replaying the failed fork, claims the existing creator-intent lease, revalidates the exact pending metadata
+  under its image lock, and rewrites the same payload without activating it or changing its journal phase. A live
+  creator refuses the rewrite. Retrying the original fork then resumes those same bytes; nothing deletes a pending image
+  to satisfy an extent budget.
 - **Detached growth**: under the image's lease, an `O_EXLOCK | O_NONBLOCK | O_NOFOLLOW` open refuses a file a
   DiskImages2 helper holds and excludes such an attach until the write is durable. An in-kernel attachment takes no
   lock, so growth then refuses (`EWOULDBLOCK`, as a held lock does) when a registered in-kernel drive holds the opened
@@ -1060,49 +1060,37 @@ orphaned while it still owns an attached image.
 
 ### Freeing an image
 
-One `unlink` of a written image can reclaim its whole extent tree in one kernel operation. Holding an open file
-descriptor can defer reclamation until its last close, so an unlink-only timer is not an end-to-end release timer. Other
-writers on the store's APFS container, including files inside a different attached image, can wait behind this work.
-Background I/O priority (`IOPOL_THROTTLE`) can prolong that wait while the releaser's own metadata reads are throttled.
-Cowshed instead frees at normal disk priority and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs
-per cut**, then unlinks the empty file. This is a bound on reclamation work, **not a wall-time bound**; the file length
-remains the restart journal (16_build_volumes.md, "Garbage collection").
+One `unlink` of a written image can reclaim its whole extent tree in one kernel operation, and other writers on the
+store's APFS container, including files inside a different attached image, can wait behind that work. Holding an open
+file descriptor can defer reclamation until its last close, so an unlink-only timer is not an end-to-end release timer.
+Background I/O priority (`IOPOL_THROTTLE`) prolongs that wait instead of shortening it: the releaser's own metadata
+reads are throttled with it, so the same free takes longer and holds the container's work longer. Cowshed instead frees
+at normal disk priority and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs per cut**, then unlinks
+the empty file. A cut of 1,024 runs takes a fraction of a second and a longer cut's length grows with its extents; the
+bound is on reclamation work, **not a wall-time bound**. The file length remains the restart journal
+(16_build_volumes.md, "Garbage collection"). That bounded release runs only off every verb's path: the verb that
+releases an image spawns itself as a detached `__delete-released` child that frees that one image and does not wait for
+it, and the gateway's startup scan frees what a child or a crash left (05_gateway.md, "Deleting released images").
 
-Measured 2026-10-23, with raw per-cut extent counts and timings under the external `release-stall-bound/` evidence
-directory:
+Stepping lets other writers progress between cuts; it is neither a scheduling guarantee nor a maximum duration for one
+kernel call. Concurrent releases lengthen one another's cuts, and a pause between cuts does not shorten them, so cowshed
+adds no scheduling delay.
 
-- A materialized 485,830-run seed clone made 475 cuts: 44.125 ms median, 113.158 ms p90, 217.100 ms maximum, 27.979 s in
-  the cuts. Independent store/Data/attached-image probes reached 61.668 ms. Two concurrent releases reached 1.444 s per
-  cut and 0.972 s per probe. Some probe operations overlapped three cuts in the single-release run and four across the
-  two concurrent releases; neither experiment showed starvation for the whole release.
-- The file-only followup used a **300 GiB logical, 8 GiB allocated sparse file with 524,289 counted runs** on
-  `/private/cowshed/store` (disk3s8), not an attached image. Independent 4 KiB write-plus-fsync probes ran on that
-  volume and inside an already-attached build image (disk48s1). After materializing its map, 1,024-run cuts with no
-  pause took 16.027 ms median / 1.141 s maximum; the store and attached-image probes reached 1.094 and 1.095 s. A
-  subsequent run with a 1 ms sleep between cuts took 10.051 ms median / 97.748 ms maximum, with probe maxima 21.724 and
-  14.320 ms. Both runs let other writers progress, and probe operations overlapped at most two cuts. These sequential
-  samples under changing host load do not establish that the sleep caused the improvement or guarantees a latency
-  ceiling. No scheduling delay is added on that evidence alone.
-- On a fresh clone of that sparse file, the **first cut removed just one physical run yet took 5.086 s**; a separate
-  per-step-only run measured 9.733 s. During the aligned 5.086 s call, the independent store and attached-image probes
-  completed 571 and 543 operations respectively. Thus those writers did not freeze for the entire call. The store probe
-  nevertheless reached 855.084 ms during the release; the attached-image probe reached 7.590 ms. The earlier 485,830-run
-  clone's first 454-run cut took 50.074 s. A clone-family experiment measured a first cut of 34.836 s, a source-file
-  probe of 35.899 s, and an unrelated store-file probe of 18.544 s. Reducing the reclamation step cannot bound the
-  whole-map work inside the first mutation.
+The first mutation of a clone is bounded by no step: a fresh clone's first cut, however few runs it removes, does
+whole-map work inside one `ftruncate` or 4 KiB `pwrite` call, before userspace can yield, and takes seconds or more.
+Writers beside it are not frozen for the whole call, but they can wait on it. Cowshed sees an unsplittable syscall from
+its interface and cannot inspect APFS's internal transaction boundaries, so reducing the reclamation step cannot bound
+that work, and nothing here repairs a slow retirement, first write or release that comes from it.
 
-The first-mutation cost is inside one `ftruncate` or 4 KiB `pwrite` call, before userspace can yield. These measurements
-do not inspect APFS's internal transaction boundaries. They demonstrate an unsplittable syscall from cowshed's
-interface, not a repair of the reported 50.7 s retirement, 26.5 s first write, or twelve-minute release. Other writers
-made progress during ordinary stepping in these experiments. That observation is neither a universal scheduling
-guarantee nor a maximum duration for one kernel call.
+Unlinking a still-shared clone can be cheap, but `EF_SHARES_ALL_BLOCKS` is an observation, not custody: the flag can
+clear when the other owner unlinks, so a plan-time flag check does not say who owns the map when the cuts run and does
+not justify skipping cuts. Cowshed retains the stepped path for every file.
 
-Unlinking a still-shared clone can be cheap: the followup measured 0.032 ms for unlink plus 0.005 ms for last close
-while the source retained the map. But `EF_SHARES_ALL_BLOCKS` is an observation, not custody. The same fixture observed
-that flag with reference count two, unlinked its source, then observed the flag cleared and reference count one. Its
-subsequent unlink/close was also cheap (0.672 / 0.008 ms); this is a flag-lifetime counterexample, not evidence of a
-slow sole-owner close. A plan-time flag check therefore does not justify skipping cuts. Cowshed retains the existing
-stepped path for every file.
+Background reclamation moves the wait off verbs: the verb that releases an image spawns itself as a detached
+`__delete-released` child that frees that one image, and the gateway's startup scan frees what a child or a crash left
+(05_gateway.md, "Deleting released images"); nothing polls for work. So no verb waits for the cuts or for the first
+mutation, and a land or an `rm` does not hold its turn and locks through them. It does not split the first mutation:
+that call can stall the container's other writers, in the child as in a verb.
 
 Remaining options, not additional guarantees or implemented cutovers:
 
@@ -1115,8 +1103,7 @@ Remaining options, not additional guarantees or implemented cutovers:
 - Put latency-sensitive writers on a different APFS container/device. Another image or volume in the same container is
   not an isolation boundary. Such placement needs its own measurement; it is not proved here.
 - A shared-unlink optimization would need an enforceable lifetime/immutability hold on another map owner through final
-  close, not a second flag read. Background or serialized reclamation can move or reduce contention but does not split
-  the first mutation. A smaller step or an inter-step yield cannot do so either.
+  close, not a second flag read. A smaller step or an inter-step yield cannot split the first mutation either.
 
 ## Ownership, identity, and the volume label
 

@@ -60,7 +60,7 @@ impl ReseedPlan {
             replacement_volume: None,
             previous_bytes: self.previous_image.bytes,
             replacement_bytes: self.seed_image.bytes,
-            freed_bytes: 0,
+            released_bytes: 0,
             dry_run: true,
         }
     }
@@ -190,14 +190,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 },
                 ..plan.previous_record.clone()
             })?;
-            host.release_claimed(layout, claim, crate::storage::apfs::release::Reclaim::Now)
+            host.release_claimed(layout, claim)
                 .map_err(storage)?;
             drop(creating);
             Ok(ReseedResult {
                 replacement_volume: Some(replacement.to_string()),
                 previous_bytes,
                 replacement_bytes,
-                freed_bytes: previous_bytes,
+                released_bytes: previous_bytes,
                 dry_run: false,
                 ..plan.preview()
             })

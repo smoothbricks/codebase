@@ -793,7 +793,7 @@ pub struct StorageGcReport {
     pub retained_pinned: usize,
     pub retained_recent: usize,
     pub retained_active: usize,
-    pub freed_bytes: u64,
+    pub released_bytes: u64,
     /// Candidate-local failures; the sweep continues with the remaining candidates.
     pub deferred: Vec<StorageGcDeferred>,
     /// Privileged event-log debris retained outside workspace names, not a collection failure.
