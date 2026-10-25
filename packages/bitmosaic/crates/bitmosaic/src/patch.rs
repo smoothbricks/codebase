@@ -1604,9 +1604,9 @@ fn words_edit_in_place(
     let groups = wc / DIR_STRIDE;
     let group_delta = &mut group_delta[..groups];
     group_delta.fill(0);
-    // A block a fresh bit lands in is occupied, no scan needed; only a
-    // block a remove zeroed a word of might have emptied, and only those
-    // are scanned.
+    // A block a fresh bit lands in is occupied, no scan needed, unless a
+    // remove then zeroed one of its words, the add's own included: only
+    // blocks a remove zeroed a word of are scanned.
     let mut filled_blocks = [0u64; SUMMARY_WORDS];
     let mut zeroed_blocks = [0u64; SUMMARY_WORDS];
     let (mut min_add, mut max_add) = (None, None);
@@ -1667,10 +1667,11 @@ fn words_edit_in_place(
                 .to_le_bytes();
         }
     }
-    // Summary: filled blocks are set outright; a zeroed block is scanned.
+    // Summary: filled blocks are set outright; a zeroed block is scanned,
+    // filled or not.
     for s in 0..SUMMARY_WORDS {
         let mut summary = read_u64_at(payload, 8 * s) | filled_blocks[s];
-        let mut blocks = zeroed_blocks[s] & !filled_blocks[s];
+        let mut blocks = zeroed_blocks[s];
         while blocks != 0 {
             let block = s * 64 + blocks.trailing_zeros() as usize;
             blocks &= blocks - 1;
@@ -1684,32 +1685,33 @@ fn words_edit_in_place(
         }
         payload[8 * s..8 * s + 8].copy_from_slice(&summary.to_le_bytes());
     }
-    // The refuter: exact smallest and largest member.
+    // The refuter: exact smallest and largest member. Every member lies
+    // between the outer of the old bound and the extreme fresh add; removes,
+    // an add's own included, only move a bound inward, so each bound is the
+    // first member found from there.
     let word = |w: usize| read_u64_at(payload, WORDS_AT + (w - lo) * 8);
     let has = |v: usize| word(v >> 6) >> (v & 63) & 1 == 1;
     let old_min = usize::from(read_u16_at(payload, BOUNDS_AT));
     let old_max = usize::from(read_u16_at(payload, BOUNDS_AT + 2));
-    let min = match min_add {
-        Some(a) if a < old_min => a,
-        _ if has(old_min) => old_min,
-        _ => {
-            let mut w = old_min >> 6;
-            while word(w) == 0 {
-                w += 1;
-            }
-            w * 64 + word(w).trailing_zeros() as usize
+    let low = min_add.map_or(old_min, |a: usize| a.min(old_min));
+    let high = max_add.map_or(old_max, |a: usize| a.max(old_max));
+    let min = if has(low) {
+        low
+    } else {
+        let mut w = low >> 6;
+        while word(w) == 0 {
+            w += 1;
         }
+        w * 64 + word(w).trailing_zeros() as usize
     };
-    let max = match max_add {
-        Some(a) if a > old_max => a,
-        _ if has(old_max) => old_max,
-        _ => {
-            let mut w = old_max >> 6;
-            while word(w) == 0 {
-                w -= 1;
-            }
-            w * 64 + 63 - word(w).leading_zeros() as usize
+    let max = if has(high) {
+        high
+    } else {
+        let mut w = high >> 6;
+        while word(w) == 0 {
+            w -= 1;
         }
+        w * 64 + 63 - word(w).leading_zeros() as usize
     };
     payload[BOUNDS_AT..BOUNDS_AT + 2].copy_from_slice(&(min as u16).to_le_bytes());
     payload[BOUNDS_AT + 2..BOUNDS_AT + 4].copy_from_slice(&(max as u16).to_le_bytes());
@@ -1737,6 +1739,16 @@ struct ForestPlan {
     old_total: usize,
 }
 
+/// Pass 1's verdict on a forest batch.
+enum ForestPass {
+    /// No chunk changes: the batch touched only chunks absent before and
+    /// after, so every add it made it took back, counted added and removed.
+    Unchanged {
+        taken_back: u32,
+    },
+    Planned(ForestPlan),
+}
+
 fn prepare_forest<W: Witness, const CAPTURE: bool>(
     slot: &[u8],
     adds: &[u32],
@@ -1748,16 +1760,18 @@ fn prepare_forest<W: Witness, const CAPTURE: bool>(
     let Root::Forest(forest) = view.root else {
         return Err(PatchError::Malformed);
     };
-    let Some(mut plan) =
-        plan_forest::<W, CAPTURE>(&forest, adds, removes, scratch, slot.len(), witness)
-    else {
-        return Ok(PreparedPlan::Unchanged(PatchReport {
-            added: 0,
-            removed: 0,
-            len: view.len(),
-            serialized_len: view.serialized_len(),
-        }));
-    };
+    let mut plan =
+        match plan_forest::<W, CAPTURE>(&forest, adds, removes, scratch, slot.len(), witness) {
+            ForestPass::Planned(plan) => plan,
+            ForestPass::Unchanged { taken_back } => {
+                return Ok(PreparedPlan::Unchanged(PatchReport {
+                    added: taken_back,
+                    removed: taken_back,
+                    len: view.len(),
+                    serialized_len: view.serialized_len(),
+                }));
+            }
+        };
     let needed = plan.forest_total;
     if needed > slot.len() {
         return Err(PatchError::Capacity { needed });
@@ -1946,7 +1960,8 @@ fn refresh_rows(scratch: &mut PatchScratch) {
 }
 
 /// Pass 1: re-ladder every touched chunk into the staged region and price
-/// both roots. The slot is not written. `None` when the batch is empty.
+/// both roots. The slot is not written. [`ForestPass::Unchanged`] when no
+/// chunk changes.
 /// `capacity` is the slot's length: the in-place edit is routed only when
 /// its transient footprint fits, and the caller compares the final length
 /// against the same bound.
@@ -1957,7 +1972,7 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
     scratch: &mut PatchScratch,
     capacity: usize,
     witness: &mut W,
-) -> Option<ForestPlan> {
+) -> ForestPass {
     let chunks = forest.chunks as usize;
     let old_total = forest.bytes.len();
     scratch.touched.clear();
@@ -2130,7 +2145,10 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
         scratch.touched.push(Touched { key, old, fresh });
     }
     if scratch.touched.is_empty() {
-        return None;
+        // Every chunk was skipped as absent before and after: each of its
+        // adds was removed again, and a remove held only such an add.
+        debug_assert_eq!(added, removed);
+        return ForestPass::Unchanged { taken_back: added };
     }
 
     let final_len = scratch.touched.iter().fold(forest.len, |len, touched| {
@@ -2185,7 +2203,7 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
             (total, true)
         }
     };
-    Some(ForestPlan {
+    ForestPass::Planned(ForestPlan {
         chunks,
         geometry: forest.geometry,
         added,
@@ -2930,10 +2948,12 @@ fn splice_ef(
     if adds.first().is_some_and(|&a| a < base) || removes.binary_search(&base).is_ok() {
         return None;
     }
-    // A remove outside the set's range holds nothing; the splice walks
-    // only values the plane can place.
+    // A remove below the smallest member, or above both the largest member
+    // and the largest add, holds nothing; the splice walks only values the
+    // plane can place. An add above the largest member can be taken back.
+    let top = adds.last().map_or(last, |&a| a.max(last));
     let removes =
-        &removes[removes.partition_point(|&r| r < base)..removes.partition_point(|&r| r <= last)];
+        &removes[removes.partition_point(|&r| r < base)..removes.partition_point(|&r| r <= top)];
     if adds.is_empty() && removes.is_empty() {
         let total = image_header(slot)?.encoded_len;
         scratch.build.clear();
@@ -2990,9 +3010,16 @@ fn splice_ef(
     let (mut added, mut removed) = (0u32, 0u32);
     while let Some(h) = edits.next_bucket() {
         if h >= new_zeros {
-            // Buckets past the new largest member hold no survivor and no
-            // add; their removes are counted and nothing is emitted.
-            removed += edits.removes.iter().filter(|&&r| ef.contains(r)).count() as u32;
+            // Buckets past the new largest member hold no survivor: every
+            // member and every add there is removed, and nothing is emitted.
+            // An add counts where it was not held, a remove where a member
+            // or an add held it.
+            added += edits.adds.iter().filter(|&&a| !ef.contains(a)).count() as u32;
+            removed += edits
+                .removes
+                .iter()
+                .filter(|&&r| ef.contains(r) || edits.adds.binary_search(&r).is_ok())
+                .count() as u32;
             break;
         }
         let (bucket_adds, bucket_removes) = edits.take(h);
@@ -3131,11 +3158,17 @@ fn splice_ef(
     )))
 }
 
-/// Largest member after the batch: the largest add, unless a surviving old
-/// member is larger — old members are walked down from the top past the
-/// removed ones, which is as many `select`s as removes at the top.
+/// Largest member after the batch: the largest add the batch keeps, unless
+/// a surviving old member is larger. Adds and old members are each walked
+/// down from the top past the removed ones, a search per remove at the top
+/// and a `select` per removed member. The smallest member always survives
+/// (the splice refuses a batch that removes it), so a survivor exists.
 fn last_after(ef: EfView<'_>, adds: &[u32], removes: &[u32]) -> u32 {
-    let mut candidate = adds.last().copied();
+    let mut candidate = adds
+        .iter()
+        .rev()
+        .find(|a| removes.binary_search(a).is_err())
+        .copied();
     let mut j = ef.len;
     let mut removes = removes;
     while j > 0 {

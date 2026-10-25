@@ -375,6 +375,26 @@ mod tests {
         patch_step(include_bytes!(
             "../fuzz/regressions/patch_step/ef-splice-unpadded-copy"
         ));
+        // A forest batch that added a value to an absent chunk and removed
+        // it again reported neither, though it witnessed both.
+        patch_step(include_bytes!(
+            "../fuzz/regressions/patch_step/forest-absent-chunk-take-back"
+        ));
+        // The Elias-Fano splice dropped the remove of an add above the
+        // largest member, so the add stayed a member.
+        patch_step(include_bytes!(
+            "../fuzz/regressions/patch_step/ef-splice-take-back-above-last"
+        ));
+        // An in-place Words edit that added the chunk's new largest value
+        // and removed it again kept it as the max refuter.
+        patch_step(include_bytes!(
+            "../fuzz/regressions/patch_step/words-refuter-take-back"
+        ));
+        // An in-place Words edit that added a value to an empty block and
+        // removed it again left the block's summary bit set.
+        patch_step(include_bytes!(
+            "../fuzz/regressions/patch_step/words-summary-take-back"
+        ));
     }
 
     /// Fixed-seed operation lists: the fuzz targets' steps in the default
