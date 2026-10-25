@@ -12,6 +12,18 @@
           "command": "cargo bench --locked -p bitmosaic --profile bench --bench ops --bench patch",
           "cwd": "{workspaceRoot}"
         }
+      },
+      "fuzz": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "commands": [
+            "cargo fuzz run --fuzz-dir packages/bitmosaic/crates/bitmosaic/fuzz patch_step -- -max_total_time=300",
+            "cargo fuzz run --fuzz-dir packages/bitmosaic/crates/bitmosaic/fuzz and_step -- -max_total_time=300"
+          ],
+          "parallel": false,
+          "cwd": "{workspaceRoot}"
+        }
       }
     }
   }

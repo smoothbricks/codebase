@@ -1,0 +1,53 @@
+[package]
+name = "bitmosaic-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own: libFuzzer and its build stay out of the
+# repository's lockfile and out of every ordinary build and test. The
+# targets are thin: each hands its bytes to a step in `bitmosaic::oracle`,
+# which the library's default test lane also runs from fixed seeds.
+[workspace]
+
+[dependencies]
+bitmosaic = { path = "..", features = ["bench-internals"] }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "patch_step"
+path = "fuzz_targets/patch_step.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "and_step"
+path = "fuzz_targets/and_step.rs"
+test = false
+doc = false
+bench = false
+# The repository's dev and debugging profiles, which every Cargo workspace
+# root here declares (see the root Cargo.toml for why each key is set).
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.dev.build-override]
+debug = 0
+
+[profile.debugging]
+inherits = "dev"
+debug = 2
+
+[profile.debugging.package."*"]
+debug = 2
+
+[profile.debugging.build-override]
+debug = 2

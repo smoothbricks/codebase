@@ -72,6 +72,7 @@ in {
       # are declared here, below, via languages.rust.targets.
       just # Task runner for packages/columine (mirrors the lmao justfile)
       cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
+      cargo-fuzz # bitmosaic:fuzz drives packages/bitmosaic's libFuzzer targets
       # Go comes from ./devenv.smoo.nix (languages.go), one version for every
       # repository for the same reason as the Rust toolchain: a compiler is part
       # of a cache key. packages/lmao-ttsc/plugin builds against it.

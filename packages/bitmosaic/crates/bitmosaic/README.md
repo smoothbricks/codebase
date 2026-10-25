@@ -185,7 +185,9 @@ allocation behavior.
 inputs come from a recipe aimed at the container ladder. `patch_step` patches one image and checks, after every
 operation, that its bytes are a fresh encoding and that the report, witnesses and reads match a BTreeSet; `and_step`
 intersects two sets on every forced skew arm, owned, mapped and through the u64 tier. The default test lane runs both
-from fixed seeds, and every container-tag pairing on every forced arm.
+from fixed seeds, and every container-tag pairing on every forced arm. `nx run bitmosaic:fuzz` drives the same steps
+with cargo-fuzz (`fuzz/`, its own workspace and lockfile) for five minutes each; it is a dedicated proof outside the
+ordinary gate.
 
 Benchmarks use the bench profile and report workload-specific observations: attach separately from attached operations,
 owned accounting separately from wire bytes, run-rich count/algebra cells, enumerable/restaged controls, and warm patch
