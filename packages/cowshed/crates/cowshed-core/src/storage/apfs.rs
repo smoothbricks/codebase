@@ -224,18 +224,17 @@ pub type AdoptStage = WorkspaceStage;
 pub type CreateStage = WorkspaceStage;
 pub type ForkStage = WorkspaceStage;
 
-/// Work a staged create, fork or adopt runs beside staging its image, under the plan's locks: it
-/// starts once the locks are held and the plan's facts revalidated, and runs while the image is
-/// attached and mounted. A create or fork gives its output to the initializer with the stage; an
-/// adopt answers it with the receipt once main is committed. When the image cannot be staged (or
-/// an adopt's be initialized or committed), `abandon` gets that output instead, so nothing the
-/// work made outlives the failure. An operation dropped before either drops the work and its
-/// output with it, and nothing runs for them after: an output that owns a resource releases it
-/// when dropped (main's first build volume does), and work dropped while it runs releases what
-/// it makes once nobody is there to take it.
+/// Work a staged adopt runs beside staging main's image, under the plan's locks: it starts once
+/// the locks are held and the plan's facts revalidated, and runs while the image is attached and
+/// mounted; its output is answered with the receipt once main is committed. When the image cannot
+/// be staged, initialized or committed, `abandon` gets that output instead, so nothing the work
+/// made outlives the failure. An operation dropped before either drops the work and its output
+/// with it, and nothing runs for them after: an output that owns a resource releases it when
+/// dropped (main's first build volume does), and work dropped while it runs releases what it
+/// makes once nobody is there to take it. A create or fork runs [`Beside`] instead.
 ///
-/// It exists for a second image the operation attaches anyway (a fork's build volume, main's
-/// first one): every `diskutil image attach` waits in the host's one `storagekitd` queue
+/// It exists for a second image the operation attaches anyway (main's first build volume, a
+/// fork's): every `diskutil image attach` waits in the host's one `storagekitd` queue
 /// (01a_apfs.md, "How the APFS host degrades"), and two attaches in flight together wait in it
 /// once, not twice.
 pub struct Alongside<W, D> {
@@ -249,6 +248,36 @@ impl Alongside<std::future::Ready<()>, fn(()) -> std::future::Ready<()>> {
         Self {
             work: std::future::ready(()),
             abandon: std::future::ready,
+        }
+    }
+}
+
+/// Work a staged create or fork runs beside staging its image, in two halves that straddle its
+/// source's image lock (16_build_volumes.md, "Fork"). `capture` runs under that lock, beside the
+/// capture of the source's image, and reads what the lock guards (a fork's seed); `ready` runs
+/// once the lock is let go, beside the clone's attach and mount, with what `capture` answered
+/// and the new workspace's incarnation, and its output goes to the initializer with the stage. When the source's
+/// image cannot be captured `abandon_captured` gets `capture`'s output; when the clone cannot be
+/// staged after that, `abandon_ready` gets `ready`'s. Dropping follows [`Alongside`]: an output
+/// that owns a resource releases it, or leaves it registered for collection, when dropped.
+pub struct Beside<C, R, AC, AR> {
+    pub capture: C,
+    pub ready: R,
+    pub abandon_captured: AC,
+    pub abandon_ready: AR,
+}
+
+type Unit = fn(()) -> std::future::Ready<()>;
+type ReadyNone = fn((), WorkspaceIncarnation) -> std::future::Ready<()>;
+
+impl Beside<std::future::Ready<()>, ReadyNone, Unit, Unit> {
+    /// No work beside the clone: the initializer gets `()`.
+    pub fn none() -> Self {
+        Self {
+            capture: std::future::ready(()),
+            ready: |(), _| std::future::ready(()),
+            abandon_captured: std::future::ready,
+            abandon_ready: std::future::ready,
         }
     }
 }
@@ -518,12 +547,6 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         image: &Path,
         mount: Option<&Path>,
     ) -> Result<(), ApfsStorageError>;
-    /// Take a fresh clone's own copy of the extent map it shares with its source, before
-    /// anything attaches it. The first write into a clone copies that map, at a cost that grows
-    /// with the source's extent count — seconds for a fragmented main — and whatever writes
-    /// first pays it: for a clone of a mounted image, the kernel's recovery write inside the
-    /// mount. Paid here, it is a step of its own instead of a slow mount.
-    fn write_first(&self, image: &Path) -> Result<(), ApfsStorageError>;
     fn resumable_clone(
         &self,
         config: &ApfsSubstrateConfig,
@@ -1486,129 +1509,198 @@ where
         }
     }
 
-    pub async fn execute_create_staged<W, D, DFut, F, Fut, E>(
+    pub async fn execute_create_staged<C, R, RF, AC, ACF, AR, ARF, F, Fut, E>(
         &self,
         plan: CreatePlan,
-        alongside: Alongside<W, D>,
+        beside: Beside<C, R, AC, AR>,
         initialize: F,
     ) -> Result<LifecycleReceipt, CreateExecutionError<E>>
     where
-        W: Future + Send,
-        W::Output: Send,
-        D: FnOnce(W::Output) -> DFut + Send,
-        DFut: Future<Output = ()> + Send,
-        F: FnOnce(CreateStage, W::Output) -> Fut + Send,
+        C: Future + Send,
+        C::Output: Send,
+        R: FnOnce(C::Output, WorkspaceIncarnation) -> RF + Send,
+        RF: Future + Send,
+        RF::Output: Send,
+        AC: FnOnce(C::Output) -> ACF + Send,
+        ACF: Future<Output = ()> + Send,
+        AR: FnOnce(RF::Output) -> ARF + Send,
+        ARF: Future<Output = ()> + Send,
+        F: FnOnce(CreateStage, RF::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send + std::fmt::Display,
     {
-        self.execute_clone_staged(plan, CloneKind::Create, alongside, initialize)
+        self.execute_clone_staged(plan, CloneKind::Create, beside, initialize)
             .await
     }
 
-    pub async fn execute_fork_staged<W, D, DFut, F, Fut, E>(
+    pub async fn execute_fork_staged<C, R, RF, AC, ACF, AR, ARF, F, Fut, E>(
         &self,
         plan: ForkPlan,
-        alongside: Alongside<W, D>,
+        beside: Beside<C, R, AC, AR>,
         initialize: F,
     ) -> Result<LifecycleReceipt, ForkExecutionError<E>>
     where
-        W: Future + Send,
-        W::Output: Send,
-        D: FnOnce(W::Output) -> DFut + Send,
-        DFut: Future<Output = ()> + Send,
-        F: FnOnce(ForkStage, W::Output) -> Fut + Send,
+        C: Future + Send,
+        C::Output: Send,
+        R: FnOnce(C::Output, WorkspaceIncarnation) -> RF + Send,
+        RF: Future + Send,
+        RF::Output: Send,
+        AC: FnOnce(C::Output) -> ACF + Send,
+        ACF: Future<Output = ()> + Send,
+        AR: FnOnce(RF::Output) -> ARF + Send,
+        ARF: Future<Output = ()> + Send,
+        F: FnOnce(ForkStage, RF::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send + std::fmt::Display,
     {
-        self.execute_clone_staged(plan, CloneKind::Fork, alongside, initialize)
+        self.execute_clone_staged(plan, CloneKind::Fork, beside, initialize)
             .await
     }
 
-    async fn execute_clone_staged<P, W, D, DFut, F, Fut, E>(
+    /// A create or fork (02_workspaces.md, "`cowshed fork`"; 16_build_volumes.md, "Fork"). Its
+    /// image locks are taken one at a time in path order, as one acquisition takes a set, so the
+    /// source's can be let go alone: it is held while the source's image and `beside.capture`'s
+    /// share of what it guards (a fork's seed) are captured, milliseconds of `clonefile`s, and let
+    /// go before any attach, mount or initializer runs, which read only the clone.
+    /// A git-worktree clone keeps it to the end: its initializer registers it in main's
+    /// repository. The destination's lock is held to the end. The hold is said on stderr as
+    /// `cowshed: apfs source-lock held=<duration>`.
+    async fn execute_clone_staged<P, C, R, RF, AC, ACF, AR, ARF, F, Fut, E>(
         &self,
         plan: P,
         kind: CloneKind,
-        alongside: Alongside<W, D>,
+        beside: Beside<C, R, AC, AR>,
         initialize: F,
     ) -> Result<LifecycleReceipt, StagedExecutionError<E>>
     where
         P: ImmutablePlan,
-        W: Future + Send,
-        W::Output: Send,
-        D: FnOnce(W::Output) -> DFut + Send,
-        DFut: Future<Output = ()> + Send,
-        F: FnOnce(WorkspaceStage, W::Output) -> Fut + Send,
+        C: Future + Send,
+        C::Output: Send,
+        R: FnOnce(C::Output, WorkspaceIncarnation) -> RF + Send,
+        RF: Future + Send,
+        RF::Output: Send,
+        AC: FnOnce(C::Output) -> ACF + Send,
+        ACF: Future<Output = ()> + Send,
+        AR: FnOnce(RF::Output) -> ARF + Send,
+        ARF: Future<Output = ()> + Send,
+        F: FnOnce(WorkspaceStage, RF::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send + std::fmt::Display,
     {
-        let backend = CheckedApfsBackend {
-            host: Arc::clone(&self.host),
-            lane: Arc::clone(&self.lane),
-            config: Arc::clone(&self.config),
-            incarnations: Arc::clone(&self.incarnations),
-            expected: plan.expected().to_vec(),
-            image_lock_mode: self.image_lock_mode,
-        };
-        let mut guard = backend.acquire(plan.operation()).await?;
-        let actual = backend
-            .read_authoritative(&mut guard, plan.expected())
-            .await?;
-        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
-
-        let host = Arc::clone(&self.host);
-        let config = Arc::clone(&self.config);
-        let incarnations = Arc::clone(&self.incarnations);
-        let expected = plan.expected().to_vec();
-        let operation = plan.operation().clone();
-        // A git-worktree clone's initializer registers it in main's repository; every other
-        // clone's initializer changes only the clone and what its incarnation owns.
-        let reaches_main = matches!(
-            &operation,
-            Operation::Create { identity, .. } | Operation::Fork { identity, .. }
-                if identity.git_worktree
-        );
-        let staging = self.lane.dispatch(move || {
-            let (source, destination, identity, operation_kind) = match &operation {
-                Operation::Create {
-                    source,
-                    destination,
-                    identity,
-                } => (source, destination, identity, CloneKind::Create),
-                Operation::Fork {
-                    source,
-                    destination,
-                    identity,
-                } => (source, destination, identity, CloneKind::Fork),
-                _ => {
-                    return Err(ApfsStorageError::InvalidPlan(
-                        "staged clone executor requires a create or fork operation",
-                    ));
-                }
-            };
-            if operation_kind != kind {
+        let (source, destination, identity) = match plan.operation() {
+            Operation::Create {
+                source,
+                destination,
+                identity,
+            } if kind == CloneKind::Create => (source, destination, identity),
+            Operation::Fork {
+                source,
+                destination,
+                identity,
+            } if kind == CloneKind::Fork => (source, destination, identity),
+            Operation::Create { .. } | Operation::Fork { .. } => {
                 return Err(ApfsStorageError::InvalidPlan(
                     "staged clone executor operation kind mismatch",
-                ));
+                )
+                .into());
             }
-            prepare_clone_stage(
-                host.as_ref(),
-                &config,
-                &expected,
-                CloneExecution {
-                    source,
-                    destination,
-                    fork: kind == CloneKind::Fork,
-                    identity,
-                },
-                incarnations.as_ref(),
-            )
-        });
-        let Alongside { work, abandon } = alongside;
-        let (prepared, beside) = tokio::join!(staging, work);
+            _ => {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "staged clone executor requires a create or fork operation",
+                )
+                .into());
+            }
+        };
+        let (source, destination, identity) =
+            (source.clone(), destination.clone(), identity.clone());
+        // A git-worktree clone's initializer registers it in main's repository; every other
+        // clone's initializer changes only the clone and what its incarnation owns.
+        let reaches_main = identity.git_worktree;
+        let source_lock =
+            workspace_lock_path(&self.config, expected_repo(plan.expected())?, &source)?;
+        let paths = operation_lock_paths(&self.config, plan.expected(), plan.operation())?;
+        let holding = operation_holding(plan.operation());
+        let mode = self.image_lock_mode;
+        let (mut locks, actual) = {
+            let host = Arc::clone(&self.host);
+            let config = Arc::clone(&self.config);
+            let expected = plan.expected().to_vec();
+            self.lane
+                .dispatch(move || {
+                    let mut locks = Vec::with_capacity(paths.len());
+                    for path in &paths {
+                        let guard = lock_images_in(
+                            host.as_ref(),
+                            std::slice::from_ref(path),
+                            mode,
+                            &holding,
+                        )?;
+                        locks.push((path.clone(), guard));
+                    }
+                    host.recover_pending(&config, &paths)?;
+                    let actual = host.observe(&expected)?;
+                    Ok((locks, actual))
+                })
+                .await?
+        };
+        let locked_at = std::time::Instant::now();
+        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
+
+        let capturing = {
+            let host = Arc::clone(&self.host);
+            let config = Arc::clone(&self.config);
+            let incarnations = Arc::clone(&self.incarnations);
+            let expected = plan.expected().to_vec();
+            self.lane.dispatch(move || {
+                capture_clone_stage(
+                    host.as_ref(),
+                    &config,
+                    &expected,
+                    CloneExecution {
+                        source: &source,
+                        destination: &destination,
+                        fork: kind == CloneKind::Fork,
+                        identity: &identity,
+                    },
+                    incarnations.as_ref(),
+                )
+            })
+        };
+        let Beside {
+            capture,
+            ready,
+            abandon_captured,
+            abandon_ready,
+        } = beside;
+        let (captured, beside_captured) = tokio::join!(capturing, capture);
+        let captured = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                abandon_captured(beside_captured).await;
+                return Err(error.into());
+            }
+        };
+        if !reaches_main {
+            locks.retain(|(path, _)| *path != source_lock);
+            cowshed_os::timing::attribute(
+                "apfs",
+                format_args!("source-lock"),
+                "held",
+                format_args!("{:?}", locked_at.elapsed()),
+            );
+        }
+        let incarnation = captured.clone.workspace.incarnation().clone();
+        let staging = {
+            let host = Arc::clone(&self.host);
+            let config = Arc::clone(&self.config);
+            self.lane
+                .dispatch(move || stage_captured_clone(host.as_ref(), &config, captured))
+        };
+        let (prepared, beside) = tokio::join!(staging, ready(beside_captured, incarnation));
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                abandon(beside).await;
+                abandon_ready(beside).await;
                 return Err(error.into());
             }
         };
@@ -3071,13 +3163,25 @@ fn finish_adoption<H: ApfsExecutionHost>(
     host.retain_mounted(workspace, attachment).map(|_| ())
 }
 
-fn prepare_clone_stage<H: ApfsExecutionHost>(
+/// A create's or fork's image as its source's image lock leaves it: a `clonefile` of the source
+/// behind its `PendingFence` sidecar (or a crash-left pending clone it resumes), not yet proven
+/// forkable or attached. [`stage_captured_clone`] does that once the lock is let
+/// go: none of it reads the source.
+struct CapturedClone {
+    clone: ResumableClone,
+    source: WorkspaceName,
+    source_image: PathBuf,
+    fork: bool,
+    resuming: bool,
+}
+
+fn capture_clone_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
     expected: &[LifecycleFact],
     execution: CloneExecution<'_>,
     incarnations: &dyn IncarnationSource,
-) -> Result<PreparedClone<H::Attachment>, ApfsStorageError> {
+) -> Result<CapturedClone, ApfsStorageError> {
     let CloneExecution {
         source: source_name,
         destination: destination_name,
@@ -3131,33 +3235,8 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             )
         })?;
         let source_mount = mount_point(config, &source)?;
-        // The first write happens only on a clone nothing has attached yet: rewriting a block
-        // under an attached image's driver could put back bytes it had just changed. Only an
-        // image clone shares an extent map with its source; a host without physical volumes
-        // has none to copy.
-        let cloned = host
-            .clone_image(&source_image, Some(&source_mount), &canonical_image)
-            .and_then(|()| {
-                if !H::HAS_PHYSICAL_VOLUMES {
-                    return Ok(());
-                }
-                // Measure the actual detached clone, not HEAD or the still-writing source.
-                // Stop at 7141 runs: admission must never hide an unbounded recount in fork.
-                timed_apfs_step("canonical", "extent-proof", || {
-                    host.require_forkable_image(&canonical_image, None)
-                        .map_err(|error| {
-                            ApfsStorageError::Host(format!(
-                                "{error}; source image {}; next: cowshed defrag {}",
-                                source_image.display(),
-                                source.name()
-                            ))
-                        })
-                })?;
-                timed_apfs_step("canonical", "first-write", || {
-                    host.write_first(&canonical_image)
-                })
-            });
-        if let Err(primary) = cloned {
+        if let Err(primary) = host.clone_image(&source_image, Some(&source_mount), &canonical_image)
+        {
             return combine_cleanup(
                 "clone canonical payload",
                 primary,
@@ -3165,27 +3244,67 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             );
         }
     }
-    if resuming && H::HAS_PHYSICAL_VOLUMES {
-        // A crash-left payload is not a retained proof of its current write generation.
-        host.require_forkable_image(&canonical_image, None).map_err(|error| {
-            ApfsStorageError::Host(format!(
-                "{error}; pending clone retained; next: cowshed defrag {}, then retry its original fork",
-                workspace.name()
-            ))
-        })?;
-    }
-
-    mount_clone_stage(
-        host,
-        config,
-        ResumableClone {
+    Ok(CapturedClone {
+        clone: ResumableClone {
             workspace,
             identity,
             image: canonical_image,
         },
-        fork.then_some(source.name()),
+        source: source.name().clone(),
+        source_image,
+        fork,
         resuming,
-    )
+    })
+}
+
+fn stage_captured_clone<H: ApfsExecutionHost>(
+    host: &H,
+    config: &ApfsSubstrateConfig,
+    captured: CapturedClone,
+) -> Result<PreparedClone<H::Attachment>, ApfsStorageError> {
+    let CapturedClone {
+        clone,
+        source,
+        source_image,
+        fork,
+        resuming,
+    } = captured;
+    let canonical_image = &clone.image;
+    // Only an image clone shares an extent map with its source; a host without physical volumes
+    // has none. Measure the actual detached clone, not HEAD or the still-writing source. Stop at
+    // 7141 runs: admission must never hide an unbounded recount in fork. Nothing writes the clone
+    // here: its first mutation, whatever and wherever it is, makes APFS copy the whole extent list
+    // it shares with its source, and that copy lands where the clone is first written, never under
+    // its source's image lock.
+    if H::HAS_PHYSICAL_VOLUMES && !resuming {
+        let proven = timed_apfs_step("canonical", "extent-proof", || {
+            host.require_forkable_image(canonical_image, None)
+                .map_err(|error| {
+                    ApfsStorageError::Host(format!(
+                        "{error}; source image {}; next: cowshed defrag {source}",
+                        source_image.display(),
+                    ))
+                })
+        });
+        if let Err(primary) = proven {
+            return combine_cleanup(
+                "clone canonical payload",
+                primary,
+                host.reclaim_image(canonical_image),
+            );
+        }
+    }
+    if resuming && H::HAS_PHYSICAL_VOLUMES {
+        // A crash-left payload is not a retained proof of its current write generation.
+        host.require_forkable_image(canonical_image, None)
+            .map_err(|error| {
+                ApfsStorageError::Host(format!(
+                    "{error}; pending clone retained; next: cowshed defrag {}, then retry its original fork",
+                    clone.workspace.name()
+                ))
+            })?;
+    }
+    mount_clone_stage(host, config, clone, fork.then_some(&source), resuming)
 }
 
 fn mount_clone_stage<H: ApfsExecutionHost>(

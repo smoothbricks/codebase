@@ -84,11 +84,11 @@ it. This is what upgrades a first-party tool's traffic from tier-2 to tier-1 att
 
 ## Native image observations
 
-The APFS host records `cowshed.image.write_first`, `cowshed.image.seed_capture`, `cowshed.image.clone` and
-`cowshed.image.retire` spans, plus `warn` rows when an image exceeds a budget. They are unconditional stderr diagnostics
-**and** Arrow rows in `<store>/telemetry/<yyyy-mm-dd>/image-<uuid>.arrow`, encoded by the existing `trace_columns` and
-`trace_segment` owners. These are host-local traces with unique trace/thread identities, not attributes relayed through
-`StepReport` into a caller's trace.
+The APFS host records `cowshed.image.seed_capture`, `cowshed.image.clone` and `cowshed.image.retire` spans, plus `warn`
+rows when an image exceeds a budget. They are unconditional stderr diagnostics **and** Arrow rows in
+`<store>/telemetry/<yyyy-mm-dd>/image-<uuid>.arrow`, encoded by the existing `trace_columns` and `trace_segment` owners.
+These are host-local traces with unique trace/thread identities, not attributes relayed through `StepReport` into a
+caller's trace.
 
 Each capture observes both the source and the destination. An absent destination starts at zero; its delta describes the
 newly named clone's allocation, **not** newly allocated unique blocks. A release (a build image's, a clean removal's
@@ -99,11 +99,13 @@ as everything it held, though a rename frees no extents or allocated bytes: a ba
 extent columns are null with the cause "a release does not walk its image's extent map". Its commit never opens the
 image (05_gateway.md), and a released build image's map runs to 880,000 extents, which took 2.5-10.6 s per image to walk
 inside `rm` (measured 2026-10-25), before the verb could answer. A recovery retirement compares the canonical file with
-the renamed file in trash: a rename frees no extents or allocated bytes. Missing files are explicitly `absent`; failed
-measurements are null with their cause, never zero. The extent count comes from
-`storage/apfs/extents.rs::count_extents`, the existing native `F_LOG2PHYS_EXT` walker. Allocation reuses that module's
-`allocated_bytes` (`st_blocks * 512`). Neither measures the mounted filesystem's contents, shared-block exclusivity, or
-bytes written.
+the renamed file in trash: a rename frees no extents or allocated bytes. A fork's capture of its source's seed
+(16_build_volumes.md, "Fork" step 3) runs under the source's image lock, so it too reads allocation alone: its extent
+columns are null with the cause "a capture under its source's image lock does not walk an extent map"; the clone's map
+is the seed's, which the seed's own capture walked. Missing files are explicitly `absent`; failed measurements are null
+with their cause, never zero. The extent count comes from `storage/apfs/extents.rs::count_extents`, the existing native
+`F_LOG2PHYS_EXT` walker. Allocation reuses that module's `allocated_bytes` (`st_blocks * 512`). Neither measures the
+mounted filesystem's contents, shared-block exclusivity, or bytes written.
 
 The custom columns are:
 

@@ -71,37 +71,40 @@ links back to the sections here.
   state, and retain the old image until verification passes. The host reclaims old blocks only when the retained image
   and every clone or checkpoint sharing them are explicitly released. This costs a filesystem copy; neither `defrag` nor
   a sparse-file copy identifies guest-freed nonzero blocks.
-- **Clone cost follows extents, not size**: `clonefile` shares the source file's extent map, and the first write to
-  either file copies that map. First-write cost scales with extent count; `fork` pays it in its own `first-write` step
-  before attach. `image.write_first` reads and rewrites the same 4 KiB at offset zero; that single write can materialize
-  the shared extent map, and the first write to either file of a clone family pays the whole copy: writing both files at
-  once makes both wait, and a clone left unwritten leaves the copy to the source's next write, after which the clone's
-  first write is cheap. Writers of unrelated files on the container keep completing during most of it, so this is
-  clone-family contention, not an intermittent container-wide stall; correlation with a live Nx freeze does not by
-  itself identify which overlapping image operation caused it. Fewer extents reduce map-copy work; yielding outside the
-  syscall cannot split it ("Freeing an image"). When a clone or checkpoint shares an image's blocks, rewritten blocks
-  move to new runs. Writes into a workspace do not rewrite main's extent map. Build state lives on volumes replaced at
-  each land rather than in main's image (16_build_volumes.md, "Why two volumes"). `doctor` counts each workspace source,
-  live build source and build seed with one `F_LOG2PHYS_EXT` query per contiguous run, reporting
-  `main-extents`/`source-extents`, `pending-source-extents`, `build-source-extents` and `build-seed-extents` against the
-  actual image path. Build diagnostics select published images of current owners; a retired incarnation is not the
-  current owner's fork source or its defrag target. At **7,141 extents** doctor warns and names
-  `cowshed defrag <workspace>`; 7,140 is the standalone first-write sensitivity bound from 60.845084042 s / 434,462 =
-  140.046964 µs/extent, not a whole-fork guarantee (08_testing.md); the RAW observation's cause is unattributed. Before
-  its first write, each fresh workspace or build clone measures its actual detached generation against this bound, not a
-  cached estimate of its still-writing source; past it the fork warns, naming the measured first-write cost and
-  `cowshed defrag <workspace>`, and proceeds: the bound is advisory and never refuses a fork. A resumed pending clone is
-  proved again. Workspace initialization is followed by a flush and a second bounded proof before activation; build
-  seeds prove their final generation after their freshness mark, before publication, and revalidate it across
-  publication. Device/inode, length, allocated blocks, and nanosecond mtime/ctime bind a proof to the physical write
-  generation, not HEAD; missing, changing images cannot claim fork readiness; an oversized one only warns. The fork's
-  walk stops counting at 7,141 runs, so its warning reports lower bounds; doctor's full diagnostic walk is explicit.
-  Proof collection is additional work. `defrag` is the remedy: it rewrites every published seed of the named incarnation
-  and its registered live build source, as well as the workspace image. Each build rewrite retains its exclusive
-  admission claim, closes Nx, refuses holders without force, restores the mount state and preserves a detached seed's
-  build-freshness time. Per-build-image counts and copied bytes are reported separately from the workspace result. It
-  detaches the workspace as `resize` does — a busy volume refuses before the image is touched — copies the image's data
-  regions with plain `pread`/`pwrite` into `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or
+- **Clone cost follows extents, not size**: `clonefile` shares the source file's extent map, and the first mutation of
+  either file copies that map, wherever it lands (a write at any offset, an append past the end, even a metadata-only
+  `ftruncate`), at a cost that scales with the extent count, not the offset; every write after it is free.
+  `hdiutil attach -nomount` does not trigger the copy; the read-write `mount_apfs` does, because APFS writes its
+  checkpoint, so a clone's first mutation is its mount (for a clone resumed after a crash, whatever writes it first) and
+  cowshed writes nothing ahead of it. A fork's clones pay the copy in their mounts, after the fork has let go of its
+  source's image lock, which a git-worktree fork keeps (16_build_volumes.md, "Fork"). Whichever file of a clone family
+  is mutated first pays the whole copy: writing both files at once makes both wait, and a clone left unwritten leaves
+  the copy to the source's next write, after which the clone's first write is cheap. Writers of unrelated files on the
+  container keep completing during most of it, so this is clone-family contention, not an intermittent container-wide
+  stall; correlation with a live Nx freeze does not by itself identify which overlapping image operation caused it.
+  Fewer extents reduce map-copy work; yielding outside the syscall cannot split it ("Freeing an image"). When a clone or
+  checkpoint shares an image's blocks, rewritten blocks move to new runs. Writes into a workspace do not rewrite main's
+  extent map. Build state lives on volumes replaced at each land rather than in main's image (16_build_volumes.md, "Why
+  two volumes"). `doctor` counts each workspace source, live build source and build seed with one `F_LOG2PHYS_EXT` query
+  per contiguous run, reporting `main-extents`/`source-extents`, `pending-source-extents`, `build-source-extents` and
+  `build-seed-extents` against the actual image path. Build diagnostics select published images of current owners; a
+  retired incarnation is not the current owner's fork source or its defrag target. At **7,141 extents** doctor warns and
+  names `cowshed defrag <workspace>`; 7,140 is the standalone first-write sensitivity bound from 60.845084042 s /
+  434,462 = 140.046964 µs/extent, not a whole-fork guarantee (08_testing.md); the RAW observation's cause is
+  unattributed. Before anything writes it, each fresh workspace or build clone measures its actual detached generation
+  against this bound, not a cached estimate of its still-writing source; past it the fork warns, naming the measured
+  first-write cost and `cowshed defrag <workspace>`, and proceeds: the bound is advisory and never refuses a fork. A
+  resumed pending clone is proved again. Workspace initialization is followed by a flush and a second bounded proof
+  before activation; build seeds prove their final generation after their freshness mark, before publication, and
+  revalidate it across publication. Device/inode, length, allocated blocks, and nanosecond mtime/ctime bind a proof to
+  the physical write generation, not HEAD; missing, changing images cannot claim fork readiness; an oversized one only
+  warns. The fork's walk stops counting at 7,141 runs, so its warning reports lower bounds; doctor's full diagnostic
+  walk is explicit. Proof collection is additional work. `defrag` is the remedy: it rewrites every published seed of the
+  named incarnation and its registered live build source, as well as the workspace image. Each build rewrite retains its
+  exclusive admission claim, closes Nx, refuses holders without force, restores the mount state and preserves a detached
+  seed's build-freshness time. Per-build-image counts and copied bytes are reported separately from the workspace
+  result. It detaches the workspace as `resize` does — a busy volume refuses before the image is touched — copies the
+  image's data regions with plain `pread`/`pwrite` into `<image>.defrag` beside it (never `clonefile`, `copyfile(3)`, or
   `std::fs::copy`, all of which clone on APFS and would share the old map), punches interior holes after each following
   write and the trailing hole after sizing the copy (APFS may allocate zero blocks when extending it), `F_FULLFSYNC`s
   it, renames it over the image, syncs the directory, and verifies the result by attaching it before restoring the mount

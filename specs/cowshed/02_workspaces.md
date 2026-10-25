@@ -579,18 +579,19 @@ image remains live and mounted throughout capture.
    detaching, sealing, or changing its mount flags. Source shells, editors and watchers continue to use it.
 2. Open the source inode without following symlinks and descriptor-clone it to `sessions/<ws>.dmg`. RAW has no outer
    allocation map; the filesystem snapshot is crash-consistent, not an application-state transaction. Create the
-   complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
+   complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux. Once
+   this clone and the build volume's seed capture beside it are made (16_build_volumes.md, "Fork"), the source's image
+   lock is let go: every later step reads only the clone. A git-worktree fork keeps it until it is registered in main.
 3. Attach the exact clone once without mounting (`hdiutil attach -kernel -nomount`, flags per 01a_apfs.md §Mounts),
    verify the freshly probed, pinned APFS volume with `fsck_apfs -q`, then use `mount_apfs` to mount that exact volume
    at `<mount-root>/<owner>/<repo>/<ws>`. The mapping is guarded again after the host lease wait; verification precedes
    the first mount, and the held mount root/source is checked before publication. No combined mountpoint attach,
-   stale-family selection, fallback or retry is allowed. RAW makes no fixed attach-latency guarantee. Before attach, the
-   `first-write` step rewrites the clone's first block with the bytes it holds, which copies the source image's extent
-   map (01a_apfs.md, "Clone cost follows extents, not size"). On a long-used main that costs tens of seconds, and under
-   host load a container-wide metadata stall follows it, until `cowshed defrag main` rewrites main contiguously. The
-   fork's process holds the clone's descriptor in that write the whole time, so a process-table census that asks about
-   it waits as long: measured 2026-10-21, 54-90 s for each of four forks, which stalled every guard and gate census on
-   the host. A census therefore asks nothing of a process a lifecycle lease names ("Holders cowshed does not run").
+   stale-family selection, fallback or retry is allowed. RAW makes no fixed attach-latency guarantee. Nothing writes the
+   clone before it mounts: its first mutation, the read-write mount, makes APFS copy the extent list it shares with the
+   source image (01a_apfs.md, "Clone cost follows extents, not size"), seconds per hundred thousand extents, after the
+   source's image lock is let go. The fork's process holds the clone's descriptor in that mount the whole time, so a
+   process-table census that asks about it waits as long. A census therefore asks nothing of a process a lifecycle lease
+   names ("Holders cowshed does not run").
 4. On attach, fsck, mount or identity failure, refuse publication with the actual error and release the destination
    attachment or report its cleanup refusal; never detach the live source as a fallback.
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = source HEAD), mint a fresh `.cowshed/token`,

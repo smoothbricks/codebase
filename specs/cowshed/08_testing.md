@@ -1239,7 +1239,7 @@ registration.
 
 | Operation                        | Budget (median, local)  | Basis                                                                                          |
 | -------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------- |
-| `cowshed fork` cold              | ≤ 1 s                   | clonefile + first write + attach + `fsck_apfs -q` + `mount_apfs`                               |
+| `cowshed fork` cold              | ≤ 1 s                   | clonefile + attach + `fsck_apfs -q` + `mount_apfs` (the mount pays the extent copy)            |
 | `cowshed rm` complete retirement | No measured bound       | detach and the release's rename finish before success; a background child frees it, off-budget |
 | `cowshed checkpoint`             | ≤ 1 s                   | descriptor-clone path                                                                          |
 | `cowshed path` / `ls`            | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design                                   |

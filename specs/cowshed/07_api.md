@@ -62,8 +62,9 @@ observes exactly what a `Workspaces` opening naming its one workspace observes a
 it replays no intent, `main`'s included, completes no publication or restore, reclaims no trash, finishes no identity
 change and writes no binding, so it takes no image lock. The command that asked for the supervisor has already opened
 under its own scope and finished what was its; a lock held now is a live lifecycle operation's, such as a fork's, which
-holds its source's lock, `main`'s included, through its whole clone (16_build_volumes.md, "Fork" step 1), minutes on a
-large build image. Residue left since stays for that operation, or the next ordinary command, to finish.
+holds its source's lock, `main`'s included, across the source's `clonefile`s and seed refresh only, or to its end when
+it is a git-worktree fork (16_build_volumes.md, "Fork" step 1). Residue left since stays for that operation, or the next
+ordinary command, to finish.
 
 The supervisor's start serves a settled mount without waiting either. With the workspace's image lock free it settles
 the mount under that lock as every caller does. With the lock held, a workspace already mounted from its own image, its

@@ -1326,12 +1326,6 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         Err(unsupported("proving a physical image's extent budget"))
     }
 
-    /// A directory clone shares no extent map with its source: there is nothing to copy before
-    /// a first write. The executor skips this step for hosts without physical volumes.
-    fn write_first(&self, _image: &Path) -> Result<(), ApfsStorageError> {
-        Err(unsupported("taking a clone's own extent map"))
-    }
-
     fn validate_pending_clone(
         &self,
         image: &Path,

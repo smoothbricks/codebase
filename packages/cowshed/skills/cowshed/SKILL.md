@@ -12,10 +12,10 @@ description:
 A cowshed workspace is a full standalone checkout — source, `.git`, `node_modules`, `target/`, every build cache —
 cloned copy-on-write from the repository's warm `main` image. A `git worktree` gives an agent a cold tree whose build
 cache starts empty and a first build that costs minutes; a cowshed workspace starts warm. On a long-used repository
-`cowshed fork` is dominated by two steps. The clone call returns in milliseconds, but the clone's first write, during
-its attach or mount, makes APFS copy the extent map of main's image file: one loaded RAW observation took about 140 µs
-per extent, and main's image fragments with every write it takes while clones share its blocks. Past 7,140 extents,
-about a second at that rate, fork refuses and names `cowshed defrag main`. Then setup walks the whole tree for symlinks
+`cowshed fork` is dominated by two steps. The clone call returns in milliseconds, but the clone's read-write mount, its
+first write, makes APFS copy the extent map of main's image file: one loaded RAW observation took about 140 µs per
+extent, and main's image fragments with every write it takes while clones share its blocks. Past 7,140 extents, about a
+second at that rate, fork warns, goes on, and names `cowshed defrag main`. Then setup walks the whole tree for symlinks
 that point outside it, about 5 s over a million entries. The number of attached images does not matter.
 
 `fork [<src>] <ws>` is the only creation verb; the source defaults to main. Every fork carries source edits and

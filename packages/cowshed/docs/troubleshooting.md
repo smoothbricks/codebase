@@ -432,15 +432,16 @@ every workspace it recovers. When a command is still slow on a wait in a host pr
 `cowshed fork` prints a `cowshed: apfs canonical/<step>` or `cowshed: fork <step>` span with its elapsed time for every
 step, so the slow step is named on stderr. On a large repository two steps carry nearly all of the time:
 
-- **The first write into the fresh clone**, `apfs canonical/first-write`. The clone call shares main's image extent map;
-  the first write to either file makes APFS copy that map. Cowshed rewrites the clone's first block before attach so the
-  cost is a step of its own rather than part of the mount's recovery write. Main's image fragments when writes move
-  blocks shared by clones into new runs, so first-write cost scales with extent count. A one-byte write into a plain
-  `cp -c` clone reproduces that map copy without an attached disk image. Deleting a written clone also incurs extent-map
-  work; `fork <ws> <name>` incurs it for the source workspace's image. `cowshed doctor` reports the extent count and
-  predicted cost as `main-extents` and warns when it reaches the cold-fork budget (08_testing.md). `cowshed defrag main`
-  rewrites main's image file contiguously while the checkout is idle; a busy volume refuses. It needs as much free space
-  as main's image has allocated and keeps it while older clones still share the old blocks.
+- **The mount of the fresh clone**, `apfs canonical/mount`. The clone call shares main's image extent map; the first
+  mutation of either file makes APFS copy that map, and the clone's read-write `mount_apfs` is that first mutation,
+  because APFS writes its checkpoint. `apfs canonical/attach` does not trigger the copy, and cowshed writes nothing to
+  the clone ahead of the mount. Main's image fragments when writes move blocks shared by clones into new runs, so the
+  mount's cost scales with extent count. A one-byte write into a plain `cp -c` clone reproduces that map copy without an
+  attached disk image. Deleting a written clone also incurs extent-map work; `fork <ws> <name>` incurs it for the source
+  workspace's image. `cowshed doctor` reports the extent count and predicted cost as `main-extents` and warns when it
+  reaches the cold-fork budget (08_testing.md). `cowshed defrag main` rewrites main's image file contiguously while the
+  checkout is idle; a busy volume refuses. It needs as much free space as main's image has allocated and keeps it while
+  older clones still share the old blocks.
 - **`fork links`**, the walk over the whole tree for symlinks that point outside it; its cost scales with the entries
   visited.
 

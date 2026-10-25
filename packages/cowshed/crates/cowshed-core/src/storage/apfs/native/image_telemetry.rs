@@ -46,16 +46,20 @@ pub(super) struct Image<'a> {
 enum Layout {
     /// The extent map and the allocation: a capture, a first write, a recovery retirement.
     Walked,
-    /// The allocation alone (`st_blocks`): a release, whose commit never opens the image
-    /// (05_gateway.md, "Deleting released images"). A released build image's map runs to
+    /// The allocation alone (`st_blocks`), for the cause its null extent columns carry: a
+    /// release, whose commit never opens the image (05_gateway.md, "Deleting released images"),
+    /// or a fork's capture under its source's image lock. A released build image's map runs to
     /// 880,000 extents, and walking it cost 2.5-10.6 s per image inside `rm` (measured
     /// 2026-10-25), all of it before the verb could answer.
-    Allocation,
+    Allocation(&'static str),
 }
 
 /// The cause a release's null extent columns carry.
 const UNWALKED: &str = "a release does not walk its image's extent map";
 
+/// The cause the null extent columns of a fork's capture carry.
+const UNWALKED_UNDER_SOURCE_LOCK: &str =
+    "a capture under its source's image lock does not walk an extent map";
 #[derive(Debug)]
 struct Snapshot {
     extents: Option<u64>,
@@ -92,7 +96,7 @@ impl Snapshot {
                         Ok(count) => (Some(count.get()), None),
                         Err(error) => (None, Some(error.to_string())),
                     },
-                    Layout::Allocation => (None, Some(UNWALKED.to_owned())),
+                    Layout::Allocation(cause) => (None, Some(cause.to_owned())),
                 };
                 let error = match (unwalked, &allocation) {
                     (None, Ok(_)) => None,
@@ -282,7 +286,24 @@ impl ImageTelemetry {
             before: image,
             after: image,
         }];
-        self.measure_with("retire", &images, Layout::Allocation, work)
+        self.measure_with("retire", &images, Layout::Allocation(UNWALKED), work)
+    }
+
+    /// `work`, a fork's capture under its source's image lock, as an `operation` span that
+    /// reads each image's allocation and walks no extent map, so the walk never lengthens the
+    /// lock (13_telemetry.md, "Native image observations").
+    pub fn measure_under_source_lock<T, E: fmt::Display>(
+        &self,
+        operation: &'static str,
+        images: &[Image<'_>],
+        work: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.measure_with(
+            operation,
+            images,
+            Layout::Allocation(UNWALKED_UNDER_SOURCE_LOCK),
+            work,
+        )
     }
 
     fn measure_with<T, E: fmt::Display>(
@@ -770,7 +791,7 @@ mod tests {
         let telemetry = ImageTelemetry::new(&fixture.0);
         telemetry
             .measure(
-                "write_first",
+                "clone",
                 &[Image {
                     role: "image",
                     before: &image,
@@ -823,7 +844,7 @@ mod tests {
         let telemetry = ImageTelemetry::new(&fixture.0);
         telemetry
             .measure(
-                "write_first",
+                "clone",
                 &[Image {
                     role: "image",
                     before: &image,
@@ -938,7 +959,7 @@ mod tests {
         fs::write(&image, [1; 32]).unwrap();
         let telemetry = ImageTelemetry::new(&fixture.0);
         let result = telemetry.measure(
-            "write_first",
+            "clone",
             &[Image {
                 role: "image",
                 before: &image,
@@ -1100,7 +1121,7 @@ mod tests {
         let failed = Arc::clone(&telemetry.failed);
         telemetry
             .measure(
-                "write_first",
+                "clone",
                 &[Image {
                     role: "image",
                     before: &image,
@@ -1114,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn image_telemetry_native_seed_clone_first_write_and_release_are_all_wired() {
+    fn image_telemetry_native_seed_clone_and_release_are_all_wired() {
         use crate::build_volume::{
             BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, Registrant,
             Registration,
@@ -1217,12 +1238,7 @@ mod tests {
         }
         assert_eq!(
             counts,
-            std::collections::BTreeMap::from([
-                ("seed_capture", 2),
-                ("clone", 2),
-                ("write_first", 2),
-                ("retire", 2),
-            ])
+            std::collections::BTreeMap::from([("seed_capture", 2), ("clone", 2), ("retire", 2),])
         );
     }
 }

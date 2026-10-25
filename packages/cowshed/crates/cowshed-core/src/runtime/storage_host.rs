@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::build_volume::{
-    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, Registration, ReleaseClaim,
+    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration,
+    ReleaseClaim,
 };
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
@@ -95,12 +96,30 @@ pub(crate) trait RuntimeStorageHost:
         seed: &BuildVolumeId,
         written: SystemTime,
     ) -> Result<(), ApfsStorageError>;
-    fn fork_build_volume(
+    /// Fork step 3's capture of `seed` into a new live volume registered as `registration`
+    /// (16_build_volumes.md, "Fork"): the only step of it that reads `seed`, so the only one the
+    /// fork takes under its source's image lock. Not yet proven or published.
+    fn capture_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
         registration: &Registration,
+    ) -> Result<CapturedBuildVolume, ApfsStorageError>;
+    /// The captured live volume proven and published, then `own_seed` cloned from it when one is
+    /// asked for, then the live volume mounted without the seed's Nx daemon record, once the
+    /// source's image lock is let go: its id and mountpoint. A failure releases what it made.
+    fn ready_fork_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+        own_seed: Option<(&BuildVolumeId, &Registration)>,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError>;
+    /// Release a capture its failed fork never readies.
+    fn abandon_captured_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+    ) -> Result<BuildVolumeRelease, ApfsStorageError>;
     fn mount_build_volume(
         &self,
         layout: &BuildVolumeLayout,

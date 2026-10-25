@@ -702,11 +702,11 @@ impl ProjectRuntimeHost for FakeHost {
                 "choose another name",
             ));
         }
-        // The real host's steps, in the shape it reports them: a clone step holding the first
-        // write into the clone, then the initializer.
+        // The real host's steps, in the shape it reports them: a clone step holding the proof of
+        // the clone's extents, then the initializer.
         let gate = self.create_gate.clone();
         timed_async("fork", "clone", async {
-            timed("apfs", format_args!("canonical/first-write"), || {
+            timed("apfs", format_args!("canonical/extent-proof"), || {
                 Ok::<_, CowshedError>(())
             })?;
             if let Some(gate) = gate {
@@ -5475,7 +5475,7 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
 
 /// A create that asks for its steps hears each one as it happens, over the controller connection
 /// the embedder holds: while the create is still held inside its clone step, the clone and the
-/// first write inside it have already arrived, nested; the rest arrive before the answer, and the
+/// extent proof inside it have already arrived, nested; the rest arrive before the answer, and the
 /// stream ends with the call. A hung create therefore names the step it hangs in.
 #[tokio::test]
 async fn a_reported_create_hears_its_steps_while_it_runs() {
@@ -5529,7 +5529,7 @@ async fn a_reported_create_hears_its_steps_while_it_runs() {
         heard_while_held,
         [
             started(0, None, "fork", "clone"),
-            started(1, Some(0), "apfs", "canonical/first-write"),
+            started(1, Some(0), "apfs", "canonical/extent-proof"),
             ended(1),
         ]
     );

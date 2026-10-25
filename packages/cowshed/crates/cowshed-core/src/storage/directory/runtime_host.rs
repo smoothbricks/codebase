@@ -10,7 +10,8 @@ use std::time::SystemTime;
 
 use super::{DirectoryExecutionHost, unsupported};
 use crate::build_volume::{
-    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, Registration, ReleaseClaim,
+    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration,
+    ReleaseClaim,
 };
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
@@ -113,13 +114,30 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         DirectoryExecutionHost::mark_seed_written(self, layout, seed, written)
     }
 
-    fn fork_build_volume(
+    fn capture_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
         registration: &Registration,
+    ) -> Result<CapturedBuildVolume, ApfsStorageError> {
+        DirectoryExecutionHost::capture_fork_build_volume(self, layout, seed, registration)
+    }
+
+    fn ready_fork_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+        own_seed: Option<(&BuildVolumeId, &Registration)>,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
-        DirectoryExecutionHost::fork_build_volume(self, layout, seed, registration)
+        DirectoryExecutionHost::ready_fork_build_volume(self, layout, captured, own_seed)
+    }
+
+    fn abandon_captured_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+    ) -> Result<BuildVolumeRelease, ApfsStorageError> {
+        DirectoryExecutionHost::abandon_captured_build_volume(self, layout, captured)
     }
 
     fn mount_build_volume(

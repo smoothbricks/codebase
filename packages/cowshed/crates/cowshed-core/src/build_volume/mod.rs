@@ -264,6 +264,23 @@ impl Registration {
     }
 }
 
+/// A clone whose bytes are captured and whose owner record is registered, but which is not yet
+/// proven forkable or published: what a fork takes under its source's image lock,
+/// so that lock covers the capture alone (16_build_volumes.md, "Fork" step 3). The creation's
+/// hold keeps collection off it until its host finishes and publishes it, or releases it once a
+/// failure abandons it. Dropped unfinished, it stays registered for collection, as a crash
+/// leaves it.
+#[derive(Debug)]
+pub struct CapturedBuildVolume {
+    pub id: BuildVolumeId,
+    pub registration: Registration,
+    /// The last write the captured bytes hold: the clone's own, before it is written.
+    pub written: std::time::SystemTime,
+    /// Whose volume the bytes came from: a refused extent proof names its defragmentation.
+    pub source_owner: WorkspaceName,
+    pub creating: BuildVolumeHold,
+}
+
 /// The build-state paths a volume holds, as written at its root ([`STATE_FILE`]), and the
 /// fingerprint of the tracked build inputs they were discovered from
 /// (`capabilities::tracked_manifest_fingerprint`): while it matches, nothing is rediscovered.

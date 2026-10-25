@@ -380,18 +380,16 @@ which every fork of the target holds while it clones the seed, so a reseed never
 4. the live volume and its backing image are flushed, then the existing mounted-source descriptor-clone captures the
    image atomically. Capture does not require unmount or detach; open files on exempt contributed paths do not refuse
    it. The Nx and Cargo guards remain held until the cloned bytes and immutable freshness mark are fixed;
-5. the clone's extent-map write and owner-record publication complete before supervised admission reopens. The
-   content-neutral first-block rewrite has its own unconditional `build-volume first-write <image>` start/end span,
-   separate from `clonefile`, with elapsed time and success or failure. It pays the clone's extent-map cost before a
-   later mounted write; it does not repair or change the captured bytes. A job admitted afterwards cannot invalidate the
-   snapshot; its later writes make the seed behind again. Dropping the capture claim only unlocks the source's hold; it
-   never retires or deletes the source.
+5. the clone's extent proof and owner-record publication complete before supervised admission reopens. The proof counts
+   the clone's extents and writes nothing: the copy of the extent map it shares with its source waits for the first
+   mutation of either (01a_apfs.md, "Clone cost follows extents, not size"). A job admitted afterwards cannot invalidate
+   the snapshot; its later writes make the seed behind again. Dropping the capture claim only unlocks the source's hold;
+   it never retires or deletes the source.
 
-Native capture, clone, first-write and release operations record each image's extent count and allocated bytes before
-and after, their signed deltas, operation and measurement time, and explicitly process-window disk-write bytes. Absolute
-extent count and growth warn separately, before a high-count image incurs another fork's first write. See
-13_telemetry.md, "Native image observations", for thresholds and their measured basis, Arrow fields, batching and
-queries.
+Native capture, clone and release operations record each image's extent count and allocated bytes before and after,
+their signed deltas, operation and measurement time, and explicitly process-window disk-write bytes. Absolute extent
+count and growth warn separately, before a high-count image costs another fork its extent-map copy. See 13_telemetry.md,
+"Native image observations", for thresholds and their measured basis, Arrow fields, batching and queries.
 
 Land already owns a shared GC hold on its quiet source. Its typed quiet capture retains the stopped supervisor socket
 lease that refuses replacement admission, from before the jobs stop through capture and adoption. It does not take a
@@ -565,20 +563,31 @@ workspace. All sources use one mint path, carrying edits and untracked files war
 
 1. Flush and descriptor-clone the target's live RAW source image without detaching it (02_workspaces.md). Source
    filesystem crash consistency does not replace build-state writer exclusion. The fork holds the target's image lock
-   from here to the end of step 3.
+   from here until step 3's capture.
 2. **Refresh the target's seed** (Targets and seeds, "Which volume a seed holds"): from a landed workspace's volume
    after an external land, else by a reseed from the target's live volume when that is nearer or as near and newer and
    has no writer.
-3. Clone **the target's** latest seed image to a new build volume owned by the new workspace, attach it, and point the
-   workspace's `.cowshed/build` at it. Clones preserve every file's bytes and mtime; Cargo freshness depends on that
-   (rule "Clones preserve mtimes").
+3. Capture **the target's** latest seed image into a new build volume owned by the new workspace: register it and
+   `clonefile` the seed, nothing more, and let go of the target's image lock. Then, reading only the clone, prove it
+   forkable, publish and attach it, and point the workspace's `.cowshed/build` at it. Clones preserve every file's bytes
+   and mtime; Cargo freshness depends on that (rule "Clones preserve mtimes").
 4. Delete `nx/workspace-data/d` in the new build volume: a daemon record names another checkout's process and socket
    (rule "One Nx state per checkout").
 
-Steps 2 and 3 up to the attach run beside step 1's attach of the cloned image, under the same lock: every attach waits
-in the host's one `storagekitd` queue (01a_apfs.md "How the APFS host degrades"), and the two in flight together wait in
-it once. The new workspace's own seed is cloned, and its link written, only once its checkout is staged; a clone that
-never stages releases the volume made for it.
+The lock covers what reads the target: the clone of its image, its seed refresh and the capture of its seed, all one
+hold, so the clone's checkout and its build volume come from one state of the target that no land or reseed changes
+between them. Nothing under the lock writes a clone of the fork's own: a clone's first mutation, whatever and wherever
+it is, makes APFS copy the whole extent list it shares with its source, and only that first mutation pays; it is the
+clone's read-write mount, after the lock is let go, so the hold is the `clonefile`s'. A step 2 reseed captures, proves
+and publishes the target's new seed under the lock, which a fork does only when the target's live volume is nearer its
+tree than the seed. The hold is said as `cowshed: apfs source-lock held=<duration>`. A git-worktree fork keeps the lock
+to the end: its initializer registers it in main's repository.
+
+After the lock is let go, the build volume's attach and mount run beside the cloned image's attach and mount: every
+attach waits in the host's one `storagekitd` queue (01a_apfs.md "How the APFS host degrades"), and the two in flight
+together wait in it once. The new workspace's own seed is a clone of its live volume made before anything mounts it, so
+it holds exactly what the target's seed held. The checkout's link is written only once its checkout is staged; a fork
+that never stages, or whose mount fails after publication, releases the volumes made for it.
 
 The fork is warm for everything the seed's volume held when it was last frozen: at the latest land, at the next fork
 after an external land, or at the latest reseed, which is this fork's own step 2 unless the target's volume had a writer
@@ -662,14 +671,15 @@ below).
    image, expected device and mountpoint and the original command failure. There is no blind mount retry; unrelated
    command failures are never converted into success by a subsequent mount observation.
 
-   The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has its
-   fresh clone of the target's latest seed (the new one, or the previous one retained by a skipped capture). Every fork
-   of the target holds the same lock from before it reads the target's seed and link until it links its own (Fork steps
-   1 to 3), and so does every reseed, so neither reads a seed or a volume the land deletes. Without it, a land that
-   freezes main's seed and releases main's previous volume while a fork of main is under way deletes the seed the fork
-   has read, and the fork fails (`sync source image …: No such file or directory`). A land that finds the lock held says
-   so on stderr and waits for it. It waits with the target's daemon already stopped (5.3), so the longer it waits, the
-   likelier an Nx client restarts it and 6.2 skips the swap, reported as any skip is.
+   The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has
+   captured its fresh clone of the target's latest seed (the new one, or the previous one retained by a skipped
+   capture); the clone's mount and link run after the land lets go. Every fork of the target holds the same lock from
+   before it reads the target's seed and link until it has captured its own (Fork steps 1 to 3), and so does every
+   reseed, so neither reads a seed or a volume the land deletes. Without it, a land that freezes main's seed and
+   releases main's previous volume while a fork of main is under way deletes the seed the fork has read, and the fork
+   fails (`sync source image …: No such file or directory`). A land that finds the lock held says so on stderr and waits
+   for it. It waits with the target's daemon already stopped (5.3), so the longer it waits, the likelier an Nx client
+   restarts it and 6.2 skips the swap, reported as any skip is.
 
    A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap. A skipped capture at 5.6
    keeps the previous seed and still swaps.

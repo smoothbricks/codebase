@@ -5973,14 +5973,21 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     volumes.release_previous(previous),
                 );
                 let in_target = async {
-                    // A kept workspace's fresh clone of the target's new seed is the last step
-                    // under the target's image lock.
-                    if !retire {
-                        volumes
-                            .refork(&locked, landing_owner.clone(), landing.to_owned())
-                            .await?;
-                    }
+                    // A kept workspace's capture of the target's new seed is the last step under
+                    // the target's image lock; its publication, mount and link run after it.
+                    let refork = if retire {
+                        None
+                    } else {
+                        Some(
+                            volumes
+                                .refork(&locked, landing_owner.clone(), landing.to_owned())
+                                .await?,
+                        )
+                    };
                     drop(locked);
+                    if let Some(refork) = refork {
+                        timed_async("land", "refork", volumes.ready_refork(refork)).await?;
+                    }
                     let _landing_hold = quiet.release_admission();
                     // Each moved link's volume carries the label of the checkout that built it:
                     // the target's supervisor names the adopted one now, in the background, and a
@@ -13058,14 +13065,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             let home = &self.home;
             let program_directories = &self.program_directories;
             let build_volumes = self.build_volumes()?;
-            // Under the source's image lock, which every fork of the source holds while its
-            // clone is staged: the seed the fork clones is first refreshed for the tree it checks
-            // out, from a landed workspace's volume or the source's own, unless something still
-            // writes that volume. The fork's live volume is attached beside the clone's own
-            // attach, so the two wait on `storagekitd` once.
-            let preparing = build_volumes.clone();
+            // Under the source's image lock, which a fork holds only while it captures: the seed
+            // the fork clones is first refreshed for the tree it checks out, from a landed
+            // workspace's volume or the source's own, unless something still writes that volume,
+            // then captured beside the capture of the source's image. Once the lock is let go the
+            // fork's live volume is published and attached beside the clone's own, so the two
+            // wait on `storagekitd` once.
+            let capturing = build_volumes.clone();
+            let readying = build_volumes.clone();
+            let abandoning_capture = build_volumes.clone();
             let abandoning = build_volumes.clone();
-            let prepare = {
+            let capture = {
                 let (source_mount, destination) = (source_mount.clone(), destination.clone());
                 let seed_source = super::build_volumes::Owner {
                     name: source_name.clone(),
@@ -13075,7 +13085,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     timed_async(
                         "fork",
                         "build-volume",
-                        preparing.prepare_fork(seed_source, source_mount, destination, aim),
+                        capturing.capture_fork(seed_source, source_mount, destination, aim),
                     )
                     .await
                 }
@@ -13084,9 +13094,26 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .substrate
                 .execute_create_staged(
                     plan,
-                    crate::storage::apfs::Alongside {
-                        work: prepare,
-                        abandon: move |prepared| async move {
+                    crate::storage::apfs::Beside {
+                        capture,
+                        ready: {
+                            let name = destination.clone();
+                            move |captured, incarnation| async move {
+                                timed_async(
+                                    "fork",
+                                    "build-volume-ready",
+                                    readying.ready_fork(
+                                        captured,
+                                        super::build_volumes::Owner { name, incarnation },
+                                    ),
+                                )
+                                .await
+                            }
+                        },
+                        abandon_captured: move |captured| async move {
+                            abandoning_capture.abandon_captured_fork(captured).await;
+                        },
+                        abandon_ready: move |prepared| async move {
                             abandoning.abandon_fork(prepared).await;
                         },
                     },
@@ -13459,11 +13486,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 let program_directories = &self.program_directories;
                 let build_volumes = self.build_volumes()?;
                 let source_name_for_callback = source.clone();
-                // Under the source's image lock, as for `resume_fork`: the source's seed is first
-                // refreshed for the source's tree, and the fork's live volume attaches beside the clone.
-                let preparing = build_volumes.clone();
+                // As for `resume_fork`: under the source's image lock the source's seed is first
+                // refreshed for the source's tree and captured; once the lock is let go the fork's
+                // live volume is published and attached beside the clone.
+                let capturing = build_volumes.clone();
+                let readying = build_volumes.clone();
+                let abandoning_capture = build_volumes.clone();
                 let abandoning = build_volumes.clone();
-                let prepare = {
+                let capture = {
                     let (source_mount, forked) = (source_mount.clone(), forked.clone());
                     let seed_source = super::build_volumes::Owner {
                         name: source.clone(),
@@ -13473,7 +13503,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         timed_async(
                             "fork",
                             "build-volume",
-                            preparing.prepare_fork(seed_source, source_mount, forked, aim),
+                            capturing.capture_fork(seed_source, source_mount, forked, aim),
                         )
                         .await
                     }
@@ -13482,9 +13512,26 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .substrate
                     .execute_fork_staged(
                         plan,
-                        crate::storage::apfs::Alongside {
-                            work: prepare,
-                            abandon: move |prepared| async move {
+                        crate::storage::apfs::Beside {
+                            capture,
+                            ready: {
+                                let name = forked.clone();
+                                move |captured, incarnation| async move {
+                                    timed_async(
+                                        "fork",
+                                        "build-volume-ready",
+                                        readying.ready_fork(
+                                            captured,
+                                            super::build_volumes::Owner { name, incarnation },
+                                        ),
+                                    )
+                                    .await
+                                }
+                            },
+                            abandon_captured: move |captured| async move {
+                                abandoning_capture.abandon_captured_fork(captured).await;
+                            },
+                            abandon_ready: move |prepared| async move {
                                 abandoning.abandon_fork(prepared).await;
                             },
                         },

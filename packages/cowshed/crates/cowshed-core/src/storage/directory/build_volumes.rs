@@ -21,7 +21,7 @@ use super::{
 };
 use crate::build_volume::{
     BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
-    LinkResolution, Registrant, Registration, ReleaseClaim, link,
+    CapturedBuildVolume, LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::ApfsStorageError;
@@ -421,6 +421,20 @@ impl DirectoryExecutionHost {
         destination: &BuildVolumeId,
         registration: &Registration,
     ) -> Result<(), ApfsStorageError> {
+        let captured =
+            self.capture_build_volume_under_hold(layout, source, destination, registration)?;
+        self.finish_captured_build_volume(layout, captured)
+    }
+
+    /// Register `destination` and copy `source` into it, nothing more: what a fork takes under
+    /// its source's image lock. A failure releases what was registered.
+    fn capture_build_volume_under_hold(
+        &self,
+        layout: &BuildVolumeLayout,
+        source: &BuildVolumeId,
+        destination: &BuildVolumeId,
+        registration: &Registration,
+    ) -> Result<CapturedBuildVolume, ApfsStorageError> {
         let from = layout.image(source);
         let to = layout.image(destination);
         self.require_store_image(&to)?;
@@ -440,22 +454,54 @@ impl DirectoryExecutionHost {
         let creating = layout
             .register(destination, registration)
             .map_err(host_error)?;
-        let cloned = (|| {
-            self.clone_tree(&from, &to)?;
-            self.mark_seed_written(layout, destination, written)?;
-            layout
-                .publish(destination, registration)
-                .map_err(host_error)
-        })();
-        match cloned {
-            Ok(()) => {
-                drop(creating);
-                Ok(())
-            }
+        match self.clone_tree(&from, &to) {
+            Ok(()) => Ok(CapturedBuildVolume {
+                id: destination.clone(),
+                registration: registration.clone(),
+                written,
+                source_owner: source_record.role.owner().clone(),
+                creating,
+            }),
             Err(error) => Err(self.unregister(layout, destination, creating, error)),
         }
     }
 
+    /// Mark `captured` with the write its source held and publish it; a failure releases it.
+    pub fn finish_captured_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+    ) -> Result<(), ApfsStorageError> {
+        let CapturedBuildVolume {
+            id,
+            registration,
+            written,
+            creating,
+            ..
+        } = captured;
+        let finished = self
+            .mark_seed_written(layout, &id, written)
+            .and_then(|()| layout.publish(&id, &registration).map_err(host_error));
+        match finished {
+            Ok(()) => {
+                drop(creating);
+                Ok(())
+            }
+            Err(error) => Err(self.unregister(layout, &id, creating, error)),
+        }
+    }
+
+    /// Release `captured`, which a failed fork never finishes: the creation's hold goes first,
+    /// so the release can claim it.
+    pub fn abandon_captured_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+    ) -> Result<BuildVolumeRelease, ApfsStorageError> {
+        let CapturedBuildVolume { id, creating, .. } = captured;
+        drop(creating);
+        self.release_build_volume(layout, &id)
+    }
     /// The instant of the last write build volume `id` holds: its mark, while the tree is
     /// unchanged since the mark was written, and otherwise the tree's own last change.
     pub fn build_volume_written(
@@ -520,21 +566,79 @@ impl DirectoryExecutionHost {
         sync_parent_path(&mark)
     }
 
-    /// A new live volume cloned from `seed` as `registration`, bound, without the seed's Nx
-    /// daemon record (16_build_volumes.md, "Fork" steps 2 and 3).
-    pub fn fork_build_volume(
+    /// Fork step 3's capture of `seed` into a new live volume registered as `registration`
+    /// (16_build_volumes.md, "Fork"), the step its source's image lock covers.
+    pub fn capture_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
         registration: &Registration,
+    ) -> Result<CapturedBuildVolume, ApfsStorageError> {
+        self.require_store_image(&layout.image(seed))?;
+        self.capture_build_volume_under_hold(layout, seed, &BuildVolumeId::mint(), registration)
+    }
+
+    /// The captured live volume published, then `own_seed`, when one is asked for, copied from it
+    /// before anything binds it, then the live volume bound without the seed's Nx daemon record.
+    /// A failure after publication releases the live volume and a seed already made.
+    pub fn ready_fork_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+        own_seed: Option<(&BuildVolumeId, &Registration)>,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
-        let live = BuildVolumeId::mint();
-        self.clone_build_volume(layout, seed, &live, registration)?;
-        let mount = self.mount_build_volume(layout, &live)?;
-        let state = crate::build_volume::BuildVolumeState::read(&mount).map_err(host_error)?;
-        crate::build_volume::nx::discard_daemon_records(&mount, &state)
-            .map_err(|error| io_error("discard the seed's Nx daemon record", &mount, error))?;
-        Ok((live, mount))
+        let live = captured.id.clone();
+        self.finish_captured_build_volume(layout, captured)?;
+        let made = match own_seed {
+            Some((seed, registration)) => {
+                match self.clone_build_volume_under_hold(layout, &live, seed, registration) {
+                    Ok(()) => Some(seed),
+                    Err(primary) => return Err(self.release_unready(layout, &[&live], primary)),
+                }
+            }
+            None => None,
+        };
+        let mounted = self.mount_build_volume(layout, &live).and_then(|mount| {
+            let state = crate::build_volume::BuildVolumeState::read(&mount).map_err(host_error)?;
+            crate::build_volume::nx::discard_daemon_records(&mount, &state)
+                .map_err(|error| io_error("discard the seed's Nx daemon record", &mount, error))?;
+            Ok(mount)
+        });
+        match mounted {
+            Ok(mount) => Ok((live, mount)),
+            Err(primary) => {
+                let made: Vec<&BuildVolumeId> = std::iter::once(&live).chain(made).collect();
+                Err(self.release_unready(layout, &made, primary))
+            }
+        }
+    }
+
+    /// Release `volumes`, which a fork's ready that failed with `primary` published: a release
+    /// that cannot run is joined to `primary`, never hidden.
+    fn release_unready(
+        &self,
+        layout: &BuildVolumeLayout,
+        volumes: &[&BuildVolumeId],
+        primary: ApfsStorageError,
+    ) -> ApfsStorageError {
+        volumes.iter().fold(primary, |primary, id| {
+            let cleanup = match self.release_build_volume(layout, id) {
+                Ok(BuildVolumeRelease::Deleted { .. }) => Ok(()),
+                Ok(BuildVolumeRelease::Held { open }) => Err(ApfsStorageError::Host(format!(
+                    "build volume {id} stays while another hold on it lives ({} open); its holder releases it, or the next collection does",
+                    open.len()
+                ))),
+                Err(error) => Err(error),
+            };
+            match crate::storage::apfs::combine_cleanup::<std::convert::Infallible>(
+                "release a build volume whose fork never readied",
+                primary,
+                cleanup,
+            ) {
+                Err(error) => error,
+                Ok(never) => match never {},
+            }
+        })
     }
 
     /// Bind build volume `id` at its mountpoint. Idempotent.
@@ -834,7 +938,7 @@ impl DirectoryExecutionHost {
     ) -> Result<(), ApfsStorageError> {
         let refork = |seed: &BuildVolumeId| {
             let tree = layout.read_record(seed).map_err(host_error)?.tree;
-            let (_, mount) = self.fork_build_volume(
+            let captured = self.capture_fork_build_volume(
                 layout,
                 seed,
                 &Registration::new(
@@ -849,6 +953,7 @@ impl DirectoryExecutionHost {
                     },
                 ),
             )?;
+            let (_, mount) = self.ready_fork_build_volume(layout, captured, None)?;
             link::point(checkout, &mount).map_err(host_error)
         };
         match layout.resolve_link(workspace, linked).map_err(host_error)? {

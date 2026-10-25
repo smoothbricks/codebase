@@ -105,13 +105,30 @@ where
         MacOsApfsExecutionHost::mark_seed_written(self, layout, seed, written)
     }
 
-    fn fork_build_volume(
+    fn capture_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         seed: &BuildVolumeId,
         registration: &Registration,
+    ) -> Result<CapturedBuildVolume, ApfsStorageError> {
+        MacOsApfsExecutionHost::capture_fork_build_volume(self, layout, seed, registration)
+    }
+
+    fn ready_fork_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+        own_seed: Option<(&BuildVolumeId, &Registration)>,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
-        MacOsApfsExecutionHost::fork_build_volume(self, layout, seed, registration)
+        MacOsApfsExecutionHost::ready_fork_build_volume(self, layout, captured, own_seed)
+    }
+
+    fn abandon_captured_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        captured: CapturedBuildVolume,
+    ) -> Result<BuildVolumeRelease, ApfsStorageError> {
+        MacOsApfsExecutionHost::abandon_captured_build_volume(self, layout, captured)
     }
 
     fn mount_build_volume(

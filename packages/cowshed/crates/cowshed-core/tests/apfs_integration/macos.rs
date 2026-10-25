@@ -24,7 +24,7 @@ use cowshed_core::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
-    Alongside, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
+    Alongside, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, Beside,
     IncarnationSource, MetadataPolicy, TokioApfsBlockingLane,
 };
 use cowshed_core::storage::lifecycle::{
@@ -258,7 +258,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         )?;
         let fork_started = Instant::now();
         let fork = substrate
-            .execute_create_staged(fork_plan, Alongside::none(), |_, ()| async {
+            .execute_create_staged(fork_plan, Beside::none(), |_, ()| async {
                 Ok::<(), &'static str>(())
             })
             .await
