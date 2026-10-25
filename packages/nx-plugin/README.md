@@ -1685,12 +1685,14 @@ RAM-backed APFS volume per user. RAM is acceleration, not a guarantee that tempo
 The volume is created lazily by the first task that needs it and detached when the last live lease ends, since its pages
 return only on detach. It is a legacy DiskImages RAM disk, so it spends none of the AppleDiskImages2 attach budget
 cowshed counts (`specs/cowshed/01a_apfs.md`, "How the APFS host degrades"). The task never attaches the disk itself: the
-cowshed gateway does (`ram-attach`, `specs/cowshed/05_gateway.md`, "RAM disks"). The disk lives in a `diskimages-helper`
+cowshed gateway does (`ram-lease`, `specs/cowshed/05_gateway.md`, "RAM disks"). The disk lives in a `diskimages-helper`
 process, and a helper the task's own job forked would be retired when that job ends, taking the volume from under every
-other job's lease, whose open files then read EIO. The helper belongs to the gateway; no job's retirement reaches it. A
-target's own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which refuses the volume's own paths (its
-mountpoint and marker, and the lock in `/private/tmp`), the task keeps its inherited `TMPDIR` and says so once,
-whichever refusal it meets first.
+other job's lease, whose open files then read EIO. The helper belongs to the gateway; no job's retirement reaches it.
+The gateway holds the disk until the creating task keeps it, once the volume is mounted and marked at its mountpoint, or
+releases it, which detaches it. A task that dies, fails or misses its deadline first leaves the detach to the gateway,
+and a gateway restart leaves it to the next gateway's startup scan. A target's own `env.TMPDIR` wins over the lease.
+Inside a cowshed sandbox, which refuses the volume's own paths (its mountpoint and marker, and the lock in
+`/private/tmp`), the task keeps its inherited `TMPDIR` and says so once, whichever refusal it meets first.
 
 Every owned `bounded-exec` target attempts the lease, test targets included. Explicit RAM unavailability uses a unique
 owned ordinary directory beside the RAM lock that answer was taken under, in the system temp directory `/private/tmp`.
@@ -1900,13 +1902,14 @@ in the I/O Registry (an `IOHDIXHDDriveOutKernel` entry per RAM disk, with its si
 each of its volumes) and their mounts in the mount table, never in `hdiutil info`: measured 2026-10-22, `hdiutil info`
 left an attached RAM disk out of 2 of 10 listings while other images attached and detached, and a disk left out would
 read as absent. A registry read that does not parse whole fails the task instead. A BSD name passes to the next disk
-once its disk goes, so every RAM detach, including provisioning rollback, is the typed gateway-owned `ram-detach` of an
-exact device and registry entry (specs/cowshed/05_gateway.md, "RAM disks"). The gateway revalidates that identity inside
-its own lease before spawning the native tool. It uses no force; a busy owned staging volume stays in place with its
-named refusal. A requester or its job ending cannot kill this protected mutation. Authoritative terminal, proven
-not-started and unknown outcomes remain distinct; only the first two or exact entry disappearance release pending
-authority. A gateway that predates `ram-attach`, or has no control listener, makes optional RAM unavailable with its
-typed reason, not a task failure. Required RAM fixtures still fail. No task ever attaches the disk itself.
+once its disk goes, so every RAM detach is gateway-owned and bound to an exact device and registry entry: a provisioning
+rollback releases its `ram-lease`, or, when a gateway restart lost that lease, sends the typed `ram-detach` every other
+detach is (specs/cowshed/05_gateway.md, "RAM disks"). The gateway revalidates that identity inside its own lease before
+spawning the native tool. It uses no force; a busy owned staging volume stays in place with its named refusal. A
+requester or its job ending cannot kill this protected mutation. Authoritative terminal, proven not-started and unknown
+outcomes remain distinct; only the first two or exact entry disappearance release pending authority. A gateway that
+predates `ram-lease`, or has no control listener, makes optional RAM unavailable with its typed reason, not a task
+failure. Required RAM fixtures still fail. No task ever attaches the disk itself.
 
 RAM attach and detach go through their typed gateway operations; every other `hdiutil` and `diskutil` execution goes
 through `cowshed disk-command`, including host-test inventory. The cowshed is the installed one on `PATH`, which must

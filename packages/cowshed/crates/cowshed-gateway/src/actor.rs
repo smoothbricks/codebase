@@ -351,6 +351,7 @@ impl Gateway {
                         audit_tail: audit_tail.clone(),
                         startup: config.startup.clone(),
                         ram_disks: config.ram_disks.clone(),
+                        ram_leases: crate::ram_lease::Records::beside(path),
                         first_launch: config.first_launch.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
                         cpu_budget: cpu_budget.clone(),
@@ -3300,6 +3301,14 @@ impl ControlRuntime {
             None
         };
 
+        // The leases a previous gateway held are read before this one serves, so none of this
+        // gateway's own is among them; their detaches run on in the background (05_gateway.md,
+        // "RAM disks").
+        drop(crate::ram_lease::sweep(
+            services.ram_disks.clone(),
+            &services.ram_leases,
+            services.ram_leases.left(),
+        ));
         let capacity = 1024;
         let cpu_budget = services.cpu_budget.clone();
         let (stop, stopped) = watch::channel(false);

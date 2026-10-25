@@ -297,8 +297,9 @@ export async function detachOwned(owned: string, uid: number, gatewaySocket: str
 /**
  * An attach through this fixture's real gateway. Right after the answer it reads the disk's registry entry and
  * appends the exact attached identity to `owned`,
- * the only record its teardown detaches from (`detachOwned`). The user's volume is attached by the gateway
- * (`ram-attach`), so that no job's end takes it from another job's lease.
+ * the only record its teardown detaches from (`detachOwned`), and answers the lease. A disk it cannot record has its
+ * lease released, so no disk is left that neither the gateway nor the teardown detaches. The user's volume is attached by
+ * the gateway (`ram-lease`), so that no job's end takes it from another job's lease.
  */
 export function recordedRamAttach(
   attach: HostCommands['attachRam'],
@@ -308,7 +309,8 @@ export function recordedRamAttach(
   return async (sectors) => {
     const attached = await attach(sectors);
     if (!attached.ok) return attached;
-    const device = attached.value;
+    const lease = attached.value;
+    const { device } = lease;
     const registry = await run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
     const table = await run('/sbin/mount', []);
     const disks =
@@ -318,16 +320,28 @@ export function recordedRamAttach(
     const listed = disks.ok ? disks.value.filter((disk) => disk.physical === device) : [];
     const [disk] = listed;
     if (listed.length !== 1 || disk === undefined || disk.sectors !== sectors || disk.uid !== userInfo().uid) {
+      const released = await lease.release();
       return {
         ok: false,
-        error: `hdiutil attached ${device}, but the I/O Registry lists ${disks.ok ? JSON.stringify(listed) : disks.error} for it: not recorded, so no teardown detaches it`,
+        error: `hdiutil attached ${device}, but the I/O Registry lists ${disks.ok ? JSON.stringify(listed) : disks.error} for it: not recorded, so its lease was released (${released.ok ? `gateway detach exit ${released.value.status}` : released.error})`,
       };
     }
     const identity = { entry: disk.entry, device, sectors };
     appendFileSync(owned, `${JSON.stringify(identity)}\n`, { mode: 0o600 });
     process.stderr.write(`fixture attached ${JSON.stringify(identity)}\n`);
-    return { ok: true, value: device };
+    return { ok: true, value: lease };
   };
+}
+
+/**
+ * The provisioning step a host call is: `mount_apfs` and `umount` of the private staging mount, or
+ * the `mount_apfs` that places the volume at its mountpoint. Null for every other call.
+ */
+export function stepOf(paths: RamTempPaths, file: string, args: readonly string[]): string | null {
+  if (file === '/sbin/mount_apfs') {
+    return args.at(-1) === paths.mountpoint ? 'mount' : 'mount_apfs';
+  }
+  return file === '/sbin/umount' ? 'unmount' : null;
 }
 
 /**

@@ -21,6 +21,7 @@ mod npm_index;
 mod nx_cache;
 mod platform;
 mod proxy;
+mod ram_lease;
 mod repo_mirror;
 mod sim_broker;
 mod task_server;

@@ -4,11 +4,18 @@
 //! A legacy DiskImages RAM disk lives in the `diskimages-helper` that `hdiutil attach ram://<n>`
 //! forks. Forked inside a job, the helper is that job's member, and the job's retirement ends it,
 //! and the disk with it, under every other user of the disk. A host-shared RAM disk is therefore
-//! attached by the gateway, which no job contains. A client writes one [`RamAttachRequest`] line
-//! and half-closes; the gateway answers one line whose `ramDisk` is a [`RamDiskAttached`]. The
-//! request names a size and nothing else: no argv, path or option reaches `hdiutil` from the wire.
+//! attached by the gateway, which no job contains. The request names a size and nothing else: no
+//! argv, path or option reaches `hdiutil` from the wire.
 //!
-//! The disk is detached by the same owner: a client writes one [`RamDetachRequest`], naming the
+//! The attach is a lease the connection holds. A client writes one [`RamLeaseRequest`] line and
+//! keeps the connection open; the gateway answers one line whose `ramDisk` is a
+//! [`RamDiskAttached`], having recorded the disk first. The client then writes one [`RamLeaseEnd`]
+//! line: `keep` once the disk is its own (the gateway forgets it), or `release` (the gateway
+//! detaches it and answers how). A connection that ends without either, its owner dead or gone
+//! past its deadline, leaves the detach to the gateway, and a gateway that stops holding a lease
+//! leaves it to the next gateway's startup scan, so no attach outlives every owner.
+//!
+//! A kept disk is detached by its owner: a client writes one [`RamDetachRequest`], naming the
 //! whole disk and the I/O Registry entry it proved its ownership by, and the gateway answers one
 //! line whose `ramDetach` is a [`RamDetached`]. A requester that goes away never cancels it.
 
@@ -17,8 +24,9 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-/// The one-shot control operation that attaches a RAM disk.
-pub const RAM_ATTACH_OP: &str = "ram-attach";
+/// The control operation that attaches a RAM disk and holds it for the connection that asked
+/// until that connection keeps or releases it ([`RamLeaseRequest`]).
+pub const RAM_LEASE_OP: &str = "ram-lease";
 
 /// The one-shot control operation that detaches a RAM disk by its registry entry.
 pub const RAM_DETACH_OP: &str = "ram-detach";
@@ -53,20 +61,40 @@ impl fmt::Display for RamDiskSectors {
     }
 }
 
-/// The line a client writes, `{"op":"ram-attach","sectors":<n>}`, and half-closes after.
+/// The line a client writes, `{"op":"ram-lease","sectors":<n>}`, keeping the connection open: the
+/// lease lasts until its [`RamLeaseEnd`] line, or until the connection ends.
 #[derive(Clone, Copy, Debug, Serialize)]
-pub struct RamAttachRequest {
+pub struct RamLeaseRequest {
     op: &'static str,
     pub sectors: RamDiskSectors,
 }
 
-impl RamAttachRequest {
+impl RamLeaseRequest {
     pub const fn new(sectors: RamDiskSectors) -> Self {
         Self {
-            op: RAM_ATTACH_OP,
+            op: RAM_LEASE_OP,
             sectors,
         }
     }
+}
+
+/// How a held lease ends: `keep` or `release`, written as one [`RamLeaseEndLine`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RamLeaseEnd {
+    /// The disk is the caller's from here: the gateway forgets it and answers `ok`.
+    Keep,
+    /// The gateway detaches the disk now and answers its `ramDetach`.
+    Release,
+}
+
+/// The one line that ends a held lease, `{"end":"keep"}` or `{"end":"release"}`, which the client
+/// half-closes after. Any other line, or none, ends the lease as its owner's absence does: the
+/// gateway detaches the disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RamLeaseEndLine {
+    pub end: RamLeaseEnd,
 }
 
 /// A RAM disk's whole disk, `/dev/disk<N>`: what detaching it names.
@@ -114,11 +142,13 @@ impl fmt::Display for RamDiskDevice {
 #[error("{0:?} is not a whole disk (/dev/disk<N>)")]
 pub struct InvalidRamDiskDevice(String);
 
-/// An answer's `ramDisk`: the whole disk the attach made.
+/// An answer's `ramDisk`: the whole disk the attach made and the I/O Registry entry the gateway read
+/// it as right after the attach, the identity a registry-bound detach names.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RamDiskAttached {
     pub device: RamDiskDevice,
+    pub registry_entry: RamDiskEntry,
 }
 
 /// Why no RAM disk was attached.
@@ -297,6 +327,9 @@ impl fmt::Display for RamDetached {
 /// does not link. Blocking; the gateway calls each on a blocking thread no connection owns, since
 /// neither is ever interrupted.
 pub trait RamDisks: fmt::Debug + Send + Sync {
+    /// Attach a RAM disk of `sectors` and read the registry entry it registers as. An attach whose
+    /// entry cannot be read is detached again before the refusal answers: no disk leaves here
+    /// without an identity to detach it by.
     fn attach(&self, sectors: RamDiskSectors) -> Result<RamDiskAttached, RamAttachRefusal>;
 
     /// Detach the disk `entry` registers as `device`, spawning only while it still does inside
@@ -308,6 +341,10 @@ pub trait RamDisks: fmt::Debug + Send + Sync {
         entry: RamDiskEntry,
         output_limit: usize,
     ) -> RamDetached;
+
+    /// Whether `entry` still registers `device` as its whole disk: what settles a detach whose
+    /// outcome alone does not say the disk is gone.
+    fn registers(&self, device: &RamDiskDevice, entry: RamDiskEntry) -> std::io::Result<bool>;
 }
 
 #[cfg(test)]

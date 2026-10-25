@@ -68,8 +68,8 @@ fn helpers(retired: &JobProcessRetirement) -> Vec<u32> {
         .collect()
 }
 
-/// The job's root: ask the gateway at `socket` for a RAM disk of `sectors`, one line and EOF, and
-/// print the one answer line.
+/// The job's root: take a `ram-lease` of `sectors` from the gateway at `socket`, keep it, and
+/// print the one attach answer line (the keep's answer goes to stderr).
 fn asks_the_gateway(socket: &Path, sectors: RamDiskSectors) -> Command {
     let mut command = Command::new("python3");
     command.args([
@@ -77,10 +77,12 @@ fn asks_the_gateway(socket: &Path, sectors: RamDiskSectors) -> Command {
         "import socket, sys\n\
          s = socket.socket(socket.AF_UNIX)\n\
          s.connect(sys.argv[1])\n\
-         s.sendall(('{\"op\":\"ram-attach\",\"sectors\":%s}\\n' % sys.argv[2]).encode())\n\
+         s.sendall(('{\"op\":\"ram-lease\",\"sectors\":%s}\\n' % sys.argv[2]).encode())\n\
+         f = s.makefile('rb')\n\
+         answer = f.readline()\n\
+         s.sendall(b'{\"end\":\"keep\"}\\n')\n\
          s.shutdown(socket.SHUT_WR)\n\
-         answer = b''\n\
-         while chunk := s.recv(65536):\n    answer += chunk\n\
+         sys.stderr.write(f.read().decode())\n\
          sys.stdout.write(answer.decode())\n",
     ]);
     command.arg(socket).arg(sectors.get().to_string());

@@ -1,4 +1,4 @@
-//! A fixture gateway serving `ram-attach`, `ram-detach` and the disk lease on a socket of its own,
+//! A fixture gateway serving `ram-lease`, `ram-detach` and the disk lease on a socket of its own,
 //! and the I/O Registry's RAM disks, for the RAM disk tests (05_gateway.md, "RAM disks").
 //!
 //! Every fixture owns a test namespace and derives everything from it (01_storage.md, "Host
@@ -14,7 +14,7 @@
 //! is never asked.
 #![allow(dead_code)]
 
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -34,7 +34,9 @@ use cowshed_gateway::{
     CredentialProvider, CredentialQuery, CredentialRecord, DiskLeaseLimits, Gateway, GatewayConfig,
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
-use cowshed_gateway_types::{RamAttachRequest, RamDiskDevice, RamDiskEntry, RamDiskSectors};
+use cowshed_gateway_types::{
+    RamDiskDevice, RamDiskEntry, RamDiskSectors, RamLeaseEnd, RamLeaseEndLine, RamLeaseRequest,
+};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 #[path = "namespace_root.rs"]
@@ -118,9 +120,16 @@ pub fn fixture_sectors(index: u64) -> RamDiskSectors {
 /// this gateway and no other.
 pub async fn gateway(disk_lease: DiskLeaseLimits) -> (Gateway, NamespaceRoot, PathBuf) {
     let root = NamespaceRoot::mint();
+    let (gateway, socket) = gateway_on(&root, disk_lease).await;
+    (gateway, root, socket)
+}
+
+/// A gateway on `root`'s namespace, as [`gateway`] starts one: a second one on the same root is
+/// the next gateway of that namespace, which finds what the first left recorded.
+pub async fn gateway_on(root: &NamespaceRoot, disk_lease: DiskLeaseLimits) -> (Gateway, PathBuf) {
     let host = HostNamespace::Test(root.namespace());
     let cache = root.path().join("cache");
-    std::fs::create_dir(&cache).expect("cache");
+    std::fs::create_dir_all(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
     let socket = lease_socket(host);
     let gateway = Gateway::start(
@@ -137,7 +146,43 @@ pub async fn gateway(disk_lease: DiskLeaseLimits) -> (Gateway, NamespaceRoot, Pa
     )
     .await
     .expect("start gateway");
-    (gateway, root, socket)
+    (gateway, socket)
+}
+
+/// Take a `ram-lease` of `sectors` from the gateway at `socket`: its one answer line and the
+/// connection that holds the lease, still open.
+pub fn lease(socket: &Path, sectors: RamDiskSectors) -> (UnixStream, serde_json::Value) {
+    let mut stream = UnixStream::connect(socket).expect("connect to the fixture gateway");
+    let request = serde_json::to_string(&RamLeaseRequest::new(sectors)).expect("encode the lease");
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .expect("write the request");
+    let mut answer = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut answer)
+        .expect("read the answer");
+    let answer = serde_json::from_str(&answer)
+        .unwrap_or_else(|error| panic!("the gateway's answer to {request} ({error}): {answer:?}"));
+    (stream, answer)
+}
+
+/// End a held lease with `end`, or with no line at all, half-close, and read what the gateway
+/// answers until it closes: it closes once it has settled the lease, a detach included.
+pub fn end_lease(mut stream: UnixStream, end: Option<RamLeaseEnd>) -> String {
+    if let Some(end) = end {
+        let line = serde_json::to_string(&RamLeaseEndLine { end }).expect("encode the end");
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("write the end");
+    }
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    let mut after = String::new();
+    stream
+        .read_to_string(&mut after)
+        .expect("read to the close");
+    after
 }
 
 /// Write one request line to the gateway at `socket`, half-close, and read its one answer line.
@@ -258,7 +303,7 @@ impl FixtureDisks {
         HostNamespace::Test(self.namespace)
     }
 
-    /// Attach a disk of `sectors` through the fixture gateway's `ram-attach` and record it by the
+    /// Attach a disk of `sectors` through the fixture gateway's `ram-lease`, keep it, and record it by the
     /// one registry entry that lists its whole disk with that size and this user. Any other
     /// listing is no ownership and is never recorded, so never detached.
     pub fn attach(&mut self, sectors: RamDiskSectors) -> OwnedDisk {
@@ -268,9 +313,7 @@ impl FixtureDisks {
                 .any(|disk| disk.sectors == sectors.get() && disk.uid == euid()),
             "no disk of the fixture's size {sectors} before its attach"
         );
-        let request =
-            serde_json::to_string(&RamAttachRequest::new(sectors)).expect("encode the attach");
-        let answer = ask(&lease_socket(self.host()), &request);
+        let (stream, answer) = lease(&lease_socket(self.host()), sectors);
         assert_eq!(
             answer["ok"], true,
             "the gateway attached the disk: {answer}"
@@ -281,7 +324,14 @@ impl FixtureDisks {
                 .expect("the answer names the whole disk"),
         )
         .expect("a whole disk");
-        self.own(device, sectors)
+        let owned = self.own(device, sectors);
+        let kept = end_lease(stream, Some(RamLeaseEnd::Keep));
+        assert_eq!(
+            kept.trim(),
+            r#"{"ok":true}"#,
+            "the gateway let the fixture keep its disk"
+        );
+        owned
     }
 
     /// Record `device`, the disk of `sectors` an attach of this fixture's gateway just answered, by

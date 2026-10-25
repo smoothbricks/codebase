@@ -22,10 +22,10 @@ use zeroize::{Zeroize, Zeroizing};
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
     EgressMode, FIRST_LAUNCH_OP, FirstLaunch, FirstLaunchProbe, HostPattern, JOBSERVER_OP,
-    LeaseClass, LeaseState, MirrorRoute, PhaseShare, RAM_ATTACH_OP, RAM_DETACH_OP,
-    RESIDENT_POOL_OP, RamAttachRefusal, RamDetached, RamDiskAttached, RamDiskDevice, RamDiskEntry,
-    RamDiskSectors, RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus,
-    TaskRunCaps, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    LeaseClass, LeaseState, MirrorRoute, PhaseShare, RAM_DETACH_OP, RAM_LEASE_OP, RESIDENT_POOL_OP,
+    RamAttachRefusal, RamDetached, RamDiskAttached, RamDiskDevice, RamDiskEntry, RamDiskSectors,
+    RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus, TaskRunCaps,
+    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
@@ -478,10 +478,6 @@ enum ControlRequest {
         #[serde(rename = "repoId")]
         repo_id: cowshed_core::repository::RepoId,
     },
-    /// Attach one RAM disk of this many sectors (05_gateway.md, "RAM disks").
-    RamAttach {
-        sectors: RamDiskSectors,
-    },
     /// Detach the RAM disk `registry_entry` registers as `device` (05_gateway.md, "RAM disks").
     RamDetach {
         device: RamDiskDevice,
@@ -496,6 +492,11 @@ enum ControlRequest {
 /// or a disk lease or CPU tokens, held for as long as its client keeps the connection open.
 enum Incoming {
     Request(ControlRequest),
+    /// A RAM disk held for the connection until it keeps or releases it (05_gateway.md, "RAM
+    /// disks").
+    RamLease {
+        sectors: RamDiskSectors,
+    },
     DiskLease {
         class: DiskClass,
         share: PhaseShare,
@@ -722,7 +723,7 @@ struct ControlResponse {
     /// The install that cut a queued CPU ask off, beside [`ControlFailureCode::InstallRestart`].
     #[serde(skip_serializing_if = "Option::is_none")]
     install: Option<cowshed_gateway_types::InstallRestart>,
-    /// The whole disk a `ram-attach` attached.
+    /// The whole disk a `ram-lease` attached and the registry entry it registers as.
     #[serde(skip_serializing_if = "Option::is_none")]
     ram_disk: Option<RamDiskAttached>,
     /// What is known of a `ram-detach`: `terminal`, `not-started` or `unknown`.
@@ -982,6 +983,7 @@ pub(crate) struct ControlServices {
     pub task_server: crate::task_server::TaskServer,
     pub jobserver: crate::jobserver::JobserverFifos,
     pub ram_disks: Option<Arc<dyn RamDisks>>,
+    pub ram_leases: crate::ram_lease::Records,
     pub first_launch: Option<Arc<dyn FirstLaunchProbe>>,
 }
 
@@ -1012,6 +1014,7 @@ impl fmt::Debug for ControlServices {
             .field("cpu_budget", &self.cpu_budget)
             .field("task_server", &self.task_server)
             .field("ram_disks", &self.ram_disks)
+            .field("ram_leases", &self.ram_leases)
             .field("first_launch", &self.first_launch)
             .finish()
     }
@@ -1107,6 +1110,16 @@ async fn serve<R, W>(
         .await
         .and_then(|line| parse(&line))
     {
+        Ok(Incoming::RamLease { sectors }) => {
+            hold_ram_lease(
+                reader,
+                writer,
+                sectors,
+                services.ram_disks.clone(),
+                services.ram_leases.clone(),
+            )
+            .await;
+        }
         Ok(Incoming::DiskLease {
             class,
             share,
@@ -1988,7 +2001,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
         "nx-cache-clear" => &["op", "repoId"],
-        RAM_ATTACH_OP => &["op", "sectors"],
+        RAM_LEASE_OP => &["op", "sectors"],
         RAM_DETACH_OP => &["op", "device", "registryEntry"],
         FIRST_LAUNCH_OP => &["op"],
         TASK_ADMIT_OP => &[
@@ -2033,6 +2046,14 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         ));
     }
     let encoding = |error: serde_json::Error| ControlError::Encoding(error.to_string());
+    if op == RAM_LEASE_OP {
+        #[derive(Deserialize)]
+        struct RamLeaseIn {
+            sectors: RamDiskSectors,
+        }
+        let RamLeaseIn { sectors } = serde_json::from_value(value).map_err(encoding)?;
+        return Ok(Incoming::RamLease { sectors });
+    }
     if op == DISK_LEASE_OP {
         let DiskLeaseIn {
             class,
@@ -2440,10 +2461,6 @@ async fn dispatch(
             },
             None,
         ),
-        ControlRequest::RamAttach { sectors } => (
-            attach_ram_disk(services.ram_disks.clone(), sectors).await,
-            None,
-        ),
         ControlRequest::RamDetach {
             device,
             registry_entry,
@@ -2458,34 +2475,138 @@ async fn dispatch(
     }
 }
 
-/// Attach a RAM disk on a blocking thread: `hdiutil` takes as long as the host's disk services do,
-/// and an attach is never interrupted (05_gateway.md, "RAM disks").
-async fn attach_ram_disk(
-    attacher: Option<Arc<dyn RamDisks>>,
+/// Hold one `ram-lease` (05_gateway.md, "RAM disks"): attach and record a disk, answer it, then
+/// settle the lease by the one line its owner writes next ([`crate::ram_lease::settle`]). The
+/// attach and every detach run on blocking threads no connection owns, so a connection cut off in
+/// either still finishes it; one cut off while it waits for its owner leaves the record to the next
+/// gateway's startup scan.
+async fn hold_ram_lease<R, W>(
+    mut reader: R,
+    mut writer: W,
     sectors: RamDiskSectors,
-) -> ControlResponse {
-    let Some(attacher) = attacher else {
-        return failure(
+    disks: Option<Arc<dyn RamDisks>>,
+    records: crate::ram_lease::Records,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use crate::ram_lease::{self, Refused, Reply, Settlement};
+    let Some(disks) = disks else {
+        let refusal = failure(
             ControlFailureCode::Rejected,
             "this gateway attaches no RAM disk: its daemon supplied no disk runner".to_owned(),
         );
+        let _ = write_response(&mut writer, &refusal).await;
+        return;
     };
-    match tokio::task::spawn_blocking(move || attacher.attach(sectors)).await {
-        Ok(Ok(attached)) => ControlResponse {
-            ram_disk: Some(attached),
+    let (attacher, attaching) = (Arc::clone(&disks), records.clone());
+    let attached =
+        tokio::task::spawn_blocking(move || ram_lease::attach(&*attacher, &attaching, sectors))
+            .await;
+    let lease = match attached {
+        Ok(Ok(lease)) => lease,
+        Ok(Err(refused)) => {
+            let refusal = match refused {
+                Refused::Attach(refusal @ RamAttachRefusal::TooLarge { .. }) => {
+                    failure(ControlFailureCode::InvalidRequest, refusal.to_string())
+                }
+                Refused::Attach(refusal @ RamAttachRefusal::Failed(_)) => {
+                    failure(ControlFailureCode::Rejected, refusal.to_string())
+                }
+                Refused::Unrecorded { error, detached } => failure(
+                    ControlFailureCode::Rejected,
+                    format!(
+                        "the gateway attached a RAM disk but could not record its lease ({error}); \
+                         its detach: {detached}"
+                    ),
+                ),
+            };
+            let _ = write_response(&mut writer, &refusal).await;
+            return;
+        }
+        Err(error) => {
+            let refusal = failure(
+                ControlFailureCode::Rejected,
+                format!("the RAM disk attach thread failed: {error}"),
+            );
+            let _ = write_response(&mut writer, &refusal).await;
+            return;
+        }
+    };
+    let held = ControlResponse {
+        ram_disk: Some(lease.clone()),
+        ..success()
+    };
+    let ending = match write_response(&mut writer, &held).await {
+        Ok(()) => {
+            let line = read_request_line(&mut reader).await.ok();
+            ram_lease::Ending::read(line.as_ref().map(|line| line.as_slice()))
+        }
+        Err(_) => ram_lease::Ending::Gone,
+    };
+    let (reply, why) = match ram_lease::settle(ending) {
+        Settlement::Forget => {
+            let forgotten = records.forget(lease.registry_entry);
+            match ram_lease::after_forget(forgotten.is_ok()) {
+                None => {
+                    let _ = write_response(&mut writer, &success()).await;
+                    return;
+                }
+                Some(reply) => (
+                    reply,
+                    format!(
+                        "was kept, but its record could not be forgotten ({})",
+                        forgotten
+                            .err()
+                            .map_or_else(String::new, |error| error.to_string())
+                    ),
+                ),
+            }
+        }
+        Settlement::Detach(reply) => (
+            reply,
+            match reply {
+                Reply::Outcome => "was released by its owner",
+                Reply::Invalid => "ended with a line that is no end",
+                Reply::Rejected => "could not be kept",
+                Reply::Nobody => "lost its owner before it was kept or released",
+            }
+            .to_owned(),
+        ),
+    };
+    let (detacher, detaching, ended, said) = (Arc::clone(&disks), records, lease, why.clone());
+    let detached = match tokio::task::spawn_blocking(move || {
+        ram_lease::detach(&*detacher, &detaching, &ended, &said)
+    })
+    .await
+    {
+        Ok(detached) => detached,
+        Err(error) if error.is_cancelled() => RamDetached::NotStarted {
+            reason: format!("the RAM disk detach thread was cancelled before it ran: {error}"),
+        },
+        Err(error) => RamDetached::Unknown {
+            reason: format!("the RAM disk detach thread failed after it started: {error}"),
+        },
+    };
+    let response = match reply {
+        Reply::Outcome => ControlResponse {
+            ram_detach: Some(detached),
             ..success()
         },
-        Ok(Err(refusal @ RamAttachRefusal::TooLarge { .. })) => {
-            failure(ControlFailureCode::InvalidRequest, refusal.to_string())
-        }
-        Ok(Err(refusal @ RamAttachRefusal::Failed(_))) => {
-            failure(ControlFailureCode::Rejected, refusal.to_string())
-        }
-        Err(error) => failure(
-            ControlFailureCode::Rejected,
-            format!("the RAM disk attach thread failed: {error}"),
+        Reply::Invalid => failure(
+            ControlFailureCode::InvalidRequest,
+            format!(
+                "a ram-lease ends with one {{\"end\":\"keep\"}} or {{\"end\":\"release\"}} line; \
+                 the gateway detached the disk: {detached}"
+            ),
         ),
-    }
+        Reply::Rejected => failure(
+            ControlFailureCode::Rejected,
+            format!("the RAM disk lease {why}; the gateway detached the disk: {detached}"),
+        ),
+        Reply::Nobody => return,
+    };
+    let _ = write_response(&mut writer, &response).await;
 }
 
 /// Measure a fresh executable's first launch on a blocking thread: each launch runs a process to
@@ -2940,17 +3061,18 @@ mod tests {
             Ok(Incoming::Request(ControlRequest::FirstLaunch))
         ));
 
-        // A RAM attach names a positive size and nothing else: no argv reaches hdiutil.
+        // A RAM lease names a positive size and nothing else: no argv reaches hdiutil.
         assert!(matches!(
-            parse_control_request(br#"{"op":"ram-attach","sectors":131072}"#),
-            Ok(Incoming::Request(ControlRequest::RamAttach { sectors })) if sectors.get() == 131_072
+            parse_control_request(br#"{"op":"ram-lease","sectors":131072}"#),
+            Ok(Incoming::RamLease { sectors }) if sectors.get() == 131_072
         ));
         for refused in [
-            &br#"{"op":"ram-attach","sectors":0}"#[..],
-            br#"{"op":"ram-attach","sectors":-1}"#,
-            br#"{"op":"ram-attach","sectors":"131072"}"#,
-            br#"{"op":"ram-attach"}"#,
-            br#"{"op":"ram-attach","sectors":131072,"argv":["-force"]}"#,
+            &br#"{"op":"ram-lease","sectors":0}"#[..],
+            br#"{"op":"ram-lease","sectors":-1}"#,
+            br#"{"op":"ram-lease","sectors":"131072"}"#,
+            br#"{"op":"ram-lease"}"#,
+            br#"{"op":"ram-lease","sectors":131072,"argv":["-force"]}"#,
+            br#"{"op":"ram-attach","sectors":131072}"#,
         ] {
             assert!(parse_control_request(refused).is_err());
         }
@@ -3234,6 +3356,14 @@ mod tests {
                 .expect("the test waits for the end");
             detached
         }
+
+        fn registers(
+            &self,
+            _device: &RamDiskDevice,
+            _entry: RamDiskEntry,
+        ) -> std::io::Result<bool> {
+            Ok(false)
+        }
     }
 
     #[derive(Debug)]
@@ -3252,6 +3382,225 @@ mod tests {
         ) -> RamDetached {
             panic!("the detach of {device} panicked after it started")
         }
+
+        fn registers(
+            &self,
+            _device: &RamDiskDevice,
+            _entry: RamDiskEntry,
+        ) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// RAM disks held in memory: an attach registers `/dev/disk9` as entry `0x9`, a detach
+    /// takes it out of the registry, and both are counted.
+    #[derive(Debug, Default)]
+    struct MemoryDisks {
+        registered: std::sync::Mutex<Vec<RamDiskEntry>>,
+        attaches: std::sync::atomic::AtomicUsize,
+        detaches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MemoryDisks {
+        fn disk9() -> RamDiskAttached {
+            RamDiskAttached {
+                device: RamDiskDevice::parse("/dev/disk9").expect("a whole disk"),
+                registry_entry: RamDiskEntry::parse("0x9").expect("an entry"),
+            }
+        }
+
+        fn counts(&self) -> (usize, usize, usize) {
+            (
+                self.attaches.load(std::sync::atomic::Ordering::SeqCst),
+                self.detaches.load(std::sync::atomic::Ordering::SeqCst),
+                self.registered.lock().unwrap().len(),
+            )
+        }
+    }
+
+    impl RamDisks for MemoryDisks {
+        fn attach(&self, _sectors: RamDiskSectors) -> Result<RamDiskAttached, RamAttachRefusal> {
+            self.attaches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let disk = Self::disk9();
+            self.registered.lock().unwrap().push(disk.registry_entry);
+            Ok(disk)
+        }
+
+        fn detach(
+            &self,
+            device: &RamDiskDevice,
+            entry: RamDiskEntry,
+            output_limit: usize,
+        ) -> RamDetached {
+            self.detaches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.registered
+                .lock()
+                .unwrap()
+                .retain(|registered| *registered != entry);
+            RamDetached::terminal(
+                cowshed_gateway_types::RamDetachStatus::Exit(0),
+                format!(
+                    "\"{}\" ejected.\n",
+                    device.as_str().trim_start_matches("/dev/")
+                )
+                .as_bytes(),
+                b"",
+                output_limit,
+            )
+        }
+
+        fn registers(&self, _device: &RamDiskDevice, entry: RamDiskEntry) -> std::io::Result<bool> {
+            Ok(self.registered.lock().unwrap().contains(&entry))
+        }
+    }
+
+    /// A lease record directory of the test's own, beside a socket path nothing binds.
+    fn lease_records() -> (std::path::PathBuf, crate::ram_lease::Records) {
+        let root = std::env::temp_dir().join(format!("cowshed-ram-lease-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("root");
+        let records = crate::ram_lease::Records::beside(&root.join("gateway.sock"));
+        (root, records)
+    }
+
+    /// Ask `hold_ram_lease` for a disk over an in-memory connection and read its answer; `end`
+    /// is the line the owner writes then, or `None` for an owner that goes away. Answers the
+    /// attach answer and what came after it, once the lease's task has ended.
+    async fn lease_ending(
+        disks: &Arc<MemoryDisks>,
+        records: &crate::ram_lease::Records,
+        end: Option<&str>,
+    ) -> (serde_json::Value, String) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let served: Arc<dyn RamDisks> = disks.clone();
+        let holding = tokio::spawn(hold_ram_lease(
+            server_reader,
+            server_writer,
+            RamDiskSectors::new(std::num::NonZeroU64::new(16).unwrap()),
+            Some(served),
+            records.clone(),
+        ));
+        let mut client = tokio::io::BufReader::new(client);
+        let mut answer = String::new();
+        client
+            .read_line(&mut answer)
+            .await
+            .expect("the attach answer");
+        let after = match end {
+            None => {
+                drop(client);
+                String::new()
+            }
+            Some(end) => {
+                client
+                    .get_mut()
+                    .write_all(format!("{end}\n").as_bytes())
+                    .await
+                    .expect("the end line");
+                client.get_mut().shutdown().await.expect("half-close");
+                let mut after = String::new();
+                client
+                    .read_to_string(&mut after)
+                    .await
+                    .expect("the end answer");
+                after
+            }
+        };
+        holding.await.expect("the lease's task");
+        (
+            serde_json::from_str(&answer).expect("an answer line"),
+            after,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ram_lease_whose_owner_goes_away_is_detached_and_forgotten() {
+        let (root, records) = lease_records();
+        let disks = Arc::new(MemoryDisks::default());
+        let (answer, after) = lease_ending(&disks, &records, None).await;
+        assert_eq!(
+            answer,
+            serde_json::json!({"ok": true, "ramDisk": {"device": "/dev/disk9", "registryEntry": "0x9"}})
+        );
+        assert_eq!(after, "");
+        assert_eq!(
+            disks.counts(),
+            (1, 1, 0),
+            "attached once, detached once, registered none"
+        );
+        assert!(
+            records.left().expect("records").is_empty(),
+            "the record went with the disk"
+        );
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kept_ram_lease_is_its_owners_and_every_other_end_detaches() {
+        let (root, records) = lease_records();
+        let kept = Arc::new(MemoryDisks::default());
+        let (_, after) = lease_ending(&kept, &records, Some(r#"{"end":"keep"}"#)).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&after).unwrap(),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(kept.counts(), (1, 0, 1), "a kept disk stays registered");
+        assert!(
+            records.left().expect("records").is_empty(),
+            "a kept lease is forgotten"
+        );
+
+        let released = Arc::new(MemoryDisks::default());
+        let (_, after) = lease_ending(&released, &records, Some(r#"{"end":"release"}"#)).await;
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(after["ok"], true, "{after}");
+        assert_eq!(after["ramDetach"]["outcome"], "terminal", "{after}");
+        assert_eq!(
+            after["ramDetach"]["status"],
+            serde_json::json!({"exit": 0}),
+            "{after}"
+        );
+        assert_eq!(released.counts(), (1, 1, 0));
+
+        let garbled = Arc::new(MemoryDisks::default());
+        let (_, after) = lease_ending(&garbled, &records, Some(r#"{"end":"kept"}"#)).await;
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(after["ok"], false, "{after}");
+        assert_eq!(after["code"], "invalid-request", "{after}");
+        assert_eq!(garbled.counts(), (1, 1, 0));
+        assert!(records.left().expect("records").is_empty());
+        std::fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_startup_scan_detaches_the_leases_a_previous_gateway_held() {
+        let (root, records) = lease_records();
+        let disks = Arc::new(MemoryDisks::default());
+        // The previous gateway attached and recorded the disk, then stopped holding it.
+        let lease = disks
+            .attach(RamDiskSectors::new(std::num::NonZeroU64::new(16).unwrap()))
+            .unwrap();
+        records.record(&lease).expect("record");
+        let served: Arc<dyn RamDisks> = disks.clone();
+        crate::ram_lease::sweep(Some(served), &records, records.left())
+            .expect("a lease to sweep")
+            .await
+            .expect("the sweep");
+        assert_eq!(
+            disks.counts(),
+            (1, 1, 0),
+            "the previous gateway's disk is detached"
+        );
+        assert!(
+            records.left().expect("records").is_empty(),
+            "and its record removed"
+        );
+        let quiet: Arc<dyn RamDisks> = disks.clone();
+        assert!(crate::ram_lease::sweep(Some(quiet), &records, records.left()).is_none());
+        std::fs::remove_dir_all(root).expect("remove root");
     }
 
     fn disk7() -> (RamDiskDevice, RamDiskEntry) {

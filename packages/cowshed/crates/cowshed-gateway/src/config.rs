@@ -271,7 +271,7 @@ pub struct GatewayConfig {
     pub executable_sha256: Option<String>,
     /// What status reports of the daemon's startup pass; `None` for a gateway no daemon owns.
     pub startup: Option<Arc<dyn StartupProbe>>,
-    /// What attaches and detaches the host's RAM disks for `ram-attach` and `ram-detach` (05_gateway.md, "RAM disks"): the
+    /// What attaches and detaches the host's RAM disks  for `ram-lease` and `ram-detach` (05_gateway.md, "RAM disks"): the
     /// daemon's disk runner, which this crate does not link. `None` attaches none.
     pub ram_disks: Option<Arc<dyn cowshed_gateway_types::RamDisks>>,
     /// What measures a fresh executable's first launch for the `first-launch` op (05_gateway.md,

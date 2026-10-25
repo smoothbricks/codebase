@@ -1262,7 +1262,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   for (const unavailable of [
     { kind: 'unavailable', reason: 'unproven-owner', detail: 'the legacy marker does not prove gateway ownership' },
-    { kind: 'unavailable', reason: 'gateway-unsupported', detail: 'the gateway does not serve ram-attach' },
+    { kind: 'unavailable', reason: 'gateway-unsupported', detail: 'the gateway does not serve ram-lease' },
     { kind: 'unavailable', reason: 'gateway-absent', detail: 'the owned gateway fixture socket is absent' },
   ] satisfies Extract<RamTempAcquisition, { kind: 'unavailable' }>[]) {
     for (const status of [0, 7]) {
@@ -1422,7 +1422,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     await withOrdinaryTempWorkspace(async (workspace, ordinary) => {
       const missing = join(ordinary, 'missing');
       const volume = scriptedVolume(
-        { ok: true, value: { kind: 'unavailable', reason: 'gateway-unsupported', detail: 'no ram-attach' } },
+        { ok: true, value: { kind: 'unavailable', reason: 'gateway-unsupported', detail: 'no ram-lease' } },
         null,
         null,
         missing,
@@ -1439,7 +1439,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         await standInOwner(workspace.root),
       );
       expect(result.success).toBe(false);
-      expect(result.terminalOutput).toContain('gateway-unsupported: no ram-attach');
+      expect(result.terminalOutput).toContain('gateway-unsupported: no ram-lease');
       expect(result.terminalOutput).toContain(`could not create ordinary scratch under ${missing}:`);
       expect(await exists(join(workspace.root, 'observed-tmpdir'))).toBe(false);
       expect(await readdir(ordinary)).toEqual([]);

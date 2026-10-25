@@ -64,8 +64,8 @@ import type { TempVolumeSpace } from './verdict.js';
  * - The disk lives as long as that helper, and a helper forked inside a job is
  *   the job's member, which the job's end retires under every other lease. So
  *   the helper belongs to the cowshed gateway, which no job contains and which
- *   attaches the disk (`ram-attach`, specs/cowshed/05_gateway.md, "RAM disks");
- *   a task never does.
+ *   attaches the disk under the creating task's lease (`ram-lease`,
+ *   specs/cowshed/05_gateway.md, "RAM disks"); a task never does.
  * - Attach + format + mount costs ~2 s and is DiskArbitration traffic, so the
  *   volume is created once, lazily, and every task takes a subdirectory.
  * - Spotlight's mds keeps one IOKit right for every APFS volume it admits, for
@@ -117,11 +117,14 @@ import type { TempVolumeSpace } from './verdict.js';
  * nowhere but at its mountpoint or staging directory, and either carrying a volume called exactly its name, which a
  * volume is made under and keeps, or recorded by the exact registry entry its owner holds a receipt or its ledger holds
  * custody for, which covers an attach whose format never finished. A RAM disk of that size that is neither, another
- * volume's, a test's, or an unformatted one nothing recorded, is ignored, however it is mounted. Before creating, a
- * task detaches each disk of that inventory its owner holds a receipt for, because a creator killed or deadlined
- * mid-step leaves one behind — measured 2026-10-06: a deadlined `hdiutil attach` whose diskimages-helper finished the
- * attach after `hdiutil` was killed, and a volume mounted with no marker. A disk it holds no receipt for, one with a
- * lease directory on it, or one with something attached below it stops the creation instead; its error names it.
+ * volume's, a test's, or an unformatted one nothing recorded, is ignored, however it is mounted. The gateway holds
+ * each disk it attaches under its creator's lease until the creator keeps it, its volume mounted and marked at the
+ * mountpoint, and detaches it when the creator releases it or goes away first: a creator killed or deadlined mid-step
+ * leaves no disk behind, where one did before the lease (measured 2026-10-06: a deadlined `hdiutil attach` whose
+ * diskimages-helper finished the attach after `hdiutil` was killed). A gateway restart leaves an unended lease's disk
+ * to the next gateway's startup scan. Before creating, a task detaches each disk of that inventory its owner holds a
+ * receipt for. A disk it holds no receipt for, one with a lease directory on it, or one with something attached below
+ * it stops the creation instead; its error names it.
  *
  * An image attached from a file below a lease belongs to whoever attached it:
  * cowshed's real-APFS fixtures release theirs under the production per-image
@@ -248,13 +251,26 @@ export interface DetachBinding {
   readonly registryEntry: string;
 }
 
+/** A RAM disk the gateway attached and holds until this caller keeps or releases it; the gateway detaches it if the caller goes away first. */
+export interface RamDiskLease {
+  /** Its whole disk, `/dev/diskN`. */
+  readonly device: string;
+  /** Its I/O Registry entry, `0x…`, as the gateway read it right after its attach. */
+  readonly registryEntry: string;
+  /** The caller owns the disk from here. Err: the lease was lost or refused; the disk is the gateway's to detach. */
+  keep(): Promise<Result<void, string>>;
+  /** The gateway detaches the disk now. Ok: its detach answer; Err: the lease was lost (no answer), so nothing is known of a detach. */
+  release(): Promise<Result<CommandOutput, string>>;
+}
+
 export interface HostCommands {
   run(file: string, args: readonly string[], deadlineMs?: number, binding?: DetachBinding): Promise<CommandOutput>;
   /**
-   * Attach a RAM disk of `sectors` 512-byte sectors through its owner, answering its whole disk (`/dev/diskN`). The
-   * owner is the cowshed gateway (`ram-attach`), never this task: a helper the task's own job forked would end with it.
+   * Attach a RAM disk of `sectors` 512-byte sectors through its owner, answering its lease. The owner is the cowshed
+   * gateway (`ram-lease`), never this task: a helper the task's own job forked would end with it. The gateway holds the
+   * disk until the lease is kept or released, and detaches it if this caller goes away first.
    */
-  attachRam(sectors: number): Promise<Result<string, string | RamUnavailable>>;
+  attachRam(sectors: number): Promise<Result<RamDiskLease, string | RamUnavailable>>;
   /**
    * Exact attach receipts owned by this caller; names and capacity never establish this authority. A disk it owns
    * counts as the volume's even with nothing mounted, which covers an attach whose format never finished; one it holds
@@ -1479,7 +1495,7 @@ export class RamTempVolume {
   }
 
   /** Capture only the exact whole disk this attach answered, before any filesystem mutation. */
-  private async attachedIdentity(physical: string): Promise<Result<AttachedRamDisk, RamTempError>> {
+  private async attachedIdentity(physical: string): Promise<Result<AttachedRamDisk, ProvisionFailed>> {
     const registry = await this.commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
     if (registry.status !== 0) return failed('attach identity', commandText(registry));
     const parsed = ramDisksIn(registry.stdout, '');
@@ -1788,38 +1804,52 @@ export class RamTempVolume {
     }
     const attached = await this.commands.attachRam(this.sectors);
     if (!attached.ok) {
-      // An attach whose answer never came may still finish; its disk is a stray the next creator detaches.
+      // An attach whose answer never came may still finish; this caller closed its lease, so the gateway detaches it.
       return typeof attached.error === 'string'
-        ? failed('ram-attach', attached.error)
+        ? failed('ram-lease', attached.error)
         : { ok: false, error: attached.error };
     }
-    const physical = attached.value;
-    const identity = await this.attachedIdentity(physical);
-    if (!identity.ok) return identity;
-    const provisioned = await this.provision(physical, identity.value.entry);
-    if (provisioned.ok) {
-      return provisioned;
-    }
-    // Rollback uses the exact captured entry, without force; a busy owned staging volume is retained.
-    const command = await this.runDetach(op, physical, identity.value.entry);
+    // Every path from here ends the lease: kept once the volume is mounted and marked at its mountpoint, released on
+    // any failure before that.
+    const lease = attached.value;
+    const identity = await this.attachedIdentity(lease.device);
+    const provisioned = identity.ok ? await this.provision(lease.device, identity.value.entry) : identity;
+    if (!provisioned.ok) return this.rollBack(op, lease, provisioned.error);
+    const kept = await lease.keep();
+    return kept.ok
+      ? kept
+      : this.rollBack(op, lease, { kind: 'provision-failed', step: 'ram-lease keep', detail: kept.error });
+  }
+
+  /**
+   * End the lease of a volume that failed. The gateway detaches the disk on release, by its registry entry and without
+   * force, so a busy owned staging volume is retained. A lease lost to a gateway restart answers no release: this caller
+   * then detaches the exact disk itself, under its ledger's custody, so no later lease is admitted on a disk the next
+   * gateway's startup scan removes.
+   */
+  private async rollBack(
+    op: Operation,
+    lease: RamDiskLease,
+    failure: ProvisionFailed,
+  ): Promise<Result<never, ProvisionFailed>> {
+    const released = await lease.release();
+    const lost = released.ok ? [] : [released.error];
+    const command = released.ok ? released : await this.runDetach(op, lease.device, lease.registryEntry);
     if (!command.ok)
-      return failed(provisioned.error.step, [provisioned.error.detail, describeRamTempError(command.error)].join('; '));
+      return failed(failure.step, [failure.detail, ...lost, describeRamTempError(command.error)].join('; '));
     const detached = command.value;
     if (detached.pending !== undefined) {
-      return failed(provisioned.error.step, [provisioned.error.detail, commandText(detached)].join('; '));
+      return failed(failure.step, [failure.detail, ...lost, commandText(detached)].join('; '));
     }
     // The detach takes every volume of the disk with it. What it leaves at the staging directory and the
     // mountpoint is a bare directory on the host's Data volume each: removed here, and already absent is done.
     const detachFailure =
       detached.status === 0
-        ? null
-        : `gateway detach ${physical} then failed (${commandText(detached)}); owned staging is retained`;
+        ? []
+        : [`gateway detach ${lease.device} then failed (${commandText(detached)}); owned staging is retained`];
     const directoryFailures =
       detached.status === 0 ? await removeMountDirectories([this.paths.staging, this.paths.mountpoint]) : [];
-    const failures = [...(detachFailure === null ? [] : [detachFailure]), ...directoryFailures];
-    return failures.length === 0
-      ? provisioned
-      : failed(provisioned.error.step, [provisioned.error.detail, ...failures].join('; '));
+    return failed(failure.step, [failure.detail, ...lost, ...detachFailure, ...directoryFailures].join('; '));
   }
 
   /**

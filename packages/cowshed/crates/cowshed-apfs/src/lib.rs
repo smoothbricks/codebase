@@ -6299,6 +6299,36 @@ mod io_registry {
         Ok(None)
     }
 
+    /// The registry entry of the legacy image drive (`IOHDIXHDDrive`, a RAM disk's) whose whole
+    /// disk is `bsd_name` (`disk9`): the identity a RAM disk keeps until it leaves the registry,
+    /// which no later disk reuses. `None` when no registered IOMedia has that name, when no legacy
+    /// image drive lies above it, or when it leaves the registry while being read.
+    pub(super) fn legacy_image_entry(bsd_name: &str) -> io::Result<Option<u64>> {
+        let properties = mutable_dictionary()?;
+        let name_key = key("BSD Name")?;
+        let name = key(bsd_name)?;
+        // SAFETY: `properties` is a live mutable dictionary, which retains the key and value.
+        unsafe { CFDictionarySetValue(properties.0, name_key.0, name.0) };
+        let Some(media) = registered_matching(c"IOMedia", Some(&properties))?.next() else {
+            return Ok(None);
+        };
+        let mut entry = Some(media);
+        while let Some(current) = entry {
+            if conforms(&current, c"IOHDIXHDDrive") {
+                return match entry_id(&current, "read a RAM disk's registry id") {
+                    Ok(id) => Ok(Some(id)),
+                    Err(Unread::Gone) => Ok(None),
+                    Err(Unread::Failed(error)) => Err(error),
+                };
+            }
+            entry = match provider(&current) {
+                Ok(parent) => parent,
+                Err(Unread::Gone) => return Ok(None),
+                Err(Unread::Failed(error)) => return Err(error),
+            };
+        }
+        Ok(None)
+    }
     /// Registered entries whose class is exactly `class`, subclasses excluded, as the kernel's
     /// instance counts count them. An entry that leaves the registry mid-read is departing.
     fn registered_exactly(class: &CStr) -> io::Result<u64> {

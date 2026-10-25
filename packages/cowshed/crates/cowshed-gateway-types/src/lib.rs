@@ -45,9 +45,10 @@ pub use policy::{
 };
 
 pub use ram_disk::{
-    InvalidRamDiskDevice, InvalidRamDiskEntry, RAM_ATTACH_OP, RAM_DETACH_OP, RAM_DISK_SECTOR_BYTES,
-    RamAttachRefusal, RamAttachRequest, RamDetachRequest, RamDetachStatus, RamDetached,
-    RamDiskAttached, RamDiskDevice, RamDiskEntry, RamDiskSectors, RamDisks,
+    InvalidRamDiskDevice, InvalidRamDiskEntry, RAM_DETACH_OP, RAM_DISK_SECTOR_BYTES, RAM_LEASE_OP,
+    RamAttachRefusal, RamDetachRequest, RamDetachStatus, RamDetached, RamDiskAttached,
+    RamDiskDevice, RamDiskEntry, RamDiskSectors, RamDisks, RamLeaseEnd, RamLeaseEndLine,
+    RamLeaseRequest,
 };
 pub use repo_id::{InvalidRepoId, validate_repo_id};
 pub use session::{

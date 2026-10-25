@@ -1,7 +1,17 @@
 import { describe, expect, it, jest } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { closeSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, watch, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  watch,
+  writeFileSync,
+} from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
@@ -31,13 +41,15 @@ import {
   RAM_TMPDIR_SOCKET_BUDGET_BYTES,
   type RamDisk,
   type RamTempError,
+  type RamTempPaths,
   RamTempVolume,
+  type Result,
   ramDisksIn,
   ramTempPaths,
   testNamespace,
   volumeDisks,
 } from './ram-temp.js';
-import { registryDevice } from './ram-temp-fixtures.js';
+import { registryDevice, stepOf } from './ram-temp-fixtures.js';
 
 /**
  * The namespace the cases that run fake host commands name their volumes by. They make nothing below it: each case's
@@ -811,16 +823,40 @@ describe('detaching a RAM disk an inventory found', () => {
   });
 });
 
-/** A gateway on an owned socket that answers each connection's one line with `answer(line)` once the client half-closes. */
-async function withGateway<T>(answer: (line: string) => string, body: (socket: string) => Promise<T>): Promise<T> {
+/** What a fake gateway does with a line it read: answer it, or never answer and close at the client's EOF. */
+type GatewayMove = { readonly answer: string } | 'unanswered';
+
+/**
+ * A gateway on an owned socket that serves one connection: it moves on each line the client writes as `move(line)` says,
+ * and answers the client's EOF by closing. `body`'s result comes back with what the gateway saw, in order: each line,
+ * and `EOF` where the client half-closed or went away.
+ */
+async function withGateway<T>(
+  move: (line: string) => GatewayMove,
+  body: (socket: string) => Promise<T>,
+): Promise<{ result: T; seen: string[] }> {
   const directory = await ownedSocketDirectory('ra-', 'gw.sock');
   const socket = join(directory, 'gw.sock');
+  const seen: string[] = [];
+  const closed = Promise.withResolvers<void>();
   const server = createServer({ allowHalfOpen: true }, (client) => {
-    let line = '';
+    let buffered = '';
     client.on('data', (chunk: Buffer) => {
-      line += chunk.toString('utf8');
+      buffered += chunk.toString('utf8');
+      for (let newline = buffered.indexOf('\n'); newline >= 0; newline = buffered.indexOf('\n')) {
+        const line = buffered.slice(0, newline);
+        buffered = buffered.slice(newline + 1);
+        seen.push(line);
+        const next = move(line);
+        if (next !== 'unanswered') client.write(next.answer);
+      }
     });
-    client.on('end', () => client.end(answer(line)));
+    client.on('end', () => {
+      seen.push('EOF');
+      client.end();
+    });
+    client.on('error', (error) => seen.push(`error: ${error.message}`));
+    client.on('close', () => closed.resolve());
   });
   try {
     const { promise: listening, resolve: listened, reject: failed } = Promise.withResolvers<void>();
@@ -828,41 +864,104 @@ async function withGateway<T>(answer: (line: string) => string, body: (socket: s
     server.listen(socket, listened);
     await listening;
     server.off('error', failed);
-    return await body(socket);
+    const result = await body(socket);
+    await closed.promise;
+    return { result, seen };
   } finally {
     server.close();
     rmSync(directory, { recursive: true, force: true });
   }
 }
 
-describe("the gateway's ram-attach", () => {
-  it('asks for one size, half-closed, and answers the whole disk the gateway names', async () => {
-    const asked: string[] = [];
-    const attached = await withGateway(
-      (line) => {
-        asked.push(line);
-        return '{"ok":true,"ramDisk":{"device":"/dev/disk7"}}\n';
-      },
-      (socket) => createHostCommands(socket, BOUNDED_TEST_IDLE_TIMEOUT_MS).attachRam(131_072),
-    );
-    expect(asked).toEqual(['{"op":"ram-attach","sectors":131072}\n']);
-    expect(attached).toEqual({ ok: true, value: '/dev/disk7' });
-  });
+const LEASE_REQUEST = '{"op":"ram-lease","sectors":131072}';
+const GRANT = '{"ok":true,"ramDisk":{"device":"/dev/disk7","registryEntry":"0x1000b0ab1"}}\n';
 
-  it('names a gateway that predates the operation, a refusal, and an answer without a whole disk', async () => {
+describe("the gateway's ram-lease", () => {
+  const detachAnswer = JSON.stringify({
+    ok: true,
+    ramDetach: {
+      outcome: 'terminal',
+      status: { exit: 0 },
+      stdout: 'disk7 ejected\n',
+      stderr: '',
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    },
+  });
+  const ends: {
+    name: string;
+    end: 'keep' | 'release';
+    move: GatewayMove;
+    outcome: Result<void, string> | Result<CommandOutput, string>;
+    seen: string[];
+  }[] = [
+    {
+      name: 'keeps the disk with one half-closed end line',
+      end: 'keep',
+      move: { answer: '{"ok":true}\n' },
+      outcome: { ok: true, value: undefined },
+      seen: [LEASE_REQUEST, '{"end":"keep"}', 'EOF'],
+    },
+    {
+      name: "releases the disk with one half-closed end line and answers the gateway's detach",
+      end: 'release',
+      move: { answer: `${detachAnswer}\n` },
+      outcome: { ok: true, value: { status: 0, stdout: 'disk7 ejected\n', stderr: '' } },
+      seen: [LEASE_REQUEST, '{"end":"release"}', 'EOF'],
+    },
+    {
+      name: 'says the lease lost when a restarted gateway never answers its keep',
+      end: 'keep',
+      move: 'unanswered',
+      outcome: {
+        ok: false,
+        error: expect.stringContaining("the lease is lost, and the disk is the gateway's to detach"),
+      },
+      seen: [LEASE_REQUEST, '{"end":"keep"}', 'EOF'],
+    },
+    {
+      name: 'says the lease lost when a restarted gateway never answers its release',
+      end: 'release',
+      move: 'unanswered',
+      outcome: {
+        ok: false,
+        error: expect.stringContaining("the lease is lost, and the disk is the gateway's to detach"),
+      },
+      seen: [LEASE_REQUEST, '{"end":"release"}', 'EOF'],
+    },
+  ];
+  for (const row of ends) {
+    it(`asks for one size without half-closing, holds the lease open, and ${row.name}`, async () => {
+      const { result, seen } = await withGateway(
+        (line) => (line === LEASE_REQUEST ? { answer: GRANT } : row.move),
+        async (socket) => {
+          const leased = await createHostCommands(socket, BOUNDED_TEST_IDLE_TIMEOUT_MS).attachRam(131_072);
+          if (!leased.ok) throw new Error(`no lease: ${JSON.stringify(leased.error)}`);
+          expect(leased.value).toMatchObject({ device: '/dev/disk7', registryEntry: '0x1000b0ab1' });
+          return row.end === 'keep' ? await leased.value.keep() : await leased.value.release();
+        },
+      );
+      expect(result).toEqual(row.outcome);
+      // The request is never half-closed: the gateway reads EOF only after the end line, never before it.
+      expect(seen).toEqual(row.seen);
+    });
+  }
+
+  it('names a gateway that predates the operation, a refusal, and an answer without a whole disk and registry entry', async () => {
     const answers = [
       '{"ok":false,"code":"invalid-request","error":"gateway control encoding failed: unknown gateway control operation"}\n',
       '{"ok":false,"code":"rejected","error":"hdiutil attach -nomount ram://131072 ended exit 1: no memory"}\n',
-      '{"ok":true,"ramDisk":{"device":"/dev/disk7s1"}}\n',
+      '{"ok":true,"ramDisk":{"device":"/dev/disk7s1","registryEntry":"0x1000b0ab1"}}\n',
+      '{"ok":true,"ramDisk":{"device":"/dev/disk7"}}\n',
     ];
     const outcomes = [];
     for (const answer of answers) {
-      outcomes.push(
-        await withGateway(
-          () => answer,
-          (socket) => attachRamDisk(socket, 131_072, BOUNDED_TEST_IDLE_TIMEOUT_MS),
-        ),
+      const { result, seen } = await withGateway(
+        () => ({ answer }),
+        (socket) => attachRamDisk(socket, 131_072, BOUNDED_TEST_IDLE_TIMEOUT_MS),
       );
+      expect(seen).toEqual([LEASE_REQUEST, 'EOF']);
+      outcomes.push(result);
     }
     expect(outcomes).toEqual([
       {
@@ -871,16 +970,35 @@ describe("the gateway's ram-attach", () => {
           kind: 'ram-unavailable',
           reason: 'gateway-unsupported',
           detail:
-            'gateway predates ram-attach (invalid-request: gateway control encoding failed: unknown gateway control operation)',
+            'gateway predates ram-lease (invalid-request: gateway control encoding failed: unknown gateway control operation)',
         },
       },
       {
         ok: false,
-        error:
-          'the gateway refused ram-attach (rejected: hdiutil attach -nomount ram://131072 ended exit 1: no memory)',
+        error: 'the gateway refused ram-lease (rejected: hdiutil attach -nomount ram://131072 ended exit 1: no memory)',
       },
-      { ok: false, error: `the gateway's ram-attach answer names no whole disk: ${answers[2]?.trim()}` },
+      {
+        ok: false,
+        error: `the gateway's ram-lease answer names no whole disk and registry entry: ${answers[2]?.trim()}`,
+      },
+      {
+        ok: false,
+        error: `the gateway's ram-lease answer names no whole disk and registry entry: ${answers[3]?.trim()}`,
+      },
     ]);
+  });
+
+  it('closes the lease at its deadline without an end line, leaving the detach to the gateway', async () => {
+    const { result, seen } = await withGateway(
+      () => 'unanswered',
+      (socket) => attachRamDisk(socket, 131_072, 50),
+    );
+    expect(result).toEqual({
+      ok: false,
+      error:
+        'the gateway answered no ram-lease within 50 ms; this client closed the lease, so the gateway detaches any disk its attach still makes',
+    });
+    expect(seen).toEqual([LEASE_REQUEST, 'EOF']);
   });
 
   it('attaches nothing itself when no gateway answers', async () => {
@@ -950,7 +1068,7 @@ describe('creating the RAM temp volume', () => {
       });
       expect(acquired).toEqual({
         ok: false,
-        error: { kind: 'provision-failed', step: 'ram-attach', detail: 'the owner refused' },
+        error: { kind: 'provision-failed', step: 'ram-lease', detail: 'the owner refused' },
       });
       expect(asked).toEqual([131_072]);
       expect(ran).toEqual(['/usr/sbin/ioreg -r -c IOHDIXHDDriveOutKernel -l -w0', '/sbin/mount']);
@@ -1001,7 +1119,7 @@ describe('creating the RAM temp volume', () => {
         };
         expect(await new RamTempVolume(paths, capacity, commands).acquire(noSubtrees)).toEqual({
           ok: false,
-          error: { kind: 'provision-failed', step: 'ram-attach', detail: 'the owner refused' },
+          error: { kind: 'provision-failed', step: 'ram-lease', detail: 'the owner refused' },
         });
         expect(asked).toEqual([131_072]);
       }
@@ -1065,6 +1183,217 @@ describe('creating the RAM temp volume', () => {
       rmSync(parent, { recursive: true, force: true });
     }
   });
+});
+
+/** The registry entry the stand-in gives its attached RAM disk: the identity a detach of its own must name. */
+const STAND_IN_REGISTRY_ENTRY = '0x1000b0ab1';
+
+/** One RAM disk as ioreg -r -c IOHDIXHDDriveOutKernel -l -w0 lists it: its whole disk and its image. */
+function ramDiskRecord(name: string, sectors: number, uid: number): string {
+  return [
+    `+-o IOHDIXHDDriveOutKernel <class IOHDIXHDDriveOutKernel, id ${STAND_IN_REGISTRY_ENTRY}, registered, matched, active, busy 0, retain 1>`,
+    '{',
+    `  "image-path" = <"ram://${sectors}">`,
+    `  "owner-uid" = ${uid}`,
+    `  "BSD Name" = "${name}"`,
+    '}',
+    '',
+  ].join('\n');
+}
+
+/** How the stand-in's gateway answers the lease it grants, and whose disk its registry lists. */
+interface StandInGateway {
+  /** The uid the registry lists the attached disk under: any but the volume's fails the attach identity. */
+  readonly owner: number;
+  /** Its answer to the lease's keep. */
+  readonly keep: Result<void, string>;
+  /** Its release finds the lease lost to a gateway restart, so it answers no detach. */
+  readonly lost: boolean;
+}
+
+/**
+ * A recording HostCommands stand-in for one provisioning run. Its gateway attaches one RAM disk under a lease, and it
+ * answers ioreg, mount, diskutil, mount_apfs and umount from the disk and the mounts it holds, so provisioning's own
+ * checks run unchanged. Its mounts are no separate device, so the marker leaves with the staging mount and the
+ * mountpoint never holds the marked volume: a provisioning that succeeds on it ends at the lease the creation then takes.
+ * It fails the step named injected, records every step and every end of the lease in order, and every detach the caller
+ * runs itself.
+ */
+function provisioningStandIn(paths: RamTempPaths, injected: string | null, gateway: StandInGateway) {
+  const calls: { file: string; args: readonly string[] }[] = [];
+  const steps: string[] = [];
+  const detaches: { device: string; registryEntry: string }[] = [];
+  const kernel: { disk: { name: string; sectors: number } | null; mounts: Map<string, string> } = {
+    disk: null,
+    mounts: new Map(),
+  };
+  const detach = (): CommandOutput => {
+    kernel.disk = null;
+    kernel.mounts.clear();
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const commands: HostCommands = {
+    async run(file, args) {
+      calls.push({ file, args });
+      const step = stepOf(paths, file, args);
+      if (step !== null) steps.push(step);
+      if (step !== null && step === injected) return { status: 1, stdout: '', stderr: 'injected' };
+      if (file === '/usr/sbin/ioreg') {
+        const disk = args.includes('IOHDIXHDDriveOutKernel') ? kernel.disk : null;
+        return {
+          status: 0,
+          stdout: disk === null ? '' : ramDiskRecord(disk.name, disk.sectors, gateway.owner),
+          stderr: '',
+        };
+      }
+      if (file === '/sbin/mount') {
+        const table = [...kernel.mounts].map(([point, volume]) => `/dev/${volume} on ${point} (apfs, local, nobrowse)`);
+        return { status: 0, stdout: table.join('\n'), stderr: '' };
+      }
+      if (file === '/usr/sbin/diskutil' && args[1] === 'createContainer') {
+        return { status: 0, stdout: 'Disk from APFS operation: disk902\n', stderr: '' };
+      }
+      if (file === '/usr/sbin/diskutil' && args[1] === 'addVolume') {
+        return { status: 0, stdout: 'Disk from APFS operation: disk902s1\n', stderr: '' };
+      }
+      if (file === '/sbin/mount_apfs') {
+        const [, , device = '', point = ''] = args;
+        kernel.mounts.set(point, device.slice('/dev/'.length));
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (file === '/sbin/umount') {
+        const [point = ''] = args;
+        if (!kernel.mounts.delete(point)) return { status: 1, stdout: '', stderr: `${point} is not mounted` };
+        // The marker leaves the directory with the volume, so the unmounted directory is bare again.
+        rmSync(join(point, '.smoo-ram'), { force: true });
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      throw new Error(`${file} ${args.join(' ')} is not answered by the provisioning stand-in`);
+    },
+    async attachRam(sectors) {
+      kernel.disk = { name: 'disk901', sectors };
+      return {
+        ok: true,
+        value: {
+          device: '/dev/disk901',
+          registryEntry: STAND_IN_REGISTRY_ENTRY,
+          async keep() {
+            steps.push('keep');
+            return gateway.keep;
+          },
+          async release() {
+            steps.push('release');
+            return gateway.lost
+              ? { ok: false, error: 'the gateway answered no release: the lease is lost' }
+              : { ok: true, value: detach() };
+          },
+        },
+      };
+    },
+    async detachRam(device, registryEntry) {
+      detaches.push({ device, registryEntry });
+      return detach();
+    },
+  };
+  return { commands, calls, steps, detaches };
+}
+
+describe('the lease on the RAM disk a creation attaches', () => {
+  const uid = userInfo().uid;
+  const granted: StandInGateway = { owner: uid, keep: { ok: true, value: undefined }, lost: false };
+  const cases: {
+    name: string;
+    injected: string | null;
+    gateway: StandInGateway;
+    /** The creation's failure, given the volume's mountpoint. */
+    error: (mountpoint: string) => { step: string; detail: string };
+    steps: string[];
+    detaches: { device: string; registryEntry: string }[];
+  }[] = [
+    {
+      name: 'is released, and never detached by the creator, when the staging mount fails',
+      injected: 'mount_apfs',
+      gateway: granted,
+      error: () => ({ step: 'mount_apfs (staging)', detail: 'exit 1: injected' }),
+      steps: ['mount_apfs', 'release'],
+      detaches: [],
+    },
+    {
+      name: 'is released, and never detached by the creator, when the mountpoint mount fails',
+      injected: 'mount',
+      gateway: granted,
+      error: () => ({ step: 'mount_apfs (mountpoint)', detail: 'exit 1: injected' }),
+      steps: ['mount_apfs', 'unmount', 'mount', 'release'],
+      detaches: [],
+    },
+    {
+      name: 'is released when the attached disk is not the unique registry identity of the attach',
+      injected: null,
+      gateway: { ...granted, owner: uid + 1 },
+      error: () => ({
+        step: 'attach identity',
+        detail:
+          '/dev/disk901 is not the unique registry identity of this gateway attach; no provisioning or guessed detach',
+      }),
+      steps: ['release'],
+      detaches: [],
+    },
+    {
+      name: 'is kept exactly once, after the volume is mounted at its mountpoint',
+      injected: null,
+      gateway: granted,
+      // The stand-in's mounts are no separate device: the kept volume is no marked volume to the lease taken next.
+      error: (mountpoint) => ({ step: 'create', detail: `${mountpoint} is not the marked volume once provisioned` }),
+      steps: ['mount_apfs', 'unmount', 'mount', 'keep'],
+      detaches: [],
+    },
+    {
+      name: 'is detached by the creator by its exact identity when keep fails and its release finds the lease lost',
+      injected: null,
+      gateway: {
+        owner: uid,
+        keep: { ok: false, error: 'the gateway answered no keep: the lease is lost' },
+        lost: true,
+      },
+      error: () => ({
+        step: 'ram-lease keep',
+        detail: 'the gateway answered no keep: the lease is lost; the gateway answered no release: the lease is lost',
+      }),
+      steps: ['mount_apfs', 'unmount', 'mount', 'keep', 'release'],
+      detaches: [{ device: '/dev/disk901', registryEntry: STAND_IN_REGISTRY_ENTRY }],
+    },
+  ];
+  for (const row of cases) {
+    it(row.name, async () => {
+      const parent = mkdtempSync(join(tmpdir(), 'ra-lease-'));
+      try {
+        const root = join(parent, 'root');
+        mkdirSync(root, { mode: 0o700 });
+        const paths: RamTempPaths = {
+          ...ramTempPaths(userInfo(), NAMESPACE),
+          root,
+          mountpoint: join(root, 'ram'),
+          leaseBytesMax: Number.MAX_SAFE_INTEGER,
+          staging: join(root, 'ram-new'),
+          lockFile: join(parent, 'v.lock'),
+        };
+        const standIn = provisioningStandIn(paths, row.injected, row.gateway);
+        const acquired = await new RamTempVolume(paths, RAM_TEMP_CAPACITY_BYTES, standIn.commands).acquire(noSubtrees);
+        const detail = JSON.stringify({ acquired, steps: standIn.steps, calls: standIn.calls }, null, 2);
+        expect(acquired, detail).toEqual({
+          ok: false,
+          error: { kind: 'provision-failed', ...row.error(paths.mountpoint) },
+        });
+        expect(standIn.steps, detail).toEqual(row.steps);
+        expect(standIn.detaches, detail).toEqual(row.detaches);
+        expect(existsSync(paths.staging), detail).toBe(false);
+        // Only a kept volume stays mounted; every ended attempt removes its mountpoint.
+        expect(existsSync(paths.mountpoint), detail).toBe(row.steps.at(-1) === 'keep');
+      } finally {
+        rmSync(parent, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 /** No native disk command runs: the only child is this owned facade, whose effect and exit have separate controls. */
@@ -1180,9 +1509,21 @@ socket.end();
         recorded = true;
         await writeFile(registry, image);
       }
-      return mode === 'rollback'
-        ? { ok: true, value: '/dev/disk7' }
-        : { ok: false, error: 'owned attach admission reached' };
+      if (mode !== 'rollback') return { ok: false, error: 'owned attach admission reached' };
+      // A gateway that restarted under the lease answers no release: the rollback is this caller's own detach.
+      return {
+        ok: true,
+        value: {
+          device: '/dev/disk7',
+          registryEntry: entry,
+          async keep() {
+            throw new Error('a provisioning that failed keeps no lease');
+          },
+          async release() {
+            return { ok: false, error: 'the gateway answered no release: the lease is lost' };
+          },
+        },
+      };
     },
   };
   const subtrees = {

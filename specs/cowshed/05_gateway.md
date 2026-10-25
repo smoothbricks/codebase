@@ -816,19 +816,20 @@ the reconcile.
 deleted. Nx work of the project in flight, a backend starting or a clear already running is the failure code `busy`,
 whose message names that work; any other refusal is `rejected`.
 
-`{"op":"ram-attach","sectors":<n>}` is one-shot and attaches one RAM disk of `n` 512-byte sectors for the caller ("RAM
-disks", below). It answers `ramDisk: { device: "/dev/diskN" }`, the whole disk `hdiutil` printed.
-`{"op":"first-launch"}` is one-shot and measures a fresh executable's first launch from the daemon's own process ("The
-gateway host"): a copy of the daemon's executable, signed ad hoc again under an identifier no launch has used, launched
-twice with `--version`, each timed from spawn to exit, then removed. It answers
-`firstLaunch: { firstMicros, secondMicros }`; a daemon that supplies no probe, or a probe that fails, is `rejected` with
-the probe's own words. `{"op":"ram-detach","device":"/dev/diskN","registryEntry":"0x<hex>"}` is one-shot and detaches
-the RAM disk that I/O Registry entry registers as that whole disk. It answers `ramDetach`, whose `outcome` is
-`terminal`, `not-started` or `unknown` (same section).
+`{"op":"ram-lease","sectors":<n>}` attaches one RAM disk of `n` 512-byte sectors and holds it for the connection that
+asked ("RAM disks", below). It answers `ramDisk: { device: "/dev/diskN", registryEntry: "0x<hex>" }`, the whole disk
+`hdiutil` printed and the I/O Registry entry the gateway read it as; the client then writes one `{"end":"keep"}` or
+`{"end":"release"}` line and half-closes. `{"op":"first-launch"}` is one-shot and measures a fresh executable's first
+launch from the daemon's own process ("The gateway host"): a copy of the daemon's executable, signed ad hoc again under
+an identifier no launch has used, launched twice with `--version`, each timed from spawn to exit, then removed. It
+answers `firstLaunch: { firstMicros, secondMicros }`; a daemon that supplies no probe, or a probe that fails, is
+`rejected` with the probe's own words. `{"op":"ram-detach","device":"/dev/diskN","registryEntry":"0x<hex>"}` is one-shot
+and detaches the RAM disk that I/O Registry entry registers as that whole disk. It answers `ramDetach`, whose `outcome`
+is `terminal`, `not-started` or `unknown` (same section).
 
 Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a
 `disk-lease`, `cpu-tokens`, `jobserver` or `resident-pool` request is held for as long as its client keeps the
-connection open.
+connection open, and a `ram-lease` until its client's end line or the connection's end.
 
 ## Disk-lifecycle lease
 
@@ -924,7 +925,7 @@ with that job, and the disk with it, under every other job's use of the disk: op
 ENOENT.
 
 The helper of a RAM disk a host-shared volume lives on belongs to the gateway, which no job contains; a job's retirement
-must never reach it. `ram-attach` forks `hdiutil attach -nomount ram://<n>` from the gateway, through
+must never reach it. `ram-lease` forks `hdiutil attach -nomount ram://<n>` from the gateway, through
 `SystemCommandRunner` under the storage class of the gateway's own disk-lifecycle lease, as a protected disk-image
 command that is never killed. The request names a size and nothing else; no argv, path or option reaches `hdiutil` from
 the wire. `sectors` must be a positive integer whose bytes fit in the host's physical memory (`hw.memsize`): a RAM disk
@@ -938,16 +939,39 @@ report explicit capability or provenance unavailability and run on owned ordinar
 malformed provenance or unreadable pending authority is still an error. Required RAM boundary fixtures never substitute
 another medium.
 
-The gateway records nothing about the disk. Its caller owns the volume on it, proves that ownership by the disk's I/O
-Registry entry, which it reads right after the attach, and detaches the disk only through `ram-detach` naming that entry
-and its whole disk: the disk just attached for it when its provisioning fails, and any later one, a stray it reclaims
-included. It never detaches one through `disk-command`, and never with `-force`. The helper's own session keeps it out
-of the gateway's process group, so a gateway restart leaves the disk attached. A caller that stops waiting leaves the
-attach running. A volume counts as its own only the disks of its uid and size that carry its exact volume name at its
-mountpoint or staging, or whose registry entry its ledger or a receipt records; it reclaims those strays and ignores
-every other disk, so a disk of another namespace, a test's, is never taken for production's.
+The attach is a lease the requesting connection holds, and every way it ends settles the disk, so no disk outlives every
+owner. Right after `hdiutil` answers, on the blocking thread that ran it, the gateway reads the disk's I/O Registry
+entry and records the lease durably, one file per lease named by that entry and holding its whole disk, in `ram-leases/`
+beside its control socket (mode 0700); only then does it answer `ramDisk`. A disk whose entry cannot be read is detached
+again by the name the attach just printed, which nobody else has heard of, and one whose lease cannot be recorded is
+detached by its entry; either attach is `rejected`. The client keeps the connection open and writes one end line, which
+decides the lease (`cowshed-gateway`'s `ram_lease` core):
 
-`ram-detach` is the gateway's other RAM disk mutation and has the attach's owner. The gateway forks
+- `{"end":"keep"}`: the disk is the caller's from then on. The gateway removes the record and answers `ok: true`. A
+  record it cannot remove would make the next startup scan detach a disk its owner uses, so the gateway then detaches
+  the disk and refuses the keep as `rejected`.
+- `{"end":"release"}`: the gateway detaches the disk and answers `ramDetach` exactly as `ram-detach` does.
+- Any other line: the gateway detaches the disk and answers `invalid-request` naming the detach's outcome.
+- No line: the connection ended or broke first, its owner dead, killed or gone past its deadline. The gateway detaches
+  the disk; nobody is left to answer.
+
+Each detach is the registry-bound one `ram-detach` runs, on a blocking thread no connection owns. The record goes only
+once a registry read right after the detach no longer finds the entry registering the disk; a disk still registered
+(busy, so the unforced detach failed), or a registry that cannot be read, keeps its record. A gateway that stops while
+it holds a lease, its connections aborted with it, leaves the record too. The gateway's startup scan reads every record
+before its control socket serves, so each is a previous gateway's lease whose owner's connection is gone, and detaches
+each on a blocking thread, removing the record by the same rule. The scan is the only retry: a record waits for the next
+gateway start, never for a timer. The gateway says every lease it detaches on its stderr, as
+`cowshed: ram-lease <device> entry=<entry> <why>: detach outcome=<outcome>; <record>`.
+
+A kept disk's caller owns the volume on it and detaches the disk only through `ram-detach` naming its entry and whole
+disk. It never detaches one through `disk-command`, and never with `-force`. The helper's own session keeps it out of
+the gateway's process group, so a gateway restart leaves a kept disk attached. A volume counts as its own only the disks
+of its uid and size that carry its exact volume name at its mountpoint or staging, or whose registry entry its ledger or
+a receipt records; it reclaims those strays and ignores every other disk, so a disk of another namespace, a test's, is
+never taken for production's.
+
+`ram-detach` is the gateway's other RAM disk mutation and has the kept disk's owner. The gateway forks
 `hdiutil detach <device>` through `SystemCommandRunner`'s registry-bound detach under the storage class of its own
 disk-lifecycle lease, as a protected disk-image command that is never killed. Inside the grant, immediately before the
 spawn, the runner reads `registryEntry` again and spawns only while that entry still registers `device` as its whole
@@ -983,7 +1007,13 @@ it attached: `a_ram_detach_outlives_the_requester_that_asked_for_it` kills a job
 the detach waits behind a namespace phase the test holds; the retirement signals no `hdiutil`, and the disk leaves the
 registry once the phase drains. `a_ram_detach_refuses_an_entry_that_does_not_register_the_device` swaps the entries of
 two fixture disks, answers `not-started` for both and leaves both registered, then detaches one by its own entry while
-the other stays registered under the same whole disk.
+the other stays registered under the same whole disk. The lease's decisions are `ram_lease`'s table tests, and its
+connection boundary is `control`'s `ram_lease` tests on in-memory disks: an owner gone, kept, released or garbled, and a
+startup scan of a previous gateway's record. The actual runs are `cowshed-gateway`'s `ram_lease` tests on real fixture
+disks: `a_ram_lease_whose_owner_ends_without_keeping_it_leaves_the_registry` ends a lease with no line and finds the
+disk gone once the gateway closes the connection; `the_next_gateway_detaches_a_lease_a_stopped_gateway_held` drains a
+gateway holding a lease, finds the disk still registered, and starts the namespace's next gateway, whose startup scan
+detaches it.
 
 ## Host CPU budget
 
