@@ -401,10 +401,11 @@ mod tests {
 
     fn image(program: &str) -> ProcessImage {
         ProcessImage {
-            program: program.to_owned(),
+            program: program.into(),
             argv: vec![CommandArg::new(OsString::from_vec(
                 program.as_bytes().to_vec(),
-            ))],
+            ))]
+            .into(),
             truncated: false,
         }
     }
@@ -598,6 +599,49 @@ mod tests {
                 other => panic!("a tick emits heartbeats only, got {other:?}"),
             })
             .collect()
+    }
+
+    /// Every record of one image shares it: the tree's, each event of a life that runs it, and
+    /// a forked child's birth until its own exec. A record that copied an argv would keep one
+    /// copy per record for as long as its job's record is kept.
+    #[test]
+    fn every_record_of_an_image_shares_its_argv() {
+        let mut run = Run::new();
+        let (shell, compiler) = (id(100, 1), id(101, 2));
+        run.root(shell).expect("a birth event");
+        run.fork(compiler, shell);
+        run.apply(JobProcessObservation::Tree(ProcessObservation::Exec {
+            process: compiler,
+            image: image("/usr/bin/cc"),
+        }))
+        .expect("an exec event");
+        run.exit(compiler, 2).expect("an exit event");
+        let tree = run.fold.tree(job(), utc(3));
+        let shares = |record: usize, process: &JobProcessSample| {
+            let record = &tree.processes[record];
+            std::sync::Arc::ptr_eq(&process.program, &record.program)
+                && std::sync::Arc::ptr_eq(&process.argv, &record.argv)
+        };
+        // The exit with no usage read after it is also a coverage gap, which names no record.
+        let records: Vec<_> = run
+            .events
+            .iter()
+            .filter(|event| !matches!(event, JobProcessEvent::Gap { .. }))
+            .collect();
+        assert_eq!(records.len(), 4, "{records:?}");
+        for event in records {
+            let shared = match event {
+                // The child was born running its parent's image.
+                JobProcessEvent::Born { index: 1, process } => shares(0, process),
+                JobProcessEvent::Born { index, process }
+                | JobProcessEvent::Exec { index, process }
+                | JobProcessEvent::Exited { index, process } => {
+                    shares(usize::try_from(*index).unwrap(), process)
+                }
+                other => panic!("no other event was observed: {other:?}"),
+            };
+            assert!(shared, "a record copied its image: {event:?}");
+        }
     }
 
     #[test]

@@ -1288,7 +1288,10 @@ mod tests {
             .expect("no read fails while both children run cat");
         for &pid in &expected {
             let process = observer.fold().live(pid).expect("adopted");
-            assert_eq!(observer.fold().image(process).unwrap().program, "/bin/cat");
+            assert_eq!(
+                &*observer.fold().image(process).unwrap().program,
+                "/bin/cat"
+            );
         }
         drop(hold_write);
         let failures = until_exited(&mut observer, root);
@@ -1299,8 +1302,11 @@ mod tests {
         let nodes: Vec<_> = observer.fold().nodes().collect();
         assert_eq!(nodes.len(), 3, "{nodes:?}");
         assert_eq!(nodes[0].identity.pid, root);
-        assert_eq!(nodes[0].image.program, "/bin/bash");
-        assert_eq!(nodes[0].image.argv, argv(&["/bin/bash", "-c", &script]));
+        assert_eq!(&*nodes[0].image.program, "/bin/bash");
+        assert_eq!(
+            &*nodes[0].image.argv,
+            argv(&["/bin/bash", "-c", &script]).as_slice()
+        );
         let exited = Some(&ProcessExit {
             status: Some(ExitStatus::Exited { code: 0 }),
             exited_at: nodes[0].exit.unwrap().exited_at.clone(),
@@ -1313,8 +1319,11 @@ mod tests {
         for node in &nodes[1..] {
             assert_eq!(node.parent, Some(nodes[0].identity));
             assert_eq!(node.ppid, root);
-            assert_eq!(node.image.program, "/bin/cat");
-            assert_eq!(node.image.argv, argv(&["/bin/cat", &marker, "-"]));
+            assert_eq!(&*node.image.program, "/bin/cat");
+            assert_eq!(
+                &*node.image.argv,
+                argv(&["/bin/cat", &marker, "-"]).as_slice()
+            );
             assert_eq!(
                 node.exit.and_then(|exit| exit.status.as_ref()),
                 Some(&ExitStatus::Exited { code: 0 })
@@ -1352,8 +1361,11 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
         let nodes: Vec<_> = observer.fold().nodes().collect();
         assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].image.program, "/bin/cat");
-        assert_eq!(nodes[0].image.argv, argv(&["/bin/cat", &marker, "-"]));
+        assert_eq!(&*nodes[0].image.program, "/bin/cat");
+        assert_eq!(
+            &*nodes[0].image.argv,
+            argv(&["/bin/cat", &marker, "-"]).as_slice()
+        );
         assert_eq!(observer.fold().coverage(), &ProcessCoverage::Complete);
     }
 
@@ -1375,7 +1387,7 @@ mod tests {
         for node in &nodes[1..] {
             assert_eq!(node.parent, Some(nodes[0].identity));
             assert!(
-                node.image.program == "/usr/bin/true" || node.image.program == "/bin/bash",
+                &*node.image.program == "/usr/bin/true" || &*node.image.program == "/bin/bash",
                 "{node:?}"
             );
         }
@@ -1557,8 +1569,8 @@ mod tests {
 
     fn shell_image(program: &str) -> ProcessImage {
         ProcessImage {
-            program: program.to_owned(),
-            argv: argv(&[program]),
+            program: program.into(),
+            argv: argv(&[program]).into(),
             truncated: false,
         }
     }
@@ -1804,10 +1816,7 @@ mod tests {
         assert_eq!(observer.owned(&leader).unwrap(), [process]);
         assert!(observer.registered.contains_key(&process));
         assert_eq!(
-            observer
-                .fold()
-                .image(process)
-                .map(|image| image.program.as_str()),
+            observer.fold().image(process).map(|image| &*image.program),
             Some("/bin/cat")
         );
         assert_eq!(

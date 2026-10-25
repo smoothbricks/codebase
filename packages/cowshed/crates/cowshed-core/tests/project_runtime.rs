@@ -3995,7 +3995,7 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
         loop {
             let tree = job.processes().await.expect("native process tree");
             if tree.processes.len() == 3
-                && tree.processes[2].program == "/bin/cat"
+                && &*tree.processes[2].program == "/bin/cat"
                 && tree.processes.iter().all(|process| process.usage.is_some())
             {
                 break tree;

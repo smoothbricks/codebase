@@ -10881,3 +10881,172 @@ if not sibling_reaped:
     serving.abort();
     assert!(serving.await.unwrap_err().is_cancelled());
 }
+
+/// This process's allocator footprint, threads and kqueues: a native fixture's supervisor runs
+/// in the test's own process, so these are what the supervisor retains.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct Footprint {
+    heap_bytes: usize,
+    heap_blocks: u32,
+    resident_bytes: u64,
+    threads: i32,
+    kqueues: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn footprint() -> Footprint {
+    let pid = i32::try_from(std::process::id()).unwrap();
+    // SAFETY: plain-data out-parameters, written whole by the calls below.
+    let (mut heap, mut task): (libc::malloc_statistics_t, libc::proc_taskinfo) =
+        unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    // SAFETY: a null zone sums every zone; `heap` is a valid out-pointer.
+    unsafe { libc::malloc_zone_statistics(std::ptr::null_mut(), &raw mut heap) };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap();
+    // SAFETY: `task` is a valid out-pointer of `size` bytes.
+    let read =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut task).cast(), size) };
+    assert_eq!(read, size, "{}", std::io::Error::last_os_error());
+    // SAFETY: `proc_fdinfo` is plain data; the zeroed entries are overwritten or unread.
+    let mut descriptors: Vec<libc::proc_fdinfo> = vec![unsafe { std::mem::zeroed() }; 4096];
+    let capacity =
+        i32::try_from(descriptors.len() * std::mem::size_of::<libc::proc_fdinfo>()).unwrap();
+    // SAFETY: `descriptors` holds `capacity` writable bytes.
+    let listed = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            descriptors.as_mut_ptr().cast(),
+            capacity,
+        )
+    };
+    assert!(listed > 0, "{}", std::io::Error::last_os_error());
+    let listed = usize::try_from(listed).unwrap() / std::mem::size_of::<libc::proc_fdinfo>();
+    assert!(listed < descriptors.len(), "every descriptor was listed");
+    Footprint {
+        heap_bytes: heap.size_in_use,
+        heap_blocks: heap.blocks_in_use,
+        resident_bytes: task.pti_resident_size,
+        threads: task.pti_threadnum,
+        kqueues: descriptors[..listed]
+            .iter()
+            .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_KQUEUE.cast_unsigned())
+            .count(),
+    }
+}
+
+/// The argv bytes a job's observation took from the kernel: one image per exec, and its root's.
+/// A forked life runs its parent's image until it execs, so its birth reads none.
+#[cfg(target_os = "macos")]
+async fn exec_image_bytes(handle: &WorkspaceSupervisorHandle, job: JobId) -> usize {
+    use cowshed_core::api::process::{JobProcessEvent, JobProcessSample};
+    let bytes = |process: &JobProcessSample| {
+        process.program.len()
+            + process
+                .argv
+                .iter()
+                .map(|argument| argument.as_os_str().len())
+                .sum::<usize>()
+    };
+    let mut events = handle
+        .process_events(job, cowshed_core::api::SampleInterval::new(1000).unwrap())
+        .await
+        .unwrap();
+    let mut total = 0;
+    while let Some(event) = events.next().await {
+        match event.unwrap() {
+            JobProcessEvent::Born { index: 0, process } | JobProcessEvent::Exec { process, .. } => {
+                total += bytes(&process);
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// A concluded job keeps its process tree and events readable and nothing else of its
+/// observation: no writer thread, no kqueue, and one copy of each image it ran (07_api.md,
+/// "Process-tree observations"). Each ended job once kept its writer, two kqueue descriptors
+/// and a copy of an argv per record of it until the supervisor retired: a workspace that built
+/// for an hour held a gigabyte.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_concluded_job_keeps_its_observation_records_and_no_writer() {
+    const JOBS: usize = 8;
+    let (handle, _ledger, _root) = native_process_fixture("concluded-observation", None);
+    // Each of 32 lives runs an 8 KiB argv and forks a child that shares it until its own exec,
+    // as a compiler driver and the tools it starts do.
+    let argv: Vec<CommandArg> = (0..64)
+        .map(|index| CommandArg::from(format!("{index:0>128}")))
+        .collect();
+    let run = || async {
+        let mut command: Vec<CommandArg> = vec![
+            "/bin/bash".into(),
+            "-c".into(),
+            r#"i=0; while [ $i -lt 32 ]; do /bin/bash -c ':; /bin/sleep 0.01' bash "$@"; i=$((i+1)); done"#
+                .into(),
+            "bash".into(),
+        ];
+        command.extend(argv.iter().cloned());
+        let job = handle
+            .exec(
+                None,
+                None,
+                ExecRequest {
+                    command: ExecCommand::Argv(command),
+                    cwd: None,
+                    scope: ExecScope::HostGate,
+                    env: [("PATH".into(), "/usr/bin:/bin".into())]
+                        .into_iter()
+                        .collect(),
+                    ..gate(request(StdinSource::Empty))
+                },
+                AdmissionSource::Coordinator,
+            )
+            .await
+            .unwrap();
+        let ended = handle.wait(job).await.unwrap();
+        assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
+        job
+    };
+    // The first job warms the supervisor's own allocations.
+    run().await;
+    let before = footprint();
+    let mut images = 0;
+    for _ in 0..JOBS {
+        let job = run().await;
+        let tree = handle.processes(job).await.unwrap();
+        assert!(tree.processes.len() > 32, "{} lives", tree.processes.len());
+        images += exec_image_bytes(&handle, job).await;
+    }
+    let after = footprint();
+    let retained = after.heap_bytes - before.heap_bytes;
+    cowshed_os::eprintln!(
+        "{JOBS} concluded jobs: heap {} -> {} bytes ({retained} retained, {} blocks), \
+         {images} exec image bytes, resident {} -> {}, threads {} -> {}, kqueues {} -> {}",
+        before.heap_bytes,
+        after.heap_bytes,
+        i64::from(after.heap_blocks) - i64::from(before.heap_blocks),
+        before.resident_bytes,
+        after.resident_bytes,
+        before.threads,
+        after.threads,
+        before.kqueues,
+        after.kqueues,
+    );
+    assert!(
+        after.kqueues <= before.kqueues,
+        "a concluded job keeps no kqueue: {} -> {}",
+        before.kqueues,
+        after.kqueues
+    );
+    // One copy of each image costs its bytes, a header per argument, and the records of the
+    // lives that ran it: under twice the image bytes. A second copy of an argv per record --
+    // the tree, each event and the writer's fold each held one -- costs four times or more.
+    assert!(
+        retained < images * 2,
+        "{JOBS} concluded jobs retain {retained} heap bytes for {images} bytes of exec images"
+    );
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+}

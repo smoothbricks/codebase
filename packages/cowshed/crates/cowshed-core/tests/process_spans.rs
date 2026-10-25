@@ -183,7 +183,7 @@ fn id(pid: u32, birth: u64) -> ProcessIdentity {
 
 fn image(program: &str, argv: &[&[u8]]) -> ProcessImage {
     ProcessImage {
-        program: program.to_owned(),
+        program: program.into(),
         argv: argv
             .iter()
             .map(|argument| CommandArg::new(OsString::from_vec(argument.to_vec())))
@@ -869,7 +869,7 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
             ),
             (
                 Some(record.pid),
-                Some(record.program.as_str()),
+                Some(&*record.program),
                 Some(usage.cpu_user_us.get()),
                 Some(usage.rss_bytes.get()),
                 Some(usage.rss_peak_bytes.get()),

@@ -1424,7 +1424,7 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
         pid: 4242,
         ppid: 4200,
         program: "cargo".into(),
-        argv: vec![CommandArg::from("cargo")],
+        argv: vec![CommandArg::from("cargo")].into(),
         truncated: false,
         born_at: timestamp(),
         usage: None,
@@ -1522,7 +1522,7 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
         ("ioNotAccounted", ProcessIoUnavailable::NotAccounted),
     ] {
         let process = JobProcessSample {
-            argv: vec![CommandArg::from(OsString::from_vec(vec![0xff]))],
+            argv: vec![CommandArg::from(OsString::from_vec(vec![0xff]))].into(),
             usage: Some(ProcessUsage {
                 io: ProcessStorageIo::Unavailable { reason },
                 ..ended.usage.expect("exited fixture usage")

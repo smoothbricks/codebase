@@ -6,6 +6,7 @@
 //! describes was decided when it was folded, by the kernel birth identity the observer retained
 //! (`runtime::process_tree`); a reused pid is a second record, never the first one updated.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -34,10 +35,11 @@ pub struct JobProcessSample {
     /// for a root, the process outside the job that started it.
     pub ppid: u32,
     /// The executable of the last observed exec; a child that has not exec'd runs its parent's.
-    pub program: String,
+    // Shared with every other record of the same exec's image, so a record copies no argv.
+    pub program: Arc<str>,
     /// The argv of that exec, byte-exact within a record's bounds: at most 128 KiB per argument
     /// and 1 MiB in all.
-    pub argv: Vec<CommandArg>,
+    pub argv: Arc<[CommandArg]>,
     /// Whether the exec's argv exceeded those bounds and `argv` holds only its first bytes. A
     /// record from before the bound was kept has no such field and was never cut.
     #[serde(default)]

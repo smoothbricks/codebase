@@ -715,8 +715,8 @@ mod tests {
         let process = JobProcessSample {
             pid: 4,
             ppid: 1,
-            program: "/bin/cat".to_owned(),
-            argv: vec![CommandArg::from("/bin/cat")],
+            program: "/bin/cat".into(),
+            argv: vec![CommandArg::from("/bin/cat")].into(),
             truncated: false,
             born_at: UtcTimestamp::new("2026-10-12T00:00:00Z").unwrap(),
             usage: None,
@@ -782,8 +782,8 @@ mod tests {
             let process = JobProcessSample {
                 pid,
                 ppid: 1,
-                program: "/bin/cat".to_owned(),
-                argv: vec![CommandArg::from("/bin/cat")],
+                program: "/bin/cat".into(),
+                argv: vec![CommandArg::from("/bin/cat")].into(),
                 truncated: false,
                 born_at: UtcTimestamp::new("2026-10-12T00:00:00Z").unwrap(),
                 usage: None,

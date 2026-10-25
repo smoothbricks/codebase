@@ -53,13 +53,14 @@ pub struct ProcessIdentity {
     pub birth: BirthToken,
 }
 
-/// The image a process runs after an exec.
+/// The image a process runs after an exec, allocated once per exec and shared by the life that
+/// runs it, the lives it forks and every record and event of them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessImage {
-    pub program: String,
+    pub program: Arc<str>,
     /// Within the record bounds every observation keeps (07_api.md, "Process-tree
     /// observations"): [`Self::observed`] cuts what exceeds them and says so in `truncated`.
-    pub argv: Vec<CommandArg>,
+    pub argv: Arc<[CommandArg]>,
     pub truncated: bool,
 }
 
@@ -93,8 +94,8 @@ impl ProcessImage {
             kept.push(CommandArg::new(std::ffi::OsString::from_vec(argument)));
         }
         Self {
-            program,
-            argv: kept,
+            program: program.into(),
+            argv: kept.into(),
             truncated,
         }
     }
@@ -172,7 +173,7 @@ struct Life {
     subtree: Option<IssuedSubtree>,
     ppid: u32,
     /// Shared with the parent until this life execs: a fork copies no argv.
-    image: Arc<ProcessImage>,
+    image: ProcessImage,
     image_known: bool,
     born_at: UtcTimestamp,
     exit: Option<ProcessExit>,
@@ -199,8 +200,8 @@ impl Life {
         JobProcessSample {
             pid: self.identity.pid,
             ppid: self.ppid,
-            program: self.image.program.clone(),
-            argv: self.image.argv.clone(),
+            program: Arc::clone(&self.image.program),
+            argv: Arc::clone(&self.image.argv),
             truncated: self.image.truncated,
             born_at: self.born_at.clone(),
             usage,
@@ -246,7 +247,7 @@ impl ProcessTreeFold {
                 ppid,
                 at,
                 image,
-            } => self.born(process, None, ppid, at, Arc::new(image), true),
+            } => self.born(process, None, ppid, at, image, true),
             ProcessObservation::Forked {
                 process,
                 parent,
@@ -260,7 +261,7 @@ impl ProcessTreeFold {
                 if parent_life.exit.is_some() {
                     return Err(ProcessFoldError::AfterExit { pid: parent.pid });
                 }
-                let image = Arc::clone(&parent_life.image);
+                let image = parent_life.image.clone();
                 let image_known = parent_life.image_known;
                 self.born(process, Some(index), parent.pid, at, image, image_known)
             }
@@ -268,7 +269,7 @@ impl ProcessTreeFold {
                 let Some(life) = self.running_life(process)? else {
                     return Ok(());
                 };
-                life.image = Arc::new(image);
+                life.image = image;
                 life.image_known = true;
                 Ok(())
             }
@@ -328,7 +329,7 @@ impl ProcessTreeFold {
         self.by_identity.get(&process).and_then(|&index| {
             self.lives[index]
                 .image_known
-                .then_some(&*self.lives[index].image)
+                .then_some(&self.lives[index].image)
         })
     }
 
@@ -459,7 +460,7 @@ impl ProcessTreeFold {
         parent: Option<usize>,
         ppid: u32,
         at: UtcTimestamp,
-        image: Arc<ProcessImage>,
+        image: ProcessImage,
         image_known: bool,
     ) -> Result<(), ProcessFoldError> {
         if self.by_identity.contains_key(&identity) {
@@ -528,7 +529,7 @@ mod tests {
 
     fn image(program: &str, argv: &[&[u8]]) -> ProcessImage {
         ProcessImage {
-            program: program.to_owned(),
+            program: program.into(),
             argv: argv
                 .iter()
                 .map(|arg| CommandArg::new(OsString::from_vec(arg.to_vec())))
@@ -617,7 +618,7 @@ mod tests {
         assert_eq!(tree.coverage, ProcessCoverage::Complete);
         let child = &tree.processes[1];
         assert_eq!((child.pid, child.ppid), (101, 100));
-        assert_eq!(child.program, "/usr/bin/cc");
+        assert_eq!(&*child.program, "/usr/bin/cc");
         let bytes: Vec<Vec<u8>> = child
             .argv
             .iter()
@@ -724,7 +725,7 @@ mod tests {
         root(&mut fold, shell);
         fork(&mut fold, subshell, shell, 1);
         let tree = tree(&fold, 2);
-        assert_eq!(tree.processes[1].program, "/bin/sh");
+        assert_eq!(&*tree.processes[1].program, "/bin/sh");
         assert_eq!(tree.processes[1].argv, tree.processes[0].argv);
         fold.apply(ProcessObservation::Exec {
             process: subshell,
@@ -733,11 +734,11 @@ mod tests {
         .unwrap();
         fork(&mut fold, id(103, 4), shell, 2);
         let tree = self::tree(&fold, 3);
-        assert_eq!(tree.processes[1].program, "/usr/bin/make");
+        assert_eq!(&*tree.processes[1].program, "/usr/bin/make");
         // The child's exec leaves the image it shared with its parent, which the parent's next
         // child shares in turn.
-        assert_eq!(tree.processes[0].program, "/bin/sh");
-        assert_eq!(tree.processes[2].program, "/bin/sh");
+        assert_eq!(&*tree.processes[0].program, "/bin/sh");
+        assert_eq!(&*tree.processes[2].program, "/bin/sh");
         assert_eq!(tree.processes[2].argv, tree.processes[0].argv);
     }
 
@@ -766,7 +767,7 @@ mod tests {
             image: image("/usr/bin/cc", &[b"cc"]),
         })
         .unwrap();
-        assert_eq!(fold.image(child).unwrap().program, "/usr/bin/cc");
+        assert_eq!(&*fold.image(child).unwrap().program, "/usr/bin/cc");
         assert!(fold.node_at(1).unwrap().image_known);
         assert!(fold.image(parent).is_none());
         assert_eq!(
@@ -808,7 +809,7 @@ mod tests {
         assert_eq!(tree.coverage, ProcessCoverage::Complete);
         let lives: Vec<_> = tree.processes.iter().filter(|p| p.pid == 200).collect();
         assert_eq!(lives.len(), 2);
-        assert_eq!(lives[0].program, "/bin/sh");
+        assert_eq!(&*lives[0].program, "/bin/sh");
         assert_eq!(
             (lives[0].born_at.clone(), lives[1].born_at.clone()),
             (at(1), at(3))
@@ -818,7 +819,7 @@ mod tests {
             Some(ExitStatus::Exited { code: 0 })
         );
         assert_eq!(lives[0].exit.as_ref().unwrap().exited_at, at(2));
-        assert_eq!(lives[1].program, "/usr/bin/ld");
+        assert_eq!(&*lives[1].program, "/usr/bin/ld");
         assert_eq!(
             lives[1].exit.as_ref().unwrap().status,
             Some(ExitStatus::Exited { code: 7 })

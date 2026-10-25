@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::cast::AsArray;
@@ -446,7 +447,7 @@ struct SpanIds {
 struct OpenSpan {
     ids: SpanIds,
     identity: ProcessIdentity,
-    program: String,
+    program: Arc<str>,
     busy: bool,
     /// The newest usage this span has observed, with an unavailable storage pair replaced by the
     /// last one it read: the counters a later row is compared against.
@@ -512,7 +513,7 @@ impl ProcessSpanProjection {
                     ProcessColumns::default()
                 } else {
                     ProcessColumns {
-                        proc_program: Some(process.program.clone()),
+                        proc_program: Some(process.program.to_string()),
                         ..ProcessColumns::default()
                     }
                 };
@@ -609,14 +610,14 @@ impl ProcessSpanProjection {
             write_blocker(&mut columns, blocked);
         }
         columns.proc_pid = Some(process.pid);
-        columns.proc_program = Some(process.program.clone());
+        columns.proc_program = Some(process.program.to_string());
         columns.proc_argv = Some(argv_display(&process.argv));
         self.by_identity.insert(identity, span_id);
         // A span starts idle. A busy birth record is flipped by the first row that observes it.
         self.open.push(OpenSpan {
             ids,
             identity,
-            program: process.program.clone(),
+            program: Arc::clone(&process.program),
             busy: false,
             usage: process.usage,
             closed: false,
@@ -1086,7 +1087,7 @@ mod tests {
         JobProcessSample {
             pid,
             ppid,
-            program: program.to_owned(),
+            program: program.into(),
             argv: argv
                 .iter()
                 .map(|argument| CommandArg::from(*argument))

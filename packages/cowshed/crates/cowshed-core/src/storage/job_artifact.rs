@@ -6972,8 +6972,8 @@ mod tests {
         );
         let cut = record(JobProcessLeaf {
             pid: 1,
-            program: image.program,
-            argv: image.argv,
+            program: image.program.to_string(),
+            argv: image.argv.to_vec(),
             truncated: image.truncated,
         });
         let ProtectedRecord::Job(read) =

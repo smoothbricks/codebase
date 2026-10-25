@@ -1177,8 +1177,8 @@ pub struct LockHolder { pub pid: u32, pub job: Option<JobId>, pub program: Optio
 pub struct JobProcessSample {
     pub pid: u32,
     pub ppid: u32,
-    pub program: String,
-    pub argv: Vec<CommandArg>,                // at most 128 KiB per argument and 1 MiB in all
+    pub program: Arc<str>,                    // shared with every record of the same exec's image
+    pub argv: Arc<[CommandArg]>,              // at most 128 KiB per argument and 1 MiB in all
     pub truncated: bool,                      // the exec's argv exceeded those bounds and was cut to them
     pub born_at: UtcTimestamp,
     pub usage: Option<ProcessUsage>,          // absent until its counters are first read, never zeroes
@@ -1254,6 +1254,10 @@ An observation keeps every argv within the bounds a record holds (`MAX_COMMAND_A
 argument past 128 KiB keeps its first 128 KiB, the argument that crosses 1 MiB in all keeps what fits, later ones are
 dropped, and `truncated` says so. macOS bounds only a process's whole argv (`KERN_ARGMAX`), so a legal process can hold
 an argument no record could; a record written before this field reads it as `false`.
+
+Each exec's image is held once: the life that runs it, a child forked from it until that child's own exec, and every
+record and event of them share it, so a record copies no argv. Once a job concludes, its tree and events stay readable
+as they ended, and nothing of the observer that watched it remains: no writer, thread, kqueue or fold.
 
 Birth and parent identity are kernel observations retained internally, not fresh trust in numeric PID values.
 Per-process CPU counters are that process's own usage. Complete job counters have an independent, declared source and

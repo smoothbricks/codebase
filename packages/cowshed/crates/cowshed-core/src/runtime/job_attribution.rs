@@ -112,8 +112,8 @@ impl AttributionSummary {
             observed_cpu: observed,
             winner: winner.map(|(_, identity, image)| JobProcessLeaf {
                 pid: identity.pid,
-                program: image.program.clone(),
-                argv: image.argv.clone(),
+                program: image.program.to_string(),
+                argv: image.argv.to_vec(),
                 truncated: image.truncated,
             }),
         })
@@ -367,8 +367,8 @@ mod tests {
 
     fn image(program: &str) -> ProcessImage {
         ProcessImage {
-            program: program.to_owned(),
-            argv: vec![CommandArg::new(program)],
+            program: program.into(),
+            argv: vec![CommandArg::new(program)].into(),
             truncated: false,
         }
     }
