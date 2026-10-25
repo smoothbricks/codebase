@@ -184,6 +184,11 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/compiler-variables.sh',
+    target: 'tooling/direnv/compiler-variables.sh',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/git-hooks/pre-commit.sh',
     target: 'tooling/git-hooks/pre-commit.sh',
     executable: true,

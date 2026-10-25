@@ -303,6 +303,18 @@ every cache entry private to the machine that wrote it and make one target hash 
 outside it — enough to make a pre-push cross-compile probe unsatisfiable. Keep explicit inputs for arbitrary
 build-script reads or custom environment variables that Cargo metadata cannot name.
 
+Cargo itself keys a build script's run on every variable the script names with `rerun-if-env-changed` (cc-rs names
+`CC_<target>` and its kin), so an ambient value Nx does not hash still reruns the script and rebuilds everything that
+depends on it. The `@smoothbricks/nx-plugin/cargo-build-script-env` export reads those records:
+`buildScriptEnvironmentDrift(profile, sees)` returns each variable whose recorded value differs from what Cargo would
+see now, with both values and the packages whose scripts read it; `cargoSees(files, environment)` is that view over the
+configuration chain `cargoConfigFiles(directory, cargoHome)` lists (the deepest `[env]` entry decides: forced, else the
+environment's value, else the entry's), and `runBuildScriptEnvironmentDrift([checkout])` prints the drift of
+`<checkout>/target/debug`. Variables Cargo sets for the processes it runs (`CARGO_*`, `OUT_DIR` and the other documented
+build-script names) are not compared: a run that recorded one was started by a `cargo` a Cargo-run process spawned.
+`tooling/land-host.sh` calls it through `tooling/land-cargo-env.ts` before each gate (cowshed
+`specs/cowshed/16_build_volumes.md`, "One Cargo environment on every path").
+
 A target whose inputs a repository DECLARES replaces the inferred list, pin included. Name the two `devenv.lock` entries
 in that declaration, or in the named input it uses, or a toolchain bump will not invalidate it. The replaced list also
 held the target's `externalDependencies` entries described below; restate them (`[]` for a target that runs only cargo,

@@ -589,6 +589,13 @@ nothing when nothing changed:
   `xcrun`, which answers `unable to find sdk: 'macosx'` once the nix developer directory is gone. `xcrun` is then
   Apple's `/usr/bin/xcrun`, so `xcrun --sdk macosx --show-sdk-path` names the selected Xcode or Command Line Tools SDK
   in host shells and sandboxed jobs alike. Each drop is announced; values outside the store stay as given.
+  - `tooling/direnv/compiler-variables.sh` makes cc-rs's compiler variables the shell's own: `CC_<target>`,
+    `CXX_<target>`, `AR_<target>` and `RANLIB_<target>`, their `HOST_` and `TARGET_` forms, and `CFLAGS`, `CXXFLAGS`,
+    `ARFLAGS` and `RANLIBFLAGS` in all of those forms and generic. It keeps the ones the shell's `env` declares, which
+    `devenv.smoo.nix` passes it, and drops and announces every other one the shell inherits. cc-rs build scripts rerun
+    on each name they look a compiler up through, so one a caller carried in from another checkout's shell rebuilds
+    those packages and everything that depends on them against a target built without it (cowshed
+    `specs/cowshed/16_build_volumes.md`, "One Cargo environment on every path").
 - The repository's local git config includes `tooling/workspace.gitconfig` by a path relative to the config file
   (`../tooling/workspace.gitconfig` in `.git/config`), so a copied checkout reads its own copy. An absolute include
   would name the checkout that wrote it, and git refuses to run when an include exists but cannot be read — the original

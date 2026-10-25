@@ -81,6 +81,14 @@
   # same files for anything that names it.
   rustToolchainBin = "${config.languages.rust.toolchainPackage}/bin";
 
+  # The cc-rs compiler variables this shell's `env` declares (a Linux shell
+  # pins its native compiler there): compiler-variables.sh keeps them and
+  # drops every other one the shell inherits (enterShell item 9).
+  declaredCompilerVariables =
+    lib.filter
+    (name: builtins.match "((HOST|TARGET)_)?(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|ARFLAGS|RANLIBFLAGS)(_[a-z].*)?" name != null)
+    (lib.attrNames config.env);
+
   # Expose pyflakes without propagating a second interpreter into the shell.
   pyflakesBin = pkgs.runCommandLocal "pyflakes-${pkgs.python3Packages.pyflakes.version}" {} ''
     mkdir -p "$out/bin"
@@ -614,6 +622,9 @@ in {
     #    nixpkgs xcbuild's `xcrun` are dropped, each one announced, so Xcode's
     #    clang compiles against the licensed SDK and `xcrun` is Apple's.
     #    tooling/direnv/apple-developer.sh does it and states why.
+    # 9. cc-rs's compiler variables are this shell's: the ones its `env`
+    #    declares and no others. tooling/direnv/compiler-variables.sh drops
+    #    and announces every other one the shell inherits, and states why.
     # Nx's own socket fallback (under HOME or TMPDIR) can exceed the Unix socket
     # limit in a checkout, and an inherited NX_SOCKET_DIR may be another
     # workspace's: tooling/direnv/nx-socket-dir.sh, sourced below, names this
@@ -660,6 +671,7 @@ in {
       # one literal path its host shells and sandboxed jobs all share, and
       # states why.
       . "$DEVENV_ROOT/nx-socket-dir.sh" || exit $?
+      . "$DEVENV_ROOT/compiler-variables.sh" ${lib.escapeShellArgs declaredCompilerVariables}
       ${lib.optionalString pkgs.stdenv.isDarwin ''
         . "$DEVENV_ROOT/apple-developer.sh" /nix/store
       ''}

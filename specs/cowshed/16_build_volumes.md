@@ -1344,9 +1344,23 @@ the same unit-identity environment. Concretely:
   without `CI` is not wholly `Fresh` under `CI=true`. Agent harnesses export `CI=true` on every command. The workspace
   environment cowshed provides unsets `CI` unless the runner identifies itself as real CI (`GITHUB_ACTIONS`, or the
   runner's own marker), and a repository's dev shell does the same.
-- **The toolchain's compiler variables.** `CC_<target>`, `CXX_<target>` and `AR_<target>` must be the dev shell's. Build
-  scripts using the `cc` crate declare `rerun-if-env-changed` on them; one missing variable rebuilds every `-sys` crate
-  that reads it, and all of their dependents.
+- **The toolchain's compiler variables.** cc-rs's compiler variables are the dev shell's: the ones its `env` declares
+  and no others. They are `CC_<target>`, `CXX_<target>`, `AR_<target>` and `RANLIB_<target>`, the `HOST_` and `TARGET_`
+  forms of each, and `CFLAGS`, `CXXFLAGS`, `ARFLAGS` and `RANLIBFLAGS` in each of those forms and generic; the generic
+  tool names are the stdenv's on Linux and Xcode's on Darwin (`apple-developer.sh` drops them). cc-rs declares
+  `rerun-if-env-changed` on each name it looks a compiler up through, so a value a caller's environment carries in (an
+  agent started in another checkout's devenv shell exports Apple's clang as `CC_aarch64_apple_darwin`) reruns every
+  build script that looked it up, and rebuilds every unit that depends on those packages, against a seed the land built
+  without it. The dev shell's prologue drops each inherited one it does not declare and announces the drop
+  (`tooling/direnv/compiler-variables.sh`), so a host shell, `direnv exec`, a sandboxed job's shell and the land's pure
+  shell agree. A host-gate job runs its argv in exactly its caller's environment, so its Cargo is the checkout's only
+  through that shell: its caller is the shell, or its argv enters it, as the land's `direnv exec <checkout>` does.
+  - **Enforced by**: `packages/cli/src/monorepo/compiler-variables.test.ts`; and the land. Before gating,
+    `tooling/land-host.sh` compares the shed's dev-profile build-script records with what Cargo sees in the gate's
+    shell, the shell main's seed is built in, and names each variable they disagree on, its recorded and current values
+    and the packages whose scripts read it (`@smoothbricks/nx-plugin/cargo-build-script-env`, which a real Cargo build
+    holds to Cargo's own rerun decision). It is said, never a reason to stop: drift costs the gate a rebuild, not
+    correctness.
 - **No absolute checkout paths in compiler flags.** `--remap-path-prefix=<absolute checkout>=…` puts the checkout path
   into `RUSTFLAGS`, which is part of every unit's identity, so every checkout builds its own units. Use
   `-Zremap-cwd-prefix` (relative), or no remap.

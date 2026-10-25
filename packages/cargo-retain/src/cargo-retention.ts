@@ -178,6 +178,7 @@ export interface CargoFingerprint {
   readonly local?: readonly {
     readonly CheckDepInfo?: { readonly dep_info: string };
     readonly RerunIfChanged?: { readonly output: string };
+    readonly RerunIfEnvChanged?: { readonly var: string; readonly val: string | null };
   }[];
   readonly [field: string]: unknown;
 }

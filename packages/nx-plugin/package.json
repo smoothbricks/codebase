@@ -30,6 +30,12 @@
       "import": "./dist/failure-summary.js",
       "default": "./dist/failure-summary.js"
     },
+    "./cargo-build-script-env": {
+      "types": "./dist/cargo-build-script-env.d.ts",
+      "development": "./src/cargo-build-script-env.ts",
+      "import": "./dist/cargo-build-script-env.js",
+      "default": "./dist/cargo-build-script-env.js"
+    },
     "./bounded-test-policy": {
       "types": "./dist/bounded-test-policy.d.ts",
       "import": "./dist/bounded-test-policy.js",

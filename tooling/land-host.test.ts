@@ -232,6 +232,7 @@ function fixture(replayFails = false, publishFails = false): Land {
     'land-history.ts',
     'land-publish.ts',
     'land-summary.ts',
+    'land-cargo-env.ts',
   ]) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
@@ -349,6 +350,21 @@ describe('land-host.sh', () => {
     expect(existsSync(join(land.ws, 'agent-todo/land-ledger.md'))).toBe(false);
   });
 
+  it('names the build-script environment the shed recorded and the land shell does not give, and lands anyway', () => {
+    const land = fixture();
+    const fingerprint = join(land.ws, 'target/debug/build/ring/0123456789abcdef/fingerprint');
+    mkdirSync(fingerprint, { recursive: true });
+    writeFileSync(
+      join(fingerprint, 'run-build-script-build-script-build.json'),
+      JSON.stringify({ deps: [], local: [{ RerunIfEnvChanged: { var: 'SMOO_LAND_PROBE', val: '/usr/bin/clang' } }] }),
+    );
+    const run = land.land([DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)]);
+    expect(run.status, run.log).toBe(0);
+    expect(run.log).toContain(
+      'cargo-build-script-env: SMOO_LAND_PROBE: 1 build-script run(s) of ring recorded "/usr/bin/clang"; Cargo now sees unset',
+    );
+    expect(run.nx).toEqual(['daemon --stop', GATE.join(' '), MAIN_BUILD.join(' ')]);
+  });
   // Which diagnostics the summary keeps is land-summary.test.ts's; this land proves what the script does with them.
   it('stops immediately on a failed gate, reporting its complete captured failure once, without rerunning or committing a ledger', () => {
     const land = fixture();

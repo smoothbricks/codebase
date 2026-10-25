@@ -141,6 +141,12 @@ gate_workspace() {
     say "could not stop $workspace's Nx daemon; a stale file map could gate a tree other than $head"
     exit 1
   }
+  # The shed's Cargo build-script records against the gate's shell, the shell main's seed is built in (build_main): a
+  # variable they disagree on is one the shed's own shells carried, and this gate reruns every build script that read it
+  # and rebuilds what depends on them (16_build_volumes.md, "One Cargo environment on every path"). Said, never a reason
+  # to stop: drift costs the gate time, not correctness.
+  (cd "$checkout" && direnv exec "$checkout" bun "$here/land-cargo-env.ts" "$checkout") >&2 ||
+    say "comparing $workspace's Cargo build-script environment with the land shell failed (status $?); the land goes on"
   output=$(mktemp "${TMPDIR:-/tmp}/land-gate.XXXXXX")
   gate_status=0
   began=$(date +%s)
