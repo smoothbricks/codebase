@@ -68,6 +68,12 @@
       "import": "./dist/ts/lib/errors/Blocked.js",
       "default": "./dist/ts/lib/errors/Blocked.js"
     },
+    "./errors/Deadline": {
+      "types": "./dist/ts/lib/errors/Deadline.d.ts",
+      "development": "./src/lib/errors/Deadline.ts",
+      "import": "./dist/ts/lib/errors/Deadline.js",
+      "default": "./dist/ts/lib/errors/Deadline.js"
+    },
     "./errors/RetriesExhausted": {
       "types": "./dist/ts/lib/errors/RetriesExhausted.d.ts",
       "import": "./dist/ts/lib/errors/RetriesExhausted.js",

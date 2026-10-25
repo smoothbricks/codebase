@@ -592,6 +592,35 @@ there is no `CodeError` class.
 shell that maps sockets and timers onto them belongs to that crate. In cowshed it is `cowshed-os::deadline`
 (smoothbricks `specs/cowshed/05_gateway.md`, "Deadlines").
 
+## TypeScript: deadlines <a id="smoo/lmao!n/op-retry.deadlines"></a>
+
+`errors/Deadline.ts` carries lmao-core's deadline values in TypeScript, under the same names and fields, plus the shell
+that bounds one wait with them. A wait on another process is a request or a long wait, and the shape decides its bound:
+
+- `deadline(op, peer, bound, body, timers?)` runs a request within one `Bound` (`{ class, withinMs }`, the class one of
+  `control`, `handshake`, `reap`, `ffi`, the value from the owning spec's table). Past the bound it answers
+  `Err(TimeoutError)`, code `TIMEOUT`, whose `data` names the op, the peer, the class, the bound, the elapsed time and
+  the last `Progress`. A body whose budget is already spent is never started.
+- `idle(op, holder, idleMs, body, timers?)` runs a long wait for as long as its holder shows progress. Each
+  `wait.progress(p)` starts the silence over, and `wait.setSilence(ms)` holds a holder that has shown its heartbeat to
+  the heartbeat's bound from its last progress. Once the holder has been silent for the bound it answers
+  `Err(SilentError)`, code `SILENT`, naming the holder, the silence, the whole wait and the last progress. There is no
+  total ceiling.
+- `wait.lost()` is `PeerLostError`, code `PEER_LOST`: the peer ended the connection before answering. A peer absent at
+  connect is `Blocked.service(peer)`.
+
+The body gets `wait.signal`, which is aborted at the bound with the failure as its reason. The body ends its own side of
+the wait on it (aborts its `fetch`, destroys its socket); the peer is never ended. A body's own result passes through
+unchanged; a body that rejects before the bound rejects the wait, because a throw is a bug and not a wait failure. After
+the bound, the body's abort is its expected end, and any other rejection stays unhandled rather than vanishing behind
+the answer already given.
+
+`TimeoutError`, `SilentError` and `PeerLostError` extend `CodeError`, so `errorCodeOf` writes their code and their
+`message` is the line lmao-core's `Display` prints. All three are terminal: none is a `TransientError`, so the span
+retry loop never retries one. An Op returns the failure with `ctx.err(result.error)` and its span ends `span-err`.
+`Timers` (`now()` in monotonic milliseconds and `after(ms, fire)`) is the injected clock: production passes nothing and
+gets `performance.now()` with `setTimeout`, and a test moves its own clock and fires its own timers.
+
 ## Integration Points <a id="smoo/lmao!n/op-retry.integration-points"></a>
 
 This system integrates with:
@@ -609,5 +638,6 @@ This system integrates with:
 | `packages/lmao/src/lib/errors/retry-policy.ts`     | `RetryPolicy` + backoff helpers + `mergePolicy` (`.policy` fence)                              |
 | `packages/lmao/src/lib/errors/Blocked.ts`          | `Blocked` class (`.blocked` fence)                                                             |
 | `packages/lmao/src/lib/errors/RetriesExhausted.ts` | Terminal error when a `Blocked` retry budget is exhausted                                      |
+| `packages/lmao/src/lib/errors/Deadline.ts`         | `deadline`/`idle`, `TimeoutError`/`SilentError`/`PeerLostError` (`.deadlines` fence)           |
 | `packages/lmao/src/lib/spanContext.ts`             | `executeWithRetry0`–`8` / `getRetryableError` / `calculateDelay` / `sleep` / `writeRetryEntry` |
 | `packages/lmao/src/lib/schema/systemSchema.ts`     | `ENTRY_TYPE_SPAN_RETRY` constant                                                               |

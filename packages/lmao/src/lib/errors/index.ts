@@ -10,6 +10,7 @@
 export * from './Blocked.js';
 // Existing exports
 export * from './CodeError.js';
+export * from './Deadline.js';
 export * from './RetriesExhausted.js';
 
 // Phase 19 exports - TransientError uses RetryPolicy from retry-policy.ts
