@@ -95,6 +95,14 @@ fn named_path(parent: &Path, prefix: &str, pid: u32) -> PathBuf {
     parent.join(format!("{prefix}-p{pid:08x}{:07x}", nonce & 0x0fff_ffff))
 }
 
+/// The pid carried by a named scratch root of exactly `prefix`, admitted by the
+/// same grammar as the production sweep. A longer family, an unowned name and a
+/// non-positive or out-of-range pid are unknown, never ownership proof.
+pub fn named_owner_for(path: &Path, prefix: &str) -> Option<i32> {
+    let name = path.file_name()?.to_str()?;
+    (name.strip_prefix(prefix)?.len() == NAMED_SUFFIX).then(|| named_owner(path))?
+}
+
 fn named_owner(path: &Path) -> Option<i32> {
     let name = path.file_name()?.to_str()?;
     if !name.starts_with("cowshed-") && !name.starts_with("cs-") {
@@ -206,16 +214,105 @@ impl Report {
     }
 }
 
+/// One swept root and its open listing, if any.
 struct Root {
     path: PathBuf,
     entries: Option<ReadDir>,
 }
 
-/// A directory cursor survives passes, so retained/live entries cannot starve later dead ones.
-/// Only direct children are considered: RAM leases, their ledger, staging and archives are not ours.
+/// What a pass does next at its roots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Turn {
+    /// Open the root's listing, then answer [`Cursors::listed`].
+    List(usize),
+    /// Read the root's next entry, then answer [`Cursors::read`].
+    Read(usize),
+    /// The pass is over, having met this many entries.
+    End(usize),
+}
+
+/// Where the sweep is among its roots, kept between passes: the root it turns to next, round
+/// robin, and which roots have a listing open. A listing survives passes, so retained or live
+/// entries cannot starve later dead ones, and a listing that ended is opened afresh next pass.
+struct Cursors {
+    next: usize,
+    open: Vec<bool>,
+}
+
+/// One pass over the roots: the entries it may still meet, those it met, the roots it is done
+/// with, and a root whose listing just opened, to read at once.
+struct Pass {
+    budget: usize,
+    met: usize,
+    done: Vec<bool>,
+    opened: Option<usize>,
+}
+
+impl Cursors {
+    fn new(roots: usize) -> Self {
+        Self {
+            next: 0,
+            open: vec![false; roots],
+        }
+    }
+
+    /// A pass that meets at most `budget` entries, an unreadable one included.
+    fn pass(&self, budget: usize) -> Pass {
+        Pass {
+            budget,
+            met: 0,
+            done: vec![false; self.open.len()],
+            opened: None,
+        }
+    }
+
+    /// The pass's next turn.
+    fn turn(&mut self, pass: &mut Pass) -> Turn {
+        if let Some(index) = pass.opened.take() {
+            return Turn::Read(index);
+        }
+        while pass.met < pass.budget && pass.done.iter().any(|done| !done) {
+            let index = self.next;
+            self.next = (index + 1) % self.open.len();
+            if !pass.done[index] {
+                return if self.open[index] {
+                    Turn::Read(index)
+                } else {
+                    Turn::List(index)
+                };
+            }
+        }
+        Turn::End(pass.met)
+    }
+
+    /// Root `index`'s listing opened, or could not be opened and is passed over for the rest of
+    /// this pass.
+    fn listed(&mut self, pass: &mut Pass, index: usize, opened: bool) {
+        if opened {
+            self.open[index] = true;
+            pass.opened = Some(index);
+        } else {
+            pass.done[index] = true;
+        }
+    }
+
+    /// Root `index`'s listing gave an entry, readable or not, which counts against the pass's
+    /// bound; or it ended, and the next pass opens it afresh.
+    fn read(&mut self, pass: &mut Pass, index: usize, entry: bool) {
+        if entry {
+            pass.met += 1;
+        } else {
+            self.open[index] = false;
+            pass.done[index] = true;
+        }
+    }
+}
+
+/// The host's scratch sweep over its roots' direct children only: RAM leases, their ledger,
+/// staging and archives are not ours.
 pub struct Reaper {
     roots: Vec<Root>,
-    next: usize,
+    cursors: Cursors,
 }
 
 impl Reaper {
@@ -231,8 +328,8 @@ impl Reaper {
             }
         }
         Ok(Self {
+            cursors: Cursors::new(unique.len()),
             roots: unique,
-            next: 0,
         })
     }
 
@@ -242,47 +339,46 @@ impl Reaper {
     }
 
     pub fn sweep(&mut self, store: &Path, dry_run: bool) -> Report {
-        let mut report = Report::default();
-        let mut exhausted = vec![false; self.roots.len()];
-        while report.examined < PASS_ENTRIES && exhausted.iter().any(|done| !done) {
-            let index = self.next;
-            self.next = (index + 1) % self.roots.len();
-            if exhausted[index] {
-                continue;
+        let mut findings = Vec::new();
+        let mut pass = self.cursors.pass(PASS_ENTRIES);
+        let examined = loop {
+            match self.cursors.turn(&mut pass) {
+                Turn::List(index) => {
+                    let root = &mut self.roots[index];
+                    let opened = match fs::read_dir(&root.path) {
+                        Ok(entries) => {
+                            root.entries = Some(entries);
+                            true
+                        }
+                        Err(error) => {
+                            findings.push(kept(&root.path, format!("cannot enumerate: {error}")));
+                            false
+                        }
+                    };
+                    self.cursors.listed(&mut pass, index, opened);
+                }
+                Turn::Read(index) => {
+                    let root = &mut self.roots[index];
+                    let entry = match root.entries.as_mut().and_then(Iterator::next) {
+                        None => {
+                            root.entries = None;
+                            false
+                        }
+                        Some(Err(error)) => {
+                            findings.push(kept(&root.path, format!("cannot read entry: {error}")));
+                            true
+                        }
+                        Some(Ok(entry)) => {
+                            findings.extend(inspect(&entry.path(), store, dry_run));
+                            true
+                        }
+                    };
+                    self.cursors.read(&mut pass, index, entry);
+                }
+                Turn::End(examined) => break examined,
             }
-            let root = &mut self.roots[index];
-            if root.entries.is_none() {
-                match fs::read_dir(&root.path) {
-                    Ok(entries) => root.entries = Some(entries),
-                    Err(error) => {
-                        report
-                            .findings
-                            .push(kept(&root.path, format!("cannot enumerate: {error}")));
-                        exhausted[index] = true;
-                        continue;
-                    }
-                }
-            }
-            match root.entries.as_mut().and_then(Iterator::next) {
-                None => {
-                    root.entries = None;
-                    exhausted[index] = true;
-                }
-                Some(Err(error)) => {
-                    report.examined += 1;
-                    report
-                        .findings
-                        .push(kept(&root.path, format!("cannot read entry: {error}")));
-                }
-                Some(Ok(entry)) => {
-                    report.examined += 1;
-                    if let Some(finding) = inspect(&entry.path(), store, dry_run) {
-                        report.findings.push(finding);
-                    }
-                }
-            }
-        }
-        report
+        };
+        Report { examined, findings }
     }
 }
 
@@ -380,6 +476,13 @@ fn owners(path: &Path) -> io::Result<Vec<i32>> {
     }
     let mut text = String::new();
     file.take(MAX_OWNER_BYTES + 1).read_to_string(&mut text)?;
+    owner_record(&text)
+}
+
+/// The pids an owner record's `text` publishes: the magic line, one positive pid per line, at
+/// least one, then `end`, within [`MAX_OWNER_BYTES`]. Anything else, a record torn before its
+/// `end` included, is an unknown owner, never a dead one.
+fn owner_record(text: &str) -> io::Result<Vec<i32>> {
     let mut lines = text.lines();
     if text.len() > usize::try_from(MAX_OWNER_BYTES).expect("small constant")
         || !text.ends_with('\n')
@@ -391,68 +494,183 @@ fn owners(path: &Path) -> io::Result<Vec<i32>> {
             "unknown owner record format",
         ));
     }
-    let pids = lines
+    lines
         .map(|line| line.parse::<i32>().ok().filter(|pid| *pid > 0))
         .collect::<Option<Vec<_>>>()
         .filter(|pids| !pids.is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown owner pid"))?;
-    Ok(pids)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown owner pid"))
+}
+
+/// Why a sweep keeps an entry with a cowshed name rather than reclaim it.
+#[derive(Debug)]
+enum Keep {
+    /// Real-APFS fixture scratch, which its detach-aware sweep reclaims.
+    ApfsFixture,
+    Uninspected(io::Error),
+    NotPrivate,
+    UnknownOwner(io::Error),
+    LiveOwner(i32),
+    UninspectableOwner(i32, io::Error),
+}
+
+impl std::fmt::Display for Keep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApfsFixture => {
+                f.write_str("APFS fixture scratch belongs to the detach-aware test sweep")
+            }
+            Self::Uninspected(error) => write!(f, "cannot inspect: {error}"),
+            Self::NotPrivate => f.write_str("not a private directory of this user"),
+            Self::UnknownOwner(error) => write!(f, "unknown owner: {error}"),
+            Self::LiveOwner(pid) => write!(f, "owner pid {pid} is live (or cannot be inspected)"),
+            Self::UninspectableOwner(pid, error) => {
+                write!(f, "owner pid {pid} cannot be inspected: {error}")
+            }
+        }
+    }
+}
+
+/// What a sweep does with one temp entry.
+#[derive(Debug)]
+enum Verdict<M> {
+    /// Not cowshed's to judge: another tool's name, or an entry cowshed never named or owned.
+    Pass,
+    Keep(Keep),
+    /// Every recorded owner is dead: reclaim the private directory observed as `M`.
+    Reclaim(M),
+}
+
+/// What a sweep asks of one temp entry next, or its verdict. Each observation is asked only when
+/// the decision needs it: another tool's entry is never stat'ed, an owner record is read only in
+/// a private directory of this user, and liveness only of a complete record's owners. No name or
+/// age proves death: only every recorded owner observed dead reclaims, and an entry with a cowshed
+/// name that cannot be judged is kept, named.
+#[derive(Debug)]
+enum Look<M> {
+    /// Stat the entry without following a link; [`Look::metadata`] takes the answer.
+    Metadata {
+        known: bool,
+    },
+    /// Read its owner record; [`Look::owners`] takes the answer.
+    Owners {
+        known: bool,
+        entry: M,
+    },
+    /// Ask each owner's liveness; [`Look::liveness`] takes the answers in the record's order.
+    Liveness {
+        entry: M,
+        owners: Vec<i32>,
+    },
+    Verdict(Verdict<M>),
+}
+
+impl<M> Look<M> {
+    /// What the entry's name alone decides.
+    fn name(name: &str) -> Self {
+        if foreign(name) {
+            Self::Verdict(Verdict::Pass)
+        } else if name.starts_with("cowshed-itest-") {
+            Self::Verdict(Verdict::Keep(Keep::ApfsFixture))
+        } else {
+            Self::Metadata {
+                known: name.starts_with("cowshed-") || name.starts_with("cs-"),
+            }
+        }
+    }
+
+    /// The entry, stat'ed without following a link, as a private directory of this user (`Some`,
+    /// kept for its reclamation) or as anything else.
+    fn metadata(known: bool, private: io::Result<Option<M>>) -> Self {
+        let unjudged = |keep| {
+            Self::Verdict(if known {
+                Verdict::Keep(keep)
+            } else {
+                Verdict::Pass
+            })
+        };
+        match private {
+            Ok(Some(entry)) => Self::Owners { known, entry },
+            Ok(None) => unjudged(Keep::NotPrivate),
+            Err(error) => unjudged(Keep::Uninspected(error)),
+        }
+    }
+
+    /// The entry's owner record as [`owner_record`] read it.
+    fn owners(known: bool, entry: M, owners: io::Result<Vec<i32>>) -> Self {
+        match owners {
+            Ok(owners) => Self::Liveness { entry, owners },
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !known => {
+                Self::Verdict(Verdict::Pass)
+            }
+            Err(error) => Self::Verdict(Verdict::Keep(Keep::UnknownOwner(error))),
+        }
+    }
+
+    /// Each recorded owner's observed liveness, in the record's order: the first not observed dead
+    /// keeps the entry, naming it. No observed owner is no proof that every owner is dead: an empty
+    /// set is an unknown owner, never a reclaim.
+    fn liveness(entry: M, observed: Vec<(i32, io::Result<bool>)>) -> Self {
+        if observed.is_empty() {
+            return Self::Verdict(Verdict::Keep(Keep::UnknownOwner(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the owner record names no owner",
+            ))));
+        }
+        for (pid, running) in observed {
+            match running {
+                Ok(false) => {}
+                Ok(true) => return Self::Verdict(Verdict::Keep(Keep::LiveOwner(pid))),
+                Err(error) => {
+                    return Self::Verdict(Verdict::Keep(Keep::UninspectableOwner(pid, error)));
+                }
+            }
+        }
+        Self::Verdict(Verdict::Reclaim(entry))
+    }
+}
+
+/// Whether `metadata`, read without following a link, is a directory this user owns that no other
+/// user can write: the only entry a sweep judges, so it never crosses an ownership boundary or
+/// inspects a mutable public directory.
+fn private_directory(metadata: &fs::Metadata) -> bool {
+    // SAFETY: geteuid has no preconditions.
+    metadata.is_dir()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o022 == 0
 }
 
 fn inspect(path: &Path, store: &Path, dry_run: bool) -> Option<Finding> {
     let name = path.file_name()?.to_string_lossy();
-    if foreign(&name) {
-        return None;
-    }
-    if name.starts_with("cowshed-itest-") {
-        return Some(kept(
-            path,
-            "APFS fixture scratch belongs to the detach-aware test sweep",
-        ));
-    }
-    let known_name = name.starts_with("cowshed-") || name.starts_with("cs-");
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) => return known_name.then(|| kept(path, format!("cannot inspect: {error}"))),
-    };
-    // Never follow a link, cross an ownership boundary, or inspect a mutable public directory.
-    // SAFETY: geteuid has no preconditions.
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-    {
-        return known_name.then(|| kept(path, "not a private directory of this user"));
-    }
-    let pids = match owners(path) {
-        Ok(pids) => pids,
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !known_name => return None,
-        Err(error) => return Some(kept(path, format!("unknown owner: {error}"))),
-    };
-    for pid in pids {
-        match crate::process::running(pid) {
-            Ok(false) => {}
-            Ok(true) => {
-                return Some(kept(
-                    path,
-                    format!("owner pid {pid} is live (or cannot be inspected)"),
-                ));
+    let mut look = Look::name(&name);
+    let verdict = loop {
+        look = match look {
+            Look::Metadata { known } => Look::metadata(
+                known,
+                fs::symlink_metadata(path)
+                    .map(|metadata| private_directory(&metadata).then_some(metadata)),
+            ),
+            Look::Owners { known, entry } => Look::owners(known, entry, owners(path)),
+            Look::Liveness { entry, owners } => {
+                let observed = owners
+                    .into_iter()
+                    .map(|pid| (pid, crate::process::running(pid)))
+                    .collect();
+                Look::liveness(entry, observed)
             }
-            Err(error) => {
-                return Some(kept(
-                    path,
-                    format!("owner pid {pid} cannot be inspected: {error}"),
-                ));
-            }
-        }
+            Look::Verdict(verdict) => break verdict,
+        };
+    };
+    match verdict {
+        Verdict::Pass => None,
+        Verdict::Keep(keep) => Some(kept(path, keep.to_string())),
+        Verdict::Reclaim(metadata) => Some(match reclaim(path, store, dry_run, &metadata) {
+            Ok(disposition) => Finding {
+                path: path.to_owned(),
+                disposition,
+            },
+            Err(error) => kept(path, format!("reclamation failed: {error}")),
+        }),
     }
-    let result = reclaim(path, store, dry_run, &metadata);
-    Some(match result {
-        Ok(disposition) => Finding {
-            path: path.to_owned(),
-            disposition,
-        },
-        Err(error) => kept(path, format!("reclamation failed: {error}")),
-    })
 }
 
 /// Only this tiny, closed grammar is disposable. Anything else may be the only run evidence.
@@ -482,6 +700,26 @@ fn socket_files(path: &Path) -> io::Result<Option<Vec<PathBuf>>> {
     Ok(Some(files))
 }
 
+/// What reclaiming a dead owner's directory does: socket scratch, the closed grammar
+/// [`socket_files`] admits as `F`, is deleted; anything else may be the only run evidence and is
+/// archived whole. A dry run says which and changes nothing.
+#[derive(Debug, Eq, PartialEq)]
+enum Plan<F> {
+    Delete(F),
+    Archive,
+    WouldDelete,
+    WouldArchive,
+}
+
+fn plan<F>(sockets: Option<F>, dry_run: bool) -> Plan<F> {
+    match (sockets, dry_run) {
+        (Some(_), true) => Plan::WouldDelete,
+        (None, true) => Plan::WouldArchive,
+        (Some(files), false) => Plan::Delete(files),
+        (None, false) => Plan::Archive,
+    }
+}
+
 fn reclaim(
     path: &Path,
     store: &Path,
@@ -508,10 +746,13 @@ fn reclaim(
     if !now.is_dir() || (now.dev(), now.ino()) != (original.dev(), original.ino()) {
         return Err(io::Error::other("scratch directory identity changed"));
     }
+    let sockets = match plan(sockets, dry_run) {
+        Plan::WouldDelete => return Ok(Disposition::WouldDelete),
+        Plan::WouldArchive => return Ok(Disposition::WouldArchive),
+        Plan::Delete(files) => Some(files),
+        Plan::Archive => None,
+    };
     if let Some(files) = sockets {
-        if dry_run {
-            return Ok(Disposition::WouldDelete);
-        }
         // No recursive removal: a concurrent unexpected writer leaves its output in place.
         for file in files
             .iter()
@@ -528,9 +769,6 @@ fn reclaim(
         fs::remove_dir(path)?;
         Ok(Disposition::Deleted)
     } else {
-        if dry_run {
-            return Ok(Disposition::WouldArchive);
-        }
         let trash = store.join(".trash/scratch");
         crate::fsio::AnchoredDirectory::create(&trash)?;
         let seconds = SystemTime::now()
