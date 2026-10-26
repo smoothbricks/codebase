@@ -500,6 +500,10 @@
     },
   },
   "trustedDependencies": [
+    "sharp",
+    "nx",
+    "esbuild",
+    "msgpackr-extract",
     "scriptc",
   ],
   "patchedDependencies": {

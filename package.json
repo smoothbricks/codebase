@@ -310,7 +310,11 @@
     "nx": "23.2.1"
   },
   "trustedDependencies": [
-    "scriptc"
+    "esbuild",
+    "msgpackr-extract",
+    "nx",
+    "scriptc",
+    "sharp"
   ],
   "smoo": {
     "github": {
