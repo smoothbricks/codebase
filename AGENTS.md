@@ -46,19 +46,21 @@ is the host-installed CLI of `packages/cowshed`.
    before a disruptive host operation. _Enforced by: review._
 2. **Landing.** When you land, retire a shed or claim something is landed → use the land command. "Landed" means the
    commit is an ancestor of `main` (`git merge-base --is-ancestor`). Retire every finished shed promptly, and only after
-   its work is landed or deliberately dropped: a shed left standing holds its image and build volumes. When `cowshed rm`
-   refuses, never add `--force`: a shed whose content `main` already holds (`cowshed ls --landing` counts its unlanded
-   commits) is reset to `main` if dirt blocks the removal, then removed with plain `cowshed rm`; a shed whose work was
-   deliberately dropped (superseded or obsolete, the reason clear from the brief, the git log or the session JSONL) is
-   removed with `cowshed rm --abandon` (clear dirt first: `--abandon` waives none), then `cowshed gc --abandoned`; a
-   shed with real unlanded work and a live owner, failed or partly landed, is landed, or left to that owner. `--abandon`
-   bundles the unlanded tips it destroys into `sessions/.trash/`, and `gc --abandoned` deletes all of the project's
-   bundles, each the only copy of its commits; `--force` destroys the uncommitted tree. Maintainer rulings of 2026-10-18
-   and 2026-10-26: cleaning up is as important as creating, if not more, and `--abandon` may be used for it. A fix that
-   removes a fleet bottleneck, such as a failure that blocks more than one shed, comes before local polish. Combine
-   related fixes into one train, with one lander per project: a second land of the same project loses the cache hits the
-   first just wrote. _Enforced by: the land turn and `tooling/land-host.sh`; `cowshed rm`'s containment refusal; review
-   for the flags._
+   its work is landed, preserved or deliberately dropped: a shed left standing holds its image and build volumes. When
+   `cowshed rm` refuses, never add `--force`: a shed whose content `main` already holds (`cowshed ls --landing` counts
+   its unlanded commits) is reset to `main` if dirt blocks the removal, then removed with plain `cowshed rm`; a shed
+   whose work is wanted but will not land now (a WIP kept for review) is pushed with `cowshed push <ws>`, which keeps
+   its head in main's repository, then removed with plain `cowshed rm`, never `--abandon` (clear dirt first, and push
+   again after a later commit); a shed whose work was deliberately dropped (superseded or obsolete, the reason clear
+   from the brief, the git log or the session JSONL) is removed with `cowshed rm --abandon` (clear dirt first:
+   `--abandon` waives none), then `cowshed gc --abandoned`; a shed with real unlanded work and a live owner, failed or
+   partly landed, is landed, or left to that owner. `--abandon` bundles the unlanded tips it destroys into
+   `sessions/.trash/`, and `gc --abandoned` deletes all of the project's bundles, each the only copy of its commits;
+   `--force` destroys the uncommitted tree. Maintainer rulings of 2026-10-18 and 2026-10-26: cleaning up is as important
+   as creating, if not more, and `--abandon` may be used for it. A fix that removes a fleet bottleneck, such as a
+   failure that blocks more than one shed, comes before local polish. Combine related fixes into one train, with one
+   lander per project: a second land of the same project loses the cache hits the first just wrote. _Enforced by: the
+   land turn and `tooling/land-host.sh`; `cowshed rm`'s containment refusal; review for the flags._
 3. **Edits.** When you are about to edit → work in your own shed (one owner per unit, no git worktrees, never a peer's
    path until released). Use absolute workspace paths in filesystem and edit tools, so a session's cwd cannot redirect
    an edit into `main`. Markdown that belongs to no code unit goes straight to `main` with the doc commit (see
