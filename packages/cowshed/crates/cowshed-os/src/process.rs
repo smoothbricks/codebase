@@ -572,9 +572,7 @@ impl ExitWatch {
     fn exited(&self, within: Option<Duration>) -> io::Result<bool> {
         use std::os::fd::AsRawFd as _;
 
-        let timeout = within.map_or(-1, |within| {
-            i32::try_from(within.as_millis()).unwrap_or(i32::MAX)
-        });
+        let timeout = within.map_or(-1, crate::deadline::poll_timeout);
         let mut exited = libc::pollfd {
             fd: self.0.as_raw_fd(),
             events: libc::POLLIN,

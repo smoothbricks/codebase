@@ -400,10 +400,7 @@ fn connect(socket: &Path, deadline: Option<CommandDeadline>) -> io::Result<UnixS
 /// peer shutdown even while a complete answer remains readable. The caller owns the deadline
 /// and recomputes it after a capped poll interval or signal; this wait never restarts it.
 fn poll_ready(stream: &UnixStream, events: libc::c_short, within: Duration) -> io::Result<bool> {
-    let millis = within
-        .as_millis()
-        .saturating_add(u128::from(!within.subsec_nanos().is_multiple_of(1_000_000)));
-    let timeout = i32::try_from(millis).unwrap_or(i32::MAX);
+    let timeout = cowshed_os::deadline::poll_timeout(within);
     let mut pending = libc::pollfd {
         fd: stream.as_raw_fd(),
         events,

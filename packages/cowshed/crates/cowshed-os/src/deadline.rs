@@ -1353,18 +1353,24 @@ fn unix_address(socket: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t
     Ok((address, length))
 }
 
+/// `within` as a `poll(2)` timeout: rounded up to the poll's millisecond, so a poll never wakes
+/// before the bound it was asked to reach. A truncated timeout wakes up to a millisecond early, and
+/// a caller that reads the poll's timeout as its bound's expiry then reports it before the bound.
+pub fn poll_timeout(within: Duration) -> libc::c_int {
+    let millis = within
+        .as_millis()
+        .saturating_add(u128::from(!within.subsec_nanos().is_multiple_of(1_000_000)));
+    libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX)
+}
+
 /// Wait up to `within` for `descriptor` to be ready for `events`, and answer whether it is. The
-/// timeout is rounded up to the poll's millisecond, so a poll never wakes before the bound it was
-/// asked to reach; the caller decides its bound again after every wake.
+/// caller decides its bound again after every wake.
 fn poll_ready(
     descriptor: BorrowedFd<'_>,
     events: libc::c_short,
     within: Duration,
 ) -> io::Result<bool> {
-    let millis = within
-        .as_millis()
-        .saturating_add(u128::from(!within.subsec_nanos().is_multiple_of(1_000_000)));
-    let timeout = libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX);
+    let timeout = poll_timeout(within);
     let mut pending = libc::pollfd {
         fd: descriptor.as_raw_fd(),
         events,
@@ -1386,6 +1392,22 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     const SHORT_REAP: Bound = Bound::new(LatencyClass::Reap, Duration::from_millis(50));
+
+    /// A bound becomes a poll timeout no shorter than itself: a part millisecond rounds up, a
+    /// whole one stays, and one past the poll's range waits as long as a poll can.
+    #[test]
+    fn a_poll_timeout_never_ends_before_its_bound() {
+        for (within, millis) in [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(1), 1),
+            (Duration::from_micros(49_187), 50),
+            (Duration::from_millis(50), 50),
+            (Duration::from_nanos(50_000_001), 51),
+            (Duration::from_secs(u64::MAX), libc::c_int::MAX),
+        ] {
+            assert_eq!(poll_timeout(within), millis, "{within:?}");
+        }
+    }
 
     /// Kill the process group `leader` leads, which this test started. A group with no member
     /// left is already ended: the assertions that follow say what ended it.

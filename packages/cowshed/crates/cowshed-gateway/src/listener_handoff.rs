@@ -80,7 +80,7 @@ fn readable(fd: std::os::fd::RawFd, bound: Option<Duration>) -> io::Result<()> {
         revents: 0,
     };
     let bound = match bound {
-        Some(bound) => i32::try_from(bound.as_millis()).map_err(io::Error::other)?,
+        Some(bound) => cowshed_os::deadline::poll_timeout(bound),
         None => -1,
     };
     loop {
