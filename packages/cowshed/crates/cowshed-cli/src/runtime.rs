@@ -1358,9 +1358,42 @@ pub fn merge_primary(primary: CowshedError, teardown: Option<CowshedError>) -> C
     }
 }
 
-struct ResolvedProjectRoot {
+pub(crate) struct ResolvedProjectRoot {
     root: PathBuf,
     resuming_re_adoption: bool,
+}
+
+/// When project discovery must establish store authority for a CLI command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectPreflightOrder {
+    BeforeControl,
+    AtDispatch,
+}
+
+fn project_preflight_order(command: &Command) -> ProjectPreflightOrder {
+    match command {
+        Command::Exec(args) if args.scope == cowshed_core::api::dto::ExecScope::HostGate => {
+            ProjectPreflightOrder::BeforeControl
+        }
+        _ => ProjectPreflightOrder::AtDispatch,
+    }
+}
+
+/// A root already discovered before control-plane work, or discovery still owed at dispatch.
+pub(crate) enum PreparedProject {
+    Deferred,
+    Resolved(ResolvedProjectRoot),
+}
+
+pub(crate) async fn prepare_project_before_control(cli: &Cli) -> Result<PreparedProject> {
+    match project_preflight_order(&cli.command) {
+        ProjectPreflightOrder::BeforeControl => {
+            cowshed_os::timing::spanned("cli", "resolve-root", resolve_project_context(cli))
+                .await
+                .map(PreparedProject::Resolved)
+        }
+        ProjectPreflightOrder::AtDispatch => Ok(PreparedProject::Deferred),
+    }
 }
 
 pub async fn resolve_project_root(cli: &Cli) -> Result<PathBuf> {
@@ -5549,8 +5582,9 @@ async fn finish_dispatch<S: CliService>(
     }
 }
 
-pub async fn run_bridge_command<R, W, E>(
+pub(crate) async fn run_bridge_command<R, W, E>(
     cli: Cli,
+    prepared: PreparedProject,
     stdin: R,
     output: &mut Output<W, E>,
 ) -> Result<DispatchExit>
@@ -5570,24 +5604,33 @@ where
             ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await?;
         return dispatch_and_shutdown(bridge, cli, stdin, output).await;
     }
-    let stdin = match crate::resident::answer(&cli, stdin, output).await? {
-        crate::resident::Answer::Answered(exit) => return Ok(exit),
-        crate::resident::Answer::Declined(stdin) => stdin,
+    let stdin = match &prepared {
+        // Host scope is a coordinator route. Its store-authorized root is already known,
+        // so neither a resident probe nor another discovery belongs before dispatch.
+        PreparedProject::Resolved(_) => stdin,
+        PreparedProject::Deferred => match crate::resident::answer(&cli, stdin, output).await? {
+            crate::resident::Answer::Answered(exit) => return Ok(exit),
+            crate::resident::Answer::Declined(stdin) => stdin,
+        },
     };
     let discovery = cli.command.project_discovery();
     if discovery == ProjectDiscovery::NotUsed {
         return dispatch_host_command(cli, output, false).await;
     }
-    let resolved =
-        match cowshed_os::timing::spanned("cli", "resolve-root", resolve_project_context(&cli))
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(_) if discovery == ProjectDiscovery::Optional => {
-                return dispatch_host_command(cli, output, true).await;
+    let resolved = match prepared {
+        PreparedProject::Resolved(resolved) => resolved,
+        PreparedProject::Deferred => {
+            match cowshed_os::timing::spanned("cli", "resolve-root", resolve_project_context(&cli))
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(_) if discovery == ProjectDiscovery::Optional => {
+                    return dispatch_host_command(cli, output, true).await;
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
-        };
+        }
+    };
     let root = &resolved.root;
     let mode = runtime_open_mode(&cli.command);
     let requested_repo_id = runtime_open_repo_id(&cli.command)?;
@@ -5769,6 +5812,53 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn host_scope_discovers_store_authority_before_control_operations() {
+        use ProjectPreflightOrder::{AtDispatch, BeforeControl};
+        let cases: &[(&[&str], ProjectPreflightOrder)] = &[
+            (
+                &["exec", "workspace", "--host", "--", "true"],
+                BeforeControl,
+            ),
+            (
+                &[
+                    "exec",
+                    "workspace",
+                    "--host",
+                    "--class",
+                    "gate",
+                    "--",
+                    "true",
+                ],
+                BeforeControl,
+            ),
+            (
+                &[
+                    "exec",
+                    "workspace",
+                    "--host",
+                    "--class",
+                    "resident",
+                    "--",
+                    "true",
+                ],
+                BeforeControl,
+            ),
+            (&["exec", "workspace", "--", "true"], AtDispatch),
+            (
+                &["exec", "workspace", "--class", "gate", "--", "true"],
+                AtDispatch,
+            ),
+            (&["rm", "workspace"], AtDispatch),
+            (&["doctor"], AtDispatch),
+            (&["ls", "--all"], AtDispatch),
+        ];
+        for (argv, expected) in cases {
+            let cli = crate::args::parse_args(argv.iter().copied()).expect("valid command");
+            assert_eq!(project_preflight_order(&cli.command), *expected, "{argv:?}");
         }
     }
 

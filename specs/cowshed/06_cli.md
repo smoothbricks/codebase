@@ -168,6 +168,12 @@ PATH"; no daemon answering is not a disagreement. `ls`, `doctor`, `build-state`,
 the disagreement, and `setup` and `gateway` end it. `gateway status` and `doctor` (`gateway-stale-binary`) name
 `cowshed setup` as the remedy for a daemon running other bytes than the CLI.
 
+For exec in host scope, project discovery first establishes the caller's store authority through the controller Git
+profile it already writes. A sandboxed CLI therefore gets the store's sandbox-denied refusal (exit 6, naming that path)
+before an install-slot wait, a manager build check or a resident connection can replace it with a control-plane failure.
+The discovered root is carried into coordinator dispatch and is not discovered twice. The build check still precedes
+opening the project or replaying lifecycle work; other commands keep their existing preflight order.
+
 The stranded-user journey this contract exists for: after a reboot with locked or unmounted volumes, `cowshed doctor`
 explains the exact divergence (volume present but locked, or at macOS's default `/Volumes/<name>` instead of its
 canonical path, stubs listed by name, service status) and `cowshed setup` fixes it in one step.

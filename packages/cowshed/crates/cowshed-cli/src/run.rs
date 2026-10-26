@@ -425,6 +425,10 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
         return Ok(finish(outcome, &mut output, json, &waits));
     }
+    let prepared = match runtime::prepare_project_before_control(&parsed).await {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(finish(Err(error), &mut output, json, &waits)),
+    };
     // A land step that starts while an install holds the slot waits for that install, and then
     // holds nothing (`install_basis::wait_for_install`): no install ever waits on a land step.
     // Waited for before the build check, so the step judges the daemon the install left.
@@ -465,7 +469,8 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             match runtime_dispatch(&parsed.command) {
                 RuntimeDispatch::Host => runtime::run_host_command(parsed, &mut output).await,
                 RuntimeDispatch::Project => {
-                    runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output).await
+                    runtime::run_bridge_command(parsed, prepared, tokio::io::stdin(), &mut output)
+                        .await
                 }
             }
             .map(|exit| exit.code)
