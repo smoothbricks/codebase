@@ -1204,7 +1204,7 @@ describe('observing the RAM temp volume', () => {
     };
     mkdirSync(paths.mountpoint);
     const marker = join(paths.mountpoint, '.smoo-ram');
-    execFileSync('/usr/bin/mkfifo', [marker]);
+    execFileSync('mkfifo', [marker]);
     const asked: number[] = [];
     const commands: HostCommands = {
       async run(file, args): Promise<CommandOutput> {

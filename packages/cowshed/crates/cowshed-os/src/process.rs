@@ -1677,7 +1677,7 @@ mod tests {
     fn a_childs_run_state_follows_its_life() {
         use crate::fork_lock::Spawn as _;
 
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("600")
             .spawn_locked()
             .expect("spawn sleep");

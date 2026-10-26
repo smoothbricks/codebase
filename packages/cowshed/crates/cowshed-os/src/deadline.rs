@@ -1402,7 +1402,7 @@ mod tests {
 
     #[test]
     fn a_child_that_never_exits_is_not_waited_for_past_its_bound() {
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("600")
             .spawn_locked()
             .expect("spawn sleep");
@@ -1451,7 +1451,7 @@ mod tests {
     fn an_exited_childs_output_held_by_its_own_child_expires_naming_the_stream() {
         use std::os::unix::process::CommandExt as _;
         let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "/bin/sleep 600 & printf started"])
+            .args(["-c", "sleep 600 & printf started"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .process_group(0)
@@ -1500,7 +1500,7 @@ mod tests {
         use std::os::unix::process::CommandExt as _;
         let failure = output_within(
             "probe command",
-            std::process::Command::new("/bin/sleep")
+            std::process::Command::new("sleep")
                 .arg("600")
                 .process_group(0),
             &start("run probe", SHORT_REAP),

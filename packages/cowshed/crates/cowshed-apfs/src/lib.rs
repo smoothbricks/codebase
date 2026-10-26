@@ -8396,8 +8396,7 @@ mod tests {
     /// used to park its runner until that process ended.
     #[test]
     fn a_disk_child_whose_own_child_holds_its_output_fails_naming_the_held_pipe() {
-        let request =
-            CommandRequest::new("/bin/sh", ["-c", "/bin/sleep 600 & printf started; exit 0"]);
+        let request = CommandRequest::new("/bin/sh", ["-c", "sleep 600 & printf started; exit 0"]);
         let policy = DeadlinePolicy {
             deadline: DISK_CHILD_DEADLINE,
             past_deadline: PastDeadline::Kill,
