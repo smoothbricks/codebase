@@ -274,14 +274,14 @@ fn render_command_map() -> String {
         + 2;
     let mut map = String::from("commands:\n");
     for (spec, grammar) in COMMANDS.iter().zip(&grammars) {
-        pad(&mut map, 2);
-        map.push_str(grammar);
         let written = 2 + grammar.len();
         let summary_column = column + 2;
         if written + 2 > summary_column {
-            map.push('\n');
+            wrap(&mut map, grammar, 2, 0);
             wrap(&mut map, spec.summary, summary_column, 0);
         } else {
+            pad(&mut map, 2);
+            map.push_str(grammar);
             pad(&mut map, summary_column - written);
             wrap(&mut map, spec.summary, summary_column, summary_column);
         }
