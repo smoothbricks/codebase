@@ -13,7 +13,7 @@ use crate::metadata::WorkspaceName;
 
 /// How long a probe takes before its `done` line prints. On a loaded host every ordinary probe
 /// answered in under a second, while the ones a slow doctor's time went to — the gateway's
-/// answer, the store's metadata walk, main's abandoned refs — took 2 s and more; below this a
+/// answer, the store's metadata walk — took 2 s and more; below this a
 /// `done` line would say only that a probe was fast, hundreds of times per project.
 pub const SLOW_PROBE: Duration = Duration::from_secs(2);
 

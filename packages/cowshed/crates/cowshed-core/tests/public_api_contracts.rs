@@ -563,7 +563,6 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
             reason: GcReason::ExpiredCheckpoint,
         }],
         deferred: Vec::new(),
-        abandoned_refs: AbandonedRefSweep::default(),
     };
     assert_eq!(
         serde_json::to_value(gc).expect("gc JSON"),
@@ -580,8 +579,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
                 "bytes":4096,
                 "reason":"expiredCheckpoint"
             }],
-            "deferred": [],
-            "abandonedRefs": {"retired": [], "kept": []}
+            "deferred": []
         })
     );
     assert_eq!(serde_json::to_value(EmptyResult {}).unwrap(), json!({}));
@@ -983,13 +981,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
                 target_head: Some(GitOid::new("1".repeat(40)).unwrap()),
                 unlanded_commits: 3,
                 branches: Vec::new(),
-                preserved: AbandonedPreservation::Preserved {
-                    refs: vec![PreservedRef {
-                        name: "HEAD".into(),
-                        tip: GitOid::new("4".repeat(40)).unwrap(),
-                        reference: format!("refs/cowshed/raven/abandoned/{}/HEAD", "4".repeat(40)),
-                    }],
-                },
+                preserved: AbandonedPreservation::BundleOnly,
                 bundle: PathBuf::from("/store/acme/widget/sessions/.trash/raven-tip.bundle"),
             }),
         })
@@ -999,11 +991,6 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             "targetBranch":"main",
             "targetHead":"1111111111111111111111111111111111111111",
             "unlandedCommits":3,
-            "preserved":{ "kind": "preserved", "refs": [{
-                "name":"HEAD",
-                "tip":"4444444444444444444444444444444444444444",
-                "reference":"refs/cowshed/raven/abandoned/4444444444444444444444444444444444444444/HEAD"
-            }] },
             "bundle":"/store/acme/widget/sessions/.trash/raven-tip.bundle"
         }})
     );
@@ -1019,7 +1006,6 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         serde_json::to_value(GcOptions {
             dry_run: true,
             abandoned: false,
-            supersede: None,
         })
         .unwrap(),
         json!({"dryRun":true,"abandoned":false})
@@ -1029,39 +1015,8 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         GcOptions {
             dry_run: false,
             abandoned: true,
-            supersede: None,
         }
     );
-    assert_eq!(
-        serde_json::from_value::<GcOptions>(json!({
-            "supersede": {
-                "workspace": "raven",
-                "head": "1111111111111111111111111111111111111111",
-                "reason": "replaced by the gate rewrite"
-            }
-        }))
-        .unwrap()
-        .supersede
-        .map(|supersede| supersede.reason),
-        Some(SupersededReason::new("replaced by the gate rewrite").unwrap())
-    );
-    for blank in ["", "  \t", "two\nlines"] {
-        assert!(
-            SupersededReason::new(blank).is_err(),
-            "{blank:?} is no reason"
-        );
-        assert!(
-            serde_json::from_value::<GcOptions>(json!({
-                "supersede": {
-                    "workspace": "raven",
-                    "head": "1111111111111111111111111111111111111111",
-                    "reason": blank
-                }
-            }))
-            .is_err(),
-            "the wire refuses {blank:?} as a reason too"
-        );
-    }
 
     assert_eq!(
         serde_json::from_value::<AttachOptions>(json!({})).unwrap(),
@@ -1214,6 +1169,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         previous_target_head: Some(oid('a')),
         target_was_checked_out: true,
         retired: true,
+        folded: Vec::new(),
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Frozen,
             adoption: cowshed_core::api::dto::Adoption::Skipped {

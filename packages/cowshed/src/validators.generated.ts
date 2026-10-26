@@ -9,39 +9,6 @@ export const assertAbandonedPreservationList = typia.createAssertEquals<readonly
 export const parseAbandonedPreservationList = (json: string): readonly Api.AbandonedPreservation[] =>
   assertAbandonedPreservationList(JSON.parse(json));
 
-export const assertAbandonedRefRetirement = typia.createAssertEquals<Api.AbandonedRefRetirement>();
-export const parseAbandonedRefRetirement = (json: string): Api.AbandonedRefRetirement =>
-  assertAbandonedRefRetirement(JSON.parse(json));
-export const assertAbandonedRefRetirementList = typia.createAssertEquals<readonly Api.AbandonedRefRetirement[]>();
-export const parseAbandonedRefRetirementList = (json: string): readonly Api.AbandonedRefRetirement[] =>
-  assertAbandonedRefRetirementList(JSON.parse(json));
-
-export const assertAbandonedRefSupersession = typia.createAssertEquals<Api.AbandonedRefSupersession>();
-export const parseAbandonedRefSupersession = (json: string): Api.AbandonedRefSupersession =>
-  assertAbandonedRefSupersession(JSON.parse(json));
-export const assertAbandonedRefSupersessionList = typia.createAssertEquals<readonly Api.AbandonedRefSupersession[]>();
-export const parseAbandonedRefSupersessionList = (json: string): readonly Api.AbandonedRefSupersession[] =>
-  assertAbandonedRefSupersessionList(JSON.parse(json));
-
-export const assertAbandonedRefSweep = typia.createAssertEquals<Api.AbandonedRefSweep>();
-export const parseAbandonedRefSweep = (json: string): Api.AbandonedRefSweep =>
-  assertAbandonedRefSweep(JSON.parse(json));
-export const assertAbandonedRefSweepList = typia.createAssertEquals<readonly Api.AbandonedRefSweep[]>();
-export const parseAbandonedRefSweepList = (json: string): readonly Api.AbandonedRefSweep[] =>
-  assertAbandonedRefSweepList(JSON.parse(json));
-
-export const assertAbandonedRefs = typia.createAssertEquals<Api.AbandonedRefs>();
-export const parseAbandonedRefs = (json: string): Api.AbandonedRefs => assertAbandonedRefs(JSON.parse(json));
-export const assertAbandonedRefsList = typia.createAssertEquals<readonly Api.AbandonedRefs[]>();
-export const parseAbandonedRefsList = (json: string): readonly Api.AbandonedRefs[] =>
-  assertAbandonedRefsList(JSON.parse(json));
-
-export const assertAbandonedTip = typia.createAssertEquals<Api.AbandonedTip>();
-export const parseAbandonedTip = (json: string): Api.AbandonedTip => assertAbandonedTip(JSON.parse(json));
-export const assertAbandonedTipList = typia.createAssertEquals<readonly Api.AbandonedTip[]>();
-export const parseAbandonedTipList = (json: string): readonly Api.AbandonedTip[] =>
-  assertAbandonedTipList(JSON.parse(json));
-
 export const assertAbandonedWork = typia.createAssertEquals<Api.AbandonedWork>();
 export const parseAbandonedWork = (json: string): Api.AbandonedWork => assertAbandonedWork(JSON.parse(json));
 export const assertAbandonedWorkList = typia.createAssertEquals<readonly Api.AbandonedWork[]>();
@@ -564,6 +531,23 @@ export const parseFindingSeverity = (json: string): Api.FindingSeverity => asser
 export const assertFindingSeverityList = typia.createAssertEquals<readonly Api.FindingSeverity[]>();
 export const parseFindingSeverityList = (json: string): readonly Api.FindingSeverity[] =>
   assertFindingSeverityList(JSON.parse(json));
+
+export const assertFoldKept = typia.createAssertEquals<Api.FoldKept>();
+export const parseFoldKept = (json: string): Api.FoldKept => assertFoldKept(JSON.parse(json));
+export const assertFoldKeptList = typia.createAssertEquals<readonly Api.FoldKept[]>();
+export const parseFoldKeptList = (json: string): readonly Api.FoldKept[] => assertFoldKeptList(JSON.parse(json));
+
+export const assertFoldOutcome = typia.createAssertEquals<Api.FoldOutcome>();
+export const parseFoldOutcome = (json: string): Api.FoldOutcome => assertFoldOutcome(JSON.parse(json));
+export const assertFoldOutcomeList = typia.createAssertEquals<readonly Api.FoldOutcome[]>();
+export const parseFoldOutcomeList = (json: string): readonly Api.FoldOutcome[] =>
+  assertFoldOutcomeList(JSON.parse(json));
+
+export const assertFoldedWorkspace = typia.createAssertEquals<Api.FoldedWorkspace>();
+export const parseFoldedWorkspace = (json: string): Api.FoldedWorkspace => assertFoldedWorkspace(JSON.parse(json));
+export const assertFoldedWorkspaceList = typia.createAssertEquals<readonly Api.FoldedWorkspace[]>();
+export const parseFoldedWorkspaceList = (json: string): readonly Api.FoldedWorkspace[] =>
+  assertFoldedWorkspaceList(JSON.parse(json));
 
 export const assertForkCommitment = typia.createAssertEquals<Api.ForkCommitment>();
 export const parseForkCommitment = (json: string): Api.ForkCommitment => assertForkCommitment(JSON.parse(json));
@@ -1542,13 +1526,6 @@ export const assertRetireDescendantsRequestList = typia.createAssertEquals<reado
 export const parseRetireDescendantsRequestList = (json: string): readonly Api.RetireDescendantsRequest[] =>
   assertRetireDescendantsRequestList(JSON.parse(json));
 
-export const assertRetiredAbandonedRefs = typia.createAssertEquals<Api.RetiredAbandonedRefs>();
-export const parseRetiredAbandonedRefs = (json: string): Api.RetiredAbandonedRefs =>
-  assertRetiredAbandonedRefs(JSON.parse(json));
-export const assertRetiredAbandonedRefsList = typia.createAssertEquals<readonly Api.RetiredAbandonedRefs[]>();
-export const parseRetiredAbandonedRefsList = (json: string): readonly Api.RetiredAbandonedRefs[] =>
-  assertRetiredAbandonedRefsList(JSON.parse(json));
-
 export const assertRetry = typia.createAssertEquals<Api.Retry>();
 export const parseRetry = (json: string): Api.Retry => assertRetry(JSON.parse(json));
 export const assertRetryList = typia.createAssertEquals<readonly Api.Retry[]>();
@@ -1763,12 +1740,6 @@ export const parseStreamLines = (json: string): Api.StreamLines => assertStreamL
 export const assertStreamLinesList = typia.createAssertEquals<readonly Api.StreamLines[]>();
 export const parseStreamLinesList = (json: string): readonly Api.StreamLines[] =>
   assertStreamLinesList(JSON.parse(json));
-
-export const assertSupersededReason = typia.createAssertEquals<Api.SupersededReason>();
-export const parseSupersededReason = (json: string): Api.SupersededReason => assertSupersededReason(JSON.parse(json));
-export const assertSupersededReasonList = typia.createAssertEquals<readonly Api.SupersededReason[]>();
-export const parseSupersededReasonList = (json: string): readonly Api.SupersededReason[] =>
-  assertSupersededReasonList(JSON.parse(json));
 
 export const assertSupervisorRecovery = typia.createAssertEquals<Api.SupervisorRecovery>();
 export const parseSupervisorRecovery = (json: string): Api.SupervisorRecovery =>

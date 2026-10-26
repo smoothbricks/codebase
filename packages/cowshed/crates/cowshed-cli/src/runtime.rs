@@ -16,17 +16,17 @@ pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::operations::{ListLanding, ReAdoption};
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
-    AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName,
-    CheckpointInfo, CheckpointOptions, CheckpointResult, CommandArg, Coordinator, DefragmentResult,
-    DoctorReport, EmptyResult, ExecRequest, ExpectedRefHead, Finding, FindingSeverity, ForkOptions,
-    GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream,
-    LandOptions, LandReport, LandTurnName, LandingCommits, MountResult, OutputPublication,
-    ProjectGrantDelta, ProjectGrants, PublicationPolicy, PushOptions, PushReport,
-    RebaseBuildVolume, RebaseOptions, RebaseReport, RefLockPath, RekeyResult, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
-    UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName, CheckpointInfo,
+    CheckpointOptions, CheckpointResult, CommandArg, Coordinator, DefragmentResult, DoctorReport,
+    EmptyResult, ExecRequest, ExpectedRefHead, Finding, FindingSeverity, FoldKept, FoldOutcome,
+    FoldedWorkspace, ForkOptions, GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta,
+    GrantSet, JobInfo, JobStream, LandOptions, LandReport, LandTurnName, LandingCommits,
+    MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants, PublicationPolicy,
+    PushOptions, PushReport, RebaseBuildVolume, RebaseOptions, RebaseReport, RefLockPath,
+    RekeyResult, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
+    ReseedResult, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
+    StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo,
+    WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -1616,7 +1616,7 @@ where
         Command::List(args) => {
             if args.all {
                 let projects = list_projects(listing_landing(args)).await?;
-                emit_project_listing(output, json, args, projects).await?;
+                emit_project_listing(output, json, args, projects)?;
                 if !json {
                     emit_kept_abandon_bundles(output, &service.kept_abandon_bundles().await?)?;
                 }
@@ -1880,14 +1880,6 @@ where
                         ))
                         .map_err(output_error)?;
                 }
-                for kept in abandoned.preserved.refs() {
-                    output
-                        .guidance(&format!(
-                            "kept {} at {} in main as {}",
-                            kept.name, kept.tip, kept.reference
-                        ))
-                        .map_err(output_error)?;
-                }
                 output
                     .guidance(&format!("bundled to {}", abandoned.bundle.display()))
                     .map_err(output_error)?;
@@ -2067,7 +2059,6 @@ where
                 .gc(GcOptions {
                     dry_run: args.dry_run,
                     abandoned: args.abandoned,
-                    supersede: args.supersede,
                 })
                 .await?;
             for deferred in &report.deferred {
@@ -2079,7 +2070,6 @@ where
                     ))
                     .map_err(output_error)?;
             }
-            emit_abandoned_refs(output, &report)?;
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             } else {
@@ -2212,7 +2202,6 @@ where
                     .gc(GcOptions {
                         dry_run: false,
                         abandoned: false,
-                        supersede: None,
                     })
                     .await?;
                 output
@@ -3653,7 +3642,7 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::OrphanMountpoint => "orphaned mountpoint",
         GcReason::ExpiredCheckpoint => "expired checkpoint",
         GcReason::AbandonedBundle => {
-            "abandon bundle of commits main does not contain; main keeps its tips as refs"
+            "abandon bundle of commits main does not contain; the bundle is the only copy"
         }
         GcReason::UnlinkedBuildVolume => "build volume no checkout links",
         GcReason::SupersededSeed => "seed superseded by its target's latest, or its target retired",
@@ -3720,7 +3709,30 @@ fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport)
             }
             Ok(())
         })
-        .map_err(output_error)
+        .map_err(output_error)?;
+    for folded in &report.folded {
+        output.guidance(&fold_line(folded)).map_err(output_error)?;
+    }
+    Ok(())
+}
+
+/// What a land did with one session it folded (02_workspaces.md, `land` step 5, "Folds"): retired,
+/// or kept, and why.
+fn fold_line(folded: &FoldedWorkspace) -> String {
+    let outcome = match &folded.outcome {
+        FoldOutcome::Retired => "retired".to_owned(),
+        FoldOutcome::Kept {
+            reason: FoldKept::Dirty { files },
+        } => format!("kept (dirty: {files} files)"),
+        FoldOutcome::Kept {
+            reason: FoldKept::Refused { message, .. },
+        } => format!("kept (refused: {message})"),
+    };
+    format!(
+        "folded {} {}: {outcome}",
+        folded.workspace.as_str(),
+        folded.head
+    )
 }
 
 /// What the rebase carried into the workspace's build volume, as one stderr line
@@ -3823,11 +3835,6 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
     lines
 }
 
-/// The branch `ls` measures against, which is the same constant `land` merges into and `rm` gates
-/// on. Sharing it is the point: a listing that reported against a different branch than the gate
-/// enforces would be a listing that lies about what `rm` will do.
-const LANDING_TARGET_BRANCH: &str = cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH;
-
 /// The landing measurement is opt-in, and `--landed` opts in by implication: a filter on a fact
 /// nobody measured would filter on nothing.
 const fn landing_requested(args: crate::args::ListArgs) -> bool {
@@ -3856,7 +3863,7 @@ fn sort_project_listing(projects: &mut [ProjectWorkspaces]) {
     }
 }
 
-async fn emit_project_listing<W: Write, E: Write>(
+fn emit_project_listing<W: Write, E: Write>(
     output: &mut Output<W, E>,
     json: bool,
     args: crate::args::ListArgs,
@@ -3888,103 +3895,6 @@ async fn emit_project_listing<W: Write, E: Write>(
         )?;
     } else {
         emit_project_workspaces_table(output, &projects)?;
-    }
-    emit_kept_abandoned_refs(output, &projects).await
-}
-
-/// Name, after `ls --all`'s table, every abandonment each attached project's main keeps refs
-/// for because main does not hold it (01_storage.md); gc retires the rest, so they go unnamed.
-async fn emit_kept_abandoned_refs<W: Write, E: Write>(
-    output: &mut Output<W, E>,
-    projects: &[ProjectWorkspaces],
-) -> Result<()> {
-    // `ls` reads the host's projects, so its Git runs for the host store.
-    let roots = cowshed_core::storage::bootstrap::CanonicalRoots::global();
-    let host_store = roots.shared_store();
-    for project in projects {
-        let Some(main) = project.workspaces.iter().find(|workspace| {
-            workspace.role == WorkspaceRole::Main && workspace.state != WorkspaceState::Detached
-        }) else {
-            continue;
-        };
-        let measured = match cowshed_core::landing::resolve_target(
-            host_store,
-            &main.mount,
-            LANDING_TARGET_BRANCH,
-        )
-        .await
-        {
-            Ok(target) => cowshed_core::landing::abandoned_refs(host_store, &target).await,
-            Err(reason) => Err(reason),
-        };
-        match measured {
-            Ok((abandonments, unreadable)) => {
-                for kept in abandonments.iter().filter(|refs| !refs.landed()) {
-                    output
-                        .guidance(&format!(
-                            "{}: {kept}; {}",
-                            project.repo_id,
-                            kept.supersede_hint()
-                        ))
-                        .map_err(output_error)?;
-                }
-                for reference in unreadable {
-                    output
-                        .warning(&format!(
-                            "{}: {reference} is under an abandoned/ namespace no abandonment writes",
-                            project.repo_id
-                        ))
-                        .map_err(output_error)?;
-                }
-            }
-            Err(reason) => output
-                .warning(&format!(
-                    "{}: the abandoned refs its main keeps cannot be measured: {reason}",
-                    project.repo_id
-                ))
-                .map_err(output_error)?,
-        }
-    }
-    Ok(())
-}
-/// What a gc did with the abandonments main's repository keeps: each it retired (or, in a dry
-/// run, would) and why, and each it keeps with what main lacks of it and how to let it go.
-fn emit_abandoned_refs<W: Write, E: Write>(
-    output: &mut Output<W, E>,
-    report: &GcReport,
-) -> Result<()> {
-    let sweep = &report.abandoned_refs;
-    let verb = if report.dry_run {
-        "would retire"
-    } else {
-        "retired"
-    };
-    for retired in &sweep.retired {
-        output
-            .guidance(&format!(
-                "{verb} refs/cowshed/{}/abandoned/{}/: {}",
-                retired.workspace, retired.head, retired.by
-            ))
-            .map_err(output_error)?;
-    }
-    for kept in &sweep.kept {
-        output
-            .guidance(&format!("kept {kept}; {}", kept.supersede_hint()))
-            .map_err(output_error)?;
-    }
-    for unreadable in &sweep.unreadable {
-        output
-            .warning(&format!(
-                "{unreadable} is under an abandoned/ namespace no abandonment writes; gc leaves it"
-            ))
-            .map_err(output_error)?;
-    }
-    if let Some(reason) = &sweep.unmeasured {
-        output
-            .warning(&format!(
-                "gc kept every abandoned ref: main's repository cannot be measured: {reason}"
-            ))
-            .map_err(output_error)?;
     }
     Ok(())
 }
@@ -4124,22 +4034,9 @@ fn landing_row(repo_id: Option<&RepoId>, workspace: &WorkspaceInfo) -> Vec<Strin
     row
 }
 /// What a reported abandonment does not record, as one warning: a journal record an earlier build
-/// wrote, before abandonments recorded what keeps their tips or measurements named files, is
-/// history read back, not a clean result (02_workspaces.md, `rm` step 1). `None` when the record
-/// is complete.
+/// wrote, before branch measurements named the files they touched, is history read back, not a
+/// clean result (02_workspaces.md, `rm` step 1). `None` when the record is complete.
 fn predating_warning(workspace: &str, abandoned: &AbandonedWork) -> Option<String> {
-    let mut gaps = Vec::new();
-    if matches!(
-        abandoned.preserved,
-        AbandonedPreservation::PredatesPreservation
-    ) {
-        gaps.push(format!(
-            "no record of what keeps head {}: the record predates kept refs, and {} is the copy it \
-             names",
-            abandoned.head,
-            abandoned.bundle.display()
-        ));
-    }
     let unnamed: Vec<&str> = abandoned
         .branches
         .iter()
@@ -4154,16 +4051,11 @@ fn predating_warning(workspace: &str, abandoned: &AbandonedWork) -> Option<Strin
         })
         .map(|branch| branch.branch.as_str())
         .collect();
-    if !unnamed.is_empty() {
-        gaps.push(format!(
-            "branch measurements predate named files and count commits by patch identity: {}",
-            unnamed.join(", ")
-        ));
-    }
-    (!gaps.is_empty()).then(|| {
+    (!unnamed.is_empty()).then(|| {
         format!(
-            "{workspace}'s abandonment was recorded by an earlier cowshed: {}",
-            gaps.join("; ")
+            "{workspace}'s abandonment was recorded by an earlier cowshed: branch measurements \
+             predate named files and count commits by patch identity: {}",
+            unnamed.join(", ")
         )
     })
 }
@@ -5731,7 +5623,7 @@ where
         }
         Command::List(args) => {
             let projects = list_projects(listing_landing(args)).await?;
-            emit_project_listing(output, cli.global.json, args, projects).await?;
+            emit_project_listing(output, cli.global.json, args, projects)?;
             if !cli.global.json {
                 emit_kept_abandon_bundles(output, &kept_abandon_bundles().await?)?;
             }
@@ -7190,9 +7082,7 @@ mod tests {
             emit_workspace_listing(&mut workspaces, json, args, None, Vec::new())
                 .expect("workspace listing");
             let mut projects = Output::new(Vec::new(), Vec::new(), false);
-            emit_project_listing(&mut projects, json, args, Vec::new())
-                .await
-                .expect("project listing");
+            emit_project_listing(&mut projects, json, args, Vec::new()).expect("project listing");
             (
                 String::from_utf8(workspaces.into_inner().0).expect("utf-8"),
                 String::from_utf8(projects.into_inner().0).expect("utf-8"),
@@ -8205,11 +8095,11 @@ mod tests {
     }
 
     /// A removal report read back from an earlier build's journal record is history, not a clean
-    /// result: the warning names the head no ref keeps, the bundle the record names and each
-    /// branch whose measurement named no files. Read from the records the core's journal test
-    /// captured, so the warning answers the shapes an earlier build actually wrote.
+    /// result: the warning names each branch whose measurement named no files. Read from the
+    /// records the core's journal test captured, so the warning answers the shapes an earlier
+    /// build actually wrote.
     #[test]
-    fn an_abandonment_an_earlier_build_recorded_warns_once_and_a_complete_one_does_not() {
+    fn an_abandonment_an_earlier_build_recorded_warns_only_for_unnamed_measurements() {
         let journal: serde_json::Value = serde_json::from_str(include_str!(
             "../../cowshed-core/tests/fixtures/lifecycle-intents-before-preserved-refs.json"
         ))
@@ -8222,14 +8112,10 @@ mod tests {
         };
 
         let plain = abandoned("accounting-process-fence-proof");
-        let warning = predating_warning("accounting-process-fence-proof", &plain)
-            .expect("a predating record warns");
-        assert!(warning.contains(plain.head.as_str()), "{warning}");
-        assert!(
-            warning.contains(&plain.bundle.display().to_string()),
-            "{warning}"
+        assert_eq!(
+            predating_warning("accounting-process-fence-proof", &plain),
+            None
         );
-        assert!(!warning.contains("branch measurements"), "{warning}");
 
         let branched = abandoned("nx-cache-advisor");
         let warning =
@@ -8239,18 +8125,6 @@ mod tests {
                 && warning.contains(&branched.branches[0].branch),
             "{warning}"
         );
-
-        let kept = AbandonedWork {
-            preserved: AbandonedPreservation::Preserved { refs: Vec::new() },
-            branches: Vec::new(),
-            ..plain.clone()
-        };
-        assert_eq!(predating_warning("raven", &kept), None);
-        let main = AbandonedWork {
-            preserved: AbandonedPreservation::NothingToPreserve,
-            ..plain
-        };
-        assert_eq!(predating_warning("main", &main), None);
     }
 }
 

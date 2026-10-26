@@ -115,11 +115,12 @@ taskpolicy -b direnv exec . cargo nextest run --cargo-profile release -p cowshed
   --run-ignored all --no-capture --build-jobs 2
 ```
 
-## Abandoned-ref sweep: patch identity before content
+## Content proof: patch identity before content
 
-Production enters through `gc` and `doctor` → `sweep_abandoned_refs` → `landing::abandoned_refs` → `counted` →
-`GitRepository::divergence` and `GitRepository::content_not_held`, once per kept tip on every run (01_storage.md,
-"Retention"). Every git call is its own sandboxed controller process, so the phase costs what its process count costs.
+Production enters through `rm`'s gate, `ls --landing` and a land's folds → `counted` → `GitRepository::divergence` and,
+for a branch whose merge into the target changes something, `GitRepository::content_not_held` (02_workspaces.md, `rm`
+step 1). It was measured through gc's abandoned-ref sweep, since removed, which ran it once per kept tip. Every git call
+is its own sandboxed controller process, so the phase costs what its process count costs.
 
 `content_not_held` used to merge every file both sides changed, with one `git merge-file` and one `git cat-file blob`
 each, before it asked patch identity, and then ran one `rev-list -- <file>` per unheld file. On the SB store (33 kept

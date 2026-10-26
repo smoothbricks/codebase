@@ -84,8 +84,6 @@
     "macos::an_active_fork_with_a_gone_source_completes_its_create_intent": 8203,
     "macos::clean_landed_source_is_physically_deleted_before_reply_and_crash_replay": 9584,
     "macos::cold_named_open_reads_selected_authority_and_preserves_full_diagnostics": 9704,
-    "macos::gc_retires_the_abandoned_refs_main_holds_and_supersedes_the_rest_only_with_a_reason": 24036,
-    "macos::gc_waits_for_mains_image_lock_holding_no_intent_lease": 12840,
     "macos::ignored_only_copy_source_content_keeps_recovery_trash": 4835,
     "macos::removes_source_after_discarding_unpublished_prepared_rename": 4617,
     "macos::rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed": 12755,

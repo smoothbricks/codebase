@@ -30,11 +30,8 @@
 //! * Git facts are written where they are known, never reconstructed. A workspace retirement
 //!   (`retire-workspace`) is the one line that is not an unlink: the rename into trash is the
 //!   moment the workspace's repository stops being reachable, and the line records its head and
-//!   every local branch with what keeps each tip — a ref in main's repository, or the target that
-//!   held it. Keeping an abandon bundle's tips before `gc --abandoned` deletes it
-//!   (`keep-abandoned-tips`) records the refs the same way, under the bundle's path. Retiring an
-//!   abandonment's refs from main's repository (`retire-abandoned-ref`) records each tip with what
-//!   let it go: the target branch that holds it, or the reason its owner gave for superseding it. A
+//!   every local branch with what keeps each tip — the abandon bundle, or the target that held it.
+//!   A
 //!   workspace retirement also says who retired it (`retiredBy`): the process that ran the removal,
 //!   its argv, and its parent's, the shell or agent that asked; and, when the removal was forced,
 //!   which of the guards it overrode, each named — so a removal nobody expected can be traced to
@@ -97,10 +94,6 @@ pub enum DeletionOp {
     ReleaseBuildVolume,
     #[serde(rename = "retire-workspace")]
     RetireWorkspace,
-    #[serde(rename = "keep-abandoned-tips")]
-    KeepAbandonedTips,
-    #[serde(rename = "retire-abandoned-ref")]
-    RetireAbandonedRef,
     /// A recovery image's file moved out of the store by `gc --recover`, to `recoveredTo`.
     #[serde(rename = "recover-retired-image")]
     RecoverRetiredImage,
@@ -120,8 +113,6 @@ impl std::fmt::Display for DeletionOp {
             Self::ReleaseImagelessBuildVolume => "release-imageless-build-volume",
             Self::ReleaseBuildVolume => "release-build-volume",
             Self::RetireWorkspace => "retire-workspace",
-            Self::KeepAbandonedTips => "keep-abandoned-tips",
-            Self::RetireAbandonedRef => "retire-abandoned-ref",
             Self::RecoverRetiredImage => "recover-retired-image",
         };
         formatter.write_str(tag)
@@ -183,21 +174,21 @@ pub struct KeptTip {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "by", rename_all = "camelCase")]
 pub enum KeptBy {
-    /// `reference` in the repository at `repository` holds the tip itself: main's, or for a
-    /// purge the retained checkout the restore puts back, where the ref outlives the project.
+    /// `reference` in the repository at `repository` holds the tip itself. Written by an earlier
+    /// build, whose abandonments also kept their tips as refs in main's repository; read so that
+    /// build's lines still parse.
     Ref {
         repository: PathBuf,
         reference: String,
     },
+    /// The abandon bundle at `path` holds the tip, its only copy (02_workspaces.md, `rm` step 1).
+    Bundle { path: PathBuf },
     /// The removal gate proved `branch` (at `head`), or a ref `cowshed push` wrote, holds the
     /// tip's changes (02_workspaces.md, `rm` step 1).
     Target {
         branch: String,
         head: crate::api::dto::GitOid,
     },
-    /// Nothing keeps the tip: its owner retired it as superseded, giving `reason`
-    /// (`gc --supersede`, 01_storage.md).
-    Superseded { reason: String },
 }
 
 /// Who retired a workspace, and what its `--force` overrode (02_workspaces.md, `rm` step 1).
@@ -370,30 +361,6 @@ pub fn recovery_retention(project_root: &Path, image: &Path) -> crate::api::dto:
             crate::api::dto::RecoveryRetention::Unrecorded,
             |(at, because)| crate::api::dto::RecoveryRetention::Recorded { at, because },
         )
-}
-
-/// Best-effort append of a line carrying Git facts, under the same never-fail rule as
-/// [`log_deletion`].
-pub fn log_git_tips(
-    project_root: &Path,
-    op: DeletionOp,
-    workspace: &str,
-    artifact: &Path,
-    git: GitTips,
-) {
-    let entry = DeletionLogEntry {
-        at: rfc3339_utc(SystemTime::now()),
-        op,
-        workspace: workspace.to_owned(),
-        image: None,
-        artifact: artifact.to_path_buf(),
-        kind: DeletionKind::Other,
-        git: Some(git),
-        retired_by: None,
-        retained: None,
-        recovered_to: None,
-    };
-    append_entry(project_root, &entry);
 }
 
 /// The controller's own record that it removed an image's CA companion.

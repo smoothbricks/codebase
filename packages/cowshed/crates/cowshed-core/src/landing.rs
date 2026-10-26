@@ -16,11 +16,16 @@
 //!   state of a real project — the target detached, its mount no longer a repository, no such
 //!   branch — so each one becomes [`LandingCommits::Indeterminate`] carrying the reason.
 //!   Consumers treat that exactly as they treat unlanded work.
-//! * **Landed is content or patch identity.** Work reaches a target by cherry-pick, squash,
-//!   rewrite, or a pick whose conflict a lander resolved: a commit is landed when the target's
-//!   content carries its change or the target holds a patch-equivalent of it. The measurement
-//!   names each file whose change the target still lacks, and why, and a refusal names the
-//!   commits held by neither proof, so it says what would be lost.
+//! * **Landed is the merge changing nothing, content or patch identity.** Work reaches a target
+//!   by cherry-pick, squash, rewrite, or a pick whose conflict a lander resolved. A head whose
+//!   merge into the target reproduces the target's tree is landed, in one `git merge-tree` that
+//!   also follows renames; otherwise a commit is landed when the target's content carries its
+//!   change or the target holds a patch-equivalent of it. The measurement names each file whose
+//!   change the target still lacks, and why, and a refusal names the commits held by neither
+//!   proof, so it says what would be lost.
+//! * **A land's folds are measured here, decided by [`fold_step`].** The sessions a land carried
+//!   into its target are retired by the land (02_workspaces.md, `land` step 5, "Folds"); which
+//!   ones, and why one is kept, is a pure function of what [`fold_facts`] read.
 //!
 //! One reading here is not a verdict: [`published_holding`] measures the target repository's own
 //! tracking ref for its published branch, the same way, so a refusal can say when that ref already
@@ -31,9 +36,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::{
-    AbandonedRefs, AbandonedTip, BranchLanding, BranchLandings, GitOid, LandingCommits,
-    PreservedRef, UnlandedPaths, WorkspaceInfo, WorkspaceLanding, WorkspaceState,
+    BranchLanding, BranchLandings, FoldKept, GitOid, LandingCommits, UnlandedPaths, WorkspaceInfo,
+    WorkspaceLanding, WorkspaceState,
 };
+use crate::error::ErrorCode;
 use crate::git::{CommitSubject, ContentNotHeld, GitRepository};
 use crate::metadata::{WorkspaceName, WorkspaceRole};
 
@@ -363,96 +369,136 @@ pub async fn measure_commits(
     }
 }
 
-/// Every abandonment the target's repository keeps under `refs/cowshed/<ws>/abandoned/<head>/`,
-/// each tip measured against the target exactly as `rm` measures a branch: ancestry, then content
-/// or patch identity (02_workspaces.md, `rm` step 1). One definition of landed serves both, so a tip that reached
-/// main by cherry-pick or a conflict-resolved pick reads as landed here as it would at `rm`.
-///
-/// The second list names every ref under an `abandoned/` namespace that is not one an abandonment
-/// writes (`HEAD` or `heads/<branch>` under a workspace name and a full head): those are never
-/// measured, so nothing may retire them. A listing that fails is the error, never an empty answer.
-pub async fn abandoned_refs(
-    store_root: &std::sync::Arc<Path>,
-    target: &LandingTarget,
-) -> std::result::Result<(Vec<AbandonedRefs>, Vec<String>), String> {
-    let refs = GitRepository::from_root(store_root, &target.repository)
-        .ref_tips(&["refs/cowshed"])
-        .await
-        .map_err(|error| error.message)?;
-    let mut namespaces: std::collections::BTreeMap<(WorkspaceName, GitOid), Vec<PreservedRef>> =
-        std::collections::BTreeMap::new();
-    let mut unreadable = Vec::new();
-    for (name, tip) in refs {
-        // A name rendered lossily is not the ref's name, and deleting by it would fail every sweep.
-        let name = match String::from_utf8(name) {
-            Ok(name) => name,
-            Err(error) => {
-                let name = String::from_utf8_lossy(error.as_bytes()).into_owned();
-                if name.starts_with("refs/cowshed/") && name.split('/').nth(3) == Some("abandoned")
-                {
-                    unreadable.push(name);
-                }
-                continue;
-            }
-        };
-        let Some(rest) = name.strip_prefix("refs/cowshed/") else {
-            continue;
-        };
-        let mut parts = rest.splitn(4, '/');
-        let (Some(workspace), Some("abandoned")) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let parsed = (|| {
-            let workspace = WorkspaceName::new(workspace).ok()?;
-            let head = GitOid::new(parts.next()?.to_owned()).ok()?;
-            let kept_as = parts.next()?;
-            let short = if kept_as == "HEAD" {
-                String::from("HEAD")
-            } else {
-                kept_as
-                    .strip_prefix("heads/")
-                    .filter(|branch| !branch.is_empty())?
-                    .to_owned()
-            };
-            let tip = GitOid::new(String::from_utf8_lossy(&tip).into_owned()).ok()?;
-            Some((workspace, head, short, tip))
-        })();
-        match parsed {
-            Some((workspace, head, short, tip)) => {
-                namespaces
-                    .entry((workspace, head))
-                    .or_default()
-                    .push(PreservedRef {
-                        name: short,
-                        tip,
-                        reference: name,
-                    });
-            }
-            None => unreadable.push(name),
-        }
-    }
-    let mut measured = Vec::with_capacity(namespaces.len());
-    for ((workspace, head), kept) in namespaces {
-        let mut tips = Vec::with_capacity(kept.len());
-        for kept in kept {
-            let commits = counted(store_root, target, &target.repository, kept.tip.as_str())
-                .await
-                .unwrap_or_else(|reason| LandingCommits::Indeterminate { reason });
-            tips.push(AbandonedTip { kept, commits });
-        }
-        measured.push(AbandonedRefs {
-            workspace,
-            head,
-            tips,
-        });
-    }
-    Ok((measured, unreadable))
+/// What merging a workspace head into its target produced (`git merge-tree --write-tree`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergedTree {
+    /// A clean merge, and the tree it wrote.
+    Clean(GitOid),
+    /// The merge conflicts: the head changes something the target changed differently.
+    Conflicted,
 }
 
-/// The two questions of `rm` step 1 (02_workspaces.md), in order: a head the target contains is
-/// landed, cheaply and exactly; otherwise each of its commits must be held by the target's
-/// content or by a patch-equivalent commit of the target ([`GitRepository::content_not_held`]),
-/// however the work got there.
+/// Whether merging a head into the target changes nothing: the merge is clean and its tree is the
+/// target's own. Then every change the head carries is already in the target, however it got
+/// there (02_workspaces.md, `rm` step 1).
+pub fn merge_changes_nothing(target_tree: &GitOid, merged: &MergedTree) -> bool {
+    matches!(merged, MergedTree::Clean(tree) if tree == target_tree)
+}
+
+/// What a land's fold step read of one session (02_workspaces.md, `land` step 5, "Folds").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FoldFacts {
+    /// Whether its own change since its merge base with the target's previous head touches a path
+    /// the landed range changes, or why that could not be read.
+    pub touched: std::result::Result<bool, String>,
+    /// Whether the landed tip holds its head and every other local branch, as `rm` measures them.
+    pub landed: bool,
+    /// Its uncommitted changes (tracked, and untracked no ignore rule covers), or why they could
+    /// not be counted.
+    pub dirty_files: std::result::Result<u64, String>,
+}
+
+/// What the land does with a session it folded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FoldStep {
+    /// Retire it as `rm` would, sparing a live owner.
+    Retire,
+    /// Keep it, saying why.
+    Keep(FoldKept),
+}
+
+/// The fold decision: `None` for a session that is not the land's (its own change touches nothing
+/// the land changed, or the target does not hold it), which the land neither touches nor names.
+/// A folded session is retired when its tree is clean and kept, with why, when it is dirty or its
+/// tree cannot be read. A session whose own change cannot be read is kept and named rather than
+/// passed over in silence.
+pub fn fold_step(facts: &FoldFacts) -> Option<FoldStep> {
+    match &facts.touched {
+        Err(reason) => {
+            return Some(FoldStep::Keep(FoldKept::Refused {
+                code: ErrorCode::EnvironmentMissing,
+                message: format!("its own change could not be read: {reason}"),
+            }));
+        }
+        Ok(false) => return None,
+        Ok(true) if !facts.landed => return None,
+        Ok(true) => {}
+    }
+    Some(match &facts.dirty_files {
+        Ok(0) => FoldStep::Retire,
+        Ok(files) => FoldStep::Keep(FoldKept::Dirty { files: *files }),
+        Err(reason) => FoldStep::Keep(FoldKept::Refused {
+            code: ErrorCode::EnvironmentMissing,
+            message: format!("its working tree could not be read: {reason}"),
+        }),
+    })
+}
+
+/// The paths `previous..landed` changes in the target's repository: what a land carried, against
+/// which every session's own change is matched (02_workspaces.md, `land` step 5, "Folds").
+pub async fn landed_paths(
+    store_root: &std::sync::Arc<Path>,
+    target: &LandingTarget,
+    previous: &GitOid,
+    landed: &GitOid,
+) -> std::result::Result<std::collections::BTreeSet<Vec<u8>>, String> {
+    GitRepository::from_root(store_root, &target.repository)
+        .changed_paths(&format!("{previous}..{landed}"))
+        .await
+        .map_err(|error| error.message)
+}
+
+/// Read what [`fold_step`] decides from for the session at `workspace_mount`: whether its own
+/// change since its merge base with `previous` touches `landed_paths`, and only then whether the
+/// target holds it, measured as `rm` measures it ([`measure`]), and how dirty its tree is.
+pub async fn fold_facts(
+    store_root: &std::sync::Arc<Path>,
+    target: &LandingTarget,
+    landed_paths: &std::collections::BTreeSet<Vec<u8>>,
+    previous: &GitOid,
+    workspace_mount: &Path,
+    push_repository: &Path,
+    workspace: &str,
+) -> FoldFacts {
+    let own = match GitRepository::from_root(store_root, workspace_mount)
+        .with_alternate_objects(&target.objects)
+    {
+        Ok(repository) => repository
+            .changed_paths(&format!("{previous}...HEAD"))
+            .await
+            .map_err(|error| error.message),
+        Err(error) => Err(error.message),
+    };
+    let touched = own.map(|own| !own.is_disjoint(landed_paths));
+    if touched != Ok(true) {
+        return FoldFacts {
+            touched,
+            landed: false,
+            dirty_files: Ok(0),
+        };
+    }
+    let landing = measure(
+        store_root,
+        &Ok(target.clone()),
+        workspace_mount,
+        push_repository,
+        workspace,
+        "HEAD",
+    )
+    .await;
+    FoldFacts {
+        touched,
+        landed: landing.fully_landed(),
+        dirty_files: landing
+            .dirty_files
+            .ok_or_else(|| String::from("git status could not be read")),
+    }
+}
+/// The three questions of `rm` step 1 (02_workspaces.md), in order: a head the target contains is
+/// landed, cheaply and exactly; otherwise a head whose merge into the target changes nothing is
+/// landed, in one process; otherwise each of its commits must be held by the target's content or
+/// by a patch-equivalent commit of the target ([`GitRepository::content_not_held`]), however the
+/// work got there.
 async fn counted(
     store_root: &std::sync::Arc<Path>,
     target: &LandingTarget,
@@ -469,7 +515,17 @@ async fn counted(
         .divergence(tip, head)
         .await
         .map_err(|error| error.message)?;
-    let unheld = if ahead == 0 {
+    let unheld = if ahead == 0
+        || merge_changes_nothing(
+            &workspace
+                .tree_of(tip)
+                .await
+                .map_err(|error| error.message)?,
+            &workspace
+                .merged_tree(tip, head)
+                .await
+                .map_err(|error| error.message)?,
+        ) {
         ContentNotHeld::default()
     } else {
         workspace
@@ -635,4 +691,66 @@ pub fn retain_fully_landed<T: AsRef<WorkspaceInfo>>(rows: &mut Vec<T>) -> Vec<Wi
         landing.fully_landed()
     });
     withheld
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FoldFacts, FoldStep, MergedTree, fold_step, merge_changes_nothing};
+    use crate::api::dto::{FoldKept, GitOid};
+    use crate::error::ErrorCode;
+
+    fn oid(byte: char) -> GitOid {
+        GitOid::new(byte.to_string().repeat(40)).expect("an object id")
+    }
+
+    #[test]
+    fn only_a_clean_merge_to_the_targets_own_tree_changes_nothing() {
+        let target = oid('a');
+        for (merged, changes_nothing) in [
+            (MergedTree::Clean(oid('a')), true),
+            (MergedTree::Clean(oid('b')), false),
+            (MergedTree::Conflicted, false),
+        ] {
+            assert_eq!(
+                merge_changes_nothing(&target, &merged),
+                changes_nothing,
+                "{merged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fold_is_a_touched_landed_session_retired_clean_and_kept_dirty_or_unread() {
+        let facts = |touched, landed, dirty_files| FoldFacts {
+            touched,
+            landed,
+            dirty_files,
+        };
+        for (facts, step) in [
+            (facts(Ok(false), true, Ok(0)), None),
+            (facts(Ok(true), false, Ok(0)), None),
+            (facts(Ok(false), false, Ok(3)), None),
+            (facts(Ok(true), true, Ok(0)), Some(FoldStep::Retire)),
+            (
+                facts(Ok(true), true, Ok(2)),
+                Some(FoldStep::Keep(FoldKept::Dirty { files: 2 })),
+            ),
+            (
+                facts(Ok(true), true, Err(String::from("unreadable"))),
+                Some(FoldStep::Keep(FoldKept::Refused {
+                    code: ErrorCode::EnvironmentMissing,
+                    message: String::from("its working tree could not be read: unreadable"),
+                })),
+            ),
+            (
+                facts(Err(String::from("unreadable")), false, Ok(0)),
+                Some(FoldStep::Keep(FoldKept::Refused {
+                    code: ErrorCode::EnvironmentMissing,
+                    message: String::from("its own change could not be read: unreadable"),
+                })),
+            ),
+        ] {
+            assert_eq!(fold_step(&facts), step, "{facts:?}");
+        }
+    }
 }

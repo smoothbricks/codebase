@@ -226,6 +226,152 @@ async fn a_named_rm_abandon_supersedes_its_targets_refused_unfinished_retire() {
     assert_eq!(fixture.listed(&rm).await, ["lane", "main"]);
     rm.shutdown().await.expect("stop the removing runtime");
 }
+/// A train folds units by cherry-pick, one through a conflict its lander resolved, then lands into
+/// its lane base. The land retires every session it folded — whose own change its range touched and
+/// whose content the landed tip holds — keeps a fold a host process holds or whose tree is dirty,
+/// naming why, and leaves a unit the train did not take: the target lacks its change, so a plain
+/// `rm` still refuses it (02_workspaces.md, `land` step 5 "Folds" and `rm` step 1).
+#[tokio::test]
+async fn a_land_retires_the_units_its_train_folded_and_keeps_live_dirty_and_unlanded_work() {
+    let fixture = Fixture::new("land-folds");
+    let runtime = fixture.adopt().await;
+    let lane = fixture
+        .mint(&runtime, "lane", ForkOptions::default())
+        .await
+        .expect("fork the lane base");
+    let lane_mount = PathBuf::from(lane["info"]["mount"].as_str().expect("lane mount"));
+    fs::write(lane_mount.join("story"), "a\nX\nc\n").expect("story");
+    git(&lane_mount, &["add", "story"]);
+    git(&lane_mount, &["commit", "-q", "-m", "story"]);
+    let unit = |name: &'static str, file: &'static str, contents: &'static str| {
+        let fixture = &fixture;
+        let runtime = &runtime;
+        async move {
+            let view = fixture
+                .fork(runtime, "lane", name)
+                .await
+                .expect("fork a unit");
+            let mount = PathBuf::from(view["info"]["mount"].as_str().expect("unit mount"));
+            fs::write(mount.join(file), contents).expect("unit work");
+            git(&mount, &["add", file]);
+            git(&mount, &["commit", "-q", "-m", &format!("{name}'s work")]);
+            mount
+        }
+    };
+    // Two units insert at the same line: the second pick conflicts and the lander keeps both.
+    let picked = unit("picked", "story", "a\nX\nW\nc\n").await;
+    let resolved = unit("resolved", "story", "a\nX\nY\nc\n").await;
+    let busy = unit("busy", "busy", "busy work\n").await;
+    let dirty = unit("dirty", "dirty", "dirty work\n").await;
+    let unlanded = unit("unlanded", "story", "a\nX\nc\nQ\n").await;
+    fs::write(dirty.join("dirty"), "dirty work, edited after\n").expect("dirty edit");
+
+    let train = fixture
+        .fork(&runtime, "lane", "train")
+        .await
+        .expect("fork the train");
+    let train = PathBuf::from(train["info"]["mount"].as_str().expect("train mount"));
+    for unit in [&picked, &resolved, &busy, &dirty] {
+        git(
+            &train,
+            &["fetch", "-q", unit.to_str().expect("unit path"), "HEAD"],
+        );
+        let pick = Command::new("git")
+            .args(["cherry-pick", "FETCH_HEAD"])
+            .current_dir(&train)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output_locked()
+            .expect("git cherry-pick");
+        if !pick.status.success() {
+            assert!(
+                unit == &resolved,
+                "only resolved's pick conflicts: {pick:?}"
+            );
+            fs::write(train.join("story"), "a\nX\nW\nY\nc\n").expect("resolution");
+            git(&train, &["add", "story"]);
+            git(
+                &train,
+                &["-c", "core.editor=true", "cherry-pick", "--continue"],
+            );
+        }
+    }
+    // A host shell sitting in a folded unit's checkout is a live owner.
+    let mut holder = Command::new("sleep")
+        .arg("600")
+        .current_dir(&busy)
+        .spawn_locked()
+        .expect("hold the busy unit's mount");
+
+    let landed = fixture
+        .land_into(&runtime, "train", &lane, true)
+        .await
+        .expect("land the train into its lane base");
+    holder.kill().expect("release the busy unit");
+    holder.wait().expect("reap the holder");
+
+    let outcome = |name: &str| {
+        landed["folded"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the land reports its folds: {landed}"))
+            .iter()
+            .find(|fold| fold["workspace"] == name)
+            .map(|fold| fold["outcome"].clone())
+    };
+    assert_eq!(
+        outcome("picked"),
+        Some(json!({ "kind": "retired" })),
+        "{landed}"
+    );
+    assert_eq!(
+        outcome("resolved"),
+        Some(json!({ "kind": "retired" })),
+        "{landed}"
+    );
+    let busy_kept = outcome("busy").expect("busy is folded");
+    assert_eq!(busy_kept["kind"], json!("kept"), "{landed}");
+    assert_eq!(busy_kept["reason"]["kind"], json!("refused"), "{landed}");
+    assert!(
+        busy_kept["reason"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(&holder.id().to_string())),
+        "the refusal names the holder: {landed}"
+    );
+    assert_eq!(
+        outcome("dirty"),
+        Some(json!({ "kind": "kept", "reason": { "kind": "dirty", "files": 1 } })),
+        "{landed}"
+    );
+    assert_eq!(
+        outcome("unlanded"),
+        None,
+        "the train did not fold it: {landed}"
+    );
+    assert_eq!(
+        fixture.listed(&runtime).await,
+        ["busy", "dirty", "lane", "main", "unlanded"]
+    );
+
+    let refusal = fixture
+        .call(
+            &runtime,
+            "coordinator.destroy",
+            json!({
+                "repoId": fixture.repo, "workspace": "unlanded",
+                "options": RemoveOptions { force: true, ..RemoveOptions::default() },
+            }),
+        )
+        .await
+        .expect_err("main lacks the unlanded unit's change");
+    assert_eq!(refusal.code, cowshed_core::ErrorCode::Conflict);
+    assert!(refusal.message.contains("story"), "{refusal:?}");
+    let _ = unlanded;
+    runtime.shutdown().await.expect("stop the landing runtime");
+}
 /// A gitignored path is disposable by the project's own declaration, so it never keeps a recovery
 /// image (02_workspaces.md, `rm` step 5): a tree whose only extra file is ignored retires with its
 /// image released. A hidden untracked file no rule ignores is still the only copy, and keeps its
@@ -2218,10 +2364,9 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
 }
 
 /// Losing a finished fork's source never authorizes losing its unlanded commits, and abandoning
-/// them keeps them: `--abandon` writes the head into main's repository under
-/// `refs/cowshed/<ws>/abandoned/<head>/` before the image retires, and the deletion log names the
-/// head and that ref. A bundle whose refs are gone — what an earlier build left — gets them back
-/// from `gc --abandoned` before the sweep deletes it, journaled the same way.
+/// them keeps them in the verified bundle in the project's trash, their only copy. The deletion
+/// log names the head and that bundle, and nothing is written into main's repository; `gc
+/// --abandoned` releases the bundle as it releases any, and writes no ref either.
 #[tokio::test]
 async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed() {
     let fixture = Fixture::new("rm-unlanded-fork");
@@ -2301,31 +2446,25 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
         "unlanded history remains in recovery"
     );
     rm.shutdown().await.expect("stop the abandoning runtime");
-    let reference = format!("refs/cowshed/finished/abandoned/{original_head}/HEAD");
-    let kept_head = json!({ "name": "HEAD", "tip": original_head, "reference": reference });
-    assert!(
-        abandoned["abandoned"]["preserved"]["refs"]
-            .as_array()
-            .is_some_and(|kept| kept.contains(&kept_head)),
-        "{abandoned}"
-    );
-    assert_eq!(
-        resolved(&fixture.checkout, &reference),
-        original_head,
-        "main's repository holds the abandoned commit"
-    );
-    let retired = deletion_log(&fixture, "retire-workspace", "finished");
-    assert_eq!(retired["git"]["head"], json!(original_head), "{retired}");
-    assert_kept_by_ref(&retired, &original_head, &fixture.checkout, &reference);
-
-    // An earlier build abandoned into the bundle alone: without the ref, the bundle in the trash
-    // is the only copy, and `gc --abandoned` keeps its tips before it deletes it.
-    git(&fixture.checkout, &["update-ref", "-d", &reference]);
     let bundle = PathBuf::from(
         abandoned["abandoned"]["bundle"]
             .as_str()
             .expect("bundle path"),
     );
+    assert!(
+        abandoned["abandoned"].get("preserved").is_none(),
+        "the bundle is the only copy: {abandoned}"
+    );
+    assert!(bundle.exists(), "{}", bundle.display());
+    assert_eq!(
+        abandoned_refs_in(&fixture.checkout),
+        Vec::<String>::new(),
+        "main's repository keeps no abandoned ref"
+    );
+    let retired = deletion_log(&fixture, "retire-workspace", "finished");
+    assert_eq!(retired["git"]["head"], json!(original_head), "{retired}");
+    assert_kept_by_bundle(&retired, &original_head, &bundle);
+
     let gc = fixture.gc().await;
     fixture
         .call(
@@ -2343,14 +2482,10 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
         "bundle authorization does not discard its image"
     );
     assert_eq!(
-        resolved(&fixture.checkout, &reference),
-        original_head,
-        "the sweep kept the bundle's tip in main's repository first"
+        abandoned_refs_in(&fixture.checkout),
+        Vec::<String>::new(),
+        "gc --abandoned writes no ref either"
     );
-    let kept = deletion_log(&fixture, "keep-abandoned-tips", "finished");
-    assert_eq!(kept["artifact"], json!(bundle), "{kept}");
-    assert_eq!(kept["git"]["head"], json!(original_head), "{kept}");
-    assert_kept_by_ref(&kept, &original_head, &fixture.checkout, &reference);
 
     // A bundle is not permission to delete the complete recovery image. Terminal store
     // removal refuses before main moves while that evidence remains.
@@ -2367,26 +2502,34 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
     assert_eq!(head(&recovery), original_head);
     purge.shutdown().await.expect("stop the purging runtime");
     assert_eq!(
-        resolved(&fixture.checkout, &reference),
-        original_head,
-        "the still-bound main checkout keeps the abandoned commit"
+        abandoned_refs_in(&fixture.checkout),
+        Vec::<String>::new(),
+        "a refused purge writes no ref into main's repository"
     );
 }
 
-/// `entry`'s Git tips name `HEAD` at `head`, kept by `reference` in the repository at
-/// `repository`.
-fn assert_kept_by_ref(entry: &Value, head: &str, repository: &Path, reference: &str) {
+/// Every ref under an `abandoned/` namespace of `refs/cowshed/` in the repository at `checkout`.
+fn abandoned_refs_in(checkout: &Path) -> Vec<String> {
+    String::from_utf8(git_bytes(
+        checkout,
+        &["for-each-ref", "--format=%(refname)", "refs/cowshed/"],
+    ))
+    .expect("ref names are UTF-8")
+    .lines()
+    .filter(|reference| reference.contains("/abandoned/"))
+    .map(str::to_owned)
+    .collect()
+}
+/// `entry`'s Git tips name `HEAD` at `head`, kept by the abandon bundle at `bundle`.
+fn assert_kept_by_bundle(entry: &Value, head: &str, bundle: &Path) {
     let tip = entry["git"]["tips"]
         .as_array()
         .and_then(|tips| tips.iter().find(|tip| tip["name"] == "HEAD"))
         .unwrap_or_else(|| panic!("no HEAD tip: {entry}"));
     assert_eq!(tip["tip"], json!(head), "{entry}");
-    assert_eq!(tip["kept"]["by"], json!("ref"), "{entry}");
-    assert_eq!(tip["kept"]["reference"], json!(reference), "{entry}");
-    let kept_in = PathBuf::from(tip["kept"]["repository"].as_str().expect("repository"));
     assert_eq!(
-        kept_in.canonicalize().expect("kept repository"),
-        repository.canonicalize().expect("main checkout"),
+        tip["kept"],
+        json!({ "by": "bundle", "path": bundle }),
         "{entry}"
     );
 }
@@ -2502,243 +2645,6 @@ fn deletion_log(fixture: &Fixture, op: &str, workspace: &str) -> Value {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|entry| entry["op"] == op && entry["workspace"] == workspace)
         .unwrap_or_else(|| panic!("no {op} line for {workspace} in {}:\n{text}", log.display()))
-}
-
-/// The commit `revision` names in `directory`.
-fn resolved(directory: &Path, revision: &str) -> String {
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", revision])
-        .current_dir(directory)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
-        .expect("git process");
-    assert!(
-        output.status.success(),
-        "git rev-parse {revision} in {}: {}",
-        directory.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("revision is UTF-8")
-        .trim()
-        .to_owned()
-}
-
-/// Main's repository keeps no ref for work it already has (01_storage.md, "Retention"). Every gc
-/// retires an abandonment main holds by content — here a pick whose conflict main resolved to the
-/// workspace's own text, which neither ancestry nor patch identity sees — and journals it; it keeps
-/// one main lacks, which doctor names with its count. Its owner lets that one go only by naming it
-/// with a one-line reason, which the deletion log records.
-#[tokio::test]
-async fn gc_retires_the_abandoned_refs_main_holds_and_supersedes_the_rest_only_with_a_reason() {
-    let fixture = Fixture::new("abandoned-refs");
-    let runtime = fixture.adopt().await;
-    let listed = fixture
-        .call(&runtime, "project.list", json!({ "repoId": fixture.repo }))
-        .await
-        .expect("list workspaces");
-    let main = PathBuf::from(
-        listed["workspaces"]
-            .as_array()
-            .and_then(|workspaces| {
-                workspaces
-                    .iter()
-                    .find(|workspace| workspace["info"]["role"] == "main")
-            })
-            .and_then(|workspace| workspace["info"]["mount"].as_str())
-            .unwrap_or_else(|| panic!("main's mount: {listed}")),
-    );
-    let mut heads = Vec::new();
-    for (workspace, file, text) in [
-        ("picked", "tracked", "picked\n"),
-        ("spike", "spike", "spike\n"),
-    ] {
-        let minted = fixture
-            .mint(&runtime, workspace, ForkOptions::default())
-            .await
-            .expect("mint workspace");
-        let mount = PathBuf::from(minted["info"]["mount"].as_str().expect("workspace mount"));
-        fs::write(mount.join(file), text).expect("workspace change");
-        git(&mount, &["add", file]);
-        git(&mount, &["commit", "-q", "-m", workspace]);
-        heads.push(head(&mount));
-    }
-    runtime.shutdown().await.expect("stop the creating runtime");
-    let (picked, spike) = (heads[0].clone(), heads[1].clone());
-    for workspace in ["picked", "spike"] {
-        let rm = fixture
-            .open_removing(workspace)
-            .await
-            .expect("open removal");
-        fixture
-            .call(
-                &rm,
-                "coordinator.destroy",
-                json!({
-                    "repoId": fixture.repo, "workspace": workspace,
-                    "options": RemoveOptions { abandon: true, force: true, ..RemoveOptions::default() },
-                }),
-            )
-            .await
-            .expect("--abandon keeps the unlanded tips in main");
-        rm.shutdown().await.expect("stop the abandoning runtime");
-    }
-    let picked_ref = format!("refs/cowshed/picked/abandoned/{picked}/HEAD");
-    let spike_ref = format!("refs/cowshed/spike/abandoned/{spike}/HEAD");
-    // Main changes the line itself, then takes the workspace's text resolving the conflict: the
-    // content lands under a commit whose diff no patch identity matches.
-    fs::write(main.join("tracked"), b"main\n").expect("main's own change");
-    git(&main, &["commit", "-q", "-am", "main's own change"]);
-    fs::write(main.join("tracked"), b"picked\n").expect("resolved pick");
-    git(
-        &main,
-        &["commit", "-q", "-am", "pick picked, conflict resolved"],
-    );
-    let main_head = head(&main);
-    let landed = json!({ "kind": "landed", "targetBranch": "main", "targetHead": main_head });
-
-    let gc = fixture.gc().await;
-    let sweep = async |options: Value| {
-        fixture
-            .call(
-                &gc,
-                "coordinator.gc",
-                json!({ "repoId": fixture.repo, "options": options }),
-            )
-            .await
-    };
-    let preview = sweep(json!({ "dryRun": true }))
-        .await
-        .expect("gc --dry-run");
-    assert_eq!(
-        preview["abandonedRefs"]["retired"][0]["workspace"], "picked",
-        "{preview}"
-    );
-    assert_eq!(
-        preview["abandonedRefs"]["retired"][0]["by"], landed,
-        "{preview}"
-    );
-    assert_eq!(
-        resolved(&main, &picked_ref),
-        picked,
-        "a dry run deletes nothing"
-    );
-
-    let swept = sweep(json!({})).await.expect("gc");
-    let report = &swept["abandonedRefs"];
-    assert_eq!(
-        report["retired"].as_array().map(Vec::len),
-        Some(1),
-        "{swept}"
-    );
-    assert_eq!(report["retired"][0]["by"], landed, "{swept}");
-    assert!(!has_ref(&main, &picked_ref), "gc retired {picked_ref}");
-    let retired = deletion_log(&fixture, "retire-abandoned-ref", "picked");
-    assert_eq!(retired["git"]["head"], json!(picked), "{retired}");
-    assert_eq!(
-        retired["git"]["tips"][0]["kept"],
-        json!({ "by": "target", "branch": "main", "head": main_head }),
-        "{retired}"
-    );
-    assert_eq!(report["kept"].as_array().map(Vec::len), Some(1), "{swept}");
-    assert_eq!(report["kept"][0]["workspace"], "spike", "{swept}");
-    assert_eq!(
-        report["kept"][0]["tips"][0]["commits"]["unlanded"], 1,
-        "{swept}"
-    );
-    assert_eq!(
-        resolved(&main, &spike_ref),
-        spike,
-        "gc keeps work main lacks"
-    );
-
-    let doctor = fixture
-        .call(&gc, "coordinator.doctor", json!({ "repoId": fixture.repo }))
-        .await
-        .expect("doctor");
-    let named = doctor["findings"]
-        .as_array()
-        .expect("findings")
-        .iter()
-        .filter(|finding| finding["code"] == "abandoned-refs")
-        .collect::<Vec<_>>();
-    assert_eq!(named.len(), 1, "{doctor}");
-    let message = named[0]["message"].as_str().expect("message");
-    assert!(
-        message.contains(&format!("refs/cowshed/spike/abandoned/{spike}/"))
-            && message.contains("carries 1 commit main does not hold"),
-        "{doctor}"
-    );
-    assert!(
-        named[0]["hint"]
-            .as_str()
-            .is_some_and(|hint| hint.contains(&format!("cowshed gc --supersede spike/{spike}"))),
-        "{doctor}"
-    );
-
-    for reason in ["", "  \t", "two\nlines"] {
-        let refusal = sweep(json!({
-            "supersede": { "workspace": "spike", "head": spike, "reason": reason }
-        }))
-        .await
-        .expect_err("a supersession needs a one-line reason");
-        assert!(refusal.message.contains("superseded reason"), "{refusal:?}");
-    }
-    let refusal = sweep(json!({
-        "supersede": { "workspace": "picked", "head": picked, "reason": "landed already" }
-    }))
-    .await
-    .expect_err("gc already retired picked's refs");
-    assert_eq!(
-        refusal.code,
-        cowshed_core::ErrorCode::Conflict,
-        "{refusal:?}"
-    );
-    assert!(
-        refusal.message.contains(&format!(
-            "keeps no refs under refs/cowshed/picked/abandoned/{picked}/"
-        )),
-        "{refusal:?}"
-    );
-    assert_eq!(
-        resolved(&main, &spike_ref),
-        spike,
-        "a refused supersession deletes nothing"
-    );
-
-    let reason = "the spike is replaced by the gate rewrite";
-    let superseded = sweep(json!({
-        "supersede": { "workspace": "spike", "head": spike, "reason": reason }
-    }))
-    .await
-    .expect("gc --supersede");
-    assert_eq!(
-        superseded["abandonedRefs"]["retired"][0]["by"],
-        json!({ "kind": "superseded", "reason": reason }),
-        "{superseded}"
-    );
-    assert!(!has_ref(&main, &spike_ref), "the owner retired {spike_ref}");
-    let retired = deletion_log(&fixture, "retire-abandoned-ref", "spike");
-    assert_eq!(
-        retired["git"]["tips"][0]["kept"],
-        json!({ "by": "superseded", "reason": reason }),
-        "{retired}"
-    );
-    gc.shutdown().await.expect("stop gc");
-}
-
-/// Whether `reference` names a commit in the repository at `directory`.
-fn has_ref(directory: &Path, reference: &str) -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", reference])
-        .current_dir(directory)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
-        .expect("git process")
-        .status
-        .success()
 }
 
 /// The kernel claim on a new workspace's port block lasts until its image publication is
@@ -3655,18 +3561,12 @@ async fn a_refused_existing_destination_resume_keeps_mutating_phase() {
     assert_eq!(record.completion, None);
 }
 
-/// Names the checkout the [`gc_process`] child opens.
 const GC_CHECKOUT_ENV: &str = "COWSHED_TEST_GC_CHECKOUT";
 /// Names that child's home, the fixture's scratch root.
 const GC_HOME_ENV: &str = "COWSHED_TEST_GC_HOME";
 /// Names that child's store.
 const GC_STORE_ENV: &str = "COWSHED_TEST_GC_STORE";
-/// Names the abandonment, `<ws>/<head>`, that child supersedes.
-const GC_SUPERSEDE_ENV: &str = "COWSHED_TEST_GC_SUPERSEDE";
-/// Why that child supersedes it.
-const GC_REASON: &str = "the spike is replaced by the lock-order rewrite";
-
-/// `cowshed gc --supersede` in a process of its own: this test binary run as [`gc_process`], its
+/// `cowshed gc` in a process of its own: this test binary run as [`gc_process`], its
 /// stderr piped so the test reads what it says as it says it.
 struct GcProcess {
     child: std::process::Child,
@@ -3675,15 +3575,13 @@ struct GcProcess {
 }
 
 impl GcProcess {
-    /// Start gc on `fixture`'s project beneath `scratch`, so the fixture's cleanup ends it,
-    /// superseding `supersede`.
-    fn start(fixture: &Fixture, scratch: &Path, supersede: &str) -> Self {
+    /// Start gc on `fixture`'s project beneath `scratch`, so the fixture's cleanup ends it.
+    fn start(fixture: &Fixture, scratch: &Path) -> Self {
         let mut child = Command::new(std::env::current_exe().expect("this test binary"))
             .args(["--exact", "macos::gc_process", "--nocapture"])
             .env(GC_CHECKOUT_ENV, &fixture.checkout)
             .env(GC_HOME_ENV, fixture.storage.home())
             .env(GC_STORE_ENV, fixture.storage.store())
-            .env(GC_SUPERSEDE_ENV, supersede)
             .current_dir(scratch)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -3734,7 +3632,7 @@ impl GcProcess {
 
 /// Not a test of its own: the other process of [`GcProcess`]. Run as this binary with
 /// [`GC_CHECKOUT_ENV`] set, it opens that checkout's project as `cowshed gc` opens it, with
-/// store-wide recovery, then supersedes the abandonment [`GC_SUPERSEDE_ENV`] names. Run any other
+/// store-wide recovery, then collects. Run any other
 /// way it does nothing.
 #[tokio::test]
 async fn gc_process() {
@@ -3753,10 +3651,6 @@ async fn gc_process() {
         Vec::new(),
         CanonicalRoots::fixture(namespace, variable(GC_STORE_ENV)),
     );
-    let supersede = std::env::var(GC_SUPERSEDE_ENV).expect("the abandonment gc supersedes");
-    let (workspace, head) = supersede
-        .split_once('/')
-        .expect("the abandonment is <ws>/<head>");
     let repo = fixture_repo();
     let gc = ProjectRuntime::open_directory_existing_at(
         &checkout,
@@ -3772,50 +3666,26 @@ async fn gc_process() {
         "coordinator.gc",
         json!({
             "repoId": repo,
-            "options": { "supersede": { "workspace": workspace, "head": head, "reason": GC_REASON } },
+            "options": { "dryRun": false },
         }),
     )
     .await
-    .expect("gc --supersede");
+    .expect("gc");
     gc.shutdown().await.expect("stop gc");
 }
 
 /// `gc` finishing other processes' unfinished forks waits for `main.dmg.lock` holding no intent
-/// lease (01_storage.md, "Lock order"). Measured 2026-10-22: `gc --supersede` took the intent
+/// lease (01_storage.md, "Lock order"). Measured 2026-10-22: a `gc` took the intent
 /// leases of nine unfinished forks, then sat 18 minutes in `flock` on `main.dmg.lock` behind
 /// another process's operation, and every fork of those names was refused as running elsewhere.
-/// Here another process holds main's lock while a real `gc --supersede` process replays two
-/// unfinished forks. While gc says it waits, the lease a fork of either name takes first is free;
-/// once the holder lets go, gc takes each lease again, finishes both forks from their records as it
-/// reads them then, and supersedes the abandonment it was asked to.
+/// Here another process holds main's lock while a real `gc` process replays two unfinished
+/// forks. While gc says it waits, the lease a fork of either name takes first is free; once the
+/// holder lets go, gc takes each lease again and finishes both forks from their records as it
+/// reads them then.
 #[tokio::test]
 async fn gc_waits_for_mains_image_lock_holding_no_intent_lease() {
     let fixture = Fixture::new("gc-lock-order");
     let runtime = fixture.adopt().await;
-    let listed = fixture
-        .call(&runtime, "project.list", json!({ "repoId": fixture.repo }))
-        .await
-        .expect("list workspaces");
-    let main = PathBuf::from(
-        listed["workspaces"]
-            .as_array()
-            .and_then(|workspaces| {
-                workspaces
-                    .iter()
-                    .find(|workspace| workspace["info"]["role"] == "main")
-            })
-            .and_then(|workspace| workspace["info"]["mount"].as_str())
-            .unwrap_or_else(|| panic!("main's mount: {listed}")),
-    );
-    let minted = fixture
-        .mint(&runtime, "spike", ForkOptions::default())
-        .await
-        .expect("mint the spike");
-    let spike_mount = PathBuf::from(minted["info"]["mount"].as_str().expect("the spike's mount"));
-    fs::write(spike_mount.join("spike"), b"spike\n").expect("the spike's change");
-    git(&spike_mount, &["add", "spike"]);
-    git(&spike_mount, &["commit", "-q", "-m", "spike"]);
-    let spike = head(&spike_mount);
     let unfinished = ["first", "second"];
     for workspace in unfinished {
         fixture.plant_workspace_branch(workspace);
@@ -3836,24 +3706,6 @@ async fn gc_waits_for_mains_image_lock_holding_no_intent_lease() {
         );
     }
     runtime.shutdown().await.expect("stop the forking runtime");
-    let rm = fixture
-        .open_removing("spike")
-        .await
-        .expect("open the removal");
-    fixture
-        .call(
-            &rm,
-            "coordinator.destroy",
-            json!({
-                "repoId": fixture.repo, "workspace": "spike",
-                "options": RemoveOptions { abandon: true, force: true, ..RemoveOptions::default() },
-            }),
-        )
-        .await
-        .expect("--abandon keeps the spike's unlanded tip in main");
-    rm.shutdown().await.expect("stop the abandoning runtime");
-    let spike_ref = format!("refs/cowshed/spike/abandoned/{spike}/HEAD");
-    assert!(has_ref(&main, &spike_ref), "rm --abandon kept {spike_ref}");
 
     let layout = fixture.layout();
     let main_lock = layout
@@ -3863,7 +3715,7 @@ async fn gc_waits_for_mains_image_lock_holding_no_intent_lease() {
         .to_owned();
     let scratch = fixture.checkout.parent().expect("the scratch root");
     let holder = LockHolder::hold(scratch, fixture.storage.store(), &main_lock);
-    let mut gc = GcProcess::start(&fixture, scratch, &format!("spike/{spike}"));
+    let mut gc = GcProcess::start(&fixture, scratch);
     let waiting = gc.says("cowshed: waiting to finish first's unfinished lifecycle work: ");
     assert!(
         waiting.contains(&main_lock.display().to_string())
@@ -3887,8 +3739,4 @@ async fn gc_waits_for_mains_image_lock_holding_no_intent_lease() {
             "gc finished the fork of {workspace}: {said}"
         );
     }
-    assert!(
-        !has_ref(&main, &spike_ref),
-        "gc superseded {spike_ref}: {said}"
-    );
 }

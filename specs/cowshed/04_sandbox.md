@@ -497,10 +497,9 @@ Notes:
   whose main config includes main-tree files cannot fetch"), with the hint to move the include or go through a
   standalone lane. Only a fetch is refused: a read of another repository's object store in place (`rm`'s unlanded-work
   proof, `ls --landing`) runs no program and works under the Git-only profile. The object-only bundle
-  create/verify/list-heads/fetch verbs access controller-owned bundle files in the denied store, including the fetch
-  that keeps an abandon bundle's tips in main's repository; they run host-side with hooks, fsmonitor and automatic
-  maintenance disabled, without checkout, configured remotes or merge/filter execution. The store is not made readable
-  to a workspace Git sandbox.
+  create/verify/list-heads/fetch verbs access controller-owned bundle files in the denied store; they run host-side with
+  hooks, fsmonitor and automatic maintenance disabled, without checkout, configured remotes or merge/filter execution.
+  The store is not made readable to a workspace Git sandbox.
 - **Effective denies are monotonic.** `repo_id` is the machine-independent lowercase `owner/repo` normalized from a
   chosen remote URL. The binding records that remote and validates the identifier against it; multiple bound identities
   may exist but exactly one is primary. A local-only repository requires an explicit `repo_id`, and discovery may

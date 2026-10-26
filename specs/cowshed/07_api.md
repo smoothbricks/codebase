@@ -620,6 +620,25 @@ pub struct LandedReport {
     pub target_was_checked_out: bool,
     pub retired: bool,
     pub build_volume: LandBuildVolume,
+    pub folded: Vec<FoldedWorkspace>,    // the sessions the land folded (02: `land` step 5, "Folds")
+}
+
+pub struct FoldedWorkspace {
+    pub workspace: WorkspaceName,
+    pub head: GitOid,
+    pub outcome: FoldOutcome,
+}
+
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FoldOutcome {
+    Retired,
+    Kept { reason: FoldKept },
+}
+
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FoldKept {
+    Dirty { files: u64 },                 // tracked changes and untracked files no ignore rule covers
+    Refused { code: ErrorCode, message: String }, // the retirement's own refusal: a live owner, a holder, a lease
 }
 ```
 
@@ -1697,7 +1716,8 @@ supervisor that ran the job retires.
 - `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
   `LandReport = { kind: "delivered", ...PushReport } | { kind: "landed", ...LandedReport } | { kind: "preflighted", ...LandPreflight }`;
   `LandPreflight = { workspaceIncarnation, sourceHead, targetBranch, targetHead: ExpectedRefHead }`;
-  `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume }`;
+  `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume, folded }`;
+  `FoldedWorkspace = { workspace, head, outcome: { kind: "retired" } | { kind: "kept", reason: { kind: "dirty", files } | { kind: "refused", code, message } } }`;
   preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`;
   `CheckpointQuota = { maxCount, maxBytes }`.
 - `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, cpuBudget?, pendingInstall? }`;

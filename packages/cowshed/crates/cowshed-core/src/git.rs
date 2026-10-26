@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 #[cfg(any(target_os = "macos", test))]
 use crate::api::dto::Sha256Digest;
-use crate::api::dto::{GitOid, PreservedRef, UnlandedChange, UnlandedPath};
+use crate::api::dto::{GitOid, UnlandedChange, UnlandedPath};
 use crate::error::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 use cowshed_os::timing::timed_async;
@@ -337,27 +337,63 @@ pub struct GitRepository {
     alternate_objects: Option<PathBuf>,
 }
 
-/// A temporary bare repository belongs to the verification future, including when its caller
-/// drops that future. Async cleanup alone cannot run after cancellation.
-struct BundleVerificationScratch {
+/// What a [`GitScratch`] holds, which names it and its directory in every report about it.
+#[derive(Clone, Copy)]
+enum ScratchUse {
+    /// A bare repository an abandonment bundle is fetched into, beside the bundle.
+    BundleVerification,
+    /// The object directory a landed merge writes into ([`GitRepository::merged_tree`]), in the
+    /// repository's own git directory.
+    MergeObjects,
+}
+
+impl ScratchUse {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::BundleVerification => ".bundle-verify",
+            Self::MergeObjects => "cowshed-merge-objects",
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Self::BundleVerification => "abandonment bundle verification repository",
+            Self::MergeObjects => "merge object directory",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::BundleVerification => "repair the cowshed store and retry removal",
+            Self::MergeObjects => "repair the workspace's git directory, then retry",
+        }
+    }
+}
+
+/// A scratch directory belongs to the future that made it, including when its caller drops that
+/// future. Async cleanup alone cannot run after cancellation.
+struct GitScratch {
     path: PathBuf,
+    usage: ScratchUse,
     removed: bool,
 }
 
-impl BundleVerificationScratch {
-    fn create(parent: &Path) -> Result<Self> {
-        let path = parent.join(format!(".bundle-verify-{}", uuid::Uuid::new_v4().simple()));
+impl GitScratch {
+    fn create(parent: &Path, usage: ScratchUse) -> Result<Self> {
+        let path = parent.join(format!(
+            "{}-{}",
+            usage.prefix(),
+            uuid::Uuid::new_v4().simple()
+        ));
         fs::create_dir(&path).map_err(|error| {
             CowshedError::environment_missing(
-                format!(
-                    "cannot create abandonment bundle verification repository {}: {error}",
-                    path.display()
-                ),
-                "repair the cowshed store and retry removal",
+                format!("cannot create {} {}: {error}", usage.what(), path.display()),
+                usage.hint(),
             )
         })?;
         Ok(Self {
             path,
+            usage,
             removed: false,
         })
     }
@@ -368,10 +404,11 @@ impl BundleVerificationScratch {
             .map_err(|error| {
                 CowshedError::environment_missing(
                     format!(
-                        "cannot remove abandonment bundle verification repository {}: {error}",
+                        "cannot remove {} {}: {error}",
+                        self.usage.what(),
                         self.path.display()
                     ),
-                    "repair the cowshed store and retry removal",
+                    self.usage.hint(),
                 )
             })?;
         self.removed = true;
@@ -379,14 +416,15 @@ impl BundleVerificationScratch {
     }
 }
 
-impl Drop for BundleVerificationScratch {
+impl Drop for GitScratch {
     fn drop(&mut self) {
         if !self.removed
             && let Err(error) = fs::remove_dir_all(&self.path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             cowshed_os::eprintln!(
-                "cowshed: could not remove interrupted bundle verification repository {}: {error}",
+                "cowshed: could not remove interrupted {} {}: {error}",
+                self.usage.what(),
                 self.path.display()
             );
         }
@@ -1533,7 +1571,7 @@ impl GitRepository {
                 "repair the cowshed store and retry removal",
             )
         })?;
-        let scratch = BundleVerificationScratch::create(parent)?;
+        let scratch = GitScratch::create(parent, ScratchUse::BundleVerification)?;
 
         let verification = async {
             let output = run_git_at(
@@ -1654,108 +1692,134 @@ impl GitRepository {
         }
     }
 
-    /// Keep every tip `bundle` advertises in this repository, under `namespace`: `HEAD` as
-    /// `<namespace>/HEAD` and `refs/heads/<branch>` as `<namespace>/heads/<branch>`, answering
-    /// each with the tip its ref holds.
+    /// Merge `head` into `target` without a work tree, an index or a ref (`git merge-tree
+    /// --write-tree`): the tree a clean merge produces, or [`crate::landing::MergedTree::Conflicted`].
+    /// One process for the whole branch, and it follows renames on both sides. Strict on both
+    /// endpoints like [`Self::divergence`].
     ///
-    /// The fetch runs host-side like every bundle verb (04_sandbox.md): the bundle lives in the
-    /// controller's store, which no sandbox profile reads. Refspecs are not forced, so a ref that
-    /// already holds another tip refuses rather than being overwritten, and every ref is read back
-    /// and compared with the tip the bundle advertises: one that does not resolve to it has kept
-    /// nothing. A bundle advertising anything but `HEAD` and branches is refused, never partly
-    /// kept. Like every bundle verb it starts no automatic maintenance in this repository.
-    pub async fn preserve_bundle(
+    /// No merge driver decides it: a driver like `merge=ours` drops the branch's side and still
+    /// merges cleanly to the target's tree, which would read as landed, and the built-in `union`
+    /// keeps the target's line where the branch deleted it. No attribute source can be switched
+    /// off for `$GIT_DIR/info/attributes`, so every driver this repository's config names, and
+    /// `union`, fails instead, whichever attributes select it, and a file one would resolve
+    /// conflicts. The merge writes its objects into a scratch object directory in this
+    /// repository's git directory, which it removes; its own store and an attached one are only
+    /// read. A linked worktree's own store is main's.
+    pub async fn merged_tree(
         &self,
-        bundle: &Path,
-        namespace: &str,
-    ) -> Result<Vec<PreservedRef>> {
-        let listed = run_git_bundle_at(
-            &self.root,
-            None,
-            [
-                OsStr::new("bundle"),
-                OsStr::new("list-heads"),
-                bundle.as_os_str(),
-            ],
-        )
-        .await?;
-        if !listed.status.success() {
-            return Err(bundle_artifact_error(
-                "list the abandonment bundle's tips",
-                &listed,
-            ));
+        target: &str,
+        head: &str,
+    ) -> Result<crate::landing::MergedTree> {
+        self.require_commits([target, head]).await?;
+        let listing = self.run(["config", "-z", "--name-only", "--list"]).await?;
+        if !listing.status.success() {
+            return Err(git_internal("read the Git config", &listing));
         }
-        let mut kept = Vec::new();
-        for line in parse_lines(&listed.stdout, "abandonment bundle tip")? {
-            let unreadable = || {
-                CowshedError::integrity(
-                    format!(
-                        "abandonment bundle {} advertises `{line}`, which is neither HEAD nor a \
-                         branch",
-                        bundle.display()
-                    ),
-                    "inspect the bundle, then keep its tips by hand before deleting it",
-                )
-            };
-            let (tip, advertised) = line.split_once(' ').ok_or_else(unreadable)?;
-            let (name, reference) = match advertised.strip_prefix("refs/heads/") {
-                _ if advertised == "HEAD" => (String::from("HEAD"), format!("{namespace}/HEAD")),
-                Some(branch) => (branch.to_owned(), format!("{namespace}/heads/{branch}")),
-                None => return Err(unreadable()),
-            };
-            kept.push((
-                advertised.to_owned(),
-                PreservedRef {
-                    name,
-                    tip: parse_oid(tip.to_owned(), "abandonment bundle tip")?,
-                    reference,
-                },
-            ));
+        let mut overrides = vec![String::from("merge.union.driver=false")];
+        overrides.extend(driver_overrides(&listing.stdout)?);
+        let located = self
+            .run([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-path",
+                "objects",
+            ])
+            .await?;
+        if !located.status.success() {
+            return Err(git_internal("locate the git directory", &located));
         }
-        if kept.is_empty() {
+        let mut lines = located
+            .stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&located.stdout)
+            .split(|byte| *byte == b'\n')
+            .map(|line| Path::new(OsStr::from_bytes(line)));
+        let (Some(git_dir), Some(objects), None) = (lines.next(), lines.next(), lines.next())
+        else {
             return Err(CowshedError::integrity(
-                format!("abandonment bundle {} advertises no tip", bundle.display()),
-                "inspect the bundle; one with no tip holds nothing to keep",
+                format!(
+                    "git named no git directory and object store for {}",
+                    self.root.display()
+                ),
+                "restore the expected repository at this path, then retry",
             ));
+        };
+        let read =
+            std::env::join_paths(std::iter::once(objects).chain(self.alternate_objects.as_deref()))
+                .map_err(|_| {
+                    CowshedError::conflict(
+                        format!(
+                            "git cannot attach an object store whose path contains a colon: {}",
+                            objects.display()
+                        ),
+                        "move the repository to a path without a colon",
+                    )
+                })?;
+        let scratch = GitScratch::create(git_dir, ScratchUse::MergeObjects)?;
+        let mut command = git_command_with_objects(
+            #[cfg(target_os = "macos")]
+            &self.store_root,
+            &self.root,
+            self.alternate_objects.as_deref(),
+            #[cfg(target_os = "macos")]
+            None,
+        )?;
+        for setting in &overrides {
+            command.arg("-c").arg(setting);
         }
-        let mut fetch = vec![
-            OsString::from("fetch"),
-            OsString::from("--quiet"),
-            OsString::from("--no-tags"),
-            OsString::from("--no-write-fetch-head"),
-            bundle.as_os_str().to_owned(),
-        ];
-        fetch.extend(kept.iter().map(|(advertised, preserved)| {
-            OsString::from(format!("{advertised}:{}", preserved.reference))
-        }));
-        let output = run_git_bundle_at(&self.root, None, fetch).await?;
+        let output = command
+            .env("GIT_OBJECT_DIRECTORY", &scratch.path)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", read)
+            .args(["merge-tree", "--write-tree", "--no-messages", target, head])
+            .output_locked()
+            .await
+            .map_err(|error| git_spawn_error(&error));
+        let cleanup = scratch.cleanup().await;
+        let output = output?;
+        cleanup?;
+        match output.status.code() {
+            Some(0) => Ok(crate::landing::MergedTree::Clean(parse_oid(
+                parse_one_string(&output.stdout, "merge into the target")?,
+                "the merged tree",
+            )?)),
+            // Exit 1 is git's answer, not a failure: the merge conflicts.
+            Some(1) => Ok(crate::landing::MergedTree::Conflicted),
+            _ => Err(git_internal("merge into the target", &output)),
+        }
+    }
+
+    /// The tree `revision` records.
+    pub async fn tree_of(&self, revision: &str) -> Result<GitOid> {
+        let tree = format!("{revision}^{{tree}}");
+        let value = self
+            .read_one(["rev-parse", "--verify", tree.as_str()], "read a tree")
+            .await?;
+        parse_oid(value, &tree)
+    }
+
+    /// Every path `range` changes (`a..b`, or `a...b` for what `b` changed since its merge base
+    /// with `a`), a rename counted as both its paths.
+    pub async fn changed_paths(&self, range: &str) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+        let output = self
+            .run([
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                range,
+            ])
+            .await?;
         if !output.status.success() {
-            return Err(bundle_artifact_error(
-                "keep the abandonment bundle's tips in main's repository",
-                &output,
-            ));
+            return Err(git_internal("list the paths a range changes", &output));
         }
-        let mut preserved = Vec::with_capacity(kept.len());
-        for (_, kept) in kept {
-            let commit = format!("{}^{{commit}}", kept.reference);
-            let held = self
-                .read_one(
-                    ["rev-parse", "--verify", commit.as_str()],
-                    "read a kept tip",
-                )
-                .await?;
-            if held != kept.tip.as_str() {
-                return Err(CowshedError::integrity(
-                    format!(
-                        "{} holds {held}, not the abandoned {} tip {}",
-                        kept.reference, kept.name, kept.tip
-                    ),
-                    "inspect main's repository refs, then retry",
-                ));
-            }
-            preserved.push(kept);
-        }
-        Ok(preserved)
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect())
     }
 
     /// How many commits are reachable from any of `heads` and not from `target`.
@@ -4046,7 +4110,6 @@ fn read_git_config_bounded(path: &Path) -> Result<Option<Vec<u8>>> {
 /// command the config selects may run with that read: filters pass content through unchanged,
 /// merge and external diff drivers fail as `diff.external` already does, and a textconv is the
 /// identity. A key that cannot be spelled as a `-c` override refuses the command.
-#[cfg(target_os = "macos")]
 fn driver_overrides(listing: &[u8]) -> Result<Vec<String>> {
     let mut drivers = std::collections::BTreeSet::new();
     for key in listing
@@ -5275,10 +5338,10 @@ mod tests {
     use std::process::{Command, ExitStatus, Output};
 
     use super::{
-        BundleVerificationScratch, CloneOrigin, CowshedUpstream, FALLBACK_MAIN_REMOTE,
-        GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl, WorkspaceRepository, changes_path,
-        ensure_git_success, git_ended, git_message, held_by_repository_blocking, ignored_by_rules,
-        is_git_repository, parse_lines, parse_range_listing, workspace_remote_name,
+        CloneOrigin, CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository, GitScratch, MAIN_REMOTE,
+        MainRemote, RemoteUrl, ScratchUse, WorkspaceRepository, changes_path, ensure_git_success,
+        git_ended, git_message, held_by_repository_blocking, ignored_by_rules, is_git_repository,
+        parse_lines, parse_range_listing, workspace_remote_name,
     };
 
     #[cfg(target_os = "macos")]
@@ -5939,6 +6002,63 @@ mod tests {
                 .iter()
                 .any(|commit| commit.oid == head.as_str() && commit.subject.starts_with("Merge")),
             "the merge is listed under its own oid"
+        );
+    }
+
+    /// No merge driver makes a branch merge to the target's tree, so none makes it read as landed:
+    /// neither one the repository's config defines and `$GIT_DIR/info/attributes` selects, which
+    /// no attribute source reaches, nor the built-in `union`, which keeps the target's line where
+    /// the branch deleted it. Each merge conflicts, and neither writes an object into the
+    /// repository: its store stays as the merge found it.
+    #[tokio::test]
+    async fn no_merge_driver_makes_a_branch_merge_to_the_target_tree() {
+        let store = crate::temp_root::FixtureStore::new();
+        let root = repository();
+        let repo = GitRepository::from_root(store.shared(), &root);
+        fs::write(root.join("ours"), "base\n").expect("write ours");
+        fs::write(root.join("union"), "base\n").expect("write union");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        let base = repo.head_oid().await.expect("read base");
+        for (branch, path, content) in [("by-ours", "ours", "unit\n"), ("by-union", "union", "")] {
+            git(&root, &["switch", "-qc", branch, base.as_str()]);
+            fs::write(root.join(path), content).expect("write the unit's change");
+            git(&root, &["commit", "-qam", branch]);
+        }
+        git(&root, &["switch", "-q", "main"]);
+        fs::write(root.join("ours"), "target\n").expect("write target ours");
+        fs::write(root.join("union"), "target\n").expect("write target union");
+        git(&root, &["commit", "-qam", "target"]);
+        git(&root, &["config", "merge.ours.driver", "true"]);
+        fs::create_dir_all(root.join(".git/info")).expect("create info");
+        fs::write(
+            root.join(".git/info/attributes"),
+            "ours merge=ours\nunion merge=union\n",
+        )
+        .expect("write info/attributes");
+        let objects = || {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&*root)
+                .args(["count-objects", "-v"])
+                .output_locked()
+                .expect("count objects");
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before = objects();
+
+        for branch in ["by-ours", "by-union"] {
+            assert_eq!(
+                repo.merged_tree("main", branch).await.expect("merge"),
+                crate::landing::MergedTree::Conflicted,
+                "{branch}"
+            );
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&objects()),
+            String::from_utf8_lossy(&before),
+            "the merges wrote into the repository's object store"
         );
     }
 
@@ -8418,7 +8538,8 @@ mod tests {
     #[tokio::test]
     async fn cancelled_bundle_verification_removes_its_bare_repository() {
         let root = repository();
-        let scratch = BundleVerificationScratch::create(&root).expect("verification repository");
+        let scratch = GitScratch::create(&root, ScratchUse::BundleVerification)
+            .expect("verification repository");
         let path = scratch.path.clone();
         let work = tokio::spawn(async move {
             let _scratch = scratch;

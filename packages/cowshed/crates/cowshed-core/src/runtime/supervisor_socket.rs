@@ -2939,6 +2939,8 @@ async fn answer(
                 RetireWhen::Now => supervisor.retire(nx_daemon).await?,
                 RetireWhen::AfterJobs => supervisor.retire_after_jobs(nx_daemon).await?,
                 RetireWhen::IfIdle => supervisor.retire_if_idle(nx_daemon).await?,
+
+                RetireWhen::IfUnowned => supervisor.retire_if_unowned(nx_daemon).await?,
             }
             (unit()?, Bytes::new())
         }

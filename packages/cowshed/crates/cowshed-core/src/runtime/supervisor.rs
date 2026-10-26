@@ -3729,6 +3729,12 @@ impl WorkspaceSupervisorHandle {
         self.retire_when(nx_daemon, RetireWhen::IfIdle).await
     }
 
+    /// Retire now if no job runs (the Nx keeper's start excepted) and no named session is open;
+    /// refused as a `Conflict`, changing nothing, otherwise.
+    pub async fn retire_if_unowned(&self, nx_daemon: NxDaemonRetirement) -> Result<()> {
+        self.retire_when(nx_daemon, RetireWhen::IfUnowned).await
+    }
+
     async fn retire_when(&self, nx_daemon: NxDaemonRetirement, when: RetireWhen) -> Result<()> {
         self.call(|reply| Command::Retire {
             authority: self.authority.clone(),
@@ -4087,6 +4093,11 @@ pub enum RetireWhen {
     AfterJobs,
     /// Now if no job runs; a `Conflict`, changing nothing, while one does.
     IfIdle,
+
+    /// Now if nobody owns the workspace: a `Conflict`, changing nothing, while a job runs (the Nx
+    /// keeper's start excepted) or a named session is open. A land's fold step asks this, sparing
+    /// a live owner rather than waiting for it (02_workspaces.md, `land` step 5, "Folds").
+    IfUnowned,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5609,6 +5620,20 @@ impl SupervisorActor {
                             )));
                         }
                         RetireWhen::IfIdle => self.retire_now(nx_daemon, reply),
+
+                        RetireWhen::IfUnowned
+                            if self.has_user_jobs() || !self.named_sessions.is_empty() =>
+                        {
+                            let _ = reply.send(Err(CowshedError::conflict(
+                                format!(
+                                    "the workspace's supervisor runs a job or holds an open shell \
+                                     ({} named session(s) open), so it was not retired",
+                                    self.named_sessions.len()
+                                ),
+                                "let its owner finish, then cowshed rm it",
+                            )));
+                        }
+                        RetireWhen::IfUnowned => self.retire_now(nx_daemon, reply),
                         RetireWhen::AfterJobs => {
                             self.close_admission();
                             self.retire_after_jobs.push((nx_daemon, reply));

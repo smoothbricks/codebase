@@ -310,12 +310,11 @@ ancestor) is written to `abandoned-main-<tip>.bundle` in a `cowshed/` directory 
 verified, and reported as abandoned work against the retained checkout's branch, with nothing to preserve as refs
 (`AbandonedWork.preserved` is `nothingToPreserve`). `--abandon` on main without `--restore` is a usage error.
 
-Main's image is the repository that holds every `refs/cowshed/*` ref cowshed wrote: abandoned tips (`rm` step 1) and
-`push`ed branches. The restore retires that image, so before the swap it fetches each of those refs, unforced, into the
-retained checkout under the same name, reads each back, and refuses (naming the refs) when one is missing or holds
-another tip; a `push` staging ref is transient and stays. The retained checkout is the repository the user keeps, so the
-refs outlive the project there, and a later removal of that checkout is what would lose them; the restore says so on
-stderr.
+Main's image is the repository that holds every `refs/cowshed/*` ref cowshed wrote: the branches `push` preserves. The
+restore retires that image, so before the swap it fetches each of those refs, unforced, into the retained checkout under
+the same name, reads each back, and refuses (naming the refs) when one is missing or holds another tip; a `push` staging
+ref is transient and stays. The retained checkout is the repository the user keeps, so the refs outlive the project
+there, and a later removal of that checkout is what would lose them; the restore says so on stderr.
 
 Unbinding is last. Removing main first records the checkout path in the project store (`checkout-root.json`), because
 main's images — the only other record naming it — are retired and then reclaimed. A restore interrupted after retiring
@@ -1194,6 +1193,24 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
    workspace and exits with the refusal, but its message starts with the landed head and target: the target has moved,
    so the next step is `cowshed rm`, not another land.
 
+   **Folds.** A land whose unit retired then retires every session workspace it folded: one whose own work the landed
+   range carried into the target. Trains fold units by cherry-pick, resolving conflicts and adding review fixes, so no
+   folded unit is an ancestor of what lands and none retires by a land of its own. The fold list is the land's own: the
+   paths the range from the target's previous head to the landed head changes, and every published, mounted session
+   other than the unit, the target workspace and main whose own changes since its merge base with that previous head
+   touch one of them. Of those, a workspace is folded when the landed tip holds it by `rm`'s measurement (`rm` step 1,
+   against the branch the unit landed on, every local branch included); the others are not the land's, and are neither
+   touched nor named. A folded workspace is retired as `rm` retires it, measured again under its own land lease, with
+   two differences. The age floor does not apply: its work is already in the target. And its owner is spared, never
+   quiesced: a supervisor running a job or holding an open shell session refuses the stop rather than waiting for it,
+   and a process cowshed does not run that holds its mount refuses as it does for `rm` ("Holders cowshed does not run").
+   A folded workspace whose tree is dirty (a tracked change, or an untracked file no ignore rule covers) is kept. Each
+   folded workspace is reported in `LandedReport.folded` with its head and its outcome, `retired`, or `kept` with why
+   (`dirty` with its file count, or `refused` with the refusal's code and message), and said on stderr. A kept fold
+   never fails the land, and nothing about it is stored: it is the next `rm`'s, or the next land's that touches it.
+   Retired folds release their build volumes in one collection after the last of them. A land with `--no-retire` folds
+   nothing.
+
 `--no-retire` keeps the workspace after a successful land (for a coordinator that wants to reuse it via
 `rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable
 `refs/cowshed/<ws>/heads/<branch>` preservation ref without advancing the target branch, for review-gated flows. It
@@ -1306,12 +1323,19 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 ## `cowshed rm <ws>` — perceived-instant deletion
 
 1. Refuse (exit 4) unless every local branch (HEAD included) is landed in live main: the image takes every branch with
-   it. Landed is judged in two questions. A tip main contains (an ancestor of main, or main itself) is landed, cheaply
-   and exactly. Otherwise every commit of `main..<tip>` must be held by one of two proofs. **Content:** for each file
-   the branch changed since its merge base with main, main already holds that change: main has the same entry, or
-   merging the branch's change into main's version (`git merge-file`, based at the merge base) reproduces main's
-   version, where a region both changed is held when main's lines there have dropped the lines the branch replaced and
-   carry the lines it wrote, in order. **Patch identity:** main holds a patch-equivalent commit, as
+   it. Landed is judged in three questions, cheapest first. A tip main contains (an ancestor of main, or main itself) is
+   landed, cheaply and exactly. Otherwise a tip whose merge into main changes nothing is landed:
+   `git merge-tree --write-tree <main> <tip>` merges cleanly to main's own tree, one process for the whole branch, and
+   it follows a file the branch renamed, where the per-file proof below sees a new path that main has since edited. No
+   merge driver decides it: every driver the repository's config names and the built-in `union` fail, whichever
+   attributes select them (committed, `$GIT_DIR/info/attributes` or none), so a file one would resolve conflicts
+   instead; `merge=ours` would otherwise drop the branch's side and still reproduce main's tree. The merge writes its
+   objects into a scratch object directory it then removes, never into the workspace's object store or main's (a linked
+   worktree's store is main's). Otherwise every commit of `main..<tip>` must be held by one of two proofs. **Content:**
+   for each file the branch changed since its merge base with main, main already holds that change: main has the same
+   entry, or merging the branch's change into main's version (`git merge-file`, based at the merge base) reproduces
+   main's version, where a region both changed is held when main's lines there have dropped the lines the branch
+   replaced and carry the lines it wrote, in order. **Patch identity:** main holds a patch-equivalent commit, as
    `git cherry main <tip>` marks it `-` (git's patch-id against main's commits since the merge base), for an ordinary
    commit that changes something; a merge that authors nothing (an empty combined diff) is held as well. A file the
    content proof does not hold is unheld while any commit that changes it is held by neither proof. A cherry-pick, a
@@ -1333,34 +1357,32 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    read refuses the same way. It alone carries `removal: {reason: "young", createdAt, removableAt}`: `removableAt` is
    the first second the floor lets the workspace go, absent when the creation cannot be read, so a caller that owns the
    workspace waits for that second instead of copying the floor. `--force` overrides it. A `land` retiring the unit it
-   landed, and the replay of a removal already authorized, are not asked. Explicit `--abandon` requires a verified
-   recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as refs,
-   before retiring unlanded work. It is written beside that name and renamed into place once verified; a retried removal
-   that finds a bundle verifying for the same range keeps it instead of writing another. The verified bundle's tips are
-   then fetched into main's repository, unforced, as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and
-   `refs/cowshed/<ws>/abandoned/<head>/heads/<branch>`, each read back against the tip the bundle advertises, before
-   anything retires: the trash is emptied by `gc --abandoned`, and the refs by any `gc` once main holds every tip by
-   this gate's own measurement, or by their owner's `gc --supersede` (01_storage.md, "Retention"). Keying the namespace
-   by the abandoned head means a later workspace reusing the name never overwrites what an earlier one left. A tip that
-   cannot be kept refuses the abandonment. The report says what keeps the tips (`AbandonedWork.preserved`): `preserved`
-   with each kept ref; `nothingToPreserve` for main's own `--restore --abandon` (below), where main is what is being
-   restored and its bundle is the copy; or `predatesPreservation` for a record an earlier build wrote, which kept no
-   refs and recorded none — the bundle it names was the one copy it made. A measurement's files (`unlandedPaths`)
-   likewise are `named`, or `predatesPaths` for a record from a build that counted commits by patch identity and named
-   no file. A command reporting a predating record warns once on stderr, naming what it does not record
-   (00_overview.md).
+   landed or a workspace it folded (`land` step 5), and the replay of a removal already authorized, are not asked.
+   Explicit `--abandon` requires a verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and
+   every branch that did not pass as refs, before retiring unlanded work. It is written beside that name and renamed
+   into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead of
+   writing another. The bundle is the only copy: nothing is written into main's repository, whose refs are the branches
+   people check out and the ones `push` writes, never a namespace per abandonment that nobody reads. It stays in the
+   trash until `gc --abandoned` releases it (01_storage.md, "Retention"). The report names it (`AbandonedWork.bundle`),
+   and `AbandonedWork.preserved` says what else keeps the tips: absent (`bundleOnly`) for every session abandonment;
+   `nothingToPreserve` for main's own `--restore --abandon` (below), where main is what is being restored and its bundle
+   is the copy; or `preserved` with each ref, in a record an earlier build wrote when abandonments also wrote refs into
+   main's repository, which no build writes or reads now. A measurement's files (`unlandedPaths`) are `named`, or
+   `predatesPaths` for a record from a build that counted commits by patch identity and named no file. A command
+   reporting a predating record warns once on stderr, naming what it does not record (00_overview.md).
 
    Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
    (01_storage.md) once the source release is committed or the recovery retirement completes: the head and every local
-   branch tip read before the image went, each with what keeps it — `{"by":"ref","repository":…,"reference":…}` for a
-   tip the abandonment kept, `{"by":"target",…}` naming the branch and head that held a tip the gate passed. The line
-   also says who retired the workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid and
-   argv and its parent's, which is the shell, script or agent that asked; and, for a forced removal, `forced`, naming
-   each guard the force overrode (`dirty`, `inProgress` with the operation, `young` with `createdAt` and `ageSeconds`),
-   empty when it overrode none. A retirement that keeps its image as recovery (step 5) also names the trash path it kept
-   (`image`) and every reason it kept it (`retained`): `inProgress` with the operation, `dirty`, `abandoned`, `onlyCopy`
-   with the first untracked leaf the target checkout does not hold, or `main` for main's own retirement. A retirement
-   whose tips could not be read says so on stderr and writes the line without Git facts; it is never refused for that.
+   branch tip read before the image went, each with what keeps it — `{"by":"bundle","path":…}` naming the abandon bundle
+   for a tip the abandonment kept, `{"by":"target",…}` naming the branch and head that held a tip the gate passed. The
+   line also says who retired the workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid
+   and argv and its parent's, which is the shell, script or agent that asked; and, for a forced removal, `forced`,
+   naming each guard the force overrode (`dirty`, `inProgress` with the operation, `young` with `createdAt` and
+   `ageSeconds`), empty when it overrode none. A retirement that keeps its image as recovery (step 5) also names the
+   trash path it kept (`image`) and every reason it kept it (`retained`): `inProgress` with the operation, `dirty`,
+   `abandoned`, `onlyCopy` with the first untracked leaf the target checkout does not hold, or `main` for main's own
+   retirement. A retirement whose tips could not be read says so on stderr and writes the line without Git facts; it is
+   never refused for that.
 
    The refusal reports whether the published branch already holds HEAD's commits; it never authorizes a removal. Only
    once the gate has refused HEAD does it measure HEAD, with the same landing module `ls` reads, against the primary
@@ -1565,14 +1587,14 @@ unpublished before retirement does not invalidate that recovery fact.
 `cowshed rm main --restore --purge [--force] [--abandon]` (`Coordinator::remove_project`) removes the whole project in
 one call: every session workspace, including clones a create never published, under the given `--force`/`--abandon`;
 each removal has already committed its release or completed its recovery preservation when collection begins; collects;
-with `--abandon` keeps every abandon bundle's tips in main's repository as `gc --abandoned` does (01_storage.md) and
-then deletes the bundles in `sessions/.trash`, refusing before one is deleted when any cannot be kept; and restores
-main, whose final unbinding hands the project's released images to the gateway ("Checkout layouts"). Each step is
-idempotent, so a refusal leaves the rest to the same command. A collection that still finds the store changed under it
-(another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command finishes the
-removal; callers never sleep and retry `gc` themselves. Recovery images can hold only-copy work even after all abandoned
-commits were bundled; they therefore refuse terminal store removal until their contents have been deliberately recovered
-with `gc --recover` (step 5), which the refusal's hint names. Bundle authorization alone never discards them.
+with `--abandon` deletes the abandon bundles in `sessions/.trash`, the only copy of the commits they hold, which
+`--abandon` authorizes losing (01_storage.md); and restores main, whose final unbinding hands the project's released
+images to the gateway ("Checkout layouts"). Each step is idempotent, so a refusal leaves the rest to the same command. A
+collection that still finds the store changed under it (another process) is refused as retryable — `Conflict` with
+`Retry::GcPlanStale` — and the same command finishes the removal; callers never sleep and retry `gc` themselves.
+Recovery images can hold only-copy work even after all abandoned commits were bundled; they therefore refuse terminal
+store removal until their contents have been deliberately recovered with `gc --recover` (step 5), which the refusal's
+hint names. Bundle authorization alone never discards them.
 
 ## `cowshed attach` / `cowshed detach`
 

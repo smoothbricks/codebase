@@ -5,10 +5,7 @@ use cowshed_core::api::held_lock::DecimalU64;
 use cowshed_core::api::hold::KernelAddress;
 use cowshed_core::api::operations::FdHoldersRequest;
 use cowshed_core::api::server::HostRole;
-use cowshed_core::api::{
-    AbandonedRefSupersession, ExecClass, ExecScope, GitOid, GrantDelta, LandMode, LandTurnName,
-    SupersededReason,
-};
+use cowshed_core::api::{ExecClass, ExecScope, GrantDelta, LandMode, LandTurnName};
 use cowshed_core::metadata::{EgressMode, EgressRule, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
@@ -641,7 +638,6 @@ pub struct RekeyArgs {
 pub struct GcArgs {
     pub dry_run: bool,
     pub abandoned: bool,
-    pub supersede: Option<AbandonedRefSupersession>,
     pub recover: Option<RecoverArgs>,
 }
 
@@ -1050,8 +1046,6 @@ pub fn cli_command() -> ClapCommand {
         .subcommand(leaf("gc").args([
             flag("dry-run"),
             flag("abandoned"),
-            value("supersede"),
-            value("reason"),
             value("recover"),
             value("to"),
         ]))
@@ -3476,11 +3470,11 @@ const REMOVE: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--abandon",
-            meaning: "the sole authorization for destroying work main does not hold, and needed only for that: a workspace whose changes main holds passes without it. Before deleting, HEAD and every local branch that did not pass are bundled into sessions/.trash/<ws>-<tip>.bundle, then kept in main's repository as refs/cowshed/<ws>/abandoned/<head>/HEAD and .../heads/<branch>, and the abandonment reported branch by branch with each kept ref, so the commits stay recoverable from main itself after gc --abandoned empties the trash — the uncommitted tree is not bundled and does not survive. The project's deletion log records the head, every branch tip and the ref that keeps each. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
+            meaning: "the sole authorization for destroying work main does not hold, and needed only for that: a workspace whose changes main holds passes without it. Before deleting, HEAD and every local branch that did not pass are bundled into a verified recovery bundle, sessions/.trash/<ws>-<tip>.bundle, which is the only copy of those commits: nothing is written into main's repository, and `gc --abandoned` is what eventually deletes the bundle. The uncommitted tree is not bundled and does not survive. The project's deletion log names the head, every branch tip and the bundle that keeps each. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
         },
         Opt {
             spelling: "--purge",
-            meaning: "main --restore only: remove the whole project in one call — every session workspace (listed or never published, under the --force and --abandon given), the collection of their images, and with --abandon the abandon bundles in sessions/.trash once main's repository keeps their tips — and then restore main, which first carries every refs/cowshed ref (abandoned tips, pushed branches) into the retained checkout it puts back, where they outlive the project. A store another process changed under the collection is refused as retryable (`retry.reason` is `gcPlanStale` in --json); run the same command again",
+            meaning: "main --restore only: remove the whole project in one call — every session workspace (listed or never published, under the --force and --abandon given), the collection of their images, and with --abandon the abandon bundles in sessions/.trash, each deleted and its deletion journaled as `remove-abandoned-bundle` — and then restore main, which first carries every refs/cowshed ref (pushed branches) into the retained checkout it puts back, where they outlive the project. A store another process changed under the collection is refused as retryable (`retry.reason` is `gcPlanStale` in --json); run the same command again",
         },
     ],
 };
@@ -3841,16 +3835,15 @@ const GC: CommandSpec = CommandSpec {
     summary: "free storage",
     about: &[
         "Reclaims seven kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedPinned`, `retainedActive` and `releasedBytes`. Six of them need no flag; the seventh, `abandonedBundle`, is only ever collected under `--abandoned`. `rm`, `land`, and `restore` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
-        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars, checkpoints and empty mountpoint. Retirement already ran the containment gate, so these commits are in main or were deliberately abandoned — and an abandonment kept them in main's repository under `refs/cowshed/<ws>/abandoned/<head>/`. Safe. The `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are *not* this category and are never reclaimed without `--abandoned`: they are the recovery files of the commits that removal gave up, so they stay fetchable and their disk use accumulates until you reclaim them with `--abandoned` or delete them yourself.",
+        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars, checkpoints and empty mountpoint. Retirement already ran the containment gate, so these commits are in main, or an abandonment bundled them into a `<ws>-<tip>.bundle` file first. Safe. The `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are *not* this category and are never reclaimed without `--abandoned`: each is the only copy of the commits that removal gave up, so it stays until you reclaim it with `--abandoned` or delete it yourself.",
         "`orphanStagingImage` and `orphanStagingMetadata` — a staged image, with or without its grants sidecar, or a sidecar with no image, under the project's `.staging/` in the store. Each is a lifecycle transaction — create, fork, restore — that died between writing the image and publishing it. The one sign a transaction is still running is its workspace lifecycle lock: an entry whose lock is held is retained and counted in `retainedActive`; an entry whose lock is free was never published under a workspace name, so nothing uses it. Safe.",
         "`orphanStagingMount` — a mountpoint under the mount root's `.staging/` whose image is gone or was never published: an empty directory, or a volume an interrupted operation left attached. Attached volumes are detached before the directory goes, so an orphan that held tens of gigabytes stops charging for them. Safe; the same lock rule retains a mountpoint an operation still owns.",
         "`expiredCheckpoint` — an automatic checkpoint that is neither one of the five most recent for its workspace nor younger than fourteen days. This is the category that can delete something you still want: an automatic checkpoint is a real crash-consistent copy of that workspace, and past those two thresholds it goes. Pinned checkpoints are never candidates, and `cowshed checkpoint --keep` or any explicitly labelled checkpoint is pinned; `retainedPinned` in the report counts what was spared for that reason.",
         "`orphanMountpoint` — a directory under the project's mount root that is no workspace's mountpoint: nothing is mounted at it and no image or retirement names it. Hidden files and files the project ignores are what late writers left after a volume went away, and go with the directory; any other file stops the removal and is named, so you move or delete it yourself.",
-        "`abandonedBundle` — under `--abandoned` only, the `<ws>-<tip>.bundle` files in `sessions/.trash/` that `rm --abandon` verified and left behind, holding commits main does not contain, which is why no plain `gc` ever deletes one. A plain `gc` still says how many the trash keeps and their allocated bytes, as `doctor` and `ls --all` do, so they are never out of sight. Before deleting any, `--abandoned` fetches each bundle's tips into main's repository as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and `.../heads/<branch>` — the refs `rm --abandon` already wrote, written again for a bundle an older cowshed left without them — and records them in the project's deletion log; a bundle it cannot keep that way stops the whole sweep, naming it, and nothing is deleted. `--dry-run --abandoned` lists them with their real allocated bytes first.",
+        "`abandonedBundle` — under `--abandoned` only, the `<ws>-<tip>.bundle` files in `sessions/.trash/` that `rm --abandon` verified and left behind, holding commits main does not contain, which is why no plain `gc` ever deletes one. A plain `gc` still says how many the trash keeps and their allocated bytes, as `doctor` and `ls --all` do, so they are never out of sight. Each bundle is the only copy of the commits it holds, so `--abandoned` deletes them and journals each deletion in the project's deletion log as `remove-abandoned-bundle`. `--dry-run --abandoned` lists them with their real allocated bytes first.",
         "A bare mountpoint whose only entry is root's `0700` `.fseventsd` is retained aside by an atomic, same-parent `.root-held-<uuid>` rename instead of deleting privileged debris. A mounted filesystem, symlink substitution, rename collision or another entry (hidden included) is never overwritten or moved. The retained log is named with a quoted privileged cleanup hint in `deferred`; it does not fail collection or make doctor unhealthy. Dry-run and doctor report it as information without renaming.",
         "Also collects build volumes no checkout links and superseded seeds. A running job's shared hold or an unfinished create/fork in the lifecycle intent journal defers release; otherwise a refused unforced unmount gets bounded grace, then is forced if needed, naming each initial holder's pid and command. Both gc and opportunistic collection in rm/land say why they skip volumes, and one failed release does not hide later candidates. Dry-run reports these reasons without changing any mount or image.",
         "`--recover <image> --to <dir>` is the one way a recovery image leaves the store. A removal that could not prove every source byte held elsewhere — a forced dirty or in-progress tree, abandoned commits, or an untracked file the target checkout lacks — keeps the complete image as `sessions/.trash/<ws>-<incarnation>.dmg`; no gc reclaims one, and removing the whole project refuses while one remains. It moves the image, its grants sidecar and CA companion into `<dir>/<ws>-<incarnation>/` beside a `recovery.json` manifest naming the project, workspace, incarnation and why the removal kept it, and deletes nothing. The directory must be outside the store, on the store's filesystem; a retry after an interruption finishes the same move.",
-        "Every gc also retires the refs `rm --abandon` keeps in main's repository, `refs/cowshed/<ws>/abandoned/<head>/`, once main holds every tip by ancestry, content or patch identity — the measurement `rm` uses, so a cherry-pick, squash or conflict-resolved pick counts — and journals each in the project's deletion log as `retire-abandoned-ref`. Every other abandonment is kept and named with how many commits main does not hold, here, in `doctor` and in `ls --all`. Its owner lets one go with `--supersede <ws>/<head> --reason <one line>`, and the reason is journaled; nothing else ever deletes those refs.",
     ],
     options: &[
         Opt {
@@ -3859,15 +3852,7 @@ const GC: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--abandoned",
-            meaning: "also reclaim the `sessions/.trash/<ws>-<tip>.bundle` files `rm --abandon` kept, after keeping each one's tips in main's repository under `refs/cowshed/<ws>/abandoned/<head>/`; they are reclaimed only when you ask",
-        },
-        Opt {
-            spelling: "--supersede <ws>/<head>",
-            meaning: "retire the abandoned refs `refs/cowshed/<ws>/abandoned/<head>/` though main does not hold them, recording why in the project's deletion log; requires --reason",
-        },
-        Opt {
-            spelling: "--reason <one line>",
-            meaning: "why the work --supersede names is no longer needed: one line, not blank",
+            meaning: "also delete the `sessions/.trash/<ws>-<tip>.bundle` files `rm --abandon` wrote; each is the only copy of the commits it holds, so they are deleted only when you ask, and each deletion is journaled as `remove-abandoned-bundle`",
         },
         Opt {
             spelling: "--recover <image>",
@@ -3882,46 +3867,6 @@ const GC: CommandSpec = CommandSpec {
 
 fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &GC;
-    let supersede = match (os(matches, "supersede"), os(matches, "reason")) {
-        (None, None) => None,
-        (Some(_), None) => {
-            return Err(UsageError::new(
-                "--supersede needs --reason: say in one line why the work is no longer needed",
-                USAGE,
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(UsageError::new(
-                "--reason only explains a --supersede",
-                USAGE,
-            ));
-        }
-        (Some(namespace), Some(reason)) => {
-            let namespace = namespace
-                .to_str()
-                .ok_or_else(|| UsageError::new("--supersede names <ws>/<head> in UTF-8", USAGE))?;
-            let (workspace, head) = namespace.split_once('/').ok_or_else(|| {
-                UsageError::new(
-                    format!("--supersede names <ws>/<head>, got `{namespace}`"),
-                    USAGE,
-                )
-            })?;
-            let reason = reason
-                .into_string()
-                .map_err(|_| UsageError::new("--reason must be UTF-8", USAGE))
-                .and_then(|reason| {
-                    SupersededReason::new(reason)
-                        .map_err(|error| UsageError::new(error.to_string(), USAGE))
-                })?;
-            Some(AbandonedRefSupersession {
-                workspace: WorkspaceName::new(workspace)
-                    .map_err(|error| UsageError::new(error.to_string(), USAGE))?,
-                head: GitOid::new(head.to_owned())
-                    .map_err(|error| UsageError::new(error.to_string(), USAGE))?,
-                reason,
-            })
-        }
-    };
     let recover = match (os(matches, "recover"), os(matches, "to")) {
         (None, None) => None,
         (Some(_), None) => {
@@ -3937,9 +3882,9 @@ fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
             ));
         }
         (Some(image), Some(to)) => {
-            if supersede.is_some() || flagged(matches, "dry-run") || flagged(matches, "abandoned") {
+            if flagged(matches, "dry-run") || flagged(matches, "abandoned") {
                 return Err(UsageError::new(
-                    "--recover moves one recovery image and collects nothing: it takes no --dry-run, --abandoned or --supersede",
+                    "--recover moves one recovery image and collects nothing: it takes no --dry-run or --abandoned",
                     USAGE,
                 ));
             }
@@ -3952,7 +3897,6 @@ fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Gc(GcArgs {
         dry_run: flagged(matches, "dry-run"),
         abandoned: flagged(matches, "abandoned"),
-        supersede,
         recover,
     }))
 }
@@ -4059,6 +4003,7 @@ const LAND: CommandSpec = CommandSpec {
         "The whole close-out as one primitive: run the checks inside the sandbox, fast-forward main's checkout to the workspace's branch, retire the workspace. The target must be the branch main's checkout has checked out, and a dirty tree is refused before the checks run, since they see the working tree but only the commit lands. A gated land does not rebase: when main has moved past the workspace's base, the fast-forward is refused and `cowshed rebase <ws>` is the next step. Any step that fails before the fast-forward leaves the workspace intact; a retire refused after it says what landed, and the next step is `cowshed rm`.",
         "Before running any --check command, land synchronizes the gateway with current workspace grants. If synchronization fails, no check runs and the target branch is unchanged. Landing without --check does not require this preflight.",
         "Landing is also what `rm` measures against: the ancestry gate a removal enforces is satisfied by the branch this command delivers to.",
+        "A land that retires its unit also retires the sessions it folded: each session whose own changes touch a path the landed range changed, and whose work the landed tip holds as `rm` measures it. A folded session's live owner is spared, never stopped, and a folded session with a dirty tree is kept. Each folded session is reported in `folded` with its outcome, `retired` or `kept` with why. A land with --no-retire folds nothing.",
         "An adopted build volume is renamed `[cowshed] <project> — build <target>` in the background. The target's previous volume is released before land returns, including with --no-retire, unless a running job's hold owns it. Release uses an unforced unmount with bounded grace, then force if needed, naming initial holders and every collection deferral. Seeds are never mounted or named: mounting one just to rename it would advance the image mtime used for seed freshness.",
         "With `--into <lane>`, the unit lands into the lane base <lane> instead of main: the lane base's checked-out branch is fast-forwarded, and the unit retires once the lane base holds its commits. The lane itself reaches main with `cowshed rebase <lane>` and `cowshed land <lane>`.",
         "With `--into <lane> --ungated`, the fold is Git alone and one command: land first rebases the unit onto the branch the lane base has checked out, as `cowshed rebase <ws> --into <lane> --ungated` does, and a unit already based on that branch lands as it is, with nothing fetched or replayed. A conflict stops the land before anything moves, leaves the unit as it was and names the conflicted paths. --expected-source-head names the head before that rebase; the landed head is reported. Then no check, no Nx cache initialization, carry, seed freeze or build-volume adoption. The lane base keeps its build volume and seed, and the unit's volume is released with the unit. Only a land into main gates, so main refuses `--ungated`.",
@@ -4323,55 +4268,6 @@ mod tests {
             "CacheClearReport",
         ] {
             assert!(page.contains(fact), "missing {fact}: {page}");
-        }
-    }
-
-    #[test]
-    fn gc_supersedes_one_named_abandonment_only_with_a_one_line_reason() {
-        let head = "1".repeat(40);
-        let namespace = format!("raven/{head}");
-        assert_eq!(
-            parse_args([
-                "gc",
-                "--supersede",
-                &namespace,
-                "--reason",
-                "replaced by the rewrite"
-            ])
-            .unwrap()
-            .command,
-            Command::Gc(GcArgs {
-                supersede: Some(AbandonedRefSupersession {
-                    workspace: WorkspaceName::new("raven").unwrap(),
-                    head: GitOid::new(head.clone()).unwrap(),
-                    reason: SupersededReason::new("replaced by the rewrite").unwrap(),
-                }),
-                ..GcArgs::default()
-            })
-        );
-        for refused in [
-            &["gc", "--supersede", &namespace][..],
-            &["gc", "--reason", "replaced"],
-            &["gc", "--supersede", &namespace, "--reason", ""],
-            &["gc", "--supersede", &namespace, "--reason", "  \t"],
-            &["gc", "--supersede", &namespace, "--reason", "two\nlines"],
-            &["gc", "--supersede", "raven", "--reason", "replaced"],
-            &[
-                "gc",
-                "--supersede",
-                "raven/not-an-oid",
-                "--reason",
-                "replaced",
-            ],
-            &[
-                "gc",
-                "--supersede",
-                &format!("not/a/name/{head}"),
-                "--reason",
-                "replaced",
-            ],
-        ] {
-            assert!(parse_args(refused).is_err(), "{refused:?}");
         }
     }
 

@@ -74,7 +74,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
     lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
-    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released, one per workspace retired (naming the process that retired it and what a force overrode) and per abandon bundle kept and per abandoned ref retired, with Git tips (storage/deletion_log.rs)
+    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released, one per workspace retired (naming the process that retired it, what a force overrode and, for an abandonment, the bundle that keeps its tips), with Git tips (storage/deletion_log.rs)
     main.dmg                         # adopted main image (created here behind a PendingFence sidecar)
     main.dmg.grants.json             # controller-owned grants + detached metadata
     main.dmg.ca.key                  # main's workspace CA private key, 0600
@@ -258,9 +258,9 @@ It takes one workspace at a time: the lease, then that workspace's work, taking 
 lock it finds held makes it let go of the lease, say on stderr which lock and holder it waits for, and wait for that
 lock alone. Then it tries the lease again and reads the journal and the store afresh before it acts, because the
 operation's owner, or a verb run on the name meanwhile, may have finished it. The wait takes a proof that no lease is
-held (`storage::recovery::Unleased`), which only letting go of every lease yields. Measured 2026-10-22: `gc --supersede`
-took the intent leases of nine unfinished forks, then waited 18 minutes for `main.dmg.lock` behind another process, and
-every fork of those names was refused as running in another process.
+held (`storage::recovery::Unleased`), which only letting go of every lease yields. Measured 2026-10-22: a `gc` took the
+intent leases of nine unfinished forks, then waited 18 minutes for `main.dmg.lock` behind another process, and every
+fork of those names was refused as running in another process.
 
 ### In-image marker: `.cowshed/workspace.json`
 
@@ -340,8 +340,7 @@ that `gc` and failed verbs release) and provably dead scratch, never idle worksp
 | Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**          | landing/removal is always explicit                                                                                                                                           |
 | Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are released to `.deleting`, not here    |
 | Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background | each is handed to the gateway's `image-cleanup` queue, which lists leftovers at its start (05_gateway.md); no verb frees it: `rm`, `land` and `gc` only commit and hand over |
-| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository      | explicit `cowshed gc --abandoned`                                                                                                                                            |
-| Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry, content or patch identity | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                                                                                                     |
+| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; the bundle is the only copy of the commits it holds        | explicit `cowshed gc --abandoned`                                                                                                                                            |
 | Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`   | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                                                                                     |
 
 - `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
@@ -369,30 +368,13 @@ that `gc` and failed verbs release) and provably dead scratch, never idle worksp
 - Abandon bundles are regular `*.bundle` files directly in `sessions/.trash`; staged `.partial` siblings and symlinks
   are not bundle candidates. Plain `gc`, opportunistic collection, and `doctor --repair` never authorize their
   reclamation. Only explicit `--abandoned` (`GcOptions.abandoned: true`) adds the `abandonedBundle` category to the
-  exact plan. `gc --dry-run --abandoned` lists those candidates and their allocated bytes without deleting them.
-  Reclamation never loses the commits: before executing the plan, every bundle candidate's tips are fetched into main's
-  repository under the namespace its removal used, `refs/cowshed/<ws>/abandoned/<head>/` (02_workspaces.md, `rm` step 1;
-  the file name `<ws>-<head>.bundle` names both), and journaled as a `keep-abandoned-tips` deletion-log line on the
-  bundle's path naming that repository and each ref; each kept tip is also said on stderr. A removal by this build
-  already kept them; a bundle an earlier build wrote, whose removal record says `predatesPreservation`, gets them here.
-  A purge keeps them the same way before its main fetch fail refuses the whole sweep as a conflict naming each, before
-  anything is deleted. Keeping them is never hiding them: a plain `gc` reports how many the trash keeps and their
-  allocated bytes, `doctor` reports them as an `abandon-bundles` info finding, and `ls --all` names each project's after
-  its table. Naming them authorizes nothing; the plain sweep's own plan still never holds one.
-- Abandoned refs are retired by every `gc` once main holds them, so main's repository keeps no ref for work it already
-  has. Each `refs/cowshed/<ws>/abandoned/<head>/` namespace's tips are measured as the `rm` gate measures a branch
-  (02_workspaces.md, `rm` step 1): an ancestor of main's branch, or each of its commits held by content (every file it
-  changes already as main has it, whatever history or conflict resolution got it there) or by a patch-equivalent commit
-  of main. A namespace main holds every tip of is deleted ref by ref (`update-ref -d <ref> <tip>`, so a ref moved since
-  it was measured is refused, never lost) and journaled as one `retire-abandoned-ref` deletion-log line naming each tip
-  and the branch and head that hold it (`{"by":"target",…}`). Every other namespace is kept: `gc` reports it, `doctor`
-  names it as an `abandoned-refs` info finding with each tip's count of commits main does not hold, and `ls --all` names
-  it after its table. Its owner lets one go with `cowshed gc --supersede <ws>/<head> --reason "<one line>"`, which
-  retires that namespace whatever main holds and journals the reason (`{"by":"superseded","reason":…}`); a blank,
-  whitespace-only or multi-line reason, or a namespace main's repository does not keep, is refused. `--dry-run` reports
-  both and deletes nothing. When main's repository cannot be measured, nothing is retired and the report says why; a
-  supersession then refuses. A ref under an `abandoned/` namespace that no abandonment writes is reported and never
-  touched.
+  exact plan. `gc --dry-run --abandoned` lists those candidates and their allocated bytes without deleting them. The
+  bundle is the only copy of the commits it holds: no removal and no sweep writes them into main's repository, so
+  `--abandoned` is the operator's authorization to lose them, and each bundle it deletes is journaled as a
+  `remove-abandoned-bundle` deletion-log line. A purge with `--abandon` deletes them the same way. Keeping them is never
+  hiding them: a plain `gc` reports how many the trash keeps and their allocated bytes, `doctor` reports them as an
+  `abandon-bundles` info finding, and `ls --all` names each project's after its table. Naming them authorizes nothing;
+  the plain sweep's own plan still never holds one.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
   trash image and empty mountpoint, each image released for background deletion (05_gateway.md, "Deleting released

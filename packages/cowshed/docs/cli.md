@@ -656,11 +656,11 @@ it (absent when the recorded creation cannot be read). `cowshed land` retiring t
 refused for its age.
 
 `--abandon` has no short spelling, and it is the only way to delete unlanded commits. Before deleting, it writes a Git
-bundle of `main..HEAD` beside the retired image in `sessions/.trash/<ws>-<tip>.bundle`, keeps the bundle's tips in
-main's repository as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and `…/heads/<branch>`, and prints what it destroyed and
-where it is kept, so even a deliberate abandonment is recoverable from main itself. The project's `deletion-log.jsonl`
-records every retirement's head and branch tips with the ref or target that keeps each, and who retired the workspace:
-the `cowshed` process and its parent, each by pid and argv, and for a forced removal every guard the force overrode:
+bundle of `main..HEAD` beside the retired image in `sessions/.trash/<ws>-<tip>.bundle` and prints what it destroyed and
+where it is kept. That bundle is the only copy: nothing is written into main's repository. The project's
+`deletion-log.jsonl` records every retirement's head and branch tips with the bundle or target that keeps each, and who
+retired the workspace: the `cowshed` process and its parent, each by pid and argv, and for a forced removal every guard
+the force overrode:
 
 ```
 $ cowshed rm raven
@@ -670,15 +670,14 @@ next: land the workspace: cowshed land raven
 
 $ cowshed rm raven --abandon
 cowshed: abandoned 9 commits at 9b2e77d… that main (at 6f3a2c1…) did not contain
-cowshed: kept HEAD at 9b2e77d… in main as refs/cowshed/raven/abandoned/9b2e77d…/HEAD
 cowshed: bundled to /private/cowshed/store/acme/api/sessions/.trash/raven-9b2e77d….bundle
 next: cowshed gc   # free space from old checkpoints too
 ```
 
-Recover abandoned work from main's repository:
+Recover abandoned work from the bundle:
 
 ```sh
-git branch recovered-raven refs/cowshed/raven/abandoned/<head>/HEAD
+git fetch /private/cowshed/store/acme/api/sessions/.trash/raven-<head>.bundle HEAD:recovered-raven
 ```
 
 Bundle verification uses a temporary bare repository, and the bundle is staged beside its final name until it verifies.
@@ -686,10 +685,7 @@ Interrupting `rm --abandon` removes both before the command exits; a retry reval
 
 Bundles stay until `cowshed gc --abandoned`, but they are never out of sight: a plain `cowshed gc` says how many the
 trash keeps and their bytes, `cowshed doctor` reports them as an `abandon-bundles` finding, and `cowshed ls --all` names
-each project's after its table. `gc --abandoned` keeps each bundle's tips in main the same way before deleting it —
-including a bundle an older cowshed left without refs — and refuses, deleting nothing, when one cannot be kept. The refs
-in main go when main holds every tip — any `cowshed gc` retires them then — or when you supersede the work
-(`cowshed gc`, below).
+each project's after its table. `gc --abandoned` deletes them, and with them the only copy of their commits.
 
 `cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
 Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
@@ -1295,6 +1291,15 @@ when retirement is left at its default. Its text output is the preservation ref 
 `kind: delivered` with the existing push-report fields. An ordinary land returns `kind: landed` with its target,
 build-volume and retirement report.
 
+A land that retires its workspace then retires every workspace it folded: a train that cherry-picked units, resolving
+conflicts and fixing review findings on the way, lands work none of whose commits are a unit's own, so no unit could
+retire by its own land. A workspace is folded when its own changes touch a path the landed range changes and the target
+now holds it, measured as `rm` measures it. Each is retired as `rm` would retire it, except that its age is not asked
+and a live owner is spared instead of waited for: a job its supervisor runs, an open shell session, or a process holding
+its checkout keeps it. A dirty folded workspace is kept too. The report's `folded` names each with its outcome
+(`retired`, or `kept` with why), and stderr says the same; a kept fold never fails the land, and a later `rm` retires
+it. Work the target does not hold is never folded. `--no-retire` folds nothing.
+
 `--ungated`, with `--into <lane>`, folds a unit into its lane base by Git alone: no check, no Nx cache initialization,
 carry, seed freeze or build-volume adoption. First it rebases the unit onto the lane base's checked-out branch, as
 `rebase --into <lane> --ungated` does; a unit whose head already holds that branch's tip is based on it and lands as it
@@ -1775,19 +1780,6 @@ instead ([APFS ownership](../../../specs/cowshed/01a_apfs.md#ownership-identity-
 Releases retired and orphaned images for background deletion, removes stale mountpoint dirs, prunes expired checkpoints,
 and reports the allocated bytes of the images it released, not bytes freed: their deletions free the space after the
 command returns. Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
-
-Every `gc` also retires the refs `rm --abandon` kept in main, `refs/cowshed/<ws>/abandoned/<head>/`, once main holds
-every tip, by ancestry, content or patch identity: a cherry-pick, a squash or a pick whose conflict was resolved counts,
-as it does for `rm`. Each retirement is a `retire-abandoned-ref` line in the project's deletion log. `gc` keeps the rest
-and names each with how many commits main does not hold; `cowshed doctor` reports them as `abandoned-refs` findings and
-`cowshed ls --all` after its table. When that work is no longer wanted, say why and let it go:
-
-```sh
-cowshed gc --supersede raven/<head> --reason "rewritten as the gate refactor"
-```
-
-The reason is one line and may not be blank; the deletion log records it beside each tip. `--dry-run` reports what would
-be retired and deletes nothing.
 
 A removal that could not prove every source byte held elsewhere — a forced dirty or in-progress tree, abandoned commits,
 or an untracked file no ignore rule covers and main's checkout lacks — keeps the complete image as a recovery image,

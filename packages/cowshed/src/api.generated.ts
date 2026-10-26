@@ -2,81 +2,25 @@
 import type { tags } from 'typia';
 
 /**
- * What main's repository keeps of an abandonment's tips.
+ * What keeps an abandonment's tips besides its bundle.
  *
  * Three facts are kept apart, because each tells a reader something else about where the
- * commits are: refs main keeps, nothing to keep because main itself is what was abandoned, and a
- * record from a build that kept no refs and so never recorded any.
+ * commits are: the bundle alone, main itself being what was abandoned, and the refs an earlier
+ * build also wrote into main's repository.
  */
 export type AbandonedPreservation =
   | ({ readonly kind: 'preserved' } & {
       readonly refs: ReadonlyArray<PreservedRef>;
     })
   | { readonly kind: 'nothingToPreserve' }
-  | { readonly kind: 'predatesPreservation' };
-
-/**
- * What lets an abandonment's refs go.
- */
-export type AbandonedRefRetirement =
-  | ({ readonly kind: 'landed' } & {
-      readonly targetBranch: string;
-      readonly targetHead: GitOid;
-    })
-  | ({ readonly kind: 'superseded' } & {
-      readonly reason: SupersededReason;
-    });
-
-/**
- * `gc --supersede <workspace>/<head> --reason <one line>`: retire that abandonment's refs though main
- * does not hold them, recording why.
- */
-export type AbandonedRefSupersession = {
-  readonly workspace: WorkspaceName;
-  readonly head: GitOid;
-  readonly reason: SupersededReason;
-};
-
-/**
- * What one `gc` did with the abandonments main's repository keeps: those it retired (or, in a dry
- * run, would retire), those it kept because main does not hold them, and refs under an
- * `abandoned/` namespace it could not read as one, which it never touches.
- */
-export type AbandonedRefSweep = {
-  readonly retired: ReadonlyArray<RetiredAbandonedRefs>;
-  readonly kept: ReadonlyArray<AbandonedRefs>;
-  readonly unreadable?: ReadonlyArray<string>;
-  /**
-   * Why main's repository could not be measured at all; nothing was retired.
-   */
-  readonly unmeasured?: string;
-};
-
-/**
- * One abandonment's tips as main's repository keeps them, under
- * `refs/cowshed/<workspace>/abandoned/<head>/`, each measured against main the way `rm` measures a
- * branch (02_workspaces.md, `rm` step 1).
- */
-export type AbandonedRefs = {
-  readonly workspace: WorkspaceName;
-  readonly head: GitOid;
-  readonly tips: ReadonlyArray<AbandonedTip>;
-};
-
-/**
- * One kept tip and what main holds of it.
- */
-export type AbandonedTip = {
-  readonly kept: PreservedRef;
-  readonly commits: LandingCommits;
-};
+  | { readonly kind: 'bundleOnly' };
 
 /**
  * The commits a `--abandon` removal destroyed, and where they are kept.
  *
  * Every field is what a reader needs to *undo* the abandonment: the tip that is gone, the branch
- * it never reached and where that branch stood, how much history went with it, the refs main's
- * repository keeps it under, and the bundle to fetch from.
+ * it never reached and where that branch stood, how much history went with it, and the bundle to
+ * fetch from, which is the only copy.
  */
 export type AbandonedWork = {
   readonly head: GitOid;
@@ -91,9 +35,9 @@ export type AbandonedWork = {
    */
   readonly branches?: ReadonlyArray<BranchLanding>;
   /**
-   * What keeps the abandoned tips besides the bundle (02_workspaces.md, `rm` step 1). A record
-   * without the field is one a build before preserved refs wrote: it reads as
-   * [`AbandonedPreservation::PredatesPreservation`] and is written back without the field.
+   * What keeps the abandoned tips besides the bundle (02_workspaces.md, `rm` step 1): nothing
+   * for a session's abandonment, which writes the field as absent and reads that absence as
+   * [`AbandonedPreservation::BundleOnly`].
    */
   readonly preserved?: AbandonedPreservation;
   readonly bundle: string;
@@ -1217,6 +1161,37 @@ export type Finding = {
 
 export type FindingSeverity = 'info' | 'warning' | 'error';
 
+/**
+ * Why a folded session was kept: it is the next `rm`'s, or the next land's that touches it.
+ */
+export type FoldKept =
+  | ({ readonly kind: 'dirty' } & {
+      readonly files: number & tags.Type<'uint64'>;
+    })
+  | ({ readonly kind: 'refused' } & {
+      readonly code: ErrorCode;
+      readonly message: string;
+    });
+
+/**
+ * What the land did with a folded session.
+ */
+export type FoldOutcome =
+  | { readonly kind: 'retired' }
+  | ({ readonly kind: 'kept' } & {
+      readonly reason: FoldKept;
+    });
+
+/**
+ * A session a land folded: its own change touched a path the landed range changed, and the
+ * target now holds it by `rm`'s measurement (02_workspaces.md, `land` step 5, "Folds").
+ */
+export type FoldedWorkspace = {
+  readonly workspace: WorkspaceName;
+  readonly head: GitOid;
+  readonly outcome: FoldOutcome;
+};
+
 export type ForkCommitment = {
   readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly order: number & tags.Type<'uint64'>;
@@ -1354,14 +1329,10 @@ export type GcDeferred = {
 export type GcOptions = {
   readonly dryRun?: boolean;
   /**
-   * Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle` —
-   * once main's repository keeps each one's tips (01_storage.md). Never implied.
+   * Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle`,
+   * the only copy of their commits (01_storage.md). Never implied.
    */
   readonly abandoned?: boolean;
-  /**
-   * Retire one abandonment's refs though main does not hold them, recording the reason.
-   */
-  readonly supersede?: AbandonedRefSupersession;
 };
 
 export type GcReason =
@@ -1389,11 +1360,6 @@ export type GcReport = {
   readonly dryRun: boolean;
   readonly candidates: ReadonlyArray<GcCandidate>;
   readonly deferred: ReadonlyArray<GcDeferred>;
-  /**
-   * The abandonments main's repository keeps under `refs/cowshed/<ws>/abandoned/`: every sweep
-   * retires those main holds (02_workspaces.md, `rm` step 1).
-   */
-  readonly abandonedRefs: AbandonedRefSweep;
 };
 
 export type GcRequest = {
@@ -2228,6 +2194,11 @@ export type LandedReport = {
    * What the land did with build volumes (16_build_volumes.md, Land steps 4–7).
    */
   readonly buildVolume: LandBuildVolume;
+  /**
+   * The sessions the land folded (02_workspaces.md, `land` step 5, "Folds"), each retired or
+   * kept; empty when it retired nothing of its own.
+   */
+  readonly folded: ReadonlyArray<FoldedWorkspace>;
 };
 
 /**
@@ -2622,7 +2593,7 @@ export type PortBlock = {
 };
 
 /**
- * One tip an abandonment kept in main's repository.
+ * One tip an earlier build's abandonment kept in main's repository.
  */
 export type PreservedRef = {
   /**
@@ -3284,16 +3255,6 @@ export type RetireDescendantsRequest = {
 };
 
 /**
- * An abandonment `gc` retired from main's repository, and what authorized it.
- */
-export type RetiredAbandonedRefs = {
-  readonly workspace: WorkspaceName;
-  readonly head: GitOid;
-  readonly refs: ReadonlyArray<PreservedRef>;
-  readonly by: AbandonedRefRetirement;
-};
-
-/**
  * Why a `Conflict` is safe to retry unchanged: the call planned against state a concurrent
  * operation changed before it acted, and changed nothing itself. Retrying is the remedy; no
  * other repair is needed.
@@ -3608,12 +3569,6 @@ export type StreamInfoRef = {
  * no `\n` ended.
  */
 export type StreamLines = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
-
-/**
- * Why an abandonment's kept tips no longer need keeping, said by their owner: one line, not blank.
- * It is the record a `gc --supersede` leaves in the deletion log for commits main never held.
- */
-export type SupersededReason = string;
 
 /**
  * The workspace supervisors that served before the daemon started and that it has not finished

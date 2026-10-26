@@ -128,7 +128,8 @@ pub(crate) enum CopyCheckpoint {
 pub enum NotRecoveryImage {
     /// Not an entry directly in this project's trash, `trash`.
     OutsideTrash { trash: PathBuf },
-    /// One of the trash's `rm --abandon` bundles: commits, which `gc --abandoned` keeps in main.
+    /// One of the trash's `rm --abandon` bundles: the only copy of its commits, which
+    /// `gc --abandoned` deletes.
     AbandonBundle,
     /// In the trash, but not named `<workspace>-<incarnation>.dmg` as a retirement names one.
     Unnamed,
@@ -150,7 +151,7 @@ impl NotRecoveryImage {
                     "{} is an rm --abandon bundle, not a recovery image",
                     image.display()
                 ),
-                "cowshed gc --abandoned keeps a bundle's commits in main's repository before it reclaims the bundle",
+                "the bundle is the only copy of its commits: cowshed gc --abandoned deletes it",
             ),
             Self::Unnamed => CowshedError::usage(
                 format!(

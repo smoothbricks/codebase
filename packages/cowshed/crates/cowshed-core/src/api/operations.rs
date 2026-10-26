@@ -319,6 +319,7 @@ operations! {
     coordinator json "coordinator.rebase" CoordinatorRebase(RebaseRequest) -> RebaseReport;
     /// Lands a workspace into its target.
     coordinator json "coordinator.land" CoordinatorLand(LandRequest) -> LandReport;
+
     /// Restores a workspace to a checkpoint.
     coordinator json "coordinator.restore" CoordinatorRestore(RestoreRequest) -> EmptyResult;
     /// Grows a workspace's image or build volume.

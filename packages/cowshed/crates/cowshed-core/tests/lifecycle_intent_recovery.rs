@@ -138,7 +138,7 @@ fn a_journal_an_earlier_build_wrote_reads_as_predating_and_is_written_back_as_it
         let abandoned = report.abandoned.as_ref().expect("an abandonment");
         assert_eq!(
             abandoned.preserved,
-            AbandonedPreservation::PredatesPreservation,
+            AbandonedPreservation::BundleOnly,
             "{name}"
         );
         for branch in &abandoned.branches {

@@ -19,7 +19,7 @@ use cowshed_core::api::dto::{
     DoctorReport, ExecClass, ExecCommand, ExecRequest, ExecScope, Finding, FindingSeverity,
     ForkOptions, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo,
     JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions, LandReport,
-    MirrorInfo, PortBlock, PreservedRef, PushOptions, PushReport, RebaseOptions, RemoveOptions,
+    MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
     RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
@@ -1096,16 +1096,7 @@ impl ProjectRuntimeHost for FakeHost {
                     target_head: Some(GitOid::new("1".repeat(40)).expect("fixed tip")),
                     unlanded_commits: 3,
                     branches: Vec::new(),
-                    preserved: AbandonedPreservation::Preserved {
-                        refs: vec![PreservedRef {
-                            name: "HEAD".to_owned(),
-                            tip: GitOid::new("4".repeat(40)).expect("fixed head"),
-                            reference: format!(
-                                "refs/cowshed/{workspace}/abandoned/{}/HEAD",
-                                "4".repeat(40)
-                            ),
-                        }],
-                    },
+                    preserved: AbandonedPreservation::BundleOnly,
                     bundle: self.descriptor.storage.store().join(format!(
                         "sessions/.trash/{workspace}-{}.bundle",
                         "4".repeat(40)
@@ -1152,7 +1143,6 @@ impl ProjectRuntimeHost for FakeHost {
             dry_run: options.dry_run,
             candidates: Vec::new(),
             deferred: Vec::new(),
-            abandoned_refs: Default::default(),
         })
     }
 
@@ -1278,6 +1268,7 @@ impl ProjectRuntimeHost for FakeHost {
             previous_target_head: None,
             target_was_checked_out: true,
             retired: false,
+            folded: Vec::new(),
             build_volume: cowshed_core::api::dto::LandBuildVolume {
                 seed: cowshed_core::api::dto::LandSeed::Unchanged,
                 adoption: cowshed_core::api::dto::Adoption::Skipped {

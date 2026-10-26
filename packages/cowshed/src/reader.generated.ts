@@ -8,15 +8,9 @@ import * as V from './validators.generated.js';
 
 type ReaderName =
   | 'ABANDONED_PRESERVATION'
+  | 'ABANDONED_PRESERVATION__BUNDLE_ONLY'
   | 'ABANDONED_PRESERVATION__NOTHING_TO_PRESERVE'
-  | 'ABANDONED_PRESERVATION__PREDATES_PRESERVATION'
   | 'ABANDONED_PRESERVATION__PRESERVED'
-  | 'ABANDONED_REFS'
-  | 'ABANDONED_REF_RETIREMENT'
-  | 'ABANDONED_REF_RETIREMENT__LANDED'
-  | 'ABANDONED_REF_RETIREMENT__SUPERSEDED'
-  | 'ABANDONED_REF_SWEEP'
-  | 'ABANDONED_TIP'
   | 'ABANDONED_WORK'
   | 'ADOPTION'
   | 'ADOPTION_CHECK'
@@ -71,6 +65,7 @@ type ReaderName =
   | 'EGRESS_MODE'
   | 'EGRESS_RULE'
   | 'EMPTY_RESULT'
+  | 'ERROR_CODE'
   | 'EXEC_CLASS'
   | 'EXEC_SCOPE'
   | 'EXIT_STATUS'
@@ -85,6 +80,13 @@ type ReaderName =
   | 'FD_IDENTITY__INODE'
   | 'FINDING'
   | 'FINDING_SEVERITY'
+  | 'FOLDED_WORKSPACE'
+  | 'FOLD_KEPT'
+  | 'FOLD_KEPT__DIRTY'
+  | 'FOLD_KEPT__REFUSED'
+  | 'FOLD_OUTCOME'
+  | 'FOLD_OUTCOME__KEPT'
+  | 'FOLD_OUTCOME__RETIRED'
   | 'GATEWAY_CPU_BUDGET'
   | 'GATEWAY_STATUS'
   | 'GC_CANDIDATE'
@@ -225,15 +227,12 @@ type ReaderName =
   | 'RESEED_RESULT'
   | 'RESIZE_RESULT'
   | 'RESIZE_VOLUME'
-  | 'RETIRED_ABANDONED_REFS'
   | 'RE_ADOPTION'
   | 'SCCACHE_STATS'
   | 'SCCACHE_STATUS'
   | 'SCRIPT_COMMAND'
   | 'SCRIPT_VALUE'
   | 'SEALED_JOB_REF'
-  | 'SEQ__ABANDONED_REFS'
-  | 'SEQ__ABANDONED_TIP'
   | 'SEQ__BOUND_IDENTITY'
   | 'SEQ__BRANCH_LANDING'
   | 'SEQ__BUILD_STATE_LINK'
@@ -253,6 +252,7 @@ type ReaderName =
   | 'SEQ__FD_HOLDER'
   | 'SEQ__FD_IDENTITY'
   | 'SEQ__FINDING'
+  | 'SEQ__FOLDED_WORKSPACE'
   | 'SEQ__GC_CANDIDATE'
   | 'SEQ__GC_DEFERRED'
   | 'SEQ__JOB_INFO_REF'
@@ -266,7 +266,6 @@ type ReaderName =
   | 'SEQ__PROJECT_WORKSPACES'
   | 'SEQ__RECOVERY_CAUSE'
   | 'SEQ__REMOVED_WORKSPACE'
-  | 'SEQ__RETIRED_ABANDONED_REFS'
   | 'SEQ__SCRIPT_VALUE'
   | 'SEQ__SIM_VERB'
   | 'SEQ__SKILL_INSTALL'
@@ -342,52 +341,12 @@ const READERS: Readers<ReaderName> = {
     arms: [
       ['preserved', 'ABANDONED_PRESERVATION__PRESERVED'],
       ['nothingToPreserve', 'ABANDONED_PRESERVATION__NOTHING_TO_PRESERVE'],
-      ['predatesPreservation', 'ABANDONED_PRESERVATION__PREDATES_PRESERVATION'],
+      ['bundleOnly', 'ABANDONED_PRESERVATION__BUNDLE_ONLY'],
     ],
   },
+  ABANDONED_PRESERVATION__BUNDLE_ONLY: { kind: 'record', fields: [] },
   ABANDONED_PRESERVATION__NOTHING_TO_PRESERVE: { kind: 'record', fields: [] },
-  ABANDONED_PRESERVATION__PREDATES_PRESERVATION: { kind: 'record', fields: [] },
   ABANDONED_PRESERVATION__PRESERVED: { kind: 'record', fields: [['refs', 'SEQ__PRESERVED_REF']] },
-  ABANDONED_REFS: {
-    kind: 'record',
-    fields: [
-      ['workspace', 'LEAF'],
-      ['head', 'LEAF'],
-      ['tips', 'SEQ__ABANDONED_TIP'],
-    ],
-  },
-  ABANDONED_REF_RETIREMENT: {
-    kind: 'internal',
-    tag: 'kind',
-    arms: [
-      ['landed', 'ABANDONED_REF_RETIREMENT__LANDED'],
-      ['superseded', 'ABANDONED_REF_RETIREMENT__SUPERSEDED'],
-    ],
-  },
-  ABANDONED_REF_RETIREMENT__LANDED: {
-    kind: 'record',
-    fields: [
-      ['targetBranch', 'LEAF'],
-      ['targetHead', 'LEAF'],
-    ],
-  },
-  ABANDONED_REF_RETIREMENT__SUPERSEDED: { kind: 'record', fields: [['reason', 'LEAF']] },
-  ABANDONED_REF_SWEEP: {
-    kind: 'record',
-    fields: [
-      ['retired', 'SEQ__RETIRED_ABANDONED_REFS'],
-      ['kept', 'SEQ__ABANDONED_REFS'],
-      ['unreadable', 'LEAF'],
-      ['unmeasured', 'LEAF'],
-    ],
-  },
-  ABANDONED_TIP: {
-    kind: 'record',
-    fields: [
-      ['kept', 'PRESERVED_REF'],
-      ['commits', 'LANDING_COMMITS'],
-    ],
-  },
   ABANDONED_WORK: {
     kind: 'record',
     fields: [
@@ -728,6 +687,18 @@ const READERS: Readers<ReaderName> = {
     ],
   },
   EMPTY_RESULT: { kind: 'record', fields: [] },
+  ERROR_CODE: {
+    kind: 'external',
+    arms: [
+      ['internal', 'LEAF'],
+      ['usage', 'LEAF'],
+      ['not-found', 'LEAF'],
+      ['conflict', 'LEAF'],
+      ['environment-missing', 'LEAF'],
+      ['sandbox-denied', 'LEAF'],
+      ['integrity', 'LEAF'],
+    ],
+  },
   EXEC_CLASS: {
     kind: 'external',
     arms: [
@@ -821,6 +792,40 @@ const READERS: Readers<ReaderName> = {
       ['error', 'LEAF'],
     ],
   },
+  FOLDED_WORKSPACE: {
+    kind: 'record',
+    fields: [
+      ['workspace', 'LEAF'],
+      ['head', 'LEAF'],
+      ['outcome', 'FOLD_OUTCOME'],
+    ],
+  },
+  FOLD_KEPT: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['dirty', 'FOLD_KEPT__DIRTY'],
+      ['refused', 'FOLD_KEPT__REFUSED'],
+    ],
+  },
+  FOLD_KEPT__DIRTY: { kind: 'record', fields: [['files', 'LEAF']] },
+  FOLD_KEPT__REFUSED: {
+    kind: 'record',
+    fields: [
+      ['code', 'ERROR_CODE'],
+      ['message', 'LEAF'],
+    ],
+  },
+  FOLD_OUTCOME: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['retired', 'FOLD_OUTCOME__RETIRED'],
+      ['kept', 'FOLD_OUTCOME__KEPT'],
+    ],
+  },
+  FOLD_OUTCOME__KEPT: { kind: 'record', fields: [['reason', 'FOLD_KEPT']] },
+  FOLD_OUTCOME__RETIRED: { kind: 'record', fields: [] },
   GATEWAY_CPU_BUDGET: {
     kind: 'external',
     arms: [
@@ -890,7 +895,6 @@ const READERS: Readers<ReaderName> = {
       ['dryRun', 'LEAF'],
       ['candidates', 'SEQ__GC_CANDIDATE'],
       ['deferred', 'SEQ__GC_DEFERRED'],
-      ['abandonedRefs', 'ABANDONED_REF_SWEEP'],
     ],
   },
   GRANT_SET: {
@@ -1223,6 +1227,7 @@ const READERS: Readers<ReaderName> = {
       ['targetWasCheckedOut', 'LEAF'],
       ['retired', 'LEAF'],
       ['buildVolume', 'LAND_BUILD_VOLUME'],
+      ['folded', 'SEQ__FOLDED_WORKSPACE'],
     ],
   },
   LANDING_COMMITS: {
@@ -1799,15 +1804,6 @@ const READERS: Readers<ReaderName> = {
       ['build', 'LEAF'],
     ],
   },
-  RETIRED_ABANDONED_REFS: {
-    kind: 'record',
-    fields: [
-      ['workspace', 'LEAF'],
-      ['head', 'LEAF'],
-      ['refs', 'SEQ__PRESERVED_REF'],
-      ['by', 'ABANDONED_REF_RETIREMENT'],
-    ],
-  },
   RE_ADOPTION: {
     kind: 'record',
     fields: [
@@ -1870,8 +1866,6 @@ const READERS: Readers<ReaderName> = {
       ['outlivedIncomplete', 'LEAF'],
     ],
   },
-  SEQ__ABANDONED_REFS: { kind: 'seq', element: 'ABANDONED_REFS' },
-  SEQ__ABANDONED_TIP: { kind: 'seq', element: 'ABANDONED_TIP' },
   SEQ__BOUND_IDENTITY: { kind: 'seq', element: 'BOUND_IDENTITY' },
   SEQ__BRANCH_LANDING: { kind: 'seq', element: 'BRANCH_LANDING' },
   SEQ__BUILD_STATE_LINK: { kind: 'seq', element: 'BUILD_STATE_LINK' },
@@ -1891,6 +1885,7 @@ const READERS: Readers<ReaderName> = {
   SEQ__FD_HOLDER: { kind: 'seq', element: 'FD_HOLDER' },
   SEQ__FD_IDENTITY: { kind: 'seq', element: 'FD_IDENTITY' },
   SEQ__FINDING: { kind: 'seq', element: 'FINDING' },
+  SEQ__FOLDED_WORKSPACE: { kind: 'seq', element: 'FOLDED_WORKSPACE' },
   SEQ__GC_CANDIDATE: { kind: 'seq', element: 'GC_CANDIDATE' },
   SEQ__GC_DEFERRED: { kind: 'seq', element: 'GC_DEFERRED' },
   SEQ__JOB_INFO_REF: { kind: 'seq', element: 'JOB_INFO_REF' },
@@ -1904,7 +1899,6 @@ const READERS: Readers<ReaderName> = {
   SEQ__PROJECT_WORKSPACES: { kind: 'seq', element: 'PROJECT_WORKSPACES' },
   SEQ__RECOVERY_CAUSE: { kind: 'seq', element: 'RECOVERY_CAUSE' },
   SEQ__REMOVED_WORKSPACE: { kind: 'seq', element: 'REMOVED_WORKSPACE' },
-  SEQ__RETIRED_ABANDONED_REFS: { kind: 'seq', element: 'RETIRED_ABANDONED_REFS' },
   SEQ__SCRIPT_VALUE: { kind: 'seq', element: 'SCRIPT_VALUE' },
   SEQ__SIM_VERB: { kind: 'seq', element: 'SIM_VERB' },
   SEQ__SKILL_INSTALL: { kind: 'seq', element: 'SKILL_INSTALL' },

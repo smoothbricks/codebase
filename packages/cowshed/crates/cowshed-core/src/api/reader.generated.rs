@@ -12,38 +12,12 @@ static ABANDONED_PRESERVATION: Reader = Reader::Internal {
             "nothingToPreserve",
             &ABANDONED_PRESERVATION__NOTHING_TO_PRESERVE,
         ),
-        (
-            "predatesPreservation",
-            &ABANDONED_PRESERVATION__PREDATES_PRESERVATION,
-        ),
+        ("bundleOnly", &ABANDONED_PRESERVATION__BUNDLE_ONLY),
     ],
 };
+static ABANDONED_PRESERVATION__BUNDLE_ONLY: Reader = Reader::Record(&[]);
 static ABANDONED_PRESERVATION__NOTHING_TO_PRESERVE: Reader = Reader::Record(&[]);
-static ABANDONED_PRESERVATION__PREDATES_PRESERVATION: Reader = Reader::Record(&[]);
 static ABANDONED_PRESERVATION__PRESERVED: Reader = Reader::Record(&[("refs", &SEQ__PRESERVED_REF)]);
-static ABANDONED_REFS: Reader = Reader::Record(&[
-    ("workspace", &LEAF),
-    ("head", &LEAF),
-    ("tips", &SEQ__ABANDONED_TIP),
-]);
-static ABANDONED_REF_RETIREMENT: Reader = Reader::Internal {
-    tag: "kind",
-    arms: &[
-        ("landed", &ABANDONED_REF_RETIREMENT__LANDED),
-        ("superseded", &ABANDONED_REF_RETIREMENT__SUPERSEDED),
-    ],
-};
-static ABANDONED_REF_RETIREMENT__LANDED: Reader =
-    Reader::Record(&[("targetBranch", &LEAF), ("targetHead", &LEAF)]);
-static ABANDONED_REF_RETIREMENT__SUPERSEDED: Reader = Reader::Record(&[("reason", &LEAF)]);
-static ABANDONED_REF_SWEEP: Reader = Reader::Record(&[
-    ("retired", &SEQ__RETIRED_ABANDONED_REFS),
-    ("kept", &SEQ__ABANDONED_REFS),
-    ("unreadable", &LEAF),
-    ("unmeasured", &LEAF),
-]);
-static ABANDONED_TIP: Reader =
-    Reader::Record(&[("kept", &PRESERVED_REF), ("commits", &LANDING_COMMITS)]);
 static ABANDONED_WORK: Reader = Reader::Record(&[
     ("head", &LEAF),
     ("targetBranch", &LEAF),
@@ -247,6 +221,15 @@ static EGRESS_MODE: Reader = Reader::External(&[("intercept", &LEAF), ("opaque",
 static EGRESS_RULE: Reader =
     Reader::Record(&[("host", &LEAF), ("ports", &LEAF), ("mode", &EGRESS_MODE)]);
 static EMPTY_RESULT: Reader = Reader::Record(&[]);
+static ERROR_CODE: Reader = Reader::External(&[
+    ("internal", &LEAF),
+    ("usage", &LEAF),
+    ("not-found", &LEAF),
+    ("conflict", &LEAF),
+    ("environment-missing", &LEAF),
+    ("sandbox-denied", &LEAF),
+    ("integrity", &LEAF),
+]);
 static EXEC_CLASS: Reader = Reader::External(&[
     ("background", &LEAF),
     ("interactive", &LEAF),
@@ -293,6 +276,29 @@ static FINDING: Reader = Reader::Record(&[
 ]);
 static FINDING_SEVERITY: Reader =
     Reader::External(&[("info", &LEAF), ("warning", &LEAF), ("error", &LEAF)]);
+static FOLDED_WORKSPACE: Reader = Reader::Record(&[
+    ("workspace", &LEAF),
+    ("head", &LEAF),
+    ("outcome", &FOLD_OUTCOME),
+]);
+static FOLD_KEPT: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("dirty", &FOLD_KEPT__DIRTY),
+        ("refused", &FOLD_KEPT__REFUSED),
+    ],
+};
+static FOLD_KEPT__DIRTY: Reader = Reader::Record(&[("files", &LEAF)]);
+static FOLD_KEPT__REFUSED: Reader = Reader::Record(&[("code", &ERROR_CODE), ("message", &LEAF)]);
+static FOLD_OUTCOME: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("retired", &FOLD_OUTCOME__RETIRED),
+        ("kept", &FOLD_OUTCOME__KEPT),
+    ],
+};
+static FOLD_OUTCOME__KEPT: Reader = Reader::Record(&[("reason", &FOLD_KEPT)]);
+static FOLD_OUTCOME__RETIRED: Reader = Reader::Record(&[]);
 static GATEWAY_CPU_BUDGET: Reader =
     Reader::External(&[("ledger", &CPU_BUDGET_STATUS), ("unanswered", &LEAF)]);
 static GATEWAY_STATUS: Reader = Reader::Record(&[
@@ -340,7 +346,6 @@ static GC_REPORT: Reader = Reader::Record(&[
     ("dryRun", &LEAF),
     ("candidates", &SEQ__GC_CANDIDATE),
     ("deferred", &SEQ__GC_DEFERRED),
-    ("abandonedRefs", &ABANDONED_REF_SWEEP),
 ]);
 static GRANT_SET: Reader = Reader::Record(&[
     ("revision", &LEAF),
@@ -560,6 +565,7 @@ static LANDED_REPORT: Reader = Reader::Record(&[
     ("targetWasCheckedOut", &LEAF),
     ("retired", &LEAF),
     ("buildVolume", &LAND_BUILD_VOLUME),
+    ("folded", &SEQ__FOLDED_WORKSPACE),
 ]);
 static LANDING_COMMITS: Reader = Reader::Internal {
     tag: "state",
@@ -938,12 +944,6 @@ static RESIZE_RESULT: Reader = Reader::Record(&[
     ("capacity", &LEAF),
 ]);
 static RESIZE_VOLUME: Reader = Reader::External(&[("workspace", &LEAF), ("build", &LEAF)]);
-static RETIRED_ABANDONED_REFS: Reader = Reader::Record(&[
-    ("workspace", &LEAF),
-    ("head", &LEAF),
-    ("refs", &SEQ__PRESERVED_REF),
-    ("by", &ABANDONED_REF_RETIREMENT),
-]);
 static RE_ADOPTION: Reader = Reader::Record(&[("replacement", &LEAF), ("retained", &LEAF)]);
 static SCCACHE_STATS: Reader = Reader::Record(&[
     ("maxCacheSize", &LEAF),
@@ -979,8 +979,6 @@ static SEALED_JOB_REF: Reader = Reader::Record(&[
     ("outlived", &SEQ__OUTLIVED_PROCESS),
     ("outlivedIncomplete", &LEAF),
 ]);
-static SEQ__ABANDONED_REFS: Reader = Reader::Seq(&ABANDONED_REFS);
-static SEQ__ABANDONED_TIP: Reader = Reader::Seq(&ABANDONED_TIP);
 static SEQ__BOUND_IDENTITY: Reader = Reader::Seq(&BOUND_IDENTITY);
 static SEQ__BRANCH_LANDING: Reader = Reader::Seq(&BRANCH_LANDING);
 static SEQ__BUILD_STATE_LINK: Reader = Reader::Seq(&BUILD_STATE_LINK);
@@ -1000,6 +998,7 @@ static SEQ__FAILED_CHECK: Reader = Reader::Seq(&FAILED_CHECK);
 static SEQ__FD_HOLDER: Reader = Reader::Seq(&FD_HOLDER);
 static SEQ__FD_IDENTITY: Reader = Reader::Seq(&FD_IDENTITY);
 static SEQ__FINDING: Reader = Reader::Seq(&FINDING);
+static SEQ__FOLDED_WORKSPACE: Reader = Reader::Seq(&FOLDED_WORKSPACE);
 static SEQ__GC_CANDIDATE: Reader = Reader::Seq(&GC_CANDIDATE);
 static SEQ__GC_DEFERRED: Reader = Reader::Seq(&GC_DEFERRED);
 static SEQ__JOB_PROCESS_SAMPLE: Reader = Reader::Seq(&JOB_PROCESS_SAMPLE);
@@ -1011,7 +1010,6 @@ static SEQ__PRESERVED_REF: Reader = Reader::Seq(&PRESERVED_REF);
 static SEQ__PROCESS_COVERAGE_GAP: Reader = Reader::Seq(&PROCESS_COVERAGE_GAP);
 static SEQ__RECOVERY_CAUSE: Reader = Reader::Seq(&RECOVERY_CAUSE);
 static SEQ__REMOVED_WORKSPACE: Reader = Reader::Seq(&REMOVED_WORKSPACE);
-static SEQ__RETIRED_ABANDONED_REFS: Reader = Reader::Seq(&RETIRED_ABANDONED_REFS);
 static SEQ__SCRIPT_VALUE: Reader = Reader::Seq(&SCRIPT_VALUE);
 static SEQ__SIM_VERB: Reader = Reader::Seq(&SIM_VERB);
 static SEQ__SKILL_INSTALL: Reader = Reader::Seq(&SKILL_INSTALL);
