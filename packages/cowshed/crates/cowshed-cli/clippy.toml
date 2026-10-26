@@ -1,3 +1,26 @@
+# Every wait on another process ends by its bound (specs/cowshed/05_gateway.md, "Deadlines",
+# Enforcement). A site kept unbounded is allowed for its one item or statement, beside a
+# `// WHY unbounded:` that says what ends it (WAIT-WHY, packages/nx-plugin/src/wait-why-policy.ts).
+disallowed-methods = [
+  { path = "std::process::Child::wait", reason = "reap within a bound: cowshed_os::deadline::reap (tests: test_backstop::ChildBackstop)" },
+  { path = "std::process::Child::wait_with_output", reason = "collect within a bound: cowshed_os::deadline::{OutputPumps, reap} (tests: test_backstop::ChildBackstop)" },
+  { path = "tokio::process::Child::wait", reason = "reap within a bound: cowshed_os::deadline::reap_async (tests: test_backstop::AsyncChildBackstop)" },
+  { path = "tokio::process::Child::wait_with_output", reason = "collect within a bound: cowshed_os::deadline::reap_async (tests: test_backstop::AsyncChildBackstop)" },
+  { path = "tokio::process::Child::kill", reason = "start_kill, then reap within a bound: cowshed_os::deadline::reap_async" },
+  { path = "cowshed_os::fork_lock::Run::output_locked", reason = "run within a bound: cowshed_os::deadline::output_within (tests: test_backstop::CommandBackstop)" },
+  { path = "cowshed_os::fork_lock::Run::status_locked", reason = "run within a bound: cowshed_os::deadline::{reap, output_within} (tests: test_backstop::CommandBackstop)" },
+  { path = "cowshed_os::fork_lock::RunAsync::output_locked", reason = "run within a bound: cowshed_os::deadline::reap_async (tests: test_backstop::AsyncCommandBackstop)" },
+  { path = "cowshed_os::fork_lock::RunAsync::status_locked", reason = "run within a bound: cowshed_os::deadline::reap_async (tests: test_backstop::AsyncCommandBackstop)" },
+  { path = "std::os::unix::net::UnixStream::connect", reason = "connect within a bound: cowshed_os::deadline::connect_unix (tests: test_backstop::UnixStreamBackstop)" },
+  { path = "tokio::net::UnixStream::connect", reason = "connect within a bound: cowshed_os::deadline::{connect_unix, PeerStream::connect} (tests: test_backstop::AsyncUnixStreamBackstop)" },
+  { path = "libc::flock", reason = "lock within a bound: cowshed_os::flock::{try_exclusive, exclusive}" },
+  { path = "std::fs::File::lock", reason = "lock within a bound: cowshed_os::flock::exclusive" },
+  { path = "std::fs::File::lock_shared", reason = "lock within a bound: cowshed_os::flock" },
+  { path = "libc::waitpid", reason = "reap within a bound: cowshed_os::deadline::reap (tests: test_backstop::waitpid)" },
+  { path = "libc::waitid", reason = "wait for the exit within a bound: cowshed_os::process::ExitWatch::within (tests: test_backstop::waitid)" },
+  { path = "libc::wait4", reason = "reap within a bound: cowshed_os::deadline::reap (tests: test_backstop::wait4)" },
+]
+
 # Every stderr line is one write: cowshed processes share one stderr file, and std's macros write
 # a line in pieces that splice into other processes' lines (cowshed-os/src/stderr.rs).
 disallowed-macros = [

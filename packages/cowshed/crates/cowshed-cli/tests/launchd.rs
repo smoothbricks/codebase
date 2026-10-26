@@ -1825,6 +1825,7 @@ fn native_filesystem_copies_a_binary_with_the_exec_bit_and_exact_bytes() {
 #[cfg(target_os = "macos")]
 mod descriptor_inheritance {
     use super::*;
+    use cowshed_os::test_backstop::UnixStreamBackstop as _;
     use std::io::Write as _;
     use std::os::unix::net::UnixStream;
 
@@ -1840,7 +1841,7 @@ mod descriptor_inheritance {
         let Some(socket) = std::env::var_os(SOCKET_ENV) else {
             return Ok(());
         };
-        let mut report = UnixStream::connect(socket)?;
+        let mut report = UnixStream::connect_bounded(socket)?;
         let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
         // SAFETY: getrlimit initializes the writable rlimit on success.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } == -1 {

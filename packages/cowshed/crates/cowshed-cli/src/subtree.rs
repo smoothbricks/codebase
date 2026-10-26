@@ -180,6 +180,7 @@ mod tests {
     use super::*;
     use cowshed_core::api::JobId;
     use cowshed_os::fork_lock::Spawn as _;
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::ffi::OsString;
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
@@ -289,10 +290,10 @@ mod tests {
         let mut record = Vec::new();
         if let Err(error) = reader.read_to_end(&mut record) {
             child.kill().expect("stop failed exec helper");
-            child.wait().expect("reap failed exec helper");
+            child.wait_bounded().expect("reap failed exec helper");
             panic!("admission channel failed: {error}");
         }
-        let output = child.wait_with_output().unwrap();
+        let output = child.wait_with_output_bounded().unwrap();
         assert_eq!(output.status.code(), Some(37), "{output:?}");
         assert!(
             output

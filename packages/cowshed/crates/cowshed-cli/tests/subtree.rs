@@ -1,6 +1,7 @@
 //! Native and library-hosted subtree wrappers, without a real supervisor or project.
 #![cfg(unix)]
 
+use cowshed_os::test_backstop::ChildBackstop as _;
 use std::ffi::OsString;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
@@ -49,10 +50,12 @@ fn wrapper(mut command: Command) -> (u32, Vec<u8>, Output) {
     let mut admission = Vec::new();
     if let Err(error) = reader.read_to_end(&mut admission) {
         child.kill().expect("stop wrapper after admission failure");
-        child.wait().expect("reap wrapper after admission failure");
+        child
+            .wait_bounded()
+            .expect("reap wrapper after admission failure");
         panic!("admission read failed: {error}");
     }
-    (pid, admission, child.wait_with_output().unwrap())
+    (pid, admission, child.wait_with_output_bounded().unwrap())
 }
 
 fn root_command(argv: &[OsString]) -> Command {
@@ -153,7 +156,11 @@ fn admission_write_failure_does_not_exec() {
             Ok(())
         });
     }
-    let output = command.spawn_locked().unwrap().wait_with_output().unwrap();
+    let output = command
+        .spawn_locked()
+        .unwrap()
+        .wait_with_output_bounded()
+        .unwrap();
     assert!(!output.status.success(), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     assert!(
@@ -279,7 +286,7 @@ fn retire(input: &[u8], socket: Option<&str>) -> Output {
     }
     let mut child = command.spawn_locked().unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
-    child.wait_with_output().unwrap()
+    child.wait_with_output_bounded().unwrap()
 }
 
 const HANDLE: &[u8] = br#"{"jobId":1,"index":2,"incarnation":"0123456789abcdef0123456789abcdef"}"#;

@@ -235,6 +235,9 @@ impl HeldCommand {
         interrupts: &mut Interrupts,
     ) -> (io::Result<ExitStatus>, Result<(), CowshedError>) {
         let mut relay: Result<(), CowshedError> = Ok(());
+        // WHY unbounded: the command is this verb's own work (`cowshed lock`, `cowshed land-turn --
+        // <cmd>`); it lasts as long as the command, which the caller's forwarded signals end.
+        #[allow(clippy::disallowed_methods)]
         let status = loop {
             tokio::select! {
                 status = self.child.wait() => break status,

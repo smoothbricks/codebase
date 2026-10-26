@@ -32,6 +32,9 @@ use cowshed_gateway::{
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::NO_PROGRESS;
+use cowshed_os::test_backstop::{
+    AsyncUnixStreamBackstop as _, ChildBackstop as _, FileBackstop as _, UnixStreamBackstop as _,
+};
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
@@ -3361,11 +3364,6 @@ async fn directory_a_land_fences_the_target_head_under_the_caller_ref_lock_subst
             .open(&ref_lock)
             .expect("open the ref lock")
     };
-    let flock = |file: &fs::File, operation: libc::c_int| {
-        use std::os::unix::io::AsRawFd as _;
-        // SAFETY: `file` owns the descriptor for the whole call.
-        unsafe { libc::flock(file.as_raw_fd(), operation) == 0 }
-    };
     let topic = new_workspace(&mut service, "topic").await;
     fs::write(topic.join("topic.txt"), b"topic\n").unwrap();
     git(&topic, &["add", "topic.txt"]);
@@ -3375,7 +3373,7 @@ async fn directory_a_land_fences_the_target_head_under_the_caller_ref_lock_subst
 
     let writer = open_lock();
     assert!(
-        flock(&writer, libc::LOCK_EX),
+        writer.lock_bounded().is_ok(),
         "the writer took the ref lock"
     );
     let land = run(
@@ -3434,7 +3432,7 @@ async fn directory_a_land_fences_the_target_head_under_the_caller_ref_lock_subst
     .await;
     assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), rebased);
     assert!(
-        flock(&open_lock(), libc::LOCK_EX | libc::LOCK_NB),
+        open_lock().try_lock().is_ok(),
         "a land kept the ref lock after it returned"
     );
     service
@@ -3857,7 +3855,7 @@ impl OtherProcessLock {
 
     fn release(mut self) {
         drop(self.0.stdin.take());
-        let status = self.0.wait().expect("wait for the lock holder");
+        let status = self.0.wait_bounded().expect("wait for the lock holder");
         assert!(status.success(), "the lock holder failed: {status}");
     }
 }
@@ -3884,8 +3882,9 @@ async fn eventually(mut ready: impl FnMut() -> bool) {
 /// dead holder's. The lock is let go at once, leaving the volume for the gc after it.
 async fn job_holds_released(layout: &BuildVolumeLayout, id: &BuildVolumeId) {
     let hold = layout.hold_path(id);
-    let released =
-        tokio::task::spawn_blocking(move || fs::File::open(&hold).and_then(|file| file.lock()));
+    let released = tokio::task::spawn_blocking(move || {
+        fs::File::open(&hold).and_then(|file| file.lock_bounded())
+    });
     released
         .await
         .expect("the hold wait's thread")
@@ -3905,7 +3904,7 @@ impl Drop for Holder {
         if let Err(error) = self.0.kill() {
             cowshed_os::eprintln!("holder {}: kill: {error}", self.0.id());
         }
-        if let Err(error) = self.0.wait() {
+        if let Err(error) = self.0.wait_bounded() {
             cowshed_os::eprintln!("holder {}: wait: {error}", self.0.id());
         }
     }
@@ -4798,7 +4797,10 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
     }
     assert_eq!(linked_volume(&layout, &fixture.checkout), before);
     drop(opening.0.stdin.take());
-    opening.0.wait().expect("lockf exits with its command");
+    opening
+        .0
+        .wait_bounded()
+        .expect("lockf exits with its command");
     drop(opening);
 
     // The first land retained topic and left main's database in place. Change the landing tree
@@ -6893,7 +6895,7 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
         "retirement leaves the foreign owner record unchanged"
     );
     let socket_path: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    std::os::unix::net::UnixStream::connect(socket_path["socketPath"].as_str().unwrap())
+    std::os::unix::net::UnixStream::connect_bounded(socket_path["socketPath"].as_str().unwrap())
         .expect("the real foreign daemon socket survives");
 
     // Cleanup belongs to the daemon's standalone owner, only after the survival proof.
@@ -6992,9 +6994,10 @@ async fn default_land_never_signals_a_foreign_nominee_during_retirement(
             .is_none(),
         "the foreign process survived the complete default land, including retirement"
     );
-    std::os::unix::net::UnixStream::connect(&socket).expect("the foreign listener remains live");
+    std::os::unix::net::UnixStream::connect_bounded(&socket)
+        .expect("the foreign listener remains live");
     foreign.kill().expect("stop the test's own foreign sleeper");
-    foreign.wait().expect("reap the sleeper");
+    foreign.wait_bounded().expect("reap the sleeper");
     drop(listener);
     drop(service);
     fixture.stop_gateway().await;

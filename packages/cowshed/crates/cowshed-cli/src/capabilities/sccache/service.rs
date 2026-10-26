@@ -376,6 +376,9 @@ pub(crate) async fn service_status(namespace: HostNamespace) -> Result<SccacheSt
     })
 }
 
+// WHY unbounded: debt: a live sccache server that stops answering stalls it; doctor's path is
+// bounded (`service_status_within`). Moves to that bound.
+#[allow(clippy::disallowed_methods)]
 async fn read_stats(home: &Path, socket: &Path) -> Option<SccacheStats> {
     parse_stats(stats_command(home, socket)?.output_locked().await.ok()?)
 }
@@ -392,6 +395,9 @@ pub(crate) async fn service_status_within(
         None => (None, None),
         Some(mut command) => {
             command.kill_on_drop(true);
+            // WHY unbounded: the `within` timeout around it ends it, and `kill_on_drop` ends the
+            // child.
+            #[allow(clippy::disallowed_methods)]
             match tokio::time::timeout(within, command.output_locked()).await {
                 Ok(output) => (output.ok().and_then(parse_stats), None),
                 Err(_) => (
@@ -521,8 +527,13 @@ pub(crate) fn installed_program(home: &Path) -> Result<StoreBackedProgram> {
     nix::rooted_program(home, &gc_root(home))
 }
 
+/// Whether the sccache server at `socket` accepts a connection within the handshake bound.
 async fn socket_answers(socket: &Path) -> bool {
-    tokio::net::UnixStream::connect(socket).await.is_ok()
+    let budget = cowshed_os::deadline::start("sccache status", cowshed_os::deadline::HANDSHAKE);
+    let peer = cowshed_os::deadline::Peer::unix("sccache server", socket);
+    cowshed_os::deadline::connect_unix(&budget, &peer, socket)
+        .await
+        .is_ok()
 }
 
 pub fn emit_sccache_status<W: Write, E: Write>(

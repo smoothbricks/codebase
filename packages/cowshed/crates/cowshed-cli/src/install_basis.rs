@@ -25,7 +25,6 @@ use cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH;
 use cowshed_core::{CowshedError, Result};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -57,16 +56,20 @@ impl InstallSlot {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
             .map_err(|error| slot_error(&path, "open", &error))?;
-        let lock = match flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+        let lock = match lock.try_lock() {
             Ok(()) => lock,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(std::fs::TryLockError::WouldBlock) => {
                 cowshed_os::eprintln!(
                     "cowshed: another install holds {}; waiting for it to finish",
                     path.display()
                 );
                 let waited = path.clone();
-                tokio::task::spawn_blocking(move || flock(&lock, libc::LOCK_EX).map(|()| lock))
-                    .await
+                // WHY unbounded: an installer waits in line for as long as the install ahead of it
+                // runs, said on stderr first; the operator's interrupt ends it. debt: a holder that
+                // wedges stalls every later install. Moves to cowshed_os::flock::exclusive.
+                #[allow(clippy::disallowed_methods)]
+                let locked = tokio::task::spawn_blocking(move || lock.lock().map(|()| lock)).await;
+                locked
                     .map_err(|error| {
                         CowshedError::internal(format!(
                             "waiting for {} failed: {error}",
@@ -75,7 +78,9 @@ impl InstallSlot {
                     })?
                     .map_err(|error| slot_error(&path, "lock", &error))?
             }
-            Err(error) => return Err(slot_error(&path, "lock", &error)),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(slot_error(&path, "lock", &error));
+            }
         };
         Ok(Self { _lock: lock })
     }
@@ -99,10 +104,10 @@ impl InstallSlot {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(slot_error(&path, "open", &error)),
         };
-        match flock(&lock, libc::LOCK_SH | libc::LOCK_NB) {
+        match lock.try_lock_shared() {
             Ok(()) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
-            Err(error) => Err(slot_error(&path, "lock", &error)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+            Err(std::fs::TryLockError::Error(error)) => Err(slot_error(&path, "lock", &error)),
         }
     }
 }
@@ -156,20 +161,6 @@ pub fn continue_as_installed(support_directory: &Path) -> Result<std::process::C
     }
     command.args(std::env::args_os().skip(1));
     Ok(command)
-}
-
-fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
-    loop {
-        // SAFETY: `file` owns a live descriptor for the duration of the call; `flock` does not
-        // consume it.
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
 }
 
 fn slot_error(path: &Path, operation: &str, error: &io::Error) -> CowshedError {
@@ -261,7 +252,7 @@ pub async fn judge(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::ffi::OsStr;
     use std::fs;
     use std::process::Command;
@@ -371,7 +362,7 @@ pub(crate) mod tests {
                 .env("GIT_AUTHOR_DATE", &date)
                 .env("GIT_COMMITTER_DATE", &date);
         }
-        let output = command.output_locked().expect("run git");
+        let output = command.output_bounded().expect("run git");
         assert!(
             output.status.success(),
             "git failed in {}: {}",
@@ -564,11 +555,9 @@ pub(crate) mod tests {
         let main = Main::new("slot");
         let held = InstallSlot::take(&main.root).await.expect("first install");
         let probe = File::open(main.root.join(INSTALL_LOCK_NAME)).expect("lock file");
-        assert_eq!(
-            flock(&probe, libc::LOCK_EX | libc::LOCK_NB)
-                .expect_err("the slot is held")
-                .kind(),
-            io::ErrorKind::WouldBlock
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the slot is held"
         );
         let waiter = tokio::spawn({
             let root = main.root.clone();
@@ -611,7 +600,8 @@ pub(crate) mod tests {
             "a step that waited says so, so it can go on as the build the install left"
         );
         let probe = File::open(main.root.join(INSTALL_LOCK_NAME)).expect("lock file");
-        flock(&probe, libc::LOCK_EX | libc::LOCK_NB)
+        probe
+            .try_lock()
             .expect("the land step holds nothing once it goes on: the next install takes the slot");
     }
 

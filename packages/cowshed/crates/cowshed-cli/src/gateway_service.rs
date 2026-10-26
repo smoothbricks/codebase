@@ -3617,6 +3617,8 @@ mod tests {
     use super::*;
     use crate::launchd::STABLE_BINARY_MODE;
     use cowshed_os::namespace::TestNamespace;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     type RecordingExecutor = LaunchdExecutor<NativeFilesystem, RecordingGatewayLaunchctl>;
 
@@ -4871,7 +4873,6 @@ mod tests {
     /// is not. Every step is given what it needs, so none can raise a dialog.
     #[cfg(target_os = "macos")]
     async fn prove_one_requirement_across_two_setups(keychain_home: &Path) {
-        use cowshed_os::fork_lock::Run as _;
         let identity = gateway_host_identity(keychain_home).unwrap();
         let (home, executable, _) = host_with_agent("host-proof");
         let host = executable.gateway_host();
@@ -4891,7 +4892,7 @@ mod tests {
             let shown = std::process::Command::new(code_signing::CODESIGN)
                 .args(["-dvvv", "-r-"])
                 .arg(&host)
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             let text = format!(
                 "{}{}",
@@ -5400,6 +5401,7 @@ mod tests {
     /// where the test wants it.
     #[cfg(target_os = "macos")]
     mod startup {
+        use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
         use std::num::NonZeroUsize;
 
         use cowshed_core::metadata::WorkspaceName;
@@ -5706,7 +5708,7 @@ mod tests {
         async fn hold_gate(socket: &Path, checkout: &str) -> tokio::net::UnixStream {
             use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-            let mut stream = tokio::net::UnixStream::connect(socket)
+            let mut stream = tokio::net::UnixStream::connect_bounded(socket)
                 .await
                 .expect("connect");
             let repo = format!(

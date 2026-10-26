@@ -29,6 +29,9 @@ use crate::code_signing::CODESIGN;
 /// so no assessment of the template or of an earlier probe answers for it. The probe runs
 /// `--version`, so its launch is the program's start and nothing else. The scratch directory is
 /// removed on every exit path.
+// WHY unbounded: debt: codesign and the probe's first launch wait on syspolicyd's scan, which can
+// stall the gateway's `first-launch` answer. Moves to output_within under an Ffi bound.
+#[allow(clippy::disallowed_methods)]
 pub fn measure(template: &Path) -> io::Result<FirstLaunch> {
     let scratch = Scratch::create()?;
     let probe = scratch.0.join("probe");
@@ -63,6 +66,9 @@ pub fn measure(template: &Path) -> io::Result<FirstLaunch> {
     })
 }
 
+// WHY unbounded: debt: the probe's first launch waits on syspolicyd's scan, the very latency it
+// measures; a stalled scan stalls it. Moves to output_within under an Ffi bound.
+#[allow(clippy::disallowed_methods)]
 fn launch(probe: &Path) -> io::Result<u64> {
     let started = Instant::now();
     let status = Command::new(probe)

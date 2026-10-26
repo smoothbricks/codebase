@@ -521,6 +521,9 @@ fn pem(label: &str, der: &[u8]) -> Zeroizing<String> {
 
 /// Run `security` with `arguments`, `stdin` written to it when given, and require it to
 /// succeed: its output, or an error naming the command and what it said.
+// WHY unbounded: `security` runs for `cowshed setup` and `cowshed install`, an operator's verbs;
+// the operator's interrupt ends it.
+#[allow(clippy::disallowed_methods)]
 fn security(arguments: &[&OsStr], stdin: Option<&[u8]>) -> Result<Output, CowshedError> {
     let described = || {
         arguments
@@ -571,6 +574,8 @@ fn security(arguments: &[&OsStr], stdin: Option<&[u8]>) -> Result<Output, Cowshe
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     /// `security find-identity -p codesigning <keychain>` on macOS 26.6, with this identity,
     /// another one and a valid identity after the matching section.
@@ -746,7 +751,7 @@ mod tests {
                 let _ = Command::new(SECURITY)
                     .arg("delete-keychain")
                     .arg(&self.0)
-                    .output_locked();
+                    .output_bounded();
                 let _ = std::fs::remove_dir_all(self.0.parent().expect("keychain directory"));
             }
         }

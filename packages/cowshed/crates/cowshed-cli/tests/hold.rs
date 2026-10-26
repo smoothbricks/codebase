@@ -17,6 +17,7 @@
 //!   that left the group and still holds it, once the leader exited.
 #![cfg(unix)]
 
+use cowshed_os::test_backstop::ChildBackstop as _;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead as _, BufReader, PipeReader, PipeWriter, Read as _, Write as _};
@@ -179,7 +180,7 @@ impl Hold {
     }
 
     fn wait(&mut self) -> std::process::ExitStatus {
-        self.child.wait().expect("wait for cowshed hold")
+        self.child.wait_bounded().expect("wait for cowshed hold")
     }
 }
 

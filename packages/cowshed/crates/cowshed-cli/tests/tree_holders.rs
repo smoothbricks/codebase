@@ -5,6 +5,7 @@
 //! guard kills that group and reaps it, so a failed assertion leaks neither it nor the tree.
 #![cfg(unix)]
 
+use cowshed_os::test_backstop::ChildBackstop as _;
 use std::fs;
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::process::CommandExt as _;
@@ -92,8 +93,8 @@ impl Resident {
 impl Drop for Resident {
     fn drop(&mut self) {
         let pid = i32::try_from(self.id()).expect("a pid fits in pid_t");
-        let result =
-            signal_unreaped_group(pid, libc::SIGKILL).and_then(|()| self.child.wait().map(|_| ()));
+        let result = signal_unreaped_group(pid, libc::SIGKILL)
+            .and_then(|()| self.child.wait_bounded().map(|_| ()));
         if let Err(error) = result {
             if thread::panicking() {
                 cowshed_os::eprintln!("resident process group {pid} cleanup failed: {error}");

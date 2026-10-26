@@ -2,12 +2,11 @@
 //! Governing contract: specs/cowshed/05_gateway.md, "Build records and downgrades";
 //! specs/cowshed/16_build_volumes.md, "Hash inputs are the same in every checkout".
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use cowshed_os::fork_lock::Run as _;
 
 struct Scratch(PathBuf);
 
@@ -38,7 +37,7 @@ impl Drop for Scratch {
 }
 
 fn output(command: &mut Command) -> String {
-    let result = command.output_locked().expect("run the real fixture tool");
+    let result = command.output_bounded().expect("run the real fixture tool");
     assert!(
         result.status.success(),
         "{command:?} failed: {}",

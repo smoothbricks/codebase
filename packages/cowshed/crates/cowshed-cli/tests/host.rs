@@ -2,6 +2,7 @@
 //! socketpair as its standard input, and the host operations called on the other end
 //! (07_api.md, "Host operations").
 
+use cowshed_os::test_backstop::{AsyncChildBackstop as _, ChildBackstop as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixStream;
@@ -86,7 +87,7 @@ async fn a_host_connection_answers_what_the_verb_computes_and_ends_with_its_peer
 
     drop(host);
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed host");
     assert_eq!(
@@ -122,7 +123,7 @@ async fn a_project_client_refuses_a_host_connection_handshake() {
         "{refused:?}"
     );
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed host");
     assert!(
@@ -160,7 +161,7 @@ fn printed(args: &[&std::ffi::OsStr], stdin: &[u8]) -> Vec<serde_json::Value> {
         .spawn()
         .unwrap();
     verb.stdin.take().unwrap().write_all(stdin).unwrap();
-    let output = verb.wait_with_output().unwrap();
+    let output = verb.wait_with_output_bounded().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -254,7 +255,7 @@ async fn a_host_connection_answers_the_holder_censuses_and_retirement_as_their_v
 
     drop(host);
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed host");
     assert_eq!(
@@ -264,7 +265,7 @@ async fn a_host_connection_answers_the_holder_censuses_and_retirement_as_their_v
         String::from_utf8_lossy(&output.stderr)
     );
     drop(holder.stdin.take());
-    assert!(holder.wait().unwrap().success());
+    assert!(holder.wait_bounded().unwrap().success());
 }
 
 /// `host.fdHolders` answers what `fd-holders` prints: here a child handed this test's pipe as its
@@ -331,7 +332,7 @@ async fn a_host_connection_answers_fd_holders_as_the_verb_prints_them() {
 
     drop(host);
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed host");
     assert_eq!(
@@ -341,7 +342,7 @@ async fn a_host_connection_answers_fd_holders_as_the_verb_prints_them() {
         String::from_utf8_lossy(&output.stderr)
     );
     drop(holder.stdin.take());
-    assert!(holder.wait().unwrap().success());
+    assert!(holder.wait_bounded().unwrap().success());
 }
 
 #[cfg(target_os = "macos")]
@@ -398,7 +399,7 @@ mod real_apfs_host {
         drop(events);
         drop(host);
         let output = child
-            .wait_with_output()
+            .wait_with_output_bounded()
             .await
             .expect("wait for cowshed host");
         assert_eq!(
@@ -455,7 +456,7 @@ async fn a_host_credential_upload_is_the_stdin_secret_and_nothing_else() {
 
     drop(host);
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed host");
     assert_eq!(
@@ -530,7 +531,7 @@ async fn a_sccache_host_connection_serves_the_sccache_rows_and_no_other_role() {
     }
     drop(sccache);
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed sccache host");
     assert_eq!(
@@ -550,7 +551,7 @@ async fn a_sccache_host_connection_serves_the_sccache_rows_and_no_other_role() {
         .expect_err("a host client refuses sccache host");
     assert!(refused.message.contains("Sccache"), "{refused:?}");
     child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed sccache host");
 
@@ -560,7 +561,7 @@ async fn a_sccache_host_connection_serves_the_sccache_rows_and_no_other_role() {
         .expect_err("a sccache host client refuses cowshed host");
     assert!(refused.message.contains("Host"), "{refused:?}");
     child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed host");
 }
@@ -617,7 +618,7 @@ async fn a_host_disk_command_refuses_volume_renames_as_the_verb_does() {
     drop(events);
     drop(host);
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed host");
     assert_eq!(output.status.code(), Some(0), "{output:?}");

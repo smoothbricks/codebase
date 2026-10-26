@@ -248,6 +248,9 @@ fn git_at<const N: usize>(
     for (key, value) in extra_env {
         command.env(key, value);
     }
+    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors and
+    // prompts off (`git_command_at`): it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = command
         .output_locked()
         .map_err(|error| cowshed_core::git::git_spawn_error(&error))?;

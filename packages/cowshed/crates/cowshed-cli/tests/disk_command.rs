@@ -3,12 +3,13 @@
 //! to a reader that already left reported as a wrapper failure, never a panic.
 #![cfg(target_os = "macos")]
 
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use cowshed_apfs::{CommandRequest, CommandRunner, ProcessStatus, SystemCommandRunner};
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 /// The `cowshed` binary under test, read when the test runs (see `output_contracts.rs`).
@@ -24,7 +25,7 @@ fn disk_command(argv: &[&str]) -> std::process::Output {
         .arg("disk-command")
         .args(argv)
         .stdin(Stdio::null())
-        .output_locked()
+        .output_bounded()
         .expect("run cowshed disk-command")
 }
 
@@ -85,7 +86,7 @@ fn usage_refusals_never_reach_a_tool() {
     let json = Command::new(cowshed())
         .args(["--json", "disk-command", "hdiutil", "--", "info"])
         .stdin(Stdio::null())
-        .output_locked()
+        .output_bounded()
         .expect("run cowshed --json disk-command");
     assert_eq!(json.status.code(), Some(2), "{json:?}");
     assert!(
@@ -132,7 +133,7 @@ fn output_to_a_reader_that_left_is_a_wrapper_failure() {
         .stderr(Stdio::piped())
         .spawn_locked()
         .expect("spawn cowshed with the closed stdout pipe")
-        .wait_with_output()
+        .wait_with_output_bounded()
         .expect("wait for cowshed disk-command");
     assert_eq!(output.status.code(), Some(100), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);

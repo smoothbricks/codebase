@@ -1,4 +1,5 @@
 use cowshed_cli::output::{Output, write_error_envelope, write_success_envelope};
+use cowshed_os::test_backstop::{ChildBackstop as _, FileBackstop as _};
 
 use cowshed_core::api::{EmptyResult, MountResult};
 use cowshed_core::metadata::WorkspaceName;

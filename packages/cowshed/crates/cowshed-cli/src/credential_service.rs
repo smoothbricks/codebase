@@ -373,6 +373,9 @@ async fn run_secret_command(argv: &[String]) -> Result<Zeroizing<String>> {
             "pass --secret-command '[\"op\",\"read\",\"op://vault/item/field\"]'",
         )
     })?;
+    // WHY unbounded: the operator's own credential helper, run for their `cowshed credential` verb,
+    // may prompt them; the operator's interrupt ends it.
+    #[allow(clippy::disallowed_methods)]
     let output = tokio::process::Command::new(program)
         .args(arguments)
         .stdin(std::process::Stdio::null())

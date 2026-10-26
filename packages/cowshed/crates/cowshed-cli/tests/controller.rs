@@ -1,6 +1,7 @@
 //! `cowshed controller` as an embedding process meets it: the binary started with one end of a
 //! socketpair as its standard input, and the controller protocol spoken on the other end.
 
+use cowshed_os::test_backstop::AsyncChildBackstop as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -85,7 +86,7 @@ async fn host_controller_an_embedding_process_reaches_its_project_through_the_co
     drop(cowshed);
 
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for cowshed controller");
     assert!(

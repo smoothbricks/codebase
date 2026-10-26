@@ -2,10 +2,11 @@
 //! launchd stops a job with, and ends as the child ended.
 
 use cowshed_cli::gateway_host::{EXIT_FAILED, VERB};
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::fork_lock::Spawn as _;
 
 /// The host is the `cowshed` binary itself, run with the hidden verb launchd's plist gives it.
 /// It is read when the test runs: `env!` would bake in the path of the checkout that compiled
@@ -22,20 +23,20 @@ fn cowshed() -> PathBuf {
 fn the_host_exits_with_its_childs_exit_code() {
     let status = Command::new(cowshed())
         .args([VERB, "/bin/sh", "-c", "exit 7"])
-        .status_locked()
+        .status_bounded()
         .unwrap();
     assert_eq!(status.code(), Some(7));
     // `/bin/sh` is the one program path every supported host has: NixOS keeps no `/usr/bin/true`.
     let status = Command::new(cowshed())
         .args([VERB, "/bin/sh", "-c", "exit 0"])
-        .status_locked()
+        .status_bounded()
         .unwrap();
     assert_eq!(status.code(), Some(0));
 }
 
 #[test]
 fn the_host_refuses_to_run_without_a_child_and_says_why() {
-    let output = Command::new(cowshed()).arg(VERB).output_locked().unwrap();
+    let output = Command::new(cowshed()).arg(VERB).output_bounded().unwrap();
     assert_eq!(output.status.code(), Some(EXIT_FAILED));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("needs the program to run"),
@@ -69,7 +70,7 @@ fn a_signal_to_the_host_reaches_the_child_and_the_host_ends_as_the_child_did() {
     let pid = libc::pid_t::try_from(host.id()).unwrap();
     // SAFETY: `pid` is this test's own unreaped child.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-    assert_eq!(host.wait().unwrap().code(), Some(42));
+    assert_eq!(host.wait_bounded().unwrap().code(), Some(42));
 
     // A child killed by the forwarded signal leaves the host killed by it too.
     let mut host = Command::new(cowshed())
@@ -86,7 +87,7 @@ fn a_signal_to_the_host_reaches_the_child_and_the_host_ends_as_the_child_did() {
     let pid = libc::pid_t::try_from(host.id()).unwrap();
     // SAFETY: as above.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-    let status = host.wait().unwrap();
+    let status = host.wait_bounded().unwrap();
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&status),
         Some(libc::SIGTERM)

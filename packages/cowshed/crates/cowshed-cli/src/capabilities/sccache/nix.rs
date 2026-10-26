@@ -230,6 +230,9 @@ pub fn build(home: &Path, flake: &Path) -> Result<BuildOutcome> {
         CowshedError::internal(format!("could not create {}: {error}", parent.display()))
     })?;
 
+    // WHY unbounded: the nix build is `cowshed setup`'s own work, minutes long and network-bound;
+    // the operator's interrupt ends it.
+    #[allow(clippy::disallowed_methods)]
     let output = match Command::new(NIX_EXECUTABLE)
         .arg("build")
         .arg(format!("{}#{FLAKE_ATTRIBUTE}", flake.display()))

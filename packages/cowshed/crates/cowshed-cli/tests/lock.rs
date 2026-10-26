@@ -16,6 +16,7 @@
 //!   a waiter that did not signal keeps its place in the queue.
 #![cfg(unix)]
 
+use cowshed_os::test_backstop::{ChildBackstop as _, FileBackstop as _};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
@@ -277,7 +278,7 @@ fn held(path: &Path) -> bool {
 /// sleep alone holds it.
 fn unrecorded(lock: &Path) -> TestProcess {
     let file = File::create(lock).expect("create the lock");
-    file.lock().expect("take the lock");
+    file.lock_bounded().expect("take the lock");
     let descriptor = file.as_raw_fd();
     let mut command = Command::new("sleep");
     command.arg("600");
@@ -348,8 +349,8 @@ impl TestProcess {
 impl Drop for TestProcess {
     fn drop(&mut self) {
         let pid = i32::try_from(self.id()).expect("a pid fits in pid_t");
-        let result =
-            signal_unreaped_group(pid, libc::SIGKILL).and_then(|()| self.child.wait().map(|_| ()));
+        let result = signal_unreaped_group(pid, libc::SIGKILL)
+            .and_then(|()| self.child.wait_bounded().map(|_| ()));
         if let Err(error) = result {
             if thread::panicking() {
                 cowshed_os::eprintln!("fixture process group {pid} cleanup failed: {error}");

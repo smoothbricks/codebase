@@ -5,6 +5,7 @@
 //! with `observe` while they wait.
 #![cfg(unix)]
 
+use cowshed_os::test_backstop::ChildBackstop as _;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, ErrorKind, Write as _};
@@ -274,8 +275,8 @@ impl Land {
 impl Drop for Land {
     fn drop(&mut self) {
         let pid = i32::try_from(self.pid()).expect("a pid fits in pid_t");
-        let result =
-            signal_unreaped_group(pid, libc::SIGKILL).and_then(|()| self.child.wait().map(|_| ()));
+        let result = signal_unreaped_group(pid, libc::SIGKILL)
+            .and_then(|()| self.child.wait_bounded().map(|_| ()));
         if let Err(error) = result {
             if thread::panicking() {
                 cowshed_os::eprintln!("land fixture process group {pid} cleanup failed: {error}");
