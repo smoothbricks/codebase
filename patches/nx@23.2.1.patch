@@ -1818,7 +1818,7 @@ index 0000000000000000000000000000000000000000..e596198223c7bd9e8988bd97ed3d6db3
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets, notice });
 +}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e244efd435b28642ed86e999d6c86f7d94..0ea9c84c3dced043459bfb15d5d44a72882a1fb1 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..e9ff19d900a4cc51059111a3cab4029c04ca0a3a 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -7,17 +7,13 @@ const fs_1 = require("fs");
@@ -1956,7 +1956,21 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..0ea9c84c3dced043459bfb15d5d44a72
  async function handleResult(socket, type, hrFn, mode) {
      let hr;
      const startMark = new Date();
-@@ -256,9 +290,10 @@ async function handleResult(socket, type, hrFn, mode) {
+@@ -242,7 +276,12 @@ async function handleResult(socket, type, hrFn, mode) {
+     }
+     const doneHandlingMark = new Date();
+     if (hr.error) {
+-        await (0, shutdown_utils_1.respondWithErrorAndExit)(socket, hr.description, hr.error);
++        if (type === 'REQUEST_PROJECT_GRAPH') {
++            await (0, shutdown_utils_1.respondWithError)(socket, hr.description, hr.error);
++        }
++        else {
++            await (0, shutdown_utils_1.respondWithErrorAndExit)(socket, hr.description, hr.error);
++        }
+     }
+     else {
+         logger_1.serverLogger.log(`Serializing response for ${type} message in ${mode} mode`);
+@@ -256,9 +295,10 @@ async function handleResult(socket, type, hrFn, mode) {
      logger_1.serverLogger.log(`Handled ${mode} message ${type}. Handling time: ${doneHandlingMark.getTime() - startMark.getTime()}. Response time: ${endMark.getTime() - doneHandlingMark.getTime()}.`);
  }
  function handleInactivityTimeout() {
@@ -1969,7 +1983,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..0ea9c84c3dced043459bfb15d5d44a72
          (0, shutdown_utils_1.resetInactivityTimeout)(handleInactivityTimeout);
      }
      else {
-@@ -287,37 +322,6 @@ function registerProcessTerminationListeners() {
+@@ -287,37 +327,6 @@ function registerProcessTerminationListeners() {
          sockets: exports.openSockets,
      }));
  }
@@ -2007,7 +2021,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..0ea9c84c3dced043459bfb15d5d44a72
  /**
   * When applicable files in the workspaces are changed (created, updated, deleted),
   * we need to recompute the cached serialized project graph so that it is readily
-@@ -339,6 +343,11 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -339,6 +348,11 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
              return;
          }
          logger_1.serverLogger.watcherLog((0, watcher_1.convertChangeEventsToLogMessage)(changeEvents));
@@ -2019,7 +2033,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..0ea9c84c3dced043459bfb15d5d44a72
          (0, route_workspace_changes_1.routeWorkspaceChanges)(changeEvents);
      }
      catch (err) {
-@@ -348,65 +357,68 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -348,65 +362,68 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
          (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(err);
      }
  };
@@ -2127,7 +2141,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..0ea9c84c3dced043459bfb15d5d44a72
      return new Promise(async (resolve, reject) => {
          // `listen` reports a failed bind asynchronously on the server, which the
          // try below cannot catch — without this an EACCES became an uncaught
-@@ -432,11 +444,9 @@ async function startServer() {
+@@ -432,11 +449,9 @@ async function startServer() {
                              // Best effort; the 0700 socket directory is the primary control.
                          }
                      }
@@ -3441,7 +3455,7 @@ index a880a6620cd7ac46e4bd189bc2034ce58825769a..ef3c99a115e7114ea78da379316a0478
      })) {
          return true;
 diff --git a/dist/src/project-graph/plugins/get-plugins.d.ts b/dist/src/project-graph/plugins/get-plugins.d.ts
-index ed7ae5d82d4c6981375ad71c3a57573376d76ab8..5d00f2ecaa695085618d838b512273af28f1f96c 100644
+index ed7ae5d82d4c6981375ad71c3a57573376d76ab8..20ab7e18125d96d683b9198c74eb40b62870889c 100644
 --- a/dist/src/project-graph/plugins/get-plugins.d.ts
 +++ b/dist/src/project-graph/plugins/get-plugins.d.ts
 @@ -1,5 +1,5 @@
@@ -3451,6 +3465,22 @@ index ed7ae5d82d4c6981375ad71c3a57573376d76ab8..5d00f2ecaa695085618d838b512273af
  export interface SeparatedPlugins {
      specifiedPlugins: LoadedNxPlugin[];
      defaultPlugins: LoadedNxPlugin[];
+@@ -7,11 +7,11 @@ export interface SeparatedPlugins {
+ /** Exported for tests: the fallback latch is process-scoped by design. */
+ export declare function resetIsolationFallbackForTesting(): void;
+ /**
+- * Loads a plugin in a worker, falling back to this process when the worker's
+- * socket was refused.
++ * Loads local source in restartable workers. Installed plugins follow the
++ * isolation setting and may fall back to this process on worker socket refusal.
+  *
+- * Isolation is preferred: it is what keeps two plugins with conflicting
+- * TypeScript versions or module-level state apart. But a sandbox that has not
++ * For installed plugins, isolation keeps conflicting TypeScript versions and
++ * module-level state apart. But a sandbox that has not
+  * been told about the Nx socket root refuses the worker's socket, and failing
+  * the whole command over that is worse than running the plugins here. The
+  * fallback is narrow on purpose. It needs a failure to start or reach the
 @@ -21,12 +21,13 @@ export declare function resetIsolationFallbackForTesting(): void;
   * threw is rethrown, because rerunning it in-process would bury its actual
   * error.
@@ -3467,7 +3497,7 @@ index ed7ae5d82d4c6981375ad71c3a57573376d76ab8..5d00f2ecaa695085618d838b512273af
   * Returns specified plugins (from nx.json) and default plugins (project.json,
   * package.json, etc.) as separate arrays. This separation is needed for
 diff --git a/dist/src/project-graph/plugins/get-plugins.js b/dist/src/project-graph/plugins/get-plugins.js
-index df153050063fa81b915d3004d3a87cd397f73b19..d7f256bda99c1d380974a81b8a920ba7c42ea154 100644
+index df153050063fa81b915d3004d3a87cd397f73b19..29c41c972bf12fc73423f5a66e6f5af6a1ecae02 100644
 --- a/dist/src/project-graph/plugins/get-plugins.js
 +++ b/dist/src/project-graph/plugins/get-plugins.js
 @@ -4,6 +4,7 @@ exports.loadingMethod = void 0;
@@ -3493,6 +3523,22 @@ index df153050063fa81b915d3004d3a87cd397f73b19..d7f256bda99c1d380974a81b8a920ba7
  let loadedPlugins;
  let cachedSeparatedPlugins;
  let pendingPluginsPromise;
+@@ -56,11 +61,11 @@ function resetIsolationFallbackForTesting() {
+     isolationRefusedInThisProcess = false;
+ }
+ /**
+- * Loads a plugin in a worker, falling back to this process when the worker's
+- * socket was refused.
++ * Loads local source in restartable workers. Installed plugins follow the
++ * isolation setting and may fall back to this process on worker socket refusal.
+  *
+- * Isolation is preferred: it is what keeps two plugins with conflicting
+- * TypeScript versions or module-level state apart. But a sandbox that has not
++ * For installed plugins, isolation keeps conflicting TypeScript versions and
++ * module-level state apart. But a sandbox that has not
+  * been told about the Nx socket root refuses the worker's socket, and failing
+  * the whole command over that is worse than running the plugins here. The
+  * fallback is narrow on purpose. It needs a failure to start or reach the
 @@ -71,16 +76,31 @@ function resetIsolationFallbackForTesting() {
   * error.
   */
@@ -3659,10 +3705,16 @@ index b0824c89a9e318a26d00b18b2ef71acbed4541ef..2237a7ed8b05b60b999f486276063301
 +export declare function loadNxPlugin(plugin: PluginConfiguration, root: string, index?: number): PluginLoadResult;
  export declare function loadNxPluginAsync(pluginConfiguration: PluginConfiguration, paths: string[], root: string, index?: number): Promise<LoadedNxPlugin>;
 diff --git a/dist/src/project-graph/plugins/in-process-loader.js b/dist/src/project-graph/plugins/in-process-loader.js
-index 2b80ddcfe7de5140519b427ac0b88c13798b6c8d..c3d2ad157201991290026701de45f0673a376b32 100644
+index 2b80ddcfe7de5140519b427ac0b88c13798b6c8d..cd12b3771c8830261fc2c6ab17e840b0141d7844 100644
 --- a/dist/src/project-graph/plugins/in-process-loader.js
 +++ b/dist/src/project-graph/plugins/in-process-loader.js
-@@ -12,6 +12,7 @@ const path = require("node:path/posix");
+@@ -1,5 +1,4 @@
+ "use strict";
+-// This file contains methods and utilities that should **only** be used by the plugin worker.
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.readPluginPackageJson = readPluginPackageJson;
+ exports.loadNxPlugin = loadNxPlugin;
+@@ -12,6 +11,7 @@ const path = require("node:path/posix");
  const resolve_plugin_1 = require("./resolve-plugin");
  const transpiler_1 = require("./transpiler");
  const handle_import_1 = require("../../utils/handle-import");
@@ -3670,7 +3722,7 @@ index 2b80ddcfe7de5140519b427ac0b88c13798b6c8d..c3d2ad157201991290026701de45f067
  function readPluginPackageJson(pluginName, projects, paths = (0, installation_directory_1.getNxRequirePaths)()) {
      try {
          const result = (0, package_json_1.readModulePackageJsonWithoutFallbacks)(pluginName, paths);
-@@ -40,7 +41,8 @@ function readPluginPackageJson(pluginName, projects, paths = (0, installation_di
+@@ -40,7 +40,8 @@ function readPluginPackageJson(pluginName, projects, paths = (0, installation_di
  function loadNxPlugin(plugin, root, index) {
      return [
          loadNxPluginAsync(plugin, (0, installation_directory_1.getNxRequirePaths)(root), root, index),

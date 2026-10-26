@@ -345,7 +345,7 @@ already known and re-hashes only one whose stat moved; a moved link, and at most
 the full census, which finds a file added beside them. Only changed bytes restart the daemon (`LINKED_PLUGIN_CHANGED`),
 so a rebuild that rewrites identical files, or a link moved to a copy with the same bytes, keeps it. A plugin package
 installed inside the workspace changes only with its lockfile and is not watched this way. A local plugin — one whose
-entry resolves to source inside the checkout, outside `node_modules` — is not a restart at all:
+entry resolves to source inside the checkout, outside `node_modules` — reloads its worker instead of the daemon:
 
 A local plugin is always loaded in a plugin worker, even under `NX_ISOLATE_PLUGINS=false`, because a module loaded into
 the daemon's own process cannot be evicted: purging `require.cache` does not unload an ESM module, so an in-process
@@ -371,6 +371,21 @@ process; every other plugin keeps the worker and state it had. Bun has no module
 CLI runs under Bun spawns these workers with the `node` on PATH rather than its own executable.
 `nx-daemon-validity.test.ts` walks the reload end to end in one daemon: a CJS and an ESM local plugin whose helpers
 change, and a third local plugin that must not reload.
+
+A `REQUEST_PROJECT_GRAPH` failure, including a plugin that fails to load, is a nonterminal error value: the daemon
+answers it with the shared `respondWithError` helper and keeps serving. A developer correcting a local plugin must not
+pay a daemon restart or discard peers' graphs. A later source change retries graph preparation; the failed load never
+substitutes the previous plugin's graph. All other daemon and protocol errors retain their existing exit policy. The
+same regression refuses a local helper, repairs it, and observes its new target from the same daemon pid while an
+unaffected plugin's worker remains loaded.
+
+Measured on one unchanged consumer with three local graph plugins, three cold-daemon requests and their following warm
+recomputes per arm: median `loadSpecifiedNxPlugins` is 315.9 ms in-process and 662.6 ms in workers (346.7 ms more cold
+setup). The largest logged `total for creating and serializing project graph` per sample has cold medians 3389.1 →
+6281.6 ms and warm medians 7477.1 → 14147.7 ms. End-to-end client wall medians are cold 10274.1 → 7325.3 ms and warm
+17060.2 → 15452.7 ms. These are busy-host observations, not a speedup claim: overlapping graph requests share fixed
+performance marks, so the daemon's numbers are not isolated build clocks. No warm sample starts another plugin worker or
+reloads the specified plugin set; the added worker-loading cost is paid at cold load or source invalidation.
 
 Each restart (`LOCK_FILES_CHANGED`, `LINKED_PLUGIN_CHANGED`) belongs to the process that started the daemon. A daemon
 started as `start.js --kept`, cowshed's keeper job (`specs/cowshed/04_sandbox.md`), stops instead of spawning its own

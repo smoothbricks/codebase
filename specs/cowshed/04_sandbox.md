@@ -1037,6 +1037,10 @@ the daemon keeps serving (`patches/README.md`, "Event-driven daemon validity"). 
 that asks for it, and for these workers alike, socket placement is still a Cowshed runtime binding, not a per-project
 flag or filesystem grant.
 
+A graph-request failure, including a local plugin load refusal, is answered without stopping the daemon. A source fix
+can retry graph preparation without replacing that daemon or unrelated plugin workers. Other daemon and protocol errors
+keep their existing exit policy (`patches/README.md`, "Event-driven daemon validity").
+
 A TypeScript fixture running inside that job keeps its workspace outside every checkout in the job's private `TMPDIR`.
 Its short socket parent alias lies in the already-admitted runtime namespace and points to real leaves in the fixture's
 own root. This reuses the runtime link pattern without a new socket grant; the final socket directory is not a symlink,
