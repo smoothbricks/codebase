@@ -2169,12 +2169,13 @@ uninterruptible waits behind them.
   on stderr: its holder is a releaser still syncing its own rename, and that releaser hands it over afterwards. Before
   the first cut the thread syncs the entry's directory and that directory's parent, because a releaser may have died
   between its rename and the rename's syncs. It then cuts from the end of the file, at most 1,024 physical runs per
-  `ftruncate`, at normal disk priority (16_build_volumes.md, "Garbage collection"; `IOPOL_THROTTLE` stays rejected,
-  01a_apfs.md, "Freeing an image"), unlinks the empty file and syncs the directory. The file's length is the journal: a
-  cut ends on a run boundary, so an entry cut short is finished from its length. The thread says on stderr each entry it
-  frees, with its bytes and cuts. An entry that is gone when its turn comes (freed already, or moved by a final
-  unbinding) needs nothing; one whose free fails is said with its cause and stays in `.deleting` for the gateway's next
-  start.
+  `ftruncate`, halved after a slow cut down to 64 (each cut sized by how long the one before takes; 01a_apfs.md,
+  "Freeing an image"), at normal disk priority (16_build_volumes.md, "Garbage collection"; `IOPOL_THROTTLE` stays
+  rejected, 01a_apfs.md, "Freeing an image"), unlinks the empty file and syncs the directory. The file's length is the
+  journal: a cut ends on a run boundary, so an entry cut short is finished from its length. The thread says on stderr
+  each entry it frees, with its bytes and cuts. An entry that is gone when its turn comes (freed already, or moved by a
+  final unbinding) needs nothing; one whose free fails is said with its cause and stays in `.deleting` for the gateway's
+  next start.
 - **A restart finishes what it cut.** An install's restart stops the thread mid-entry, and the next gateway's startup
   listing finishes what it left: so a gateway restart or a reboot (the gateway is `RunAtLoad`) frees every entry left,
   an image cut short mid-free included.

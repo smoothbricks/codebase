@@ -1070,10 +1070,14 @@ file descriptor can defer reclamation until its last close, so an unlink-only ti
 Background I/O priority (`IOPOL_THROTTLE`) prolongs that wait instead of shortening it: the freeing thread's own
 metadata reads are throttled with it, so the same free takes longer and holds the container's work longer. Cowshed
 instead frees at normal disk priority and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs per
-cut**, then unlinks the empty file. A cut of 1,024 runs takes a fraction of a second and a longer cut's length grows
-with its extents; the bound is on reclamation work, **not a wall-time bound**. The file length remains the restart
-journal (16_build_volumes.md, "Garbage collection"). That bounded release runs only off every verb's path, in the
-gateway: the verb that releases an image hands the renamed entry over and returns, and the gateway's `image-cleanup`
+cut**, then unlinks the empty file. The gateway's cleanup sizes each cut by the time the one before takes: past 100 ms
+(`CUT_TARGET`) the next cut is halved, down to 64 runs (`STEP_FLOOR`), and under 50 ms it is doubled, up to 1,024
+(`next_cut`), so a cut that holds the container long is followed by smaller ones. Measured 2026-10-26 on the train-6
+install, draining 99 released images back to back at a fixed 1,024 runs a cut: 206 cuts in 45 s, most 0.07 to 0.2 s,
+five of 1.05 to 5.49 s, while build-volume mounts sat over 120 s in `mount(2)` and forks failed at them. The run count
+bounds reclamation work, **not a wall-time bound**: no size bounds one call's wall time. The file length remains the
+restart journal (16_build_volumes.md, "Garbage collection"). That bounded release runs only off every verb's path, in
+the gateway: the verb that releases an image hands the renamed entry over and returns, and the gateway's `image-cleanup`
 thread frees one entry at a time, cutting each at once (05_gateway.md, "Deleting released images").
 
 Stepping lets other writers progress between cuts; it is neither a scheduling guarantee nor a maximum duration for one

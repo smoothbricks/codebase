@@ -1065,17 +1065,18 @@ delta incrementally, as an edit would.
 - Freeing an image never takes one go. One `unlink` of a written image is one free of its whole extent tree, and every
   writer of the store's APFS container waits behind it: a long free hangs every `cowshed fork` and `ls` on the host. So
   a deletion cuts the image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut,
-  and unlinks it once it is empty; the table is `STEP_EXTENTS` in `storage/apfs/release.rs`. A cut of 1,024 runs takes a
-  fraction of a second and a longer cut's length grows with its extents, which is why 1,024 is the bound. The bound is
-  on runs reclaimed, not time inside a kernel call. A fresh clone's first cut does whole-map first-mutation work inside
-  one syscall, which a step limit or yield cannot split. An observed shared-map flag does not retain its other owner, so
-  no flag-based shortcut bypasses the cuts. See 01a_apfs.md, "Freeing an image", for the reasons and limitations. The
-  image's length is the free's journal: a cut ends on a run boundary, so a free that did not finish (a crash, a gateway
-  restart) leaves a shorter image that the next gateway start's listing queues and the cleanup finishes, and nothing
-  else records progress. The gateway frees one entry at a time, cutting each at once (05_gateway.md, "Deleting released
-  images"); it holds the entry's `flock`, and no image lock, for the whole free. The free runs at normal disk priority:
-  a thread throttled to background priority (`IOPOL_THROTTLE`) holds the container's work while its own metadata reads
-  wait, so the same free takes longer and the writers beside it wait longer.
+  and unlinks it once it is empty; the table is `STEP_EXTENTS` in `storage/apfs/release.rs`. A cut's length grows with
+  its extents, so the gateway's cleanup sizes each cut by the time the one before takes: halved, down to 64 runs, after
+  a cut that runs past 100 ms, and doubled, up to 1,024, after one under 50 ms (`next_cut`; 01a_apfs.md, "Freeing an
+  image"). The bound is on runs reclaimed, not time inside a kernel call. A fresh clone's first cut does whole-map
+  first-mutation work inside one syscall, which a step limit or yield cannot split. An observed shared-map flag does not
+  retain its other owner, so no flag-based shortcut bypasses the cuts. See 01a_apfs.md, "Freeing an image", for the
+  reasons and limitations. The image's length is the free's journal: a cut ends on a run boundary, so a free that did
+  not finish (a crash, a gateway restart) leaves a shorter image that the next gateway start's listing queues and the
+  cleanup finishes, and nothing else records progress. The gateway frees one entry at a time, cutting each at once
+  (05_gateway.md, "Deleting released images"); it holds the entry's `flock`, and no image lock, for the whole free. The
+  free runs at normal disk priority: a thread throttled to background priority (`IOPOL_THROTTLE`) holds the container's
+  work while its own metadata reads wait, so the same free takes longer and the writers beside it wait longer.
 - Workspace images containing the only copy of dirty or unlanded content keep their separate recovery rules; rebuildable
   build images do not use that preservation mechanism.
 - Every release that commits an image, a seed's or another volume's, whatever asked for it (collection, a land's release

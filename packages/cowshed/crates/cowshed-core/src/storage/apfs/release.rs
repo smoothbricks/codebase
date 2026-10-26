@@ -36,6 +36,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use cowshed_os::fork_lock::Fenced;
 use cowshed_os::fsio::{
@@ -74,6 +75,35 @@ use super::extents::for_each_run;
 /// observations under that load, not wall-time guarantees. A fresh shared-map clone took
 /// 50.074 s for its first 454-run cut; reducing reclamation work cannot bound map splitting.
 pub const STEP_EXTENTS: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(1023));
+
+/// The fewest extents a timed cut frees ([`next_cut`]), and the step the gateway's cleanup plans
+/// in: a cut of the last 64 runs still frees whole runs from the end.
+pub const STEP_FLOOR: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(63));
+
+/// How long one cut of the gateway's cleanup may hold the store's container before the next cut
+/// is made smaller ([`next_cut`]).
+///
+/// Measured 2026-10-26 on the train-6 install, the cleanup draining 99 released images (18.2 TB
+/// allocated) back to back at 1,024 runs a cut: 206 cuts in 45 s, most 0.07 to 0.2 s, five of
+/// 1.05 to 5.49 s, while build-volume mounts sat over 120 s in `mount(2)` and forks failed at
+/// them. A fixed run count bounds reclamation work, not how long one call holds the container.
+pub const CUT_TARGET: Duration = Duration::from_millis(100);
+
+/// The size of the cut after one of `step` extents that took `took`: halved, down to
+/// [`STEP_FLOOR`], when it ran past [`CUT_TARGET`]; doubled, up to [`STEP_EXTENTS`], when it
+/// took under half of it; otherwise the same.
+pub fn next_cut(step: StepExtents, took: Duration) -> StepExtents {
+    let extents = if took > CUT_TARGET {
+        NonZeroU64::new(step.get() / 2).map_or(STEP_FLOOR.0, |half| half.max(STEP_FLOOR.0))
+    } else if took < CUT_TARGET / 2 {
+        step.0
+            .saturating_mul(NonZeroU64::MIN.saturating_add(1))
+            .min(STEP_EXTENTS.0)
+    } else {
+        step.0
+    };
+    StepExtents(extents)
+}
 
 /// How many extents one step frees at most: never zero, so every plan ends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +155,18 @@ impl ReleasePlan {
 
     fn advance(&mut self) {
         self.cuts.pop();
+    }
+
+    /// The length a cut freeing the plan's next `steps` steps cuts the file to, those steps taken
+    /// off the plan; `None` once every cut is made.
+    fn take(&mut self, steps: NonZeroU64) -> Option<u64> {
+        let kept = self
+            .cuts
+            .len()
+            .saturating_sub(usize::try_from(steps.get()).unwrap_or(usize::MAX));
+        let cut = *self.cuts.get(kept)?;
+        self.cuts.truncate(kept);
+        Some(cut)
     }
 }
 
@@ -258,6 +300,29 @@ impl Release {
         while self.plan.next().is_some() {
             self.step()?;
         }
+        self.unlink()
+    }
+
+    /// Make every cut left, each sized by how long the one before took ([`next_cut`]), the
+    /// first freeing [`STEP_EXTENTS`] runs, and unlink the empty file. The plan's steps are
+    /// [`STEP_FLOOR`] runs, so every size is a whole number of them.
+    fn finish_timed(mut self) -> io::Result<Released> {
+        let mut size = STEP_EXTENTS;
+        loop {
+            let steps = NonZeroU64::new(size.get() / STEP_FLOOR.get()).unwrap_or(NonZeroU64::MIN);
+            let Some(cut) = self.plan.take(steps) else {
+                break;
+            };
+            let started = Instant::now();
+            self.file.set_len(cut)?;
+            size = next_cut(size, started.elapsed());
+            self.steps += 1;
+        }
+        self.unlink()
+    }
+
+    /// Unlink the emptied file from its held directory.
+    fn unlink(self) -> io::Result<Released> {
         // SAFETY: the held directory descriptor and the NUL-terminated name outlive the call.
         if unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) } != 0 {
             let error = io::Error::last_os_error();
@@ -311,7 +376,7 @@ pub fn free_committed(entry: &Path) -> io::Result<Released> {
     if let Some(parent) = entry.parent().and_then(Path::parent) {
         sync_held_directory(&open_directory_nofollow(parent)?)?;
     }
-    let released = Release::plan(directory.try_clone()?, name, file, STEP_EXTENTS)?.finish()?;
+    let released = Release::plan(directory.try_clone()?, name, file, STEP_FLOOR)?.finish_timed()?;
     sync_held_directory(&directory)?;
     Ok(released)
 }
@@ -846,6 +911,34 @@ mod tests {
             let resumed: Vec<u64> = ReleasePlan::new(left, cut, step(extents)).cuts().collect();
 
             prop_assert_eq!(resumed, cuts[made + 1..].to_vec());
+        }
+    }
+
+    /// The next cut's size follows the last one's wall time (05_gateway.md "Deleting released
+    /// images"): past the target it halves, down to the floor; under half the target it doubles,
+    /// up to the ceiling; between the two it stays.
+    #[test]
+    fn the_next_cut_halves_past_the_target_and_doubles_under_half_of_it() {
+        let ms = std::time::Duration::from_millis;
+        // (this cut's extents, its wall time, the next cut's extents)
+        let rows: [(u64, std::time::Duration, u64); 10] = [
+            (1024, ms(99), 1024),
+            (1024, ms(101), 512),
+            (128, ms(5_490), 64),
+            (64, ms(5_490), 64),
+            (512, ms(49), 1024),
+            (64, ms(49), 128),
+            (128, ms(49), 256),
+            (1024, ms(1), 1024),
+            (128, ms(50), 128),
+            (128, ms(100), 128),
+        ];
+        for (extents, took, next) in rows {
+            assert_eq!(
+                next_cut(step(extents), took),
+                step(next),
+                "{extents} extents in {took:?}"
+            );
         }
     }
 

@@ -484,20 +484,21 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 - **Bounded image release** (16_build_volumes.md, "Garbage collection"; 05_gateway.md, "Deleting released images"): over
   generated run layouts and step bounds, every cut shortens the file and frees at most one step of runs, the cuts end at
   zero and free every run exactly once in as few cuts as the bound allows, and a release resumed after any cut plans
-  exactly the cuts left. Its real boundary is a fragmented file on the host's filesystem, cut a few steps, abandoned,
-  and finished by a second release that counts only what was left. The deleting directory's crash points are witnessed
-  the same way. A release returns with its entry whole and unlocked and frees nothing, whatever it releases (a build
-  volume, a removed workspace's image, an orphan session or staging image, an expired checkpoint, a failed restore's
-  staged clone) and whether or not a gateway takes its hand-over: the image is off its name, every byte waits in
-  `.deleting`, and a retry finds the commit already made, makes its rename durable and answers. A link in place of the
-  deleting directory refuses. A directory store's release of a tree a process holds anything inside answers with the
-  tree committed whole to its `.deleting` directory, deletes nothing and hands nothing over, and `finish_build_releases`
-  leaves a build-volume tree while it is held and deletes it once it is not. An unsynced native entry still requires all
-  rename syncs before its owner's retry answers. Directory regressions replace the deleting directory's pathname after
-  acquisition: neither retry confirmation nor the finisher may follow the foreign tree. The finisher syncs both held
-  directories while the unsynced entry is still intact, then deletes through those descriptors; a replaced opened child
-  and foreign symlink targets remain untouched. A real self-held payload stays, but the finisher's own observation does
-  not retain it.
+  exactly the cuts left. A table fixes the cleanup's timed cut size (`next_cut`): past 100 ms the next cut halves, down
+  to 64 runs; under 50 ms it doubles, up to 1,024; between the two it stays. Its real boundary is a fragmented file on
+  the host's filesystem, cut a few steps, abandoned, and finished by a second release that counts only what was left.
+  The deleting directory's crash points are witnessed the same way. A release returns with its entry whole and unlocked
+  and frees nothing, whatever it releases (a build volume, a removed workspace's image, an orphan session or staging
+  image, an expired checkpoint, a failed restore's staged clone) and whether or not a gateway takes its hand-over: the
+  image is off its name, every byte waits in `.deleting`, and a retry finds the commit already made, makes its rename
+  durable and answers. A link in place of the deleting directory refuses. A directory store's release of a tree a
+  process holds anything inside answers with the tree committed whole to its `.deleting` directory, deletes nothing and
+  hands nothing over, and `finish_build_releases` leaves a build-volume tree while it is held and deletes it once it is
+  not. An unsynced native entry still requires all rename syncs before its owner's retry answers. Directory regressions
+  replace the deleting directory's pathname after acquisition: neither retry confirmation nor the finisher may follow
+  the foreign tree. The finisher syncs both held directories while the unsynced entry is still intact, then deletes
+  through those descriptors; a replaced opened child and foreign symlink targets remain untouched. A real self-held
+  payload stays, but the finisher's own observation does not retain it.
 - **Released images are handed to the gateway and freed by its cleanup queue** (05_gateway.md, "Deleting released
   images"). A release through a store whose configuration names no gateway (a function call over a fixture store no test
   gave one) returns with its entry whole in `.deleting` and says so once per process. The hand-over is a function call
