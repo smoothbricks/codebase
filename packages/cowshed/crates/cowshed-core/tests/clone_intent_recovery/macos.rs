@@ -1441,12 +1441,9 @@ async fn gateway_startup_heals_main_without_waiting_for_another_process_holding_
 
     let inventory = cowshed_core::NativeGatewayInventory::new(fixture.storage.clone());
     let progress = cowshed_core::StartupHealState::mounting(1);
-    let outcomes = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        inventory.heal(vec![fixture.repo.clone()], &progress),
-    )
-    .await
-    .expect("the heal waits for no lock another process holds");
+    // The heal answers at once; one that waited on the holder would be named by the leg's
+    // no-progress bound, never by a clock of this test's own (README "Test Clock Policy").
+    let outcomes = inventory.heal(vec![fixture.repo.clone()], &progress).await;
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     match &outcomes[0].main {
         Ok(mount) => assert!(mount.is_dir(), "main's mount {}", mount.display()),
