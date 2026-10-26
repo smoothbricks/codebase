@@ -4057,6 +4057,14 @@ mod tests {
         else {
             panic!("nothing holds the seed");
         };
+        assert_eq!(
+            scratch
+                .layout
+                .seed_of(&topic.name, &topic.incarnation)
+                .unwrap(),
+            None,
+            "a newest seed a release claims leaves no seed, never an older one"
+        );
         let target = topic.name.clone();
         scratch
             .volumes

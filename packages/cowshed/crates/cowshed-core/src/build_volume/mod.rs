@@ -872,6 +872,21 @@ impl BuildVolumeLayout {
         }
     }
 
+    /// Whether a release holds its exclusive claim on volume `id` ([`Self::claim_release`]). A
+    /// volume with no hold file was never claimed.
+    pub fn claimed(&self, id: &BuildVolumeId) -> io::Result<bool> {
+        let file = match fs::File::open(self.hold_path(id)).map(Fenced::new) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match file.try_lock_shared() {
+            Ok(()) => Ok(false),
+            Err(fs::TryLockError::WouldBlock) => Ok(true),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
     /// The volume a build link's target names, or `None` when the target is not one of this
     /// project's build mountpoints. Root aliases compare by their resolved parent directories.
     pub fn volume_at(&self, target: &Path) -> Option<BuildVolumeId> {
@@ -1181,7 +1196,10 @@ impl BuildVolumeLayout {
     }
 
     /// The latest seed of `target` at `incarnation`. Two seeds of one target are an
-    /// interrupted reseed: the newer is the latest.
+    /// interrupted reseed: the newer is the latest. A seed a release claims is never the latest
+    /// (16_build_volumes.md, "Garbage collection"): on a tie of creation times, recorded to the
+    /// second, the unclaimed seed is the newer, as a superseded seed's successor is; a newest seed
+    /// a release claims (its target retiring) leaves the target no seed, never an older one.
     pub fn seed_of(
         &self,
         target: &WorkspaceName,
@@ -1192,12 +1210,29 @@ impl BuildVolumeLayout {
             let Some(record) = self.read_record_present(&id)? else {
                 continue;
             };
+            let claimed = || {
+                self.claimed(&id).map_err(|error| {
+                    crate::CowshedError::integrity(
+                        format!(
+                            "build volume hold {} is unreadable: {error}",
+                            self.hold_path(&id).display()
+                        ),
+                        "cowshed doctor --json",
+                    )
+                })
+            };
             if record.is_seed_of(target, incarnation) {
-                seeds.push((id, record));
+                let unclaimed = !claimed()?;
+                seeds.push((unclaimed, id, record));
             }
         }
-        seeds.sort_by(|left, right| left.1.created_at.cmp(&right.1.created_at));
-        Ok(seeds.pop())
+        seeds.sort_by(|left, right| {
+            (&left.2.created_at, left.0).cmp(&(&right.2.created_at, right.0))
+        });
+        Ok(seeds
+            .pop()
+            .filter(|(unclaimed, ..)| *unclaimed)
+            .map(|(_, id, record)| (id, record)))
     }
 }
 

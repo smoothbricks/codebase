@@ -975,12 +975,14 @@ delta incrementally, as an edit would.
 - A held lifecycle or image lock likewise defers release. A superseded seed is claimed under its target's image lock,
   which the land and reseed paths hold while they replace it, and released once that lock is let go: the claim keeps
   collection, and a later land or reseed of the target, off it, so none releases a seed another is retiring, and no
-  seed's rename, sync or hand-over to the gateway runs under the lock. A seed already claimed when a land or reseed
-  reads the target's seeds is one an earlier one is retiring, and is left to it, as is one a retiring workspace's own
-  release finds claimed. A land retires its seeds once it lets the target's lock go, and a fork once its create has let
-  every lock go (a git-worktree fork holds its source's until its initializer ends), whether or not either succeeds;
-  only a crash, or a retirement that fails and says so on stderr, leaves a superseded seed recorded under its target,
-  for the next seed's retirement or collection.
+  seed's rename, sync or hand-over to the gateway runs under the lock. A claimed seed is never its target's latest seed,
+  so no fork clones it: on a tie of creation times (recorded to the second) its unclaimed successor is the newer, and a
+  newest seed a release claims (its target retiring) leaves the target no seed rather than an older one. A seed already
+  claimed when a land or reseed reads the target's seeds is one an earlier one is retiring, and is left to it, as is one
+  a retiring workspace's own release finds claimed. A land retires its seeds once it lets the target's lock go, and a
+  fork once its create has let every lock go (a git-worktree fork holds its source's until its initializer ends),
+  whether or not either succeeds; only a crash, or a retirement that fails and says so on stderr, leaves a superseded
+  seed recorded under its target, for the next seed's retirement or collection.
 - Collection decides from a snapshot, and a land can move a target's link onto a volume after it: an `rm` that retires
   the landing workspace while that workspace's land still runs sees the landing volume linked by nothing, and once it
   releases it, main's link names a volume that no longer exists. So each release claims the volume first and reads again
