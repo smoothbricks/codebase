@@ -30,6 +30,15 @@ pub enum BuildStateFinding {
         phase: CargoDiscoveryPhase,
         cause: String,
     },
+    /// The job that asks Cargo held no `cargo` on its PATH, so Cargo was asked about none of the
+    /// manifests its batch carried. `shell` is the checkout-relative directory of the workspace
+    /// shell whose activation put none there, or `None` when no shell selects the directory the
+    /// job ran in: cowshed links no toolchain of its own (15_capabilities.md, "Bootstrap
+    /// executables").
+    NoCargo {
+        shell: Option<PathBuf>,
+        manifests: Vec<PathBuf>,
+    },
 }
 
 impl std::fmt::Display for BuildStateFinding {
@@ -49,6 +58,30 @@ impl std::fmt::Display for BuildStateFinding {
                 },
                 manifest.display()
             ),
+            Self::NoCargo { shell, manifests } => {
+                let manifests = manifests
+                    .iter()
+                    .map(|manifest| manifest.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match shell {
+                    Some(shell) => write!(
+                        formatter,
+                        "the workspace shell activated from {} put no `cargo` on its jobs' PATH, \
+                         and cowshed links none of its own, so Cargo was not asked about \
+                         {manifests} and their target directories are not on the build volume: \
+                         declare the toolchain in that shell",
+                        shell.join(".envrc").display()
+                    ),
+                    None => write!(
+                        formatter,
+                        "no workspace shell (`.envrc`) declares a toolchain for {manifests}, and \
+                         cowshed links no `cargo` of its own, so Cargo was not asked about them and \
+                         their target directories are not on the build volume: declare the \
+                         toolchain in the repository's shell"
+                    ),
+                }
+            }
         }
     }
 }
@@ -59,13 +92,46 @@ pub struct BuildStateDiscovery {
     pub findings: Vec<BuildStateFinding>,
 }
 
+impl BuildStateDiscovery {
+    /// Record why Cargo gave no answer about `manifest`. A batch whose job held no `cargo` is one
+    /// finding naming its shell, which every manifest of that batch joins.
+    fn unanswered(&mut self, manifest: PathBuf, phase: CargoDiscoveryPhase, why: CargoUnanswered) {
+        match why {
+            CargoUnanswered::Failed(cause) => {
+                self.findings.push(BuildStateFinding::CargoUnavailable {
+                    manifest,
+                    phase,
+                    cause,
+                });
+            }
+            CargoUnanswered::NoCargo { shell } => {
+                let batch = self.findings.iter_mut().find_map(|finding| match finding {
+                    BuildStateFinding::NoCargo {
+                        shell: held,
+                        manifests,
+                    } if *held == shell => Some(manifests),
+                    _ => None,
+                });
+                match batch {
+                    Some(manifests) => manifests.push(manifest),
+                    None => self.findings.push(BuildStateFinding::NoCargo {
+                        shell,
+                        manifests: vec![manifest],
+                    }),
+                }
+            }
+        }
+    }
+}
+
 /// How discovery asks its tools. A recorded fingerprint certifies what discovery found for those
 /// inputs, so it must also name the discovery that found it: a cowshed that asks differently
 /// would otherwise keep an answer an earlier one got wrong, findings included, until a manifest
 /// happens to change. Bump it whenever discovery's questions or the environment they run in
 /// change. 2: Cargo is asked as a job, after the workspace shell's activation. 3: installed
 /// JavaScript packages contribute their `node_modules/.cache`. 5: Codegraph indexes are build-volume state.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 5";
+/// 6: a job that holds no `cargo` is one finding per shell, not one Cargo failure per manifest.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 6";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";
@@ -184,7 +250,19 @@ pub fn may_name_build_state(workspace: &Path) -> Result<bool> {
 }
 
 /// Cargo's answer to one query discovery asks of it: its stdout, or why it gave none.
-pub type CargoAnswer = std::result::Result<Vec<u8>, String>;
+pub type CargoAnswer = std::result::Result<Vec<u8>, CargoUnanswered>;
+
+/// Why discovery has no answer from Cargo to one query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CargoUnanswered {
+    /// Cargo, or the job running it, ended without one; the cause is their own account.
+    Failed(String),
+    /// The job of the query's batch held no `cargo` on its PATH, so Cargo never ran. `shell` is
+    /// the checkout-relative directory of the workspace shell activated before the driver, or
+    /// `None` when no shell selects the batch's directory: cowshed links no `cargo` of its own
+    /// (15_capabilities.md, "Bootstrap executables").
+    NoCargo { shell: Option<PathBuf> },
+}
 
 /// One question discovery asks Cargo: `cargo <args> --manifest-path <manifest>` in `directory`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,7 +320,14 @@ impl CargoRunner for JobCargo<'_> {
             shells.entry(shell).or_default().push(index);
         }
         let mut answers: Vec<Option<CargoAnswer>> = vec![None; queries.len()];
-        for indices in shells.into_values() {
+        for (shell, indices) in shells {
+            // Detection selects a shell only among the directories of the workspace it inspects.
+            let shell = shell.map(|shell| {
+                shell
+                    .strip_prefix(&self.sandbox.workspace_mount)
+                    .expect("a workspace shell lies inside its workspace")
+                    .to_owned()
+            });
             let batch: Vec<&CargoQuery> = indices.iter().map(|index| &queries[*index]).collect();
             let directory = &batch[0].directory;
             let job = crate::runtime::supervisor::run_as_job(
@@ -276,10 +361,8 @@ impl CargoRunner for JobCargo<'_> {
                     }
                 }
             })?;
-            for (index, answer) in indices
-                .into_iter()
-                .zip(driver_answers(&output, batch.len()))
-            {
+            let answered = driver_answers(&output, batch.len(), shell.as_deref());
+            for (index, answer) in indices.into_iter().zip(answered) {
                 answers[index] = Some(answer);
             }
         }
@@ -354,13 +437,15 @@ pub(super) const DRIVER_PROGRAMS: [&str; 3] = ["cat", "mktemp", "rm"];
 /// first executable of their name on the PATH the job holds, never a fixed `/bin` or `/usr/bin`
 /// path: NixOS keeps only `/bin/sh` and `/usr/bin/env`, so a job whose shell supplies none of
 /// them reaches `bash` and [`DRIVER_PROGRAMS`] through core's bootstrap links
-/// (15_capabilities.md, "Detection inputs").
+/// (15_capabilities.md, "Detection inputs"). A job whose PATH holds no `cargo` prints
+/// [`NO_CARGO`] alone, once for its whole batch, and asks nothing.
 const DRIVER: &str = r#"set -u
 parallel=$1
 count=$2
 shift 2
 query=("${@:1:count}")
 shift "$count"
+command -v cargo >/dev/null || { printf 'no-cargo\0'; exit 127; }
 work=$(mktemp -d) || exit 70
 trap 'rm -rf -- "$work"' EXIT
 while (($# >= 2)); do
@@ -385,6 +470,11 @@ while (($# >= 2)); do
 done
 "#;
 
+/// All the driver prints when its job's PATH holds no `cargo`: no shell selects the batch's
+/// directory, or the one that does activated none, and core links none (15_capabilities.md,
+/// "Bootstrap executables"). Never the start of an answer, whose first field is a decimal status.
+const NO_CARGO: &[u8] = b"no-cargo\0";
+
 fn driver_argv(args: &[&str], queries: &[&CargoQuery]) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
         // Found on the job's PATH, as cargo is: NixOS has no bash in its fixed system directories.
@@ -405,8 +495,22 @@ fn driver_argv(args: &[&str], queries: &[&CargoQuery]) -> Vec<OsString> {
 
 /// The driver's `count` answers, in query order. A query the driver never answered -- its
 /// shell's activation failed, or the job died -- carries the job's own exit and stderr, which
-/// is where the activation said what went wrong.
-fn driver_answers(output: &std::process::Output, count: usize) -> Vec<CargoAnswer> {
+/// is where the activation said what went wrong. A driver that found no `cargo` on its job's PATH
+/// answers every query with that, naming `shell`, the batch's checkout-relative workspace shell
+/// directory, if any.
+fn driver_answers(
+    output: &std::process::Output,
+    count: usize,
+    shell: Option<&Path>,
+) -> Vec<CargoAnswer> {
+    if output.stdout == NO_CARGO {
+        return vec![
+            Err(CargoUnanswered::NoCargo {
+                shell: shell.map(Path::to_owned),
+            });
+            count
+        ];
+    }
     let mut fields = output.stdout.split(|byte| *byte == 0);
     let mut answers: Vec<CargoAnswer> = std::iter::from_fn(|| {
         let status = fields.next()?;
@@ -418,25 +522,25 @@ fn driver_answers(output: &std::process::Output, count: usize) -> Vec<CargoAnswe
                 .and_then(|status| status.parse::<i32>().ok())
             {
                 Some(0) => Ok(stdout.to_vec()),
-                Some(status) => Err(format!(
+                Some(status) => Err(CargoUnanswered::Failed(format!(
                     "Cargo exit status {status}: {}",
                     String::from_utf8_lossy(stderr).trim_end()
-                )),
-                None => Err(format!(
+                ))),
+                None => Err(CargoUnanswered::Failed(format!(
                     "the job running Cargo framed an exit status as {:?}",
                     String::from_utf8_lossy(status)
-                )),
+                ))),
             },
         )
     })
     .take(count)
     .collect();
     while answers.len() < count {
-        answers.push(Err(format!(
+        answers.push(Err(CargoUnanswered::Failed(format!(
             "the job running Cargo ended ({}) before Cargo answered: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim_end()
-        )));
+        ))));
     }
     answers
 }
@@ -461,7 +565,7 @@ impl CargoRunner for HostCargo {
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .output_locked()
             .map_err(|error| CowshedError::internal(format!("cannot run bash: {error}")))?;
-        Ok(driver_answers(&output, queries.len()))
+        Ok(driver_answers(&output, queries.len(), None))
     }
 }
 
@@ -714,11 +818,9 @@ fn discover_cargo_targets(
                     cause: error.to_string(),
                 }),
             },
-            Err(cause) => result.findings.push(BuildStateFinding::CargoUnavailable {
-                manifest,
-                phase: CargoDiscoveryPhase::WorkspaceRoot,
-                cause,
-            }),
+            Err(unanswered) => {
+                result.unanswered(manifest, CargoDiscoveryPhase::WorkspaceRoot, unanswered)
+            }
         }
     }
     let mut queries = Vec::with_capacity(roots.len());
@@ -760,16 +862,13 @@ fn discover_cargo_targets(
             .expect("workspace roots were checked above")
             .to_owned();
         let metadata = metadata.and_then(|bytes| {
-            serde_json::from_slice::<CargoMetadata>(&bytes).map_err(|error| error.to_string())
+            serde_json::from_slice::<CargoMetadata>(&bytes)
+                .map_err(|error| CargoUnanswered::Failed(error.to_string()))
         });
         let metadata = match metadata {
             Ok(metadata) => metadata,
-            Err(cause) => {
-                result.findings.push(BuildStateFinding::CargoUnavailable {
-                    manifest: relative_manifest,
-                    phase: CargoDiscoveryPhase::Metadata,
-                    cause,
-                });
+            Err(unanswered) => {
+                result.unanswered(relative_manifest, CargoDiscoveryPhase::Metadata, unanswered);
                 continue;
             }
         };
@@ -1041,7 +1140,7 @@ mod driver_tests {
     /// The driver with `bash` looked up on exactly `path`. `HOST_PATH` is the host's PATH, for a
     /// fixture program that hands over to the host's own; `PROBE_ROOT` is where fixture programs
     /// leave their notes.
-    fn run_driver_on(
+    pub(super) fn run_driver_on(
         fixture: &Fixture,
         args: &[&str],
         queries: &[CargoQuery],
@@ -1057,18 +1156,13 @@ mod driver_tests {
             .unwrap()
     }
 
-    /// A job whose PATH holds core's bootstrap links and the repository's `cargo` has no more than
-    /// `bash`, `cargo` and [`DRIVER_PROGRAMS`]: the driver finds each there, never at a fixed path
-    /// (NixOS keeps only `/bin/sh` and `/usr/bin/env`), and needs nothing else. The PATH here is the
-    /// fixture's `bin` alone, where each program notes that it ran and hands over to the host's own:
-    /// a program reached any other way leaves no note, and one the driver newly needs is not found.
-    #[test]
-    fn cargo_driver_runs_on_a_path_holding_only_its_programs() {
-        let fixture = Fixture::new();
-        fs::write(fixture.root.join("ran"), "").unwrap();
+    /// Core's bootstrap links in the fixture's `bin`: `bash` and [`DRIVER_PROGRAMS`], each noting
+    /// that it ran and handing over to the host's own. No `cargo`: cowshed links none
+    /// (15_capabilities.md, "Bootstrap executables").
+    pub(super) fn bootstrap_links(fixture: &Fixture) {
         for name in ["bash"].into_iter().chain(DRIVER_PROGRAMS) {
             executable(
-                &fixture,
+                fixture,
                 &format!("bin/{name}"),
                 &format!(
                     "#!/bin/sh\n\
@@ -1078,6 +1172,18 @@ mod driver_tests {
                 ),
             );
         }
+    }
+
+    /// A job whose PATH holds core's bootstrap links and the repository's `cargo` has no more than
+    /// `bash`, `cargo` and [`DRIVER_PROGRAMS`]: the driver finds each there, never at a fixed path
+    /// (NixOS keeps only `/bin/sh` and `/usr/bin/env`), and needs nothing else. The PATH here is the
+    /// fixture's `bin` alone, where each program notes that it ran and hands over to the host's own:
+    /// a program reached any other way leaves no note, and one the driver newly needs is not found.
+    #[test]
+    fn cargo_driver_runs_on_a_path_holding_only_its_programs() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("ran"), "").unwrap();
+        bootstrap_links(&fixture);
         executable(
             &fixture,
             "bin/cargo",
@@ -1090,7 +1196,7 @@ mod driver_tests {
         let only_the_fixture = fixture.root.join("bin").into_os_string();
         let output = run_driver_on(&fixture, &["locate-project"], &queries, only_the_fixture);
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(driver_answers(&output, 1), [Ok(b"answered".to_vec())]);
+        assert_eq!(driver_answers(&output, 1, None), [Ok(b"answered".to_vec())]);
         let notes = fs::read_to_string(fixture.root.join("ran")).unwrap();
         let mut ran: Vec<&str> = notes.lines().collect();
         ran.sort_unstable();
@@ -1107,7 +1213,7 @@ mod driver_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::super::test_support::Fixture;
-    use super::driver_tests::{executable, run_driver};
+    use super::driver_tests::{bootstrap_links, executable, run_driver, run_driver_on};
     use super::*;
 
     fn write(fixture: &Fixture, relative: &str, content: &str) {
@@ -1326,6 +1432,58 @@ mod tests {
         );
     }
 
+    /// Discovery's Cargo asked the way a job of a checkout without a shell asks it: on a PATH
+    /// holding core's bootstrap links alone ([`bootstrap_links`]).
+    struct ShelllessCargo<'a>(&'a Fixture);
+
+    impl CargoRunner for ShelllessCargo<'_> {
+        fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>> {
+            let bootstrap = self.0.root.join("bin").into_os_string();
+            let output = run_driver_on(self.0, args, queries, bootstrap);
+            Ok(driver_answers(&output, queries.len(), None))
+        }
+    }
+
+    /// A checkout that pins its toolchain (`rust-toolchain.toml`) but has no shell to supply it:
+    /// its job's PATH holds no `cargo`. That is one finding naming the missing shell and every
+    /// manifest it skips, never one Cargo failure per manifest, and discovery goes on.
+    #[test]
+    fn a_job_holding_no_cargo_is_one_finding_naming_the_missing_shell() {
+        let fixture = Fixture::new();
+        git(&fixture, &["init", "--quiet"]);
+        write(
+            &fixture,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"probe\"]\nresolver = \"2\"\n",
+        );
+        package(&fixture, "probe", "probe");
+        write(
+            &fixture,
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"stable\"\n",
+        );
+        git(
+            &fixture,
+            &[
+                "add",
+                "Cargo.toml",
+                "probe/Cargo.toml",
+                "rust-toolchain.toml",
+            ],
+        );
+        bootstrap_links(&fixture);
+        let state =
+            discover_build_state(&fixture.context(), &mut ShelllessCargo(&fixture)).unwrap();
+        assert!(state.paths.is_empty(), "{:?}", state.paths);
+        assert_eq!(
+            state.findings,
+            [BuildStateFinding::NoCargo {
+                shell: None,
+                manifests: vec!["Cargo.toml".into(), "probe/Cargo.toml".into()],
+            }]
+        );
+    }
+
     #[test]
     fn cargo_driver_bounds_parallelism_and_keeps_answers_in_manifest_order() {
         let fixture = Fixture::new();
@@ -1379,13 +1537,15 @@ printf '%s:%s\n' "$index" "$PWD"
         let expected: Vec<CargoAnswer> = (0..9)
             .map(|index| {
                 if index == 2 {
-                    Err("Cargo exit status 101: refused manifest 2".to_owned())
+                    Err(CargoUnanswered::Failed(
+                        "Cargo exit status 101: refused manifest 2".to_owned(),
+                    ))
                 } else {
                     Ok(format!("{index}:{}", directory.display()).into_bytes())
                 }
             })
             .collect();
-        assert_eq!(driver_answers(&output, queries.len()), expected);
+        assert_eq!(driver_answers(&output, queries.len(), None), expected);
         for index in 0..9 {
             assert!(fixture.root.join(format!("done-{index}")).is_file());
         }
@@ -1400,16 +1560,50 @@ printf '%s:%s\n' "$index" "$PWD"
             stderr: b"direnv: error .envrc failed\n".to_vec(),
         };
         assert_eq!(
-            driver_answers(&output, 3),
+            driver_answers(&output, 3, None),
             [
                 Ok(b"/checkout/Cargo.toml\n".to_vec()),
-                Err("Cargo exit status 101: error: no workspace".to_owned()),
-                Err(
+                Err(CargoUnanswered::Failed(
+                    "Cargo exit status 101: error: no workspace".to_owned()
+                )),
+                Err(CargoUnanswered::Failed(
                     "the job running Cargo ended (exit status: 1) before Cargo answered: \
                      direnv: error .envrc failed"
                         .to_owned()
-                ),
+                )),
             ]
+        );
+    }
+
+    /// A driver whose job found no `cargo` answers every query of its batch with the shell that
+    /// supplied none, and discovery folds that batch into one finding, however many manifests it
+    /// carried.
+    #[test]
+    fn a_batch_without_cargo_is_one_finding_naming_its_shell() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(127 << 8),
+            stdout: NO_CARGO.to_vec(),
+            stderr: Vec::new(),
+        };
+        let shell = Path::new("tooling/shell");
+        let mut discovery = BuildStateDiscovery::default();
+        for (manifest, answer) in ["a/Cargo.toml", "b/Cargo.toml"]
+            .into_iter()
+            .zip(driver_answers(&output, 2, Some(shell)))
+        {
+            discovery.unanswered(
+                manifest.into(),
+                CargoDiscoveryPhase::WorkspaceRoot,
+                answer.unwrap_err(),
+            );
+        }
+        assert_eq!(
+            discovery.findings,
+            [BuildStateFinding::NoCargo {
+                shell: Some(shell.to_owned()),
+                manifests: vec!["a/Cargo.toml".into(), "b/Cargo.toml".into()],
+            }]
         );
     }
 

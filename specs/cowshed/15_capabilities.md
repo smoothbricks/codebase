@@ -68,11 +68,14 @@ one, so discovery from the pre-activation environment asked a cargo no job ever 
 shell answers a whole batch of lookups, so discovery pays one activation per shell, not one per manifest. An in-checkout
 `target_directory` contributes its checkout-relative path. A disabled cargo capability skips discovery; its directory
 override narrows the tracked manifest scan. Offline lookup failures, and an activation that ends before Cargo answers,
-are typed findings and skip that workspace, not the whole mint. Discovery runs at mint and when tracked Cargo input
-contents change. One `git ls-files` query supplies every tracked `Cargo.toml`, `.cargo/config*` and `go.mod` path;
-BLAKE3 hashes their working-tree bytes, so unstaged edits refresh the build-state paths before the next job. The
-fingerprint also folds in a discovery revision, so a cowshed that asks differently rediscovers instead of keeping an
-earlier discovery's answer, findings included. Caller environment and untracked config are not fingerprint inputs.
+are typed findings and skip that workspace, not the whole mint. So is a job whose PATH holds no `cargo`, because no
+shell selects its directory or the one that does activates none: cowshed links no toolchain (Bootstrap executables,
+below), so that batch is one finding naming its shell, or that there is none, and every manifest it skips, never one
+Cargo failure per manifest. Discovery runs at mint and when tracked Cargo input contents change. One `git ls-files`
+query supplies every tracked `Cargo.toml`, `.cargo/config*` and `go.mod` path; BLAKE3 hashes their working-tree bytes,
+so unstaged edits refresh the build-state paths before the next job. The fingerprint also folds in a discovery revision,
+so a cowshed that asks differently rediscovers instead of keeping an earlier discovery's answer, findings included.
+Caller environment and untracked config are not fingerprint inputs.
 
 The job that answers a batch is one `bash` script. `bash`, and the `cargo`, `mktemp`, `rm` and `cat` the script runs,
 are each the first executable of their name on the PATH the job holds, never a fixed `/bin` or `/usr/bin` path: NixOS
