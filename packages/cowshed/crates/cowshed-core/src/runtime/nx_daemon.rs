@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -104,7 +103,8 @@ impl NxDaemonIdle {
 /// The daemon of an Nx project, as its rendezvous record and the world agree on it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Probe {
-    /// The record names a running process whose socket accepts a connection.
+    /// The record names a running process whose socket file still has a socket attached: it
+    /// accepts, or is busy with a full queue (`deadline::occupant`).
     Live,
     /// No record: no daemon was started, or the one that was removed its record on exit.
     Unrecorded,
@@ -112,7 +112,7 @@ pub(crate) enum Probe {
     Unreadable,
     /// The recorded process is gone.
     Dead,
-    /// The recorded socket refuses a connection.
+    /// The recorded socket file has no socket attached, or cannot be read.
     Refused,
 }
 
@@ -320,9 +320,6 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
 }
 
 /// The probe of `record`, and for a live daemon the pid and bytes of the read that verified it.
-// WHY unbounded: debt: Darwin answers a unix connect in the call; on Linux a full queue parks it
-// until the daemon accepts. Moves to a bounded blocking connect.
-#[allow(clippy::disallowed_methods)]
 fn read_and_probe(record: &Path) -> (Probe, Option<(libc::pid_t, Vec<u8>)>) {
     let bytes = match std::fs::read(record) {
         Ok(bytes) => bytes,
@@ -343,9 +340,10 @@ fn read_and_probe(record: &Path) -> (Probe, Option<(libc::pid_t, Vec<u8>)>) {
     if !running(pid) {
         return (Probe::Dead, None);
     }
-    match UnixStream::connect(&recorded.socket_path) {
-        Ok(_) => (Probe::Live, Some((pid, bytes))),
-        Err(_) => (Probe::Refused, None),
+    match cowshed_os::deadline::occupant(&recorded.socket_path) {
+        Ok(cowshed_os::deadline::Occupant::Live) => (Probe::Live, Some((pid, bytes))),
+        Ok(cowshed_os::deadline::Occupant::Absent | cowshed_os::deadline::Occupant::Stopped)
+        | Err(_) => (Probe::Refused, None),
     }
 }
 
