@@ -2482,6 +2482,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cache: false,
         outputs: [],
         dependsOn: ['cli-arm64-macos'],
+        configurations: { production: {} },
         metadata: { smooTaskKind: 'build' },
       });
       expect(unservedHostTargets['napi-native']).toEqual({
@@ -2489,6 +2490,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cache: false,
         outputs: [],
         dependsOn: ['cargo-napi'],
+        configurations: { production: {} },
         metadata: { smooTaskKind: 'build' },
       });
       expect(unservedHostTargets['cargo-napi']?.metadata).toEqual({

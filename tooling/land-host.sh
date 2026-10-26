@@ -27,6 +27,8 @@
 #    whole again, and Nx's cache replays every task whose inputs did not move.
 #    After the gate passes, `bun run check:linux` cross-lints the same tree for Linux: the pre-push hook refuses a
 #    tree whose Linux cross check is not cached, so a land that skipped it would leave main unpushable.
+#    The shipping seam then builds this host's production CLI and runs cowshed:release-check on those dist bytes.
+#    The guard remains uncached and dependency-free; both phases report their wall time and refuse a red land.
 #    After the gate and the Linux cross check pass, the gate run's task results are published to the
 #    project's localhost Nx cache, the only writer to it (sheds only read it). The cache never blocks a land: task
 #    hashes that cannot be read from the gate's run summary, or a publish that fails, are said and the land goes on.
@@ -253,6 +255,24 @@ gate_workspace() {
     exit "$linux_status"
   }
   rm "$output"
+  shipping_started=$(date +%s)
+  say "building the host production CLI for shipping verification"
+  gate_job bun nx run cowshed:cli-native:production --outputStyle=static-failures-only >&2 || {
+    shipping_status=$?
+    say "host production CLI exited $shipping_status after $(($(date +%s) - shipping_started))s; the land stops"
+    [ -z "$hashes" ] || rm "$hashes"
+    exit "$shipping_status"
+  }
+  shipping_built=$(date +%s)
+  say "checking the shipping CLI bytes with cowshed:release-check"
+  gate_job bun nx run cowshed:release-check --outputStyle=static-failures-only >&2 || {
+    shipping_status=$?
+    say "shipping release-check exited $shipping_status after $(($(date +%s) - shipping_built))s; the land stops"
+    [ -z "$hashes" ] || rm "$hashes"
+    exit "$shipping_status"
+  }
+  shipping_checked=$(date +%s)
+  say "shipping verification: producer $((shipping_built - shipping_started))s, release-check $((shipping_checked - shipping_built))s, total $((shipping_checked - shipping_started))s"
   [ -n "$hashes" ] || return 0
   # The gate and the Linux cross check passed, so the gate's task results are the land's to publish. The cache never
   # blocks a land: a failed publish is said, and the land goes on.

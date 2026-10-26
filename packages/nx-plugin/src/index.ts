@@ -2080,7 +2080,13 @@ async function createProjectTargets(
   };
   for (const [name, dependsOn] of Object.entries(hostBuilds)) {
     if (dependsOn.length > 0) {
-      targets[name] = { executor: 'nx:noop', cache: false, outputs: [], dependsOn };
+      targets[name] = {
+        executor: 'nx:noop',
+        cache: false,
+        outputs: [],
+        dependsOn,
+        configurations: { production: {} },
+      };
     }
   }
 

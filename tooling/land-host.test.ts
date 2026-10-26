@@ -46,6 +46,17 @@ const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
 /** The build a successful land runs in main, so main's built outputs match the sources it lands. */
 const MAIN_BUILD = ['run-many', '-t', 'build', '--outputStyle=static-failures-only'];
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
+const SHIPPING_PRODUCER = ['run', 'cowshed:cli-native:production', '--outputStyle=static-failures-only'];
+const SHIPPING_CHECK = ['run', 'cowshed:release-check', '--outputStyle=static-failures-only'];
+const SHIPPING_PRODUCER_PASSED: Call = {
+  ...passingRun(SHIPPING_PRODUCER),
+  run: [{ taskId: 'cowshed:cli-native:production', hash: 'shipping-producer-hash', status: 0 }],
+};
+const SHIPPING_CHECK_PASSED: Call = {
+  ...passingRun(SHIPPING_CHECK),
+  run: [{ taskId: 'cowshed:release-check', hash: 'shipping-check-hash', status: 0 }],
+};
+const SHIPPING = [SHIPPING_PRODUCER_PASSED, SHIPPING_CHECK_PASSED];
 /** A whole gate that passed: its run summary carries the root aggregate's row, the hash a land publishes. */
 const GATE_PASSED: Call = {
   ...passingRun(GATE),
@@ -409,13 +420,20 @@ describe('land-host.sh', () => {
         requireFileOutput: true,
         output: `capture-prefix\n${'x'.repeat(70_000)}${suffix.slice(0, -1)}`,
       },
+      ...SHIPPING,
       passingRun(MAIN_BUILD),
     ]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('gating');
     expect(run.log).toContain("the reseed preview found nothing to price; the gate builds on ws's own build volume");
     expect(run.reseeds).toEqual(['ws --from main --dry-run']);
-    expect(run.nx).toEqual(['daemon --stop', WIRING(newMain).join(' '), GATE.join(' '), MAIN_BUILD.join(' ')]);
+    expect(run.nx).toEqual([
+      'daemon --stop',
+      WIRING(newMain).join(' '),
+      GATE.join(' '),
+      ...SHIPPING.map((call) => call.args.join(' ')),
+      MAIN_BUILD.join(' '),
+    ]);
     expect(run.log).toContain("building main's outputs");
     expect(run.log).not.toContain('capture-prefix');
     expect(run.log).toContain('capture-suffix');
@@ -433,12 +451,24 @@ describe('land-host.sh', () => {
       join(fingerprint, 'run-build-script-build-script-build.json'),
       JSON.stringify({ deps: [], local: [{ RerunIfEnvChanged: { var: 'SMOO_LAND_PROBE', val: '/usr/bin/clang' } }] }),
     );
-    const run = land.land([DAEMON_STOP, passingRun(WIRING(before)), passingRun(GATE), passingRun(MAIN_BUILD)]);
+    const run = land.land([
+      DAEMON_STOP,
+      passingRun(WIRING(before)),
+      passingRun(GATE),
+      ...SHIPPING,
+      passingRun(MAIN_BUILD),
+    ]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain(
       'cargo-build-script-env: SMOO_LAND_PROBE: 1 build-script run(s) of ring recorded "/usr/bin/clang"; Cargo now sees unset',
     );
-    expect(run.nx).toEqual(['daemon --stop', WIRING(before).join(' '), GATE.join(' '), MAIN_BUILD.join(' ')]);
+    expect(run.nx).toEqual([
+      'daemon --stop',
+      WIRING(before).join(' '),
+      GATE.join(' '),
+      ...SHIPPING.map((call) => call.args.join(' ')),
+      MAIN_BUILD.join(' '),
+    ]);
   });
   // Which diagnostics the summary keeps is the failure-summary package's; this land proves what the script does with them.
   it('stops immediately on a failed gate, reporting its complete captured failure once, without rerunning or committing a ledger', () => {
@@ -529,16 +559,18 @@ describe('land-host.sh', () => {
         DAEMON_STOP,
         passingRun(WIRING('*')),
         passingRun(GATE),
+        ...SHIPPING,
         DAEMON_STOP,
         passingRun(WIRING('*')),
         passingRun(GATE),
+        ...SHIPPING,
         { args: MAIN_BUILD, exit: 1 },
       ],
       true,
     );
     expect(run.log).toContain('main moved while the gate ran');
     expect(run.status, run.log).toBe(0);
-    expect(run.nx).toHaveLength(7);
+    expect(run.nx).toHaveLength(11);
     // Each pass checks wiring against the main head it rebased onto: the start, then the commit main moved to.
     expect(run.nx.filter((call) => call.startsWith('run @smoothbricks/codebase:wiring'))).toEqual([
       WIRING(git(land.main, 'rev-parse', 'HEAD~2')).join(' '),
@@ -552,7 +584,7 @@ describe('land-host.sh', () => {
   it('publishes the gate task results once the Linux cross check passes, and lands', () => {
     const land = fixture();
     const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, passingRun(MAIN_BUILD)]);
+    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, ...SHIPPING, passingRun(MAIN_BUILD)]);
     expect(run.status, run.log).toBe(0);
     expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
     // The publisher gets the cowshed bridge as one program, then the checkout and the gate's succeeded task hashes.
@@ -565,7 +597,7 @@ describe('land-host.sh', () => {
   it('lands even when the publish is refused, and says so', () => {
     const land = fixture(false, true);
     const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, passingRun(MAIN_BUILD)]);
+    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, ...SHIPPING, passingRun(MAIN_BUILD)]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('the publish was refused');
     expect(run.log).toContain('failed (status 1); the land goes on');
@@ -575,7 +607,13 @@ describe('land-host.sh', () => {
   it('lands without publishing when the gate passes without a readable run summary, and leaves no temporary file', () => {
     const land = fixture();
     const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), passingRun(GATE), passingRun(MAIN_BUILD)]);
+    const run = land.land([
+      DAEMON_STOP,
+      passingRun(WIRING('*')),
+      passingRun(GATE),
+      ...SHIPPING,
+      passingRun(MAIN_BUILD),
+    ]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain("could not read the gate's task hashes");
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
@@ -628,7 +666,13 @@ describe('land-host.sh', () => {
         tasks: [{ taskId: '@smoothbricks/codebase:gate', hash: 'stale-hash', status: 0 }],
       }),
     );
-    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), passingRun(GATE), passingRun(MAIN_BUILD)]);
+    const run = land.land([
+      DAEMON_STOP,
+      passingRun(WIRING('*')),
+      passingRun(GATE),
+      ...SHIPPING,
+      passingRun(MAIN_BUILD),
+    ]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain(
       'the run summary is of an invocation that began at 2026-01-01T00:00:00.000Z, before this gate',
@@ -657,10 +701,35 @@ describe('land-host.sh', () => {
     expect(run.log).not.toContain('land-host: lib:lint failed');
   });
 
+  it.each([
+    { phase: 'host production producer', calls: [{ args: SHIPPING_PRODUCER, exit: 17 }], status: 17 },
+    { phase: 'shipping guard', calls: [SHIPPING_PRODUCER_PASSED, { args: SHIPPING_CHECK, exit: 19 }], status: 19 },
+  ])('stops before landing when the $phase fails', ({ calls, status }) => {
+    const land = fixture();
+    const before = git(land.main, 'rev-parse', 'HEAD');
+    const run = land.land([DAEMON_STOP, passingRun(WIRING(before)), GATE_PASSED, ...calls]);
+    expect(run.status, run.log).toBe(status);
+    expect(run.log).toContain('the land stops');
+    expect(run.nx).toEqual([
+      'daemon --stop',
+      WIRING(before).join(' '),
+      GATE.join(' '),
+      ...calls.map((call) => call.args.join(' ')),
+    ]);
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
+    expect(existsSync(join(land.state, 'publish.args'))).toBe(false);
+  });
+
   describe('build-volume pick', () => {
     const PREVIEW = 'ws --from main --dry-run';
     const RESEED = 'ws --from main';
-    const passing = (): Call[] => [DAEMON_STOP, passingRun(WIRING('*')), passingRun(GATE), passingRun(MAIN_BUILD)];
+    const passing = (): Call[] => [
+      DAEMON_STOP,
+      passingRun(WIRING('*')),
+      passingRun(GATE),
+      ...SHIPPING,
+      passingRun(MAIN_BUILD),
+    ];
 
     it('reseeds onto the seed it priced when that seed leaves less to compile, then gates and lands', () => {
       const land = fixture(false, false, { preview: 'seed', price: `seed ${SEED}` });
@@ -721,9 +790,11 @@ describe('land-host.sh', () => {
           DAEMON_STOP,
           passingRun(WIRING('*')),
           passingRun(GATE),
+          ...SHIPPING,
           DAEMON_STOP,
           passingRun(WIRING('*')),
           passingRun(GATE),
+          ...SHIPPING,
           passingRun(MAIN_BUILD),
         ],
         true,
