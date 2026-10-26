@@ -4,8 +4,8 @@
  * and its whole body, which `remoteRequest` reads before it answers. A `gh` command that makes such a request is the
  * same wait, through `remoteChild`.
  *
- * Past the bound the wait ends on this side only (the fetch is aborted, the `gh` client this process started is sent
- * SIGTERM; the service is never touched) and answers a `RemoteHttpTimeout` naming the op, the peer, the bound, the time
+ * Past the bound the wait ends on this side only (the fetch is aborted; a `gh` client this process started is left
+ * running, unreferenced, as the deadline rule leaves every peer) and answers a `RemoteHttpTimeout` naming the op, the peer, the bound, the time
  * waited and how far the request got. The failure is terminal: nothing retries around it and nothing raises the bound
  * to pass. The cli does not depend on lmao, so this is the request half of lmao's `deadline()` for these two waits,
  * with the same injected clock (specs/lmao/01r_transient_errors_and_retry.md, "TypeScript: deadlines").
@@ -116,8 +116,8 @@ export async function remoteRequest(
 }
 
 /**
- * Wait for `child`, a `gh` client making one request, to close within the `remote-http` bound. Past it the client is
- * sent SIGTERM and the wait answers at once; a client that cannot start rejects with its spawn error.
+ * Wait for `child`, a `gh` client making one request, to close within the `remote-http` bound. Past it the wait answers at
+ * once and the client is left as it is, unreferenced, so it never holds this process open; a client that cannot start rejects with its spawn error.
  */
 export function remoteChild(
   op: string,
@@ -128,7 +128,7 @@ export function remoteChild(
     Promise.withResolvers<RemoteResult<{ code: number | null; signal: NodeJS.Signals | null }>>();
   let last: RemoteProgress = 'nothing';
   const bound = arm(op, child.spawnfile, timers, () => {
-    child.kill('SIGTERM');
+    child.unref();
     resolve({ ok: false, error: bound.timeout(last) });
   });
   child.once('spawn', () => {

@@ -98,7 +98,7 @@ describe('remoteRequest', () => {
 });
 
 describe('remoteChild', () => {
-  it('answers TIMEOUT at the remote-http bound and ends the client it started', async () => {
+  it('answers TIMEOUT at the remote-http bound and leaves the client it started running', async () => {
     const clock = manualTimers();
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     const answer = remoteChild('gh secret list', child, clock.timers);
@@ -117,7 +117,9 @@ describe('remoteChild', () => {
         last: 'spawned',
       },
     });
-    expect(await closed).toBe('SIGTERM');
+    expect([child.exitCode, child.signalCode]).toEqual([null, null]);
+    child.kill('SIGKILL');
+    expect(await closed).toBe('SIGKILL');
   });
 
   it('answers the exit of a client that finished and disarms its timer', async () => {
