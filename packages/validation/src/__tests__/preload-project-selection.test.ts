@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,15 +30,19 @@ describe('ttsc project router', () => {
   });
 
   it('reselects source owners after an inherited config changes without losing unchanged modules', () => {
-    const root = mkdtempSync(join(packageRoot, 'test-fixtures', 'project-selection-'));
+    const root = mkdtempSync(join(tmpdir(), 'validation-project-selection-'));
     try {
+      // Transient authored inputs are private scratch, not package source a
+      // concurrent lint may discover. Keep only dependency resolution linked.
+      symlinkSync(resolve(packageRoot, '..', '..', 'node_modules'), join(root, 'node_modules'), 'dir');
+      symlinkSync(join(packageRoot, 'package.json'), join(root, 'package.json'));
       const compilerOptions = {
         target: 'esnext',
         module: 'esnext',
         moduleResolution: 'bundler',
         noEmit: true,
         allowImportingTsExtensions: true,
-        types: [],
+        types: ['node'],
       };
       writeFileSync(
         join(root, 'tsconfig.json'),
