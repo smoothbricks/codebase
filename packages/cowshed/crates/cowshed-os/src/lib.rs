@@ -11,6 +11,7 @@ pub mod fsio;
 pub mod host_load;
 pub mod namespace;
 pub mod process;
+pub mod process_events;
 pub mod scratch;
 pub mod stderr;
 pub mod stdio;
