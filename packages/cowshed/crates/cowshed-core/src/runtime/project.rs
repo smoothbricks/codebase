@@ -5939,6 +5939,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                         "daemon".into(),
                                         "--stop".into(),
                                     ],
+                                    crate::build_volume::nx::DAEMON_EXIT_GRACE,
+                                    Box::new(|| None),
                                 ),
                             )
                         })
@@ -20531,23 +20533,38 @@ async fn transfer_mirror(
 
 /// Repository-selected Git commands (including merge drivers and filters) run
 /// with a write boundary around the checkout, not with controller host reach.
+///
+/// Git runs for as long as it shows progress (`cowshed_os::deadline::output_by_progress`): its
+/// output, or CPU anywhere in its process group (a merge driver, filter or hook at work), restarts
+/// the heartbeat silence. A git that shows neither for that long, a hook hung on nothing, fails
+/// `SILENT` naming its group's running processes by pid and command, and they are ended.
 #[cfg(target_os = "macos")]
-// WHY unbounded: git's exit ends it. The repository's own merge drivers, filters and hooks run
-// inside it for as long as that code takes, as under the operator's own git; the operator's
-// interrupt ends it.
-#[allow(clippy::disallowed_methods)]
 async fn invoke_git(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
     args: &[&str],
 ) -> Result<std::process::Output> {
-    let mut command =
-        tokio::process::Command::from(crate::git::sandboxed_git_command_at(store_root, root)?);
-    command.args(args).output_locked().await.map_err(|error| {
-        CowshedError::environment_missing(
-            error.to_string(),
-            "restore /usr/bin/git and sandbox-exec",
+    let mut command = crate::git::sandboxed_git_command_at(store_root, root)?;
+    command.args(args);
+    tokio::task::spawn_blocking(move || {
+        cowshed_os::deadline::output_by_progress(
+            "git",
+            &mut command,
+            cowshed_os::deadline::HEARTBEAT_SILENCE,
+            &mut || None,
         )
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("the git thread failed: {error}")))?
+    .map_err(|error| match error {
+        cowshed_os::deadline::RunError::Spawn { source, .. } => CowshedError::environment_missing(
+            source.to_string(),
+            "restore /usr/bin/git and sandbox-exec",
+        ),
+        error => CowshedError::environment_missing(
+            error.to_string(),
+            "the named process stopped making progress: see what it waits for, then retry",
+        ),
     })
 }
 

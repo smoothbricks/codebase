@@ -772,10 +772,10 @@ pub enum RunError {
     Reap(#[from] ReapError),
     #[error(transparent)]
     Output(#[from] OutputError),
-    /// A run whose output is its heartbeat ([`run_to_log`]) wrote nothing for its silence
-    /// (code `SILENT`, terminal).
+    /// A run whose output and CPU are its heartbeat ([`run_by_progress`]) showed neither, and
+    /// waited behind no live holder, for its whole silence (code `SILENT`, terminal).
     #[error("{0}")]
-    Silent(Box<Silent<ChildPeer>>),
+    Silent(Box<SilentRun>),
     /// The run's output could not be written to its log (code `IO`).
     #[error("{op}: writing the output of {role} pid {pid} to its log failed: {source}")]
     Log {
@@ -785,6 +785,63 @@ pub enum RunError {
         #[source]
         source: io::Error,
     },
+}
+
+/// A run that went silent ([`RunError::Silent`]): the silence, naming the child, and the running
+/// members of its process group as the kernel showed them, the hung process among them, each by
+/// pid, command and state. When the group's CPU could not be read, why.
+#[derive(Debug)]
+pub struct SilentRun {
+    pub silent: Silent<ChildPeer>,
+    pub group: io::Result<Vec<crate::process::GroupMember>>,
+    pub cpu_unread: Option<io::Error>,
+}
+
+impl fmt::Display for SilentRun {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}; no CPU advanced in its process group",
+            self.silent
+        )?;
+        if let Some(error) = &self.cpu_unread {
+            write!(formatter, " (its CPU could not be read: {error})")?;
+        }
+        match &self.group {
+            Ok(members) if members.is_empty() => {
+                formatter.write_str("; its group has no running process")
+            }
+            Ok(members) => {
+                formatter.write_str("; its group's running processes:")?;
+                for member in members {
+                    write!(formatter, " {member};")?;
+                }
+                Ok(())
+            }
+            Err(error) => write!(formatter, "; its group could not be listed: {error}"),
+        }
+    }
+}
+
+/// What a run's spent silence decides ([`run_by_progress`]), given the CPU its group had used at
+/// the last look, the CPU it has used now (`None` when it could not be read), and the live holder
+/// the run waits behind, if any.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AtSilence {
+    /// The group's CPU advanced: the run works, silently.
+    Worked,
+    /// No CPU advanced, but the run waits in line behind this live holder: queued, not silent.
+    Queued(String),
+    /// Nothing moved: no output, no CPU, no holder ahead.
+    Silent,
+}
+
+pub(crate) fn at_silence(last: Option<u64>, now: Option<u64>, queued: Option<String>) -> AtSilence {
+    match (last, now, queued) {
+        (Some(last), Some(now), _) if now > last => AtSilence::Worked,
+        (_, _, Some(holder)) => AtSilence::Queued(holder),
+        _ => AtSilence::Silent,
+    }
 }
 
 impl RunError {
@@ -838,26 +895,81 @@ pub fn output_within(
 }
 
 /// Run `command`, `role` to this process, with its stdout and stderr appended to `log` as they
-/// come, for as long as it keeps writing: each chunk restarts `silence` ([`idle`]). A long run has
-/// no total ceiling; its output is its heartbeat (specs/cowshed/05_gateway.md, "Deadlines"). A
-/// child that writes nothing for `silence` fails `SILENT`, naming it, its pid, its kernel state
-/// and the bytes it wrote; it is sent SIGTERM and reaped within [`REAP`], and collected later past
-/// that. Otherwise its status, once both streams have ended and it is reaped within [`REAP`]. Its
-/// stdin is null.
+/// come, under [`run_by_progress`]'s silence: a long run has no total ceiling; its output and its
+/// group's CPU are its heartbeat (specs/cowshed/05_gateway.md, "Deadlines"). The run waits behind
+/// no holder.
 pub fn run_to_log(
     role: &'static str,
     command: &mut std::process::Command,
     mut log: std::fs::File,
     silence: Duration,
 ) -> Result<ExitStatus, RunError> {
-    use crate::fork_lock::Spawn as _;
     use std::io::Write as _;
+    run_by_progress(
+        role,
+        command,
+        silence,
+        &mut |_, bytes| log.write_all(bytes),
+        &mut || None,
+    )
+}
+
+/// Run `command`, `role` to this process, as [`output_within`] does (no input, both outputs
+/// collected), under [`run_by_progress`]'s silence instead of a total: `queued` names the live
+/// holder the run waits behind, if any.
+pub fn output_by_progress(
+    role: &'static str,
+    command: &mut std::process::Command,
+    silence: Duration,
+    queued: &mut dyn FnMut() -> Option<String>,
+) -> Result<std::process::Output, RunError> {
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let status = run_by_progress(
+        role,
+        command,
+        silence,
+        &mut |stream, bytes| {
+            match stream {
+                OutputStream::Stdout => stdout.extend_from_slice(bytes),
+                OutputStream::Stderr => stderr.extend_from_slice(bytes),
+            }
+            Ok(())
+        },
+        queued,
+    )?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run `command`, `role` to this process, as the leader of a process group of its own, handing
+/// each chunk of its stdout and stderr to `sink` as it comes, for as long as it shows progress
+/// (AGENTS.md rule 15; 05_gateway.md "Deadlines"). Each chunk restarts `silence` ([`idle`]).
+/// When the silence is spent, [`at_silence`] decides: CPU that advanced anywhere in the group
+/// since the last look (a hook computing in silence) restarts it; so does a live holder `queued`
+/// names, the run waiting in line behind it, which is said on stderr; with neither the run fails
+/// `SILENT`, naming the child, its kernel state, the bytes it wrote and every running member of
+/// its group by pid and command. The group is then sent SIGTERM and the child reaped within
+/// [`REAP`], and collected later past that. Otherwise its status, once both streams have ended
+/// and it is reaped within [`REAP`]. Its stdin is null.
+pub fn run_by_progress(
+    role: &'static str,
+    command: &mut std::process::Command,
+    silence: Duration,
+    sink: &mut dyn FnMut(OutputStream, &[u8]) -> io::Result<()>,
+    queued: &mut dyn FnMut() -> Option<String>,
+) -> Result<ExitStatus, RunError> {
+    use crate::fork_lock::Spawn as _;
+    use std::os::unix::process::CommandExt as _;
     const OP: &str = "run to log";
 
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .spawn_locked()
         .map_err(|source| RunError::Spawn {
             op: OP,
@@ -865,6 +977,9 @@ pub fn run_to_log(
             source,
         })?;
     let pid = child.id();
+    let group = libc::pid_t::try_from(pid).ok();
+    let read_cpu = || group.map(crate::process::group_cpu);
+    let mut cpu = read_cpu().and_then(Result::ok);
     let pumps = OutputPumps::start(&mut child);
     let mut open = pumps.started.len();
     let mut heard = idle(OP, silence);
@@ -875,8 +990,8 @@ pub fn run_to_log(
         }
         let wait = heard.remaining(clock()).unwrap_or_default();
         match pumps.pumped.recv_timeout(wait) {
-            Ok(Pumped::Chunk(_, bytes)) => {
-                if let Err(source) = log.write_all(&bytes) {
+            Ok(Pumped::Chunk(stream, bytes)) => {
+                if let Err(source) = sink(stream, &bytes) {
                     break Some(RunError::Log {
                         op: OP,
                         role,
@@ -900,9 +1015,38 @@ pub fn run_to_log(
             // The timer's tick can wake the wait a hair early; only a spent silence is silent.
             Err(mpsc::RecvTimeoutError::Timeout) if heard.remaining(clock()).is_some() => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                break Some(RunError::Silent(Box::new(
-                    heard.silent(ChildPeer::observed(role, pid), clock()),
-                )));
+                let (now, mut cpu_unread) = match read_cpu() {
+                    Some(Ok(now)) => (Some(now), None),
+                    Some(Err(error)) => (None, Some(error)),
+                    None => (None, None),
+                };
+                if cpu.is_none() && cpu_unread.is_none() {
+                    cpu_unread = Some(io::Error::other(
+                        "its group's CPU had no earlier reading to compare with",
+                    ));
+                }
+                let decided = at_silence(cpu, now, queued());
+                cpu = now.or(cpu);
+                // A window of work or queueing restarts the silence; the bytes written stay the
+                // last progress, which a later silence names.
+                let written = Progress::Received { bytes: written };
+                match decided {
+                    AtSilence::Worked => heard.observe(written, clock()),
+                    AtSilence::Queued(holder) => {
+                        crate::eprintln!("cowshed: {role} pid {pid} waits in line behind {holder}");
+                        heard.observe(written, clock());
+                    }
+                    AtSilence::Silent => {
+                        break Some(RunError::Silent(Box::new(SilentRun {
+                            silent: heard.silent(ChildPeer::observed(role, pid), clock()),
+                            group: group.map_or_else(
+                                || Err(io::Error::other(format!("pid {pid} names no group"))),
+                                crate::process::group_members,
+                            ),
+                            cpu_unread,
+                        })));
+                    }
+                }
             }
             // Every pump has ended and said so.
             Err(mpsc::RecvTimeoutError::Disconnected) => break None,
@@ -917,9 +1061,9 @@ pub fn run_to_log(
             Progress::State("output ended"),
         ),
         Some(failure) => {
-            if let Ok(target) = libc::pid_t::try_from(pid) {
-                // SAFETY: `target` is this process's own unreaped child.
-                unsafe { libc::kill(target, libc::SIGTERM) };
+            if let Some(group) = group {
+                // SAFETY: `group` is the process group this process's own child leads.
+                unsafe { libc::killpg(group, libc::SIGTERM) };
             }
             let signalled = Progress::Signalled {
                 signal: libc::SIGTERM,
@@ -1747,7 +1891,7 @@ mod tests {
             RunError::Reap(ReapError::Wait { pid, .. })
             | RunError::Output(OutputError::Read { pid, .. })
             | RunError::Log { pid, .. } => Some(*pid),
-            RunError::Silent(silent) => Some(silent.holder.pid),
+            RunError::Silent(run) => Some(run.silent.holder.pid),
         }
     }
 
@@ -1995,24 +2139,29 @@ mod tests {
     }
 
     #[test]
-    fn a_run_to_log_that_goes_silent_fails_naming_the_child_and_is_ended() {
+    fn a_run_to_log_that_goes_silent_fails_naming_its_hung_process_and_is_ended() {
         let log = LogFile::new("silent");
         let failure = run_to_log(
             "probe command",
-            std::process::Command::new("/bin/sh").args(["-c", "echo started; exec sleep 600"]),
+            std::process::Command::new("/bin/sh").args(["-c", "echo started; sleep 600"]),
             log.create(),
             Duration::from_millis(50),
         )
-        .expect_err("sleep 600 writes nothing more within 50 ms");
-        let RunError::Silent(silent) = &failure else {
+        .expect_err("sleep 600 writes nothing and computes nothing within 50 ms");
+        let RunError::Silent(run) = &failure else {
             panic!("expected SILENT, got {failure}");
         };
         assert_eq!(failure.code(), "SILENT");
-        assert_eq!(silent.op, "run to log");
-        assert_eq!(silent.holder.role, "probe command");
-        assert_eq!(silent.last, Progress::Received { bytes: 8 });
+        assert_eq!(run.silent.op, "run to log");
+        assert_eq!(run.silent.holder.role, "probe command");
+        assert_eq!(run.silent.last, Progress::Received { bytes: 8 });
+        let members = run.group.as_ref().expect("the silent run's group");
+        assert!(
+            members.iter().any(|member| member.command == "sleep 600"),
+            "the hung process is named: {failure}"
+        );
         assert_eq!(
-            crate::process::run_state(libc::pid_t::try_from(silent.holder.pid).expect("a pid")),
+            crate::process::run_state(libc::pid_t::try_from(run.silent.holder.pid).expect("a pid")),
             RunState::Gone,
             "the silent child was ended and reaped"
         );
@@ -2020,6 +2169,90 @@ mod tests {
             std::fs::read_to_string(&log.0).expect("read the log"),
             "started\n"
         );
+    }
+
+    /// A child that spins without writing is working: at a spent silence its group's CPU has
+    /// advanced, so the run goes on. The runner's `queued` callback marks each look; the test ends
+    /// the child at the second, so the run answering that kill, not `SILENT`, is the proof that
+    /// the first look counted the CPU as progress.
+    #[test]
+    fn a_child_that_spins_in_silence_is_progress_at_each_look() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let leader = std::cell::Cell::new(None::<libc::pid_t>);
+        let looks = std::cell::Cell::new(0_u32);
+        let status = run_by_progress(
+            "probe command",
+            std::process::Command::new("/bin/sh").args(["-c", "echo $$; while :; do :; done"]),
+            Duration::from_millis(100),
+            &mut |_, bytes| {
+                let pid = std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|line| line.trim().parse().ok());
+                leader.set(leader.get().or(pid));
+                Ok(())
+            },
+            &mut || {
+                looks.set(looks.get() + 1);
+                if looks.get() == 2 {
+                    let pid = leader.get().expect("the child said its pid before it spun");
+                    // SAFETY: `pid` is the run's own unreaped child.
+                    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+                }
+                None
+            },
+        )
+        .expect("a spinning child is progress until it is ended");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(looks.get(), 2);
+    }
+
+    /// What a spent silence decides from the group's CPU at the last look and now, and the live
+    /// holder the run waits behind.
+    #[test]
+    fn a_spent_silence_is_work_queueing_or_silence() {
+        let holder = || Some("pid 7 `cargo build`".to_owned());
+        let cases = [
+            ("CPU advanced", Some(5), Some(6), None, AtSilence::Worked),
+            (
+                "CPU advanced while queued",
+                Some(5),
+                Some(6),
+                holder(),
+                AtSilence::Worked,
+            ),
+            (
+                "no CPU, a holder ahead",
+                Some(5),
+                Some(5),
+                holder(),
+                AtSilence::Queued("pid 7 `cargo build`".to_owned()),
+            ),
+            (
+                "no CPU, nobody ahead",
+                Some(5),
+                Some(5),
+                None,
+                AtSilence::Silent,
+            ),
+            (
+                "CPU unread, nobody ahead",
+                Some(5),
+                None,
+                None,
+                AtSilence::Silent,
+            ),
+            ("no baseline yet", None, Some(9), None, AtSilence::Silent),
+            (
+                "CPU unread, a holder ahead",
+                None,
+                None,
+                holder(),
+                AtSilence::Queued("pid 7 `cargo build`".to_owned()),
+            ),
+        ];
+        for (case, last, now, queued, expected) in cases {
+            assert_eq!(at_silence(last, now, queued), expected, "{case}");
+        }
     }
 
     #[tokio::test]

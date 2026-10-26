@@ -1696,15 +1696,17 @@ impl SandboxEnvironment {
 /// Controller-owned discovery asks a project's tools through this rather than through the
 /// pre-activation environment: a checkout whose toolchain comes from its dev environment has
 /// none on the bootstrap PATH, or a different one, and a job only ever meets the activated one.
-// WHY unbounded: it runs the project's own tool exactly as a job of the workspace runs one, and a
-// job has no total ceiling (05_gateway.md "Deadlines"): the tool's exit ends it, or the operator's
-// interrupt. Its callers say what it waits for: discovery names Cargo's lock holders every
-// WAIT_REPORT, and the land's `nx daemon --stop` is its `stop-landing-nx` step.
-#[allow(clippy::disallowed_methods)]
+///
+/// The tool runs for as long as it shows progress (`cowshed_os::deadline::output_by_progress`):
+/// output, or CPU anywhere in its process group, restarts `silence`, and so does a live holder
+/// `queued` names, which the tool waits in line behind. One that shows none for `silence` fails
+/// `SILENT`, naming its group's running processes, which are ended.
 pub async fn run_as_job(
     sandbox: &SandboxConfig,
     cwd: &Path,
     argv: Vec<OsString>,
+    silence: Duration,
+    mut queued: Box<dyn FnMut() -> Option<String> + Send>,
 ) -> Result<std::process::Output> {
     let mut ceiling = sandbox.clone();
     ceiling.configure_capabilities_for(cwd)?;
@@ -1713,15 +1715,30 @@ pub async fn run_as_job(
     let caller = BTreeMap::new();
     let environment = sandbox_environment(sandbox, &caller).await?;
     let plan = one_shot_plan(sandbox, profile, cwd.to_owned(), argv)?;
-    let mut command = sandboxed_command(&plan, &environment.child(&caller));
-    prepare_child_descriptors(command.as_std_mut())
+    let mut command = sandboxed_command(&plan, &environment.child(&caller)).into_std();
+    prepare_child_descriptors(&mut command)
         .map_err(ExecError::from)
         .map_err(map_exec_error)?;
-    cowshed_os::fork_lock::RunAsync::output_locked(&mut command)
-        .await
-        .map_err(classify_spawn_error)
-        .map_err(ExecError::from)
-        .map_err(map_exec_error)
+    let program = plan.program.clone();
+    tokio::task::spawn_blocking(move || {
+        cowshed_os::deadline::output_by_progress(
+            "project tool",
+            &mut command,
+            silence,
+            &mut *queued,
+        )
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("the project tool's thread failed: {error}")))?
+    .map_err(|error| match error {
+        cowshed_os::deadline::RunError::Spawn { source, .. } => {
+            map_exec_error(ExecError::from(classify_spawn_error(source)))
+        }
+        error => CowshedError::environment_missing(
+            format!("{}: {error}", program.display()),
+            "the named process stopped making progress: see what it waits for, then retry",
+        ),
+    })
 }
 
 /// Prepare the workspace's private environment host-side and describe the child environment.
@@ -8885,9 +8902,15 @@ mod workspace_toolchain_tests {
             .expect("executable");
         let sandbox = sandbox_at(&mount);
 
-        let output = run_as_job(&sandbox, &mount, vec![OsString::from("./which-bash")])
-            .await
-            .expect("run the script as a job");
+        let output = run_as_job(
+            &sandbox,
+            &mount,
+            vec![OsString::from("./which-bash")],
+            cowshed_os::deadline::HEARTBEAT_SILENCE,
+            Box::new(|| None),
+        )
+        .await
+        .expect("run the script as a job");
         assert!(output.status.success(), "{output:?}");
         assert_eq!(
             String::from_utf8(output.stdout).expect("utf-8").trim_end(),

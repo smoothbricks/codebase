@@ -330,10 +330,13 @@ impl CargoRunner for JobCargo<'_> {
             });
             let batch: Vec<&CargoQuery> = indices.iter().map(|index| &queries[*index]).collect();
             let directory = &batch[0].directory;
+            let home = self.sandbox.home.clone();
             let job = crate::runtime::supervisor::run_as_job(
                 self.sandbox,
                 directory,
                 driver_argv(args, &batch),
+                cowshed_os::deadline::HEARTBEAT_SILENCE,
+                Box::new(move || cargo_lock_held(&home)),
             );
             let output = self.runtime.block_on(async {
                 tokio::pin!(job);
@@ -376,6 +379,32 @@ impl CargoRunner for JobCargo<'_> {
 /// How often a discovery job that has not answered says what it waits on.
 const WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The live holders of the host Cargo home's locks, as `<holder> holds <lock>`, when any process
+/// holds one: discovery's Cargo then waits in line behind it, queued, not silent. `None` when none
+/// does, or when the locks cannot be read, which proves no holder. Darwin only: elsewhere the
+/// holders are not read, so a Cargo blocked on its lock has only its own progress.
+fn cargo_lock_held(home: &Path) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let cargo_home = home.join(".cargo");
+        let held: Vec<String> = super::cargo::STATE_FILES
+            .iter()
+            .flat_map(|file| {
+                let lock = cargo_home.join(file);
+                crate::build_volume::nx::holders(&lock)
+                    .into_iter()
+                    .flatten()
+                    .map(move |holder| format!("{holder} holds {}", lock.display()))
+            })
+            .collect();
+        (!held.is_empty()).then(|| held.join("; "))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        None
+    }
+}
 /// Who holds the host Cargo home's own locks open. Cargo blocks on its package-cache lock
 /// while another cargo resolves or builds, and discovery's Cargo shares that `$CARGO_HOME`
 /// ([`super::cargo::HOME`]), so a concurrent build is the usual reason a discovery job waits.

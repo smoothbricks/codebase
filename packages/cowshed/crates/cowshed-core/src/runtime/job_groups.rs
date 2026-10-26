@@ -1272,7 +1272,7 @@ fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
 #[cfg(target_os = "macos")]
 fn running_in_group(pgid: i32) -> io::Result<Vec<RunningLife>> {
     let mut members = Vec::new();
-    for pid in group_pids(pgid)? {
+    for pid in cowshed_os::process::group_pids(pgid)? {
         // Exited (an unreaped process answers ESRCH too) or gone: nothing to signal.
         let Some(life) = running_life(pid)? else {
             continue;
@@ -1866,48 +1866,6 @@ impl ProcessExit {
             }
             ready.clear_ready();
         }
-    }
-}
-
-/// The pids holding the group id, in exited processes too.
-#[cfg(target_os = "macos")]
-fn group_pids(pgid: i32) -> io::Result<Vec<i32>> {
-    let mut pids = vec![0; 32];
-    loop {
-        let bytes =
-            i32::try_from(std::mem::size_of_val(pids.as_slice())).map_err(io::Error::other)?;
-        // SAFETY: errno is thread-local; libproc writes at most `bytes` into this live slice.
-        let count = unsafe {
-            *libc::__error() = 0;
-            libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes)
-        };
-        if count <= 0 {
-            let error = io::Error::last_os_error();
-            return if count == 0 && error.raw_os_error() == Some(0) {
-                Ok(Vec::new())
-            } else {
-                Err(error)
-            };
-        }
-        let count = usize::try_from(count).map_err(io::Error::other)?;
-        // A full buffer is never evidence of complete membership.
-        if count < pids.len() {
-            pids.truncate(count);
-            if pids.iter().any(|pid| *pid <= 0) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "process group membership contains an invalid pid",
-                ));
-            }
-            return Ok(pids);
-        }
-        let length = pids.len().checked_mul(2).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "process group membership overflowed",
-            )
-        })?;
-        pids.resize(length, 0);
     }
 }
 

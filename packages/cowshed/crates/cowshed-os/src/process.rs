@@ -428,6 +428,226 @@ pub fn run_state(pid: libc::pid_t) -> RunState {
     }
 }
 
+/// One process of a group, named as a run that went silent names it: its pid, its command and
+/// what the kernel shows it doing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupMember {
+    pub pid: libc::pid_t,
+    pub command: String,
+    pub state: RunState,
+}
+
+impl fmt::Display for GroupMember {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "pid {} `{}` ({})",
+            self.pid, self.command, self.state
+        )
+    }
+}
+
+/// The pids holding the group id `pgid`, exited processes included, as `proc_listpgrppids` lists
+/// them. A full buffer is never taken as the whole group: it is doubled and read again.
+#[cfg(target_os = "macos")]
+pub fn group_pids(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    let mut pids = vec![0; 32];
+    loop {
+        let bytes =
+            i32::try_from(std::mem::size_of_val(pids.as_slice())).map_err(io::Error::other)?;
+        // SAFETY: errno is thread-local; libproc writes at most `bytes` into this live slice.
+        let count = unsafe {
+            *libc::__error() = 0;
+            libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes)
+        };
+        if count <= 0 {
+            let error = io::Error::last_os_error();
+            return if count == 0 && error.raw_os_error() == Some(0) {
+                Ok(Vec::new())
+            } else {
+                Err(error)
+            };
+        }
+        let count = usize::try_from(count).map_err(io::Error::other)?;
+        if count < pids.len() {
+            pids.truncate(count);
+            if pids.iter().any(|pid| *pid <= 0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process group membership contains an invalid pid",
+                ));
+            }
+            return Ok(pids);
+        }
+        let length = pids.len().checked_mul(2).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process group membership overflowed",
+            )
+        })?;
+        pids.resize(length, 0);
+    }
+}
+
+/// The CPU the processes of group `pgid` have used, each with its reaped children's, in the
+/// kernel's own unit (Mach ticks on Darwin): comparable only to another reading of this group,
+/// reaps it, so work done anywhere in the group advances the reading. A member that exits
+/// between the listing and its read is left out, and so is one the kernel will not read for this
+/// process (`EPERM`: a setuid program), whose work the reading then does not see; a run that goes
+/// silent names it among its group's members. Any other failed read is the reading's error.
+/// between the listing and its read is left out; any other failed read is the reading's error.
+#[cfg(target_os = "macos")]
+pub fn group_cpu(pgid: libc::pid_t) -> io::Result<u64> {
+    let mut total = 0_u64;
+    for pid in group_pids(pgid)? {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+        // SAFETY: `info` is writable storage of the size the V4 flavor writes.
+        let read =
+            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
+        if read != 0 {
+            let error = io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM)) {
+                continue;
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("read the CPU of process {pid} in group {pgid}: {error}"),
+            ));
+        }
+        // SAFETY: a successful call filled the V4 record.
+        let info = unsafe { info.assume_init() };
+        total = total
+            .saturating_add(info.ri_user_time)
+            .saturating_add(info.ri_system_time)
+            .saturating_add(info.ri_child_user_time)
+            .saturating_add(info.ri_child_system_time);
+    }
+    Ok(total)
+}
+
+/// The running processes of group `pgid`, each named by its command line (its executable when the
+/// arguments cannot be read) and its state.
+#[cfg(target_os = "macos")]
+pub fn group_members(pgid: libc::pid_t) -> io::Result<Vec<GroupMember>> {
+    Ok(group_pids(pgid)?
+        .into_iter()
+        .filter_map(|pid| {
+            let state = run_state(pid);
+            if matches!(state, RunState::Gone | RunState::Zombie) {
+                return None;
+            }
+            let command = process_arguments(pid).map_or_else(
+                |error| format!("command unread: {error}"),
+                |arguments| {
+                    arguments
+                        .argv
+                        .iter()
+                        .map(|argument| String::from_utf8_lossy(argument))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+            );
+            Some(GroupMember {
+                pid,
+                command,
+                state,
+            })
+        })
+        .collect())
+}
+
+/// Each process's stat whose group is `pgid`, as `(pid, fields after the command name)`. A pid
+/// that exits between the listing and its read is left out.
+#[cfg(target_os = "linux")]
+fn group_stats(pgid: libc::pid_t) -> io::Result<Vec<(libc::pid_t, String)>> {
+    let mut stats = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let fields = stat
+            .rfind(')')
+            .map(|closing| stat[closing + 1..].to_owned())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("process {pid}'s stat has no command delimiter"),
+                )
+            })?;
+        // Field 5, the group, after the state (field 3) and the parent (field 4).
+        if fields
+            .split_whitespace()
+            .nth(2)
+            .and_then(|group| group.parse().ok())
+            == Some(pgid)
+        {
+            stats.push((pid, fields));
+        }
+    }
+    Ok(stats)
+}
+
+/// [`group_cpu`] from procfs: utime, stime, cutime and cstime (fields 14 to 17), in clock ticks.
+#[cfg(target_os = "linux")]
+pub fn group_cpu(pgid: libc::pid_t) -> io::Result<u64> {
+    let mut total = 0_u64;
+    for (pid, fields) in group_stats(pgid)? {
+        // Fields 14 to 17, after the state (field 3).
+        for field in fields.split_whitespace().skip(11).take(4) {
+            let ticks = field.parse::<u64>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("process {pid}'s stat holds a CPU field that is no count"),
+                )
+            })?;
+            total = total.saturating_add(ticks);
+        }
+    }
+    Ok(total)
+}
+
+/// [`group_members`] from procfs: the command line from `cmdline`.
+#[cfg(target_os = "linux")]
+pub fn group_members(pgid: libc::pid_t) -> io::Result<Vec<GroupMember>> {
+    Ok(group_stats(pgid)?
+        .into_iter()
+        .filter_map(|(pid, _)| {
+            let state = run_state(pid);
+            if matches!(state, RunState::Gone | RunState::Zombie) {
+                return None;
+            }
+            let command = std::fs::read(format!("/proc/{pid}/cmdline")).map_or_else(
+                |error| format!("command unread: {error}"),
+                |line| {
+                    line.split(|byte| *byte == 0)
+                        .filter(|argument| !argument.is_empty())
+                        .map(String::from_utf8_lossy)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+            );
+            Some(GroupMember {
+                pid,
+                command,
+                state,
+            })
+        })
+        .collect())
+}
 /// A process's exit, watched from a moment it ran. The kernel reports it only once the process
 /// has released what it held, every descriptor included (measured on Darwin: a listener it alone
 /// held is detached from its socket file by NOTE_EXIT; Linux makes a pidfd readable in

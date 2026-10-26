@@ -933,15 +933,22 @@ the handshake bound.
     empty-membership notification and each signalled member's pidfd within one reap bound, past which it fails `TIMEOUT`
     naming every member still alive with its pid, image and kernel state (07_api.md, "Complete job accounting and
     observation reconciliation").
-    - **A child whose output is its progress has a silence bound, not a total.** A long-running command whose stdout and
-      stderr show its work runs under `cowshed-os::deadline::run_to_log`: both streams are appended to its log as they
-      come, and each chunk restarts its silence bound, which its caller names. A child that writes nothing for that
-      silence fails `SILENT`, naming its pid, the state the kernel shows it in and the bytes it wrote; it is sent
-      `SIGTERM` and reaped within the reap bound, and collected later past it. A child that ends its streams is reaped
-      within the reap bound and its status answers. A repository mirror's transfers (`clone --mirror` and the
-      `fetch --prune` that updates it) run with `--progress` under the heartbeat silence (15 s, `HEARTBEAT_SILENCE`),
-      their output in the mirror's transfer log: git redraws its progress meter at most once a second while a phase
-      moves, so a remote silent that long has stopped sending.
+    - **A child whose output or CPU is its progress has a silence bound, not a total.** A long-running command that
+      shows its work runs under `cowshed-os::deadline::run_by_progress` (`run_to_log` appends both streams to a log,
+      `output_by_progress` collects them) as the leader of a process group of its own. Its progress is its output or CPU
+      advancing anywhere in that group: each chunk restarts its silence bound, which its caller names, and once the
+      silence is spent the group's CPU (each member's own and its reaped children's) is read and compared with the last
+      reading, so a hook computing in silence keeps it going. A child its caller names as waiting in line behind a live
+      holder is queued, not silent: it keeps waiting, said on stderr. A child that shows none of these for its silence
+      fails `SILENT`, naming its pid, the state the kernel shows it in, the bytes it wrote and every running member of
+      its group by pid, command and state; the group is sent `SIGTERM`, the child reaped within the reap bound and
+      collected later past it. A child that ends its streams is reaped within the reap bound and its status answers. Its
+      callers: a repository mirror's transfers (`clone --mirror` and the `fetch --prune` that updates it), with
+      `--progress`, their output in the mirror's transfer log; workspace git that runs repository-selected merge
+      drivers, filters and hooks; and a project's tool run as a job, where discovery's Cargo is queued while a live
+      process holds the host Cargo home's locks. Each has the heartbeat silence (15 s, `HEARTBEAT_SILENCE`), except the
+      land's `nx daemon --stop`, which has the 10 s a stopped daemon gets to exit after the SIGTERM it sends
+      (`DAEMON_EXIT_GRACE`).
   - **The gateway's drain reaps its Nx backends within one reap bound.** Once nothing is in flight, the drain sends
     `SIGTERM` to every Nx cache backend it started and waits for all of them within one reap bound
     (`cowshed-os::deadline::reap_async`). The actor is therefore parked at most that long, and the drain ends inside
@@ -1027,12 +1034,13 @@ the handshake bound.
   child's `wait`/`wait_with_output`, tokio `Child::kill`, `Command::output`/`status`, `fork_lock`'s
   `output_locked`/`status_locked`, a unix-socket `connect`, `libc::flock` and `File::lock`/`lock_shared`,
   `waitpid`/`waitid`/`wait4`), each reason naming its bounded form in `cowshed_os::deadline` (`reap`, `reap_async`,
-  `output_within`, `run_to_log`, `connect_unix`) or `cowshed_os::flock` (`exclusive`, `queued`). A kept site allows
-  `clippy::disallowed_methods` for its one item or statement beside `// WHY unbounded: <what ends the wait>`, and
-  `cowshed:wait-why` (WAIT-WHY, `packages/nx-plugin/src/wait-why-policy.ts`, a dependency of `cowshed:lint`) refuses the
-  allow without it, and refuses a reason that records `debt:`: that names a stall the site leaves, not an end, so the
-  site is bounded instead. Tests wait through `cowshed_os::test_backstop`'s helpers, bounded by the no-progress
-  backstop; a test keeps a raw wait, with its WHY, only where a helper thread would change what it measures.
+  `output_within`, `run_by_progress` and its `run_to_log` and `output_by_progress`, `connect_unix`) or
+  `cowshed_os::flock` (`exclusive`, `queued`). A kept site allows `clippy::disallowed_methods` for its one item or
+  statement beside `// WHY unbounded: <what ends the wait>`, and `cowshed:wait-why` (WAIT-WHY,
+  `packages/nx-plugin/src/wait-why-policy.ts`, a dependency of `cowshed:lint`) refuses the allow without it, and refuses
+  a reason that records `debt:`: that names a stall the site leaves, not an end, so the site is bounded instead. Tests
+  wait through `cowshed_os::test_backstop`'s helpers, bounded by the no-progress backstop; a test keeps a raw wait, with
+  its WHY, only where a helper thread would change what it measures.
 
 ## Disk-lifecycle lease
 
