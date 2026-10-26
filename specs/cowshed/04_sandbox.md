@@ -1025,9 +1025,16 @@ cache, prints its `mkstemp` path, and resolves every lookup the slow way.
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
 `XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. The managed shell turns Nx's plugin
-isolation off (`NX_ISOLATE_PLUGINS=false`, `tooling/direnv/devenv.smoo.nix`), so its daemon loads the project-graph
-plugins in its own process. Where isolation is on, as in a fixture that asks for it, socket placement is still a Cowshed
-runtime binding, not a per-project flag or filesystem grant.
+isolation off (`NX_ISOLATE_PLUGINS=false`, `tooling/direnv/devenv.smoo.nix`), so its daemon loads installed
+project-graph plugins in its own process. A plugin whose entry resolves to source inside the checkout is the one
+exception: the patched Nx always loads it in a plugin worker — the `node` on PATH where the CLI runs under Bun —
+whatever that flag says, and with no in-process fallback: a worker that cannot start fails the load rather than running
+local source in the daemon. An installed plugin keeps its existing fallback. A module loaded into the daemon's own
+process cannot be evicted (Node cannot unload an ESM module), so a local plugin loaded there would keep serving its
+first-loaded code after its source changed; in a worker, only the affected plugin is retired and reloaded once a file it
+loaded changes, while the daemon keeps serving (`patches/README.md`, "Event-driven daemon validity"). Where isolation is
+on, as in a fixture that asks for it, and for these workers alike, socket placement is still a Cowshed runtime binding,
+not a per-project flag or filesystem grant.
 
 A TypeScript fixture running inside that job keeps its workspace outside every checkout in the job's private `TMPDIR`.
 Its short socket parent alias lies in the already-admitted runtime namespace and points to real leaves in the fixture's

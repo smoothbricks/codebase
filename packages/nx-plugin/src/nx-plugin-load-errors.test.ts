@@ -2,11 +2,43 @@ import { expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { localPluginPath, pluginsAffectedByChanges } from 'nx/src/project-graph/plugins/local-plugin-source.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /** Guards the plugin-load aggregation hunk of patches/nx@23.2.1.patch against the actual Bun-installed Nx. */
 const repositoryRoot = join(import.meta.dir, '../../..');
 const nxEntry = join(repositoryRoot, 'node_modules/.bin/nx');
+
+for (const fixture of [
+  { changed: ['a/entry.cjs'], expected: ['a'] },
+  { changed: ['shared/helper.mjs'], expected: ['a', 'b'] },
+  { changed: ['b/lazy.ts'], expected: ['b'] },
+  { changed: ['deleted.json'], expected: ['a'] },
+  { changed: ['unimported.ts', 'node_modules/library/index.js'], expected: [] },
+  { changed: [], expected: [] },
+]) {
+  it(`invalidates exactly the local plugin closures intersecting ${JSON.stringify(fixture.changed)}`, () => {
+    const closures = new Map([
+      ['a', new Set(['a/entry.cjs', 'shared/helper.mjs', 'deleted.json'])],
+      ['b', new Set(['b/entry.mjs', 'shared/helper.mjs', 'b/lazy.ts'])],
+      ['unrelated', new Set(['other/plugin.ts'])],
+    ]);
+    expect(pluginsAffectedByChanges(closures, fixture.changed)).toEqual(fixture.expected);
+  });
+}
+
+for (const fixture of [
+  { file: '/checkout/tooling/plugin.ts', expected: 'tooling/plugin.ts' },
+  { file: '/checkout/packages/member/index.js', expected: 'packages/member/index.js' },
+  { file: '/checkout/node_modules/installed/index.js', expected: null },
+  { file: '/checkout/packages/a/node_modules/installed/index.js', expected: null },
+  { file: '/checkout-other/plugin.js', expected: null },
+  { file: '/linked/plugin.js', expected: null },
+]) {
+  it(`classifies the resolved plugin module ${fixture.file}`, () => {
+    expect(localPluginPath('/checkout', fixture.file)).toBe(fixture.expected);
+  });
+}
 
 it('names the duplicate project and both roots when local plugin resolution fails', async () => {
   await withNxFixture('nx-plugin-duplicate-', async ({ workspace, socketDirectory }) => {

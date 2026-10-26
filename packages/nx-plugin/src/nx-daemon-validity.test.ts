@@ -237,6 +237,59 @@ function pluginInference(version: string): string {
   return `// inference ${version}\nmodule.exports = { name: 'linked-plugin', createNodesV2: ['**/never.json', () => []] };\n`;
 }
 
+/** The fields of the JSON `nx show project` prints that the local-plugin walk reads: the target names alone. */
+interface ShownProject {
+  readonly targets: { readonly [target: string]: unknown };
+  readonly [field: string]: unknown;
+}
+
+/** A local CJS plugin's entry: it appends one mark to `evals` as it loads, then infers its helper's target everywhere. */
+function cjsLocalPlugin(name: string, helper: string, evals: string): string {
+  return `const { appendFileSync } = require('node:fs');
+const { join } = require('node:path');
+appendFileSync(join(__dirname, '${evals}'), 'x');
+const { target } = require('${helper}');
+module.exports = {
+  name: '${name}',
+  createNodesV2: [
+    '**/project.json',
+    (configFiles) =>
+      configFiles.map((file) => [
+        file,
+        { projects: { [file.slice(0, file.lastIndexOf('/'))]: { targets: { [target]: { command: 'true' } } } } },
+      ]),
+  ],
+};
+`;
+}
+
+/** A local CJS plugin's helper: `target` alone sets the target its plugin infers. */
+function cjsLocalHelper(target: string): string {
+  return `exports.target = ${JSON.stringify(target)};`;
+}
+
+/** The local ESM plugin's entry: as the CJS one, for a module the ESM cache cannot evict. */
+const ESM_LOCAL_PLUGIN = `import { appendFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { target } from './esm-helper.mjs';
+appendFileSync(join(dirname(fileURLToPath(import.meta.url)), 'esm-evals.log'), 'x');
+export const name = 'local-esm-plugin';
+export const createNodesV2 = [
+  '**/project.json',
+  (configFiles) =>
+    configFiles.map((file) => [
+      file,
+      { projects: { [file.slice(0, file.lastIndexOf('/'))]: { targets: { [target]: { command: 'true' } } } } },
+    ]),
+];
+`;
+
+/** The local ESM plugin's helper: `target` alone sets the target its plugin infers. */
+function esmLocalHelper(target: string): string {
+  return `export const target = ${JSON.stringify(target)};`;
+}
+
 interface LinkedPluginCheckout {
   readonly plugin: string;
   readonly entry: string;
@@ -1047,6 +1100,84 @@ it('restarts a daemon once a plugin linked from outside the workspace changes it
       // The checkout's lockfile selects the plugin's dependencies, so its change restarts the daemon as well.
       await writeFile(first.lock, 'checkout lock two\n');
       await replaced(daemon, "the linked plugin checkout's lockfile changing");
+    },
+    FIXTURE_WORKSPACE,
+  );
+});
+
+/**
+ * A plugin that lives in the checkout is part of the graph's identity: once a file it loaded changes, the same daemon
+ * must serve a graph from the new code, with no reset and no restart, and a local plugin none of whose files changed
+ * must not be reloaded either. The fixture environment sets NX_ISOLATE_PLUGINS=false, so the walk also proves a local
+ * plugin is never kept in the daemon's own process, where a loaded ESM module cannot be evicted at all.
+ */
+it('reloads only the local plugins whose loaded files changed, in the same daemon', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-local-plugin-',
+    async ({ socketDirectory, workspace }) => {
+      await fixtureWorkspace(workspace);
+      const tooling = join(workspace, 'tooling');
+      await mkdir(tooling);
+      await writeFile(
+        join(tooling, 'cjs-plugin.cjs'),
+        cjsLocalPlugin('local-cjs-plugin', './cjs-helper.cjs', 'cjs-evals.log'),
+      );
+      await writeFile(
+        join(tooling, 'steady-plugin.cjs'),
+        cjsLocalPlugin('local-steady-plugin', './steady-helper.cjs', 'steady-evals.log'),
+      );
+      await writeFile(join(tooling, 'esm-plugin.mjs'), ESM_LOCAL_PLUGIN);
+      await writeFile(join(tooling, 'cjs-helper.cjs'), cjsLocalHelper('cjs-one'));
+      await writeFile(join(tooling, 'steady-helper.cjs'), cjsLocalHelper('steady'));
+      await writeFile(join(tooling, 'esm-helper.mjs'), esmLocalHelper('esm-one'));
+      await writeFile(
+        join(workspace, 'nx.json'),
+        JSON.stringify({
+          plugins: ['./tooling/cjs-plugin.cjs', './tooling/esm-plugin.mjs', './tooling/steady-plugin.cjs'],
+        }),
+      );
+      const env = fixtureNxEnv(workspace, socketDirectory);
+      const targets = (): string[] => {
+        const shown = nx(workspace, { ...env, NX_DAEMON: 'true' }, 'show', 'project', 'p', '--json');
+        const json = shown.trim().split('\n').at(-1) ?? '';
+        return Object.keys(typia.json.assertParse<ShownProject>(json).targets).sort();
+      };
+      const evals = async (log: string): Promise<number> => (await readFile(join(tooling, log), 'utf8')).length;
+      const daemon = await startDaemon(workspace, env);
+      expect(targets(), 'the first graph does not come from the three local plugins').toEqual([
+        'cjs-one',
+        'esm-one',
+        'steady',
+      ]);
+      const client = watchClient(workspace, env);
+      try {
+        expect(await client.next('the file watcher registering before the local helpers change')).toEqual({
+          kind: 'ready',
+          details: [],
+        });
+        await writeFile(join(tooling, 'cjs-helper.cjs'), cjsLocalHelper('cjs-two'));
+        await writeFile(join(tooling, 'esm-helper.mjs'), esmLocalHelper('esm-two'));
+        const seen = new Set<string>();
+        while (!seen.has('tooling/cjs-helper.cjs') || !seen.has('tooling/esm-helper.mjs')) {
+          const event = await client.next('the file watcher reporting the changed local helpers');
+          expect(event.kind, `a changed local plugin stopped the daemon: ${JSON.stringify(client.seen)}`).toBe(
+            'changed',
+          );
+          for (const path of event.details) seen.add(path);
+        }
+      } finally {
+        await client.end();
+      }
+      expect(targets(), 'the graph after the helpers changed still comes from the old plugin code').toEqual([
+        'cjs-two',
+        'esm-two',
+        'steady',
+      ]);
+      expect(await recordedPid(workspace), 'a changed local plugin replaced the daemon').toBe(daemon.record.processId);
+      expect(isRunning(daemon.record.processId), 'a changed local plugin stopped the daemon').toBe(true);
+      expect(await evals('cjs-evals.log'), 'the CJS local plugin was not reloaded once its helper changed').toBe(2);
+      expect(await evals('esm-evals.log'), 'the ESM local plugin was not reloaded once its helper changed').toBe(2);
+      expect(await evals('steady-evals.log'), 'a local plugin whose files did not change was reloaded').toBe(1);
     },
     FIXTURE_WORKSPACE,
   );
