@@ -556,76 +556,102 @@ pub fn group_members(pgid: libc::pid_t) -> io::Result<Vec<GroupMember>> {
         .collect())
 }
 
-/// Each process's stat whose group is `pgid`, as `(pid, fields after the command name)`. A pid
-/// that exits between the listing and its read is left out.
+/// One cgroup v2 file of `cgroup`, read whole.
 #[cfg(target_os = "linux")]
-fn group_stats(pgid: libc::pid_t) -> io::Result<Vec<(libc::pid_t, String)>> {
-    let mut stats = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let Some(pid) = entry?
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<libc::pid_t>().ok())
-        else {
-            continue;
-        };
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let fields = stat
-            .rfind(')')
-            .map(|closing| stat[closing + 1..].to_owned())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("process {pid}'s stat has no command delimiter"),
-                )
-            })?;
-        // Field 5, the group, after the state (field 3) and the parent (field 4).
-        if fields
-            .split_whitespace()
-            .nth(2)
-            .and_then(|group| group.parse().ok())
-            == Some(pgid)
-        {
-            stats.push((pid, fields));
-        }
+fn cgroup_file(cgroup: std::os::fd::BorrowedFd<'_>, name: &std::ffi::CStr) -> io::Result<String> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    // SAFETY: a NUL-terminated name relative to a live directory descriptor.
+    let fd = unsafe {
+        libc::openat(
+            cgroup.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
     }
-    Ok(stats)
+    // SAFETY: openat just returned this descriptor and nothing else owns it.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
 }
 
-/// [`group_cpu`] from procfs: utime, stime, cutime and cstime (fields 14 to 17), in clock ticks.
+/// The members of `cgroup` (its `cgroup.procs`), without `except`: every process in it, whatever
+/// parent it was reparented to.
 #[cfg(target_os = "linux")]
-pub fn group_cpu(pgid: libc::pid_t) -> io::Result<u64> {
-    let mut total = 0_u64;
-    for (pid, fields) in group_stats(pgid)? {
-        // Fields 14 to 17, after the state (field 3).
-        for field in fields.split_whitespace().skip(11).take(4) {
-            let ticks = field.parse::<u64>().map_err(|_| {
+fn cgroup_pids(
+    cgroup: std::os::fd::BorrowedFd<'_>,
+    except: Option<libc::pid_t>,
+) -> io::Result<Vec<libc::pid_t>> {
+    cgroup_file(cgroup, c"cgroup.procs")?
+        .lines()
+        .map(|line| {
+            line.trim().parse::<libc::pid_t>().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("process {pid}'s stat holds a CPU field that is no count"),
+                    format!("cgroup.procs holds {line:?}, no pid"),
                 )
-            })?;
-            total = total.saturating_add(ticks);
-        }
-    }
-    Ok(total)
+            })
+        })
+        .filter(|pid| pid.as_ref().map_or(true, |pid| Some(*pid) != except))
+        .collect()
 }
 
-/// [`group_members`] from procfs: the command line from `cmdline`.
+/// The `usage_usec` count of a cgroup's `cpu.stat`; `None` when no line holds one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn usage_usec(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("usage_usec "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The CPU every process of `cgroup` has used, live or exited, in microseconds (`cpu.stat`'s
+/// `usage_usec`), less this process's own when `except_self`: a waiter inside the cgroup it
+/// reads, whose own looks must never count as its run's progress.
 #[cfg(target_os = "linux")]
-pub fn group_members(pgid: libc::pid_t) -> io::Result<Vec<GroupMember>> {
-    Ok(group_stats(pgid)?
+pub fn cgroup_cpu(cgroup: std::os::fd::BorrowedFd<'_>, except_self: bool) -> io::Result<u64> {
+    let stat = cgroup_file(cgroup, c"cpu.stat")?;
+    let usage = usage_usec(&stat).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cpu.stat holds no usage_usec: {stat:?}"),
+        )
+    })?;
+    if !except_self {
+        return Ok(usage);
+    }
+    // SAFETY: an all-zero rusage is valid storage for getrusage to fill.
+    let mut own: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: RUSAGE_SELF with a live output buffer.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut own) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let micros = |time: libc::timeval| {
+        u64::try_from(time.tv_sec)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000)
+            .saturating_add(u64::try_from(time.tv_usec).unwrap_or(0))
+    };
+    Ok(usage.saturating_sub(micros(own.ru_utime).saturating_add(micros(own.ru_stime))))
+}
+
+/// The running members of `cgroup`, without this process when `except_self`, each named by its
+/// command line (`cmdline`) and its state.
+#[cfg(target_os = "linux")]
+pub fn cgroup_members(
+    cgroup: std::os::fd::BorrowedFd<'_>,
+    except_self: bool,
+) -> io::Result<Vec<GroupMember>> {
+    let except = except_self.then(|| {
+        // SAFETY: getpid takes nothing and cannot fail.
+        unsafe { libc::getpid() }
+    });
+    Ok(cgroup_pids(cgroup, except)?
         .into_iter()
-        .filter_map(|(pid, _)| {
+        .filter_map(|pid| {
             let state = run_state(pid);
             if matches!(state, RunState::Gone | RunState::Zombie) {
                 return None;
@@ -647,6 +673,49 @@ pub fn group_members(pgid: libc::pid_t) -> io::Result<Vec<GroupMember>> {
             })
         })
         .collect())
+}
+
+/// Send `signal` to every member of `cgroup` but this process when `except_self`; a member that
+/// exited since the listing is passed over.
+#[cfg(target_os = "linux")]
+pub fn signal_cgroup(
+    cgroup: std::os::fd::BorrowedFd<'_>,
+    except_self: bool,
+    signal: libc::c_int,
+) -> io::Result<()> {
+    let except = except_self.then(|| {
+        // SAFETY: getpid takes nothing and cannot fail.
+        unsafe { libc::getpid() }
+    });
+    for pid in cgroup_pids(cgroup, except)? {
+        // SAFETY: plain integers; a member that already exited answers ESRCH.
+        if unsafe { libc::kill(pid, signal) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// This process's own cgroup v2 directory (`/proc/self/cgroup`'s unified line under
+/// `/sys/fs/cgroup`), opened: a job's cgroup, for a waiter inside a job.
+#[cfg(target_os = "linux")]
+pub fn own_cgroup() -> io::Result<std::os::fd::OwnedFd> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup")?;
+    let path = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("this process is in no cgroup v2: {membership:?}"),
+            )
+        })?;
+    let directory =
+        std::path::Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/'));
+    Ok(std::fs::File::open(directory)?.into())
 }
 /// A process's exit, watched from a moment it ran. The kernel reports it only once the process
 /// has released what it held, every descriptor included (measured on Darwin: a listener it alone
@@ -1924,6 +1993,64 @@ mod tests {
         );
         assert_eq!(exited, RunState::Zombie);
         assert_eq!(reaped, RunState::Gone);
+    }
+
+    /// A cgroup's CPU is its `usage_usec` line's count, and a `cpu.stat` without one names none.
+    #[test]
+    fn a_cgroups_cpu_is_its_usage_usec() {
+        let cases = [
+            (
+                "usage_usec 1234\nuser_usec 1000\nsystem_usec 234\n",
+                Some(1234),
+            ),
+            ("user_usec 1000\nusage_usec 7\n", Some(7)),
+            ("user_usec 1000\nsystem_usec 234\n", None),
+            ("usage_usec many\n", None),
+        ];
+        for (stat, expected) in cases {
+            assert_eq!(usage_usec(stat), expected, "{stat:?}");
+        }
+    }
+
+    /// A run's group, read from the leader the caller holds: the leader and the two sleepers it
+    /// forked, by the pids the leader says once both exist.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_group_reads_as_its_leader_and_the_members_it_started() {
+        use crate::fork_lock::Spawn as _;
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 600 & a=$!; sleep 600 & echo $a $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn the group's leader");
+        let pgid = libc::pid_t::try_from(leader.id()).expect("a pid");
+        let mut said = String::new();
+        std::io::BufReader::new(leader.stdout.take().expect("piped stdout"))
+            .read_line(&mut said)
+            .expect("read the leader's line");
+        let members = group_members(pgid);
+        let cpu = group_cpu(pgid);
+        // SAFETY: `pgid` is the group this test's own child leads.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        leader.wait_bounded().expect("reap the leader");
+        let mut expected: Vec<libc::pid_t> = said
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("the leader says pids"))
+            .collect();
+        expected.push(pgid);
+        expected.sort_unstable();
+        let mut read: Vec<libc::pid_t> = members
+            .expect("read the group")
+            .into_iter()
+            .map(|member| member.pid)
+            .collect();
+        read.sort_unstable();
+        assert_eq!(read, expected);
+        cpu.expect("read the group's CPU");
     }
 
     /// A procfs TCP table names a port only for a `LISTEN` row whose socket the process holds:

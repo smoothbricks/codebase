@@ -201,18 +201,17 @@ where
                 })
                 .collect(),
         };
-        match start_after(service, &request) {
-            Ok(log) => say(
+        match start_after(service, &request).await {
+            Ok(job) => say(
                 output,
                 &format!(
-                    "the push and after-land commands run detached, never awaited; their outcomes go to {} and their output to {}",
+                    "the push and after-land commands run as job {job} of main, never awaited; their outcomes go to {}",
                     turn_directory.join(declared::LANDS_LOG).display(),
-                    log.display()
                 ),
             )?,
             Err(reason) => {
                 let detail = format!(
-                    "the after-land child did not start: {reason}; neither the push nor any after-land command ran"
+                    "the after-land job was not admitted: {reason}; neither the push nor any after-land command ran"
                 );
                 note(
                     output,
@@ -251,16 +250,52 @@ struct Routed {
     retire: Result<LandedReport>,
 }
 
-/// Start the after-land child for `request`; why not, when it cannot start.
-fn start_after<S: CliService>(
-    service: &S,
+/// Submit the after-land work for `request` to main's workspace supervisor as a background job at
+/// the host boundary (02_workspaces.md "A declared land" step 6), and answer its job id without
+/// waiting; why not, when it was not admitted.
+async fn start_after<S: CliService>(
+    service: &mut S,
     request: &AfterRequest,
-) -> std::result::Result<PathBuf, String> {
+) -> std::result::Result<u64, String> {
     let program = service
         .background_program()
         .map_err(|error| error.message)?
         .ok_or_else(|| "this store names no cowshed executable for background work".to_owned())?;
-    crate::land_after::start(&program, request).map_err(|error| error.message)
+    let argv = crate::land_after::argv(&program, request).map_err(|error| error.message)?;
+    let command = crate::runtime::ExecCommand {
+        workspace: cowshed_core::git::MAIN_REMOTE.to_owned(),
+        request: cowshed_core::api::ExecRequest {
+            command: cowshed_core::api::ExecCommand::Argv(
+                argv.into_iter()
+                    .map(cowshed_core::api::CommandArg::from)
+                    .collect(),
+            ),
+            cwd: None,
+            mode: cowshed_core::api::RunSandboxMode::ReadWrite,
+            env: request.environment.iter().cloned().collect(),
+            trace: None,
+            stdin: cowshed_core::api::StdinSource::Empty,
+            stdout_copy: None,
+            stderr_copy: None,
+            admission_key: None,
+            class: cowshed_core::api::ExecClass::Background,
+            want: None,
+            scope: cowshed_core::api::ExecScope::HostGate,
+        },
+        session: None,
+        background: true,
+        timeout: None,
+    };
+    let result = service
+        .exec(
+            command,
+            crate::runtime::ExecPresentation::Control,
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .await
+        .map_err(|error| error.message)?;
+    Ok(result.info.job_id.get())
 }
 
 /// Steps 3 to 5 under the land turn: rebase, gate, fast-forward and the primitive's retire; back

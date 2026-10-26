@@ -935,20 +935,27 @@ the handshake bound.
     observation reconciliation").
     - **A child whose output or CPU is its progress has a silence bound, not a total.** A long-running command that
       shows its work runs under `cowshed-os::deadline::run_by_progress` (`run_to_log` appends both streams to a log,
-      `output_by_progress` collects them) as the leader of a process group of its own. Its progress is its output or CPU
-      advancing anywhere in that group: each chunk restarts its silence bound, which its caller names, and once the
-      silence is spent the group's CPU (each member's own and its reaped children's) is read and compared with the last
-      reading, so a hook computing in silence keeps it going. A child its caller names as waiting in line behind a live
-      holder is queued, not silent: it keeps waiting, said on stderr. A child that shows none of these for its silence
-      fails `SILENT`, naming its pid, the state the kernel shows it in, the bytes it wrote and every running member of
-      its group by pid, command and state; the group is sent `SIGTERM`, the child reaped within the reap bound and
+      `output_by_progress` collects them), its child a member of a source its caller names, which is authoritative for
+      every member wherever it was reparented: on Darwin the child leads a process group of its own, which the kernel
+      lists (`proc_listpgrppids`); on Linux a cgroup v2 directory, either a leaf of this run alone that the child enters
+      before it executes (a job's or a controller run's, 07_api.md "Complete job accounting and observation
+      reconciliation"), or the waiter's own job cgroup, whose waiter is passed over and whose own CPU is no progress.
+      The members are never read by a census of the host. Its progress is its output or CPU advancing among its members:
+      each chunk restarts its silence bound, which its caller names, and once the silence is spent the members' CPU
+      (each one's own and its reaped children's on Darwin, the cgroup's `usage_usec` on Linux) is read and compared with
+      the last reading, so a hook computing in silence keeps it going. A child its caller names as waiting in line
+      behind a live holder is queued, not silent: it keeps waiting, said on stderr. A child that shows none of these for
+      its silence fails `SILENT`, naming its pid, the state the kernel shows it in, the bytes it wrote and every running
+      member by pid, command and state; the members are sent `SIGTERM`, the child reaped within the reap bound and
       collected later past it. A child that ends its streams is reaped within the reap bound and its status answers. Its
       callers: a repository mirror's transfers (`clone --mirror` and the `fetch --prune` that updates it), with
       `--progress`, their output in the mirror's transfer log; workspace git that runs repository-selected merge
-      drivers, filters and hooks; and a project's tool run as a job, where discovery's Cargo is queued while a live
-      process holds the host Cargo home's locks. Each has the heartbeat silence (15 s, `HEARTBEAT_SILENCE`), except the
-      land's `nx daemon --stop`, which has the 10 s a stopped daemon gets to exit after the SIGTERM it sends
-      (`DAEMON_EXIT_GRACE`).
+      drivers, filters and hooks (both Darwin's); a project's tool the controller runs outside any job (discovery's
+      Cargo, queued while a live process holds the host Cargo home's locks, and the land's `nx daemon --stop`), in a
+      controller run's leaf on Linux; and a declared land's push and after commands, inside their after-land job
+      (02_workspaces.md "A declared land" step 6). Each has the heartbeat silence (15 s, `HEARTBEAT_SILENCE`), except
+      `nx daemon --stop`, which has the 10 s a stopped daemon gets to exit after the SIGTERM it sends
+      (`DAEMON_EXIT_GRACE`), and the push and after commands, which have 180 s.
   - **The gateway's drain reaps its Nx backends within one reap bound.** Once nothing is in flight, the drain sends
     `SIGTERM` to every Nx cache backend it started and waits for all of them within one reap bound
     (`cowshed-os::deadline::reap_async`). The actor is therefore parked at most that long, and the drain ends inside

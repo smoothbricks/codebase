@@ -1386,6 +1386,15 @@ delegation refuses admission with `NotDelegated`, naming the unwritable director
 `cgroup.subtree_control`. A cgroup that cannot be created, or whose `cgroup.kill` cannot be opened, likewise refuses the
 job; there is no uncontained fallback. Changing sessions, including after the parent exits, does not change membership.
 
+A command the controller runs outside any admitted job has a leaf of its own beside the jobs of its class,
+`<class>/run-<incarnation>-<controller pid>-<n>`: discovery's Cargo, which runs while the controller admits a job's
+build state and so before any job of that workspace exists, and the Nx daemon retirement of a landing workspace, which
+runs after its supervisor has stopped. The controller that holds the delegation allocates it (the first `n` its pid has
+not taken), its child enters it before exec, and its membership and CPU are read from it as a job leaf's are
+(`cgroup.procs`, `cpu.stat`), so the run's progress bound (05_gateway.md "Deadlines") sees every member wherever it was
+reparented. Once the run ends the leaf is killed, waited empty within the reap bound and removed; a leaf whose
+controller no longer runs is retired by the next run of its incarnation. A census of jobs passes run leaves over.
+
 Terminal retirement signals the cgroup's observed members through pidfds, grants TERM one grace deadline, then writes
 `cgroup.kill` if membership remains. The job seals only after `cgroup.events` reads `populated 0`; `poll(POLLPRI)` wakes
 that wait, never a periodic timer. Retained member pidfds are then joined with `poll(POLLIN)` too: Linux's `cgroup_exit`

@@ -1698,11 +1698,14 @@ impl SandboxEnvironment {
 /// none on the bootstrap PATH, or a different one, and a job only ever meets the activated one.
 ///
 /// The tool runs for as long as it shows progress (`cowshed_os::deadline::output_by_progress`):
-/// output, or CPU anywhere in its process group, restarts `silence`, and so does a live holder
+/// output, or CPU used by any of its members, restarts `silence`, and so does a live holder
 /// `queued` names, which the tool waits in line behind. One that shows none for `silence` fails
-/// `SILENT`, naming its group's running processes, which are ended.
+/// `SILENT`, naming its running members, which are ended. Its members are its own process group
+/// on Darwin, and on Linux a run leaf of `incarnation`'s cgroups (07_api.md), which it enters
+/// before it executes and which is retired within the reap bound once the run ends.
 pub async fn run_as_job(
     sandbox: &SandboxConfig,
+    incarnation: &crate::metadata::WorkspaceIncarnation,
     cwd: &Path,
     argv: Vec<OsString>,
     silence: Duration,
@@ -1719,18 +1722,37 @@ pub async fn run_as_job(
     prepare_child_descriptors(&mut command)
         .map_err(ExecError::from)
         .map_err(map_exec_error)?;
+    #[cfg(target_os = "linux")]
+    let run = super::job_cgroup::CgroupAuthority::delegated()
+        .and_then(|authority| authority.incarnation(incarnation))
+        .and_then(|cgroups| cgroups.run(ExecClass::Background, cowshed_os::deadline::REAP))
+        .map_err(cgroup_error)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = incarnation;
     let program = plan.program.clone();
-    tokio::task::spawn_blocking(move || {
-        cowshed_os::deadline::output_by_progress(
+    let (ran, retired) = tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        let members = cowshed_os::deadline::Members::OwnGroup;
+        #[cfg(target_os = "linux")]
+        let members = cowshed_os::deadline::Members::Leaf(run.directory());
+        let output = cowshed_os::deadline::output_by_progress(
             "project tool",
             &mut command,
+            members,
             silence,
             &mut *queued,
-        )
+        );
+        #[cfg(target_os = "linux")]
+        let retired = run.retire(cowshed_os::deadline::REAP).map_err(cgroup_error);
+        #[cfg(not(target_os = "linux"))]
+        let retired = Ok(());
+        (output, retired)
     })
     .await
-    .map_err(|error| CowshedError::internal(format!("the project tool's thread failed: {error}")))?
-    .map_err(|error| match error {
+    .map_err(|error| {
+        CowshedError::internal(format!("the project tool's thread failed: {error}"))
+    })?;
+    let output = ran.map_err(|error| match error {
         cowshed_os::deadline::RunError::Spawn { source, .. } => {
             map_exec_error(ExecError::from(classify_spawn_error(source)))
         }
@@ -1738,7 +1760,9 @@ pub async fn run_as_job(
             format!("{}: {error}", program.display()),
             "the named process stopped making progress: see what it waits for, then retry",
         ),
-    })
+    })?;
+    retired?;
+    Ok(output)
 }
 
 /// Prepare the workspace's private environment host-side and describe the child environment.
@@ -8904,6 +8928,7 @@ mod workspace_toolchain_tests {
 
         let output = run_as_job(
             &sandbox,
+            &WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
             &mount,
             vec![OsString::from("./which-bash")],
             cowshed_os::deadline::HEARTBEAT_SILENCE,

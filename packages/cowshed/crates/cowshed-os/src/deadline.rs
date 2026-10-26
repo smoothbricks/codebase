@@ -894,13 +894,148 @@ pub fn output_within(
     })
 }
 
+/// Where a run's members are read ([`run_by_progress`]): who belongs to it, the CPU they have
+/// used, and whom a silent run's SIGTERM reaches. Each is authoritative for every member, whatever
+/// parent it was reparented to (05_gateway.md "Deadlines").
+#[derive(Clone, Copy, Debug)]
+pub enum Members<'a> {
+    /// The child leads a process group of its own, which Darwin lists (`proc_listpgrppids`).
+    #[cfg(target_os = "macos")]
+    OwnGroup,
+    /// A cgroup v2 leaf of this run alone, which the child enters before it executes.
+    #[cfg(target_os = "linux")]
+    Leaf(std::os::fd::BorrowedFd<'a>),
+    /// The caller's own cgroup (a job's, for a waiter inside it): the child is a member already;
+    /// the waiter is not one of the run's, so its pid is passed over and its CPU is no progress.
+    #[cfg(target_os = "linux")]
+    Enclosing(std::os::fd::BorrowedFd<'a>),
+    /// No source borrows on this platform: the lifetime's uninhabited carrier.
+    #[doc(hidden)]
+    #[cfg(not(target_os = "linux"))]
+    Unborrowed(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
+}
+
+impl Members<'_> {
+    /// Make `command`'s child a member before it executes anything.
+    fn admit(self, command: &mut std::process::Command) -> io::Result<()> {
+        use std::os::unix::process::CommandExt as _;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::OwnGroup => {
+                command.process_group(0);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Self::Leaf(cgroup) => {
+                use std::os::fd::{AsRawFd as _, FromRawFd as _};
+                // SAFETY: a NUL-terminated name relative to a live directory descriptor.
+                let procs = unsafe {
+                    libc::openat(
+                        cgroup.as_raw_fd(),
+                        c"cgroup.procs".as_ptr(),
+                        libc::O_WRONLY | libc::O_CLOEXEC,
+                    )
+                };
+                if procs < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: openat just returned this descriptor; the hook below owns it.
+                let procs = unsafe { std::os::fd::OwnedFd::from_raw_fd(procs) };
+                // SAFETY: write(2) is async-signal-safe; "0" names the writing process, the
+                // child, which enters the leaf before it executes.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::write(procs.as_raw_fd(), c"0".as_ptr().cast(), 1) == 1 {
+                            Ok(())
+                        } else {
+                            Err(io::Error::last_os_error())
+                        }
+                    });
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            Self::Enclosing(_) => Ok(()),
+            #[cfg(not(target_os = "linux"))]
+            Self::Unborrowed(never, _) => match never {},
+        }
+    }
+
+    /// The CPU the members have used so far, in a unit comparable only to another reading.
+    fn cpu(self, child: u32) -> io::Result<u64> {
+        #[cfg(target_os = "linux")]
+        let _ = child;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::OwnGroup => crate::process::group_cpu(group_of(child)?),
+            #[cfg(target_os = "linux")]
+            Self::Leaf(cgroup) => crate::process::cgroup_cpu(cgroup, false),
+            #[cfg(target_os = "linux")]
+            Self::Enclosing(cgroup) => crate::process::cgroup_cpu(cgroup, true),
+            #[cfg(not(target_os = "linux"))]
+            Self::Unborrowed(never, _) => match never {},
+        }
+    }
+
+    /// The running members, each by pid, command and state.
+    fn members(self, child: u32) -> io::Result<Vec<crate::process::GroupMember>> {
+        #[cfg(target_os = "linux")]
+        let _ = child;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::OwnGroup => crate::process::group_members(group_of(child)?),
+            #[cfg(target_os = "linux")]
+            Self::Leaf(cgroup) => crate::process::cgroup_members(cgroup, false),
+            #[cfg(target_os = "linux")]
+            Self::Enclosing(cgroup) => crate::process::cgroup_members(cgroup, true),
+            #[cfg(not(target_os = "linux"))]
+            Self::Unborrowed(never, _) => match never {},
+        }
+    }
+
+    /// Send SIGTERM to every member: a silent run's end.
+    fn terminate(self, child: u32) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::OwnGroup => {
+                if let Ok(group) = group_of(child) {
+                    // SAFETY: `group` is the process group this process's own child leads.
+                    unsafe { libc::killpg(group, libc::SIGTERM) };
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Self::Leaf(cgroup) => {
+                let _ = crate::process::signal_cgroup(cgroup, false, libc::SIGTERM);
+            }
+            #[cfg(target_os = "linux")]
+            Self::Enclosing(cgroup) => {
+                let _ = crate::process::signal_cgroup(cgroup, true, libc::SIGTERM);
+            }
+            #[cfg(not(target_os = "linux"))]
+            Self::Unborrowed(never, _) => match never {},
+        }
+        // The child itself, in every case: it may have left the source (setpgid, a cgroup move).
+        if let Ok(pid) = libc::pid_t::try_from(child) {
+            // SAFETY: `pid` is this process's own unreaped child.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+    }
+}
+
+/// The process group a child of [`Members::OwnGroup`] leads: its own pid.
+#[cfg(target_os = "macos")]
+fn group_of(child: u32) -> io::Result<libc::pid_t> {
+    libc::pid_t::try_from(child).map_err(io::Error::other)
+}
+
 /// Run `command`, `role` to this process, with its stdout and stderr appended to `log` as they
 /// come, under [`run_by_progress`]'s silence: a long run has no total ceiling; its output and its
-/// group's CPU are its heartbeat (specs/cowshed/05_gateway.md, "Deadlines"). The run waits behind
+/// members' CPU are its heartbeat (specs/cowshed/05_gateway.md, "Deadlines"). The run waits behind
 /// no holder.
 pub fn run_to_log(
     role: &'static str,
     command: &mut std::process::Command,
+    members: Members<'_>,
     mut log: std::fs::File,
     silence: Duration,
 ) -> Result<ExitStatus, RunError> {
@@ -908,6 +1043,7 @@ pub fn run_to_log(
     run_by_progress(
         role,
         command,
+        members,
         silence,
         &mut |_, bytes| log.write_all(bytes),
         &mut || None,
@@ -920,6 +1056,7 @@ pub fn run_to_log(
 pub fn output_by_progress(
     role: &'static str,
     command: &mut std::process::Command,
+    members: Members<'_>,
     silence: Duration,
     queued: &mut dyn FnMut() -> Option<String>,
 ) -> Result<std::process::Output, RunError> {
@@ -927,6 +1064,7 @@ pub fn output_by_progress(
     let status = run_by_progress(
         role,
         command,
+        members,
         silence,
         &mut |stream, bytes| {
             match stream {
@@ -944,32 +1082,36 @@ pub fn output_by_progress(
     })
 }
 
-/// Run `command`, `role` to this process, as the leader of a process group of its own, handing
-/// each chunk of its stdout and stderr to `sink` as it comes, for as long as it shows progress
-/// (AGENTS.md rule 15; 05_gateway.md "Deadlines"). Each chunk restarts `silence` ([`idle`]).
-/// When the silence is spent, [`at_silence`] decides: CPU that advanced anywhere in the group
-/// since the last look (a hook computing in silence) restarts it; so does a live holder `queued`
-/// names, the run waiting in line behind it, which is said on stderr; with neither the run fails
-/// `SILENT`, naming the child, its kernel state, the bytes it wrote and every running member of
-/// its group by pid and command. The group is then sent SIGTERM and the child reaped within
-/// [`REAP`], and collected later past that. Otherwise its status, once both streams have ended
-/// and it is reaped within [`REAP`]. Its stdin is null.
+/// Run `command`, `role` to this process, its child a member of `members` before it executes,
+/// handing each chunk of its stdout and stderr to `sink` as it comes, for as long as it shows
+/// progress (AGENTS.md rule 15; 05_gateway.md "Deadlines"). Each chunk restarts `silence`
+/// ([`idle`]). When the silence is spent, [`at_silence`] decides: CPU that advanced anywhere
+/// among the members since the last look (a hook computing in silence) restarts it; so does a live
+/// holder `queued` names, the run waiting in line behind it, which is said on stderr; with neither
+/// the run fails `SILENT`, naming the child, its kernel state, the bytes it wrote and every
+/// running member by pid and command. The members are then sent SIGTERM and the child reaped
+/// within [`REAP`], and collected later past that. Otherwise its status, once both streams have
+/// ended and it is reaped within [`REAP`]. Its stdin is null.
 pub fn run_by_progress(
     role: &'static str,
     command: &mut std::process::Command,
+    members: Members<'_>,
     silence: Duration,
     sink: &mut dyn FnMut(OutputStream, &[u8]) -> io::Result<()>,
     queued: &mut dyn FnMut() -> Option<String>,
 ) -> Result<ExitStatus, RunError> {
     use crate::fork_lock::Spawn as _;
-    use std::os::unix::process::CommandExt as _;
     const OP: &str = "run to log";
 
+    members.admit(command).map_err(|source| RunError::Spawn {
+        op: OP,
+        role,
+        source,
+    })?;
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .process_group(0)
         .spawn_locked()
         .map_err(|source| RunError::Spawn {
             op: OP,
@@ -977,9 +1119,8 @@ pub fn run_by_progress(
             source,
         })?;
     let pid = child.id();
-    let group = libc::pid_t::try_from(pid).ok();
-    let read_cpu = || group.map(crate::process::group_cpu);
-    let mut cpu = read_cpu().and_then(Result::ok);
+    let read_cpu = || members.cpu(pid);
+    let mut cpu = read_cpu().ok();
     let pumps = OutputPumps::start(&mut child);
     let mut open = pumps.started.len();
     let mut heard = idle(OP, silence);
@@ -1016,9 +1157,8 @@ pub fn run_by_progress(
             Err(mpsc::RecvTimeoutError::Timeout) if heard.remaining(clock()).is_some() => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let (now, mut cpu_unread) = match read_cpu() {
-                    Some(Ok(now)) => (Some(now), None),
-                    Some(Err(error)) => (None, Some(error)),
-                    None => (None, None),
+                    Ok(now) => (Some(now), None),
+                    Err(error) => (None, Some(error)),
                 };
                 if cpu.is_none() && cpu_unread.is_none() {
                     cpu_unread = Some(io::Error::other(
@@ -1039,10 +1179,7 @@ pub fn run_by_progress(
                     AtSilence::Silent => {
                         break Some(RunError::Silent(Box::new(SilentRun {
                             silent: heard.silent(ChildPeer::observed(role, pid), clock()),
-                            group: group.map_or_else(
-                                || Err(io::Error::other(format!("pid {pid} names no group"))),
-                                crate::process::group_members,
-                            ),
+                            group: members.members(pid),
                             cpu_unread,
                         })));
                     }
@@ -1061,10 +1198,7 @@ pub fn run_by_progress(
             Progress::State("output ended"),
         ),
         Some(failure) => {
-            if let Some(group) = group {
-                // SAFETY: `group` is the process group this process's own child leads.
-                unsafe { libc::killpg(group, libc::SIGTERM) };
-            }
+            members.terminate(pid);
             let signalled = Progress::Signalled {
                 signal: libc::SIGTERM,
             };
@@ -2096,8 +2230,10 @@ mod tests {
     }
 
     /// A log file of this test's own, removed on every exit path.
+    #[cfg(target_os = "macos")]
     struct LogFile(std::path::PathBuf);
 
+    #[cfg(target_os = "macos")]
     impl LogFile {
         fn new(label: &str) -> Self {
             Self(std::env::temp_dir().join(format!(
@@ -2114,18 +2250,21 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for LogFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_run_to_log_appends_both_streams_and_answers_the_exit() {
         let log = LogFile::new("exit");
         let status = run_to_log(
             "probe command",
             std::process::Command::new("/bin/sh").args(["-c", "echo out; echo err >&2; exit 3"]),
+            Members::OwnGroup,
             log.create(),
             REAP.within,
         )
@@ -2138,12 +2277,14 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_run_to_log_that_goes_silent_fails_naming_its_hung_process_and_is_ended() {
         let log = LogFile::new("silent");
         let failure = run_to_log(
             "probe command",
             std::process::Command::new("/bin/sh").args(["-c", "echo started; sleep 600"]),
+            Members::OwnGroup,
             log.create(),
             Duration::from_millis(50),
         )
@@ -2175,6 +2316,7 @@ mod tests {
     /// advanced, so the run goes on. The runner's `queued` callback marks each look; the test ends
     /// the child at the second, so the run answering that kill, not `SILENT`, is the proof that
     /// the first look counted the CPU as progress.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_child_that_spins_in_silence_is_progress_at_each_look() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -2183,6 +2325,7 @@ mod tests {
         let status = run_by_progress(
             "probe command",
             std::process::Command::new("/bin/sh").args(["-c", "echo $$; while :; do :; done"]),
+            Members::OwnGroup,
             Duration::from_millis(100),
             &mut |_, bytes| {
                 let pid = std::str::from_utf8(bytes)

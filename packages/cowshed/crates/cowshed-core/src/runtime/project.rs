@@ -5933,6 +5933,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 "stop-landing-nx",
                                 super::supervisor::run_as_job(
                                     &sandbox,
+                                    &landing_owner.incarnation,
                                     &root,
                                     vec![
                                         root.join("node_modules/.bin/nx").into_os_string(),
@@ -6803,9 +6804,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             )?;
             let discovery = {
                 let mount = mount.to_owned();
+                let incarnation = current.derived.workspace.incarnation().clone();
                 let runtime = tokio::runtime::Handle::current();
                 crate::storage::lifecycle::dispatch_blocking(move || {
-                    let mut cargo = crate::capabilities::JobCargo::new(&sandbox, runtime);
+                    let mut cargo =
+                        crate::capabilities::JobCargo::new(&sandbox, &incarnation, runtime);
                     sandbox.with_detection_context(&mount, |context| {
                         crate::capabilities::discover_build_state(context, &mut cargo)
                     })
@@ -20500,6 +20503,7 @@ async fn transfer_mirror(
         let status = cowshed_os::deadline::run_to_log(
             "git",
             &mut command,
+            cowshed_os::deadline::Members::OwnGroup,
             written,
             cowshed_os::deadline::HEARTBEAT_SILENCE,
         )
@@ -20550,6 +20554,7 @@ async fn invoke_git(
         cowshed_os::deadline::output_by_progress(
             "git",
             &mut command,
+            cowshed_os::deadline::Members::OwnGroup,
             cowshed_os::deadline::HEARTBEAT_SILENCE,
             &mut || None,
         )

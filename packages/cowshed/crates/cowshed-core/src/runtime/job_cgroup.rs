@@ -15,10 +15,16 @@
 //! every job shares with every other job, whatever its workspace. The tree under that root is:
 //!
 //! ```text
-//! <delegated>/controller                       the controller process itself
-//! <delegated>/<class>/                         gate, interactive or background
-//! <delegated>/<class>/job-<incarnation>-<id>   one job of one workspace incarnation
+//! <delegated>/controller                                   the controller process itself
+//! <delegated>/<class>/                                     gate, interactive or background
+//! <delegated>/<class>/job-<incarnation>-<id>               one job of one workspace incarnation
+//! <delegated>/<class>/run-<incarnation>-<pid>-<n>          one run its controller (pid) makes
 //! ```
+//!
+//! A run is a command the controller itself runs outside any admitted job: discovery's Cargo, a
+//! landing workspace's Nx daemon retirement after its supervisor stopped ([`RunCgroup`]). Its
+//! leaf gives it the same authoritative membership and CPU as a job's, which a run bounded by its
+//! progress reads (`cowshed_os::deadline::Members::Leaf`).
 //!
 //! A job is never given a name or a path to choose: its first process enters its cgroup through a
 //! write end of `cgroup.procs` the controller opened ([`Placement`]), close-on-exec from birth, so
@@ -86,6 +92,7 @@ pub const CONTROLLER_LEAF: &str = "controller";
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
 
 const JOB_PREFIX: &str = "job-";
+const RUN_PREFIX: &str = "run-";
 
 /// A cgroup v2 controller job cgroups use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -638,6 +645,13 @@ impl IncarnationCgroups {
                 }
                 let path = entry.path();
                 let name = entry.file_name();
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(RUN_PREFIX))
+                {
+                    // A run's leaf ([`RunCgroup`]), its controller's: no job of any incarnation.
+                    continue;
+                }
                 let Some(name) = name.to_str().filter(|name| name.starts_with(JOB_PREFIX)) else {
                     return Err(CgroupError::Malformed {
                         path,
@@ -666,6 +680,139 @@ impl IncarnationCgroups {
         }
         identities.sort_by_key(|identity| identity.job_id);
         Ok(identities)
+    }
+
+    /// A fresh cgroup leaf for one run of this incarnation's controller, in `class`'s cgroup and
+    /// placed as a job of `class` is: `run-<incarnation>-<this pid>-<n>`, the first `n` not
+    /// taken. A leaf of this incarnation whose controller no longer runs is retired first, within
+    /// `reap`: a controller that died mid-run left it, with whatever its run still held.
+    pub fn run(&self, class: ExecClass, reap: Bound) -> Result<RunCgroup> {
+        let class = ClassCgroup::of(class);
+        let parent = self.root.join(class.name());
+        let own = format!("{RUN_PREFIX}{}-", self.incarnation.as_str());
+        for entry in fs::read_dir(&parent).map_err(failed("readdir", &parent))? {
+            let entry = entry.map_err(failed("readdir", &parent))?;
+            let name = entry.file_name();
+            let Some(controller) = name
+                .to_str()
+                .and_then(|name| run_leaf_controller(name, &self.incarnation))
+            else {
+                continue;
+            };
+            if cowshed_os::process::running(controller).map_err(failed("stat", &entry.path()))? {
+                continue;
+            }
+            RunCgroup::open(entry.path())?.retire(reap)?;
+        }
+        // SAFETY: getpid takes nothing and cannot fail.
+        let controller = unsafe { libc::getpid() };
+        let mut n = 1_u64;
+        loop {
+            let path = parent.join(format!("{own}{controller}-{n}"));
+            n += 1;
+            if !make_directory(&path)? {
+                continue;
+            }
+            let opened = RunCgroup::open(path.clone()).and_then(|run| {
+                class.place_job(&run.path)?;
+                Ok(run)
+            });
+            return opened.map_err(|admission| match fs::remove_dir(&path) {
+                Ok(()) => admission,
+                Err(source) => CgroupError::AdmissionCleanup {
+                    path,
+                    admission: Box::new(admission),
+                    source,
+                },
+            });
+        }
+    }
+}
+
+/// The cgroup leaf of one run the controller makes outside any admitted job
+/// ([`IncarnationCgroups::run`]): the run's child enters it before it executes, and its
+/// membership and CPU are the leaf's.
+#[derive(Debug)]
+pub struct RunCgroup {
+    path: PathBuf,
+    directory: OwnedFd,
+    kill: OwnedFd,
+}
+
+impl RunCgroup {
+    fn open(path: PathBuf) -> Result<Self> {
+        let directory = open_directory(&path)?;
+        let kill =
+            open_at(directory.as_raw_fd(), c"cgroup.kill", libc::O_WRONLY).map_err(|source| {
+                CgroupError::KillUnavailable {
+                    path: path.join("cgroup.kill"),
+                    source,
+                }
+            })?;
+        Ok(Self {
+            path,
+            directory,
+            kill,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The leaf's directory, for the run to read its members and CPU from.
+    pub fn directory(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.directory.as_fd()
+    }
+
+    /// End whatever the run left in the leaf and remove it, once the kernel reports it empty
+    /// within `reap`. A member still alive then fails the wait as [`CgroupError::Unreaped`],
+    /// named, and the leaf is left as it is.
+    pub fn retire(self, reap: Bound) -> Result<()> {
+        let deadline = deadline::start("run cgroup kill", reap);
+        let events = read_at(&self.directory, c"cgroup.events").map_err(failed_in(
+            "read",
+            &self.path,
+            "cgroup.events",
+        ))?;
+        let last = if populated(&self.path, &events)? {
+            // SAFETY: one byte from a live buffer to the leaf's cgroup.kill.
+            if unsafe { libc::write(self.kill.as_raw_fd(), c"1".as_ptr().cast(), 1) } != 1 {
+                return Err(failed_in("write", &self.path, "cgroup.kill")(
+                    io::Error::last_os_error(),
+                ));
+            }
+            Progress::Signalled {
+                signal: libc::SIGKILL,
+            }
+        } else {
+            Progress::Nothing
+        };
+        if !wait_empty(&self.directory, &self.path, || {
+            deadline.remaining(deadline::clock())
+        })? {
+            let mut pids = BTreeSet::new();
+            let live = collect_members(&self.directory, &self.path, &mut pids)
+                .map(|()| {
+                    pids.into_iter()
+                        .map(|pid| LiveMember::observed(pid, None))
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|census| census.to_string());
+            return Err(CgroupError::Unreaped {
+                expired: Box::new(deadline.expired(
+                    LiveMembership {
+                        cgroup: self.path.clone(),
+                        members: live,
+                    },
+                    last,
+                    deadline::clock(),
+                )),
+                beside: Vec::new(),
+            });
+        }
+        remove_empty_hierarchy(&self.path)
     }
 }
 
@@ -1185,61 +1332,9 @@ impl JobCgroup {
         }
     }
 
-    /// Wait until the kernel reports no live member, for as long as `remaining` grants (`None`
-    /// once the wait's deadline has passed); whether membership emptied. No clock samples the
-    /// membership: cgroup.events changes wake ppoll(POLLPRI), clipped to what is left, and each
-    /// wake rereads that descriptor.
+    /// [`wait_empty`] on this job's cgroup.
     fn wait_empty_within(&self, remaining: impl Fn() -> Option<Duration>) -> Result<bool> {
-        let fd = open_at(self.directory.as_raw_fd(), c"cgroup.events", libc::O_RDONLY)
-            .map_err(failed_in("open", &self.path, "cgroup.events"))?;
-        let mut file = fs::File::from(fd);
-        let mut text = String::with_capacity(64);
-        loop {
-            file.rewind()
-                .map_err(failed_in("seek", &self.path, "cgroup.events"))?;
-            text.clear();
-            file.read_to_string(&mut text).map_err(failed_in(
-                "read",
-                &self.path,
-                "cgroup.events",
-            ))?;
-            if !populated(&self.path, &text)? {
-                return Ok(true);
-            }
-            let Some(remaining) = remaining() else {
-                return Ok(false);
-            };
-            let timeout = libc::timespec {
-                tv_sec: libc::time_t::try_from(remaining.as_secs()).unwrap_or(libc::time_t::MAX),
-                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
-            };
-            let mut event = libc::pollfd {
-                fd: file.as_raw_fd(),
-                events: libc::POLLPRI,
-                revents: 0,
-            };
-            // SAFETY: one live descriptor, a valid timeout, and no signal-mask change. The timeout
-            // is what is left of the wait's one deadline, never a sampling period.
-            let answer =
-                unsafe { libc::ppoll(&raw mut event, 1, &raw const timeout, std::ptr::null()) };
-            if answer < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(failed_in("ppoll(POLLPRI)", &self.path, "cgroup.events")(
-                    error,
-                ));
-            }
-            if event.revents & (libc::POLLNVAL | libc::POLLHUP) != 0 {
-                return Err(CgroupError::Malformed {
-                    path: self.path.join("cgroup.events"),
-                    detail: format!("membership watch closed (poll revents {})", event.revents),
-                });
-            }
-            // A timeout also rereads the kernel's state before it decides the deadline passed.
-            // POLLERR accompanies POLLPRI on cgroup.events and is not a failed observation.
-        }
+        wait_empty(&self.directory, &self.path, remaining)
     }
 
     /// Collect final counters and remove an empty job's hierarchy without requiring the exec
@@ -1454,6 +1549,74 @@ fn finish_cgroup(
     }
     remove_empty_hierarchy(path)?;
     Ok(totals)
+}
+
+/// The pid of the controller whose run leaf `name` is, `run-<incarnation>-<pid>-<n>`, when it is a
+/// well-formed run leaf of `incarnation`.
+fn run_leaf_controller(name: &str, incarnation: &WorkspaceIncarnation) -> Option<libc::pid_t> {
+    let rest = name
+        .strip_prefix(RUN_PREFIX)?
+        .strip_prefix(incarnation.as_str())?
+        .strip_prefix('-')?;
+    let (pid, n) = rest.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Wait until the kernel reports no live member of the cgroup at `directory` (`path`), for as
+/// long as `remaining` grants (`None` once the wait's deadline has passed); whether membership
+/// emptied. No clock samples the membership: cgroup.events changes wake ppoll(POLLPRI), clipped
+/// to what is left, and each wake rereads that descriptor.
+fn wait_empty(
+    directory: &OwnedFd,
+    path: &Path,
+    remaining: impl Fn() -> Option<Duration>,
+) -> Result<bool> {
+    let fd = open_at(directory.as_raw_fd(), c"cgroup.events", libc::O_RDONLY)
+        .map_err(failed_in("open", path, "cgroup.events"))?;
+    let mut file = fs::File::from(fd);
+    let mut text = String::with_capacity(64);
+    loop {
+        file.rewind()
+            .map_err(failed_in("seek", path, "cgroup.events"))?;
+        text.clear();
+        file.read_to_string(&mut text)
+            .map_err(failed_in("read", path, "cgroup.events"))?;
+        if !populated(path, &text)? {
+            return Ok(true);
+        }
+        let Some(remaining) = remaining() else {
+            return Ok(false);
+        };
+        let timeout = libc::timespec {
+            tv_sec: libc::time_t::try_from(remaining.as_secs()).unwrap_or(libc::time_t::MAX),
+            tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+        };
+        let mut event = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLPRI,
+            revents: 0,
+        };
+        // SAFETY: one live descriptor, a valid timeout, and no signal-mask change. The timeout is
+        // what is left of the wait's one deadline, never a sampling period.
+        let answer =
+            unsafe { libc::ppoll(&raw mut event, 1, &raw const timeout, std::ptr::null()) };
+        if answer < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(failed_in("ppoll(POLLPRI)", path, "cgroup.events")(error));
+        }
+        if event.revents & (libc::POLLNVAL | libc::POLLHUP) != 0 {
+            return Err(CgroupError::Malformed {
+                path: path.join("cgroup.events"),
+                detail: format!("membership watch closed (poll revents {})", event.revents),
+            });
+        }
+        // A timeout also rereads the kernel's state before it decides the deadline passed.
+        // POLLERR accompanies POLLPRI on cgroup.events and is not a failed observation.
+    }
 }
 
 /// Population was proved empty recursively; the owned hierarchy can contain empty child groups.
@@ -1745,6 +1908,23 @@ fn keyed_counter(path: &Path, text: &str, counter: &'static str) -> Result<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run leaf names its controller only when it is this incarnation's and well formed.
+    #[test]
+    fn a_run_leaf_names_its_controller_only_for_its_incarnation() {
+        let own =
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("an incarnation");
+        let cases = [
+            ("run-0198f2c0b7e34dc795f17b238b331c80-4242-3", Some(4242)),
+            ("run-0198f2c0b7e34dc795f17b238b331c80-4242", None),
+            ("run-0198f2c0b7e34dc795f17b238b331c80-x-3", None),
+            ("run-0298f2c0b7e34dc795f17b238b331c80-4242-3", None),
+            ("job-0198f2c0b7e34dc795f17b238b331c80-7", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(run_leaf_controller(name, &own), expected, "{name}");
+        }
+    }
 
     #[test]
     fn the_unified_line_names_the_membership() {

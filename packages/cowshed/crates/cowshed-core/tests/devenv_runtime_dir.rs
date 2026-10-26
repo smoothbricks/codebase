@@ -1464,8 +1464,10 @@ async fn host_controller_cargo_discovery_asks_the_toolchain_the_dev_environment_
         );
     }
     let runtime = tokio::runtime::Handle::current();
+    let incarnation =
+        WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("an incarnation");
     let discovery = tokio::task::spawn_blocking(move || {
-        let mut cargo = JobCargo::new(&sandbox, runtime);
+        let mut cargo = JobCargo::new(&sandbox, &incarnation, runtime);
         sandbox.with_detection_context(&sandbox.workspace_mount, |context| {
             discover_build_state(context, &mut cargo)
         })

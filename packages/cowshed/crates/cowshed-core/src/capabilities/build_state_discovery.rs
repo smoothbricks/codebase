@@ -287,15 +287,21 @@ pub trait CargoRunner {
 /// Runs off the async runtime (the blocking pool): each job is awaited on `runtime`.
 pub struct JobCargo<'a> {
     sandbox: &'a crate::sandbox::SandboxConfig,
+    incarnation: &'a crate::metadata::WorkspaceIncarnation,
     runtime: tokio::runtime::Handle,
 }
 
 impl<'a> JobCargo<'a> {
     pub fn new(
         sandbox: &'a crate::sandbox::SandboxConfig,
+        incarnation: &'a crate::metadata::WorkspaceIncarnation,
         runtime: tokio::runtime::Handle,
     ) -> Self {
-        Self { sandbox, runtime }
+        Self {
+            sandbox,
+            incarnation,
+            runtime,
+        }
     }
 }
 
@@ -333,6 +339,7 @@ impl CargoRunner for JobCargo<'_> {
             let home = self.sandbox.home.clone();
             let job = crate::runtime::supervisor::run_as_job(
                 self.sandbox,
+                self.incarnation,
                 directory,
                 driver_argv(args, &batch),
                 cowshed_os::deadline::HEARTBEAT_SILENCE,

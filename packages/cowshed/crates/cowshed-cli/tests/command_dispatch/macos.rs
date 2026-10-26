@@ -7867,7 +7867,7 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
 mod workspace_isolation;
 
 /// A fixture whose store has this test's own built cowshed installed, as a host has its installed
-/// one: a declared land's after-land child runs as it.
+/// one: a declared land's after-land job runs as it.
 impl Fixture {
     fn with_background_program(self) -> Self {
         let installed = cowshed_core::host_dirs::installed_binary_directory(self.storage.home());
@@ -7974,8 +7974,9 @@ impl DeclaredLand {
             .unwrap_or_default()
     }
 
-    /// The kernel's write event on lands.log announces the detached child's records. The
-    /// subscription is armed before reading the log, and the runner owns the no-progress bound.
+    /// The kernel's write event on lands.log announces the after-land job's records (a background
+    /// job of main's supervisor, which the CLI submitted and never awaited). The subscription is
+    /// armed before reading the log, and the runner owns the no-progress bound.
     fn wait_for_lands(&self, count: usize) -> Vec<cowshed_core::declared_land::LandRecord> {
         let mut lands = Vec::new();
         await_vnode(&self.turn.join("lands.log"), None, || {
