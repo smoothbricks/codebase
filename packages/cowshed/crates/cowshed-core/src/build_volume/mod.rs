@@ -200,11 +200,6 @@ pub struct BuildVolumeRecord {
     pub checked_out: Option<GitOid>,
     #[serde(default, skip_serializing_if = "BuildVolumeStage::is_published")]
     pub stage: BuildVolumeStage,
-    /// The extent count a seed's sidecar written before the cleanup lost its records carries.
-    /// Parsed so such a sidecar stays readable until the install strips the field from every
-    /// sidecar; never written and read by nothing. The next commit deletes it.
-    #[serde(default, skip_serializing)]
-    pub extents: Option<u64>,
 }
 
 impl BuildVolumeRecord {
@@ -216,7 +211,6 @@ impl BuildVolumeRecord {
             created_at: crate::storage::deletion_log::rfc3339_utc(std::time::SystemTime::now()),
             checked_out: None,
             stage: BuildVolumeStage::Published,
-            extents: None,
         }
     }
 
