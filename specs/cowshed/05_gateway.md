@@ -986,8 +986,8 @@ the handshake bound.
   form in `cowshed_os::deadline` (`reap`, `reap_async`, `output_within`, `connect_unix`). A kept site allows
   `clippy::disallowed_methods` for its one item or statement beside `// WHY unbounded: <what ends the wait>`, and
   `cowshed:wait-why` (WAIT-WHY, `packages/nx-plugin/src/wait-why-policy.ts`, a dependency of `cowshed:lint`) refuses the
-  allow without it. Tests take no allow: they wait through `cowshed_os::test_backstop`'s helpers, bounded by the
-  no-progress backstop.
+  allow without it. Tests wait through `cowshed_os::test_backstop`'s helpers, bounded by the no-progress backstop; a
+  test keeps a raw wait, with its WHY, only where a helper thread would change what it measures.
 
 ## Disk-lifecycle lease
 
