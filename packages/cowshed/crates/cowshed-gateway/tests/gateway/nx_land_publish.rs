@@ -6,12 +6,13 @@
 //! `Gateway` with one real nx-cache-server, the stock Nx client in two fixture checkouts, and no
 //! credential anywhere.
 use super::*;
+use cowshed_os::test_backstop::{AsyncChildBackstop as _, AsyncCommandBackstop as _};
 
 use super::nx_outage::{executions, gateway_with, nx_events, run_text, scrub, write_workspace};
 use super::nx_process::{server_path, server_script};
 use cowshed_core::build_volume::nx::{Attribution, Published, attribute, publish_script};
 use cowshed_gateway::NxCacheServiceConfig;
-use cowshed_os::fork_lock::{RunAsync as _, Spawn as _};
+use cowshed_os::fork_lock::Spawn as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::process::{Output, Stdio};
@@ -34,7 +35,7 @@ async fn shed_build(root: &Path, origin: &str) -> Output {
     command
         .env("NX_SELF_HOSTED_REMOTE_CACHE_SERVER", origin)
         .env("NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY", "true");
-    command.output_locked().await.expect("run the stock Nx")
+    command.output_bounded().await.expect("run the stock Nx")
 }
 
 /// The land's publish job for `hashes` of the checkout at `root`: the script on stdin, the
@@ -61,7 +62,7 @@ async fn land_publish(root: &Path, origin: &str, hashes: &[String]) -> Published
         .expect("write the publish script");
     drop(stdin);
     let output = child
-        .wait_with_output()
+        .wait_with_output_bounded()
         .await
         .expect("wait for the publish");
     assert!(output.status.success(), "{}", run_text(&output));

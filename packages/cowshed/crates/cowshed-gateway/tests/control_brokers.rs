@@ -3,6 +3,7 @@
 #[path = "support/fixture_dir.rs"]
 mod fixture_dir;
 
+use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
 use std::{os::unix::fs::PermissionsExt as _, sync::Arc};
 
 use async_trait::async_trait;
@@ -157,7 +158,9 @@ async fn tcp_credential_is_distinct_unix_is_local_and_shutdown_closes_both() {
     assert_eq!(response["ok"], false);
     assert_eq!(response["code"], "unauthorized");
 
-    let mut raw_unix = UnixStream::connect(&socket).await.expect("raw Unix");
+    let mut raw_unix = UnixStream::connect_bounded(&socket)
+        .await
+        .expect("raw Unix");
     raw_unix
         .write_all(b"{\"op\":\"status\",\"unknown\":true}\n")
         .await

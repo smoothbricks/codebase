@@ -13,6 +13,7 @@ mod fixture_dir;
 #[path = "support/ram_fixture.rs"]
 mod ram_fixture;
 
+use cowshed_os::test_backstop::ChildBackstop as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -39,7 +40,9 @@ fn run_job(
 ) {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let (child, root) = monitor.spawn_root(command).expect("spawn the job's root");
-    let output = child.wait_with_output().expect("wait for the job's root");
+    let output = child
+        .wait_with_output_bounded()
+        .expect("wait for the job's root");
     (output, root)
 }
 

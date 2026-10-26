@@ -6,6 +6,7 @@
 #[path = "support/fixture_dir.rs"]
 mod fixture_dir;
 
+use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -114,7 +115,7 @@ struct Asker {
 
 impl Asker {
     async fn ask(socket: &Path, line: String) -> Self {
-        let stream = UnixStream::connect(socket).await.expect("connect");
+        let stream = UnixStream::connect_bounded(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         writer.write_all(line.as_bytes()).await.expect("ask");
         let mut asker = Self {
@@ -149,7 +150,7 @@ impl Asker {
 
 /// A one-shot control request's answer.
 async fn one_shot(socket: &Path, line: &str) -> Value {
-    let mut stream = UnixStream::connect(socket).await.expect("connect");
+    let mut stream = UnixStream::connect_bounded(socket).await.expect("connect");
     stream.write_all(line.as_bytes()).await.expect("ask");
     stream.shutdown().await.expect("half-close");
     let mut answer = String::new();

@@ -1,5 +1,6 @@
 use super::*;
 
+use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
 use std::{path::PathBuf, sync::LazyLock};
 use tokio::net::UnixStream;
 // A static is never dropped, so this root outlives the process: one per Linux test process.
@@ -38,7 +39,7 @@ async fn unix_socket_churn_unlinks_every_session() {
             .install(session)
             .await
             .expect("install Unix session");
-        let stream = UnixStream::connect(&socket)
+        let stream = UnixStream::connect_bounded(&socket)
             .await
             .expect("connect Unix socket");
         drop(stream);
@@ -92,7 +93,7 @@ async fn linux_data_socket_root_is_enforced_and_serves_requests() {
         policy.clone(),
     );
     gateway.handle().install(installed).await.expect("install");
-    let mut client = UnixStream::connect(&socket)
+    let mut client = UnixStream::connect_bounded(&socket)
         .await
         .expect("connect workspace data socket");
     client

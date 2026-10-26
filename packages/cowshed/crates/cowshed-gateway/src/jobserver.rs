@@ -1093,6 +1093,7 @@ async fn serve_pool(
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::{AsyncUnixStreamBackstop as _, UnixStreamBackstop as _};
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
@@ -1168,7 +1169,9 @@ mod tests {
             std::fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let stream = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+        let stream = tokio::net::UnixStream::connect_bounded(&endpoint)
+            .await
+            .unwrap();
         let mut reader = BufReader::new(stream);
         reader
             .get_mut()
@@ -1200,8 +1203,11 @@ mod tests {
     /// One held `cpu-pool` connection, answered `queued`.
     async fn child(endpoint: &Path, want: usize) -> tokio::io::BufReader<tokio::net::UnixStream> {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-        let mut reader =
-            tokio::io::BufReader::new(tokio::net::UnixStream::connect(endpoint).await.unwrap());
+        let mut reader = tokio::io::BufReader::new(
+            tokio::net::UnixStream::connect_bounded(endpoint)
+                .await
+                .unwrap(),
+        );
         reader
             .get_mut()
             .write_all(format!("{{\"op\":\"cpu-pool\",\"want\":{want}}}\n").as_bytes())
@@ -1314,7 +1320,7 @@ mod tests {
             let mut clients = Vec::new();
             for _ in 0..8 {
                 let mut client = cowshed_os::fork_lock::create(|| {
-                    std::os::unix::net::UnixStream::connect(&endpoint)
+                    std::os::unix::net::UnixStream::connect_bounded(&endpoint)
                 })
                 .unwrap();
                 client

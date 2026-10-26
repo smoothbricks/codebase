@@ -428,11 +428,23 @@ async fn run_fetch_helper(
             .await?;
         Ok::<_, std::io::Error>(bytes)
     });
+    // WHY unbounded: the request's cancellation, the other arm, ends it.
+    #[allow(clippy::disallowed_methods)]
     let status = tokio::select! {
         status = child.wait() => status.map_err(|_| RepoMirrorError::FetchFailed)?,
         _ = plan.cancellation.cancelled() => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            // A helper that already exited refuses the signal; the reap answers for it either way.
+            let _ = child.start_kill();
+            if let Err(failure) = cowshed_os::deadline::reap_async(
+                "git fetch helper",
+                &mut child,
+                &cowshed_os::deadline::start("reap cancelled git fetch helper", cowshed_os::deadline::REAP),
+                cowshed_os::deadline::Progress::Signalled { signal: libc::SIGKILL },
+            )
+            .await
+            {
+                cowshed_os::eprintln!("cowshed: {failure}");
+            }
             writer.abort();
             reader.abort();
             remove_tree(&plan.destination);
@@ -611,6 +623,9 @@ fn git_command(git: &Path, extra_header: Option<&Zeroizing<String>>) -> std::pro
 /// The helper process is env-cleared, so the parent passes an absolute `git`
 /// path in the request. Interactive prompts stay off; file/ext protocols and
 /// HTTP redirects stay denied.
+// WHY unbounded: this runs in the gateway's fetch helper, whose whole work these gits are; the
+// gateway's request cancellation kills the helper.
+#[allow(clippy::disallowed_methods)]
 fn fetch_with_git(mut request: HelperRequest) -> Result<Option<String>, ()> {
     let extra_header = request.credential.take().map(|credential| {
         Zeroizing::new(format!(
@@ -1961,15 +1976,10 @@ mod tests {
                 !destination.exists(),
                 "cancelled helper left unpublished destination"
             );
-            let mut status = 0;
-            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            let wait_error = std::io::Error::last_os_error();
+            let reaped = cowshed_os::test_backstop::waitpid(pid, libc::WNOHANG)
+                .expect_err("cancelled helper process {pid} was not already reaped");
             assert_eq!(
-                waited, -1,
-                "cancelled helper process {pid} was not already reaped"
-            );
-            assert_eq!(
-                wait_error.raw_os_error(),
+                reaped.raw_os_error(),
                 Some(libc::ECHILD),
                 "cancelled helper process {pid} remained waitable"
             );

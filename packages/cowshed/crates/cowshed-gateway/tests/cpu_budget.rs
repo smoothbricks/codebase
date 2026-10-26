@@ -5,6 +5,9 @@
 #[path = "support/fixture_dir.rs"]
 mod fixture_dir;
 
+use cowshed_os::test_backstop::{
+    AsyncChildBackstop as _, AsyncUnixStreamBackstop as _, ChildBackstop as _,
+};
 use std::io::{BufRead as _, BufReader as StdBufReader, Write as _};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
@@ -138,7 +141,7 @@ struct Asker {
 
 impl Asker {
     async fn jobserver(socket: &Path, want: usize, checkout: &str) -> Self {
-        let stream = UnixStream::connect(socket).await.expect("connect");
+        let stream = UnixStream::connect_bounded(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         let request = gate_request(want, checkout, "land gate");
         writer
@@ -156,7 +159,7 @@ impl Asker {
     /// A gate job's root request with its trusted job identity, as the supervisor sends it; the
     /// grant names the job's private CPU pool.
     async fn gate_job(socket: &Path, checkout: &str) -> (Self, PathBuf) {
-        let stream = UnixStream::connect(socket).await.expect("connect");
+        let stream = UnixStream::connect_bounded(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         let request = gate_request(1, checkout, "nx run-many -t gate");
         writer
@@ -186,7 +189,7 @@ impl Asker {
 
     /// One held request line on `socket`, answered `queued`.
     async fn send(socket: &Path, request: Value) -> Self {
-        let stream = UnixStream::connect(socket).await.expect("connect");
+        let stream = UnixStream::connect_bounded(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         writer
             .write_all(format!("{request}\n").as_bytes())
@@ -217,7 +220,7 @@ impl Asker {
     }
 
     async fn ask(socket: &Path, want: usize, checkout: &str) -> Self {
-        let stream = UnixStream::connect(socket).await.expect("connect");
+        let stream = UnixStream::connect_bounded(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         writer
             .write_all(request(want, checkout).as_bytes())
@@ -264,7 +267,7 @@ impl Asker {
 
 /// A one-shot control request's answer.
 async fn one_shot(socket: &Path, line: &str) -> Value {
-    let mut stream = UnixStream::connect(socket).await.expect("connect");
+    let mut stream = UnixStream::connect_bounded(socket).await.expect("connect");
     stream.write_all(line.as_bytes()).await.expect("ask");
     stream.shutdown().await.expect("half-close");
     let mut answer = String::new();
@@ -420,7 +423,7 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     assert_eq!((held.total, held.held), (8, 8));
 
     holder.kill().expect("SIGKILL the holder");
-    holder.wait().expect("reap");
+    holder.wait_bounded().expect("reap");
     assert_eq!(
         waiter.granted().await,
         2,
@@ -538,7 +541,7 @@ async fn a_checkout_holding_a_token_is_served_after_at_most_the_background_limit
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
     let (gateway, _root, socket) = gateway(8).await;
-    let stream = UnixStream::connect(&socket).await.expect("connect");
+    let stream = UnixStream::connect_bounded(&socket).await.expect("connect");
     let (reader, mut writer) = stream.into_split();
     writer
         .write_all(b"{\"op\":\"jobserver\",\"want\":4,\"checkout\":\"/w/js\",\"command\":\"cargo build\"}\n")
@@ -1064,7 +1067,9 @@ async fn resident(socket: &Path, checkout: &str, job_id: u64) -> (tokio::process
         "command": "node nx/dist/src/daemon/server/start.js",
         "job": { "repoId": "owner/repo", "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
             "jobId": job_id } });
-    let mut stream = UnixStream::connect(socket).await.expect("connect resident");
+    let mut stream = UnixStream::connect_bounded(socket)
+        .await
+        .expect("connect resident");
     stream
         .write_all(format!("{request}\n").as_bytes())
         .await
@@ -1147,8 +1152,11 @@ async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
 
     // A resident's death closes its pool, and the ledger is as it was without any resident.
     for (mut child, pool) in residents {
-        child.kill().await.expect("SIGKILL and reap the resident");
-        while UnixStream::connect(&pool).await.is_ok() {
+        child
+            .kill_bounded()
+            .await
+            .expect("SIGKILL and reap the resident");
+        while UnixStream::connect_bounded(&pool).await.is_ok() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -1558,7 +1566,9 @@ async fn waiters_reach(socket: &Path, checkout: &str, count: usize) {
 /// A child of the pool at `pool` asking for `want`, held once granted: what a sibling of an exec
 /// holds of its holder's pool. Answers the connection and its granted count.
 async fn pool_child(pool: &Path, want: usize) -> (UnixStream, u64) {
-    let mut stream = UnixStream::connect(pool).await.expect("connect the pool");
+    let mut stream = UnixStream::connect_bounded(pool)
+        .await
+        .expect("connect the pool");
     stream
         .write_all(format!("{{\"op\":\"cpu-pool\",\"want\":{want}}}\n").as_bytes())
         .await
@@ -1786,7 +1796,9 @@ async fn queued_jobserver_client_names_holders_before_release_and_status_lists_b
         }
         // A third request observes the second ahead of it in the same queue. Its queued
         // acknowledgement is the broker's own atomic admission snapshot, not a status guess.
-        let stream = UnixStream::connect(&socket).await.expect("third request");
+        let stream = UnixStream::connect_bounded(&socket)
+            .await
+            .expect("third request");
         let (reader, writer) = stream.into_split();
         let mut third = Asker {
             lines: BufReader::new(reader),
@@ -1812,7 +1824,10 @@ async fn queued_jobserver_client_names_holders_before_release_and_status_lists_b
             .read_to_string(&mut remaining)
             .await
             .expect("remaining stderr");
-        let output = child.wait_with_output().await.expect("client exits");
+        let output = child
+            .wait_with_output_bounded()
+            .await
+            .expect("client exits");
         assert!(
             output.status.success(),
             "{}\n{remaining}",

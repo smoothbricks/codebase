@@ -10,6 +10,7 @@
 #[path = "support/fixture_dir.rs"]
 mod fixture_dir;
 
+use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::num::NonZeroUsize;
@@ -124,7 +125,10 @@ struct JobGrant {
 }
 
 async fn job_grant(socket: &Path, g: usize) -> JobGrant {
-    let (reader, mut writer) = UnixStream::connect(socket).await.unwrap().into_split();
+    let (reader, mut writer) = UnixStream::connect_bounded(socket)
+        .await
+        .unwrap()
+        .into_split();
     let request = serde_json::json!({ "op": "jobserver", "want": g, "checkout": CHECKOUT,
         "command": "cargo test", "pool": true,
         "job": { "repoId": "owner/repo", "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
@@ -205,7 +209,7 @@ impl FifoReader {
 
 /// A child asking the job's pool socket for `want`, answered `queued`.
 async fn child(pool: &Path, want: usize) -> BufReader<UnixStream> {
-    let mut reader = BufReader::new(UnixStream::connect(pool).await.unwrap());
+    let mut reader = BufReader::new(UnixStream::connect_bounded(pool).await.unwrap());
     reader
         .get_mut()
         .write_all(format!("{{\"op\":\"cpu-pool\",\"want\":{want}}}\n").as_bytes())

@@ -2,8 +2,11 @@
 //! process: its lock, its refusal frame, its death with the gateway, and its stdin-EOF drain. Raw
 //! bytes service and process integration only; no archive restore or cutover claim.
 use super::*;
+use cowshed_os::test_backstop::{
+    AsyncChildBackstop as _, AsyncCommandBackstop as _, CommandBackstop as _,
+};
 
-use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
+use cowshed_os::fork_lock::Spawn as _;
 
 use std::ffi::OsString;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -234,7 +237,7 @@ async fn await_exit(kq: OwnedFd) -> bool {
 fn servers_of(parent: u32, script: &Path) -> Vec<u32> {
     let listing = std::process::Command::new("/bin/ps")
         .args(["-axo", "pid=,ppid=,args="])
-        .output_locked()
+        .output_bounded()
         .expect("ps snapshot");
     assert!(
         listing.status.success(),
@@ -454,7 +457,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let refused = second.output_locked().await.expect("run second server");
+    let refused = second.output_bounded().await.expect("run second server");
     assert_eq!(
         refused.status.code(),
         Some(1),
@@ -487,7 +490,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
     // Kill the real gateway. Its death closes the server's stdin pipe, and the kernel must report
     // the registered server exit.
     child.start_kill().expect("kill gateway child");
-    child.wait().await.expect("reap gateway child");
+    child.wait_bounded().await.expect("reap gateway child");
     drop(child_stdin);
     assert!(
         await_exit(kq).await,
@@ -522,7 +525,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
         .await
         .expect("close fresh server stdin");
     drop(fresh_stdin);
-    let status = fresh.wait().await.expect("reap fresh server");
+    let status = fresh.wait_bounded().await.expect("reap fresh server");
     assert!(
         status.success(),
         "fresh server must drain to exit 0: {status:?}"

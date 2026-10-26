@@ -4,10 +4,10 @@
 //! this test kills with SIGKILL. It proves that stream cut and nothing else: no restore or
 //! cutover claim.
 use super::*;
+use cowshed_os::test_backstop::CommandBackstop as _;
 
 use super::nx_process::{is_server_args, server_path, server_script};
 use cowshed_gateway::{AuditEvent, AuditStatus, GatewayTimeouts, NxCacheServiceConfig};
-use cowshed_os::fork_lock::Run as _;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -75,7 +75,7 @@ async fn read_some(stream: &mut TcpStream, buffer: &mut [u8]) -> usize {
 fn own_server_child(gateway_pid: u32, script: &std::path::Path) -> libc::pid_t {
     let listing = std::process::Command::new("/bin/ps")
         .args(["-axo", "pid=,ppid=,args="])
-        .output_locked()
+        .output_bounded()
         .expect("ps snapshot");
     assert!(
         listing.status.success(),

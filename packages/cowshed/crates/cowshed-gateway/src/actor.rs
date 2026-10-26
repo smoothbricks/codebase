@@ -3609,6 +3609,8 @@ pub enum GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::AsyncChildBackstop as _;
 
     fn seed(method: Method, mode: EgressMode) -> AdmissionSeed {
         AdmissionSeed {
@@ -4037,7 +4039,7 @@ mod tests {
                     } => {
                         if process.try_wait().expect("fixture child status").is_none() {
                             process.start_kill().expect("kill fixture child");
-                            process.wait().await.expect("reap fixture child");
+                            process.wait_bounded().await.expect("reap fixture child");
                         }
                     }
                     NxBackendState::Ready { process: None, .. }
@@ -4198,7 +4200,7 @@ mod tests {
         let token = fixture.install("nx-exit", "owner/nx-exit", 94, 1).await;
         let mut child = unit_child().await;
         child.start_kill().expect("kill fixture child");
-        child.wait().await.expect("reap fixture child");
+        child.wait_bounded().await.expect("reap fixture child");
         fixture.actor.nx_backends.insert(
             "owner/nx-exit".to_owned(),
             NxBackendState::Ready {

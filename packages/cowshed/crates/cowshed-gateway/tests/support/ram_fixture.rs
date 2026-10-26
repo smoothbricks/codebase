@@ -14,6 +14,7 @@
 //! is never asked.
 #![allow(dead_code)]
 
+use cowshed_os::test_backstop::UnixStreamBackstop as _;
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt as _;
@@ -152,7 +153,7 @@ pub async fn gateway_on(root: &NamespaceRoot, disk_lease: DiskLeaseLimits) -> (G
 /// Take a `ram-lease` of `sectors` from the gateway at `socket`: its one answer line and the
 /// connection that holds the lease, still open.
 pub fn lease(socket: &Path, sectors: RamDiskSectors) -> (UnixStream, serde_json::Value) {
-    let mut stream = UnixStream::connect(socket).expect("connect to the fixture gateway");
+    let mut stream = UnixStream::connect_bounded(socket).expect("connect to the fixture gateway");
     let request = serde_json::to_string(&RamLeaseRequest::new(sectors)).expect("encode the lease");
     stream
         .write_all(format!("{request}\n").as_bytes())
@@ -187,7 +188,7 @@ pub fn end_lease(mut stream: UnixStream, end: Option<RamLeaseEnd>) -> String {
 
 /// Write one request line to the gateway at `socket`, half-close, and read its one answer line.
 pub fn ask(socket: &Path, request: &str) -> serde_json::Value {
-    let mut stream = UnixStream::connect(socket).expect("connect to the fixture gateway");
+    let mut stream = UnixStream::connect_bounded(socket).expect("connect to the fixture gateway");
     stream
         .write_all(format!("{request}\n").as_bytes())
         .expect("write the request");

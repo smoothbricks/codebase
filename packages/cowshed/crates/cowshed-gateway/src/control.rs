@@ -368,8 +368,7 @@ impl GatewayControlClient {
                 let encoded = serde_json::to_vec(request)
                     .map_err(|error| ControlError::Encoding(error.to_string()))?;
                 let peer = Peer::unix(GATEWAY, socket);
-                let connected =
-                    deadline::establish(&budget, &peer, UnixStream::connect(socket)).await?;
+                let connected = deadline::connect_unix(&budget, &peer, socket).await?;
                 let peer = peer.credited(&connected);
                 (
                     PeerStream::connected(Box::new(connected) as BoxControlIo, peer, budget),
@@ -1803,14 +1802,11 @@ where
 
 /// Connect to a requester's live CPU pool. Only a pool that cannot be reached is absent.
 async fn connect_parent(path: &Path) -> std::io::Result<cowshed_os::fork_lock::Fenced<UnixStream>> {
-    let mut connect = std::pin::pin!(UnixStream::connect(path));
-    // Darwin creates a socket then sets CLOEXEC: fence each poll so no concurrently spawned
-    // child keeps this descriptor past exec.
-    let stream = std::future::poll_fn(|cx| {
-        cowshed_os::fork_lock::create(|| Ok(connect.as_mut().poll(cx)))
-            .expect("polling the connection runs an infallible closure")
-    })
-    .await?;
+    // connect_unix fences each poll so no concurrently spawned child keeps this descriptor
+    // past exec, and ends a connect the pool never answers at the handshake bound.
+    let budget = deadline::start("jobserver parent pool", deadline::HANDSHAKE);
+    let peer = Peer::unix("requester CPU pool", path);
+    let stream = deadline::connect_unix(&budget, &peer, path).await?;
     Ok(cowshed_os::fork_lock::Fenced::new(stream))
 }
 

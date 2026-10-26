@@ -10,6 +10,7 @@
 //! a PUT is 403, audited as `Failed` with classification `nx-backend-unavailable`. The local build
 //! still runs once and succeeds.
 
+use cowshed_os::test_backstop::AsyncCommandBackstop as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -17,7 +18,6 @@ use std::sync::Arc;
 
 use cowshed_gateway::{NxCacheBackend, NxCacheServiceConfig};
 use cowshed_gateway_types::WorkspacePolicy;
-use cowshed_os::fork_lock::RunAsync as _;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
@@ -120,7 +120,7 @@ async fn nx_run(root: &Path, remote: Option<&str>, receipt: Option<&str>) -> Out
     if let Some(origin) = remote {
         command.env("NX_SELF_HOSTED_REMOTE_CACHE_SERVER", origin);
     }
-    command.output_locked().await.expect("run the stock Nx")
+    command.output_bounded().await.expect("run the stock Nx")
 }
 
 /// Real executions of `app:build`: one `run` line each. A remote restore appends nothing, and a
@@ -726,7 +726,7 @@ async fn native_store_through_gateway_to_503_backend_is_audited_and_returns_fals
         .env("NX_CACHE_DIRECTORY", root.path().join(".nx/cache"))
         .env("NX_SELF_HOSTED_REMOTE_CACHE_SERVER", &origin)
         .env("NO_PROXY", "127.0.0.1,localhost")
-        .output_locked()
+        .output_bounded()
         .await
         .expect("run the native store");
     assert!(store.status.success(), "{}", run_text(&store));

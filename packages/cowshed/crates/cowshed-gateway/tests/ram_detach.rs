@@ -15,6 +15,7 @@ mod fixture_dir;
 #[path = "support/ram_fixture.rs"]
 mod ram_fixture;
 
+use cowshed_os::test_backstop::ChildBackstop as _;
 use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -94,7 +95,7 @@ async fn a_ram_detach_outlives_the_requester_that_asked_for_it() {
                     .expect("read the requester");
                 assert_eq!(said, "sent\n", "the requester wrote its detach");
                 child.kill().expect("kill the requester");
-                child.wait().expect("reap the requester");
+                child.wait_bounded().expect("reap the requester");
                 let retired = monitor
                     .retire_root(root, Duration::from_secs(1))
                     .expect("retire the requester's job");

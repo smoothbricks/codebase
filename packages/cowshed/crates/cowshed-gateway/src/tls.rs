@@ -211,6 +211,7 @@ pub enum TlsError {
 mod test_fixture_ports;
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::{io::Write as _, process::Stdio};
 
     use tokio_rustls::TlsAcceptor;
@@ -351,7 +352,7 @@ with socket.create_connection(('127.0.0.1', int(sys.argv[1]))) as raw:
                 .expect("python3 stdin")
                 .write_all(ca_pem.as_bytes())
                 .expect("write CA");
-            child.wait_with_output().expect("python3 output")
+            child.wait_with_output_bounded().expect("python3 output")
         })
         .await
         .expect("join python3");

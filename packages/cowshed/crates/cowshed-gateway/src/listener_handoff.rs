@@ -132,6 +132,9 @@ fn one(mut descriptors: Vec<OwnedFd>) -> io::Result<OwnedFd> {
 
 /// Connect to the handoff socket, or `None` when no install serves it: no socket file, or one a
 /// crashed install left that nothing listens on.
+// WHY unbounded: Darwin answers a unix connect in the call, refused when nothing listens or the
+// queue is full, never parked (this module is macOS-only).
+#[allow(clippy::disallowed_methods)]
 fn connect(path: &Path) -> io::Result<Option<UnixStream>> {
     let stream = match cowshed_os::fork_lock::create(|| UnixStream::connect(path)) {
         Ok(stream) => stream,
@@ -280,6 +283,10 @@ impl Drop for HandoffServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         // Wakes the accept, which then sees `stop`.
+        // WHY unbounded: it connects to this process's own listener; Darwin answers a unix connect
+        // in the call, refused when nothing listens or the queue is full, never parked (this module
+        // is macOS-only).
+        #[allow(clippy::disallowed_methods)]
         let _ = UnixStream::connect(&self.path);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

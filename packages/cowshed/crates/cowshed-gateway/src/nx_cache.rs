@@ -454,6 +454,8 @@ pub(crate) async fn stop_backend(
             return Err(failed("signal", std::io::Error::last_os_error()));
         }
     }
+    // WHY unbounded: the `BACKEND_STOP_GRACE` timeout around it ends it.
+    #[allow(clippy::disallowed_methods)]
     match tokio::time::timeout(BACKEND_STOP_GRACE, process.wait()).await {
         Ok(status) => status
             .map(|_| ())
@@ -463,7 +465,23 @@ pub(crate) async fn stop_backend(
                 "cowshed: Nx cache backend for {repo_id} did not exit within {}s of SIGTERM; killing it",
                 BACKEND_STOP_GRACE.as_secs()
             );
-            process.kill().await.map_err(|error| failed("kill", error))
+            process
+                .start_kill()
+                .map_err(|error| failed("kill", error))?;
+            cowshed_os::deadline::reap_async(
+                "Nx cache backend",
+                &mut process,
+                &cowshed_os::deadline::start(
+                    "reap killed Nx cache backend",
+                    cowshed_os::deadline::REAP,
+                ),
+                cowshed_os::deadline::Progress::Signalled {
+                    signal: libc::SIGKILL,
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| failed("reap", error.into()))
         }
     }
 }

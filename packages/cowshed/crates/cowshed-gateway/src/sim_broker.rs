@@ -122,6 +122,8 @@ impl SimRunner for XcrunSimRunner {
             }
         }
         process.kill_on_drop(true);
+        // WHY unbounded: the 120 s timeout around it ends it, and `kill_on_drop` ends the runner.
+        #[allow(clippy::disallowed_methods)]
         let output = timeout(Duration::from_secs(120), process.output_locked())
             .await
             .map_err(|_| SimBrokerError::RunnerTimeout)?
