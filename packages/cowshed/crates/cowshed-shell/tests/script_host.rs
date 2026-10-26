@@ -15,6 +15,7 @@
 //! `recvmsg`; `specs/cowshed/08_testing.md`, CI, records the measurement. Protocol-position
 //! checkpoints stay as diagnostics.
 
+use cowshed_os::test_backstop::ChildBackstop as _;
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
@@ -34,7 +35,7 @@ use cowshed_core::runtime::shell_host::{
 };
 use cowshed_core::script::{Binding, RenderedScript, render};
 #[cfg(target_os = "linux")]
-use cowshed_os::fork_lock::Run as _;
+use cowshed_os::test_backstop::CommandBackstop as _;
 
 /// The exec host binary under test, read when the test runs. `env!` would bake in the path of
 /// the checkout that compiled this test, but the test runs from a cached nextest archive that
@@ -201,7 +202,7 @@ fn delegated_case(case: &str) -> bool {
     let output = command
         .arg(std::env::current_exe().expect("the running script_host test binary"))
         .args(["--exact", case, "--nocapture", "--quiet"])
-        .output_locked()
+        .output_bounded()
         .unwrap_or_else(|error| panic!("start delegated script case {case}: {error}"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -358,7 +359,7 @@ impl Host {
             "script-fixture host={} phase=control-closed",
             self.child.id()
         );
-        let joined = self.child.wait();
+        let joined = self.child.wait_bounded();
         cowshed_os::eprintln!(
             "script-fixture host={} phase=host-joined result={joined:?}",
             self.child.id()
@@ -712,7 +713,7 @@ impl ScriptJobGuard {
         let Some(mut child) = self.child.take() else {
             return Ok(None);
         };
-        match child.wait() {
+        match child.wait_bounded() {
             Ok(status) => Ok(Some(status)),
             Err(error) => {
                 self.child = Some(child);
@@ -1705,7 +1706,7 @@ read _ < "$HOME/adopt-hold"
         "control EOF ends the host after retiring the tail"
     );
     assert_eq!(
-        host.child.wait().expect("reap host").signal(),
+        host.child.wait_bounded().expect("reap host").signal(),
         Some(libc::SIGKILL)
     );
     assert!(

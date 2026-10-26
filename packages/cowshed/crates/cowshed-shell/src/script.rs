@@ -165,6 +165,9 @@ pub(crate) fn run(
                 let exit = cowshed_core::runtime::job_groups::await_exit_unreaped(pid);
                 // SAFETY: reaping this host's own child, which has exited and nothing else waits
                 // for.
+                // WHY unbounded: the ready pipe ended because the child ended before reporting, and
+                // `await_exit_unreaped` has read that exit, so it is collected at once.
+                #[allow(clippy::disallowed_methods)]
                 unsafe {
                     libc::waitpid(pid, std::ptr::null_mut(), 0);
                 }
@@ -179,13 +182,22 @@ pub(crate) fn run(
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
-                // SAFETY: killing and reaping this host's own child, which nothing else waits
-                // for.
+                // SAFETY: killing this host's own child, which nothing else waits for.
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, std::ptr::null_mut(), 0);
                 }
-                return Err(error);
+                return Err(
+                    match crate::reap_child(
+                        "script child",
+                        pid,
+                        cowshed_os::deadline::Progress::Signalled {
+                            signal: libc::SIGKILL,
+                        },
+                    ) {
+                        Ok(()) => error,
+                        Err(reap) => io::Error::new(error.kind(), format!("{error}; reap: {reap}")),
+                    },
+                );
             }
         }
     }

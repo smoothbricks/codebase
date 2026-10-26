@@ -9,6 +9,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cowshed_os::test_backstop::AsyncChildBackstop as _;
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -1937,7 +1938,7 @@ read _ < "$TMPDIR/activation-hold"
     };
     let (escaped, parent, direnv) = tokio::select! {
         ready = ready => ready,
-        status = helper.wait() => panic!("activation helper exited before publishing its pids: {status:?}"),
+        status = helper.wait_bounded() => panic!("activation helper exited before publishing its pids: {status:?}"),
     };
     let host = parent_of(direnv);
     // SAFETY: getpgid reads two process group ids.
@@ -1967,7 +1968,7 @@ read _ < "$TMPDIR/activation-hold"
         "the escaped child must be reparented before teardown"
     );
     release(&tmp.join("helper-exit")).await;
-    let status = helper.wait().await.expect("wait for the helper");
+    let status = helper.wait_bounded().await.expect("wait for the helper");
     assert!(status.success(), "helper: {status}");
     let host_ended = tokio::task::spawn_blocking(move || host_exit.within(Duration::from_secs(60)))
         .await

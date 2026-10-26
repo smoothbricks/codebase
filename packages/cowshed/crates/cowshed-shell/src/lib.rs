@@ -57,6 +57,7 @@ use cowshed_core::runtime::shell_host::{
     SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
 };
 use cowshed_core::script::Binding;
+use cowshed_os::deadline::{self, Progress};
 
 mod script;
 
@@ -497,6 +498,10 @@ impl Host {
             .ok_or_else(|| io::Error::other("direnv export has no stdout pipe"))?
             .take(u64::try_from(MAX_EXPORT_BYTES + 1).unwrap_or(u64::MAX))
             .read_to_end(&mut exported);
+        // WHY unbounded: its export pipe is closed (read to its end, or dropped at the byte cap),
+        // so direnv is ending; a stalled one is retired by the orphan guard once the supervisor
+        // that asked is gone (11_shell.md).
+        #[allow(clippy::disallowed_methods)]
         let status = child.wait()?;
         read?;
         if !status.success() {
@@ -674,6 +679,9 @@ impl Host {
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr));
         let (child, _orphan_guard) = OrphanGuard::spawn(socket, owner, command, diagnostics)?;
+        // WHY unbounded: an activation runs as long as its evaluation; the orphan guard retires it
+        // once the supervisor that asked is gone (11_shell.md), which ends this wait.
+        #[allow(clippy::disallowed_methods)]
         let output = child.wait_with_output()?;
         if !output.status.success() {
             return Ok(Err(format!(
@@ -861,7 +869,9 @@ impl Held {
             return Ok(());
         }
         let ending = job_groups::end_held_group(self.pid, |signal| self.signal(signal));
-        let reap = self.reap();
+        let reap = self.reap(Progress::Signalled {
+            signal: libc::SIGKILL,
+        });
         match (ending.is_clean(), &reap) {
             (true, Ok(())) => Ok(()),
             _ => Err(io::Error::other(format!(
@@ -871,19 +881,38 @@ impl Held {
         }
     }
 
-    /// Collect the exited leader. Its id may name another process from here on.
-    fn reap(&mut self) -> io::Result<()> {
-        loop {
-            // SAFETY: `pid` is this host's own child; a null status pointer is allowed.
-            let waited = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
-            if waited == self.pid {
-                self.reaped = true;
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
+    /// Collect the leader, exited or killed (`last`), within the reap bound. Its id may name
+    /// another process from here on.
+    fn reap(&mut self, last: Progress) -> io::Result<()> {
+        reap_child("command leader", self.pid, last)?;
+        self.reaped = true;
+        Ok(())
+    }
+}
+
+/// Collect this host's own child `pid`, `role` to it, exited or killed, within the reap bound
+/// (specs/cowshed/05_gateway.md, "Deadlines"), `last` being what this host last did to it. One stuck
+/// in an uninterruptible kernel call is named, not waited for, and stays unreaped.
+pub(crate) fn reap_child(role: &'static str, pid: libc::pid_t, last: Progress) -> io::Result<()> {
+    let id =
+        u32::try_from(pid).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    deadline::await_exit(
+        role,
+        id,
+        &deadline::start("reap child", deadline::REAP),
+        last,
+    )?;
+    loop {
+        // WHY unbounded: `await_exit` has seen the child exit, so it is collected at once.
+        #[allow(clippy::disallowed_methods)]
+        // SAFETY: `pid` is this host's own child; a null status pointer is allowed.
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        if waited == pid {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
@@ -967,7 +996,7 @@ fn serve_request(
         }
         REQUEST_RELEASE if exited => {
             fields.finish()?;
-            held.reap()?;
+            held.reap(Progress::State("exited"))?;
             reply(socket, FrameWriter::new(REPLY_RELEASED))?;
             Ok(true)
         }
@@ -1189,7 +1218,17 @@ impl OrphanGuard {
                 let retired = monitor.retire_root(root, std::time::Duration::ZERO);
                 #[cfg(target_os = "linux")]
                 let retired = child.kill();
-                let waited = child.wait();
+                let waited = deadline::reap(
+                    "activation",
+                    &mut child,
+                    &deadline::start("reap activation", deadline::REAP),
+                    Progress::Signalled {
+                        signal: libc::SIGKILL,
+                    },
+                );
+                if waited.is_err() {
+                    deadline::collect_later("activation", child);
+                }
                 return Err(io::Error::other(format!(
                     "cannot watch activation control: {error}; retirement: {retired:?}; reap: {waited:?}"
                 )));
