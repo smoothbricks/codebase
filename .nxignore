@@ -23,6 +23,7 @@ modules/
 !/packages/.gitkeep
 !/packages/columine/.cargo
 !/packages/cowshed/.cargo
+!/packages/bitmosaic/crates/bitmosaic/fuzz/.gitignore
 !/packages/cowshed/.gitignore
 !/packages/lmao-expo-benchmark/.gitignore
 !/packages/lmao-ttsc/examples/.gitignore
