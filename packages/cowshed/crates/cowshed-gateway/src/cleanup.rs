@@ -4,10 +4,10 @@
 //! hands the entry here with one `released` request, then returns. This gateway frees the entries
 //! on one thread of its own, `image-cleanup`, one at a time, so one release cut runs on the
 //! store's container at once. It picks the next by [`cleanup_order::next`] over what each
-//! releaser recorded and whether the container is under pressure, and before every cut it waits,
-//! holding only that entry's lock, while gate-class work of any repository holds or waits. Measured
-//! 2026-10-25: nine deletion children each truncating a released image at once saturated the
-//! container, and lsof, git, forks and execs sat in uninterruptible waits behind them.
+//! releaser recorded and whether the container is under pressure, and cuts it at once: nothing
+//! waits for gate work. Measured 2026-10-25: nine deletion children each truncating a released
+//! image at once saturated the container, and lsof, git, forks and execs sat in uninterruptible
+//! waits behind them.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -15,9 +15,6 @@ use std::sync::mpsc;
 use cowshed_core::storage::apfs::cleanup_order::{self, Pending, Pressure};
 use cowshed_core::storage::apfs::release::{Released, free_committed};
 use cowshed_gateway_types::ReleaseRecord;
-
-use crate::cpu_budget::{CpuBudget, QuietAsk, QuietScope};
-use crate::disk_lease::Claim;
 
 /// The container is under pressure while its free space is below one part in this many of its
 /// capacity: below an eighth, the queue frees the most unique bytes per extent first.
@@ -34,13 +31,13 @@ pub(crate) struct ImageCleanup {
 impl ImageCleanup {
     /// Start the cleanup of the store at `store`: its thread lists what an earlier gateway left,
     /// queues it with no record, and serves hand-overs from then on.
-    pub(crate) fn start(store: PathBuf, budget: CpuBudget) -> std::io::Result<Self> {
+    pub(crate) fn start(store: PathBuf) -> std::io::Result<Self> {
         let (entries, handed) = mpsc::channel();
         let shared: std::sync::Arc<Path> = std::sync::Arc::from(store.as_path());
         let again = entries.clone();
         std::thread::Builder::new()
             .name("image-cleanup".to_owned())
-            .spawn(move || run(&store, &budget, &handed, &again))?;
+            .spawn(move || run(&store, &handed, &again))?;
         Ok(Self {
             store: shared,
             entries,
@@ -71,7 +68,6 @@ struct Queued {
 
 fn run(
     store: &Path,
-    budget: &CpuBudget,
     handed: &mpsc::Receiver<(PathBuf, ReleaseRecord)>,
     again: &mpsc::Sender<(PathBuf, ReleaseRecord)>,
 ) {
@@ -130,14 +126,7 @@ fn run(
             }
         };
         let Queued { entry, pending } = queue.swap_remove(position);
-        let mut before_cut = || {
-            if waits_for_gates(pressure(store, &mut said_space)) {
-                wait_out_gates(budget, store, &entry, &mut said_space)
-            } else {
-                Ok(())
-            }
-        };
-        match free_committed(&entry, &mut before_cut) {
+        match free_committed(&entry) {
             Ok(Released::Freed { bytes, steps }) => cowshed_os::eprintln!(
                 "cowshed: freed released image {} ({bytes} bytes, {steps} cuts)",
                 entry.display()
@@ -156,13 +145,6 @@ fn run(
                     },
                     again.clone(),
                 );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                cowshed_os::eprintln!(
-                    "cowshed: released-image cleanup stops with the gateway; {} and every queued entry stay in .deleting for its next start",
-                    entry.display()
-                );
-                return;
             }
             Err(error) => cowshed_os::eprintln!(
                 "cowshed: released image {} stays in .deleting for the gateway's next start: {error}",
@@ -246,69 +228,6 @@ fn free_and_capacity(store: &Path) -> std::io::Result<(u64, u64)> {
     ))
 }
 
-/// How often a cut waiting for gate work reads the store's free space again: pressure arising
-/// while it waits ends the wait.
-const PRESSURE_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Whether a cut waits out gate work under `pressure` (05_gateway.md "Deleting released images"):
-/// only without pressure. Under it the container's free space outranks a gate's quiet, and the
-/// cut, still the only one, runs beside the gate.
-fn waits_for_gates(pressure: Pressure) -> bool {
-    pressure == Pressure::None
-}
-
-/// Before a cut of `entry` without pressure: wait, with no deadline, while gate-class work of any
-/// repository holds or waits (05_gateway.md "Room for a gate"), and say so; the store coming under
-/// pressure meanwhile ends the wait, read every [`PRESSURE_RECHECK`]. The wait holds the entry's
-/// lock and no token. A ledger that is gone, or an install's restart cutting it off, stops the
-/// cleanup (`Interrupted`): no cut is made while the gateway restarts.
-fn wait_out_gates(
-    budget: &CpuBudget,
-    store: &Path,
-    entry: &Path,
-    said_space: &mut bool,
-) -> std::io::Result<()> {
-    let stopping = || {
-        std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "the gateway's CPU ledger stopped or is restarting",
-        )
-    };
-    let QuietAsk {
-        stake,
-        gate,
-        granted,
-    } = budget.ask_quiet(
-        QuietScope::Host,
-        None,
-        Claim::new(&format!("image-cleanup {}", entry.display()), None),
-    );
-    if let Some(gate) = gate.blocking_recv().map_err(|_| stopping())? {
-        cowshed_os::eprintln!(
-            "cowshed: released-image cleanup of {} waits beside gate job: {gate}",
-            entry.display()
-        );
-        let mut granted = granted;
-        loop {
-            match granted.try_recv() {
-                Ok(()) => break,
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return Err(stopping()),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-            }
-            if !waits_for_gates(pressure(store, said_space)) {
-                cowshed_os::eprintln!(
-                    "cowshed: released-image cleanup of {} cuts beside gate work: the store's free space fell below 1/{PRESSURE_FREE_FRACTION} of its capacity",
-                    entry.display()
-                );
-                break;
-            }
-            std::thread::sleep(PRESSURE_RECHECK);
-        }
-    }
-    drop(stake);
-    Ok(())
-}
-
 /// Whether `entry` may be handed to the cleanup of the store at `store`: an absolute path below
 /// the store, in a `.deleting` directory, naming a file there.
 pub(crate) fn admissible(store: &Path, entry: &Path) -> bool {
@@ -328,16 +247,6 @@ pub(crate) fn admissible(store: &Path, entry: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    /// Measured 2026-10-26 on the train-6 install: lands ran nearly back to back, the cleanup's
-    /// quiet wait reached 679 s with 86 released images in `.deleting`, and free space fell to
-    /// 895 GB, below the pressure floor (capacity/8, about 931 GB). Under pressure a cut runs beside
-    /// gate work; only without it does a cut wait for gates to end.
-    #[test]
-    fn under_pressure_a_cut_runs_beside_gate_work() {
-        assert!(!super::waits_for_gates(Pressure::Below));
-        assert!(super::waits_for_gates(Pressure::None));
-    }
-
     use super::*;
 
     /// Only an absolute entry below the store, in a `.deleting` directory, is taken.

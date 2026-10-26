@@ -185,7 +185,6 @@ pub struct Gateway {
     sim_broker: SimBrokerHandle,
     repo_mirror_task: Option<JoinHandle<()>>,
     sim_broker_task: Option<JoinHandle<()>>,
-    cpu_budget: crate::cpu_budget::CpuBudget,
     /// The released-image cleanup, once [`Gateway::clean_up_released_images`] started it.
     cleanup: Arc<std::sync::OnceLock<crate::cleanup::ImageCleanup>>,
 }
@@ -369,7 +368,7 @@ impl Gateway {
                         cpu_budget: cpu_budget.clone(),
                         task_server: crate::task_server::TaskServer::start(
                             config.task_server,
-                            cpu_budget.clone(),
+                            cpu_budget,
                         ),
                         cleanup: Arc::clone(&cleanup),
                         jobserver: crate::jobserver::JobserverFifos::start(
@@ -406,7 +405,6 @@ impl Gateway {
             sim_broker,
             repo_mirror_task: Some(repo_mirror_task),
             sim_broker_task: Some(sim_broker_task),
-            cpu_budget,
             cleanup,
         })
     }
@@ -419,7 +417,7 @@ impl Gateway {
         if self.cleanup.get().is_some() {
             return Ok(());
         }
-        let started = crate::cleanup::ImageCleanup::start(store, self.cpu_budget.clone())?;
+        let started = crate::cleanup::ImageCleanup::start(store)?;
         let _ = self.cleanup.set(started);
         Ok(())
     }

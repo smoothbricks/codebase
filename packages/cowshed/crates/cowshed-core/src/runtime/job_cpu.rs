@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use cowshed_gateway_types::{
     INSTALL_RESTART_CODE, InstallRestart, JobserverAnswer, JobserverJob, JobserverRequest,
-    LeaseState, PROBATION_OVER_OP, QuietRequest, ResidentPoolRequest,
+    LeaseState, PROBATION_OVER_OP, ResidentPoolRequest,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
@@ -366,109 +366,6 @@ async fn connect(socket: &Path) -> std::io::Result<UnixStream> {
             .expect("polling the connection runs an infallible closure")
     })
     .await
-}
-
-fn protocol(detail: impl Into<String>) -> CowshedError {
-    CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-        detail: detail.into(),
-    })
-}
-
-/// Wait until no gate-class request of `repo` holds or waits on the gateway at `socket`: what a
-/// fork, or an attach of a detached workspace, asks before it runs (05_gateway.md "A fork or attach
-/// waits for its repository's gate"). The gateway names the gate job it waits for, and the wait
-/// says so where admission progress goes. `pool`, the CPU pool the requester inherited, lets
-/// the gate's own work through. A gateway that is absent runs no gate. One that does not answer
-/// or acknowledge, or predates the ask, is said, and the operation runs: not knowing whether a
-/// gate works is no gate. There is no deadline; dropping the future leaves the queue.
-pub async fn wait_for_quiet(
-    socket: &Path,
-    repo: &RepoId,
-    command: &str,
-    pool: Option<&str>,
-) -> Result<()> {
-    let command = wire_command(command);
-    let line = request_line(serde_json::to_vec(&QuietRequest::new(
-        repo.as_str(),
-        command,
-        pool,
-    )))?;
-    let unknown = |why: String| {
-        format!(
-            "cowshed: quiet unknown repository={repo} command={command:?}: {why}; it runs without \
-             waiting for the repository's gate"
-        )
-    };
-    let stream = match connect(socket).await {
-        Ok(stream) => stream,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            progress(unknown(format!(
-                "the gateway at {} does not answer ({error})",
-                socket.display()
-            )))
-            .await;
-            return Ok(());
-        }
-    };
-    let mut connection = Fenced::new(stream);
-    connection
-        .write_all(&line)
-        .await
-        .map_err(|error| protocol(error.to_string()))?;
-    let mut reader = BufReader::new(connection);
-    let Ok(queued) = tokio::time::timeout(ACK_BOUND, answer(&mut reader)).await else {
-        progress(unknown(
-            "the gateway did not acknowledge the quiet ask within 2000 ms".to_owned(),
-        ))
-        .await;
-        return Ok(());
-    };
-    let queued = queued?;
-    if !queued.ok {
-        if queued.code.as_deref() == Some("invalid-request") {
-            progress(unknown(format!(
-                "the gateway predates the quiet ask ({})",
-                queued.error.as_deref().unwrap_or("no diagnostic")
-            )))
-            .await;
-            return Ok(());
-        }
-        return Err(refused(queued));
-    }
-    if queued.lease != Some(LeaseState::Queued) {
-        return Err(protocol("expected the quiet queued acknowledgement"));
-    }
-    let wait = match queued.cause {
-        Some(cause) => {
-            progress(format!(
-                "cowshed: quiet wait start repository={repo} command={command:?} {cause}"
-            ))
-            .await;
-            Some(std::time::Instant::now())
-        }
-        None => None,
-    };
-    let granted = answer(&mut reader).await;
-    let ok = granted
-        .as_ref()
-        .is_ok_and(|granted| granted.ok && granted.lease == Some(LeaseState::Granted));
-    if let Some(started) = wait {
-        let status = if ok { "ok" } else { "err" };
-        progress(format!(
-            "cowshed: quiet wait done elapsed={:?} status={status} repository={repo} command={command:?}",
-            started.elapsed()
-        ))
-        .await;
-    }
-    let granted = granted?;
-    if !granted.ok {
-        return Err(refused(granted));
-    }
-    if !ok {
-        return Err(protocol("expected the quiet grant after queued"));
-    }
-    Ok(())
 }
 
 /// Connect to the gateway at `socket`, write `line`, and read its `queued` then `granted` or
@@ -1101,78 +998,6 @@ mod tests {
         gateway.abort();
         std::fs::remove_dir_all(&dir).expect("remove the test store");
         (error, served.load(Ordering::SeqCst))
-    }
-
-    /// A fork waits for its repository's gate (05_gateway.md "A fork or attach waits for its
-    /// repository's gate"): it returns once the gateway grants it, at once when the queued answer
-    /// names no gate; a gateway that predates the ask, or none at all, gates nothing; any other
-    /// refusal fails the fork with the gateway's words.
-    #[tokio::test]
-    async fn a_quiet_ask_waits_for_its_grant_and_an_absent_or_older_gateway_gates_nothing() {
-        let dir = new_store();
-        let socket = dir.join("gateway.sock");
-        let repo = RepoId::parse("acme/widget").expect("a repository");
-        let gated = json!({
-            "ok": true,
-            "lease": "queued",
-            "cause": {
-                "kind": "quiet",
-                "gate": {
-                    "repository": "acme/widget",
-                    "class": "gate",
-                    "checkout": "/w/land",
-                    "job": 9,
-                    "command": "nx run-many -t gate",
-                },
-            },
-        })
-        .to_string();
-        let granted = json!({"ok": true, "lease": "granted"}).to_string();
-        let gateway = play_gateway(
-            socket.clone(),
-            vec![Generation {
-                after: Duration::ZERO,
-                asks: vec![
-                    vec![gated, granted.clone()],
-                    vec![queued_line(), granted],
-                    vec![refusal_line(
-                        "invalid-request",
-                        "unknown gateway control operation",
-                    )],
-                    vec![refusal_line("rejected", "the gateway refuses")],
-                ],
-            }],
-        );
-        wait_for_quiet(&socket, &repo, "fork x", None)
-            .await
-            .expect("granted once the gate ends");
-        wait_for_quiet(&socket, &repo, "fork y", None)
-            .await
-            .expect("granted at once");
-        wait_for_quiet(&socket, &repo, "attach z", None)
-            .await
-            .expect("a gateway that predates the ask gates nothing");
-        let refused = wait_for_quiet(&socket, &repo, "fork w", None)
-            .await
-            .expect_err("any other refusal fails the fork");
-        assert!(
-            matches!(
-                refused.cpu_admission_source(),
-                Some(CpuAdmissionRefusal::GatewayRefused { code, .. }) if code == "rejected"
-            ),
-            "{refused:?}"
-        );
-        let received = gateway.await.expect("the gateway task");
-        let first: serde_json::Value =
-            serde_json::from_slice(&received[0]).expect("a request line");
-        assert_eq!(
-            first,
-            json!({"op": "quiet", "repoId": "acme/widget", "command": "fork x"})
-        );
-        std::fs::remove_dir_all(&dir).expect("remove the test store");
-        wait_for_quiet(&socket, &repo, "fork v", None)
-            .await
-            .expect("no gateway runs no gate");
     }
 
     #[tokio::test]

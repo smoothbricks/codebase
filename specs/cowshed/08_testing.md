@@ -511,9 +511,8 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   extent go first, the fewer extents on a tie, and a clone that shares every extent after one that frees; an entry with
   no record goes last, oldest first, in both modes, and under pressure so does one without both counts. The pressure
   read is the real container's free space, checked within its capacity, and `PRESSURE_FREE_FRACTION` is the one fraction
-  it is compared by, so no test fills a container. The host-scope quiet ask is checked with the ledger's other quiet
-  rows ("Gate work quiets the host, table-driven", above). The startup listing is a function call over a scratch store
-  with released images planted in each project's `build/.deleting` and `sessions/.deleting`, in an archived project's
+  it is compared by, so no test fills a container. The startup listing is a function call over a scratch store with
+  released images planted in each project's `build/.deleting` and `sessions/.deleting`, in an archived project's
   (`.retired-projects/<operation-id>/build/.deleting` and `…/sessions/.deleting`) and in the store's own `.deleting`,
   workspace and build images alike: it lists them all with no record, leaves a legacy `.releasing` alone, names each
   stray and each unreadable directory, leaves every other file of an archive untouched, skips the receipt files beside
@@ -546,17 +545,18 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   without bound"); gate-class grants are not counted.
 - **CPU admission is work-conserving**: over the same generated sequences, with no gate-class request holding or waiting
   a token stays free while background waits only when two or more checkouts wait and a waiting request wants more than
-  the free tokens; a gate-class request never waits beside a free token; and while one holds or waits, background is
-  granted only one token at a time, and only while it then holds under half the host (05_gateway.md, "Room for a gate",
-  Danny tg#9527, tg#10536).
-- **Gate work quiets the host, table-driven**: rows of host size, background held before a gate, the gate's tokens and a
-  newcomer's want give the newcomer's grant (the whole room with no gate work, one token beside it while the floor is
-  open, none once it is shut); rows of gate requests by repository give a fork's or attach's quiet ask its answer (run
-  now, or wait naming the gate job heading its repository) and the transition that releases it, and at host scope the
-  released-image cleanup's ask its answer (run at once with no gate-class request in any repository, or wait naming the
-  oldest gate job) and its place in `quiet` with no `repository`; rows of queued asks give each its typed cause
-  (repository-gate, quiet or tokens) (05_gateway.md, "One gate per repository", "A fork or attach waits for its
-  repository's gate", "Deleting released images").
+  the free tokens; a gate-class request never waits beside a free token; and beside gate work background is granted
+  `min(want, free)` while no eligible gate-class request waits, with no one-token clamp (05_gateway.md, "Room for a
+  gate", Danny tg#9527, tg#11040).
+- **Gate-class order, table-driven**: rows of host size, background held before a gate, the gate's tokens and a
+  newcomer's want give the newcomer's grant: `min(want, free)` while no eligible gate-class request waits, the waiting
+  gate's want first while one does, and the one-token floor for a starved checkout or a younger repository's head while
+  the work behind the oldest gate job holds under half the host; rows of returned tokens give the oldest eligible
+  gate-class request the tokens it asks for before any background; rows of gate requests by repository give each its
+  answer (run now, or wait naming the gate job heading its repository) and the transition that releases it; rows of
+  queued asks give each its typed cause (`repository-gate` or `tokens`) (05_gateway.md, "One gate per repository", "Room
+  for a gate"). Over the socket, a released image handed over while a land's gate holds tokens is freed with the gate
+  still holding (05_gateway.md, "Deleting released images").
 
 ## Integration tests (real substrate)
 

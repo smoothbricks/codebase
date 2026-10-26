@@ -671,20 +671,17 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
     // The land's gate job holds only its orchestrator's token.
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut a = Asker::ask(&socket, 2, "/w/a").await;
-    // Beside gate work the host is quiet: background's grant is one token, whatever it wants.
-    assert_eq!(a.granted().await, 1);
-    // No gate ask waits, so background takes the free tokens, one each, and the host fills.
+    // No gate ask waits: background takes the free tokens it wants, beside gate work too.
+    assert_eq!(a.granted().await, 2);
     let mut b = Asker::ask(&socket, 1, "/w/b").await;
     assert_eq!(b.granted().await, 1);
-    let mut d = Asker::ask(&socket, 1, "/w/d").await;
-    assert_eq!(d.granted().await, 1);
     let mut queued = Asker::ask(&socket, 1, "/w/c").await;
     // A land task asks the gate job's pool after c queued. The pool lends nothing of its own: the
-    // child is granted the next returned token, ahead of c, not a share of the gate's single token.
+    // child is granted the next returned tokens, ahead of c, not a share of the gate's single token.
     let mut task = Asker::child(&pool, 2).await;
     assert_eq!(task.granted_within(Duration::from_millis(50)).await, None);
     drop(a);
-    assert_eq!(task.granted().await, 1);
+    assert_eq!(task.granted().await, 2);
     assert_eq!(queued.granted_within(Duration::from_millis(50)).await, None);
     let status = ledger(&socket).await;
     let land = status
@@ -692,27 +689,23 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
         .iter()
         .find(|checkout| checkout.checkout == "/w/land")
         .expect("the land holds");
-    assert_eq!((land.held, land.running), (2, 2), "{status:?}");
-    // The task's token returns and no gate ask waits: c takes it.
+    assert_eq!((land.held, land.running), (3, 2), "{status:?}");
+    // The task's tokens return and no gate ask waits: c takes one.
     drop(task);
     assert_eq!(queued.granted().await, 1);
-    drop((gate, b, d, queued));
+    drop((gate, b, queued));
     gateway.drain().await.expect("drain");
 }
 
-/// 05_gateway.md "A fork or attach waits for its repository's gate" and "One gate per repository",
-/// over the socket: a fork of a repository whose land gates is queued with the cause naming that
-/// land's gate job, the ledger lists it, and it is granted when the repository's last gate-class
-/// request leaves; a fork of another repository is granted at once; and a second gate job of the
-/// land's repository is queued with the land as its cause.
+/// 05_gateway.md "One gate per repository", over the socket: a second gate job of a repository
+/// whose land gates is queued with the cause naming that land's gate job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fork_waits_for_its_repositorys_gate_and_hears_which_one() {
+async fn a_second_gate_of_a_repository_hears_which_gate_holds_it() {
     let (gateway, _root, socket) = gateway(4).await;
-    let quiet = |repo: &str, command: &str| serde_json::json!({ "op": "quiet", "repoId": repo, "command": command });
     let (land, _pool) = Asker::gate_job(&socket, "/w/land").await;
-    let (mut fork, queued) = Asker::open(&socket, quiet("owner/land", "fork x")).await;
+    let (second, queued) = Asker::open(&socket, gate_request(1, "/x/land", "second gate")).await;
     assert_eq!(queued["lease"], "queued", "{queued}");
-    assert_eq!(queued["cause"]["kind"], "quiet", "{queued}");
+    assert_eq!(queued["cause"]["kind"], "repository-gate", "{queued}");
     assert_eq!(
         queued["cause"]["gate"]["repository"], "owner/land",
         "{queued}"
@@ -722,43 +715,15 @@ async fn a_fork_waits_for_its_repositorys_gate_and_hears_which_one() {
         queued["cause"]["gate"]["command"], "nx run-many -t gate",
         "{queued}"
     );
-    let (mut other, queued) = Asker::open(&socket, quiet("owner/other", "fork y")).await;
-    assert_eq!(queued["lease"], "queued", "{queued}");
-    assert!(queued.get("cause").is_none(), "{queued}");
-    assert_eq!(other.answer().await["lease"], "granted");
-    let (second, queued) = Asker::open(&socket, gate_request(1, "/x/land", "second gate")).await;
-    assert_eq!(queued["lease"], "queued", "{queued}");
-    assert_eq!(queued["cause"]["kind"], "repository-gate", "{queued}");
-    assert_eq!(queued["cause"]["gate"]["checkout"], "/w/land", "{queued}");
-    let status = ledger(&socket).await;
-    assert_eq!(
-        status
-            .quiet
-            .iter()
-            .map(|waiter| (waiter.repository.as_deref(), waiter.command.as_str()))
-            .collect::<Vec<_>>(),
-        [(Some("owner/land"), "fork x")],
-        "{status:?}"
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), fork.answer())
-            .await
-            .is_err(),
-        "a fork of a gating repository waits"
-    );
-    drop(second);
-    drop(land);
-    assert_eq!(fork.answer().await["lease"], "granted");
-    assert!(ledger(&socket).await.quiet.is_empty());
-    drop((fork, other));
+    drop((second, land));
     gateway.drain().await.expect("drain");
 }
 
 /// 05_gateway.md "Deleting released images", over the socket: a release handed over while a
-/// land gates waits in the cleanup beside it, listed as a host-wide quiet waiter, and is freed
-/// once the gate ends; an entry that is not in a `.deleting` directory of the store is refused.
+/// land gates is freed as soon as the cleanup reaches it, beside the gate; an entry that is not
+/// in a `.deleting` directory of the store is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_handed_over_image_is_freed_once_gate_work_ends() {
+async fn a_handed_over_image_is_freed_beside_gate_work() {
     let (gateway, root, socket) = gateway(4).await;
     let store = root.path().join("store");
     let deleting = store.join("acme/widget/build/.deleting");
@@ -777,17 +742,11 @@ async fn a_handed_over_image_is_freed_once_gate_work_ends() {
     };
     let answer = one_shot(&socket, &handed(&entry)).await;
     assert_eq!(answer["ok"], true, "{answer}");
-    // The ledger sends no change notification: read it until the cleanup's wait shows.
-    while ledger(&socket).await.quiet.is_empty() {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let status = ledger(&socket).await;
-    assert_eq!(status.quiet[0].repository, None, "{status:?}");
-    assert!(entry.exists(), "no cut beside the gate");
-    drop(gate);
+    // The gate still holds: the cleanup cuts beside it.
     while entry.exists() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    drop(gate);
     let outside = store.join("acme/widget/build/main.dmg");
     let answer = one_shot(&socket, &handed(&outside)).await;
     assert_eq!(answer["ok"], false, "{answer}");
@@ -1330,13 +1289,10 @@ async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_backgr
     let (gateway, _root, socket) = gateway(4).await;
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut background = Asker::ask(&socket, 2, "/w/tests").await;
-    // Beside the land the host is quiet: background is granted one token a grant, and with no gate
-    // ask waiting it fills the free tokens.
-    assert_eq!(background.granted().await, 1);
+    // No gate ask waits: background takes the free tokens it wants, and the host fills.
+    assert_eq!(background.granted().await, 2);
     let mut filler = Asker::ask(&socket, 1, "/w/filler").await;
     assert_eq!(filler.granted().await, 1);
-    let mut full = Asker::ask(&socket, 1, "/w/full").await;
-    assert_eq!(full.granted().await, 1);
     let admission = GatewayJobCpu::new(socket.clone());
     let start = "node /w/land/node_modules/nx/dist/src/daemon/server/start.js --kept";
     // Asked of the host alone, as the keeper asked it before: it queues at the full host.
@@ -1385,7 +1341,7 @@ async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_backgr
     let alone = alone
         .await
         .expect("the host-alone stake is granted once a token returns");
-    drop((alone, gate, full));
+    drop((alone, gate));
     while ledger(&socket).await.held != 0 {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

@@ -124,8 +124,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
   pass `--class gate` for unit work: the gate class takes the repository's gate order ahead of its lands. Two gates run
   at gate class: the repository's land path, and a train owner's pre-land proof of its train, which is that land's gate
   run early and takes no land turn (05_gateway.md "A train's proof is gate-class work"). While any gate of a repository
-  runs, background work beside it gets one token a grant, and forks and attaches of that repository wait for its end;
-  start a long background run after it.
+  runs, its tasks are served first from every free token; nothing else waits for it.
 - macOS loopback inside exec: only the shed's own port block (`$COWSHED_PORT_BASE`, 64 ports) is connectable; 127.0.0.1
   outside it is EPERM. Bind services at `$COWSHED_PORT_BASE + 1…`, and `grant --ports <N>` before starting them. Node
   and Bun port-0 listeners, and a child they start with `--inspect=…:0`, land in the block on their own through

@@ -253,14 +253,9 @@ impl Release {
         Ok(Some(cut))
     }
 
-    /// Make every cut left, calling `before_cut` before each (the cleanup waits there for gate
-    /// work to end), and unlink the empty file from its held directory.
-    pub fn finish(
-        mut self,
-        before_cut: &mut dyn FnMut() -> io::Result<()>,
-    ) -> io::Result<Released> {
+    /// Make every cut left and unlink the empty file from its held directory.
+    pub fn finish(mut self) -> io::Result<Released> {
         while self.plan.next().is_some() {
-            before_cut()?;
             self.step()?;
         }
         // SAFETY: the held directory descriptor and the NUL-terminated name outlive the call.
@@ -281,24 +276,19 @@ impl Release {
 /// Release the file at `path` in bounded steps, then unlink it.
 pub fn release_file(path: &Path, step: StepExtents) -> io::Result<Released> {
     match Release::open(path, step)? {
-        Opened::Release(release) => release.finish(&mut || Ok(())),
+        Opened::Release(release) => release.finish(),
         Opened::Absent => Ok(Released::Absent),
         Opened::Busy => Ok(Released::Busy),
     }
 }
-/// Free the one committed release at `entry` in bounded steps and unlink it, calling
-/// `before_cut` before each cut, whose error stops the free with what it cut so far (its length
-/// is the journal): what the gateway's cleanup does with each entry it picks
-/// (05_gateway.md, "Deleting released images"). An entry another process holds is left to it
-/// ([`Released::Busy`]): its releaser is still syncing its rename, and hands it over after. One
-/// another deletion unlinked, or nothing there, is [`Released::Absent`]. The directory and its
-/// parent are synced before the first cut, since the releaser may have died between its rename
-/// and that rename's syncs, and the directory after the unlink. A link or any other non-regular
-/// file at `entry` refuses, untouched.
-pub fn free_committed(
-    entry: &Path,
-    before_cut: &mut dyn FnMut() -> io::Result<()>,
-) -> io::Result<Released> {
+/// Free the one committed release at `entry` in bounded steps and unlink it: what the gateway's
+/// cleanup does with each entry it picks (05_gateway.md, "Deleting released images"). An entry
+/// another process holds is left to it ([`Released::Busy`]): its releaser is still syncing its
+/// rename, and hands it over after. One another deletion unlinked, or nothing there, is
+/// [`Released::Absent`]. The directory and its parent are synced before the first cut, since the
+/// releaser may have died between its rename and that rename's syncs, and the directory after the
+/// unlink. A link or any other non-regular file at `entry` refuses, untouched.
+pub fn free_committed(entry: &Path) -> io::Result<Released> {
     let (directory, name) = match anchor(entry) {
         Ok(anchored) => anchored,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Released::Absent),
@@ -321,8 +311,7 @@ pub fn free_committed(
     if let Some(parent) = entry.parent().and_then(Path::parent) {
         sync_held_directory(&open_directory_nofollow(parent)?)?;
     }
-    let released =
-        Release::plan(directory.try_clone()?, name, file, STEP_EXTENTS)?.finish(before_cut)?;
+    let released = Release::plan(directory.try_clone()?, name, file, STEP_EXTENTS)?.finish()?;
     sync_held_directory(&directory)?;
     Ok(released)
 }
@@ -755,7 +744,7 @@ mod tests {
     }
 
     /// The cleanup over `directory` alone: list it, then free each entry, as the gateway's queue
-    /// does with no gate work beside it.
+    /// does.
     fn drain(directory: &Path, is_entry: impl Fn(&str) -> bool) -> io::Result<Pass> {
         let Listing { entries, left } = released_in(directory, is_entry)?;
         let mut pass = Pass {
@@ -763,7 +752,7 @@ mod tests {
             left,
         };
         for entry in entries {
-            match free_committed(&entry, &mut || Ok(()))? {
+            match free_committed(&entry)? {
                 Released::Freed { bytes, .. } => pass.drained.add(Drained { images: 1, bytes }),
                 Released::Busy => pass.left.push(Left {
                     path: entry,
@@ -923,8 +912,7 @@ mod tests {
             before.0.div_ceil(bound.get()),
             "the resumed release plans from what is left: {left:?}"
         );
-        let Released::Freed { bytes, steps } = second.finish(&mut || Ok(())).expect("finish")
-        else {
+        let Released::Freed { bytes, steps } = second.finish().expect("finish") else {
             panic!("the release frees the file");
         };
         assert_eq!(bytes, before.1, "the resumed release counts what was left");
@@ -1155,40 +1143,35 @@ mod tests {
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
-    /// The cleanup calls its hook before every cut, and only before a cut: an image of many runs
-    /// is cut in steps, each after the hook (where the gateway waits out gate work), and an entry
-    /// another process holds is left busy without one.
+    /// The cleanup cuts an image of many runs in steps, and never cuts an entry another process
+    /// holds: that entry is left busy, whole, until its releaser lets go.
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_cleanup_yields_before_every_cut_and_never_cuts_a_held_entry() {
+    fn the_cleanup_cuts_in_steps_and_never_cuts_a_held_entry() {
         use crate::storage::apfs::extents::tests::{fragmented_sparse_file, scratch};
 
-        let root = scratch("cleanup-yield");
+        let root = scratch("cleanup-held");
         let (image, _) = fragmented_sparse_file(&root.0);
         let entry = root.0.join(DELETING_DIRECTORY).join("image.dmg");
         assert!(commit_release(&image, &entry).expect("commit"));
+        let length = fs::metadata(&entry).expect("the entry").len();
         let held = fs::File::open(&entry).expect("a releaser's descriptor");
         held.lock().expect("the releaser holds the entry");
-        let mut asked = 0;
         assert_eq!(
-            free_committed(&entry, &mut || {
-                asked += 1;
-                Ok(())
-            })
-            .expect("a held entry"),
+            free_committed(&entry).expect("a held entry"),
             Released::Busy
         );
-        assert_eq!(asked, 0, "a held entry is never cut");
+        assert_eq!(
+            fs::metadata(&entry).expect("the held entry").len(),
+            length,
+            "a held entry is never cut"
+        );
         drop(held);
-        let Released::Freed { steps, .. } = free_committed(&entry, &mut || {
-            asked += 1;
-            Ok(())
-        })
-        .expect("the free") else {
+        let Released::Freed { steps, .. } = free_committed(&entry).expect("the free") else {
             panic!("the entry is freed once its releaser lets go");
         };
         assert!(steps >= 1, "an image is freed by cuts");
-        assert_eq!(asked, steps, "one wait before each cut");
+        assert!(!entry.exists(), "the freed entry is unlinked");
     }
 
     /// An owner that died between its commit's rename and that rename's syncs leaves an entry a

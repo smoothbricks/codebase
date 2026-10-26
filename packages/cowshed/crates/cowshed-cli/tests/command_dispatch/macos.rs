@@ -8234,7 +8234,7 @@ async fn cpu_budget(socket: &Path) -> cowshed_gateway_types::CpuBudgetStatus {
 /// The checkout [`LoadedHost`] holds the host for.
 const LOADING_CHECKOUT: &str = "/loaded-host/another-checkout";
 
-/// Another checkout's background work holding the whole host, background's room with no gate work,
+/// Another checkout's background work holding the whole host, taking every free token,
 /// in the fixture gateway's real ledger (05_gateway.md, "Room for a gate"), and its one-token job
 /// running on the probation token beyond it (05_gateway.md, "A one-token job starts on
 /// probation"): a background job of this project then waits for a returned token, as on a host

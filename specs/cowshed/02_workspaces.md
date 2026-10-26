@@ -579,9 +579,8 @@ The source defaults to `main`, or names any session. The clone carries the sourc
 installed dependencies, build state, tracked edits and untracked files. Every fork runs this one mint path and switches
 to its own `cowshed/<ws>` branch from the source's `HEAD`, never the source's branch. Grants start closed with a fresh
 CA and platform endpoint identity; neither source grants nor endpoints carry over. No pool or pre-warming. The source
-image remains live and mounted throughout capture. A fork first waits while gate-class work of its repository holds or
-waits on the host's gateway, and says which gate job it waits for (05_gateway.md, "A fork or attach waits for its
-repository's gate").
+image remains live and mounted throughout capture. A fork never asks about or waits for gate-class work (05_gateway.md,
+"Room for a gate").
 
 1. `flock` the source's image lock. Flush its source volume and backing file for freshness without unmounting,
    detaching, sealing, or changing its mount flags. Source shells, editors and watchers continue to use it.
@@ -1612,9 +1611,9 @@ releases both: `detach`, making room, and putting a detached workspace back afte
 canonical path with canonical flags, mounts the linked build volume again and, on Linux, creates the per-workspace
 socket/netns and starts exactly one connector before admitting execs. On macOS a session attaches on use: the gateway's
 startup pass mounts mains only (05_gateway.md, "Startup contract"), and every verb that reaches a detached session
-attaches it; Linux uses its platform service/controller lifecycle. An explicit `attach` of a detached workspace first
-waits while gate-class work of its repository holds or waits, as a fork does (05_gateway.md, "A fork or attach waits for
-its repository's gate"); an attach of a mounted workspace attaches nothing and does not wait.
+attaches it; Linux uses its platform service/controller lifecycle. An explicit `attach` of a detached workspace, like a
+fork, never waits for gate-class work (05_gateway.md, "Room for a gate"); an attach of a mounted workspace attaches
+nothing.
 
 ### Making room for an attach
 

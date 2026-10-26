@@ -702,9 +702,9 @@ below).
       once the land lets go of the target's image lock, with the release of the seeds its freeze replaced, and runs
       beside what the land does in the target next (its supervisor, a kept workspace's fresh clone, the adoption check
       of step 7), so the release's unmount, detach and commit rename can overlap them. It frees no byte before land
-      returns: the gateway's cleanup frees the committed image off the land's path, never starting a cut while gate work
-      runs, and the land never waits for it (GC below). It needs no image lock: a fork or reseed that takes the lock
-      after the rename reads the adopted volume, and none that held it before the land took it still runs.
+      returns: the gateway's cleanup frees the committed image off the land's path, and the land never waits for it (GC
+      below). It needs no image lock: a fork or reseed that takes the lock after the rename reads the adopted volume,
+      and none that held it before the land took it still runs.
 
    A skipped swap is reported in the land report with each holder's pid and command. The target keeps its build volume
    and builds the landed delta incrementally the next time anything builds there; forks start from the new seed until
@@ -1047,9 +1047,9 @@ delta incrementally, as an edit would.
   every entry a restart or a refused hand-over left: each project's `build/.deleting` and `sessions/.deleting`, the same
   two directories of every archived project (`.retired-projects/<operation-id>/`) and the store's own
   `<store>/.deleting`. So a gateway restart or a reboot frees every entry left, an image cut short mid-free included.
-  The order it frees in, its wait for gate work before every cut, and what it names and leaves are the gateway's
-  (05_gateway.md, "Deleting released images"). Before an entry's first cut it syncs the directory and its parent,
-  because the operation may have died before syncing its rename; listing syncs nothing.
+  The order it frees in and what it names and leaves are the gateway's (05_gateway.md, "Deleting released images").
+  Before an entry's first cut it syncs the directory and its parent, because the operation may have died before syncing
+  its rename; listing syncs nothing.
 - In a directory store (the test substrate, 08_testing.md "directory_*") a release only renames the payload tree into a
   `.deleting` directory (a workspace-side payload into `<project>/sessions/.deleting/<name>`, a build volume into
   `build/.deleting/<id>.dmg`) and refuses no holder: a process holding anything inside keeps what it has open. The verb
@@ -1072,11 +1072,10 @@ delta incrementally, as an edit would.
   no flag-based shortcut bypasses the cuts. See 01a_apfs.md, "Freeing an image", for the reasons and limitations. The
   image's length is the free's journal: a cut ends on a run boundary, so a free that did not finish (a crash, a gateway
   restart) leaves a shorter image that the next gateway start's listing queues and the cleanup finishes, and nothing
-  else records progress. The gateway frees one entry at a time and waits for gate-class work to end before every cut
-  (05_gateway.md, "Deleting released images"); it holds the entry's `flock`, and no image lock, for the whole free, that
-  wait included. The free runs at normal disk priority: a thread throttled to background priority (`IOPOL_THROTTLE`)
-  holds the container's work while its own metadata reads wait, so the same free takes longer and the writers beside it
-  wait longer.
+  else records progress. The gateway frees one entry at a time, cutting each at once (05_gateway.md, "Deleting released
+  images"); it holds the entry's `flock`, and no image lock, for the whole free. The free runs at normal disk priority:
+  a thread throttled to background priority (`IOPOL_THROTTLE`) holds the container's work while its own metadata reads
+  wait, so the same free takes longer and the writers beside it wait longer.
 - Workspace images containing the only copy of dirty or unlanded content keep their separate recovery rules; rebuildable
   build images do not use that preservation mechanism.
 - Every release that commits an image, a seed's or another volume's, whatever asked for it (collection, a land's release

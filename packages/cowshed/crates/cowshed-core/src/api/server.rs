@@ -1033,11 +1033,6 @@ impl RouterReply {
     ) -> std::result::Result<(), Result<RouterResponse>> {
         self.0.send(response)
     }
-
-    /// Resolves once the caller stopped waiting for the answer.
-    pub async fn closed(&mut self) {
-        self.0.closed().await;
-    }
 }
 
 /// What the router actor is serving now: published when a route starts and cleared when it ends,
