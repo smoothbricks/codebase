@@ -114,7 +114,8 @@
         "dependsOn": [
           "...",
           "spec-links",
-          "no-unbounded-wait"
+          "no-unbounded-wait",
+          "forbidden-spellings"
         ],
         "inputs": [
           "...",
@@ -169,6 +170,17 @@
         ],
         "options": {
           "command": "bun tooling/checks/no-unbounded-wait.fixtures.ts",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "forbidden-spellings": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/**/*"
+        ],
+        "options": {
+          "command": "bun packages/nx-plugin/src/bin/smoo-nx-forbidden-spellings.ts",
           "cwd": "{workspaceRoot}"
         }
       },

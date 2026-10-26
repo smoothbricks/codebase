@@ -894,6 +894,45 @@ case; a stand-in in another file; a bound below the backstop beside untimed real
 `findClockOracles(root, files, changes)` and `formatClockOracle` are exported from
 `@smoothbricks/nx-plugin/test-clock-policy`.
 
+## Forbidden Spelling Policy
+
+Three workarounds that AGENTS.md forbids by rule name have a single spelling. Consuming repositories refuse new ones
+with the `smoo-nx-forbidden-spellings` bin, which prints one `error[…]` per site, names the AGENTS.md rule it enforces,
+and exits 1:
+
+- **NO-SKIP-NX-CACHE** (Diagnosis): the Nx cache-bypass flag in any of its spellings, or its environment switch set to
+  `true` in a shell assignment, a property write or an object, YAML or JSON key. A task that passes only uncached has a
+  broken input, output or dependency declaration; repair it at its owner.
+- **NO-HOST-CENSUS** (Proof): `ps`, `lsof` or `pgrep` in command position (line start, a YAML `- ` item or `key: `, a
+  shell separator, `sudo`/`env`/`exec` with their options and assignments, or a quote) that reads every process. An
+  unquoted shell command does so unless it names a pid scope (`-p`, `-P`, `-g`, `--pid`): bare `lsof` and `pgrep node`
+  select the whole host. A quoted program may take its arguments from a variable, so it is refused only with a visible
+  selecting option and no scoping one. A signal sent by process name and a listing of `/proc` (`readdir`, `scandir`,
+  `ls`, `find`) are refused too. Start from pids the caller holds and read exactly those.
+- **NO-WAIVER-LEDGER** (Workarounds): a file the change adds whose name makes it a list of known-broken sites
+  (`*.ledger.*`, `known-broken*`, `known-failures*`). Fix the sites; only an existing ledger may shrink.
+
+Like `smoo-nx-test-walks`, the bin judges only what changed since `upstreamBase`. The line rules read the new-side lines
+of each change and the path rule reads only the files the change adds, which `diffScope` reports as `added` (every path
+absent at the base, tracked or untracked, with rename detection off). The check stops new sites and removes none, so
+existing sites need no allowance table. Comment-only lines (`//`, `/*`, `* `, `# `, `<!--`), Markdown, plain text, lock
+files, logs, patches, JSONL and binary files are not read: prose and recorded data quote the forbidden forms as policy
+or history. The policy's tests build each spelling at runtime from parts, so no file needs an exemption.
+
+The check reads every changed file in the tree, so it runs as the root project's own cached `forbidden-spellings`
+target, keyed by `{workspaceRoot}/**/*` and run before `lint`. Inside `lint` it would either key lint's other commands
+by the whole tree or, keyed as narrowly as they are, replay a cached pass after a new site landed outside that key.
+
+It reads one line at a time, so an argv list split across lines is judged by its first line only. A quoted program whose
+arguments live in a variable (`probe('lsof', args)`) shows no option to judge and passes. A spelling assembled at
+runtime or passed through a variable is invisible, and a ledger kept inside a file with another name is not seen. A
+trailing comment is part of its code line, and prose in a string literal that sits in command position reads as a
+command. A pure deletion adds no line, so `diffScope` marks its range `deleted` and no line rule judges the line it
+names. A deleted file is inactive; any other read failure stops the check with
+`Cannot inspect FORBIDDEN-SPELLING input <file>: <detail>` and exit 2. `findForbiddenSpellings(root, scope)`,
+`findLineSpellings`, `findAddedPathSpelling` and `formatSpellingFinding` are exported from
+`@smoothbricks/nx-plugin/forbidden-spelling-policy`.
+
 ## Nx Target Naming
 
 Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are

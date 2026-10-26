@@ -47,6 +47,12 @@
       "import": "./dist/test-clock-policy.js",
       "default": "./dist/test-clock-policy.js"
     },
+    "./forbidden-spelling-policy": {
+      "types": "./dist/forbidden-spelling-policy.d.ts",
+      "development": "./src/forbidden-spelling-policy.ts",
+      "import": "./dist/forbidden-spelling-policy.js",
+      "default": "./dist/forbidden-spelling-policy.js"
+    },
     "./test-walk-policy": {
       "types": "./dist/test-walk-policy.d.ts",
       "development": "./src/test-walk-policy.ts",
@@ -232,7 +238,8 @@
     "smoo-nx-nextest-timings": "./dist/bin/smoo-nx-nextest-timings.js",
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
     "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
-    "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js"
+    "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
+    "smoo-nx-forbidden-spellings": "./dist/bin/smoo-nx-forbidden-spellings.js"
   },
   "generators": "./generators.json",
   "executors": "./executors.json",

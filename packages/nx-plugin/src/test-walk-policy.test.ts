@@ -558,6 +558,10 @@ describe('test-walk-policy', () => {
         { start: 1, end: Number.POSITIVE_INFINITY },
       ]);
 
+      expect(scope.ok && [...scope.value.added]).toEqual(['tests/new.test.ts']);
+      git('add', 'tests/new.test.ts');
+      const staged = diffScope(root, base);
+      expect(staged.ok && [...staged.value.added]).toEqual(['tests/new.test.ts']);
       // Base selection: local main; a CI checkout with only origin/main; no main at all; NX_BASE set, and unresolvable.
       const commit = (...args: string[]) =>
         git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', ...args);

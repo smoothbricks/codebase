@@ -81,10 +81,15 @@ export interface DuplicateScenario {
   readonly shared: number;
 }
 
-/** A changed line range on the new side of a diff, inclusive. */
+/**
+ * A changed line range on the new side of a diff, inclusive. A pure deletion adds no line: its range is the line before
+ * the deleted ones (0 at the file's start), marked `deleted`, so a check that judges the code around a change still
+ * sees it and one that judges added lines skips it.
+ */
 export interface ChangeRange {
   readonly start: number;
   readonly end: number;
+  readonly deleted?: true;
 }
 
 interface Token {
@@ -726,14 +731,19 @@ export function assertUpstreamBasePrecondition(workspaceRoot: string): void {
   if (!base.ok) throw new Error(`${TEST_ONE_WALK.id} cannot find the upstream base: ${base.reason}`);
 }
 
+/** The files a change touches since a base, the new-side line ranges of each, and the files it adds. */
+export interface DiffScope {
+  readonly files: readonly string[];
+  readonly changes: ReadonlyMap<string, readonly ChangeRange[]>;
+  /** The paths absent at the base, tracked or untracked; with rename detection off, a moved file's new path is one. */
+  readonly added: ReadonlySet<string>;
+}
+
 /**
  * The files changed since `base`, tracked or untracked, and the new-side line ranges of each change; an untracked
  * file is changed throughout.
  */
-export function diffScope(
-  root: string,
-  base: string,
-): GitAnswer<{ readonly files: readonly string[]; readonly changes: ReadonlyMap<string, readonly ChangeRange[]> }> {
+export function diffScope(root: string, base: string): GitAnswer<DiffScope> {
   const read = (args: readonly string[]): GitAnswer<string> => {
     const result = git(root, args);
     return result.status === 0 ? { ok: true, value: result.stdout } : { ok: false, reason: failed(args, result) };
@@ -743,6 +753,9 @@ export function diffScope(
   const listed = read(['ls-files', '--others', '--exclude-standard', '-z']);
   if (!listed.ok) return listed;
   const untracked = new Set(listed.value.split('\0'));
+  const addedTracked = read(['diff', '--name-only', '--diff-filter=A', '--no-renames', '-z', base, '--']);
+  if (!addedTracked.ok) return addedTracked;
+  const added = new Set([...addedTracked.value.split('\0'), ...untracked].filter(Boolean));
   const files = [...new Set([...changed.value.split('\0'), ...untracked].filter(Boolean))].sort();
   const changes = new Map<string, readonly ChangeRange[]>();
   for (const file of files) {
@@ -754,11 +767,12 @@ export function diffScope(
     if (!diff.ok) return diff;
     changes.set(
       file,
-      Array.from(diff.value.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gmu), (match) => {
+      Array.from(diff.value.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gmu), (match): ChangeRange => {
         const start = Number(match[1]);
-        return { start, end: start + Math.max(Number(match[2] ?? 1), 1) - 1 };
+        const count = Number(match[2] ?? 1);
+        return count === 0 ? { start, end: start, deleted: true } : { start, end: start + count - 1 };
       }),
     );
   }
-  return { ok: true, value: { files, changes } };
+  return { ok: true, value: { files, changes, added } };
 }

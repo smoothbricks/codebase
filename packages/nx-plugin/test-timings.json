@@ -72,6 +72,7 @@
     "src/package-target-policy.test.ts": 222,
     "src/test-clock-policy.test.ts": 189,
     "src/nx-store-resolution.test.ts": 184,
+    "src/forbidden-spelling-policy.test.ts": 176,
     "src/managed-files/unserved-workspace-hooks.test.ts": 161,
     "src/executors/bounded-exec/cpu-pool.test.ts": 108,
     "src/lock-scope.test.ts": 103,
