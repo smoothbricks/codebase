@@ -550,25 +550,40 @@ mod tests {
 
     /// The first compaction of a project starts with no compaction directory, and the process
     /// holds none of the land's descriptors: a land run under `cowshed land-turn` holds its
-    /// repository's turn through an inheritable descriptor, and a process that kept it would hold
-    /// the turn for its whole copy. Here the land holds an exclusive lock through such a
-    /// descriptor, starts the process and closes its own: the lock is free while the process still
-    /// runs. The program stands in for the cowshed binary; it says it started through one FIFO and
-    /// waits on another, so nothing is timed.
+    /// repository's turn through an inheritable descriptor, and a process that kept it would
+    /// hold the turn for its whole copy. The oracle is the child's own descriptor table, not
+    /// the ticket's lock: under libtest this process's inheritable descriptors also leak into
+    /// other tests' children, so a free lock after `drop(held)` says nothing about this
+    /// child. The ticket is duplicated to a known inheritable number and the stand-in
+    /// program reports whether that number is open under its own `/dev/fd`, saying so
+    /// through one FIFO and waiting on another, so nothing is timed.
     #[test]
     fn the_first_compaction_starts_holding_none_of_the_lands_descriptors() {
         use std::io::{Read as _, Write as _};
-        use std::os::fd::AsRawFd as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
         use std::os::unix::fs::PermissionsExt as _;
-        let directory = std::env::temp_dir().join(format!(
-            "compaction-fds-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        fs::create_dir_all(&directory).expect("directory");
+        let directory =
+            crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-compaction-fds");
+        let ticket = directory.join("ticket");
+        let held = File::create(&ticket).expect("ticket");
+        held.try_lock().expect("lock the fresh ticket");
+        // SAFETY: `fcntl` on a descriptor this test owns; the result is checked before the
+        // descriptor it may have made is wrapped. F_DUPFD clears FD_CLOEXEC, so the child
+        // inherits this number unless start_compaction seals it.
+        let duped = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_DUPFD, 64) };
+        assert!(
+            duped >= 64,
+            "dup the ticket to an inheritable number: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `duped` is the fresh descriptor checked above, owned by this test alone.
+        let _inheritable = unsafe { OwnedFd::from_raw_fd(duped) };
         let program = directory.join("compact");
         fs::write(
             &program,
-            "#!/bin/sh\nprintf started > \"$2/ready\"\nread line < \"$2/go\"\n",
+            format!(
+                "#!/bin/sh\nif [ -e /dev/fd/{duped} ]; then printf open > \"$2/ready\"; else printf closed > \"$2/ready\"; fi\nread line < \"$2/go\"\n"
+            ),
         )
         .expect("program");
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("executable");
@@ -580,17 +595,6 @@ mod tests {
             path
         };
         let (ready, go) = (fifo("ready"), fifo("go"));
-        let ticket = directory.join("ticket");
-        let held = File::create(&ticket).expect("ticket");
-        held.try_lock().expect("lock the fresh ticket");
-        // SAFETY: a plain descriptor operation on a descriptor this test owns.
-        unsafe {
-            assert_eq!(
-                libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0),
-                0,
-                "inheritable"
-            );
-        }
         let compacting = directory.join("build/.compacting");
         let (mut process, log) =
             start_compaction(&program, &directory, &compacting).expect("started");
@@ -599,22 +603,17 @@ mod tests {
         File::open(&ready)
             .expect("the process's ready FIFO")
             .read_to_string(&mut said)
-            .expect("the process says it started");
-        assert_eq!(said, "started");
-        drop(held);
-        let again = File::open(&ticket).expect("ticket again");
-        let locked = again.try_lock();
+            .expect("the process reports its descriptor table");
         OpenOptions::new()
             .write(true)
             .open(&go)
             .and_then(|mut go| go.write_all(b"\n"))
             .expect("let the process end");
         let status = process.wait_bounded().expect("reap the process");
-        assert!(
-            locked.is_ok(),
-            "the running compaction process keeps the land's lock: {locked:?}"
+        assert_eq!(
+            said, "closed",
+            "the compaction process started holding the land's ticket descriptor {duped}"
         );
         assert!(status.success(), "the stand-in process ended {status}");
-        fs::remove_dir_all(&directory).expect("cleanup");
     }
 }
