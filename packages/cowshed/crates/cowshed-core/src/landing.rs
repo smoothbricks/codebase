@@ -23,6 +23,12 @@
 //!   change or the target holds a patch-equivalent of it. The measurement names each file whose
 //!   change the target still lacks, and why, and a refusal names the commits held by neither
 //!   proof, so it says what would be lost.
+//! * **A ref that keeps a commit keeps it, whichever commit it is.** What the target does not hold
+//!   survives the image when a ref in main's repository holds it: a branch whose tip is, or is an
+//!   ancestor of, the ref `cowshed push` wrote for it or the target's branch of its name, and the
+//!   checked-out branch's head the same way through its push ref ([`measure_commits`]). The
+//!   decision is one table (`Standing::keeps`) over one read (`standing`), shared by the head
+//!   and every other branch, so no consumer judges one by another rule.
 //! * **A land's folds are measured here, decided by [`fold_step`].** The sessions a land carried
 //!   into its target are retired by the land (02_workspaces.md, `land` step 5, "Folds"); which
 //!   ones, and why one is kept, is a pure function of what [`fold_facts`] read.
@@ -36,11 +42,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::{
-    BranchLanding, BranchLandings, FoldKept, GitOid, LandingCommits, UnlandedPaths, WorkspaceInfo,
-    WorkspaceLanding, WorkspaceState,
+    BranchLanding, BranchLandings, FoldKept, GitOid, LandingCommits, PushRef, UnlandedPaths,
+    WorkspaceInfo, WorkspaceLanding, WorkspaceState,
 };
 use crate::error::ErrorCode;
-use crate::git::{CommitSubject, ContentNotHeld, GitRepository};
+use crate::git::{CommitSubject, ContentNotHeld, GitRepository, push_ref};
 use crate::metadata::{WorkspaceName, WorkspaceRole};
 
 /// The branch a workspace's work has to reach, resolved live, with the object store that holds it.
@@ -196,7 +202,8 @@ pub async fn unmatched_commits(
         .map_err(|error| error.message)
 }
 
-/// Measure one workspace tree against `target`: its head, and every other local branch.
+/// Measure one workspace tree against `target`: its head, which the ref `cowshed push` wrote for
+/// its branch can keep where the target does not hold it, and every other local branch.
 ///
 /// Total by construction: there is no error return, because every failure has a truthful
 /// representation as [`LandingCommits::Indeterminate`] and no failure may be allowed to read as
@@ -219,7 +226,15 @@ pub async fn measure(
     let dirty_files = repository.dirty_file_count().await.ok();
     WorkspaceLanding {
         dirty_files,
-        commits: measure_commits(store_root, target, workspace_mount, head).await,
+        commits: measure_commits(
+            store_root,
+            target,
+            workspace_mount,
+            push_repository,
+            workspace,
+            head,
+        )
+        .await,
         branches: measure_branches(
             store_root,
             target,
@@ -293,7 +308,7 @@ async fn judged_branches(
         .ref_tips(&["refs/heads"])
         .await
         .map_err(|error| error.message)?;
-    let push_namespace = format!("refs/cowshed/{workspace}/heads");
+    let push_namespace = crate::git::push_namespace(workspace);
     let pushed = GitRepository::from_root(store_root, push_repository);
     let push_refs = pushed
         .ref_tips(&[push_namespace.as_str()])
@@ -303,8 +318,12 @@ async fn judged_branches(
     for (name, tip) in candidates {
         let short = name.strip_prefix(b"refs/heads/").unwrap_or(&name);
         let push_ref = [push_namespace.as_bytes(), b"/".as_slice(), short].concat();
-        if holds(&target_repository, target_branches.get(&name), &tip).await?
-            || holds(&pushed, push_refs.get(&push_ref), &tip).await?
+        if standing(&target_repository, target_branches.get(&name), &tip)
+            .await?
+            .keeps()
+            || standing(&pushed, push_refs.get(&push_ref), &tip)
+                .await?
+                .keeps()
         {
             continue;
         }
@@ -325,34 +344,117 @@ async fn judged_branches(
     Ok(unlanded)
 }
 
-/// Whether `preserving`, a ref tip read from `repository`, keeps `tip`: it is that commit or a
-/// descendant of it there. No ref keeps nothing.
-async fn holds(
+/// How a ref stands against a commit it might keep: the one fact every preservation proof of `rm`
+/// rests on (02_workspaces.md, `rm` step 1), read by [`standing`] and judged by
+/// [`Standing::keeps`], so the judgement is a table with no process behind it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Standing {
+    /// The repository has no such ref: `cowshed push` wrote none, or no branch of that name exists.
+    Absent,
+    /// The ref is the commit itself.
+    Equal,
+    /// The commit is an ancestor of the ref: the ref holds it and more.
+    Ancestor,
+    /// The commit is not an ancestor of the ref: it carries work the ref lacks, being ahead of it
+    /// or diverged from it.
+    Ahead,
+}
+
+impl Standing {
+    /// Whether the ref keeps the commit: it is that commit or a descendant of it. No ref keeps
+    /// nothing, and a commit ahead of its ref is kept only as far as the ref goes, which is not
+    /// the commit.
+    const fn keeps(self) -> bool {
+        matches!(self, Self::Equal | Self::Ancestor)
+    }
+}
+
+/// Read how `preserving`, a ref tip read from `repository`, stands against `tip`. A tip equal to
+/// the ref's is decided without a process.
+async fn standing(
     repository: &GitRepository,
     preserving: Option<&Vec<u8>>,
     tip: &[u8],
-) -> std::result::Result<bool, String> {
+) -> std::result::Result<Standing, String> {
     let Some(preserving) = preserving else {
-        return Ok(false);
+        return Ok(Standing::Absent);
     };
     if preserving.as_slice() == tip {
-        return Ok(true);
+        return Ok(Standing::Equal);
     }
-    repository
+    let held = repository
         .commit_is_ancestor(
             &String::from_utf8_lossy(tip),
             &String::from_utf8_lossy(preserving),
         )
         .await
-        .map_err(|error| error.message)
+        .map_err(|error| error.message)?;
+    Ok(if held {
+        Standing::Ancestor
+    } else {
+        Standing::Ahead
+    })
+}
+
+/// The ref `cowshed push` wrote in `push_repository` for the workspace's checked-out branch, when
+/// it keeps `head` ([`Standing::keeps`]). A detached head is on no branch, so no ref is its to
+/// read, and a branch `push` never wrote has none: both are no answer to keep, not a failure.
+///
+/// Read only after the target said it does not hold the head, and only the one ref: `head` is
+/// resolved when a ref exists to compare it with.
+async fn pushed_head(
+    store_root: &std::sync::Arc<Path>,
+    workspace_mount: &Path,
+    push_repository: &Path,
+    workspace: &str,
+    head: &str,
+) -> std::result::Result<Option<PushRef>, String> {
+    let local = GitRepository::from_root(store_root, workspace_mount);
+    let Some(branch) = local
+        .current_branch()
+        .await
+        .map_err(|error| error.message)?
+    else {
+        return Ok(None);
+    };
+    let reference = push_ref(workspace, &branch);
+    let pushed = GitRepository::from_root(store_root, push_repository);
+    let refs = pushed
+        .ref_tips(&[reference.as_str()])
+        .await
+        .map_err(|error| error.message)?;
+    let Some(preserving) = refs.get(reference.as_bytes()) else {
+        return Ok(None);
+    };
+    let head = local
+        .commit_oid(head)
+        .await
+        .map_err(|error| error.message)?;
+    if !standing(&pushed, Some(preserving), head.as_str().as_bytes())
+        .await?
+        .keeps()
+    {
+        return Ok(None);
+    }
+    let tip = GitOid::new(String::from_utf8_lossy(preserving).into_owned())
+        .map_err(|error| format!("git listed a push ref tip that is not an object id: {error}"))?;
+    Ok(Some(PushRef { reference, tip }))
 }
 
 /// The commit half of [`measure`], separated so the gate can take it without a working-tree read it
 /// already performed through its own fence.
+///
+/// A head the target does not hold is asked of one more thing, the ref `cowshed push` wrote for its
+/// branch in `push_repository` (`pushed_head`): the target's counts stay as measured, and the ref
+/// is recorded beside them as `preserved_by` of `LandingCommits::Measured` when it keeps the head, so
+/// the head passes the way another branch does. A head the target holds asks no ref anything. A ref
+/// that cannot be read is no answer, and says why.
 pub async fn measure_commits(
     store_root: &std::sync::Arc<Path>,
     target: &std::result::Result<LandingTarget, String>,
     workspace_mount: &Path,
+    push_repository: &Path,
+    workspace: &str,
     head: &str,
 ) -> LandingCommits {
     let target = match target {
@@ -363,8 +465,28 @@ pub async fn measure_commits(
             };
         }
     };
-    match counted(store_root, target, workspace_mount, head).await {
+    let mut commits = match counted(store_root, target, workspace_mount, head).await {
         Ok(commits) => commits,
+        Err(reason) => return LandingCommits::Indeterminate { reason },
+    };
+    if commits.held_by_target() {
+        return commits;
+    }
+    match pushed_head(
+        store_root,
+        workspace_mount,
+        push_repository,
+        workspace,
+        head,
+    )
+    .await
+    {
+        Ok(kept) => {
+            if let LandingCommits::Measured { preserved_by, .. } = &mut commits {
+                *preserved_by = kept;
+            }
+            commits
+        }
         Err(reason) => LandingCommits::Indeterminate { reason },
     }
 }
@@ -391,7 +513,10 @@ pub struct FoldFacts {
     /// Whether its own change since its merge base with the target's previous head touches a path
     /// the landed range changes, or why that could not be read.
     pub touched: std::result::Result<bool, String>,
-    /// Whether the landed tip holds its head and every other local branch, as `rm` measures them.
+    /// Whether the landed tip holds its head, and every other local branch passes as `rm` measures
+    /// them. A head only a ref `cowshed push` keeps is not held: a fold is work the target carries
+    /// (02_workspaces.md, `land` step 5, "Folds"), so a session whose work is merely preserved is
+    /// neither retired nor named by the land.
     pub landed: bool,
     /// Its uncommitted changes (tracked, and untracked no ignore rule covers), or why they could
     /// not be counted.
@@ -488,7 +613,7 @@ pub async fn fold_facts(
     .await;
     FoldFacts {
         touched,
-        landed: landing.fully_landed(),
+        landed: landing.commits.held_by_target() && landing.branches.fully_landed(),
         dirty_files: landing
             .dirty_files
             .ok_or_else(|| String::from("git status could not be read")),
@@ -552,6 +677,7 @@ async fn counted(
         unlanded_paths: UnlandedPaths::Named {
             paths: unheld.paths,
         },
+        preserved_by: None,
     })
 }
 
@@ -695,7 +821,7 @@ pub fn retain_fully_landed<T: AsRef<WorkspaceInfo>>(rows: &mut Vec<T>) -> Vec<Wi
 
 #[cfg(test)]
 mod tests {
-    use super::{FoldFacts, FoldStep, MergedTree, fold_step, merge_changes_nothing};
+    use super::{FoldFacts, FoldStep, MergedTree, Standing, fold_step, merge_changes_nothing};
     use crate::api::dto::{FoldKept, GitOid};
     use crate::error::ErrorCode;
 
@@ -716,6 +842,21 @@ mod tests {
                 changes_nothing,
                 "{merged:?}"
             );
+        }
+    }
+
+    /// The judgement every preservation proof shares, as a table: a ref keeps a commit exactly when
+    /// it is that commit or a descendant of it. A head the workspace pushed and has not moved is
+    /// kept, and so is one it moved back from; one it committed past, or never pushed, is not.
+    #[test]
+    fn a_ref_keeps_a_commit_only_when_it_is_that_commit_or_a_descendant_of_it() {
+        for (standing, keeps) in [
+            (Standing::Absent, false),
+            (Standing::Equal, true),
+            (Standing::Ancestor, true),
+            (Standing::Ahead, false),
+        ] {
+            assert_eq!(standing.keeps(), keeps, "{standing:?}");
         }
     }
 

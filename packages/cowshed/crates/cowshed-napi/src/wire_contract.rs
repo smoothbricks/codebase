@@ -802,6 +802,7 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
                         },
                     ],
                 },
+                preserved_by: None,
             },
             branches: BranchLandings::Measured {
                 unlanded: Vec::new(),

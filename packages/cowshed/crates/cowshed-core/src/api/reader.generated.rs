@@ -537,6 +537,7 @@ static LANDING_COMMITS__MEASURED: Reader = Reader::Record(&[
     ("landed", &LEAF),
     ("behind", &LEAF),
     ("unlandedPaths", &UNLANDED_PATHS),
+    ("preservedBy", &PUSH_REF),
 ]);
 static LAND_BUILD_VOLUME: Reader = Reader::Record(&[("seed", &LAND_SEED), ("adoption", &ADOPTION)]);
 static LAND_PREFLIGHT: Reader = Reader::Record(&[
@@ -822,6 +823,7 @@ static PROTECTED_OUTPUT: Reader = Reader::Internal {
 };
 static PROTECTED_OUTPUT__FILE: Reader = Reader::Record(&[("path", &LEAF)]);
 static PROTECTED_OUTPUT__INLINE: Reader = Reader::Record(&[("data", &TAGGED_BYTES_REF)]);
+static PUSH_REF: Reader = Reader::Record(&[("reference", &LEAF), ("tip", &LEAF)]);
 static PUSH_REPORT: Reader = Reader::Record(&[
     ("sourceHead", &LEAF),
     ("destinationRef", &LEAF),

@@ -1177,11 +1177,11 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    source head, destroy the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*`
    preservation refs on the host. The retire gate is `rm`'s, measured against the branch the workspace just landed on,
    in the target's repository: a lane unit whose commits its lane base holds retires, though main does not hold them
-   yet. Of the ways `rm` step 1 lets another local branch pass, the branch of the same name is read in the target's
-   repository, but the `push` ref `refs/cowshed/<ws>/heads/<branch>` is read in main's repository, where `push` writes
-   it whichever target the unit lands into. A retire refused at this point (the check left work behind, say) keeps the
-   workspace and exits with the refusal, but its message starts with the landed head and target: the target has moved,
-   so the next step is `cowshed rm`, not another land.
+   yet. Of the ways `rm` step 1 lets a local branch pass, the branch of the same name (another branch's alone) is read
+   in the target's repository, but the `push` ref `refs/cowshed/<ws>/heads/<branch>`, HEAD's included, is read in main's
+   repository, where `push` writes it whichever target the unit lands into. A retire refused at this point (the check
+   left work behind, say) keeps the workspace and exits with the refusal, but its message starts with the landed head
+   and target: the target has moved, so the next step is `cowshed rm`, not another land.
 
    **Folds.** A land whose unit retired then retires every session workspace it folded: one whose own work the landed
    range carried into the target. Trains fold units by cherry-pick, resolving conflicts and adding review fixes, so no
@@ -1189,9 +1189,10 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    paths the range from the target's previous head to the landed head changes, and every published, mounted session
    other than the unit, the target workspace and main whose own changes since its merge base with that previous head
    touch one of them. Of those, a workspace is folded when the landed tip holds it by `rm`'s measurement (`rm` step 1,
-   against the branch the unit landed on, every local branch included); the others are not the land's, and are neither
-   touched nor named. A folded workspace is retired as `rm` retires it, measured again under its own land lease, with
-   two differences. The age floor does not apply: its work is already in the target. And its owner is spared, never
+   against the branch the unit landed on, every local branch included, and its HEAD held by the tip itself: a HEAD only
+   a `push` ref keeps is work the tip lacks, so it is no fold); the others are not the land's, and are neither touched
+   nor named. A folded workspace is retired as `rm` retires it, measured again under its own land lease, with two
+   differences. The age floor does not apply: its work is already in the target. And its owner is spared, never
    quiesced: a supervisor running a job or holding an open shell session refuses the stop rather than waiting for it,
    and a process cowshed does not run that holds its mount refuses as it does for `rm` ("Holders cowshed does not run").
    A folded workspace whose tree is dirty (a tracked change, or an untracked file no ignore rule covers) is kept. Each
@@ -1436,8 +1437,13 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    squash, a history rewrite, or a pick whose conflict a lander resolved therefore lands the work under other commits, a
    pick main then edited past is held by patch identity, and an empty commit changes no file and carries nothing; a
    squash of several commits or a resolved pick that main then edited past matches no commit's patch and is held by
-   neither. A branch other than HEAD also passes when its tip equals or is an ancestor of main's repository branch of
-   the same name or of `refs/cowshed/<ws>/heads/<branch>`, where `push` preserves it. The refusal names each branch that
+   neither. A ref in main's repository keeps a tip when the tip equals the ref's commit or is an ancestor of it, and
+   HEAD is kept so by `refs/cowshed/<ws>/heads/<branch>` for its checked-out branch, where `push` preserves it: those
+   commits live in main's repository, which outlives the image, so a shed pushed for review retires with no flag. A HEAD
+   the target holds asks no ref. A detached HEAD is on no branch, so no ref is its to read, and a HEAD ahead of its ref
+   (committed since the push, or diverged from it) is kept only as far as the ref goes, which is not the head. A dirty
+   tree refuses first, whatever keeps HEAD. A branch other than HEAD also passes when its tip equals or is an ancestor
+   of main's repository branch of the same name or of the ref `push` wrote for it. The refusal names each branch that
    did not pass with its tip, how many of its commits neither proof holds, each unheld file with why main lacks its
    change (`missing`, `conflict`, `added`, `deleted`, `changed` where main deleted the file, `mode`, or `unmergeable`
    with git's reason), ten files per branch and a count of the rest, and then those commits, each with its subject, ten
@@ -1468,15 +1474,16 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
    (01_storage.md) once the source release is committed or the recovery retirement completes: the head and every local
    branch tip read before the image went, each with what keeps it — `{"by":"bundle","path":…}` naming the abandon bundle
-   for a tip the abandonment kept, `{"by":"target",…}` naming the branch and head that held a tip the gate passed. The
-   line also says who retired the workspace (`retiredBy`): the `caller`, the process that ran the removal with its pid
-   and argv and its parent's, which is the shell, script or agent that asked; and, for a forced removal, `forced`,
-   naming each guard the force overrode (`dirty`, `inProgress` with the operation, `young` with `createdAt` and
-   `ageSeconds`), empty when it overrode none. A retirement that keeps its image as recovery (step 5) also names the
-   trash path it kept (`image`) and every reason it kept it (`retained`): `inProgress` with the operation, `dirty`,
-   `abandoned`, `onlyCopy` with the first untracked leaf the target checkout does not hold, or `main` for main's own
-   retirement. A retirement whose tips could not be read says so on stderr and writes the line without Git facts; it is
-   never refused for that.
+   for a tip the abandonment kept, `{"by":"target",…}` naming the branch and head that held a tip the gate passed, or,
+   for the head a `push` ref alone kept, the ref and its commit (`"branch":"refs/cowshed/<ws>/heads/<branch>"`), which
+   is then the only copy. The line also says who retired the workspace (`retiredBy`): the `caller`, the process that ran
+   the removal with its pid and argv and its parent's, which is the shell, script or agent that asked; and, for a forced
+   removal, `forced`, naming each guard the force overrode (`dirty`, `inProgress` with the operation, `young` with
+   `createdAt` and `ageSeconds`), empty when it overrode none. A retirement that keeps its image as recovery (step 5)
+   also names the trash path it kept (`image`) and every reason it kept it (`retained`): `inProgress` with the
+   operation, `dirty`, `abandoned`, `onlyCopy` with the first untracked leaf the target checkout does not hold, or
+   `main` for main's own retirement. A retirement whose tips could not be read says so on stderr and writes the line
+   without Git facts; it is never refused for that.
 
    The refusal reports whether the published branch already holds HEAD's commits; it never authorizes a removal. Only
    once the gate has refused HEAD does it measure HEAD, with the same landing module `ls` reads, against the primary

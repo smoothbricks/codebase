@@ -79,16 +79,17 @@ Notes for harness integration:
   repository; exit 4 means the name is taken — pick another instead of retrying the same name.
 - The workspace branch is `cowshed/<name>`; `cowshed push` delivers it to the main repo's refs, where a human (or a
   merge queue) takes over. Never push to main's checked-out branch.
-- `cowshed rm` refuses (exit 4) unless `main` already contains the workspace's `HEAD` — the image about to be deleted is
-  where those commits live, so the refusal is your signal that work would be lost. Land it. `--force` overrides only
-  _transient_ state (dirty tree, in-progress merge, the workspace's own running jobs; never a process cowshed does not
-  run holding the mount) and deliberately cannot get past this gate; `--abandon` is the sole authorization for
-  destroying unlanded commits, and it bundles them into `sessions/.trash` first.
+- `cowshed rm` refuses (exit 4) unless `main` already contains the workspace's `HEAD`, or the ref `cowshed push` wrote
+  for its branch keeps it — the image about to be deleted is where those commits live, so the refusal is your signal
+  that work would be lost. Land it, or push it for review. `--force` overrides only _transient_ state (dirty tree,
+  in-progress merge, the workspace's own running jobs; never a process cowshed does not run holding the mount) and
+  deliberately cannot get past this gate; `--abandon` is the sole authorization for destroying unlanded commits, and it
+  bundles them into `sessions/.trash` first.
 - **Never turn a removal conflict into a blind retry with a flag.** The gate is the whole point: a coordinator script
   that answers exit 4 by adding `--force` is the failure mode this design exists to prevent. `--abandon` is not a retry
   but a decision about the work, made once for a workspace whose work was deliberately dropped (superseded or obsolete,
   the reason clear from history) and followed by `cowshed gc --abandoned`, which deletes the recovery bundle. Work still
-  wanted is landed.
+  wanted is landed, or pushed for review.
 - **Land a round of units as one batch.** Fork one batch shed from main per round and each unit from the batch. Fold a
   finished unit with `cowshed land <unit> --into <batch> --ungated`: Git alone, no check, and it retires the unit's
   shed, so only main, the batch and the units being coded stay mounted. Gate once with `cowshed land <batch>` (or the

@@ -7593,6 +7593,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             Self::require_session_state_clean(workspace, fence)?;
             return Ok(NativeRemovalAuthority {
                 abandoning: None,
+                head_kept_by: None,
                 forced: options.force.then(Vec::new),
             });
         }
@@ -7602,7 +7603,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             Self::require_session_state_clean(workspace, fence)?;
             None
         };
-        let abandoning = self
+        let NativeLandedAuthority {
+            abandoning,
+            head_kept_by,
+        } = self
             .require_session_landed(workspace, fence, options.abandon, containment)
             .await?;
         // Last, so a refusal for real work at risk is the one a young workspace gets: landed is
@@ -7612,7 +7616,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         {
             return Err(removal_young_refusal(workspace, young));
         }
-        Ok(NativeRemovalAuthority { abandoning, forced })
+        Ok(NativeRemovalAuthority {
+            abandoning,
+            head_kept_by,
+            forced,
+        })
     }
 
     /// Stop the supervisor, then prove the workspace is still the one that was checked.
@@ -7864,6 +7872,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// then edited past, a history rewrite, or a pick whose conflict was resolved on the way in is
     /// not an ancestor of anything, and demanding `--abandon` to retire it taught callers to pass
     /// a commit-destroying flag for a safe operation.
+    ///
+    /// A head the target does not hold also passes when the ref `cowshed push` wrote for its branch
+    /// keeps it (`crate::landing::measure_commits`), as another branch passes by its own push ref:
+    /// that ref is in main's repository whichever target the session lands into.
     async fn landed_state(
         &self,
         workspace: &WorkspaceName,
@@ -7877,8 +7889,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let mount = self.workspace_mount_path(workspace)?;
         Ok(NativeLandedState {
             branch: containment.branch.clone(),
-            commits: crate::landing::measure_commits(store_root, &target, &mount, head.as_str())
-                .await,
+            commits: crate::landing::measure_commits(
+                store_root,
+                &target,
+                &mount,
+                &self.descriptor.git_root,
+                workspace.as_str(),
+                head.as_str(),
+            )
+            .await,
             branches: crate::landing::measure_branches(
                 store_root,
                 &target,
@@ -7894,21 +7913,36 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ///
     /// `--abandon` is the only authorization: `--force` covers transient state and deliberately
     /// stops there, so a script that carries `--force` to get past a stuck workspace cannot also
-    /// delete work with no other home. Answers `Some` when the caller authorized an abandonment
-    /// and there is genuinely something to abandon, so the caller can bundle it before deleting.
+    /// delete work with no other home. Answers the state to bundle when the caller authorized an
+    /// abandonment and there is genuinely something to abandon, and the ref that keeps the head when
+    /// one does: the caller bundles before deleting, and the deletion log names the only copy that
+    /// survives.
     async fn require_session_landed(
         &self,
         workspace: &WorkspaceName,
         fence: &NativeRemovalGitFence,
         abandon: bool,
         containment: &NativeContainment,
-    ) -> Result<Option<NativeLandedState>> {
+    ) -> Result<NativeLandedAuthority> {
         let landed = self
             .landed_state(workspace, &fence.head, containment)
             .await?;
+        // Read before the decision takes the state: once the image is gone, that ref is the only
+        // copy of the head.
+        let head_kept_by = landed.commits.preserved_by().cloned();
         let refused = match removal_landed_decision(landed, abandon) {
-            RemovalLandedDecision::Landed => return Ok(None),
-            RemovalLandedDecision::Abandoned(landed) => return Ok(Some(landed)),
+            RemovalLandedDecision::Landed => {
+                return Ok(NativeLandedAuthority {
+                    abandoning: None,
+                    head_kept_by,
+                });
+            }
+            RemovalLandedDecision::Abandoned(landed) => {
+                return Ok(NativeLandedAuthority {
+                    abandoning: Some(landed),
+                    head_kept_by,
+                });
+            }
             RemovalLandedDecision::Refused(refused) => refused,
         };
         // Refused, finally. Only now is the published branch read, and only to explain the head's
@@ -8077,9 +8111,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// What retiring the repository at `mount` takes away: its head and every local branch, each
     /// with what keeps it once the image is gone, for the deletion log (`retire-workspace`). A tip
-    /// an abandonment kept is held by its ref in main's repository — the ref of the same name, or
-    /// one holding the same tip (the checked-out branch is kept as `HEAD`); every other tip passed
-    /// the removal gate, so the containment branch holds its changes.
+    /// an abandonment kept is held by its bundle (the checked-out branch is kept as `HEAD`); a tip
+    /// at the head the target does not hold, which `head_kept_by` names, is kept by that ref
+    /// `cowshed push` wrote, now the only copy; every other tip passed the removal gate, so the
+    /// containment branch holds its changes (`tip_keeper`).
     ///
     /// Read before the image retires, because nothing can read it after. A failure is said and
     /// costs the log its Git facts; it never fails a removal the gate already authorized.
@@ -8089,6 +8124,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         mount: &Path,
         head: &GitOid,
         abandoned: Option<&AbandonedWork>,
+        head_kept_by: Option<&crate::api::dto::PushRef>,
         containment: &NativeContainment,
     ) -> std::result::Result<crate::storage::deletion_log::GitTips, String> {
         use crate::storage::deletion_log::{GitTips, KeptBy, KeptTip};
@@ -8106,26 +8142,28 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         .await
         .map_err(|error| error.message)?;
         let kept = |name: &str, tip: &GitOid| -> std::result::Result<KeptBy, String> {
-            if let Some(work) = abandoned
-                && (name == "HEAD"
-                    || *tip == work.head
-                    || work.branches.iter().any(|branch| branch.branch == name))
-            {
-                return Ok(KeptBy::Bundle {
+            match tip_keeper(name, tip, head, abandoned, head_kept_by) {
+                TipKeeper::Bundle(work) => Ok(KeptBy::Bundle {
                     path: work.bundle.clone(),
-                });
+                }),
+                TipKeeper::PushRef(pushed) => Ok(KeptBy::Target {
+                    branch: pushed.reference.clone(),
+                    head: pushed.tip.clone(),
+                }),
+                TipKeeper::Target => {
+                    let head = target_head.clone().ok_or_else(|| {
+                        format!(
+                            "{workspace}'s {name} passed the removal gate, yet {} has no {} branch",
+                            containment.mount.display(),
+                            containment.branch
+                        )
+                    })?;
+                    Ok(KeptBy::Target {
+                        branch: containment.branch.clone(),
+                        head,
+                    })
+                }
             }
-            let head = target_head.clone().ok_or_else(|| {
-                format!(
-                    "{workspace}'s {name} passed the removal gate, yet {} has no {} branch",
-                    containment.mount.display(),
-                    containment.branch
-                )
-            })?;
-            Ok(KeptBy::Target {
-                branch: containment.branch.clone(),
-                head,
-            })
         };
         let mut tips = vec![KeptTip {
             name: String::from("HEAD"),
@@ -8953,7 +8991,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     RetirementPurpose::Removal,
                 )
                 .await?;
-            let NativeRemovalAuthority { abandoning, forced } = self
+            let NativeRemovalAuthority {
+                abandoning,
+                head_kept_by,
+                forced,
+            } = self
                 .require_removal_safe(
                     &workspace,
                     options,
@@ -8982,6 +9024,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     &mount,
                     &final_fence.head,
                     abandoned.as_ref(),
+                    head_kept_by.as_ref(),
                     containment,
                 )
                 .await;
@@ -10793,7 +10836,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             Self::require_session_state_clean(workspace, &last)?;
                             None
                         };
-                        let abandoning = this
+                        let NativeLandedAuthority {
+                            abandoning,
+                            head_kept_by,
+                        } = this
                             .require_session_landed(workspace, &last, options.abandon, containment)
                             .await?;
                         if !previous {
@@ -10813,6 +10859,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 &stage.mount_point,
                                 &last.head,
                                 abandoned.as_ref(),
+                                head_kept_by.as_ref(),
                                 containment,
                             )
                             .await;
@@ -11397,6 +11444,18 @@ struct NativeLandedState {
     branches: BranchLandings,
 }
 
+/// What the containment gate authorized of a session's commits.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct NativeLandedAuthority {
+    /// The state an authorized abandonment bundles before deleting, when there is something to
+    /// abandon.
+    abandoning: Option<NativeLandedState>,
+    /// The ref `cowshed push` wrote that keeps a head the target does not hold: once the image is
+    /// gone it is the only copy, so the deletion log names it.
+    head_kept_by: Option<crate::api::dto::PushRef>,
+}
+
 /// The branch a removal measures a session against, in the repository that holds it: main's
 /// `main` for `rm`; for `land`'s retire, the branch the unit just landed on.
 #[cfg(target_os = "macos")]
@@ -11806,8 +11865,34 @@ mod rebase_recovery_tests {
         run_git(root, &["commit", "-m", message]);
     }
 
-    /// The retire gate for `unit` measured against `branch` in `target`, with `main` the
+    /// What the retire gate measures of `unit` against `branch` in `target`, with `main` the
     /// repository `cowshed push` preserves the unit's branches in, as `landed_state` reads it.
+    async fn measured_in(
+        store_root: &std::sync::Arc<Path>,
+        target: &Path,
+        branch: &str,
+        unit: &Path,
+        main: &Path,
+    ) -> NativeLandedState {
+        let head = git_oid(store_root, unit).await.expect("unit head");
+        let resolved = crate::landing::resolve_target(store_root, target, branch).await;
+        NativeLandedState {
+            branch: branch.to_owned(),
+            commits: crate::landing::measure_commits(
+                store_root,
+                &resolved,
+                unit,
+                main,
+                "unit",
+                head.as_str(),
+            )
+            .await,
+            branches: crate::landing::measure_branches(store_root, &resolved, unit, main, "unit")
+                .await,
+        }
+    }
+
+    /// The retire gate's decision for `unit`, from [`measured_in`].
     async fn contained_in(
         store_root: &std::sync::Arc<Path>,
         target: &Path,
@@ -11815,16 +11900,10 @@ mod rebase_recovery_tests {
         unit: &Path,
         main: &Path,
     ) -> RemovalLandedDecision {
-        let head = git_oid(store_root, unit).await.expect("unit head");
-        let resolved = crate::landing::resolve_target(store_root, target, branch).await;
-        let landed = NativeLandedState {
-            branch: branch.to_owned(),
-            commits: crate::landing::measure_commits(store_root, &resolved, unit, head.as_str())
-                .await,
-            branches: crate::landing::measure_branches(store_root, &resolved, unit, main, "unit")
-                .await,
-        };
-        removal_landed_decision(landed, false)
+        removal_landed_decision(
+            measured_in(store_root, target, branch, unit, main).await,
+            false,
+        )
     }
 
     #[tokio::test]
@@ -12010,6 +12089,106 @@ mod rebase_recovery_tests {
             contained_in(store_root, &lane.lane, "cowshed/lane", &unit, &lane.main).await,
             RemovalLandedDecision::Landed,
             "the lane base's own kept branch preserves the unit's"
+        );
+    }
+
+    /// `cowshed push` is how a shed whose work is for review, not for landing, retires without
+    /// `--abandon` (02_workspaces.md, `rm` step 1): the gate reads the ref push wrote in main's
+    /// repository for the checked-out branch through the table a branch's push ref is read by. A
+    /// head that is the ref's commit or an ancestor of it is kept, though main still lacks it; one
+    /// with work the ref lacks, one nothing pushed, and a detached one, which names no branch, are
+    /// refused. The counts stay what the target holds throughout.
+    #[tokio::test]
+    async fn a_head_the_push_ref_keeps_passes_the_retire_gate_and_one_it_does_not_keep_is_refused()
+    {
+        let lane = Lane::new("head-push-preserve");
+        let store_root = lane.store.shared();
+        let unit = lane.unit("unit");
+        unit_commit(&unit, "unit.txt", "unit work");
+        let reference = "refs/cowshed/unit/heads/cowshed/unit";
+        let workspace = Lane::name("unit");
+        let branch = crate::api::dto::BranchName::new("cowshed/unit").expect("branch name");
+        let push = || {
+            preserve_workspace_branch(
+                store_root, &lane.main, &unit, &workspace, &branch, None, None,
+            )
+        };
+        let gate = || measured_in(store_root, &lane.main, "main", &unit, &lane.main);
+        let kept_by = |landed: &NativeLandedState| landed.commits.preserved_by().cloned();
+
+        let unpushed = gate().await;
+        assert!(
+            matches!(
+                unpushed.commits,
+                LandingCommits::Measured { unlanded: 1, .. }
+            ),
+            "main lacks the commit: {unpushed:?}"
+        );
+        assert_eq!(kept_by(&unpushed), None, "nothing pushed keeps nothing");
+        assert_eq!(
+            removal_landed_decision(unpushed.clone(), false),
+            RemovalLandedDecision::Refused(unpushed)
+        );
+
+        let pushed_head = git_oid(store_root, &unit).await.expect("unit head");
+        push().await.expect("push the unit's branch");
+        let pushed = gate().await;
+        assert_eq!(
+            kept_by(&pushed),
+            Some(crate::api::dto::PushRef {
+                reference: reference.to_owned(),
+                tip: pushed_head.clone(),
+            }),
+            "the ref is the head"
+        );
+        assert!(
+            matches!(pushed.commits, LandingCommits::Measured { unlanded: 1, .. }),
+            "the counts are still what main holds: {pushed:?}"
+        );
+        assert_eq!(
+            removal_landed_decision(pushed, false),
+            RemovalLandedDecision::Landed,
+            "a head the push ref keeps retires with no flag"
+        );
+
+        unit_commit(&unit, "later.txt", "later work");
+        let ahead = gate().await;
+        assert_eq!(kept_by(&ahead), None, "the head is past its push ref");
+        assert_eq!(
+            removal_landed_decision(ahead.clone(), false),
+            RemovalLandedDecision::Refused(ahead)
+        );
+
+        push().await.expect("push the later head");
+        let newest = git_oid(store_root, &unit).await.expect("newest head");
+        assert_eq!(
+            kept_by(&gate().await).map(|kept| kept.tip),
+            Some(newest.clone()),
+            "pushed again, the ref moves with the head"
+        );
+
+        run_git(&unit, &["reset", "-q", "--hard", "HEAD~1"]);
+        let moved_back = gate().await;
+        assert_eq!(
+            kept_by(&moved_back).map(|kept| kept.tip),
+            Some(newest),
+            "a head the workspace moved back from is an ancestor of its ref"
+        );
+        assert_eq!(
+            removal_landed_decision(moved_back, false),
+            RemovalLandedDecision::Landed
+        );
+
+        run_git(&unit, &["checkout", "-q", "--detach"]);
+        let detached = gate().await;
+        assert_eq!(
+            kept_by(&detached),
+            None,
+            "a detached head is on no branch, so no push ref is its to read"
+        );
+        assert_eq!(
+            removal_landed_decision(detached.clone(), false),
+            RemovalLandedDecision::Refused(detached)
         );
     }
 
@@ -18705,6 +18884,7 @@ mod removal_refusal_tests {
                     )]
                 },
             },
+            preserved_by: None,
         })
     }
 
@@ -19022,6 +19202,7 @@ mod removal_refusal_tests {
                 landed: 0,
                 behind: 0,
                 unlanded_paths: crate::api::dto::UnlandedPaths::Named { paths },
+                preserved_by: None,
             })
         };
         assert!(
@@ -19146,6 +19327,7 @@ mod removal_refusal_tests {
                     unlanded_paths: crate::api::dto::UnlandedPaths::Named {
                         paths: vec![unheld("side.txt", crate::api::dto::UnlandedChange::Added)],
                     },
+                    preserved_by: None,
                 },
             }],
         };
@@ -19325,6 +19507,7 @@ mod removal_refusal_tests {
                 unlanded_paths: crate::api::dto::UnlandedPaths::Named {
                     paths: vec![unheld("side.txt", crate::api::dto::UnlandedChange::Added)],
                 },
+                preserved_by: None,
             },
         };
         let unlanded = with_branches(BranchLandings::Measured {
@@ -19385,6 +19568,189 @@ mod removal_refusal_tests {
                 .is_err(),
             "dirt is exactly what the transient gate is for"
         );
+    }
+
+    /// `unlanded` commits main lacks, which the push ref `preserved_by` keeps when it is given.
+    fn pushed_head(
+        unlanded: u64,
+        preserved_by: Option<crate::api::dto::PushRef>,
+    ) -> NativeLandedState {
+        let mut state = measured(unlanded, 0);
+        if let LandingCommits::Measured {
+            preserved_by: slot, ..
+        } = &mut state.commits
+        {
+            *slot = preserved_by;
+        }
+        state
+    }
+
+    fn push_ref_at(tip: char) -> crate::api::dto::PushRef {
+        crate::api::dto::PushRef {
+            reference: String::from("refs/cowshed/raven/heads/cowshed/raven"),
+            tip: oid(tip),
+        }
+    }
+
+    /// What `rm` answers for a head by how its push ref stands and whether its tree is dirty, the
+    /// gates in production order (transient state, then what keeps the commits): a head the push
+    /// ref keeps retires with no flag, a head past its ref or with no ref is refused as unlanded
+    /// work is, and uncommitted work refuses first, whatever keeps the head.
+    #[test]
+    fn a_head_the_push_ref_keeps_retires_with_no_flag_and_dirt_still_refuses() {
+        let verdict = |landed: NativeLandedState, dirty: bool| {
+            match NativeProjectRuntimeHost::require_session_state_clean(
+                &workspace(),
+                &fence(dirty, None),
+            ) {
+                Err(refusal) => format!("refused: {}", refusal.message),
+                Ok(()) => match removal_landed_decision(landed, false) {
+                    RemovalLandedDecision::Landed => String::from("retires"),
+                    RemovalLandedDecision::Refused(_) => String::from("refused: unlanded"),
+                    RemovalLandedDecision::Abandoned(_) => panic!("nothing asked to abandon"),
+                },
+            }
+        };
+        for (case, landed, dirty, expected) in [
+            (
+                "HEAD is the ref's commit",
+                pushed_head(7, Some(push_ref_at('4'))),
+                false,
+                "retires",
+            ),
+            (
+                "HEAD is behind the ref's commit",
+                pushed_head(7, Some(push_ref_at('9'))),
+                false,
+                "retires",
+            ),
+            (
+                "HEAD is ahead of the ref",
+                pushed_head(8, None),
+                false,
+                "refused: unlanded",
+            ),
+            ("no ref", pushed_head(7, None), false, "refused: unlanded"),
+            (
+                "HEAD is kept, the tree is dirty",
+                pushed_head(7, Some(push_ref_at('4'))),
+                true,
+                "refused: workspace raven has uncommitted Git work",
+            ),
+            (
+                "HEAD is ahead of the ref, the tree is dirty",
+                pushed_head(8, None),
+                true,
+                "refused: workspace raven has uncommitted Git work",
+            ),
+            ("main holds HEAD", measured(0, 3), false, "retires"),
+        ] {
+            assert_eq!(verdict(landed, dirty), expected, "{case}");
+        }
+    }
+
+    /// Who keeps a tip once the image is gone, in the order the deletion log answers: the abandon
+    /// bundle for a tip the abandonment kept, then the push ref for the head it kept, and the
+    /// containment branch for everything else that passed the gate. The ref keeps a commit, so the
+    /// checked-out branch at the head's tip is kept by it as `HEAD` is; a branch elsewhere is not.
+    #[test]
+    fn a_tip_is_kept_by_the_bundle_then_the_push_ref_then_the_target() {
+        let head = oid('4');
+        let elsewhere = oid('5');
+        let kept = push_ref_at('9');
+        let work = crate::api::dto::AbandonedWork {
+            head: oid('6'),
+            target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            target_head: Some(oid('1')),
+            unlanded_commits: 2,
+            branches: vec![crate::api::dto::BranchLanding {
+                branch: String::from("named"),
+                tip: oid('7'),
+                commits: measured(1, 0).commits,
+            }],
+            preserved: crate::api::dto::AbandonedPreservation::BundleOnly,
+            bundle: PathBuf::from("sessions/.trash/raven.bundle"),
+        };
+        for (case, name, tip, abandoned, head_kept_by, expected) in [
+            (
+                "a head main holds",
+                "HEAD",
+                &head,
+                None,
+                None,
+                TipKeeper::Target,
+            ),
+            (
+                "a branch main holds",
+                "side",
+                &elsewhere,
+                None,
+                None,
+                TipKeeper::Target,
+            ),
+            (
+                "a head the push ref keeps",
+                "HEAD",
+                &head,
+                None,
+                Some(&kept),
+                TipKeeper::PushRef(&kept),
+            ),
+            (
+                "the checked-out branch at that head",
+                "cowshed/raven",
+                &head,
+                None,
+                Some(&kept),
+                TipKeeper::PushRef(&kept),
+            ),
+            (
+                "a branch elsewhere than that head",
+                "side",
+                &elsewhere,
+                None,
+                Some(&kept),
+                TipKeeper::Target,
+            ),
+            (
+                "HEAD under an abandonment",
+                "HEAD",
+                &head,
+                Some(&work),
+                Some(&kept),
+                TipKeeper::Bundle(&work),
+            ),
+            (
+                "the abandoned head's tip",
+                "side",
+                &work.head,
+                Some(&work),
+                None,
+                TipKeeper::Bundle(&work),
+            ),
+            (
+                "a branch the abandonment names",
+                "named",
+                &elsewhere,
+                Some(&work),
+                None,
+                TipKeeper::Bundle(&work),
+            ),
+            (
+                "a branch it does not name",
+                "side",
+                &elsewhere,
+                Some(&work),
+                None,
+                TipKeeper::Target,
+            ),
+        ] {
+            assert_eq!(
+                tip_keeper(name, tip, &head, abandoned, head_kept_by),
+                expected,
+                "{case}"
+            );
+        }
     }
 }
 
@@ -19811,7 +20177,7 @@ async fn deliver_into(
     } = source;
     let store_root = repository.store_root();
     let target_root = repository.root();
-    let preservation_ref = format!("refs/cowshed/{unit}/heads/{source_branch}");
+    let preservation_ref = crate::git::push_ref(unit.as_str(), source_branch);
     fence_git(
         store_root,
         target_root,
@@ -20088,7 +20454,7 @@ async fn preserve_workspace_branch(
             ),
         ));
     }
-    let destination_ref = format!("refs/cowshed/{workspace}/heads/{branch}");
+    let destination_ref = crate::git::push_ref(workspace.as_str(), branch);
     let staging_ref = format!(
         "refs/cowshed/{workspace}/staging/{}",
         uuid::Uuid::new_v4().simple()
@@ -23193,11 +23559,12 @@ impl YoungWorkspace {
     }
 }
 
-/// What a removal's gates authorized: the commits an abandonment bundles, and, when forced, every
-/// guard the force overrode, for the deletion log.
+/// What a removal's gates authorized: the commits an abandonment bundles, the ref that keeps a head
+/// the target does not hold, and, when forced, every guard the force overrode, for the deletion log.
 #[cfg(target_os = "macos")]
 struct NativeRemovalAuthority {
     abandoning: Option<NativeLandedState>,
+    head_kept_by: Option<crate::api::dto::PushRef>,
     forced: Option<Vec<crate::storage::deletion_log::Overridden>>,
 }
 
@@ -23290,6 +23657,46 @@ fn removal_landed_decision(landed: NativeLandedState, abandon: bool) -> RemovalL
         RemovalLandedDecision::Abandoned(landed)
     } else {
         RemovalLandedDecision::Refused(landed)
+    }
+}
+
+/// Who keeps one tip of a retiring workspace once its image is gone.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+enum TipKeeper<'a> {
+    /// The abandon bundle, its only copy: the abandonment kept this tip.
+    Bundle(&'a AbandonedWork),
+    /// The ref `cowshed push` wrote, which held a head the target does not: its only copy.
+    PushRef(&'a crate::api::dto::PushRef),
+    /// The containment branch holds the tip's changes: the tip passed the removal gate.
+    Target,
+}
+
+/// Who keeps the tip `name` at `tip`, for the deletion log (`retire-workspace`,
+/// 02_workspaces.md, `rm` step 1). Pure, so the order of the answers is a table: a tip the
+/// abandonment kept (`HEAD`, a tip its head carries, a branch it names) is the bundle's; otherwise
+/// a tip at the removal's `head` is the push ref's when one kept that head, and every other tip
+/// passed the gate, which the containment branch answers for. The ref keeps the commit, not a
+/// name, so the checked-out branch, at the head's own tip, is kept by it as `HEAD` is, and a
+/// branch elsewhere never is.
+#[cfg(target_os = "macos")]
+fn tip_keeper<'a>(
+    name: &str,
+    tip: &GitOid,
+    head: &GitOid,
+    abandoned: Option<&'a AbandonedWork>,
+    head_kept_by: Option<&'a crate::api::dto::PushRef>,
+) -> TipKeeper<'a> {
+    if let Some(work) = abandoned
+        && (name == "HEAD"
+            || *tip == work.head
+            || work.branches.iter().any(|branch| branch.branch == name))
+    {
+        return TipKeeper::Bundle(work);
+    }
+    match head_kept_by {
+        Some(pushed) if tip == head => TipKeeper::PushRef(pushed),
+        _ => TipKeeper::Target,
     }
 }
 

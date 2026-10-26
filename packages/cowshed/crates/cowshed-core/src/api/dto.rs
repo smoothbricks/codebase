@@ -900,8 +900,10 @@ pub struct WorkspaceLanding {
 }
 
 impl WorkspaceLanding {
-    /// Whether retiring the workspace destroys no commit: its head and every other local branch
-    /// are held by the target's repository, or preserved by a branch there or a push ref in main's.
+    /// Whether retiring the workspace destroys no commit: its head is held by the target or kept by
+    /// the ref `cowshed push` wrote for its branch ([`LandingCommits::fully_landed`]), and every
+    /// other local branch is held by the target's repository or preserved by a branch there or a
+    /// push ref in main's.
     pub fn fully_landed(&self) -> bool {
         self.commits.fully_landed() && self.branches.fully_landed()
     }
@@ -953,6 +955,11 @@ pub struct BranchLanding {
 /// the workspace changed since its merge base with the target already carries that change there)
 /// or by a patch-equivalent commit of the target. A cherry-pick, a squash, or a pick whose conflict
 /// was resolved on the way in all land the work under other commits.
+///
+/// A head the target does not hold also passes when the ref `cowshed push` wrote for its
+/// checked-out branch keeps it ([`PushRef`]): retiring the workspace then loses no commit, that ref
+/// being in main's repository, which outlives the image. The counts stay what the target holds, so
+/// a listing still says how far the work is from landing; only the verdict reads the ref.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum LandingCommits {
@@ -964,8 +971,8 @@ pub enum LandingCommits {
         target_head: GitOid,
         /// Commits the target holds neither by content nor by patch identity: each changes a file
         /// `unlanded_paths` names. For a measurement recorded before files were named, those
-        /// `git cherry` found unheld. Zero is the only value that authorizes removing the workspace
-        /// without `--abandon`.
+        /// `git cherry` found unheld. Zero, or a head `preserved_by` keeps, is what authorizes
+        /// removing the workspace without `--abandon`.
         unlanded: u64,
         /// Commits whose every change the target already holds, however it got there: by ancestry,
         /// cherry-pick, squash-merge, a history rewrite, or a conflict-resolved pick.
@@ -980,6 +987,14 @@ pub enum LandingCommits {
             skip_serializing_if = "UnlandedPaths::is_predating"
         )]
         unlanded_paths: UnlandedPaths,
+        /// The ref `cowshed push` wrote in main's repository for the checked-out branch, when it
+        /// keeps a head the target does not hold: the head is that ref's commit or an ancestor of
+        /// it, so retiring the workspace loses no commit and needs no `--abandon`. `unlanded` still
+        /// counts what the target lacks. Absent when the target holds every commit (no ref is
+        /// read), when `push` wrote none for the branch, when the head has work the ref lacks, and
+        /// for a detached head, which is on no branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preserved_by: Option<PushRef>,
     },
     /// Nothing was compared and nothing may be inferred. This never means landed: every consumer
     /// treats it exactly as it treats unlanded work.
@@ -988,9 +1003,33 @@ pub enum LandingCommits {
 }
 
 impl LandingCommits {
-    /// Whether every change the workspace carries is already in the target branch.
-    pub const fn fully_landed(&self) -> bool {
+    /// Whether the target branch holds every change the head carries, by ancestry, content or patch
+    /// identity. A land's fold asks this and never [`Self::fully_landed`]: a fold is work the target
+    /// carries, and a head only a push ref keeps is work the target lacks.
+    pub const fn held_by_target(&self) -> bool {
         matches!(self, Self::Measured { unlanded: 0, .. })
+    }
+
+    /// Whether retiring the workspace destroys none of the head's commits: the target holds every
+    /// change ([`Self::held_by_target`]), or the ref `cowshed push` wrote for its branch keeps the
+    /// head.
+    pub const fn fully_landed(&self) -> bool {
+        matches!(
+            self,
+            Self::Measured { unlanded: 0, .. }
+                | Self::Measured {
+                    preserved_by: Some(_),
+                    ..
+                }
+        )
+    }
+
+    /// The ref that keeps a head the target does not hold, when one does.
+    pub const fn preserved_by(&self) -> Option<&PushRef> {
+        match self {
+            Self::Measured { preserved_by, .. } => preserved_by.as_ref(),
+            Self::Indeterminate { .. } => None,
+        }
     }
 
     /// The tip the workspace was compared against, when a comparison happened.
@@ -1000,6 +1039,17 @@ impl LandingCommits {
             Self::Indeterminate { .. } => None,
         }
     }
+}
+
+/// A ref `cowshed push` wrote in main's repository, `refs/cowshed/<ws>/heads/<branch>`
+/// (02_workspaces.md, `push`), and the commit it names.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PushRef {
+    /// The full ref name, in main's repository.
+    pub reference: String,
+    /// The commit the ref names: the head it keeps, or a descendant of it.
+    pub tip: GitOid,
 }
 
 /// Which files a landing measurement found the target lacking the change of.

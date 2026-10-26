@@ -209,6 +209,7 @@ type ReaderName =
   | 'PROTECTED_OUTPUT'
   | 'PROTECTED_OUTPUT__FILE'
   | 'PROTECTED_OUTPUT__INLINE'
+  | 'PUSH_REF'
   | 'PUSH_REPORT'
   | 'REBASE_REPORT'
   | 'RECOVERED_IMAGE'
@@ -1196,6 +1197,7 @@ const READERS: Readers<ReaderName> = {
       ['landed', 'LEAF'],
       ['behind', 'LEAF'],
       ['unlandedPaths', 'UNLANDED_PATHS'],
+      ['preservedBy', 'PUSH_REF'],
     ],
   },
   LAND_BUILD_VOLUME: {
@@ -1634,6 +1636,13 @@ const READERS: Readers<ReaderName> = {
   },
   PROTECTED_OUTPUT__FILE: { kind: 'record', fields: [['path', 'LEAF']] },
   PROTECTED_OUTPUT__INLINE: { kind: 'record', fields: [['data', 'TAGGED_BYTES_REF']] },
+  PUSH_REF: {
+    kind: 'record',
+    fields: [
+      ['reference', 'LEAF'],
+      ['tip', 'LEAF'],
+    ],
+  },
   PUSH_REPORT: {
     kind: 'record',
     fields: [

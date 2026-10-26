@@ -171,6 +171,18 @@ pub fn workspace_remote_name(workspace: &str) -> String {
     format!("cowshed/{workspace}")
 }
 
+/// The namespace `cowshed push` preserves `workspace`'s branches under in main's repository.
+pub fn push_namespace(workspace: &str) -> String {
+    format!("refs/cowshed/{workspace}/heads")
+}
+
+/// The ref `cowshed push` installs `branch` of `workspace` as in main's repository
+/// (02_workspaces.md, `push`): the one place `rm` reads to learn what survives the workspace's
+/// image (02_workspaces.md, `rm` step 1).
+pub fn push_ref(workspace: &str, branch: &str) -> String {
+    format!("{}/{branch}", push_namespace(workspace))
+}
+
 fn workspace_branch(name: &str) -> (String, String) {
     let branch = format!("cowshed/{name}");
     let branch_ref = format!("refs/heads/{branch}");
@@ -1345,6 +1357,18 @@ impl GitRepository {
 
     async fn has_commit(&self, commit: &str) -> Result<bool> {
         Ok(self.resolve_commit(commit).await?.is_some())
+    }
+
+    /// The commit `revision` names in this repository, strict like [`Self::divergence`]: a
+    /// revision this repository cannot see is refused instead of read as "no such commit", so a
+    /// proof built on the oid never rests on a commit nobody looked at.
+    pub async fn commit_oid(&self, revision: &str) -> Result<GitOid> {
+        self.resolve_commit(revision).await?.ok_or_else(|| {
+            CowshedError::conflict(
+                format!("{revision} is not a commit this repository can see"),
+                "attach the object store that holds it, then retry",
+            )
+        })
     }
 
     /// Whether `commit` is contained by a host branch or a Cowshed preservation ref.

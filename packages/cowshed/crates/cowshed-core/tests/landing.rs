@@ -17,10 +17,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cowshed_core::api::{
-    BranchLandings, LandingCommits, UnlandedChange, UnlandedPaths, WorkspaceIncarnation,
-    WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspaceRole, WorkspaceState,
+    BranchLandings, GitOid, LandingCommits, PushRef, UnlandedChange, UnlandedPaths,
+    WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspaceRole,
+    WorkspaceState,
 };
-use cowshed_core::landing::{annotate_listing, measure, resolve_target, unmatched_commits};
+use cowshed_core::landing::{
+    annotate_listing, fold_facts, fold_step, measure, resolve_target, retain_fully_landed,
+    unmatched_commits,
+};
 use cowshed_core::repository::RepoId;
 
 #[path = "support/temp_parent.rs"]
@@ -1154,16 +1158,167 @@ async fn other_local_branches_are_measured_and_only_unpreserved_work_is_named() 
     );
 }
 
-/// A listing measures with the controller Git of the store it is given, a fixture's own here,
-/// and on macOS that Git writes its Seatbelt profile into that store (04_sandbox.md, "Exec
-/// pipeline" step 4). Publish run 39822015838's hosted macOS runner has no host store: a listing that ran its Git
-/// for the host's withheld every attached session as unreadable, "cannot write controller git's
-/// sandbox profile into /private/cowshed/store/run/profiles".
+/// `cowshed push` preserves the branch the workspace has checked out, and the ref it writes keeps
+/// the head as it keeps any branch (02_workspaces.md, `rm` step 1): a head that is the ref's commit
+/// or an ancestor of it retires without `--abandon` though the target lacks its commits, and the
+/// counts still say what the target lacks. A head past its ref, a ref some other workspace pushed, a
+/// detached head, and a head the target already holds each read no ref as keeping.
 #[tokio::test]
-async fn a_listing_measures_with_the_controller_git_of_the_store_it_is_given() {
-    let fixture = Fixture::new("listing-store");
-    let quiet = fixture.clone_workspace("quiet");
-    let row = |name: &str, role: WorkspaceRole, mount: PathBuf| WorkspaceInfo {
+async fn a_head_the_push_ref_keeps_is_landed_for_removal_and_one_past_it_is_not() {
+    let fixture = Fixture::new("head-push-ref");
+    let mount = fixture.clone_workspace("topic");
+    workspace_commit(&mount, "topic.txt", "topic\n", "topic work");
+    let pushed = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    let reference = "refs/cowshed/topic/heads/topic";
+    let push = || {
+        git(
+            fixture.parent(),
+            [
+                OsStr::new("fetch"),
+                OsStr::new("-q"),
+                mount.as_os_str(),
+                OsStr::new(&format!("+refs/heads/topic:{reference}")),
+            ],
+        )
+    };
+    let kept_by = |landing: &WorkspaceLanding, tip: &str| {
+        assert_eq!(
+            landing.commits.preserved_by(),
+            Some(&PushRef {
+                reference: reference.to_owned(),
+                tip: GitOid::new(tip.to_owned()).expect("an object id"),
+            }),
+            "{landing:?}"
+        );
+    };
+
+    let unpushed = measured(&fixture, &mount).await;
+    assert_eq!(counts(&unpushed), (1, 0, 0));
+    assert_eq!(unpushed.commits.preserved_by(), None, "no push, no ref");
+    assert!(!unpushed.fully_landed());
+
+    push();
+    let landing = measured(&fixture, &mount).await;
+    kept_by(&landing, &pushed);
+    assert_eq!(
+        counts(&landing),
+        (1, 0, 0),
+        "the counts are still what the target holds"
+    );
+    assert!(
+        landing.fully_landed(),
+        "the ref keeps the head: {landing:?}"
+    );
+    assert!(
+        !landing.commits.held_by_target(),
+        "kept is not held: {landing:?}"
+    );
+
+    workspace_commit(&mount, "later.txt", "later\n", "later work");
+    let ahead = measured(&fixture, &mount).await;
+    assert_eq!(counts(&ahead), (2, 0, 0));
+    assert_eq!(
+        ahead.commits.preserved_by(),
+        None,
+        "the head is past its ref"
+    );
+    assert!(!ahead.fully_landed());
+
+    push();
+    let newest = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    git(&mount, ["reset", "-q", "--hard", "HEAD~1"]);
+    let moved_back = measured(&fixture, &mount).await;
+    kept_by(&moved_back, &newest);
+    assert!(
+        moved_back.fully_landed(),
+        "a head moved back from its ref is an ancestor of it"
+    );
+
+    let elsewhere = measure(
+        fixture.store(),
+        &resolve_target(fixture.store(), &fixture.parent(), TARGET).await,
+        &mount,
+        &fixture.parent(),
+        "another",
+        "HEAD",
+    )
+    .await;
+    assert_eq!(
+        elsewhere.commits.preserved_by(),
+        None,
+        "a ref pushed under another workspace's name is not this workspace's"
+    );
+
+    git(&mount, ["checkout", "-q", "--detach"]);
+    let detached = measured(&fixture, &mount).await;
+    assert_eq!(
+        detached.commits.preserved_by(),
+        None,
+        "a detached head is on no branch"
+    );
+    assert!(!detached.fully_landed());
+
+    git(&mount, ["checkout", "-q", "topic"]);
+    fixture.land_content_separately("topic.txt", "topic\n", "topic work upstream");
+    let landed = measured(&fixture, &mount).await;
+    assert!(landed.commits.held_by_target(), "{landed:?}");
+    assert_eq!(
+        landed.commits.preserved_by(),
+        None,
+        "a head the target holds asks no ref anything"
+    );
+}
+
+/// A fold is work the target carries (02_workspaces.md, `land` step 5, "Folds"): a head only the
+/// push ref keeps is retirable by `rm` and still no fold, so a land never retires, or names, a
+/// session whose work it did not take.
+#[tokio::test]
+async fn a_head_only_the_push_ref_keeps_is_retirable_and_not_a_fold() {
+    let fixture = Fixture::new("fold-push-ref");
+    let mount = fixture.clone_workspace("topic");
+    let previous =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("the base commit");
+    workspace_commit(&mount, "story.txt", "topic's story\n", "topic work");
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            mount.as_os_str(),
+            OsStr::new("+refs/heads/topic:refs/cowshed/topic/heads/topic"),
+        ],
+    );
+    fixture.land_content_separately("story.txt", "the land's story\n", "the land's own change");
+
+    let landing = measured(&fixture, &mount).await;
+    assert!(landing.fully_landed(), "rm retires it: {landing:?}");
+    assert!(!landing.commits.held_by_target());
+
+    let target = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("main's target");
+    let facts = fold_facts(
+        fixture.store(),
+        &target,
+        &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+        &previous,
+        &mount,
+        &fixture.parent(),
+        "topic",
+    )
+    .await;
+    assert_eq!(facts.touched, Ok(true), "the land changed the same path");
+    assert!(!facts.landed, "{facts:?}");
+    assert_eq!(
+        fold_step(&facts),
+        None,
+        "the land neither retires nor names it"
+    );
+}
+
+/// One row of a project listing: the fixture's workspace `name`, attached at `mount`.
+fn listing_row(name: &str, role: WorkspaceRole, mount: PathBuf) -> WorkspaceInfo {
+    WorkspaceInfo {
         repo_id: RepoId::parse("fixture/listing").expect("fixture repo id"),
         workspace: WorkspaceName::new(name).expect("fixture workspace name"),
         workspace_incarnation: WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef")
@@ -1177,7 +1332,19 @@ async fn a_listing_measures_with_the_controller_git_of_the_store_it_is_given() {
         checkpoints: Vec::new(),
         snapshot_stale: false,
         landing: None,
-    };
+    }
+}
+
+/// A listing measures with the controller Git of the store it is given, a fixture's own here,
+/// and on macOS that Git writes its Seatbelt profile into that store (04_sandbox.md, "Exec
+/// pipeline" step 4). Publish run 39822015838's hosted macOS runner has no host store: a listing that ran its Git
+/// for the host's withheld every attached session as unreadable, "cannot write controller git's
+/// sandbox profile into /private/cowshed/store/run/profiles".
+#[tokio::test]
+async fn a_listing_measures_with_the_controller_git_of_the_store_it_is_given() {
+    let fixture = Fixture::new("listing-store");
+    let quiet = fixture.clone_workspace("quiet");
+    let row = listing_row;
     let mut rows = vec![
         row("main", WorkspaceRole::Main, fixture.parent()),
         row("quiet", WorkspaceRole::Workspace, quiet),
@@ -1205,4 +1372,47 @@ async fn a_listing_measures_with_the_controller_git_of_the_store_it_is_given() {
             "the listing's controller Git wrote its profile into the given store"
         );
     }
+}
+
+/// `ls --landed` and `rm` read one measurement (02_workspaces.md, `rm` step 1): a shed whose head
+/// the push ref keeps is in the landed listing, which `rm` retires with no flag, and one whose head
+/// nothing keeps is not, though both carry commits main lacks.
+#[tokio::test]
+async fn the_landed_listing_keeps_a_shed_whose_head_the_push_ref_keeps() {
+    let fixture = Fixture::new("listing-push-ref");
+    let pushed = fixture.clone_workspace("pushed");
+    workspace_commit(&pushed, "pushed.txt", "pushed\n", "pushed work");
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            pushed.as_os_str(),
+            OsStr::new("+refs/heads/pushed:refs/cowshed/pushed/heads/pushed"),
+        ],
+    );
+    let unpushed = fixture.clone_workspace("unpushed");
+    workspace_commit(&unpushed, "unpushed.txt", "unpushed\n", "unpushed work");
+    let mut rows = vec![
+        listing_row("main", WorkspaceRole::Main, fixture.parent()),
+        listing_row("pushed", WorkspaceRole::Workspace, pushed),
+        listing_row("unpushed", WorkspaceRole::Workspace, unpushed),
+    ];
+
+    annotate_listing(fixture.store(), &mut rows).await;
+    let withheld = retain_fully_landed(&mut rows);
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.workspace.as_str())
+            .collect::<Vec<_>>(),
+        ["pushed"]
+    );
+    assert!(withheld.is_empty(), "every row was answered: {withheld:?}");
+    let landing = rows[0].landing.as_ref().expect("the shed was measured");
+    assert_eq!(
+        counts(landing),
+        (1, 0, 0),
+        "the listing still counts what main lacks"
+    );
 }

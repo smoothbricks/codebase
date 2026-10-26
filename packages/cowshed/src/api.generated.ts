@@ -2075,6 +2075,11 @@ export type LandedReport = {
  * the workspace changed since its merge base with the target already carries that change there)
  * or by a patch-equivalent commit of the target. A cherry-pick, a squash, or a pick whose conflict
  * was resolved on the way in all land the work under other commits.
+ *
+ * A head the target does not hold also passes when the ref `cowshed push` wrote for its
+ * checked-out branch keeps it ([`PushRef`]): retiring the workspace then loses no commit, that ref
+ * being in main's repository, which outlives the image. The counts stay what the target holds, so
+ * a listing still says how far the work is from landing; only the verdict reads the ref.
  */
 export type LandingCommits =
   | ({ readonly state: 'measured' } & {
@@ -2083,8 +2088,8 @@ export type LandingCommits =
       /**
        * Commits the target holds neither by content nor by patch identity: each changes a file
        * `unlanded_paths` names. For a measurement recorded before files were named, those
-       * `git cherry` found unheld. Zero is the only value that authorizes removing the workspace
-       * without `--abandon`.
+       * `git cherry` found unheld. Zero, or a head `preserved_by` keeps, is what authorizes
+       * removing the workspace without `--abandon`.
        */
       readonly unlanded: number & tags.Type<'uint64'>;
       /**
@@ -2102,6 +2107,15 @@ export type LandingCommits =
        * [`UnlandedPaths::PredatesPaths`] and is written back without the field, as it was.
        */
       readonly unlandedPaths?: UnlandedPaths;
+      /**
+       * The ref `cowshed push` wrote in main's repository for the checked-out branch, when it
+       * keeps a head the target does not hold: the head is that ref's commit or an ancestor of
+       * it, so retiring the workspace loses no commit and needs no `--abandon`. `unlanded` still
+       * counts what the target lacks. Absent when the target holds every commit (no ref is
+       * read), when `push` wrote none for the branch, when the head has work the ref lacks, and
+       * for a detached head, which is on no branch.
+       */
+      readonly preservedBy?: PushRef;
     })
   | ({ readonly state: 'indeterminate' } & {
       readonly reason: string;
@@ -2775,6 +2789,21 @@ export type PushOptions = {
   readonly expectedWorkspaceIncarnation?: WorkspaceIncarnation;
   readonly expectedSourceHead?: GitOid;
   readonly expectedDestinationHead?: ExpectedRefHead;
+};
+
+/**
+ * A ref `cowshed push` wrote in main's repository, `refs/cowshed/<ws>/heads/<branch>`
+ * (02_workspaces.md, `push`), and the commit it names.
+ */
+export type PushRef = {
+  /**
+   * The full ref name, in main's repository.
+   */
+  readonly reference: string;
+  /**
+   * The commit the ref names: the head it keeps, or a descendant of it.
+   */
+  readonly tip: GitOid;
 };
 
 export type PushReport = {

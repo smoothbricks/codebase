@@ -1328,6 +1328,11 @@ export const assertPushOptionsList = typia.createAssertEquals<readonly Api.PushO
 export const parsePushOptionsList = (json: string): readonly Api.PushOptions[] =>
   assertPushOptionsList(JSON.parse(json));
 
+export const assertPushRef = typia.createAssertEquals<Api.PushRef>();
+export const parsePushRef = (json: string): Api.PushRef => assertPushRef(JSON.parse(json));
+export const assertPushRefList = typia.createAssertEquals<readonly Api.PushRef[]>();
+export const parsePushRefList = (json: string): readonly Api.PushRef[] => assertPushRefList(JSON.parse(json));
+
 export const assertPushReport = typia.createAssertEquals<Api.PushReport>();
 export const parsePushReport = (json: string): Api.PushReport => assertPushReport(JSON.parse(json));
 export const assertPushReportList = typia.createAssertEquals<readonly Api.PushReport[]>();

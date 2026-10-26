@@ -68,7 +68,7 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | Rebase within a lane    | `cowshed rebase <ws> --into <lane>`                                  | Optional: take lane-mates' work before landing, by Git alone. An ungated land rebases by itself.                                                                                                                                           |
 | Fold into a lane base   | `cowshed land <ws> --into <lane> --ungated`                          | Rebase onto the lane base's branch, fast-forward it by Git alone, and retire; the lane base's own land into main gates. Main refuses it.                                                                                                   |
 | Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.                                                                                                                                                                                  |
-| Retire                  | `cowshed rm <ws>`                                                    | Remove a shed whose work main holds; a containment refusal names commits to fold into the batch.                                                                                                                                           |
+| Retire                  | `cowshed rm <ws>`                                                    | Remove a shed whose work main holds or `push` preserved; a containment refusal names commits to fold into the batch.                                                                                                                       |
 | Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                                                                                                                                                                                                     |
 | Grow an image           | `cowshed resize <ws> <size>`                                         | Grow an image; resize never shrinks it.                                                                                                                                                                                                    |
 | Make clones cheap again | `cowshed defrag main`                                                | Rewrite main contiguously when doctor warns `main-extents`.                                                                                                                                                                                |
@@ -92,22 +92,23 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 3. Elsewhere: `cowshed rebase <ws>` onto current main, resolve conflicts in the shed, then
    `cowshed land <ws> --check '<cmd>'` (repeatable; runs inside the sandbox after grant sync).
 4. A successful land retires by default. If retire was refused after the fast-forward, main already moved: run
-   `cowshed rm <ws>`, never land again. With `--no-retire` or after `push`, `rm` once main contains HEAD and every other
-   local branch (a fork keeps only `cowshed/<ws>`; one branch per shed).
+   `cowshed rm <ws>`, never land again. With `--no-retire`, `rm` once main contains HEAD and every other local branch (a
+   fork keeps only `cowshed/<ws>`; one branch per shed); after `push`, `rm` once the pushed ref keeps HEAD: it is that
+   commit or a descendant of it.
 5. `--force` on `rm` waives only transient state (dirty tree, the workspace's own running jobs; never a process cowshed
    does not run holding the mount) and destroys the uncommitted tree; it can never waive containment, and it is never
    the answer to a refusal. `--abandon` is the sole way to destroy unlanded commits (they are bundled to
-   `sessions/.trash/` first), and a shed whose work main holds never needs it. Use it, then `cowshed gc --abandoned`
-   (which deletes the bundles), only for a shed whose work was deliberately dropped: superseded or obsolete, the reason
-   clear from history. Work still wanted is landed or folded into a batch (below). Never answer an `rm` refusal by
-   reflex: read what it names.
+   `sessions/.trash/` first), and a shed whose work main holds, or `push` preserved, never needs it. Use it, then
+   `cowshed gc --abandoned` (which deletes the bundles), only for a shed whose work was deliberately dropped: superseded
+   or obsolete, the reason clear from history. Work still wanted is landed or folded into a batch (below). Never answer
+   an `rm` refusal by reflex: read what it names.
 6. Batch work is lane work: see "Batch a round of units" below.
-7. A shed whose work main already holds, or that carries none, is removed with plain `cowshed rm <ws>` and no check
-   first: rm proves containment against live main, over every local branch: a commit is held when main's content carries
-   its change or main holds a patch-equivalent commit (`git cherry`), so a cherry-pick main later edited past still
-   counts. A containment refusal names the commits held by neither, and that shed is folded into the batch (below).
-   Every other refusal (a workspace younger than the age floor, a dirty tree, a process holding the mount, a lifecycle
-   operation in progress) names its own remedy.
+7. A shed whose work main already holds, that carries none, or whose branch `push` preserved, is removed with plain
+   `cowshed rm <ws>` and no check first: rm proves containment against live main, over every local branch: a commit is
+   held when main's content carries its change or main holds a patch-equivalent commit (`git cherry`), so a cherry-pick
+   main later edited past still counts. A containment refusal names the commits held by neither, and that shed is folded
+   into the batch (below). Every other refusal (a workspace younger than the age floor, a dirty tree, a process holding
+   the mount, a lifecycle operation in progress) names its own remedy.
 
 ## Batch a round of units
 

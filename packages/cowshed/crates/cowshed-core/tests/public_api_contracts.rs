@@ -401,6 +401,7 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                     },
                 ],
             },
+            preserved_by: None,
         },
         branches: BranchLandings::Measured {
             unlanded: vec![BranchLanding {
@@ -418,6 +419,7 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                             change: UnlandedChange::Added,
                         }],
                     },
+                    preserved_by: None,
                 },
             }],
         },
@@ -504,6 +506,7 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
             landed: 1,
             behind: 1,
             unlanded_paths: UnlandedPaths::Named { paths: Vec::new() },
+            preserved_by: None,
         },
         branches,
     };
@@ -518,6 +521,67 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
     };
     assert!(!landed_head(BranchLandings::Measured { unlanded }).fully_landed());
     assert!(!landed_head(indeterminate.branches.clone()).fully_landed());
+}
+
+/// A head the target does not hold and a push ref keeps names that ref, beside the counts that
+/// still say what the target lacks: kept is not held, and only the kept head and the held head
+/// satisfy the landed predicate. A record from a build before the field reads as no ref at all.
+#[test]
+fn a_head_a_push_ref_keeps_names_its_ref_and_is_never_read_as_held_by_the_target() {
+    let kept = LandingCommits::Measured {
+        target_branch: "main".into(),
+        target_head: oid('b'),
+        unlanded: 7,
+        landed: 0,
+        behind: 2,
+        unlanded_paths: UnlandedPaths::Named { paths: Vec::new() },
+        preserved_by: Some(PushRef {
+            reference: "refs/cowshed/raven/heads/cowshed/raven".into(),
+            tip: oid('d'),
+        }),
+    };
+    let wire = json!({
+        "state": "measured",
+        "targetBranch": "main",
+        "targetHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "unlanded": 7,
+        "landed": 0,
+        "behind": 2,
+        "unlandedPaths": { "kind": "named", "paths": [] },
+        "preservedBy": {
+            "reference": "refs/cowshed/raven/heads/cowshed/raven",
+            "tip": "dddddddddddddddddddddddddddddddddddddddd"
+        }
+    });
+    assert_eq!(serde_json::to_value(&kept).expect("kept JSON"), wire);
+    assert_eq!(
+        serde_json::from_value::<LandingCommits>(wire).expect("kept record"),
+        kept
+    );
+    assert!(kept.fully_landed(), "the ref keeps the head");
+    assert!(!kept.held_by_target(), "main lacks seven commits");
+    assert_eq!(
+        kept.preserved_by().map(|pushed| pushed.reference.as_str()),
+        Some("refs/cowshed/raven/heads/cowshed/raven")
+    );
+
+    let before_the_field = serde_json::from_value::<LandingCommits>(json!({
+        "state": "measured",
+        "targetBranch": "main",
+        "targetHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "unlanded": 7,
+        "landed": 0,
+        "behind": 2
+    }))
+    .expect("a record written before preservedBy existed");
+    assert_eq!(before_the_field.preserved_by(), None);
+    assert!(!before_the_field.fully_landed());
+
+    let unanswered = LandingCommits::Indeterminate {
+        reason: "main's repository has no main branch".into(),
+    };
+    assert_eq!(unanswered.preserved_by(), None);
+    assert!(!unanswered.fully_landed() && !unanswered.held_by_target());
 }
 
 #[test]

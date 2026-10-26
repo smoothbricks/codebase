@@ -183,8 +183,10 @@ pub enum KeptBy {
     },
     /// The abandon bundle at `path` holds the tip, its only copy (02_workspaces.md, `rm` step 1).
     Bundle { path: PathBuf },
-    /// The removal gate proved `branch` (at `head`), or a ref `cowshed push` wrote, holds the
-    /// tip's changes (02_workspaces.md, `rm` step 1).
+    /// The removal gate proved `branch` (at `head`) holds the tip's changes, or, for the head the
+    /// target does not hold, that `branch` is the ref `cowshed push` wrote
+    /// (`refs/cowshed/<ws>/heads/<branch>`, at `head`), which is then the only copy of those commits
+    /// (02_workspaces.md, `rm` step 1).
     Target {
         branch: String,
         head: crate::api::dto::GitOid,

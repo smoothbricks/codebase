@@ -756,6 +756,35 @@ impl Fixture {
         .await
     }
 
+    /// `cowshed push <workspace>` as the workspace's own worker asks it.
+    async fn push(
+        &self,
+        runtime: &ProjectRuntime,
+        workspace: &str,
+        incarnation: &WorkspaceIncarnation,
+    ) -> Result<Value> {
+        let params = json!({
+            "repoId": self.repo,
+            "workspace": workspace,
+            "workspaceIncarnation": incarnation,
+            "options": {},
+        });
+        let response = runtime
+            .router()
+            .route(
+                ConnectionAuthority::Worker {
+                    repo_id: self.repo.clone(),
+                    workspace: name(workspace),
+                    workspace_incarnation: incarnation.clone(),
+                },
+                OperationRequest::decode("worker.push", &params)?,
+                None,
+                None,
+            )
+            .await?;
+        Ok(response.into_answer()?.0)
+    }
+
     async fn call(&self, runtime: &ProjectRuntime, method: &str, params: Value) -> Result<Value> {
         route(runtime, &self.repo, method, params).await
     }
@@ -2518,6 +2547,107 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
         Vec::<String>::new(),
         "a refused purge writes no ref into main's repository"
     );
+}
+
+/// A workspace whose work is for review, not for landing, retires with no `--abandon` once
+/// `cowshed push` has kept its head in main's repository (02_workspaces.md, `rm` step 1): the gate
+/// asks the ref `push` wrote for the checked-out branch, so a head past that ref is refused until
+/// it is pushed again, and the deletion log names the ref as what keeps the head, which is the only
+/// copy once the image is gone.
+#[tokio::test]
+async fn rm_retires_a_head_the_push_ref_keeps_and_the_log_names_that_ref() {
+    let fixture = Fixture::new("rm-pushed-head");
+    let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "reviewed", ForkOptions::default())
+        .await
+        .expect("fork");
+    let mount = PathBuf::from(minted["info"]["mount"].as_str().expect("mount"));
+    let incarnation = incarnation_of(&minted);
+    let commit = |file: &str| {
+        fs::write(mount.join(file), format!("{file}\n")).expect("work");
+        git(&mount, &["add", file]);
+        git(
+            &mount,
+            &["commit", "-q", "-m", &format!("{file} for review")],
+        );
+    };
+    let head = || {
+        String::from_utf8(git_bytes(&mount, &["rev-parse", "HEAD"]))
+            .expect("an object id")
+            .trim()
+            .to_owned()
+    };
+
+    commit("first.txt");
+    let refused = fixture
+        .remove(&runtime, "reviewed")
+        .await
+        .expect_err("main lacks the commit and nothing keeps it");
+    assert_eq!(
+        refused.code,
+        cowshed_core::ErrorCode::Conflict,
+        "{refused:?}"
+    );
+
+    fixture
+        .push(&runtime, "reviewed", &incarnation)
+        .await
+        .expect("push the reviewed branch");
+    commit("second.txt");
+    let past_the_ref = fixture
+        .remove(&runtime, "reviewed")
+        .await
+        .expect_err("a head committed past its push ref is not kept by it");
+    assert_eq!(
+        past_the_ref.code,
+        cowshed_core::ErrorCode::Conflict,
+        "{past_the_ref:?}"
+    );
+
+    fixture
+        .push(&runtime, "reviewed", &incarnation)
+        .await
+        .expect("push the head again");
+    let pushed = head();
+    let image = fixture
+        .layout()
+        .session_image(&name("reviewed"))
+        .unwrap()
+        .image()
+        .to_owned();
+    let removed = fixture
+        .remove(&runtime, "reviewed")
+        .await
+        .expect("a head the push ref keeps retires with no --abandon");
+    assert!(
+        removed["abandoned"].is_null(),
+        "nothing was abandoned: {removed}"
+    );
+    assert!(!image.exists(), "the image is released");
+    runtime.shutdown().await.expect("stop the runtime");
+
+    let reference = "refs/cowshed/reviewed/heads/cowshed/reviewed";
+    assert_eq!(
+        String::from_utf8(git_bytes(&fixture.checkout, &["rev-parse", reference]))
+            .expect("an object id")
+            .trim(),
+        pushed,
+        "the ref still names the head after the image is gone"
+    );
+    let retired = deletion_log(&fixture, "retire-workspace", "reviewed");
+    let kept = json!({ "by": "target", "branch": reference, "head": pushed });
+    for tip in ["HEAD", "cowshed/reviewed"] {
+        let entry = retired["git"]["tips"]
+            .as_array()
+            .and_then(|tips| tips.iter().find(|entry| entry["name"] == tip))
+            .unwrap_or_else(|| panic!("no {tip} tip: {retired}"));
+        assert_eq!(entry["tip"], json!(pushed), "{retired}");
+        assert_eq!(
+            entry["kept"], kept,
+            "{tip} is kept by the push ref: {retired}"
+        );
+    }
 }
 
 /// Every ref under an `abandoned/` namespace of `refs/cowshed/` in the repository at `checkout`.
