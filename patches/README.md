@@ -150,9 +150,15 @@ transitions with the lock purpose, target names and lock paths. Cancellation use
 lock helpers, which execute no task work, to interrupt a blocking native wait without depending on a JavaScript signal
 handler. Producers retain their existing shutdown protocol.
 
-A waiter for a pool slot waits for exactly two events: a release hands it the released helper, or a helper leaves the
-pool and its slot is handed on to fork a successor. A helper leaves the pool on every way it can stop serving: its exit,
-a failed spawn, a failed send, or an error reply, after which the client kills it (its reply came after it unlocked what
+A cancelled acquisition fails with its cancellation, never with the exit of the helper its own client killed: the error
+names the targets, the cleanup's cause (the signal the client received, another stop, or the run's end) and each lock
+file's holder record, so a client stopped while it waits says which helper and client held the lease. Reported as the
+helper's exit, a post-land install stopped by `SIGTERM` while it waited for an operator's build of the same target read
+`Task output lease worker exited (code null, signal SIGKILL)`, as if something had killed the helper. The suite cancels
+a waiter in-process and stops a real waiting client with `SIGTERM`; both must name the cancellation and the holder. A
+waiter for a pool slot waits for exactly two events: a release hands it the released helper, or a helper leaves the pool
+and its slot is handed on to fork a successor. A helper leaves the pool on every way it can stop serving: its exit, a
+failed spawn, a failed send, or an error reply, after which the client kills it (its reply came after it unlocked what
 it held). A helper that dies holding a lease fails only that holder's release, with the exit named; a dead idle helper
 is never handed out. Without this, one failed acquire in a one-worker pool (`--parallel=1`) left a live, idle helper
 holding the only slot and every later acquire waiting forever, the client and its helper both idle with no lock wait. No

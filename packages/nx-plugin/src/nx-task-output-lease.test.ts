@@ -120,7 +120,7 @@ it('leases a target across clients through producer completion, cache capture an
     );
     const env = fixtureNxEnv(workspace, socketDirectory);
     const children: Subprocess<'ignore', 'pipe', 'pipe'>[] = [];
-    const run = (label: string, target = 'app:build') => {
+    const spawnClient = (label: string, target = 'app:build') => {
       const child = Bun.spawn(
         ['bun', '--preload', join(workspace, 'probe.cjs'), nx, 'run', target, '--outputStyle=static'],
         {
@@ -132,14 +132,16 @@ it('leases a target across clients through producer completion, cache capture an
         },
       );
       children.push(child);
-      return Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]).then(
-        (result) => {
-          if (result[0] !== 0)
-            failed.reject(new Error(`${label} ${target} exited ${result[0]}\n${result[1]}${result[2]}`));
-          return result;
-        },
-      );
+      return child;
     };
+    const outcome = (child: Subprocess<'ignore', 'pipe', 'pipe'>) =>
+      Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    const run = (label: string, target = 'app:build') =>
+      outcome(spawnClient(label, target)).then((result) => {
+        if (result[0] !== 0)
+          failed.reject(new Error(`${label} ${target} exited ${result[0]}\n${result[1]}${result[2]}`));
+        return result;
+      });
     const waitFor = (name: string) =>
       guardEvent(Promise.race([signal(name).promise, failed.promise]), name, () => events.join('\n'));
     try {
@@ -153,6 +155,18 @@ it('leases a target across clients through producer completion, cache capture an
         'the second client to reach the output boundary',
         () => events.join('\n'),
       );
+      // A client stopped while it waits for A's lease reports the stop and the holder's record, not the SIGKILL that
+      // interrupted its lock helper's native wait.
+      const stopped = spawnClient('C');
+      const stoppedOutcome = outcome(stopped);
+      await waitFor('waiting:C');
+      stopped.kill('SIGTERM');
+      const [stoppedCode, stoppedOut, stoppedErr] = await stoppedOutcome;
+      const stoppedOutput = `${stoppedOut}${stoppedErr}`;
+      expect(stoppedCode, stoppedOutput).not.toBe(0);
+      expect(stoppedOutput).toContain('cancelled during runner cleanup (the client received SIGTERM)');
+      expect(stoppedOutput).toContain('"targets":["app:build"]');
+      expect(stoppedOutput).not.toContain('worker exited');
       capture.resolve();
       const capturedA = await waitFor('captured:A');
       await waitFor('partial:B');
@@ -228,17 +242,23 @@ it('shares ownership across configurations without blocking independent targets,
       }),
     ).rejects.toThrow('producer refused');
     // The failed producer's finally released ownership, so another client can acquire it.
+    const heldPath = nextLeasePath();
     const heldAgain = await owner.acquire([task]);
+    const holder = await leaseHolder(await heldPath);
     try {
       const refused = other.acquire([task]).then(
         () => null,
         (error: unknown) => error,
       );
-      await other.cancelPending();
+      // Runner cleanup interrupts the helper's native wait with SIGKILL. The waiter's reason is the cancellation, its
+      // cause and the lock file's holder record: the helper's exit made a cancelled wait read as a foreign kill.
+      await other.cancelPending('the client received SIGTERM');
       const reason = await refused;
       expect(reason).toBeInstanceOf(Error);
       if (!(reason instanceof Error)) throw new Error('the cancelled waiter unexpectedly acquired ownership');
-      expect(reason.message).toContain('worker exited');
+      expect(reason.message).toContain('cancelled during runner cleanup (the client received SIGTERM)');
+      expect(reason.message).toContain(`"pid":${holder},`);
+      expect(reason.message).not.toContain('worker exited');
     } finally {
       await heldAgain();
     }
