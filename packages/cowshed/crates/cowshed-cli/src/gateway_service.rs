@@ -5534,8 +5534,8 @@ mod tests {
         }
 
         /// A daemon's gateway, its supervisor manager, and the supervisors it found, composed
-        /// as `run_daemon` composes them, under `root` with `sockets` under `run`. The root goes
-        /// with the daemon on every exit path.
+        /// as `run_daemon` composes them, under `root` with the socket of the supervisor of each
+        /// of `workspaces` under `run`. The root goes with the daemon on every exit path.
         struct Daemon {
             root: crate::temp_root::TempRoot,
             socket: PathBuf,
@@ -5551,13 +5551,20 @@ mod tests {
 
         async fn daemon(
             root: crate::temp_root::TempRoot,
-            sockets: &[&str],
+            workspaces: &[&str],
             heal: Arc<StartupHealState>,
         ) -> Daemon {
             let store = root.join("store");
             fs::create_dir_all(store.join("run")).expect("run directory");
-            for socket in sockets {
-                fs::write(store.join("run").join(socket), b"").expect("a socket file");
+            let repo = cowshed_core::repository::RepoId::parse("acme/widget").expect("repo id");
+            for workspace in workspaces {
+                let workspace =
+                    cowshed_core::metadata::WorkspaceName::new(*workspace).expect("workspace");
+                fs::write(
+                    supervisor_socket::socket_path(&store, &repo, &workspace),
+                    b"",
+                )
+                .expect("a socket file");
             }
             let cache = root.join("cache");
             private_directory(&cache);
@@ -5606,7 +5613,7 @@ mod tests {
         async fn the_control_socket_counts_supervisors_still_draining() {
             let daemon = daemon(
                 gateway_root("csrecover"),
-                &["first.sock", "second.sock"],
+                &["first", "second"],
                 Arc::new(StartupHealState::healed()),
             )
             .await;

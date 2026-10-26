@@ -1164,19 +1164,20 @@ it again; unresolved group evidence is retained. The jobs' records remain unterm
 them. `exec` does not replace another build as a side effect: its refusal names the serving pid and says its jobs end
 when it exits, so `kill <pid>` is the immediate cutover; `cowshed detach` is no general answer, since main refuses it.
 
-**Recovering at daemon start.** The manager lists every supervisor socket under `<store>/run` before the daemon's
-control socket binds, and recovers them once it is bound: asks each who serves it, drains each of another build, watches
-each of its own build, and ends the jobs a positively absent one left (the group ledger, above). Each recovery reaches
-only its own socket and ledger, so they all run at once, each in a task of its own, with nothing bounding them but the
-sockets there are; one wedged supervisor holds back its own workspace, never the host's others. Each drain is a
-lifecycle span, `supervisor-recovery drain <socket>`, that reports the answering `pid=` (or `error=`) and ends
-`status=ok|err`; the whole pass is `supervisor-recovery startup`, reporting `supervisors=` up front. The manager takes
-ensures from the daemon's first moment. Until the daemon's startup pass has mounted every project and restored its
-sessions, every ensure is refused as a `Conflict` carrying `healing` (05_gateway.md "Startup contract"), because the
-supervisor would run in a workspace that pass may not have mounted yet. After it, an ensure of a workspace whose
-supervisor is still being recovered is refused as a `Conflict` carrying `recovering: { supervisors }` (the count left),
-because a supervisor started then would race the recovery for the socket and the ledger; every other ensure is served.
-Gateway status reports both until they are over.
+**Recovering at daemon start.** The manager lists every supervisor socket under `<store>/run` (the `<digest>.sock` names
+alone: never `manager.sock`, nor a supervisor's `<digest>.members.sock` membership endpoint, which is not a second
+supervisor) before the daemon's control socket binds, and recovers them once it is bound: asks each who serves it,
+drains each of another build, watches each of its own build, and ends the jobs a positively absent one left (the group
+ledger, above). Each recovery reaches only its own socket and ledger, so they all run at once, each in a task of its
+own, with nothing bounding them but the sockets there are; one wedged supervisor holds back its own workspace, never the
+host's others. Each drain is a lifecycle span, `supervisor-recovery drain <socket>`, that reports the answering `pid=`
+(or `error=`) and ends `status=ok|err`; the whole pass is `supervisor-recovery startup`, reporting `supervisors=` up
+front. The manager takes ensures from the daemon's first moment. Until the daemon's startup pass has mounted every
+project and restored its sessions, every ensure is refused as a `Conflict` carrying `healing` (05_gateway.md "Startup
+contract"), because the supervisor would run in a workspace that pass may not have mounted yet. After it, an ensure of a
+workspace whose supervisor is still being recovered is refused as a `Conflict` carrying `recovering: { supervisors }`
+(the count left), because a supervisor started then would race the recovery for the socket and the ledger; every other
+ensure is served. Gateway status reports both until they are over.
 
 ## Teardown ordering
 

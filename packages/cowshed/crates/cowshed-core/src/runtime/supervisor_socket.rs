@@ -11,6 +11,7 @@
 //! `0700` directory by the process that serves it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsStr;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -155,6 +156,9 @@ const STREAM_CHUNK: usize = 64 * 1024;
 /// Bounded queue between a forwarded stdin stream and the job that reads it.
 const STREAM_DEPTH: usize = 4;
 
+/// Hex digits of the workspace digest that names a supervisor's socket ([`socket_path`]).
+const SOCKET_DIGEST_HEX: usize = 32;
+
 /// Where the supervisor of `workspace` in `repo_id` listens: the store's `run` directory, under
 /// a digest of the pair. Owner, repository and workspace names together can exceed the 104
 /// bytes a Unix socket path may hold on macOS; the digest keeps every path at 64.
@@ -171,9 +175,25 @@ pub fn socket_path(
     let digest = Sha256Digest::compute(&identity).to_hex();
     store_root
         .join("run")
-        .join(format!("{}.sock", &digest[..32]))
+        .join(format!("{}.sock", &digest[..SOCKET_DIGEST_HEX]))
 }
 
+/// Whether `name`, an entry of the store's `run` directory, is a workspace supervisor's socket:
+/// exactly the name [`socket_path`] gives one, its digest's first 32 lowercase hex digits and then
+/// `.sock`. Nothing else there is one: not the manager's `manager.sock`, not a supervisor's
+/// `<digest>.members.sock` membership endpoint ([`membership_socket_path`]), its `.groups`
+/// ledger or `.sock.lock` lease, nor a `.bind` listener still being published.
+pub fn is_socket_name(name: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    name.as_bytes()
+        .strip_suffix(b".sock")
+        .is_some_and(|digest| {
+            digest.len() == SOCKET_DIGEST_HEX
+                && digest
+                    .iter()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
 /// Only the membership endpoint is exported to admitted children, never coordinator authority.
 pub const MEMBERSHIP_SOCKET_ENV: &str = "COWSHED_SUPERVISOR_SOCKET";
 
@@ -3921,6 +3941,35 @@ mod socket_ownership_tests {
     use cowshed_os::test_backstop::{
         AsyncChildBackstop as _, AsyncUnixStreamBackstop as _, ChildBackstop as _,
     };
+
+    /// A supervisor's socket is recognized by exactly the name `socket_path` gives it; its
+    /// membership twin and every other entry of `run` are not supervisor sockets.
+    #[test]
+    fn only_the_name_socket_path_gives_is_a_supervisor_socket() {
+        let socket = socket_path(
+            Path::new("/store"),
+            &crate::repository::RepoId::parse("acme/widget").expect("repo id"),
+            &crate::metadata::WorkspaceName::new("raven").expect("workspace"),
+        );
+        let named = |path: &Path| is_socket_name(path.file_name().expect("a file name"));
+        assert!(named(&socket), "{}", socket.display());
+        assert!(!named(&membership_socket_path(&socket)));
+        assert!(!named(&super::super::job_groups::ledger_path(&socket)));
+        let digest = "0123456789abcdef0123456789abcdef";
+        for (name, supervisor) in [
+            (format!("{digest}.sock"), true),
+            (format!("{digest}.members.sock"), false),
+            (format!("{digest}.sock.lock"), false),
+            (format!("{digest}.groups"), false),
+            (format!("{digest}.bind"), false),
+            ("manager.sock".to_owned(), false),
+            (format!("{}.sock", &digest[1..]), false),
+            (format!("{digest}0.sock"), false),
+            (format!("{}.sock", digest.to_uppercase()), false),
+        ] {
+            assert_eq!(is_socket_name(OsStr::new(&name)), supervisor, "{name}");
+        }
+    }
 
     fn path() -> PathBuf {
         crate::temp_parent::scratch_parent()

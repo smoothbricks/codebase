@@ -357,18 +357,12 @@ impl SupervisorManager {
     /// daemon lists them before it answers anyone and starts recovering them only once it has
     /// claimed the host.
     pub fn recovery(self: &Arc<Self>) -> Recovery {
-        let manager_socket = manager_socket_path(&self.store_root);
         let sockets: BTreeSet<PathBuf> = std::fs::read_dir(self.store_root.join("run"))
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|entry| supervisor_socket::is_socket_name(&entry.file_name()))
             .map(|entry| entry.path())
-            .filter(|path| {
-                *path != manager_socket
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension == "sock")
-            })
             .collect();
         self.recovering
             .lock()
@@ -1525,14 +1519,23 @@ mod tests {
         served.abort();
     }
 
-    /// A fresh store with a `run` directory holding a socket file for each of `sockets`. Unix
-    /// socket paths are short; the per-user temporary directory is not.
-    fn recovery_store(prefix: &str, sockets: &[&str]) -> crate::temp_root::TempRoot {
+    /// Where the supervisor of `workspace` of `acme/widget` listens in `store`.
+    fn supervisor_socket_of(store: &Path, workspace: &str) -> PathBuf {
+        supervisor_socket::socket_path(
+            store,
+            &crate::repository::RepoId::parse("acme/widget").expect("repo id"),
+            &crate::metadata::WorkspaceName::new(workspace).expect("workspace"),
+        )
+    }
+
+    /// A fresh store with a `run` directory holding the socket file of the supervisor of each of
+    /// `workspaces`. Unix socket paths are short; the per-user temporary directory is not.
+    fn recovery_store(prefix: &str, workspaces: &[&str]) -> crate::temp_root::TempRoot {
         let store =
             crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), prefix);
         std::fs::create_dir_all(store.join("run")).expect("run directory");
-        for socket in sockets {
-            std::fs::write(store.join("run").join(socket), b"").expect("a socket file");
+        for workspace in workspaces {
+            std::fs::write(supervisor_socket_of(&store, workspace), b"").expect("a socket file");
         }
         store
     }
@@ -1589,10 +1592,7 @@ mod tests {
             }))
             .expect("authority")
             .into();
-        let store = recovery_store("cowshed-recovering", &["other.sock"]);
-        let raven =
-            supervisor_socket::socket_path(&store, &authority.repo_id, &authority.workspace);
-        std::fs::write(&raven, b"").expect("raven's socket file");
+        let store = recovery_store("cowshed-recovering", &["other", "raven"]);
         let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), healed());
         let peers = Arc::new(GatedPeers {
             gate: tokio::sync::Semaphore::new(0),
@@ -1698,7 +1698,7 @@ mod tests {
     /// next would never end.
     #[tokio::test]
     async fn supervisors_of_another_build_drain_at_once() {
-        let store = recovery_store("cowshed-drains", &["first.sock", "second.sock"]);
+        let store = recovery_store("cowshed-drains", &["first", "second"]);
         let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), healed());
         manager
             .recovery()
@@ -1707,6 +1707,59 @@ mod tests {
             }))
             .await
             .expect("both drains reach the barrier");
+        assert_eq!(manager.recovering(), None);
+    }
+
+    /// Supervisors that are positively gone, recording every socket recovery asks about.
+    #[derive(Default)]
+    struct AskedPeers {
+        asked: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SupervisorPeers for AskedPeers {
+        async fn hello_if_present(
+            &self,
+            socket: &Path,
+        ) -> Result<Option<supervisor_socket::Hello>> {
+            self.asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(socket.to_path_buf());
+            Ok(None)
+        }
+
+        async fn drain(&self, socket: &Path) -> Result<Draining> {
+            unreachable!("no supervisor of another build serves {}", socket.display())
+        }
+    }
+
+    /// Recovery lists the supervisors' own sockets and nothing else in `run`: each supervisor's
+    /// `<digest>.members.sock` membership endpoint is its twin, never a second supervisor, so it is
+    /// neither counted as recovering nor asked who serves it, and neither is `manager.sock`
+    /// (11_shell.md "Recovering at daemon start").
+    #[tokio::test]
+    async fn recovery_lists_supervisor_sockets_and_never_their_membership_twins() {
+        let store = recovery_store("cowshed-members", &["raven"]);
+        std::fs::write(manager_socket_path(&store), b"").expect("the manager's socket file");
+        let raven = supervisor_socket_of(&store, "raven");
+        std::fs::write(supervisor_socket::membership_socket_path(&raven), b"")
+            .expect("raven's membership socket file");
+        let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), healed());
+        let recovery = manager.recovery();
+        assert_eq!(
+            manager.recovering(),
+            Some(SupervisorRecovery {
+                supervisors: NonZeroUsize::new(1).expect("one"),
+            })
+        );
+        let peers = Arc::new(AskedPeers::default());
+        let asking: Arc<AskedPeers> = Arc::clone(&peers);
+        recovery.start(asking).await.expect("the recovery ends");
+        assert_eq!(
+            *peers.asked.lock().unwrap_or_else(PoisonError::into_inner),
+            [raven]
+        );
         assert_eq!(manager.recovering(), None);
     }
 
