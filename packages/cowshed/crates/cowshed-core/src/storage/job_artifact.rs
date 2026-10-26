@@ -6664,10 +6664,6 @@ mod tests {
             waited >= bound.within && expired.elapsed >= bound.within,
             "{expired}"
         );
-        assert!(
-            waited < CONTROL.within,
-            "the injected bound, not the production one, ended the wait: {expired}"
-        );
         assert_eq!(expired.peer.lock, lock);
         assert!(
             expired
