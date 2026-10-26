@@ -722,9 +722,14 @@ bound must not depend on the runner's `TMPDIR`. The roots are beside the workspa
 admits no volume whose mount path contains `/var/folders/`, and keeps one `AppleAPFSVolume` right for every volume it
 admits until it exits: a fixture volume mounted under `/private/tmp` left one each (01a_apfs.md, "Spotlight media
 references"). Production names only `mnt` and `ram<revision>` there and reads neither `t` nor a namespace's directory.
-They need the per-user root `cowshed setup` makes; `t` and each namespace's directory are created 0700 and refused
-unless the user owns them with that mode. The lease never detaches an image attached from below it; it keeps such a
-lease and names it.
+
+The directory-backend mounted-temp recovery proofs keep their real backing images in this owned APFS root too, not in
+the directory fixture's `TMPDIR`. The APFS guard is created after the directory guard so it releases its image and mount
+before the directory fixture removes its temporary tree, including on assertion failure.
+
+Real-APFS scratch roots need the per-user root `cowshed setup` makes; `t` and each namespace's directory are created
+0700 and refused unless the user owns them with that mode. The lease never detaches an image attached from below it; it
+keeps such a lease and names it.
 
 These canonical scratch roots, the `/private/tmp` directory fixtures, and the canonical `/tmp` parent of the independent
 controller-git sandbox fixtures, are host-only and run in the land gate; a `cowshed exec` sandbox denies `/private/tmp`.

@@ -1114,8 +1114,7 @@ fn host_controller_recovery_refuses_a_mounted_temp_subtree_and_keeps_the_image()
     use crate::error::ErrorCode;
     use crate::storage::recovery_image::{MANIFEST_FILE, recover};
     use cowshed_apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
-    use cowshed_os::namespace::{HostNamespace, TestNamespace};
-    let namespace = TestNamespace::mint().expect("a test namespace");
+    use cowshed_os::namespace::HostNamespace;
 
     fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         let mut files = Vec::new();
@@ -1154,7 +1153,10 @@ fn host_controller_recovery_refuses_a_mounted_temp_subtree_and_keeps_the_image()
 
     // A real blank image mounted inside the temp dir: removing the tree would empty
     // it through its mountpoint, which is exactly what the cleanup must refuse.
-    let mount_image = scratch
+    let image_root = crate::scratch_apfs::ScratchRoot::new("recover-mounted")
+        .expect("real APFS backing-image root");
+    let namespace = image_root.namespace();
+    let mount_image = image_root
         .path()
         .join("mounted")
         .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
@@ -1252,8 +1254,7 @@ fn host_controller_recovery_refuses_a_mounted_temp_root_and_keeps_the_image() {
     use crate::error::ErrorCode;
     use crate::storage::recovery_image::{MANIFEST_FILE, recover};
     use cowshed_apfs::{ApfsBackend, MacOsApfsBackend, MountAccess, SystemCommandRunner};
-    use cowshed_os::namespace::{HostNamespace, TestNamespace};
-    let namespace = TestNamespace::mint().expect("a test namespace");
+    use cowshed_os::namespace::HostNamespace;
 
     fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
         let mut files = Vec::new();
@@ -1291,7 +1292,10 @@ fn host_controller_recovery_refuses_a_mounted_temp_root_and_keeps_the_image() {
 
     // The temp dir itself mounted: every entry inside shares its device, so only
     // mount identity against the parent outside it can refuse this.
-    let mount_image = scratch
+    let image_root = crate::scratch_apfs::ScratchRoot::new("recover-mounted-root")
+        .expect("real APFS backing-image root");
+    let namespace = image_root.namespace();
+    let mount_image = image_root
         .path()
         .join("root-volume")
         .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
