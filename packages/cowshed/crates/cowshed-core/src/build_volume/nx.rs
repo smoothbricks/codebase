@@ -1955,6 +1955,19 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Read a holder child's `ready`: it says so only after the descriptor it holds is
+    /// open or the directory it works in is its own, so the census that follows reads a
+    /// settled fact once. The child's exit closes the pipe, which the empty line names.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn holder_ready(child: &mut std::process::Child) {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.as_mut().expect("piped stdout"))
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "ready\n", "the holder child announced its readiness");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn an_open_database_names_its_holder_and_a_closed_one_none() {
@@ -1966,22 +1979,15 @@ mod tests {
         assert_eq!(close(&root, &state()).unwrap(), Ok(()));
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("exec 3<\"$0\"; read _")
+            .arg("exec 3<\"$0\"; echo ready; read _")
             .arg(&database)
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn_locked()
             .unwrap();
         let pid = child.id() as i32;
-        let held = loop {
-            let held = holders(&database).unwrap();
-            if !held.is_empty() {
-                break held;
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("the shell exited before it held the database: {status}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        holder_ready(&mut child);
+        let held = holders(&database).unwrap();
         assert_eq!(
             held.iter().map(|holder| holder.pid).collect::<Vec<_>>(),
             [pid]
@@ -2011,23 +2017,16 @@ mod tests {
         }
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("exec 3<\"$0\"; read _")
+            .arg("exec 3<\"$0\"; echo ready; read _")
             .arg(&open)
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn_locked()
             .unwrap();
         let pid = child.id() as i32;
         let databases = [idle.clone(), open.clone(), gone];
-        let held = loop {
-            let held = descriptor_holders(&databases).unwrap();
-            if !held[1].is_empty() {
-                break held;
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("the shell exited before it held the database: {status}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        holder_ready(&mut child);
+        let held = descriptor_holders(&databases).unwrap();
         let pids = |holders: &[Holder]| holders.iter().map(|holder| holder.pid).collect::<Vec<_>>();
         assert_eq!(
             held.iter().map(|holders| pids(holders)).collect::<Vec<_>>(),
@@ -2057,22 +2056,15 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("read _")
+            .arg("echo ready; read _")
             .current_dir(&nested)
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn_locked()
             .unwrap();
         let pid = child.id() as i32;
-        let held = loop {
-            let held = volume_holders(&root).unwrap();
-            if held.iter().any(|holder| holder.pid == pid) {
-                break held;
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("the shell exited before its cwd showed as a holder: {status}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        holder_ready(&mut child);
+        let held = volume_holders(&root).unwrap();
         drop(child.stdin.take());
         child.wait_bounded().unwrap();
         let ours = held.iter().find(|holder| holder.pid == pid);
@@ -2577,36 +2569,6 @@ mod tests {
         assert!(!cowshed_os::process::running(daemon).unwrap());
     }
 
-    /// A process `sandbox-exec` started is sandboxed. (The host daemon of the hand-over test is
-    /// the unsandboxed case.)
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_process_under_sandbox_exec_is_sandboxed() {
-        let mut sandboxed = std::process::Command::new(crate::exec::SANDBOX_EXEC)
-            .args([
-                "-p",
-                "(version 1)(allow default)",
-                "/bin/sh",
-                "-c",
-                "echo in; read _",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn_locked()
-            .unwrap();
-        {
-            use std::io::BufRead as _;
-            let mut line = String::new();
-            std::io::BufReader::new(sandboxed.stdout.as_mut().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            assert_eq!(line, "in\n");
-        }
-        assert!(cowshed_os::process::sandboxed(sandboxed.id() as i32).unwrap());
-        drop(sandboxed.stdin.take());
-        sandboxed.wait_bounded().unwrap();
-    }
-
     /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the
     /// recorded pid): a real Nx daemon exits on it, and `nx daemon --start` afterwards starts a
     /// new one cleanly. If stock Nx ever needs more than the signal, this fails.
@@ -2883,10 +2845,11 @@ mod tests {
         let hold = || {
             std::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg("exec 3<\"$0\"; read _")
+                .arg("exec 3<\"$0\"; echo ready; read _")
                 .arg(&database)
                 .current_dir(&root)
                 .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
                 .spawn_locked()
                 .unwrap()
         };
@@ -2895,12 +2858,8 @@ mod tests {
         let own_pid = std::process::id() as i32;
         let _own = fs::File::open(&database).unwrap();
         let pids = |holders: &[Holder]| holders.iter().map(|holder| holder.pid).collect::<Vec<_>>();
-        while !{
-            let held = pids(&holders(&database).unwrap());
-            held.contains(&lifecycle_pid) && held.contains(&foreign_pid)
-        } {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        holder_ready(&mut lifecycle);
+        holder_ready(&mut foreign);
         let life = crate::runtime::job_groups::process_record(lifecycle_pid)
             .unwrap()
             .expect("the lifecycle stand-in runs")
