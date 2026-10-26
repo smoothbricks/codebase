@@ -1943,8 +1943,8 @@ fn is_staged_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-    use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
+    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::os::fd::{AsRawFd as _, RawFd};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
 
@@ -2050,30 +2050,16 @@ mod tests {
         listed.into_iter().map(|listed| listed.proc_fd).collect()
     }
 
-    /// Whether this process reads end of stream from `read` right now, without waiting.
-    fn at_end_of_stream(read: &OwnedFd) -> bool {
-        // SAFETY: plain fcntl on an owned descriptor.
-        let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
-        // SAFETY: plain fcntl on an owned descriptor.
-        assert_eq!(
-            unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            0
-        );
-        let mut byte = 0_u8;
-        // SAFETY: `byte` has room for the one byte asked for.
-        match unsafe { libc::read(read.as_raw_fd(), (&raw mut byte).cast(), 1) } {
-            0 => true,
-            _ => {
-                let error = io::Error::last_os_error();
-                assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
-                false
-            }
-        }
-    }
-
     /// A child spawned while [`pipe`](super::pipe) stands between creating a job's pair and
     /// marking it close-on-exec inherits no end of it, so the job's stream ends the moment the
     /// supervisor closes its writer, not when that unrelated child exits.
+    ///
+    /// Both oracles wait for an event, never probe at the spawn's return
+    /// ([`cowshed_os::fork_lock`]): Linux wakes a `CLONE_VFORK` spawner (glibc's `posix_spawn`)
+    /// from `exec_mmap`, before `exec` closes the close-on-exec descriptors, so the child
+    /// still lists them when the spawn returns. The child's line on stdout proves its command
+    /// runs, so its `exec` has closed every close-on-exec copy and only an inherited end is left;
+    /// end of stream read while the child lives proves no process holds the writer.
     #[test]
     fn a_child_spawned_while_a_job_pipe_is_born_inherits_no_end_of_it() {
         let (spawned, spawn_returned) = mpsc::channel();
@@ -2083,11 +2069,12 @@ mod tests {
             // and the test waits for that fork to exec before the pair is marked.
             let fenced = held_exclusive();
             spawn = Some(std::thread::spawn(move || {
-                // Blocks reading its stdin, which the test holds, until the test ends it.
+                // Says it runs, then blocks reading its stdin, which the test holds, until the
+                // test ends it.
                 let child = Command::new("/bin/sh")
-                    .args(["-c", "read -r line || :"])
+                    .args(["-c", "echo running; read -r line || :"])
                     .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
+                    .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn_locked();
                 spawned.send(()).unwrap();
@@ -2099,6 +2086,10 @@ mod tests {
         })
         .unwrap();
         let mut child = spawn.unwrap().join().unwrap().unwrap();
+        let mut running = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut running)
+            .unwrap();
         let ours = [
             pipe_end(std::process::id(), read.as_raw_fd()).unwrap(),
             pipe_end(std::process::id(), write.as_raw_fd()).unwrap(),
@@ -2110,9 +2101,12 @@ mod tests {
             })
             .collect();
         drop(write);
-        let ended = at_end_of_stream(&read);
+        // Only a child holding no end lets this read end before the child does.
+        let ended =
+            inherited.is_empty() && std::fs::File::from(read).read(&mut [0_u8]).unwrap() == 0;
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
+        assert_eq!(running, "running\n", "the child's command runs");
         assert_eq!(
             inherited,
             Vec::<RawFd>::new(),
