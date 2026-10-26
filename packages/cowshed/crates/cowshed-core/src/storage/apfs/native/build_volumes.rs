@@ -1273,8 +1273,6 @@ where
             Ok(proof) => proof,
             Err(error) => return Err(self.unregister(layout, destination, creating, error)),
         };
-        // A seed's record keeps its proof's count, for the cleanup that frees it once released.
-        let registration = registration.counted(proof.extents().get());
         if let Err(error) = layout.publish(destination, &registration) {
             return Err(self.unregister(layout, destination, creating, host_error(error)));
         }
