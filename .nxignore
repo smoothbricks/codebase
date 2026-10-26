@@ -18,6 +18,7 @@ modules/
 !/.cargo
 !/.config
 !/.github
+!/.handover
 !/.verdaccio
 !/.vscode
 !/packages/.gitkeep
