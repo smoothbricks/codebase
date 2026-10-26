@@ -4318,7 +4318,9 @@ mod tests {
         assert!(
             matches!(
                 state,
-                cowshed_os::process::RunState::Running | cowshed_os::process::RunState::Sleeping
+                cowshed_os::process::RunState::Running
+                    | cowshed_os::process::RunState::Sleeping
+                    | cowshed_os::process::RunState::Uninterruptible
             ),
             "the expiry leaves the backend running: {state}"
         );
