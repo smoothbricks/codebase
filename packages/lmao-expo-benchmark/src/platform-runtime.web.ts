@@ -21,6 +21,7 @@ const WASM_CAPACITY = 32;
  */
 async function loadBrowserModule(): Promise<WebAssembly.Module | undefined> {
   if (typeof document !== 'object') return undefined;
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: allocator.wasm is a static asset of the page's own origin, loaded beside index.html the way the page's scripts are; a hung page load ends with the page
   const response = await fetch(new URL('allocator.wasm', document.baseURI));
   if (!response.ok) {
     // invariant throw: the Expo web artifact must ship its allocator beside index.html.
