@@ -2389,6 +2389,50 @@ os._exit(0)
         assert!(!super::signal_life(pid, ours.unique_id, libc::SIGKILL).unwrap());
     }
 
+    /// Arm an identity-fenced exec watch on the life `pid` holds now, release the gate
+    /// holding it before its exec, and await the exec as a kernel event. Registration
+    /// happens before `release`, and the life is the kernel's unique id, which an exec
+    /// keeps while it renews the pid version, so no exec can fall between the arming
+    /// and the wait. The caller reads identity or membership once afterwards.
+    #[cfg(target_os = "macos")]
+    fn await_exec(pid: i32, release: impl FnOnce()) {
+        use cowshed_os::process_events::{Delivered, ProcessWatch, identity};
+        let life = identity(u32::try_from(pid).expect("a pid"))
+            .expect("read the held child's identity")
+            .expect("the held child runs")
+            .life;
+        let watch = ProcessWatch::new().expect("a process watch");
+        let grant = watch
+            .register(life)
+            .expect("arm the exec watch")
+            .expect("the held child is the life that was read");
+        release();
+        let mut delivered = Vec::new();
+        loop {
+            delivered.clear();
+            watch.events(None, &mut delivered).expect("await the exec");
+            for delivered in &delivered {
+                match delivered {
+                    Delivered::Event(event) if event.life == life => {
+                        assert!(
+                            event.exit(grant).is_none(),
+                            "the held child exited before it execed"
+                        );
+                        if event.execed {
+                            return;
+                        }
+                    }
+                    Delivered::Event(event) => {
+                        panic!("an event for a life that was not armed: {event:?}")
+                    }
+                    Delivered::Refused { ident, error } => {
+                        panic!("the exec watch was refused for {ident}: {error}")
+                    }
+                }
+            }
+        }
+    }
+
     /// A member running a setuid-root program -- the `/bin/ps` Nx runs to find a task's processes
     /// when it is told to stop -- carries root's effective uid and the job's real uid. Its group's
     /// membership is read and its life watched and signalled like any other member's: the kernel
@@ -2399,22 +2443,24 @@ os._exit(0)
     #[test]
     fn a_setuid_root_member_is_read_watched_and_signalled_like_any_other() {
         // `top` in logging mode, setuid root on every macOS host, runs until it is signalled.
-        let (job, top) = group_with_child("/usr/bin/top -l 0 -s 1 >/dev/null & echo $!; wait");
-        let group = OwnedGroup(job);
+        let (job, top) = group_with_child(
+            "exec 3<&0; (read _ <&3; exec /usr/bin/top -l 0 -s 1 >/dev/null) & echo $!; wait",
+        );
+        let mut group = OwnedGroup(job);
         let birth = super::Birth::Observed(leader(group.0.id()));
-        // The shell forks before `top` execs: the member is read until it runs as root.
-        let member = loop {
-            let records = super::job_member_records(&birth).expect("the job's membership");
-            let member = records
-                .iter()
-                .find(|record| record.pid == top)
-                .copied()
-                .expect("top is a member of the job's group");
-            if member.uid == 0 {
-                break member;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        // The forked member holds on the leader's pipe before it execs: its exec is
+        // awaited as a kernel event, then its membership is read once, as root.
+        await_exec(i32::try_from(top).unwrap(), || {
+            std::io::Write::write_all(group.0.stdin.as_mut().expect("piped stdin"), b"\n")
+                .expect("let the member exec top");
+        });
+        let records = super::job_member_records(&birth).expect("the job's membership");
+        let member = records
+            .iter()
+            .find(|record| record.pid == top)
+            .copied()
+            .expect("top is a member of the job's group");
+        assert_eq!(member.uid, 0, "the member runs top as root");
         let watch = member
             .life()
             .watch_exit()
@@ -2432,32 +2478,41 @@ os._exit(0)
     #[cfg(target_os = "macos")]
     #[test]
     fn a_leader_running_a_setuid_root_program_still_proves_its_group() {
+        use std::io::BufRead as _;
         let mut group = OwnedGroup(
             Command::new("/bin/sh")
                 .args([
                     "-c",
-                    "sleep 600 & read _; exec /usr/bin/top -l 0 -s 1 >/dev/null",
+                    "sleep 600 & echo READY; read _; exec /usr/bin/top -l 0 -s 1 >/dev/null",
                 ])
                 .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
                 .process_group(0)
                 .spawn_locked()
                 .expect("spawn a job group"),
         );
+        // READY is the shell's own report that it runs and blocks in `read`: only
+        // from here is the leader's next exec the `top` exec the watch must name,
+        // not the exec that started the shell itself.
+        let mut ready = String::new();
+        std::io::BufReader::new(group.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "READY");
         let pid = group.0.id();
         let birth = super::Birth::Observed(leader(pid));
-        std::io::Write::write_all(group.0.stdin.as_mut().expect("piped stdin"), b"\n")
-            .expect("let the leader exec top");
-        // The leader is read until it runs `top`, as root.
-        let members = loop {
-            let members = super::job_member_records(&birth).expect("the job's membership");
-            if members
+        await_exec(i32::try_from(pid).unwrap(), || {
+            std::io::Write::write_all(group.0.stdin.as_mut().expect("piped stdin"), b"\n")
+                .expect("let the leader exec top");
+        });
+        // The leader is read once, after its exec, running `top` as root.
+        let members = super::job_member_records(&birth).expect("the job's membership");
+        assert!(
+            members
                 .iter()
-                .any(|member| member.pid == pid && member.uid == 0)
-            {
-                break members;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+                .any(|member| member.pid == pid && member.uid == 0),
+            "the leader runs top as root: {members:?}"
+        );
         // The leader, and a sibling that outlives it, so a leader read as gone fails the read below
         // instead of reading an empty group.
         assert_eq!(members.len(), 2, "{members:?}");
@@ -3035,13 +3090,15 @@ os._exit(0)
         };
         let stale = leader.version;
 
-        writeln!(job.0.stdin.as_mut().unwrap(), "go").unwrap();
-        while super::Process::observe(pgid)
-            .unwrap()
-            .is_some_and(|now| now.version == stale)
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        await_exec(pgid, || {
+            writeln!(job.0.stdin.as_mut().unwrap(), "go").unwrap();
+        });
+        assert!(
+            super::Process::observe(pgid)
+                .unwrap()
+                .is_some_and(|now| now.version != stale),
+            "the leader execed under a new version"
+        );
         assert!(
             super::group_has_live_members(pgid).unwrap(),
             "the leader runs on as `cat` under a new version"
