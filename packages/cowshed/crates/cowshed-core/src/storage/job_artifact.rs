@@ -6584,6 +6584,7 @@ mod tests {
         JobLeafAttribution, JobProcessLeaf, ProcessCoverage, ProcessCoverageGap,
     };
     use crate::api::resources::{CpuMicrosDelta, StorageIoBytesDelta};
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use proptest::prelude::*;
     use std::sync::Barrier;
     use std::thread;
@@ -6690,7 +6691,7 @@ mod tests {
             loop {
                 line.clear();
                 if other.stdout.read_line(&mut line).unwrap() == 0 {
-                    let status = other.process.wait().unwrap();
+                    let status = other.process.wait_bounded().unwrap();
                     panic!(
                         "the process ended before it held {}: {status}; it said {said:?}",
                         lock.display()
@@ -6711,7 +6712,7 @@ mod tests {
         /// Let go of the lock: the process's input ends and it exits.
         fn release(mut self) {
             drop(self.process.stdin.take());
-            let status = self.process.wait().unwrap();
+            let status = self.process.wait_bounded().unwrap();
             assert!(
                 status.success(),
                 "the process holding the lock failed: {status}"
@@ -6726,7 +6727,7 @@ mod tests {
             if let Err(error) = self.process.kill() {
                 cowshed_os::eprintln!("process {}: kill: {error}", self.process.id());
             }
-            if let Err(error) = self.process.wait() {
+            if let Err(error) = self.process.wait_bounded() {
                 cowshed_os::eprintln!("process {}: wait: {error}", self.process.id());
             }
         }

@@ -1777,7 +1777,10 @@ async fn gateway_startup_leaves_an_unsettled_main_to_its_lock_holder_and_heals_i
         b"tracked\n"
     );
     drop(gateway.stdin.take());
-    let status = gateway.wait().await.expect("wait for the heal process");
+    let status = gateway
+        .wait_bounded()
+        .await
+        .expect("wait for the heal process");
     assert!(
         status.success(),
         "the heal process failed: {status}; it said: {transcript}"
