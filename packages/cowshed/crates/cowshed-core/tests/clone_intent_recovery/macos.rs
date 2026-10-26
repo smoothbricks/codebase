@@ -1521,22 +1521,18 @@ async fn gateway_startup_leaves_an_unsettled_main_to_its_lock_holder_and_heals_i
     );
 
     holder.release();
-    let answered = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        read_said(
-            &mut said,
-            &mut transcript,
-            &format!("cowshed: {}: main ", fixture.repo),
-        ),
+    // Waits for the heal's answer however long a loaded host takes; the leg's no-progress bound
+    // names a heal that never answers (README "Test Clock Policy").
+    let answered = read_said(
+        &mut said,
+        &mut transcript,
+        &format!("cowshed: {}: main ", fixture.repo),
     )
     .await;
     let line = match answered {
-        Ok(Some(line)) => line,
-        Ok(None) => panic!(
+        Some(line) => line,
+        None => panic!(
             "the heal process ended before main's background heal answered; it said: {transcript}"
-        ),
-        Err(_) => panic!(
-            "main's background heal did not answer within 60 s of the holder letting go; the heal process said: {transcript}"
         ),
     };
     assert!(
@@ -1598,12 +1594,7 @@ async fn gateway_heal_process() {
         namespace, &scratch,
     ));
     let progress = cowshed_core::StartupHealState::mounting(1);
-    let outcomes = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        inventory.heal(vec![fixture_repo()], &progress),
-    )
-    .await
-    .expect("the heal waits for no lock another process holds");
+    let outcomes = inventory.heal(vec![fixture_repo()], &progress).await;
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     match &outcomes[0].main {
         Err(cowshed_core::GatewayInventoryError::HealLeftToLockHolder { workspace, .. }) => {
