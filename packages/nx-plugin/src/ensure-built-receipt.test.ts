@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -247,6 +247,65 @@ describe('provider receipt', () => {
       disposition: 'failed',
       reason: { kind: 'provider-proof', detail: 'unnameable command input closure' },
     });
+  });
+
+  it('binds a tracked symlink by its link text', async () => {
+    await symlink('source.txt', join(root, 'tracked-link'));
+    git('add', 'tracked-link');
+    git('-c', 'user.name=Receipt fixture', '-c', 'user.email=receipt@example.invalid', 'commit', '-qm', 'link');
+    const captured = captureProducerSource(root, []);
+    if (!captured.ok) throw new Error(captured.detail);
+    expect(captured.value.files.find(({ path }) => path === 'tracked-link')).toMatchObject({
+      gitBlob: createHash('sha1').update('blob 10\0source.txt').digest('hex'),
+      sha256: createHash('sha256').update('source.txt').digest('hex'),
+    });
+  });
+});
+
+describe('a tracked public output', () => {
+  // The root cargo-test-archive reads the corpus cowshed:wire-fixtures regenerates: one tracked file that is a task's
+  // output and a later task's FILE input, which a receipt can bind only to HEAD's own bytes.
+  const produced = { ...task, outputs: ['output', 'generated.txt'] } satisfies Task;
+  const reads = () => ({ ...proof, files: [...proof.files, 'generated.txt'] });
+  async function commitGenerated(): Promise<void> {
+    await writeFile(join(root, 'generated.txt'), 'generated');
+    git('add', 'generated.txt');
+    git('-c', 'user.name=Receipt fixture', '-c', 'user.email=receipt@example.invalid', 'commit', '-qm', 'generated');
+  }
+  function capture(): ProducerSourceWitness {
+    const captured = captureProducerSource(root, producerOutputPaths(root, [produced], expandOutputs));
+    if (!captured.ok) throw new Error(captured.detail);
+    return captured.value;
+  }
+
+  it("stays source while it holds HEAD's bytes, held to them and not to its stamp through the run", async () => {
+    await commitGenerated();
+    const captured = capture();
+    expect(captured.files.map(({ path }) => path)).toContain('generated.txt');
+    expect(providerReceipt(root, produced.id, [produced], reads(), expandOutputs, captured, producer).disposition).toBe(
+      'hit',
+    );
+    // A cache restore or a regeneration that writes the same bytes moves its stamp and changes nothing.
+    await writeFile(join(root, 'generated.txt'), 'generated');
+    await utimes(join(root, 'generated.txt'), 1, 1);
+    expect(producerSourceUnchanged(root, captured)).toEqual({ ok: true, value: true });
+    await writeFile(join(root, 'generated.txt'), 'regenerated');
+    expect(producerSourceUnchanged(root, captured)).toMatchObject({
+      ok: false,
+      detail: expect.stringContaining('generated.txt'),
+    });
+    await rm(join(root, 'generated.txt'));
+    expect(producerSourceUnchanged(root, captured).ok).toBe(false);
+  });
+
+  it('binds none that differs from HEAD when the run starts', async () => {
+    await commitGenerated();
+    await writeFile(join(root, 'generated.txt'), 'edited');
+    const edited = capture();
+    expect(edited.files.map(({ path }) => path)).not.toContain('generated.txt');
+    expect(providerReceipt(root, produced.id, [produced], reads(), expandOutputs, edited, producer).disposition).toBe(
+      'failed',
+    );
   });
 });
 

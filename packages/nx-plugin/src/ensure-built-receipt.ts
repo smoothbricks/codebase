@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  type BigIntStats,
   closeSync,
   lstatSync,
   openSync,
@@ -186,17 +187,73 @@ export function receiptNode(
 }
 /**
  * Whether a tracked source node whose stamp does not prove it (its ctime alone moved, or it was read in the tick it
- * changed in) still holds the bytes or link text `files` recorded for it.
+ * changed in) still holds the bytes or link text `files` recorded for it. A node that is gone does not.
  */
 function recordedSource(root: string, files: readonly EnsureBuiltProducerFileInput[]): (path: string) => boolean {
   const recorded = new Map(files.map((file) => [join(root, file.path), file.sha256]));
-  return (path) =>
-    recorded.get(path) ===
-    createHash('sha256')
-      .update(lstatSync(path).isSymbolicLink() ? readlinkSync(path) : readFileSync(path))
-      .digest('hex');
+  return (path) => {
+    try {
+      return (
+        recorded.get(path) ===
+        createHash('sha256')
+          .update(lstatSync(path).isSymbolicLink() ? readlinkSync(path) : readFileSync(path))
+          .digest('hex')
+      );
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;
+      throw error;
+    }
+  };
 }
-/** Capture every tracked source byte at pre. Unrelated untracked files are not source basis. */
+/**
+ * One tracked file as it stands against HEAD's entry for it (`head.mode`, `head.oid`): the witness a receipt binds it
+ * by and the stamp it was read at, or how it differs.
+ */
+function trackedSource(
+  root: string,
+  file: string,
+  head: { readonly mode: string; readonly oid: string; readonly algorithm: 'sha1' | 'sha256' },
+  start: bigint,
+): ReceiptEvidence<{ readonly node: NodeWitness; readonly input: EnsureBuiltProducerFileInput }> {
+  const path = join(root, file);
+  let stats: BigIntStats;
+  try {
+    stats = lstatSync(path, { bigint: true });
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT')
+      return { ok: false, detail: `Tracked source is missing: ${file}` };
+    throw error;
+  }
+  const actualMode = stats.isSymbolicLink() ? '120000' : (stats.mode & 0o111n) !== 0n ? '100755' : '100644';
+  if (actualMode !== head.mode) return { ok: false, detail: `Tracked source mode differs from HEAD: ${file}` };
+  let gitBlob: string;
+  let sha256: string;
+  if (stats.isFile()) {
+    const digests = sourceFileDigests(path, Number(stats.size), head.algorithm);
+    gitBlob = digests.gitBlob;
+    sha256 = digests.sha256;
+  } else if (stats.isSymbolicLink()) {
+    const text = readlinkSync(path);
+    gitBlob = createHash(head.algorithm)
+      .update(`blob ${Buffer.byteLength(text)}\0`)
+      .update(text)
+      .digest('hex');
+    sha256 = createHash('sha256').update(text).digest('hex');
+  } else return { ok: false, detail: `Unbound tracked source node: ${file}` };
+  if (gitBlob !== head.oid) return { ok: false, detail: `Tracked source bytes differ from HEAD: ${file}` };
+  return {
+    ok: true,
+    value: {
+      node: { path, stamp: recordedStamp(stats, start) },
+      input: { path: file, mode: Number(stats.mode & 0o7777n), gitBlob, sha256 },
+    },
+  };
+}
+/**
+ * Capture every tracked source byte at pre. Unrelated untracked files are not source basis. A tracked public output is
+ * source while it holds HEAD's bytes, so a later task can read it as a FILE input; one that differs from HEAD is the
+ * run's to write, and no input binds to it.
+ */
 export function captureProducerSource(
   root: string,
   outputs: readonly string[],
@@ -226,28 +283,15 @@ export function captureProducerSource(
         return { ok: false, detail: `Unproved HEAD tree entry ${entry}` };
       if (kind !== 'blob') return { ok: false, detail: `Unbound tracked source namespace ${entry}` };
       const file = entry.slice(tab + 1);
-      if (excluded.has(file)) continue;
-      const path = join(root, file);
-      const stats = lstatSync(path, { bigint: true });
-      nodes.push({ path, stamp: recordedStamp(stats, start) });
-      const actualMode = stats.isSymbolicLink() ? '120000' : (stats.mode & 0o111n) !== 0n ? '100755' : '100644';
-      if (actualMode !== mode) return { ok: false, detail: `Tracked source mode differs from HEAD: ${file}` };
-      let gitBlob: string;
-      let sha256: string;
-      if (stats.isFile()) {
-        const digests = sourceFileDigests(path, Number(stats.size), algorithm);
-        gitBlob = digests.gitBlob;
-        sha256 = digests.sha256;
-      } else if (stats.isSymbolicLink()) {
-        const text = readlinkSync(path);
-        gitBlob = createHash(algorithm)
-          .update(`blob ${Buffer.byteLength(text)}\0`)
-          .update(text)
-          .digest('hex');
-        sha256 = createHash('sha256').update(text).digest('hex');
-      } else return { ok: false, detail: `Unbound tracked source node: ${file}` };
-      if (gitBlob !== oid) return { ok: false, detail: `Tracked source bytes differ from HEAD: ${file}` };
-      files.push({ path: file, mode: Number(stats.mode & 0o7777n), gitBlob, sha256 });
+      const witnessed = trackedSource(root, file, { mode, oid, algorithm }, start);
+      if (!witnessed.ok) {
+        if (excluded.has(file)) continue;
+        return witnessed;
+      }
+      // A public output's stamp is the run's to move (a cache restore or a regeneration does), so only its bytes are
+      // held.
+      if (!excluded.has(file)) nodes.push(witnessed.value.node);
+      files.push(witnessed.value.input);
     }
     const status = receiptGit(root, ['status', '--porcelain=v1', '-z', '--untracked-files=no']);
     if (!status.ok) return status;
@@ -275,8 +319,15 @@ export function producerSourceUnchanged(root: string, before: ProducerSourceWitn
     return { ok: false, detail: `${changed}: HEAD's tree is ${tree.value.trim()}, not ${before.headTree}` };
   const dirty = dirtyProviderPaths(status.value).filter((path) => !outputs.has(path));
   if (dirty.length !== 0) return { ok: false, detail: `${changed}: ${dirty.join(', ')} differ from HEAD` };
-  const moved = movedNodes(before.nodes, recordedSource(root, before.files));
+  const holds = recordedSource(root, before.files);
+  const moved = movedNodes(before.nodes, holds);
   if (moved !== null) return { ok: false, detail: `${changed}: ${moved}` };
+  const rewritten = before.files.filter(({ path }) => outputs.has(path) && !holds(join(root, path)));
+  if (rewritten.length !== 0)
+    return {
+      ok: false,
+      detail: `${changed}: tracked public output ${rewritten.map(({ path }) => path).join(', ')} no longer holds HEAD's bytes`,
+    };
   return { ok: true, value: true };
 }
 /** Enumerate exact public nodes; never exempt a broad directory of tracked source. */

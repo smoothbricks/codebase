@@ -1303,6 +1303,12 @@ A declared target names `cargoToolchain` for its toolchain identity and spells n
 an unbounded runtime source closure. `ensure-built-receipt.test.ts` judges this repository's receipt targets on its own
 graph.
 
+A tracked public output stays in the source basis while it holds HEAD's bytes, so a later task can read it as a FILE
+input: the root `cargo-test-archive` reads the corpus `cowshed:wire-fixtures` regenerates, a tracked file that is both.
+Only its stamp is the run's to move (a cache restore or a regeneration moves it). A run that leaves it other bytes
+refuses the receipt, and one that differs from HEAD when the run starts binds no input, so a task that reads it is
+unbound.
+
 Git source provenance is the committed tree and the producer's clean tracked source basis, not an unrelated untracked
 user file in its working directory. An actual FILE input outside HEAD, a modified tracked input, changed membership,
 opaque custom/native input proof or genuinely unbounded runtime source cannot be signed. Bounded runtime/env identity is
