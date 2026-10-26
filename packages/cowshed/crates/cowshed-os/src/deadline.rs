@@ -43,7 +43,7 @@ pub const CODESIGN: Bound = Bound::new(LatencyClass::Ffi, Duration::from_secs(10
 /// How often a holder says it is still there on a connection it holds open for a long wait.
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
 /// The resolution of the timers that wake a wait.
-const TIMER_TICK: Duration = Duration::from_millis(1);
+pub const TIMER_TICK: Duration = Duration::from_millis(1);
 
 /// The silence a long wait allows its holder: three missed heartbeats.
 pub const HEARTBEAT_SILENCE: Duration = Duration::from_secs(15);

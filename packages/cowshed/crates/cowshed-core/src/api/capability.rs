@@ -1730,10 +1730,9 @@ async fn run_controller_actor(
             .remaining(deadline::clock())
             .unwrap_or(std::time::Duration::ZERO);
         let call = tokio::select! {
-            () = tokio::time::sleep(silence), if owed => {
-                let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.take() };
-                break silent_controller(&stalled.idle.silent(holder, deadline::clock()));
-            }
+            // Every frame the reader has taken off the connection is handled before the silence
+            // is judged: the silence arm is polled last.
+            biased;
             () = std::future::ready(()),
                 if pending.len() < MAX_IN_FLIGHT_REQUESTS && !waiting.is_empty() => {
                 waiting.pop_front().expect("the enabled admission branch has a queued call")
@@ -1881,6 +1880,19 @@ async fn run_controller_actor(
                 };
                 let _ = reply.send(answer.outcome);
                 continue;
+            }
+            // The timer only wakes the actor; the silence decides (cowshed-os::deadline's rule).
+            // Tokio's timer can fire a tick early, and then it is re-armed for the rest.
+            () = tokio::time::sleep(silence), if owed => {
+                if stalled
+                    .idle
+                    .remaining(deadline::clock())
+                    .is_some_and(|left| left >= deadline::TIMER_TICK)
+                {
+                    continue;
+                }
+                let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.take() };
+                break silent_controller(&stalled.idle.silent(holder, deadline::clock()));
             }
         };
         let ActorCall {
@@ -3412,6 +3424,50 @@ mod tests {
         drop(server);
     }
 
+    /// 05_gateway.md "Deadlines": a heartbeat that lands on the 15 s bound, read in the same
+    /// instant the silence timer fires, is progress: the timer only wakes the actor, and every frame
+    /// already read is handled before the silence is judged. The call fails SILENT only after a
+    /// further 15 s of silence, naming that heartbeat.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_on_the_silence_bound_keeps_the_call_waiting() {
+        let (runtime, mut server) = actor_in_memory();
+        let started = tokio::time::Instant::now();
+        let call = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let _ = read_rpc_request(&mut server).await;
+        let tick = std::time::Duration::from_millis(1);
+        tokio::time::sleep(deadline::HEARTBEAT_SILENCE - tick).await;
+        // Written without yielding, then the clock moves onto the bound: the reader, woken by the
+        // frame, and the actor, woken by its timer, run in the same instant.
+        let beat = json!({ "progress": 1, "busy": null });
+        write_raw_frame(&mut server, beat.to_string().as_bytes()).await;
+        tokio::time::advance(tick).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !call.is_finished(),
+            "a heartbeat read on the silence bound is progress"
+        );
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(3600), call)
+            .await
+            .expect("the call fails once the controller is silent again")
+            .expect("the call task joins")
+            .expect_err("a controller silent after its last beat fails the call");
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_secs(30)
+                && waited < std::time::Duration::from_secs(31),
+            "SILENT a full silence bound after the beat: {waited:?}"
+        );
+        assert!(
+            failure.message.contains("last progress: heartbeat 1"),
+            "{}",
+            failure.message
+        );
+        drop(server);
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn actor_admission_bounds_non_stream_calls_and_drains_fifo() {

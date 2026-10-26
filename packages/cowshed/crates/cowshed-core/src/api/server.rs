@@ -540,8 +540,8 @@ pub(crate) mod codec {
         )
     }
 
-    /// An answer decodes as one; only a frame that is not one is read as a step, then as a
-    /// heartbeat, then as an event. No shape accepts another's fields, so no frame is two, and a
+    /// An answer decodes as one; only a frame that is not one is read as a heartbeat, then as a
+    /// step, then as an event. No shape accepts another's fields, so no frame is two, and a
     /// frame that is none reports why it is not an answer.
     pub(crate) fn decode_server_frame(bytes: &[u8]) -> Result<DecodedServerFrame, WireCodecError> {
         let not_an_answer = match decode::<RpcResponseFields<'static>>(bytes, MAX_JSON_FRAME_BYTES)
