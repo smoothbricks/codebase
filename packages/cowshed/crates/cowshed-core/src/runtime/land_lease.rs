@@ -42,6 +42,14 @@ pub enum Holding {
 }
 
 impl Holding {
+    /// The lease a land call takes for its workspace: a land holds it as
+    /// [`Holding::Land`]; a preflight takes no lease at all (02_workspaces.md,
+    /// "`cowshed land`", `--preflight`), so it answers while another operation
+    /// holds the lease, whoever that is.
+    pub(crate) const fn for_land(preflight: bool) -> Option<Self> {
+        if preflight { None } else { Some(Self::Land) }
+    }
+
     const fn verb(self) -> &'static str {
         match self {
             Self::Land => "landed",
@@ -195,7 +203,14 @@ mod tests {
         take(&sessions, "topic", Holding::Remove)
             .expect("the lease is free once its holder drops it");
     }
-
+    /// The lease a land call asks for is decided by the call alone: a preflight asks
+    /// for none (and so is never refused by a holder -- land, removal or an unreadable
+    /// record alike), a land asks to hold as a land.
+    #[test]
+    fn a_preflight_takes_no_lease_and_a_land_holds_as_land() {
+        assert_eq!(Holding::for_land(true), None);
+        assert_eq!(Holding::for_land(false), Some(Holding::Land));
+    }
     /// Names the sessions directory this test binary holds a lease in when it runs as
     /// [`lease_holder_helper`].
     const HELD_LEASE_ENV: &str = "COWSHED_TEST_HELD_LAND_LEASE_SESSIONS";

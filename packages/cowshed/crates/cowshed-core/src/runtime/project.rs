@@ -15882,9 +15882,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         into: Option<WorkspaceTarget>,
         options: LandOptions,
     ) -> Result<LandReport> {
-        if options.preflight {
+        let Some(holding) = super::land_lease::Holding::for_land(options.preflight) else {
             return self.land_preflight(&workspace, into, &options).await;
-        }
+        };
         self.wait_for_other_builds_as_a_land_step();
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         let plan = land_plan(
@@ -15897,11 +15897,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // Held to the end of the land, its own retire included: an `rm` of this workspace is
         // refused meanwhile, naming this land (02_workspaces.md "A land and an rm of one workspace
         // exclude each other").
-        let _land_lease = super::land_lease::take(
-            &self.layout.project().sessions,
-            workspace.as_str(),
-            super::land_lease::Holding::Land,
-        )?;
+        let _land_lease =
+            super::land_lease::take(&self.layout.project().sessions, workspace.as_str(), holding)?;
         let LandFenced {
             current,
             into,
