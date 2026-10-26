@@ -43,7 +43,9 @@
       {
         "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --revision"
       },
-      { "externalDependencies": ["bun-lock:."] }
+      { "externalDependencies": ["bun-lock:."] },
+      "{workspaceRoot}/patches/**/*",
+      "!{workspaceRoot}/patches/**/*.md"
     ]
   },
   "targetDefaults": {

@@ -51,7 +51,9 @@
             ]
           },
           "default",
-          "pluginScenarioSources"
+          "pluginScenarioSources",
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
         ],
         "options": {
           "command": "ttsc --noEmit -p tsconfig.json",
@@ -68,7 +70,9 @@
             ]
           },
           "default",
-          "pluginScenarioSources"
+          "pluginScenarioSources",
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
         ]
       },
       "test": {

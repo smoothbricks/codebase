@@ -167,7 +167,9 @@
           "{workspaceRoot}/tooling/checks/no-unbounded-wait.fixtures.ts",
           "{workspaceRoot}/packages/lmao/src/lib/errors/Deadline.ts",
           "{workspaceRoot}/packages/lmao/src/lib/result.ts",
-          "{workspaceRoot}/bun.lock"
+          "{workspaceRoot}/bun.lock",
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
         ],
         "options": {
           "command": "bun tooling/checks/no-unbounded-wait.fixtures.ts",

@@ -395,8 +395,12 @@ TypeScript toolchain inputs exclude Markdown beneath workspace-root `patches/`, 
 pin, including extensionless `PIN` and `VERSION` files. Native content-hash regressions distinguish those inputs from
 README and unrelated-source edits. A task that consumes Markdown declares it through an input set without a matching
 negative: Nx exclusions win over positive paths in the same fileset, so a later explicit path cannot re-include it.
-Inferred Cargo package filesets remain broad for arbitrary compiled data, headers, schemas and build-script reads;
-incidental Markdown beneath a crate can therefore still invalidate those tasks conservatively.
+Inference adds that fileset only to the targets it infers. A declared cached target that runs an installed patched
+package (a bun or node command, the patched compiler binary, a bundled or site build over a patched dependency) names
+the same fileset in its own inputs: patches are applied to `node_modules` at install, which no fileset reaches, and the
+lockfile records the patch path, not its bytes, so without the fileset a patch edit replays the previous verdict or
+output from cache. Inferred Cargo package filesets remain broad for arbitrary compiled data, headers, schemas and
+build-script reads; incidental Markdown beneath a crate can therefore still invalidate those tasks conservatively.
 
 Cargo keeps the caller's `CARGO_HOME`. Moving configuration into an isolated home can change relative paths or lose
 source replacement, credentials, and toolchain settings; forwarding it with `--config` changes precedence. Registry

@@ -56,7 +56,9 @@
             ]
           },
           "default",
-          "^dependencyDefault"
+          "^dependencyDefault",
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
         ],
         "outputs": [
           "{projectRoot}/dist/"

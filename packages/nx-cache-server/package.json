@@ -96,7 +96,9 @@
           "{projectRoot}/package.json",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun -e 'console.log(Bun.version, Bun.revision)'"
-          }
+          },
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
         ],
         "outputs": [
           "{projectRoot}/dist/server/nx-cache-server.js"

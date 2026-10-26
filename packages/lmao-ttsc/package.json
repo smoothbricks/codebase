@@ -71,7 +71,9 @@
           },
           "{projectRoot}/plugin/**/*.go",
           "{projectRoot}/plugin/go.mod",
-          "{projectRoot}/scripts/gen-go-work.mjs"
+          "{projectRoot}/scripts/gen-go-work.mjs",
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
         ],
         "options": {
           "command": "bun ../scripts/gen-go-work.mjs && go vet ./...",
@@ -91,7 +93,9 @@
           },
           "{projectRoot}/plugin/**/*.go",
           "{projectRoot}/plugin/go.mod",
-          "{projectRoot}/scripts/gen-go-work.mjs"
+          "{projectRoot}/scripts/gen-go-work.mjs",
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
         ],
         "options": {
           "command": "bun ../scripts/gen-go-work.mjs && go test ./... -p=\"$(nproc)\"",
