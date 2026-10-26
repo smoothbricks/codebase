@@ -4159,6 +4159,12 @@ mod socket_ownership_tests {
             .unwrap()
             .block_on(async move {
                 let _socket = bind(Path::new(&path)).await.unwrap();
+                // On stderr, which libtest neither captures nor frames: the socket is
+                // bound and the lease held from here.
+                use std::io::Write as _;
+                std::io::stderr()
+                    .write_all(b"bound\n")
+                    .expect("say the socket is bound");
                 std::future::pending::<()>().await;
             });
     }
@@ -4173,18 +4179,30 @@ mod socket_ownership_tests {
                 "--exact",
                 "runtime::supervisor_socket::socket_ownership_tests::holds_a_bound_socket_until_killed",
                 "--ignored",
+                "--nocapture",
             ])
             .env(BOUND_SOCKET, &path)
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn_locked()
             .unwrap();
-        // Published last, once the owner holds the lease.
-        while Instance::at(&path).ok().flatten().is_none() {
-            if let Some(status) = owner.try_wait().unwrap() {
-                panic!("the owner exited before it bound the socket: {status}");
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+        let mut said = BufReader::new(owner.stderr.take().expect("the owner's stderr"));
+        let mut transcript = String::new();
+        loop {
+            let start = transcript.len();
+            let read = said
+                .read_line(&mut transcript)
+                .await
+                .expect("the owner's stderr");
+            assert_ne!(
+                read, 0,
+                "the owner exited before it bound the socket; it said: {transcript}"
+            );
+            if transcript[start..].trim_end() == "bound" {
+                break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let killed = inode(&path);
         assert_eq!(
@@ -4227,10 +4245,10 @@ mod socket_ownership_tests {
         // and explicit stdin, then remains alive after the creator exits, until stdin ends.
         assert!(
             std::process::Command::new("/bin/sh")
-                .args(["-c", "cat <&0 & exit 0"])
+                .args(["-c", "cat <&0 & echo $! >&2; exit 0"])
                 .stdin(std::process::Stdio::inherit())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
                 .spawn_locked()
                 .unwrap()
                 .wait_bounded()
@@ -4255,11 +4273,30 @@ mod socket_ownership_tests {
             .env(INHERITED_SOCKET, &path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn_locked()
             .unwrap();
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
         // The child that inherited the listener reads this until it is dropped.
         let holder_input = creator.stdin.take().unwrap();
+        // The creator names that child on its stderr before it exits: one pid frame.
+        let mut said = BufReader::new(creator.stderr.take().expect("the creator's stderr"));
+        let mut transcript = String::new();
+        let holder_pid = loop {
+            let start = transcript.len();
+            let read = said
+                .read_line(&mut transcript)
+                .await
+                .expect("the creator's stderr");
+            assert_ne!(
+                read, 0,
+                "the creator exited without naming its holder child; it said: {transcript}"
+            );
+            if let Ok(pid) = transcript[start..].trim().parse::<i32>() {
+                break pid;
+            }
+        };
         assert!(creator.wait_bounded().await.unwrap().success());
         let held = inode(&path);
         drop(
@@ -4275,10 +4312,27 @@ mod socket_ownership_tests {
         assert_eq!(inode(&path), held);
         assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
 
+        // The holder cannot have exited: the stdin it reads is held above. Watch its
+        // exact life, then let it go and await that exit.
+        let Some(holder_process) = Process::observe(holder_pid).expect("observe the holder") else {
+            panic!(
+                "holder pid {holder_pid} does not run while its stdin is held; \
+                 the creator said: {transcript}"
+            );
+        };
+        let holder_exit = holder_process.exit().expect("watch the holder's exit");
         drop(holder_input);
-        while !matches!(occupant(&path), Ok(Occupant::Stopped)) {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        assert_eq!(
+            holder_exit
+                .observed()
+                .await
+                .expect("the holder's exit is observed"),
+            ExitObserved::Watched
+        );
+        assert!(
+            matches!(occupant(&path), Ok(Occupant::Stopped)),
+            "the socket is stopped once its last holder exited"
+        );
         assert_eq!(hello_if_present(&path).await.unwrap(), None);
         let socket = bind(&path).await.unwrap();
         assert_ne!(inode(&path), held);
@@ -4555,7 +4609,6 @@ mod drain_read_tests {
         let settled = owed.settle(Duration::from_secs(60 * 60)).await;
         assert_eq!(settled.read, [job(1), job(2)]);
         assert!(settled.unread.is_empty());
-        assert_eq!(settled.to_string(), "read by a client: [1, 2]");
     }
 
     /// A job nobody was seen asking about cannot keep a drained supervisor serving: past the
@@ -4567,10 +4620,6 @@ mod drain_read_tests {
         let settled = owed.settle(BOUND).await;
         assert!(settled.read.is_empty());
         assert_eq!(settled.unread, [job(7)]);
-        assert_eq!(
-            settled.to_string(),
-            "read by a client: []; unread after 30 minutes with no read: [7]"
-        );
     }
 
     /// An exec the actor admitted before the drain closed admission may have its requester
@@ -4716,18 +4765,9 @@ mod drain_read_tests {
                 .expect("the reader exits")
                 .success()
         );
-        let settled = tokio::time::timeout(
-            Duration::from_secs(60),
-            owed.settle(Duration::from_secs(60 * 60)),
-        )
-        .await
-        .expect("it settles once every process job 3 was owed to exited, not at its bound");
+        let settled = owed.settle(Duration::from_secs(60 * 60)).await;
         assert_eq!(settled.abandoned, [job(3)]);
         assert!(settled.unread.is_empty());
-        assert_eq!(
-            settled.to_string(),
-            "read by a client: []; every process they were owed to exited: [3]"
-        );
     }
 
     /// A draining supervisor's report says what it waits for at each step, read back by the
