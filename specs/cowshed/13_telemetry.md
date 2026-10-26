@@ -95,28 +95,25 @@ These are host-local traces with unique trace/thread identities, not attributes 
 caller's trace.
 
 Each capture observes both the source and the destination. An absent destination starts at zero; its delta describes the
-newly named clone's allocation, **not** newly allocated unique blocks. A release (a build image's, a clean removal's
-source image) compares the image at its name before it with what is left there once it answers: a release commits the
-whole image to its deleting directory before it answers, so the image is `absent` at its name after and its delta reads
-as everything it held, though a rename frees no extents or allocated bytes: the gateway's cleanup frees them later
-(05_gateway.md, "Deleting released images"). A release walks no extent map: it reads the allocation alone, and its
-extent columns are null with the cause "a release does not walk its image's extent map". Its commit never opens the
-image (05_gateway.md), and a released build image's map runs to 880,000 extents, which took 2.5-10.6 s per image to walk
-inside `rm` (measured 2026-10-25), before the verb could answer. A recovery retirement compares the canonical file with
-the renamed file in trash: a rename frees no extents or allocated bytes. A fork's capture of its source's seed
-(16_build_volumes.md, "Fork" step 3) runs under the source's image lock, so it too reads allocation alone: its extent
-columns are null with the cause "a capture under its source's image lock does not walk an extent map"; the clone's map
-is the seed's, which the seed's own capture walked. Missing files are explicitly `absent`; failed measurements are null
-with their cause, never zero. The extent count comes from `storage/apfs/extents.rs::count_extents`, the existing native
-`F_LOG2PHYS_EXT` walker. Allocation reuses that module's `allocated_bytes` (`st_blocks * 512`). Neither measures the
-mounted filesystem's contents, shared-block exclusivity, or bytes written.
+newly named clone's allocation, **not** newly allocated unique blocks. A release compares the image at its name before
+it with what is left there once it answers: a release commits the whole image to its deleting directory, so the image is
+`absent` at its name after and its delta reads as everything it held, though a rename frees no allocated bytes. The
+gateway's cleanup frees them later (05_gateway.md, "Deleting released images"). A recovery retirement compares the
+canonical file with the renamed file in trash, whose allocation is unchanged.
+
+Image telemetry reads allocation alone and never walks an extent map. No operation consumed its former extent columns or
+threshold warnings, and three full map walks around a seed capture of a 1,198,506-extent image took about 85 seconds
+around an 81 ms clone under concurrent forks (measured 2026-10-27). Compaction, doctor and forkability checks retain
+their own required extent observations; telemetry does not duplicate them. Missing files are explicitly `absent`; failed
+measurements are null with their cause, never zero. Allocation reuses `storage/apfs/extents.rs::allocated_bytes`
+(`st_blocks * 512`). It measures neither mounted filesystem contents, shared-block exclusivity nor bytes written.
 
 The custom columns are:
 
 - Identity: `operation`, `image_role` (`source`, `destination`, `image`), `image_path_before`, `image_path_after`,
   `image_state_before`, `image_state_after`, `process_id`.
-- Layout: `extents_before`, `extents_after`, `extents_delta`, `allocated_bytes_before`, `allocated_bytes_after`,
-  `allocated_bytes_delta`. Deltas are signed after-minus-before values.
+- Allocation: `allocated_bytes_before`, `allocated_bytes_after`, `allocated_bytes_delta`. Deltas are signed
+  after-minus-before values.
 - Time: `elapsed_us` covers only the operation; `measurement_us` reports the separate cost of reading both boundaries.
   The span's start/end timestamps cover the operation, not counting or sealing.
 - I/O: `process_io_write_bytes_before`, `process_io_write_bytes_after`, `process_io_write_bytes_delta`,
@@ -127,15 +124,11 @@ The custom columns are:
   window; do not sum them. `RUSAGE_CHILDREN` cannot see an in-process write.
 - Failures: `measurement_error_before`, `measurement_error_after`, `error` (operation failure). A measurement or
   publication failure never changes the operation's result.
-- Warning policy: `warning_reason`, `extents_warn`, `extents_delta_warn`, `allocated_bytes_warn`,
-  `allocated_bytes_delta_warn`.
+- Warning policy: `warning_reason`, `allocated_bytes_warn`, `allocated_bytes_delta_warn`.
 
-Absolute extent counts **at least 100,000** warn independently of growth **at least 10,000**. The measured
-435,459-extent, 281 GB image spent 60.8 seconds in first write; these budgets warn at 23% of that extent count or a
-single-operation increase of 2.3%. They are early-warning budgets, not a linear time prediction (another observed first
-write took 10.6 seconds). Allocation separately warns at **128 GiB absolute** or **8 GiB growth**, approximately 49% and
-3.1% of that 281 GB image. A high baseline warns before work begins even when the delta is zero. Shrinking does not
-trigger a growth warning. Each warning names the signal and the thresholds.
+Allocation warns at **128 GiB absolute** or **8 GiB growth**, approximately 49% and 3.1% of an observed 281 GB image. A
+high baseline warns before work begins even when the delta is zero. Shrinking does not trigger a growth warning. Each
+warning names the signal and the thresholds.
 
 One lazily started writer belongs to each native host. Its queue admits at most **4,096 operations or 16 MiB of retained
 Rust payload capacity, whichever binds first**, including observations the writer has received but not yet sealed. The
@@ -174,7 +167,7 @@ rows = rows[rows["message"].str.startswith("cowshed.image.", na=False)]
 rows = rows[rows["entry_type"].isin(["span-ok", "span-err"])]
 rows = rows[(rows["image_path_before"] == sys.argv[3]) | (rows["image_path_after"] == sys.argv[3])]
 print(rows.sort_values("timestamp")[[
-    "timestamp", "operation", "image_role", "extents_before", "extents_after", "extents_delta",
+    "timestamp", "operation", "image_role",
     "allocated_bytes_before", "allocated_bytes_after", "allocated_bytes_delta", "elapsed_us",
     "measurement_us", "process_io_write_bytes_delta", "process_io_scope", "warning_reason"
 ]].to_string(index=False))

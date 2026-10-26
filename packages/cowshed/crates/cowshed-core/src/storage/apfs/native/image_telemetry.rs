@@ -19,11 +19,7 @@ use crate::storage::trace_segment::{
     seal_segment, trace_batch,
 };
 
-// The observed 435,459-extent / 281 GB image spent 60.8 s in first write. These are
-// early-warning budgets, not a linear latency model: 100k is 23% of that count and
-// 10k growth is 2.3%. Allocation warns at 128 GiB (49%) or 8 GiB growth (3.1%).
-const EXTENTS_WARN: u64 = 100_000;
-const EXTENTS_DELTA_WARN: i64 = 10_000;
+// Allocation warns at 128 GiB or 8 GiB growth: 49% and 3.1% of an observed 281 GB image.
 const ALLOCATED_WARN: u64 = 128 << 30;
 const ALLOCATED_DELTA_WARN: i64 = 8 << 30;
 const IO_SCOPE: &str =
@@ -41,71 +37,35 @@ pub(super) struct Image<'a> {
     pub after: &'a Path,
 }
 
-/// What a snapshot reads of an image.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Layout {
-    /// The extent map and the allocation: a capture, a first write, a recovery retirement.
-    Walked,
-    /// The allocation alone (`st_blocks`), for the cause its null extent columns carry: a
-    /// release, whose commit never opens the image (05_gateway.md, "Deleting released images"),
-    /// or a fork's capture under its source's image lock. A released build image's map runs to
-    /// 880,000 extents, and walking it cost 2.5-10.6 s per image inside `rm` (measured
-    /// 2026-10-25), all of it before the verb could answer.
-    Allocation(&'static str),
-}
-
-/// The cause a release's null extent columns carry.
-const UNWALKED: &str = "a release does not walk its image's extent map";
-
-/// The cause the null extent columns of a fork's capture carry.
-const UNWALKED_UNDER_SOURCE_LOCK: &str =
-    "a capture under its source's image lock does not walk an extent map";
 #[derive(Debug)]
 struct Snapshot {
-    extents: Option<u64>,
     allocated: Option<u64>,
     state: &'static str,
     error: Option<String>,
 }
 
 impl Snapshot {
-    fn read(path: &Path, layout: Layout) -> Self {
+    fn read(path: &Path) -> Self {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self {
-                extents: Some(0),
                 allocated: Some(0),
                 state: "absent",
                 error: None,
             },
             Err(error) => Self {
-                extents: None,
                 allocated: None,
                 state: "unavailable",
                 error: Some(error.to_string()),
             },
             Ok(metadata) if !metadata.is_file() => Self {
-                extents: None,
                 allocated: None,
                 state: "unavailable",
                 error: Some("image is not a regular file".into()),
             },
             Ok(_) => {
                 let allocation = extents::allocated_bytes(path);
-                let (extents, unwalked) = match layout {
-                    Layout::Walked => match extents::count_extents(path) {
-                        Ok(count) => (Some(count.get()), None),
-                        Err(error) => (None, Some(error.to_string())),
-                    },
-                    Layout::Allocation(cause) => (None, Some(cause.to_owned())),
-                };
-                let error = match (unwalked, &allocation) {
-                    (None, Ok(_)) => None,
-                    (Some(error), Ok(_)) => Some(error),
-                    (None, Err(error)) => Some(error.to_string()),
-                    (Some(count), Err(allocation)) => Some(format!("{count}; {allocation}")),
-                };
+                let error = allocation.as_ref().err().map(ToString::to_string);
                 Self {
-                    extents,
                     allocated: allocation.ok(),
                     state: "present",
                     error,
@@ -121,15 +81,6 @@ fn delta(before: Option<u64>, after: Option<u64>) -> Option<i64> {
 
 fn warning(snapshot: &Snapshot, before: Option<&Snapshot>) -> Option<String> {
     let mut reasons = Vec::new();
-    if snapshot.extents.is_some_and(|value| value >= EXTENTS_WARN) {
-        reasons.push("extent_absolute");
-    }
-    if before
-        .and_then(|before| delta(before.extents, snapshot.extents))
-        .is_some_and(|value| value >= EXTENTS_DELTA_WARN)
-    {
-        reasons.push("extent_delta");
-    }
     if snapshot
         .allocated
         .is_some_and(|value| value >= ALLOCATED_WARN)
@@ -154,9 +105,6 @@ trace_columns! {
     image_path_after: Required<Utf8>,
     image_state_before: Required<Utf8>,
     image_state_after: Optional<Utf8>,
-    extents_before: Optional<U64>,
-    extents_after: Optional<U64>,
-    extents_delta: Optional<I64>,
     allocated_bytes_before: Optional<U64>,
     allocated_bytes_after: Optional<U64>,
     allocated_bytes_delta: Optional<I64>,
@@ -172,8 +120,6 @@ trace_columns! {
     measurement_error_after: Optional<Utf8>,
     error: Optional<Utf8>,
     warning_reason: Optional<Utf8>,
-    extents_warn: Required<U64>,
-    extents_delta_warn: Required<I64>,
     allocated_bytes_warn: Required<U64>,
     allocated_bytes_delta_warn: Required<I64>,
 }
@@ -265,61 +211,20 @@ impl ImageTelemetry {
         }
     }
 
+    /// Observe allocation at both boundaries without walking either image's extent map.
     pub fn measure<T, E: fmt::Display>(
         &self,
         operation: &'static str,
         images: &[Image<'_>],
         work: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        self.measure_with(operation, images, Layout::Walked, work)
-    }
-
-    /// `work`, the release of `image`, as a `retire` span that reads the image's allocation and
-    /// walks no extent map (13_telemetry.md, "Native image observations").
-    pub fn measure_release<T, E: fmt::Display>(
-        &self,
-        image: &Path,
-        work: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
-        let images = [Image {
-            role: "image",
-            before: image,
-            after: image,
-        }];
-        self.measure_with("retire", &images, Layout::Allocation(UNWALKED), work)
-    }
-
-    /// `work`, a fork's capture under its source's image lock, as an `operation` span that
-    /// reads each image's allocation and walks no extent map, so the walk never lengthens the
-    /// lock (13_telemetry.md, "Native image observations").
-    pub fn measure_under_source_lock<T, E: fmt::Display>(
-        &self,
-        operation: &'static str,
-        images: &[Image<'_>],
-        work: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
-        self.measure_with(
-            operation,
-            images,
-            Layout::Allocation(UNWALKED_UNDER_SOURCE_LOCK),
-            work,
-        )
-    }
-
-    fn measure_with<T, E: fmt::Display>(
-        &self,
-        operation: &'static str,
-        images: &[Image<'_>],
-        layout: Layout,
-        work: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
         let measuring = Instant::now();
         let before: Vec<_> = images.iter().map(|image| {
-            let snapshot = Snapshot::read(image.before, layout);
-            cowshed_os::eprintln!("cowshed: image {operation} before image={} role={} extents={:?} allocated_bytes={:?} state={} measurement_error={:?}",
-                image.before.display(), image.role, snapshot.extents, snapshot.allocated, snapshot.state, snapshot.error);
+            let snapshot = Snapshot::read(image.before);
+            cowshed_os::eprintln!("cowshed: image {operation} before image={} role={} allocated_bytes={:?} state={} measurement_error={:?}",
+                image.before.display(), image.role, snapshot.allocated, snapshot.state, snapshot.error);
             if let Some(reason) = warning(&snapshot, None) {
-                cowshed_os::eprintln!("cowshed: warning image {operation} before image={} reason={reason} extents_warn={EXTENTS_WARN} extents_delta_warn={EXTENTS_DELTA_WARN} allocated_bytes_warn={ALLOCATED_WARN} allocated_bytes_delta_warn={ALLOCATED_DELTA_WARN}", image.before.display());
+                cowshed_os::eprintln!("cowshed: warning image {operation} before image={} reason={reason} allocated_bytes_warn={ALLOCATED_WARN} allocated_bytes_delta_warn={ALLOCATED_DELTA_WARN}", image.before.display());
             }
             snapshot
         }).collect();
@@ -342,7 +247,7 @@ impl ImageTelemetry {
                     } else {
                         image.after
                     };
-                Snapshot::read(path, layout)
+                Snapshot::read(path)
             })
             .collect();
         let measurement_us = before_us + micros(measuring.elapsed());
@@ -362,14 +267,11 @@ impl ImageTelemetry {
                 image_path_before: image.before.display().to_string(),
                 image_path_after: image.after.display().to_string(),
                 image_state_before: before.state.into(),
-                extents_before: before.extents,
                 allocated_bytes_before: before.allocated,
                 process_id: std::process::id(),
                 process_io_write_bytes_before: io_before,
                 process_io_scope: IO_SCOPE.into(),
                 measurement_error_before: before.error.clone(),
-                extents_warn: EXTENTS_WARN,
-                extents_delta_warn: EXTENTS_DELTA_WARN,
                 allocated_bytes_warn: ALLOCATED_WARN,
                 allocated_bytes_delta_warn: ALLOCATED_DELTA_WARN,
                 ..ImageColumns::default()
@@ -392,8 +294,6 @@ impl ImageTelemetry {
                 });
             }
             columns.image_state_after = Some(after.state.into());
-            columns.extents_after = after.extents;
-            columns.extents_delta = delta(before.extents, after.extents);
             columns.allocated_bytes_after = after.allocated;
             columns.allocated_bytes_delta = delta(before.allocated, after.allocated);
             columns.elapsed_us = Some(elapsed_us);
@@ -405,12 +305,9 @@ impl ImageTelemetry {
             columns.measurement_error_after = after.error;
             columns.error = result.as_ref().err().map(ToString::to_string);
             cowshed_os::eprintln!(
-                "cowshed: image {operation} after image={} role={} extents_before={:?} extents_after={:?} extents_delta={:?} allocated_bytes_before={:?} allocated_bytes_after={:?} allocated_bytes_delta={:?} elapsed_us={elapsed_us} measurement_us={measurement_us} process_io_write_bytes_before={io_before:?} process_io_write_bytes_after={io_after:?} process_io_write_bytes_delta={:?} process_io_scope=\"{IO_SCOPE}\" process_io_error={io_error:?} measurement_error={:?} status={} error={:?}",
+                "cowshed: image {operation} after image={} role={} allocated_bytes_before={:?} allocated_bytes_after={:?} allocated_bytes_delta={:?} elapsed_us={elapsed_us} measurement_us={measurement_us} process_io_write_bytes_before={io_before:?} process_io_write_bytes_after={io_after:?} process_io_write_bytes_delta={:?} process_io_scope=\"{IO_SCOPE}\" process_io_error={io_error:?} measurement_error={:?} status={} error={:?}",
                 image.after.display(),
                 image.role,
-                columns.extents_before,
-                columns.extents_after,
-                columns.extents_delta,
                 columns.allocated_bytes_before,
                 columns.allocated_bytes_after,
                 columns.allocated_bytes_delta,
@@ -421,7 +318,7 @@ impl ImageTelemetry {
             );
             if let Some(reason) = &columns.warning_reason {
                 cowshed_os::eprintln!(
-                    "cowshed: warning image {operation} after image={} reason={reason} extents_warn={EXTENTS_WARN} extents_delta_warn={EXTENTS_DELTA_WARN} allocated_bytes_warn={ALLOCATED_WARN} allocated_bytes_delta_warn={ALLOCATED_DELTA_WARN}",
+                    "cowshed: warning image {operation} after image={} reason={reason} allocated_bytes_warn={ALLOCATED_WARN} allocated_bytes_delta_warn={ALLOCATED_DELTA_WARN}",
                     image.after.display()
                 );
                 rows.push(Row {
@@ -681,9 +578,7 @@ mod tests {
     use arrow_array::types::UInt8Type;
     use arrow_array::{Array, DictionaryArray, Int64Array, StringArray, UInt64Array};
     use arrow_ipc::reader::StreamReader;
-    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::fs::{self, File, OpenOptions};
-    use std::io::Write;
     use std::os::unix::fs::FileExt;
 
     struct Fixture(PathBuf);
@@ -763,80 +658,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires host-controller authority: run nx run cowshed:host-controller-test"]
-    fn host_controller_image_telemetry_large_native_extent_delta_emits_warning() {
-        let fixture = Fixture::new();
-        let image = fixture.0.join("image.dmg");
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&image)
-            .unwrap();
-        let block = vec![0x5a; 1 << 20];
-        for _ in 0..200 {
-            file.write_all(&block).unwrap();
-        }
-        file.sync_all().unwrap();
-        let holder = fixture.0.join("holder.dmg");
-        assert!(
-            std::process::Command::new("/bin/cp")
-                .arg("-c")
-                .arg(&image)
-                .arg(&holder)
-                .status_bounded()
-                .unwrap()
-                .success()
-        );
-        let before = extents::count_extents(&image).unwrap().get();
-        let telemetry = ImageTelemetry::new(&fixture.0);
-        telemetry
-            .measure(
-                "clone",
-                &[Image {
-                    role: "image",
-                    before: &image,
-                    after: &image,
-                }],
-                || {
-                    // Same CoW fragmentation witness as extents.rs: separated 16 KiB pages
-                    // rewritten while a clone retains their neighbours. No image attach.
-                    for offset in (0..200_u64 << 20).step_by(32 << 10) {
-                        file.write_all_at(&block[..16 << 10], offset)?;
-                    }
-                    file.sync_all()
-                },
-            )
-            .unwrap();
-        let after = extents::count_extents(&image).unwrap().get();
-        assert!(
-            after - before >= u64::try_from(EXTENTS_DELTA_WARN).unwrap(),
-            "{before} -> {after}"
-        );
-        drop(telemetry); // The last operation is sealed even before the ten-second timer.
-        let batches = fixture.batches();
-        assert_eq!(batches.len(), 1);
-        let batch = &batches[0];
-        let warned = (0..batch.num_rows())
-            .find(|&row| kind(batch, row) == "warn")
-            .unwrap();
-        assert_eq!(text(batch, "warning_reason", warned), Some("extent_delta"));
-        assert_eq!(unsigned(batch, "extents_before", warned), before);
-        assert_eq!(unsigned(batch, "extents_after", warned), after);
-        assert_eq!(
-            signed(batch, "extents_delta", warned),
-            i64::try_from(after - before).unwrap()
-        );
-        assert_eq!(text(batch, "process_io_scope", warned), Some(IO_SCOPE));
-        assert!(
-            batch
-                .column_by_name("process_io_write_bytes_delta")
-                .unwrap()
-                .is_valid(warned)
-        );
-    }
-
-    #[test]
     fn image_telemetry_small_delta_no_warning_and_rename_is_not_reclamation() {
         let fixture = Fixture::new();
         let image = fixture.0.join("image.dmg");
@@ -889,18 +710,23 @@ mod tests {
         );
     }
 
-    /// A release reads the image's allocation and never walks its extent map: its commit never
-    /// opens the image, and a released build image's map took 2.5-10.6 s to walk inside `rm`.
-    /// The extent columns are null with their cause; the allocation is measured.
     #[test]
-    fn image_telemetry_release_reads_allocation_and_walks_no_extents() {
+    fn image_telemetry_release_reports_committed_allocation() {
         let fixture = Fixture::new();
         let image = fixture.0.join("image.dmg");
         fs::write(&image, [0x5a; 8192]).unwrap();
         let entry = fixture.0.join("released.dmg");
         let telemetry = ImageTelemetry::new(&fixture.0);
         telemetry
-            .measure_release(&image, || fs::rename(&image, &entry))
+            .measure(
+                "retire",
+                &[Image {
+                    role: "image",
+                    before: &image,
+                    after: &image,
+                }],
+                || fs::rename(&image, &entry),
+            )
             .unwrap();
         drop(telemetry);
         let batches = fixture.batches();
@@ -908,49 +734,60 @@ mod tests {
         let ended = (0..batch.num_rows())
             .find(|&row| kind(batch, row) == "span-ok")
             .unwrap();
-        assert!(
-            batch
-                .column_by_name("extents_before")
-                .unwrap()
-                .is_null(ended)
-        );
-        assert_eq!(
-            text(batch, "measurement_error_before", ended),
-            Some(UNWALKED)
-        );
+        assert_eq!(text(batch, "measurement_error_before", ended), None);
         assert!(unsigned(batch, "allocated_bytes_before", ended) > 0);
         assert_eq!(text(batch, "image_state_after", ended), Some("absent"));
+        assert_eq!(text(batch, "process_io_scope", ended), Some(IO_SCOPE));
+        for column in [
+            "elapsed_us",
+            "measurement_us",
+            "process_io_write_bytes_delta",
+        ] {
+            assert!(
+                batch.column_by_name(column).unwrap().is_valid(ended),
+                "{column}"
+            );
+        }
     }
 
     #[test]
-    fn image_telemetry_absolute_and_delta_thresholds_are_independent() {
-        let snapshot = |extents, allocated| Snapshot {
-            extents: Some(extents),
+    fn image_telemetry_schema_exposes_no_extent_measurements() {
+        for field in image_fields() {
+            assert!(
+                !field.name().starts_with("extent"),
+                "unconsumed extent observation: {}",
+                field.name(),
+            );
+        }
+    }
+
+    #[test]
+    fn image_telemetry_allocation_thresholds_are_independent() {
+        let snapshot = |allocated| Snapshot {
             allocated: Some(allocated),
             state: "present",
             error: None,
         };
-        let high = snapshot(EXTENTS_WARN, 0);
-        assert_eq!(
-            warning(&high, Some(&high)).as_deref(),
-            Some("extent_absolute")
-        );
-        assert_eq!(warning(&snapshot(EXTENTS_WARN - 1, 0), None), None);
-        let low = snapshot(1, 0);
-        assert_eq!(
-            warning(&snapshot(10_001, 0), Some(&low)).as_deref(),
-            Some("extent_delta")
-        );
-        assert_eq!(warning(&snapshot(10_000, 0), Some(&low)), None);
-        assert_eq!(
-            warning(&snapshot(1, ALLOCATED_WARN), None).as_deref(),
-            Some("allocated_absolute")
-        );
-        assert_eq!(
-            warning(&snapshot(1, 8 << 30), Some(&low)).as_deref(),
-            Some("allocated_delta")
-        );
-        assert_eq!(warning(&low, Some(&high)), None, "shrinking is not growth");
+        let growth = u64::try_from(ALLOCATED_DELTA_WARN).expect("growth threshold is positive");
+        for (allocated, before, expected) in [
+            (0, None, None),
+            (ALLOCATED_WARN - 1, None, None),
+            (ALLOCATED_WARN, None, Some("allocated_absolute")),
+            (
+                ALLOCATED_WARN,
+                Some(0),
+                Some("allocated_absolute,allocated_delta"),
+            ),
+            (growth, Some(0), Some("allocated_delta")),
+            (growth - 1, Some(0), None),
+            (0, Some(ALLOCATED_WARN), None),
+        ] {
+            assert_eq!(
+                warning(&snapshot(allocated), before.map(snapshot).as_ref()).as_deref(),
+                expected,
+                "allocated={allocated} before={before:?}",
+            );
+        }
     }
 
     #[test]
@@ -1224,17 +1061,15 @@ mod tests {
                 let operation = text(batch, "operation", row).unwrap();
                 *counts.entry(operation).or_insert(0) += 1;
                 if operation == "retire" {
-                    // A release frees the whole image before it answers.
+                    // A release removes the image from its live name before it answers.
                     assert_eq!(text(batch, "image_state_after", row), Some("absent"));
                     assert_eq!(unsigned(batch, "allocated_bytes_after", row), 0);
                     assert_eq!(signed(batch, "allocated_bytes_delta", row), -8192);
                 } else {
-                    assert!(unsigned(batch, "extents_after", row) > 0);
                     assert_eq!(unsigned(batch, "allocated_bytes_after", row), 8192);
                 }
                 if text(batch, "image_role", row) == Some("destination") {
                     assert_eq!(text(batch, "image_state_before", row), Some("absent"));
-                    assert_eq!(unsigned(batch, "extents_before", row), 0);
                 }
             }
         }

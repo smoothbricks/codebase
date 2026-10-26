@@ -392,10 +392,11 @@ which every fork of the target holds while it clones the seed, so a reseed never
    the snapshot; its later writes make the seed behind again. Dropping the capture claim only unlocks the source's hold;
    it never retires or deletes the source.
 
-Native capture, clone and release operations record each image's extent count and allocated bytes before and after,
-their signed deltas, operation and measurement time, and explicitly process-window disk-write bytes. Absolute extent
-count and growth warn separately, before a high-count image costs another fork its extent-map copy. See 13_telemetry.md,
-"Native image observations", for thresholds and their measured basis, Arrow fields, batching and queries.
+Native capture, clone and release operations record each image's allocated bytes before and after, their signed delta,
+operation and measurement time, and explicitly process-window disk-write bytes. Telemetry walks no extent map: nothing
+consumed those counts, and their three walks cost about 85 seconds around an 81 ms seed clone under concurrent forks.
+Compaction, doctor and forkability retain their required counts. See 13_telemetry.md, "Native image observations", for
+allocation thresholds, the measured basis, Arrow fields, batching and queries.
 
 Land already owns a shared GC hold on its quiet source. Its typed quiet capture retains the stopped supervisor socket
 lease that refuses replacement admission, from before the jobs stop through capture and adoption. It does not take a

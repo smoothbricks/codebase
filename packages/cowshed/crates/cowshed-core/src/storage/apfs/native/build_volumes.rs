@@ -127,17 +127,6 @@ pub struct Refusal {
     pub forced: bool,
 }
 
-/// What a build volume capture's telemetry reads of its source and destination images
-/// (13_telemetry.md, "Native image observations").
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Observed {
-    /// Both extent maps and allocations: every capture outside a fork's source lock.
-    Walked,
-    /// Their allocation alone: a fork's capture runs under its source's image lock, and a walk
-    /// of a seed's map, 880,000 extents on a long-used main, would hold that lock seconds more.
-    /// The clone's map equals the seed's, which its own capture walked.
-    UnderSourceLock,
-}
 impl<R> MacOsApfsExecutionHost<R>
 where
     R: CommandRunner + Send + Sync + 'static,
@@ -308,21 +297,14 @@ where
         registration: &Registration,
         mount: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
-        let captured = self.capture_build_volume_under_hold(
-            layout,
-            source,
-            destination,
-            registration,
-            mount,
-            Observed::Walked,
-        )?;
+        let captured =
+            self.capture_build_volume_under_hold(layout, source, destination, registration, mount)?;
         self.finish_captured_build_volume(layout, captured)
     }
 
     /// Register `destination` and capture `source` into it, nothing more: the step a fork takes
-    /// under its source's image lock. A seed source must be published. `observed` says whether
-    /// the capture's telemetry walks both images' extent maps or reads their allocation alone.
-    /// A failure releases what was registered.
+    /// under its source's image lock. A seed source must be published. A failure releases
+    /// what was registered.
     fn capture_build_volume_under_hold(
         &self,
         layout: &BuildVolumeLayout,
@@ -330,7 +312,6 @@ where
         destination: &BuildVolumeId,
         registration: &Registration,
         mount: Option<&Path>,
-        observed: Observed,
     ) -> Result<CapturedBuildVolume, ApfsStorageError> {
         let from = layout.image(source);
         let to = layout.image(destination);
@@ -364,13 +345,10 @@ where
             },
         ];
         let capture = || self.capture_build_seed(&from, mount, &to);
-        let captured = match observed {
-            Observed::Walked => self.image_telemetry.measure(operation, &images, capture),
-            Observed::UnderSourceLock => self
-                .image_telemetry
-                .measure_under_source_lock(operation, &images, capture),
-        }
-        .and_then(|()| written_at(&to));
+        let captured = self
+            .image_telemetry
+            .measure(operation, &images, capture)
+            .and_then(|()| written_at(&to));
         match captured {
             Ok(written) => Ok(CapturedBuildVolume {
                 id: destination.clone(),
@@ -534,7 +512,6 @@ where
             &BuildVolumeId::mint(),
             registration,
             None,
-            Observed::UnderSourceLock,
         )
     }
 
@@ -902,11 +879,19 @@ where
             }
             self.backend.detach(&attachment, DetachIntent::Release)?;
         }
-        let removed = self.image_telemetry.measure_release(&image, || {
-            layout
-                .release_image(id)
-                .map_err(|error| io_error("release a build volume image", &image, error))
-        })?;
+        let removed = self.image_telemetry.measure(
+            "retire",
+            &[Image {
+                role: "image",
+                before: &image,
+                after: &image,
+            }],
+            || {
+                layout
+                    .release_image(id)
+                    .map_err(|error| io_error("release a build volume image", &image, error))
+            },
+        )?;
         if removed {
             layout.journal_release(id, recorded.as_ref(), true);
             self.nudge_cleanup(&layout.released(id));
