@@ -79,8 +79,8 @@ Notes for harness integration:
   repository; exit 4 means the name is taken — pick another instead of retrying the same name.
 - The workspace branch is `cowshed/<name>`; `cowshed push` delivers it to the main repo's refs, where a human (or a
   merge queue) takes over. Never push to main's checked-out branch.
-- `cowshed rm` refuses (exit 4) unless `main` already contains the workspace's `HEAD` and every other local branch, or
-  the ref `cowshed push` wrote for one keeps it — the image about to be deleted is where those commits live, so the
+- `cowshed rm` refuses (exit 4) unless each local branch of the workspace, `HEAD`'s first, is contained by `main` or
+  kept by the ref `cowshed push` wrote for it — the image about to be deleted is where those commits live, so the
   refusal is your signal that work would be lost. Land it, or push it for review. `--force` overrides only _transient_
   state (dirty tree, in-progress merge, the workspace's own running jobs; never a process cowshed does not run holding
   the mount) and deliberately cannot get past this gate; `--abandon` is the sole authorization for destroying unlanded

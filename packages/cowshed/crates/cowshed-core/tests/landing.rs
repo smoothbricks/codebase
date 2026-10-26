@@ -1330,6 +1330,19 @@ async fn a_push_ref_naming_a_commit_main_cannot_see_keeps_nothing() {
     let heads = fixture.parent().join(".git/refs/cowshed/topic/heads");
     fs::create_dir_all(&heads).expect("the ref's directory");
     fs::write(heads.join("topic"), format!("{head}\n")).expect("a ref naming the head");
+    assert_eq!(
+        git(
+            fixture.parent(),
+            [
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/cowshed/topic"
+            ]
+        )
+        .trim(),
+        head,
+        "git lists the planted ref, so the measurement below reads it"
+    );
 
     let landing = measured(&fixture, &mount).await;
 

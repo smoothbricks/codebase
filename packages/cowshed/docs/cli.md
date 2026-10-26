@@ -625,10 +625,11 @@ whatever main changed since. Patch identity: main holds a patch-equivalent commi
 since edited the same lines. Work main took by squash, cherry-pick, a rewrite or a conflict-resolved pick is landed. A
 `HEAD` main lacks also passes when the ref `cowshed push` wrote for its checked-out branch,
 `refs/cowshed/<name>/heads/<branch>`, is that commit or a descendant of it: main's repository holds the commits then, so
-a workspace pushed for review retires with no flag. A `HEAD` committed past its ref, or detached, is not kept, and a
-dirty tree still refuses first. The refusal names main's tip, each file whose change main lacks with why (`missing`,
-`conflict`, `added`, `deleted`, `changed`, `mode`, `unmergeable`; ten, then a count), the commits held by neither proof
-with their subjects (ten, then a count), and points at `cowshed land <ws>`.
+a workspace pushed for review retires with no flag (`cowshed push <name>` keeps `cowshed/<name>`, a fork's one branch;
+`--branch` names another). A `HEAD` committed past its ref, or detached, is not kept, and a dirty tree still refuses
+first. The refusal names main's tip, each file whose change main lacks with why (`missing`, `conflict`, `added`,
+`deleted`, `changed`, `mode`, `unmergeable`; ten, then a count), the commits held by neither proof with their subjects
+(ten, then a count), and points at `cowshed land <ws>`.
 
 The project-open `cowshed: info: leaving … unfinished lifecycle operations …` line concerns other workspaces outside
 this command's recovery scope. It explicitly says those operations do not block this command; `cowshed doctor` lists
