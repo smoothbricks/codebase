@@ -26,43 +26,35 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::io::AsyncRead;
 
-/// The class an exec is admitted under: one row of 05_gateway.md "Bands", fixing at the job's
-/// birth both its place in the token order and the nice it runs at. It is the exec's own axis,
-/// apart from the ledger's wire class ([`cowshed_gateway_types::JobserverClass`]): interactive
-/// asks the ledger as background and a resident asks with its own operation, so neither reaches
-/// the ledger as a class of its own.
+/// The class an exec is admitted under (05_gateway.md "Classes"), fixed at the job's birth. It
+/// sets the nice the job's command runs at and whether memory pressure makes the job wait or ends
+/// it; it grants no CPU, since the kernel schedules every class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecClass {
-    /// Every other exec, the default: checkout fairness behind the gate, within the whole host
-    /// with the tokens that gate-class asks leave free, served after them, at nice +10.
+    /// Every other exec, the default: nice +10. It waits while the host reports memory pressure,
+    /// and macOS ends the youngest such job first at Critical.
     #[default]
     Background,
-    /// Work a person or model is waiting on, declared by the requester that awaits its result:
-    /// it asks the ledger as background and runs at the supervisor's own nice, above the gate. A worker may ask
-    /// for it, since it buys a band and no token.
+    /// Work a person or model is waiting on, declared by the requester that awaits its result: it
+    /// runs at the supervisor's own nice and never waits on memory pressure. A worker may ask for it.
     Interactive,
-    /// A land's gate job and every task its pool relays: first for returned tokens, at nice +5.
-    /// Only the trusted coordinator route admits it.
+    /// A land's gate job, a train's proof and the jobs a land's steps start: nice +5, never
+    /// CPU-limited, and never made to wait or ended for memory. Only the trusted coordinator route admits it.
     Gate,
     /// A process that stays up to serve requests -- the Nx daemon a shed's supervisor keeps, a
-    /// worker that runs each request it is sent -- and is idle between them. It holds no token
-    /// for its lifetime: its grant is a pool that holds none and asks the host ledger, at
-    /// background class for its checkout, for each descendant that asks it, so a resident costs
-    /// tokens only while a request of its runs (05_gateway.md "A resident holds no token"). It
-    /// runs at background nice and names no want.
+    /// worker that runs each request it is sent -- and is idle between them. It runs at background
+    /// nice, starts at once, and macOS ends it first at Critical memory pressure (05_gateway.md "Classes").
     Resident,
-    /// A resident that serves work a person or model is waiting on -- a worker whose requests
-    /// are focused checks a session awaits. It differs from [`ExecClass::Resident`] in its nice
-    /// alone: it runs at the supervisor's own nice, the interactive band, and holds no token, its pool asking the
-    /// host ledger at background class exactly as a resident's does (05_gateway.md "A resident
-    /// holds no token", "Bands"). A worker may ask for it, and it names no want.
+    /// A resident that serves work a person or model is waiting on -- a worker whose requests are
+    /// focused checks a session awaits. It differs from [`ExecClass::Resident`] in running at the
+    /// supervisor's own nice, and it is never ended for memory (05_gateway.md "Classes").
     InteractiveResident,
 }
 
 impl ExecClass {
-    /// Whether this class is admitted as a resident: with a pool that holds no token, whose
-    /// descendants each ask the host ledger (05_gateway.md "A resident holds no token").
+    /// Whether this class is admitted as a resident: a process that stays up to serve requests and
+    /// is idle between them (05_gateway.md "Classes").
     pub const fn is_resident(self) -> bool {
         matches!(self, Self::Resident | Self::InteractiveResident)
     }
@@ -2354,9 +2346,9 @@ pub struct JobInfo {
     /// Set only for a job that failed before its command ran, for a reason its exit status
     /// cannot name.
     pub failure: Option<JobFailure>,
-    /// The class the job was admitted under (05_gateway.md "Bands"): background unless its
+    /// The class the job was admitted under (05_gateway.md "Classes"): background unless its
     /// requester declared it interactive, a trusted coordinator route admitted it as a gate, or
-    /// it was admitted as a resident that holds no token.
+    /// it was admitted as a resident or an interactive resident.
     pub class: ExecClass,
     /// Where the job's command ran: the workspace sandbox, or a coordinator's host gate.
     pub scope: ExecScope,
@@ -2364,9 +2356,6 @@ pub struct JobInfo {
     /// at 0, a gate at +5, background and a resident at +10. Absent before the command exists and
     /// for a job whose command was never observed; never inferred from the class.
     pub nice: Option<i32>,
-    /// The CPU tokens the job's gateway grant held. Absent until a grant is held, and for a
-    /// resident, which holds none.
-    pub cpu_tokens: Option<NonZeroUsize>,
     /// What held the job's process membership while its retirement proved the membership empty,
     /// and so how far that proof reaches ([`JobContainment`]). Stated once retirement has begun
     /// and its proof exists: `draining` or terminal. Absent while the job queues or runs, for a
@@ -2462,8 +2451,8 @@ impl JobInfo {
             | (JobState::Killed, Some(_))
             | (JobState::OutputLimit | JobState::Failed, _)
             | (JobState::Queued | JobState::Running | JobState::Draining, None) => {}
-            // Killed before its command existed -- withdrawn while queued for its CPU grant
-            // (11_shell.md "Server-owned CPU admission and nice placement"): it never ran, so it
+            // Killed before its command existed -- withdrawn while queued for CPU admission
+            // (11_shell.md "Job admission and class placement"): it never ran, so it
             // has no status. A job that owned a process has a pid and keeps the status it ended
             // with, so "never ran" and "ran and was killed" stay distinct.
             (JobState::Killed, None) if self.pid.is_none() => {}
@@ -2514,8 +2503,6 @@ struct JobInfoRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     nice: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cpu_tokens: Option<NonZeroUsize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     containment: Option<&'a JobContainment>,
     #[serde(skip_serializing_if = "<[OutlivedProcess]>::is_empty")]
     outlived: &'a [OutlivedProcess],
@@ -2561,8 +2548,6 @@ struct JobInfoWire {
     #[serde(default)]
     nice: Option<i32>,
     #[serde(default)]
-    cpu_tokens: Option<NonZeroUsize>,
-    #[serde(default)]
     containment: Option<JobContainment>,
     #[serde(default)]
     outlived: Vec<OutlivedProcess>,
@@ -2600,7 +2585,6 @@ impl Serialize for JobInfo {
             class: self.class,
             scope: self.scope,
             nice: self.nice,
-            cpu_tokens: self.cpu_tokens,
             containment: self.containment.as_ref(),
             outlived: &self.outlived,
             outlived_incomplete: self.outlived_incomplete,
@@ -2642,7 +2626,6 @@ impl<'de> Deserialize<'de> for JobInfo {
             class: wire.class,
             scope: wire.scope,
             nice: wire.nice,
-            cpu_tokens: wire.cpu_tokens,
             containment: wire.containment,
             outlived: wire.outlived,
             outlived_incomplete: wire.outlived_incomplete,
@@ -2676,8 +2659,6 @@ pub struct SealedJob {
     pub scope: ExecScope,
     /// The nice the job's command was observed at, as JobInfo.nice.
     pub nice: Option<i32>,
-    /// The CPU tokens the job's grant held, as JobInfo.cpu_tokens.
-    pub cpu_tokens: Option<NonZeroUsize>,
     /// What held the job's process membership while retirement proved it empty, as
     /// JobInfo.containment: absent for a job that never owned a process, for one whose supervisor
     /// owns no native membership, and for a record sealed without the proof.
@@ -2729,8 +2710,6 @@ struct SealedJobRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     nice: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cpu_tokens: Option<NonZeroUsize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     containment: Option<&'a JobContainment>,
     #[serde(skip_serializing_if = "<[OutlivedProcess]>::is_empty")]
     outlived: &'a [OutlivedProcess],
@@ -2755,8 +2734,6 @@ struct SealedJobWire {
     scope: ExecScope,
     #[serde(default)]
     nice: Option<i32>,
-    #[serde(default)]
-    cpu_tokens: Option<NonZeroUsize>,
     #[serde(default)]
     containment: Option<JobContainment>,
     #[serde(default)]
@@ -2784,7 +2761,6 @@ impl Serialize for SealedJob {
             class: self.class,
             scope: self.scope,
             nice: self.nice,
-            cpu_tokens: self.cpu_tokens,
             containment: self.containment.as_ref(),
             outlived: &self.outlived,
             outlived_incomplete: self.outlived_incomplete,
@@ -2812,7 +2788,6 @@ impl<'de> Deserialize<'de> for SealedJob {
             class: wire.class,
             scope: wire.scope,
             nice: wire.nice,
-            cpu_tokens: wire.cpu_tokens,
             containment: wire.containment,
             outlived: wire.outlived,
             outlived_incomplete: wire.outlived_incomplete,
@@ -3170,11 +3145,16 @@ pub enum JobFailure {
     /// The supervisor running the job ended without seeing it end. Recovery sealed its terminal
     /// record; any process group it could not safely identify remains diagnosed in the ledger.
     SupervisorLost,
-    /// The job's host CPU admission failed before its command ran: the gateway refused it or was
-    /// unreachable, or its grant was lost. The cause is on stderr.
+    /// The job's admission failed before its command ran: its class is not the caller's to ask,
+    /// its jobserver fifo could not be made, or the host's memory pressure, which a background
+    /// start waits on, could not be read. The cause is on stderr.
     CpuAdmission,
     /// The nice of the job's owned command could not be set, so the command never ran.
     Priority,
+    /// A background or resident job was ended because the host reached critical memory pressure
+    /// (macOS); its stderr names the pressure level and the job's resident memory (05_gateway.md
+    /// "Memory pressure").
+    Memory,
     /// The job's command was never launched for any other reason: a program, `#!` interpreter
     /// or `env` name proven absent before the spawn, a held child the observer refused before
     /// its exec, or a host that could not launch it (it could not be started or broke protocol).
@@ -3197,14 +3177,13 @@ pub struct ExecRequest {
     /// Names this exec for idempotent admission: a repeat with the same key and request answers
     /// the job the first admitted, and never spawns again.
     pub admission_key: Option<AdmissionKey>,
-    /// The class the command is admitted under (05_gateway.md "Bands"): background by default,
+    /// The class the command is admitted under (05_gateway.md "Classes"): background by default,
     /// interactive when its requester awaits its result, a gate when a trusted coordinator route
-    /// asks for one, or a resident that holds no token.
+    /// asks for one, or a resident.
     pub class: ExecClass,
-    /// The most CPU tokens the command can use at once; its grant is between one and this count.
-    /// `None` asks for its class's own (`JobScheduling::requested`): the background share of the
-    /// host for background and interactive work, one token for a gate. A resident holds none
-    /// and names none.
+    /// The most compiler and test threads the command's jobserver holds; `None` holds the host's
+    /// cores, and a larger want is held to them (`JobScheduling::requested`, 05_gateway.md
+    /// "Parallelism inside a job").
     pub want: Option<NonZeroUsize>,
     /// Where the command runs: the workspace sandbox, or a coordinator's host boundary outside it.
     pub scope: ExecScope,
@@ -4670,10 +4649,11 @@ pub struct GatewayStatus {
     /// 0.1.0 across every build, so only the executables' contents can tell them apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_daemon: Option<StaleDaemonBinary>,
-    /// The host CPU ledger the answering daemon serves on `cpu-budget`, or why it gave none.
-    /// Absent when no daemon answered `status`.
+    /// The host's scheduling as its kernel, its workspace supervisors and its store report it
+    /// (05_gateway.md "Status"), read by the CLI beside the daemon. Absent from an install's
+    /// health wait, which reads none of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_budget: Option<GatewayCpuBudget>,
+    pub scheduling: Option<HostScheduling>,
     /// True while an install holds the install slot (`dev.cowshed/install.lock`), read without
     /// taking it (05_gateway.md "A pending install is visible"). Absent on the wire while free.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -4699,15 +4679,6 @@ pub struct LandTurnQueue {
     pub abandoned: Vec<crate::land_turn::TurnEvent>,
 }
 
-/// One gate job that holds or wants CPU tokens, as the gateway's `gates_in_flight` names it.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GateJobRef {
-    /// The gate job's admission number: the smaller is the older job.
-    pub job: u64,
-    pub checkout: String,
-}
-
 /// The daemon and CLI executables, when their contents differ.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -4719,18 +4690,58 @@ pub struct StaleDaemonBinary {
     pub cli_sha256: String,
 }
 
-/// What `gateway status` read of the host CPU budget (05_gateway.md "Host CPU budget"): the
-/// daemon's own ledger, or the reason a daemon that answered `status` did not answer `cpu-budget`
-/// — never an empty ledger standing in for one it could not read.
+/// What `gateway status` reads of the host's scheduling (05_gateway.md "Status"). Every number is
+/// a reading of the kernel, a supervisor's job list or a store listing, never a count of cowshed's
+/// own, and a reading that failed says why instead of standing in as zero.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub enum GatewayCpuBudget {
-    /// Tokens held and total, each checkout's runners, and the waiting gate-class requests in
-    /// the order returned tokens go to them.
-    Ledger(cowshed_gateway_types::CpuBudgetStatus),
-    /// The daemon's refusal or the transport failure, as the control client reports it: a daemon
-    /// from before `cpu-budget` existed refuses the request it does not know.
-    Unanswered(String),
+pub struct HostScheduling {
+    /// Load, memory pressure and swap, as the kernel reports them.
+    pub readings: cowshed_gateway_types::host_status::HostReadings,
+    /// The jobs every live workspace supervisor lists.
+    pub jobs: HostJobs,
+    /// Released images the store's `.deleting` directories hold for the gateway's cleanup.
+    pub image_cleanup: ImageCleanup,
+}
+
+/// The jobs of every live workspace supervisor on the host, counted by class and state.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostJobs {
+    /// One row per class and state that has a job: queued, running or draining.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub counts: Vec<JobCount>,
+    /// The supervisors whose job list could not be read: their jobs are in no count.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unanswered: Vec<UnansweredSupervisor>,
+}
+
+/// How many of the host's live jobs have one class and one state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobCount {
+    pub class: ExecClass,
+    pub state: JobState,
+    pub jobs: u64,
+}
+
+/// A workspace supervisor socket whose job list could not be read, and why.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnansweredSupervisor {
+    pub socket: PathBuf,
+    pub error: String,
+}
+
+/// The released images waiting for the gateway's one-at-a-time cleanup (05_gateway.md "Deleting
+/// released images"), as a listing of the store's `.deleting` directories finds them.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageCleanup {
+    pub waiting: u64,
+    /// Each directory the listing could not read, with why: its images are in no count.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread: Vec<String>,
 }
 
 /// Health of the host-owned sccache LaunchAgent.

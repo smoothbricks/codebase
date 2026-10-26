@@ -95,11 +95,6 @@ pub trait GatewayControl: Send + Sync {
         workspace_id: &str,
         expected_revision: u64,
     ) -> std::result::Result<(), ControlRefusal>;
-    /// The gate jobs holding or waiting for CPU tokens (`cpu-budget`): a seed compaction's copy
-    /// holds while any runs (16_build_volumes.md, "Seed compaction"). No daemon runs none.
-    async fn gates_in_flight(
-        &self,
-    ) -> std::result::Result<BTreeSet<crate::api::dto::GateJobRef>, GatewayStatusError>;
 }
 
 /// The composition root constructs one owned control client from validated host storage.

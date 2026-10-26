@@ -23,6 +23,7 @@ pub mod live_membership;
 #[cfg(target_os = "macos")]
 pub(crate) mod mount_activity;
 pub(crate) mod nx_daemon;
+pub mod placement;
 #[cfg(target_os = "macos")]
 pub mod process_events;
 #[cfg(target_os = "macos")]

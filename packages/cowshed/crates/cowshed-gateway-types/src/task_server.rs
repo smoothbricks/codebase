@@ -2,19 +2,18 @@
 //! runs under, and the queue view the scheduler reports (specs/cowshed/05_gateway.md, "The task
 //! server schedules work units").
 //!
-//! A client writes one `TaskAdmitRequest` line and keeps the connection open, exactly like a
-//! `cpu-tokens` request: the gateway answers `queued` at once and a granted `TaskGrant` when the
-//! deterministic scheduler selects the unit and, where it asked for CPU, the host budget has
-//! granted it. `TaskTerminalRequest` records the unit's outcome as a fact, and `TaskQueueStatus`
-//! reports the whole fold: the ready order, what each waiting unit waits on, what holds each
-//! lease, and the host CPU ledger as an observation — never as an allocation.
+//! A client writes one `TaskAdmitRequest` line and keeps the connection open: the gateway answers
+//! `queued` at once and a granted `TaskGrant` when the deterministic scheduler selects the unit.
+//! The grant allocates nothing: the kernel schedules CPU among every runnable process, and the
+//! grant names the run's band and its declared ceiling. `TaskTerminalRequest` records the unit's
+//! outcome as a fact, and `TaskQueueStatus` reports the whole fold: the ready order with what
+//! holds each ready unit back, what each waiting unit waits on, and what holds each lease.
 
 use std::fmt;
-use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cpu_budget::CpuBudgetStatus;
+use crate::host_status::MemoryPressureReading;
 
 /// The control operation that admits a work unit and holds its attempt.
 pub const TASK_ADMIT_OP: &str = "task-admit";
@@ -23,11 +22,11 @@ pub const TASK_TERMINAL_OP: &str = "task-terminal";
 /// The control operation that reports the scheduler's queue.
 pub const TASK_QUEUE_OP: &str = "task-queue";
 
-/// What a work unit runs as: one row of specs/cowshed/05_gateway.md "Bands" (the owner's ruling,
-/// 2026-10-17). Interactive is work a person or model is waiting on; gate is the land's gate job and
-/// the work it relays, the land turn's holder included; background is every other unit. Gate-class
-/// work is ordered first for CPU; interactive and background work wait behind it while the host is
-/// busy and run at parity when it is not.
+/// What a work unit runs as. Interactive is work a person or model is waiting on; gate is the
+/// land's gate job and the work it relays, the land turn's holder included; background is every
+/// other unit. Gate-class work is selected first; interactive and background work follow it. A
+/// background unit is not selected while the host is under memory pressure (05_gateway.md "Host
+/// scheduling", "Memory pressure").
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskClass {
@@ -38,8 +37,8 @@ pub enum TaskClass {
 }
 
 impl TaskClass {
-    /// The band this class runs in, its row of "Bands": interactive foreground, gate normal,
-    /// background background. The band follows the class alone, whatever the host's state.
+    /// The band this class runs in: interactive foreground, gate normal, background background.
+    /// The band follows the class alone, whatever the host's state.
     pub const fn band(self) -> TaskBand {
         match self {
             Self::Interactive => TaskBand::Foreground,
@@ -50,8 +49,8 @@ impl TaskClass {
 }
 
 /// The band a granted run is placed in, fixed by its class (`TaskClass::band`): foreground above
-/// normal above background, as the nice each band runs at orders them (05_gateway.md "Bands").
-/// The server owns placement, and no caller field but the class chooses it.
+/// normal above background, as the kernel weight each band runs at orders them. The server owns
+/// placement, and no caller field but the class chooses it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskBand {
@@ -62,8 +61,8 @@ pub enum TaskBand {
 
 /// A serialization class a unit's run holds from its selection until its terminal fact: the
 /// turns the operator keeps by hand today. One `cowshed new` at a time, image windows serialized,
-/// and one checked land publication at a time. They bound serialized windows, never CPU: parallel
-/// preparation and gates are bounded by the host CPU budget alone.
+/// and one checked land publication at a time. They bound serialized windows, never CPU: the
+/// kernel schedules CPU.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LeaseClass {
@@ -124,14 +123,13 @@ impl fmt::Display for TaskOutcome {
 }
 
 /// The one line a client writes to admit a unit and hold its attempt:
-/// `{"op":"task-admit","unit":"…","owner":"…","want":8,"command":"…"}`.
+/// `{"op":"task-admit","unit":"…","owner":"…","command":"…"}`.
 ///
 /// `deps` names the units that must land before this one is ready; `leases` the serialization
-/// classes the run holds while it runs; `want` the CPU tokens it would use, where 0 asks for
-/// none. `priority` is the coordinator's priority (higher first, default 0) and `urgent` its
-/// "land now" override, which outranks every leverage. `cost` is the predicted resource cost and
-/// `deadline` the cache-domain deadline in epoch milliseconds; observations a client does not
-/// have stay absent and sort behind known ones, never invented.
+/// classes the run holds while it runs. `priority` is the coordinator's priority (higher first,
+/// default 0) and `urgent` its "land now" override, which outranks every leverage. `deadline` is
+/// the cache-domain deadline in epoch milliseconds; a client that has none leaves it absent, and
+/// it sorts behind known ones, never invented.
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskAdmitRequest<'a> {
     op: &'static str,
@@ -144,7 +142,6 @@ pub struct TaskAdmitRequest<'a> {
     pub deps: Vec<&'a str>,
     #[serde(skip_serializing_if = "leases_are_empty")]
     pub leases: Vec<LeaseClass>,
-    pub want: usize,
     #[serde(skip_serializing_if = "priority_is_zero")]
     pub priority: u32,
     #[serde(skip_serializing_if = "is_false")]
@@ -152,10 +149,8 @@ pub struct TaskAdmitRequest<'a> {
     #[serde(skip_serializing_if = "is_gate")]
     pub class: TaskClass,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline: Option<u64>,
-    /// The run's own parallelism ceiling, clamped to its grant; never a grant of its own.
+    /// The run's own parallelism ceiling, reported on its grant as declared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caps: Option<TaskRunCaps>,
     pub command: &'a str,
@@ -163,7 +158,7 @@ pub struct TaskAdmitRequest<'a> {
 
 impl<'a> TaskAdmitRequest<'a> {
     /// A gate-class unit with no leases, priority or observations.
-    pub fn new(unit: &'a str, owner: &'a str, want: usize, command: &'a str) -> Self {
+    pub fn new(unit: &'a str, owner: &'a str, command: &'a str) -> Self {
         Self {
             op: TASK_ADMIT_OP,
             unit,
@@ -171,11 +166,9 @@ impl<'a> TaskAdmitRequest<'a> {
             incarnation: None,
             deps: Vec::new(),
             leases: Vec::new(),
-            want,
             priority: 0,
             urgent: false,
             class: TaskClass::default(),
-            cost: None,
             deadline: None,
             caps: None,
             command,
@@ -184,7 +177,7 @@ impl<'a> TaskAdmitRequest<'a> {
 }
 
 /// The one line a client writes to record a unit's terminal outcome: the fact every dependent
-/// reads, and the release of the unit's lease classes and CPU grant.
+/// reads, and the release of the unit's lease classes.
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskTerminalRequest<'a> {
     op: &'static str,
@@ -202,9 +195,8 @@ impl<'a> TaskTerminalRequest<'a> {
     }
 }
 
-/// A run's own parallelism ceiling, declared with its facts and reported on its grant clamped to
-/// the CPU tokens the grant holds: a clamp on the run's own parallelism, never a grant and never
-/// a scheduler default. Leaf controls derive from the grant; the ceiling only bounds them.
+/// A run's own parallelism ceiling, declared with its facts and reported on its grant as declared:
+/// a bound the run applies to itself, never a grant and never a scheduler default.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskRunCaps {
@@ -216,9 +208,7 @@ pub struct TaskRunCaps {
     pub test_threads: usize,
 }
 
-/// What a granted unit runs under: its band, its ceiling, and the CPU tokens the host budget
-/// granted it — the grant being the only allocation authority. A unit that asked for no CPU
-/// carries no tokens.
+/// What a granted unit runs under: its band and its declared ceiling.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskGrant {
@@ -226,8 +216,6 @@ pub struct TaskGrant {
     pub band: TaskBand,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caps: Option<TaskRunCaps>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_tokens: Option<NonZeroUsize>,
 }
 
 /// One ready unit in the order the scheduler would grant it next.
@@ -247,6 +235,10 @@ pub struct TaskReadyStatus {
     /// Lease classes it needs that are currently full; empty when nothing but its turn blocks it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_leases: Vec<TaskLeaseWait>,
+    /// Why it is held for memory: the pressure reading under which a background unit waits, or why
+    /// the reading could not be taken. An unreadable reading holds it, never counts as no pressure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_wait: Option<MemoryPressureReading>,
 }
 
 /// A full lease class a ready unit is waiting on.
@@ -283,12 +275,7 @@ pub struct TaskRunningStatus {
     pub unit: String,
     pub owner: String,
     pub leases: Vec<LeaseClass>,
-    pub want: usize,
-    /// The CPU tokens the host budget granted it; absent while its ask is still queued and for a
-    /// unit that asked for none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_tokens: Option<usize>,
-    /// The run's declared ceiling clamped to its granted tokens; absent when it declares none.
+    /// The run's declared ceiling; absent when it declares none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caps: Option<TaskRunCaps>,
     /// How long it waited from admission to grant, in milliseconds.
@@ -305,9 +292,8 @@ pub struct TaskLeaseStatus {
     pub holders: Vec<String>,
 }
 
-/// The scheduler's whole fold at one instant: the ready order, what waits on what, what holds
-/// each lease, and the host CPU ledger as an observation. The CPU figures are folded from the
-/// budget's own ledger; when it cannot be read they are absent, never fabricated headroom.
+/// The scheduler's whole fold at one instant: the ready order, what waits on what, and what holds
+/// each lease.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskQueueStatus {
@@ -316,8 +302,6 @@ pub struct TaskQueueStatus {
     pub waiting: Vec<TaskWaitingStatus>,
     pub running: Vec<TaskRunningStatus>,
     pub leases: Vec<TaskLeaseStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<CpuBudgetStatus>,
 }
 
 fn deps_are_empty(deps: &[&str]) -> bool {

@@ -20,8 +20,8 @@
 #    A failure summary keeps unique tasks and exact diagnostics; the complete failed output is retained. The reporter
 #    is main's native build of @smoothbricks/failure-summary (dist/bin/<platform>/smoo-nx-failures), which step 5
 #    keeps current.
-#    The gate runs as a cowshed gate job (`cowshed exec --class gate --host`): the jobserver serves every task it
-#    starts ahead of other execs, at nice 0 where they run at +10 (05_gateway.md, "Host CPU budget").
+#    The gate runs as a cowshed gate job (`cowshed exec --class gate --host`): it is never CPU-capped, and its class's
+#    priority outranks background execs, not every class (05_gateway.md, "Host scheduling", "Classes").
 #    A red names, for each task the gate failed, the commits of the land that change a file Nx hashes for it or for a
 #    task it waits for (tooling/land-attribution.ts); naming never changes the verdict. A red land's next attempt gates
 #    whole again, and Nx's cache replays every task whose inputs did not move.
@@ -220,10 +220,9 @@ gate_workspace() {
   output=$(mktemp "${TMPDIR:-/tmp}/land-gate.XXXXXX")
   gate_status=0
   began=$(date +%s)
-  # The landing gate is never CPU-limited: it is the run that moves main. It runs as a gate job, so the
-  # jobserver ranks each of its tasks' CPU asks ahead of every other exec's, oldest first, and runs them at
-  # nice 0 where other execs run at +10. Its own grant is the one token Nx's orchestrator uses; every task
-  # asks for its own through the job's pool. Nothing here caps a width: load is the jobserver's to order.
+  # The landing gate is never CPU-capped: it is the run that moves main. It runs as a gate job, whose class's priority
+  # outranks background execs. Its Nx run serves its own CPU pool, so its tasks' runners together stay within its
+  # cores. Nothing here caps a width.
   gate_job bun nx run-many -t gate --parallel="$(sysctl -n hw.ncpu)" --nx-bail=false --outputStyle=static-failures-only >"$output" 2>&1 || gate_status=$?
   if [ "$gate_status" -ne 0 ]; then
     "$failure_summary" "$output" >&2 || {

@@ -206,7 +206,7 @@ describe('declaration model admission', () => {
     const core = join(scratch, 'crates/cowshed-core/src');
     cpSync(join(project, 'crates/cowshed-core/src'), core, { recursive: true });
     mkdirSync(join(scratch, 'crates/cowshed-gateway-types/src'), { recursive: true });
-    for (const file of ['status.rs', 'cpu_budget.rs']) {
+    for (const file of ['status.rs', 'host_status.rs']) {
       cpSync(
         join(project, 'crates/cowshed-gateway-types/src', file),
         join(scratch, 'crates/cowshed-gateway-types/src', file),

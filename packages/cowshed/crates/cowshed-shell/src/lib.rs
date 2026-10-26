@@ -51,10 +51,10 @@ use cowshed_core::runtime::process_tree::TreeOwner;
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, Inherited,
     REPLY_ACTIVATED, REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_ADOPTION_REFUSED,
-    REPLY_APPROVED, REPLY_EXITED, REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED,
-    REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_ADOPT, REQUEST_APPROVE,
-    REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus,
-    SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
+    REPLY_APPROVED, REPLY_EXITED, REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SIGNAL_FAILED,
+    REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_ADOPT, REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN,
+    REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_ARGUMENT, ShellHostProgram,
+    read_frame,
 };
 use cowshed_core::script::Binding;
 use cowshed_os::deadline::{self, Progress};
@@ -232,11 +232,10 @@ fn resolve_program(name: &str, path: Option<&OsString>) -> Option<PathBuf> {
         })
 }
 
-/// The command's nice and platform placement, passed with its streams. Linux requires the
+/// The command's platform placement, passed with its streams. Linux requires the
 /// controller-opened cgroup descriptor; macOS requires the observation fence. A script child
 /// closes these explicitly because it does not exec.
 pub(crate) struct CommandPlacement {
-    nice: Option<i32>,
     #[cfg(target_os = "linux")]
     cgroup: Placement,
     #[cfg(target_os = "macos")]
@@ -244,9 +243,8 @@ pub(crate) struct CommandPlacement {
 }
 
 impl CommandPlacement {
-    fn take(nice: Option<i32>, descriptors: &mut Vec<OwnedFd>) -> io::Result<Self> {
+    fn take(descriptors: &mut Vec<OwnedFd>) -> io::Result<Self> {
         Ok(Self {
-            nice,
             #[cfg(target_os = "linux")]
             cgroup: Placement::from_descriptor(one_descriptor(descriptors, "cgroup placement")?),
             #[cfg(target_os = "macos")]
@@ -280,16 +278,16 @@ fn reply(socket: &UnixStream, frame: FrameWriter) -> io::Result<()> {
     socket.write_all(&frame.finish()?)
 }
 
-/// Opens the grant's jobserver fifo the command's environment names, once, as Cargo will: read
+/// Opens the job's jobserver fifo the command's environment names, once, as Cargo will: read
 /// and write, without blocking. This host is the first process inside the sandbox, so a fifo it
-/// cannot open is one the command's Cargo cannot either, and that Cargo runs without it, outside
-/// the CPU budget (05_gateway.md "Cargo reads its holder's jobserver"). That is said on the job's
+/// cannot open is one the command's Cargo cannot either, and that Cargo runs without the job's
+/// jobserver (05_gateway.md "Cargo reads its holder's jobserver"). That is said on the job's
 /// stderr before the command runs, and the command still runs.
 fn report_unopenable_jobserver(
     environment: &BTreeMap<OsString, OsString>,
     stderr: &OwnedFd,
 ) -> io::Result<()> {
-    let Some(fifo) = cowshed_core::runtime::supervisor::granted_jobserver_fifo(environment) else {
+    let Some(fifo) = cowshed_core::runtime::job_cpu::granted_jobserver_fifo(environment) else {
         return Ok(());
     };
     let opened = std::fs::OpenOptions::new()
@@ -301,7 +299,7 @@ fn report_unopenable_jobserver(
         writeln!(
             std::fs::File::from(stderr.try_clone()?),
             "cowshed: the job's CPU jobserver fifo {} cannot be opened in the sandbox ({error}); \
-             Cargo will run without it, outside the CPU budget",
+             Cargo will run without the job's jobserver",
             fifo.display()
         )?;
     }
@@ -369,12 +367,11 @@ impl Host {
                 }
                 let cwd = PathBuf::from(OsStr::from_bytes(fields.bytes()?));
                 let overlay = fields.list()?;
-                let nice = fields.child_nice()?;
                 fields.finish()?;
                 let stdin = one_descriptor(&mut descriptors, "stdin")?;
                 let stdout = one_descriptor(&mut descriptors, "stdout")?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
-                let placement = CommandPlacement::take(nice, &mut descriptors)?;
+                let placement = CommandPlacement::take(&mut descriptors)?;
                 let environment = self.command_environment(&cwd, &overlay)?;
                 report_unopenable_jobserver(&environment, &stderr)?;
                 script::run(
@@ -391,12 +388,11 @@ impl Host {
                 let argv = fields.list()?;
                 let cwd = PathBuf::from(OsStr::from_bytes(fields.bytes()?));
                 let overlay = fields.list()?;
-                let nice = fields.child_nice()?;
                 fields.finish()?;
                 let stdin = one_descriptor(&mut descriptors, "stdin")?;
                 let stdout = one_descriptor(&mut descriptors, "stdout")?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
-                let placement = CommandPlacement::take(nice, &mut descriptors)?;
+                let placement = CommandPlacement::take(&mut descriptors)?;
                 self.run(
                     socket,
                     &argv,
@@ -751,7 +747,6 @@ impl Host {
         [stdin, stdout, stderr]: [OwnedFd; 3],
     ) -> io::Result<()> {
         let CommandPlacement {
-            nice,
             #[cfg(target_os = "linux")]
             cgroup,
             #[cfg(target_os = "macos")]
@@ -775,24 +770,6 @@ impl Host {
             .stderr(Stdio::from(stderr));
         #[cfg(target_os = "linux")]
         cgroup.on_exec(&mut command);
-        // A child its supervisor cannot hold sets its own nice before exec and reports exactly
-        // what it observed: a refusal fails the spawn and reaches the supervisor typed, so no
-        // command runs at a nice nobody verified.
-        let report = match nice {
-            Some(nice) => {
-                let (reported, report) = cowshed_core::runtime::shell_host::nice_pipe()?;
-                let report_end = report.as_raw_fd();
-                // SAFETY: getpid/setpriority/getpriority/write and an errno store run between
-                // fork and exec, on a stack buffer and a descriptor the closure only names.
-                unsafe {
-                    command.pre_exec(move || {
-                        cowshed_core::runtime::shell_host::report_own_nice(report_end, nice)
-                    });
-                }
-                Some((reported, report))
-            }
-            None => None,
-        };
         #[cfg(target_os = "macos")]
         {
             let [ready, go] = hold.raw();
@@ -811,11 +788,6 @@ impl Host {
         drop(command);
         #[cfg(target_os = "macos")]
         drop(hold);
-        // The child wrote before exec or never got that far; this end only kept the pipe open.
-        let reported = report.map(|(reported, report)| {
-            drop(report);
-            cowshed_core::runtime::shell_host::read_nice_report(reported)
-        });
         let exit = match spawned {
             Ok(child) => {
                 drop(diagnostics);
@@ -825,13 +797,6 @@ impl Host {
                 return serve_command(socket, held);
             }
             Err(error) => {
-                // Refused its nice: the supervisor says why on the job's stderr.
-                if let Some(Ok(Some(Err(failure)))) = &reported {
-                    return reply(
-                        socket,
-                        FrameWriter::new(REPLY_NICE_REFUSED).priority_failure(failure),
-                    );
-                }
                 let mut diagnostics = std::fs::File::from(diagnostics);
                 let _ = writeln!(
                     diagnostics,

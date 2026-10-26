@@ -39,7 +39,7 @@ export class CowshedError extends Error {
   readonly hint: string;
   /** Present only on a keyed exec that spawned nothing, naming why and the job its key admitted. */
   readonly admission?: Api.AdmissionRefusal;
-  /** Present only on a refused CPU admission: a class a worker may not ask for, a gate whose bound expired, a gateway that refused. */
+  /** Present only on a refused admission: a class a worker may not ask for, a job jobserver that could not be made, or a host memory pressure that could not be read. */
   readonly cpuAdmission?: Api.CpuAdmissionRefusal;
   /** Present only when an owned job's child could not be placed at its nice, so its command never ran. */
   readonly priority?: Api.PriorityFailure;

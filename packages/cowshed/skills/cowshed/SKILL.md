@@ -91,7 +91,6 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    `cowshed rm <ws>`, never land again. With `--no-retire` or after `push`, `rm` once main contains HEAD and every other
    local branch (a fork keeps only `cowshed/<ws>`; one branch per shed).
 5. `--force` on `rm` waives only transient state (dirty tree, the workspace's own running jobs; never a process cowshed
-<<<<<<< HEAD
    does not run holding the mount) and destroys the uncommitted tree; it can never waive containment, and it is never
    the answer to a refusal. `--abandon` is the sole way to destroy unlanded commits (they are bundled to
    `sessions/.trash/` first), and a shed whose work main holds never needs it. Use it, then `cowshed gc --abandoned`
@@ -99,18 +98,6 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    clear from history. Work still wanted is landed or folded into a batch (below). Never answer an `rm` refusal by
    reflex: read what it names.
 6. Batch work is lane work: see "Batch a round of units" below.
-=======
-   does not run holding the mount) and destroys the uncommitted tree; it can never waive containment. `--abandon` is the
-   sole way to destroy unlanded commits (they are bundled to `sessions/.trash/` first). Never answer an `rm` refusal by
-   adding a flag.
-6. Batch work is lane work
-   ([02_workspaces.md, "Lanes"](../../../../specs/cowshed/02_workspaces.md#lanes-fork-and---into)): a repository's next
-   batch is a lane base, and a finished shed's work moves into it with `cowshed land <ws> --into <batch> --ungated`: one
-   command that rebases the shed onto the batch's branch, then folds it in by Git alone, with no check and no
-   build-volume adoption. The land fast-forwards the batch shed and retires the shed at once, so it never waits for the
-   batch to reach main. A unit meant for the batch from the start forks from it (`cowshed fork <batch> <unit>`); the
-   batch itself lands to main as an ordinary gated workspace, and its `--check` is the lane's one build.
->>>>>>> e23d0b9b4f (refactor(cowshed): delete the land and rebase carries; rebase is Git alone)
 7. A shed whose work main already holds, or that carries none, is removed with plain `cowshed rm <ws>` and no check
    first: rm proves containment against live main, over every local branch: a commit is held when main's content carries
    its change or main holds a patch-equivalent commit (`git cherry`), so a cherry-pick main later edited past still
@@ -126,7 +113,7 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
 
 1. Fork one batch shed from main per round: `cowshed fork <batch>`.
 2. Fork each unit from the batch, not from main: `cowshed fork <batch> <unit>`. A unit that wants its batch-mates' work
-   before it finishes takes it with `cowshed rebase <unit> --into <batch> --ungated`.
+   before it finishes takes it with `cowshed rebase <unit> --into <batch>`, Git alone.
 3. Fold every finished unit as soon as it is done: `cowshed land <unit> --into <batch> --ungated`. It is Git alone, in
    one command. It rebases the unit onto the batch's branch (a commit the batch already holds by patch drops out),
    fast-forwards the batch and retires the unit's shed, so a finished unit never stays mounted. It runs no check and
@@ -151,8 +138,10 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
 ## Enter a shed through `cowshed exec`
 
 - Shed work runs through `cowshed exec <ws> -- <argv…>`: argv only, cwd = shed root, the child's exit passes through.
-  Its default class is `background` (`--class background`): it holds a host CPU token and runs at nice +10, the effect
-  `taskpolicy -b` was used for. `taskpolicy -b` itself fails with EPERM inside the sandbox; do not reach for it.
+  Its default class is `background` (`--class background`): it starts at once at nice +10 with its own jobserver of the
+  host's cores, and the kernel shares the cores among every job. Never wrap a command in `taskpolicy`: a clamp or `-b`
+  throttles its disk I/O, and a throttled process holding the store's filesystem work stalls every process behind it
+  (inside the sandbox it fails with EPERM anyway).
 - Never `direnv exec` a shed from the host (`cd "$(cowshed path <ws>)" && direnv exec . …`). devenv evaluates a shell
   per path, `TMPDIR` and runtime directory (specs/cowshed/03_caches.md "Sandboxed shells evaluate devenv in place"), so
   a host entry is a second cold evaluation of the same shed beside the sandbox's own (measured 2026-10-20: 197 s on top
@@ -161,11 +150,10 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
   (another checkout, `~`) needs `cowshed grant <ws> --read|--write <path>` first.
 - Unit work that cannot run sandboxed (an APFS image test, a host-controller test) runs as
   `cowshed exec <ws> --host -- direnv exec . <cmd…>`: outside the sandbox, without shell activation (hence the
-  `direnv exec`, with the host evaluation cost above), at the default background class and its background token. Never
-  pass `--class gate` for unit work: the gate class takes the repository's gate order ahead of its lands. Two gates run
-  at gate class: the repository's land path, and a train owner's pre-land proof of its train, which is that land's gate
-  run early and takes no land turn (05_gateway.md "A train's proof is gate-class work"). While any gate of a repository
-  runs, its tasks are served first from every free token; nothing else waits for it.
+  `direnv exec`, with the host evaluation cost above), at the default background class. Never pass `--class gate` for
+  unit work: a gate runs at nice +5, ahead of every other shed's background work. Two gates run at gate class: the
+  repository's land path, and a train owner's pre-land proof of its train, which is that land's gate run early and takes
+  no land turn (05_gateway.md "A train's proof is gate-class work").
 - macOS loopback inside exec: only the shed's own port block (`$COWSHED_PORT_BASE`, 64 ports) is connectable; 127.0.0.1
   outside it is EPERM. Bind services at `$COWSHED_PORT_BASE + 1…`, and `grant --ports <N>` before starting them. Node
   and Bun port-0 listeners, and a child they start with `--inspect=…:0`, land in the block on their own through

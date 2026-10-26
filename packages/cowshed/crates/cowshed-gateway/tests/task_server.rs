@@ -1,21 +1,20 @@
 #![cfg(target_os = "macos")]
 //! The task server over a real control socket: work units admitted and selected without any
-//! human assignment, the caps applied from the grant, and a queue view that names what waits on
+//! human assignment, the caps reported as declared, and a queue view that names what waits on
 //! what and who holds each serialization class.
 
 #[path = "support/fixture_dir.rs"]
 mod fixture_dir;
 
 use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
-use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use cowshed_gateway::{
-    AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, CpuBudgetLimits,
-    CredentialError, CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
+    AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, CredentialError,
+    CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
 use cowshed_gateway_types::{TaskAdmitRequest, TaskOutcome, TaskRunCaps, TaskTerminalRequest};
@@ -65,9 +64,9 @@ impl AuditSink for DiscardAudit {
     }
 }
 
-/// A gateway with a budget of `tokens` on a socket under `/tmp` (a bind path is capped at
-/// `sun_path`'s 104 bytes), and the guard that removes its root on every exit path.
-async fn gateway(tokens: usize) -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
+/// A gateway on a socket under `/tmp` (a bind path is capped at `sun_path`'s 104 bytes), and the
+/// guard that removes its root on every exit path.
+async fn gateway() -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
     let id = Uuid::new_v4().simple().to_string();
     let root = fixture_dir::secure_fixture_dir(&format!("cstask-{}", &id[..8]));
     let cache = root.path().join("cache");
@@ -78,9 +77,6 @@ async fn gateway(tokens: usize) -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
         GatewayConfig {
             control_socket: Some(socket.clone()),
             mirror_cache: MirrorCacheConfig::new(cache),
-            cpu_budget: CpuBudgetLimits {
-                tokens: NonZeroUsize::new(tokens).unwrap(),
-            },
             ..GatewayConfig::default()
         },
         Arc::new(NoCredentials),
@@ -92,8 +88,8 @@ async fn gateway(tokens: usize) -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
     (gateway, root, socket)
 }
 
-fn admit(unit: &str, deps: &[&str], want: usize, caps: Option<TaskRunCaps>) -> String {
-    let mut request = TaskAdmitRequest::new(unit, "workspace-1", want, "nx run gate");
+fn admit(unit: &str, deps: &[&str], caps: Option<TaskRunCaps>) -> String {
+    let mut request = TaskAdmitRequest::new(unit, "workspace-1", "nx run gate");
     request.deps = deps.to_vec();
     request.caps = caps;
     let mut line = serde_json::to_string(&request).expect("encode");
@@ -160,15 +156,13 @@ async fn one_shot(socket: &Path, line: &str) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what() {
-    let (gateway, _root, socket) = gateway(16).await;
-    // unit-a wants 8 tokens, half of 16, and runs; unit-b waits on unit-a and runs
-    // after its fact alone.
+    let (gateway, _root, socket) = gateway().await;
+    // unit-a runs; unit-b waits on unit-a and runs after its fact alone.
     let mut runner = Asker::ask(
         &socket,
         admit(
             "unit-a",
             &[],
-            8,
             Some(TaskRunCaps {
                 nx_parallel: 2,
                 cargo_jobs: 4,
@@ -182,7 +176,6 @@ async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what(
         admit(
             "unit-b",
             &["unit-a"],
-            2,
             Some(TaskRunCaps {
                 nx_parallel: 4,
                 cargo_jobs: 8,
@@ -192,17 +185,15 @@ async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what(
     )
     .await;
     let grant = runner.granted().await;
-    // The caps the server applies: the profile at a grant that can hold it.
+    // The caps the server reports: the ceiling as declared.
     assert_eq!(grant["unit"], "unit-a");
     assert_eq!(grant["caps"]["nxParallel"], 2);
     assert_eq!(grant["caps"]["cargoJobs"], 4);
     assert_eq!(grant["caps"]["testThreads"], 6);
-    assert_eq!(grant["cpuTokens"], 8, "the CPU is the budget's grant");
     // The queue view: what runs, what waits on what, and the serialization classes' places.
     let queue = one_shot(&socket, "{\"op\":\"task-queue\"}\n").await;
     let queue = &queue["taskQueue"];
     assert_eq!(queue["running"][0]["unit"], "unit-a");
-    assert_eq!(queue["running"][0]["cpuTokens"], 8);
     assert_eq!(queue["waiting"][0]["unit"], "unit-b");
     assert_eq!(queue["waiting"][0]["deps"][0]["unit"], "unit-a");
     assert_eq!(queue["waiting"][0]["deps"][0]["outcome"], Value::Null);
@@ -213,10 +204,9 @@ async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what(
     assert_eq!(settled["ok"], Value::Bool(true));
     let grant = dependent.granted().await;
     assert_eq!(grant["unit"], "unit-b");
-    // Its caps clamp to the 2 tokens it asked for.
-    assert_eq!(grant["caps"]["nxParallel"], 2);
-    assert_eq!(grant["caps"]["cargoJobs"], 2);
-    assert_eq!(grant["caps"]["testThreads"], 2);
+    assert_eq!(grant["caps"]["nxParallel"], 4);
+    assert_eq!(grant["caps"]["cargoJobs"], 8);
+    assert_eq!(grant["caps"]["testThreads"], 8);
     drop(runner);
     drop(dependent);
     gateway.drain().await.expect("drain");
@@ -224,10 +214,10 @@ async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_unit_keeps_one_live_attempt_over_the_wire() {
-    let (gateway, _root, socket) = gateway(4).await;
-    let mut runner = Asker::ask(&socket, admit("unit", &[], 1, None)).await;
+    let (gateway, _root, socket) = gateway().await;
+    let mut runner = Asker::ask(&socket, admit("unit", &[], None)).await;
     runner.granted().await;
-    let mut second = Asker::ask(&socket, admit("unit", &[], 1, None)).await;
+    let mut second = Asker::ask(&socket, admit("unit", &[], None)).await;
     let refused = second.refused().await;
     assert_eq!(refused["code"], "rejected", "{refused}");
     assert!(
@@ -243,15 +233,14 @@ async fn one_unit_keeps_one_live_attempt_over_the_wire() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gate_band_units_share_cpu_without_exclusive_root_admission() {
-    let (gateway, _root, socket) = gateway(4).await;
-    // Both requests retain TaskAdmitRequest's Gate class. Their grants must coexist:
-    // a task band is not an exclusive JobserverClass::Gate root.
-    let mut first = Asker::ask(&socket, admit("first", &[], 1, None)).await;
-    let mut second = Asker::ask(&socket, admit("second", &[], 1, None)).await;
+async fn gate_band_units_are_granted_concurrently() {
+    let (gateway, _root, socket) = gateway().await;
+    // Both requests retain TaskAdmitRequest's Gate class. Their grants coexist: a task band is
+    // not an exclusive gate root.
+    let mut first = Asker::ask(&socket, admit("first", &[], None)).await;
+    let mut second = Asker::ask(&socket, admit("second", &[], None)).await;
     for runner in [&mut first, &mut second] {
-        let grant = runner.granted().await;
-        assert_eq!(grant["cpuTokens"], 1);
+        runner.granted().await;
     }
     let queue = one_shot(&socket, "{\"op\":\"task-queue\"}\n").await;
     assert_eq!(queue["taskQueue"]["running"].as_array().unwrap().len(), 2);

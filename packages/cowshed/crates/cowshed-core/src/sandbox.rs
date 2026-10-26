@@ -153,7 +153,9 @@ pub struct SandboxConfig {
     /// "Fixtures").
     pub store_root: PathBuf,
 
-    /// Gateway-derived workspace IPC scope. None when an injected provider needs no extra socket scope.
+    /// The workspace's CPU pool directory, where its jobs' jobserver fifos live. The sandbox opens
+    /// it for FIFOs alone: no socket or gateway is reached through it. None when the sandbox has
+    /// no pool directory.
     pub cpu_pool_directory: Option<PathBuf>,
     /// The block the workspace's environment names (`COWSHED_PORT_BASE`/`_SIZE`) and its
     /// gateway listens on.
@@ -389,12 +391,10 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         exec_temp_dir,
         store_root: store_root.to_path_buf(),
 
-        cpu_pool_directory: Some(
-            cowshed_gateway_types::cpu_pool_directory(store_root, workspace_incarnation.as_str())
-                .map_err(|error| {
-                CowshedError::integrity(error.to_string(), "inspect the workspace incarnation")
-            })?,
-        ),
+        cpu_pool_directory: Some(crate::runtime::job_cpu::cpu_pool_directory(
+            store_root,
+            workspace_incarnation,
+        )),
         shed_links: shed_links(&mount).map_err(|error| {
             CowshedError::integrity(
                 format!("cannot read the shed beside {}: {error}", mount.display()),
@@ -1040,14 +1040,15 @@ pub fn seatbelt_profile(
     for socket in &sockets {
         push_readable_ancestors(&mut profile, socket)?;
     }
-    // The workspace's CPU pool directory, `<store>/run/cpu/<incarnation>` (05_gateway.md "The
-    // jobserver fifo"), sits behind the `/private/cowshed` deny, so its rules land here for the
-    // reason the socket ancestors above do: emitted before that deny, last-match-wins re-denied
-    // the jobserver FIFO's open with EPERM, and Cargo ran outside the CPU budget. The profile is
-    // rendered per workspace, not per job, so no job's fifo can be a literal here: the scope is
-    // this workspace's own pool directory, and inside it only FIFOs open and only sockets connect.
-    // Its ancestors and entries resolve by metadata, as the installed cowshed's do: neither the
-    // directory nor `run/cpu`, where sibling workspaces' directories sit, is listable.
+    // The workspace's CPU pool directory, `<store>/run/cpu/<incarnation>` (05_gateway.md
+    // "Parallelism inside a job"), holds its jobs' jobserver fifos (05_gateway.md "Cargo reads
+    // its holder's jobserver"). It sits behind the `/private/cowshed` deny, so its rules land
+    // here for the reason the socket ancestors above do: emitted before that deny, last-match-wins
+    // re-denied the jobserver FIFO's open with EPERM, and Cargo ran without its jobserver. The
+    // profile is rendered per workspace, not per job, so no job's fifo can be a literal here: the
+    // scope is this workspace's own pool directory, and inside it only FIFOs open. Its ancestors
+    // and entries resolve by metadata, as the installed cowshed's do: neither the directory nor
+    // `run/cpu`, where sibling workspaces' directories sit, is listable.
     if let Some(directory) = &config.cpu_pool_directory {
         for ancestor in directory.ancestors().skip(1) {
             push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
@@ -1056,12 +1057,6 @@ pub fn seatbelt_profile(
         push_line(
             &mut profile,
             &format!("(allow file-read-metadata (subpath \"{directory}\"))"),
-        );
-        push_line(
-            &mut profile,
-            &format!(
-                "(allow network-outbound (remote unix-socket (path-prefix \"{directory}/\")))"
-            ),
         );
         // Its jobserver fifo's tokens are read and written back (05_gateway.md "Cargo reads its
         // holder's jobserver"), and nothing else there is.
@@ -3218,11 +3213,11 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     #[cfg(target_os = "macos")]
     #[test]
     fn no_allow_precedes_a_deny_that_covers_it() {
-        let pool = cowshed_gateway_types::cpu_pool_directory(
+        let pool = crate::runtime::job_cpu::cpu_pool_directory(
             Path::new("/private/cowshed/store"),
-            "0198f2c0b7e34dc795f17b238b331c80",
-        )
-        .unwrap();
+            &crate::metadata::WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+                .unwrap(),
+        );
         let fifos = format!(
             "(allow file-read-data file-write-data (require-all (subpath \"{}\") (vnode-type FIFO)))",
             pool.display()

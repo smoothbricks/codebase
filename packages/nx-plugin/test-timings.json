@@ -88,7 +88,7 @@
     "src/generators/make-public/generator.test.ts": 38,
     "src/executors/bounded-exec/runtime-pin.test.ts": 33,
     "src/nx-state-location.test.ts": 32,
-    "src/executors/bounded-exec/cpu-tokens.test.ts": 30,
+    "src/executors/bounded-exec/runner-sizing.test.ts": 30,
     "src/executors/nextest-group/executor.test.ts": 28,
     "src/build-state-output-policy.test.ts": 10,
     "src/executors/bounded-exec/lock-wait.test.ts": 7,

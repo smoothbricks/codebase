@@ -872,11 +872,11 @@ exits with the command's status. `--timeout <dur>` stops waiting after that long
 under the workspace supervisor, and `cowshed exec` exits 103 with an error naming its job, because it has no output or
 status of the command's to give. A command that finishes just as the timeout fires is waited for; `cowshed exec` prints
 the rest of its output and exits with its code. `--background` prints the numeric job id and returns at once, exit 0,
-naming on stderr how to reach the job; on a loaded host that is while the job still waits for its CPU grant, so its
-status reads `queued` until the grant arrives. No CLI verb reattaches to a job; the cowshed API does
-(`worker("<ws>").job(<id>)` waits for it, reads its logs or kills it — see [integrations.md](integrations.md)).
-`cowshed exec` accepts `--session <name>` for a named session whose cwd and variables carry across calls; opening a name
-the workspace already holds rejoins that session and never closes it.
+naming on stderr how to reach the job; a background job that waits for host memory pressure to ease reads `queued` until
+it starts. No CLI verb reattaches to a job; the cowshed API does (`worker("<ws>").job(<id>)` waits for it, reads its
+logs or kills it — see [integrations.md](integrations.md)). `cowshed exec` accepts `--session <name>` for a named
+session whose cwd and variables carry across calls; opening a name the workspace already holds rejoins that session and
+never closes it.
 
 Commands under the workspace `.envrc` run in a warm shell: the supervisor activates the `.envrc` once and starts each
 command from that activated environment, so only the first command after the workspace shell's inputs change pays for
@@ -1368,61 +1368,48 @@ rename — but leaves the `cowshed` on your `PATH` alone. A build inside a works
 than refused — the copy is precisely what makes the agent independent of a path that only exists once cowshed has
 mounted it. A debug build is refused, and so is a build that does not contain the installed one (or one that records no
 commit), before anything is installed; `start` waits for the install slot like `setup` and has no `--downgrade`, which
-is `setup`'s. Activating the agent restarts a running gateway, which cuts off a land's gate in flight and refuses the
-next step of a land between its steps, so `start` and `setup` refuse to install or restart anything while a land holds
-its repository's turn or the gateway's CPU ledger shows a gate job holding or wanting tokens, naming each (exit 4; exit
-5 when the land turns cannot be read); they never wait for them. `start` refuses before it changes anything; a `setup`
-refused at its service refresh has already done its storage repair, which stays done. Rerun once they have ended;
-`cowshed gateway status` lists both (05 Gateway, "An install refuses while a land or a gate runs"). A restart waits for
-the old daemon to exit and launchd to drop its job, within the agent's own exit timeout (the plist states 30 s; the
-daemon's drain ends within 20 s). A failed activation puts the previous build back and loads the agent again: a
-bootstrap when launchd no longer holds it, a kickstart when it holds and runs it. When the bootout itself went overdue
-the agent is left alone, since launchd still tears it down, and the error names the bootstrap to run once it has gone.
-`stop` boots out the agent and removes the plist, leaving the installed cowshed — host state rather than agent state,
-and keeping it makes the next `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it
-too — the stable name, every stored copy and its build record, and the `cowshed` links on your `PATH` that name the
-stable name — for a host that is done with the gateway rather than pausing it; `cowshed setup --uninstall` removes the
-system storage daemon, both user agents, the installed cowshed with its `PATH` links and sccache's nix GC root at once.
-All of these are idempotent, and a `--purge` with nothing installed says so rather than failing.
+is `setup`'s. Activating the agent restarts a running gateway, which refuses the next step of a land between its steps,
+so `start` and `setup` refuse to install or restart anything while a land holds its repository's turn, naming each (exit
+4; exit 5 when the land turns cannot be read); they never wait for them. `start` refuses before it changes anything; a
+`setup` refused at its service refresh has already done its storage repair, which stays done. Rerun once they have
+ended; `cowshed gateway status` lists them (05 Gateway, "An install refuses while a land runs"). A restart waits for the
+old daemon to exit and launchd to drop its job, within the agent's own exit timeout (the plist states 30 s; the daemon's
+drain ends within 20 s). A failed activation puts the previous build back and loads the agent again: a bootstrap when
+launchd no longer holds it, a kickstart when it holds and runs it. When the bootout itself went overdue the agent is
+left alone, since launchd still tears it down, and the error names the bootstrap to run once it has gone. `stop` boots
+out the agent and removes the plist, leaving the installed cowshed — host state rather than agent state, and keeping it
+makes the next `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too — the stable
+name, every stored copy and its build record, and the `cowshed` links on your `PATH` that name the stable name — for a
+host that is done with the gateway rather than pausing it; `cowshed setup --uninstall` removes the system storage
+daemon, both user agents, the installed cowshed with its `PATH` links and sccache's nix GC root at once. All of these
+are idempotent, and a `--purge` with nothing installed says so rather than failing.
 
 `status` and `doctor` call the gateway healthy only when the daemon runs the same bytes as the CLI asking; a daemon
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
 
-`status` reports health without starting the service, then the host CPU ledger the daemon serves (05 Gateway, "Host CPU
-budget") in the order it serves it: tokens held of the total, with what background work holds; every lease held past the
-30-minute hold limit, oldest first, so the first lines say who holds the host and since when (05 Gateway, "The hold
-limit"); the running gate jobs, the head — the oldest land — first; the gate queue in the order returned tokens go to
-it; then each checkout's background work. A gate job is named by its admission number (the smaller is the older land)
-and its repository, even when no land is running. Each running gate job and background stake is followed by its leases,
-oldest grant first: the client's pid (the socket's peer), its tokens of its want, the age of its grant — the lease's,
-not the process's; `ps -p <pid>` gives that — and the command it named. Every waiting request is named the same way,
-with how long it has waited: one gate job's tasks wait as one entry each, and their pids, commands and ages tell them
-apart. A resident (`exec --class resident`, a kept Nx daemon) holds no token, so it is in no line; a request it runs is.
+`status` reports health without starting the service, then the land turns, then the host's scheduling as the kernel, the
+workspace supervisors and the store report it (05 Gateway, "Status"): the 1-, 5- and 15-minute load averages; the memory
+pressure (macOS `kern.memorystatus_vm_pressure_level`, Linux `/proc/pressure/memory` `some avg10`); swap in use of swap
+configured; the live jobs, counted by class and state from each workspace supervisor's own job list; and the released
+images waiting in the store's `.deleting` directories for the gateway's one-at-a-time cleanup. Every number is a kernel
+reading or a listing, never a count of cowshed's own. A reading that fails is printed as unread with its reason, never
+as zero, and a supervisor whose job list cannot be read is named the same way, its jobs in no count.
 
 ```
 $ cowshed gateway status
 cowshed: gateway is healthy: launchd loaded; control socket answers at /private/cowshed/store/gateway.sock
 cowshed: gateway versions: cli 0.1.0; daemon 0.1.0
-cowshed: gateway cpu budget: held 18/18 tokens, background holds 2
-cowshed: gateway cpu hold past 30m: /Users/me/Dev/app: pid 3977, 2/18 tokens, granted 34m07s ago: cargo --frozen test -p app
-cowshed: gateway gate head: repository=owner/app /Users/me/Dev/app gate job 4: held 15, running 2
-cowshed: gateway gate lease: repository=owner/app /Users/me/Dev/app gate job 4: pid 4120, 1/1 tokens, granted 12m30s ago: nx run-many -t gate
-cowshed: gateway gate lease: repository=owner/app /Users/me/Dev/app gate job 4: pid 4388, 14/18 tokens, granted 2m05s ago: child CPU pool
-cowshed: gateway gate job behind the head: repository=owner/lib /Users/me/Dev/lib gate job 9: held 1, running 1
-cowshed: gateway gate lease: repository=owner/lib /Users/me/Dev/lib gate job 9: pid 5012, 1/1 tokens, granted 40s ago: nx run-many -t gate
-cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them
-cowshed: gateway gate queue 1: repository=owner/app /Users/me/Dev/app gate job 4: pid 4402, want 6, waiting 1m12s: child CPU pool
-cowshed: gateway gate queue 2: repository=owner/app /Users/me/Dev/app gate job 4: pid 4417, want 2, waiting 48s: child CPU pool
-cowshed: gateway gate queue 3: repository=owner/lib /Users/me/Dev/lib gate job 9: pid 5020, want 18, waiting 35s: child CPU pool
-cowshed: gateway background: /Users/me/Dev/app: held 2, running 1, waiting 1
-cowshed: gateway background lease: /Users/me/Dev/app: pid 3977, 2/18 tokens, granted 34m07s ago: cargo --frozen test -p app
-cowshed: gateway background queue 1: /Users/me/Dev/app: pid 3990, want 1, waiting 2m30s: bun install
+cowshed: gateway host load: 23.10 19.42 12.07 (1, 5 and 15 minutes)
+cowshed: gateway host memory pressure: level=warning
+cowshed: gateway host swap: 5990 MiB of 7168 MiB in use
+cowshed: gateway jobs: gate running 1, background running 4, background queued 2, resident running 3
+cowshed: gateway image cleanup: 2 released images waiting
 ```
 
-A daemon that answers but does not know `cpu-budget` (one from before it) is reported as not answering it, never as an
-idle host. Its JSON result is the standard frozen envelope, with the ledger verbatim under `cpuBudget.ledger`, or the
-reason under `cpuBudget.unanswered`; `cpuBudget` is absent when no daemon answers. A lease whose socket named no peer
-has no `pid`:
+Its JSON result is the standard frozen envelope, with those readings under `scheduling`. Each kernel reading is
+`{ "kind": "read", … }` or `{ "kind": "unread", "error": … }`; Linux reports memory pressure as
+`{ "kind": "psi", "someAvg10": 1234 }`, in hundredths of a percent. `scheduling` is absent only from the status an
+install's health wait reports:
 
 ```json
 {
@@ -1434,73 +1421,21 @@ has no `pid`:
     "cliVersion": "0.1.0",
     "daemonVersion": "0.1.0",
     "activeWorkspaces": 3,
-    "cpuBudget": {
-      "ledger": {
-        "total": 18,
-        "held": 18,
-        "checkouts": [
-          { "checkout": "/Users/me/Dev/app", "held": 17, "running": 3, "waiting": 3 },
-          { "checkout": "/Users/me/Dev/lib", "held": 1, "running": 1, "waiting": 1 }
-        ],
-        "gateJobs": [
-          {
-            "repository": "owner/app",
-            "checkout": "/Users/me/Dev/app",
-            "job": 4,
-            "held": 15,
-            "holders": [
-              { "pid": 4120, "command": "nx run-many -t gate", "tokens": 1, "want": 1, "heldMs": 750000 },
-              { "pid": 4388, "command": "child CPU pool", "tokens": 14, "want": 18, "heldMs": 125000 }
-            ]
-          },
-          {
-            "repository": "owner/lib",
-            "checkout": "/Users/me/Dev/lib",
-            "job": 9,
-            "held": 1,
-            "holders": [{ "pid": 5012, "command": "nx run-many -t gate", "tokens": 1, "want": 1, "heldMs": 40000 }]
-          }
-        ],
-        "gateQueue": [
-          {
-            "repository": "owner/app",
-            "checkout": "/Users/me/Dev/app",
-            "job": 4,
-            "pid": 4402,
-            "command": "child CPU pool",
-            "want": 6,
-            "waitedMs": 72000
-          },
-          {
-            "repository": "owner/app",
-            "checkout": "/Users/me/Dev/app",
-            "job": 4,
-            "pid": 4417,
-            "command": "child CPU pool",
-            "want": 2,
-            "waitedMs": 48000
-          },
-          {
-            "repository": "owner/lib",
-            "checkout": "/Users/me/Dev/lib",
-            "job": 9,
-            "pid": 5020,
-            "command": "child CPU pool",
-            "want": 18,
-            "waitedMs": 35000
-          }
-        ],
-        "background": [
-          {
-            "checkout": "/Users/me/Dev/app",
-            "held": 2,
-            "holders": [
-              { "pid": 3977, "command": "cargo --frozen test -p app", "tokens": 2, "want": 18, "heldMs": 2047000 }
-            ],
-            "waiters": [{ "pid": 3990, "command": "bun install", "want": 1, "waitedMs": 150000 }]
-          }
+    "scheduling": {
+      "readings": {
+        "load": { "kind": "read", "load": { "one": 23.1, "five": 19.42, "fifteen": 12.07 } },
+        "memoryPressure": { "kind": "read", "pressure": { "kind": "darwin", "level": "warning" } },
+        "swap": { "kind": "read", "swap": { "usedBytes": 6280970240, "totalBytes": 7516192768 } }
+      },
+      "jobs": {
+        "counts": [
+          { "class": "gate", "state": "running", "jobs": 1 },
+          { "class": "background", "state": "running", "jobs": 4 },
+          { "class": "background", "state": "queued", "jobs": 2 },
+          { "class": "resident", "state": "running", "jobs": 3 }
         ]
-      }
+      },
+      "imageCleanup": { "waiting": 2 }
     }
   }
 }
@@ -1877,30 +1812,44 @@ independent clone/reflink when supported, otherwise an ordinary copy, and is ato
 policy. Publication does not alter `StreamInfo.storage` and is never used for reads or authority. Failure is a typed
 operational error and does not change the already-established process result.
 
-### Host CPU admission
+### Job classes and host scheduling
 
-Every job but a resident takes host CPU tokens from the gateway before its command starts (05_gateway.md, "Host CPU
-budget"), at a class and demand its request names; the class also fixes the nice the command runs at (05_gateway.md,
-"Bands"). An ordinary command is `background` and asks for the background share of the host, half of its tokens, so the
-runners it starts run side by side; `--want <n>` names the tokens a command can use at once instead, and its grant is
-between one and `n`. Background work takes free tokens; gate-class asks are served first. `--class interactive` names a
-command someone is waiting on: it takes its tokens as background work does and runs at its supervisor's own nice, ahead
-of a gate at +5 and background at +10 on a contended core, and a workspace's own capability may ask for it.
-`--class gate` admits the command as the operator's gate: it starts at once on free tokens, and otherwise waits for
-whole returned tokens ahead of queued background work with no deadline; background then takes the tokens no waiting gate
-ask wants; it runs at nice +5. Neither a gate nor `--host` can name a `--session`. Only this trusted route may ask for a
-gate: a workspace's own capability (`worker.exec`) is refused with a typed class-not-permitted error before anything
-runs, and no environment variable confers the class. `--host` runs the command once at the host boundary, outside the
-workspace sandbox, at the class it names: host unit work at the default background class takes background tokens, and
-only a land's `--class gate --host` takes the gate order. Only the trusted route may name `--host`, at any class.
-`--class resident` holds no token and runs at +10; its descendants ask its pool for their own. `JobInfo` reports the
-admitted `class` and `scope`, the observed `nice`, and the granted `cpuTokens`. Every one of these is the same typed
-field of the API's exec request (07_api.md, "Exec and grants"), so the CLI asks for nothing an embedding process cannot.
+Every job starts at once at the nice of its class, and the kernel schedules it beside everything else on the host
+(05_gateway.md, "Host scheduling", "Classes"): cowshed never decides whether runnable work runs. On macOS the supervisor
+places the job's first process at its class's nice with `setpriority` and reads it back; on Linux the class's nice
+weighs the job's own cgroup. No job runs under a QoS clamp, `PRIO_DARWIN_BG` or a disk policy below the default: a
+throttled process that holds the store's filesystem work stalls every process behind it. An ordinary command is
+`background` and runs at nice +10. `--class interactive` names a command someone is waiting on: it runs at its
+supervisor's own nice, ahead of a gate at +5 and background at +10 on a contended core, and a workspace's own capability
+may ask for it. `--class gate` admits the command as the operator's gate, at nice +5. Neither a gate nor `--host` can
+name a `--session`. Only this trusted route may ask for a gate: a workspace's own capability (`worker.exec`) is refused
+with a typed class-not-permitted error before anything runs, and no environment variable confers the class. Lands of one
+repository take its land turn one at a time, so one gate runs per repository. `--host` runs the command once at the host
+boundary, outside the workspace sandbox, at the class it names; only the trusted route may name `--host`, at any class.
+`--class resident` and `--class interactive-resident` admit a process that stays up between requests, at +10 and at 0;
+an idle resident costs the host nothing.
+
+Every job has its own jobserver (05_gateway.md, "Parallelism inside a job"): a fifo with as many slots as the host has
+cores, or `--want <n>` if that is fewer, served by its supervisor and handed to its make, Cargo and test runners through
+`MAKEFLAGS` and `CARGO_MAKEFLAGS`. It bounds how many compiler and test threads one build starts and never waits on
+another job. A `cowshed exec` a job starts in its own workspace shares that job's fifo.
+
+A background job waits to start while the host reports memory pressure (05_gateway.md, "Memory pressure"): macOS
+`kern.memorystatus_vm_pressure_level` at warning or above, Linux `/proc/pressure/memory` `some avg10` above 10%, read
+again every 2 s. It reads `queued` meanwhile, its stderr says
+`cowshed: jobserver wait start queue=memory pressure=<reading>`, and it is never refused for pressure; a pressure that
+cannot be read fails it with `cpuAdmission`. On macOS, while the level is critical, the supervisor ends the youngest
+background or resident job as a cancel ends one, and that job fails with `memory`, its stderr naming the level and its
+resident bytes; a gate or interactive job is never ended. On Linux the kernel does this itself: a background job's
+cgroup carries `memory.high` and `memory.swap.max=0`.
+
+`JobInfo` reports the admitted `class` and `scope` and the observed `nice`. Each is the same typed field of the API's
+exec request (07_api.md, "Exec and grants"), so the CLI asks for nothing an embedding process cannot.
 
 A host exec's child starts from an empty environment. `--host` carries the operator's environment, including custom
 operator and project variables, in the normal request. There is no execution environment-name allowlist: the existing
-supervisor runtime rules withhold enrolled credentials and replace reserved CPU-authority variables with the actual
-grant. A host exec still cannot name a session; an ordinary exec's environment is unchanged.
+supervisor runtime rules withhold enrolled credentials and replace reserved jobserver variables with the job's own. A
+host exec still cannot name a session; an ordinary exec's environment is unchanged.
 
 For every scope, keyed admission records contain only public environment names: `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `TMPDIR`, `LANG`, `TERM`, `TZ`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `BUN_INSTALL`, `DEVELOPER_DIR`

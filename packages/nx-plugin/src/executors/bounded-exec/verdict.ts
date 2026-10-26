@@ -63,16 +63,14 @@ export interface BoundedExecRecord {
   readonly hash: string | null;
   readonly verdict: BoundedExecVerdict;
   /**
-   * The host CPU budget's grant the run started under: tokens granted of those asked for, and
-   * how long it waited. Absent when it ran unbudgeted; written for the reader of a slow run,
-   * never read back.
+   * The parent CPU pool's grant the run started under: tokens granted of those asked for, and
+   * how long it waited for the pool. Absent when it ran ungranted; written for the reader of a slow
+   * run, never read back.
    */
   readonly cpu?: {
     readonly tokens: number;
     readonly want: number;
     readonly waitedMs: number;
-    /** Set when the tokens came from an ancestor's CPU pool, not the host budget; `waitedMs` is the wait for that pool. */
-    readonly inherited?: true;
   };
 }
 

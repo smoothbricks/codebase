@@ -59,9 +59,9 @@ replacement for the repository landing gate.
 Reproduce from an allowed repository development shell:
 
 ```sh
-taskpolicy -b direnv exec . cargo nextest run --cargo-profile release -p cowshed-core --lib \
+direnv exec . cargo nextest run --cargo-profile release -p cowshed-core --lib \
   -E 'test(developer_links::)' --run-ignored all --no-capture --build-jobs 2
-taskpolicy -b direnv exec . cargo nextest run --cargo-profile release -p cowshed-core --lib \
+direnv exec . cargo nextest run --cargo-profile release -p cowshed-core --lib \
   -E 'test(runtime::supervisor::install_observation_tests::)' --no-capture --build-jobs 2
 ```
 
@@ -110,7 +110,7 @@ Reproduce in a dedicated benchmark workspace, granting enough capacity before ru
 
 ```sh
 cowshed grant <benchmark-workspace> --ports 257
-taskpolicy -b direnv exec . cargo nextest run --cargo-profile release -p cowshed-gateway --lib --test gateway \
+direnv exec . cargo nextest run --cargo-profile release -p cowshed-gateway --lib --test gateway \
   -E 'test(control::tests::) | test(macos::control_socket_is_local_authenticated_and_reports_status) | test(macos::revision_tombstone_and_rotation_preserve_authority) | test(macos::session_current_benchmark)' \
   --run-ignored all --no-capture --build-jobs 2
 ```

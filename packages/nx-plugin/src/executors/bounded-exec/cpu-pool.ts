@@ -6,27 +6,27 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import typia from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
-import { CPU_TOKENS_ENV, parseInheritedTokens, type TokenGrant } from './cpu-tokens.js';
-import { holdLease } from './gateway-lease.js';
+import { holdLease, type Unleased } from './gateway-lease.js';
+import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
 /**
- * A parent's CPU pool: the tokens a granted process lends its own children, held live rather than
- * inherited as a bare count (specs/cowshed/05_gateway.md, "Host CPU budget", "Nested runners use a
- * parent-held sub-ledger").
+ * A CPU pool: the tokens a process lends the runners it starts, held live rather than inherited as a
+ * bare count (specs/cowshed/05_gateway.md, "Host scheduling", "Parallelism inside a job"). An Nx run
+ * serves one (`run-cpu-pool.ts`), and every granted bounded-exec serves a sub-pool of its grant to
+ * its own descendants, so the runners of one build tree together stay within the tree's count.
  *
  * The pool is a private Unix socket in a directory the process owns: the directory 0700, the socket
- * 0600. A child asks it for a count with one request line, exactly as it asks the gateway
- * (`holdLease`). The pool answers `queued` at once and `granted` when the child reaches the head of
- * its FIFO queue. A grant lasts while its connection does, so a child that dies returns its tokens
- * with its socket. A pool grants only from its own count, and a pool whose upstream grant has gone
- * grants nothing.
+ * 0600. A child asks it for a count with one request line, in `holdLease`'s framing. The pool
+ * answers `queued` at once and `granted` when the child reaches the head of its FIFO queue. A grant
+ * lasts while its connection does, so a child that dies returns its tokens with its socket. A pool
+ * grants only from its own count, and a pool whose upstream grant has gone grants nothing.
  *
  * The same count is a GNU make jobserver fifo beside the socket, mode 0600, which Cargo, its build
  * scripts and every nested `cargo` read through `CARGO_MAKEFLAGS`/`MAKEFLAGS` (specs/cowshed/05_gateway.md,
- * "The jobserver fifo"). A pool of `g` holds `g − 1` token bytes there; the holder's own command holds the
- * implicit first token. A socket grant takes fifo bytes first and that implicit slot last, which the holder
- * is not using while it waits on the child it lends it to; release writes the bytes back and frees the slot.
- * A Cargo reading the fifo and a nested runner holding a socket grant so share one count.
+ * "Cargo reads its holder's jobserver"). A pool of `g` holds `g − 1` token bytes there; the holder's own
+ * command holds the implicit first token. A socket grant takes fifo bytes first and that implicit slot last,
+ * which the holder is not using while it waits on the child it lends it to; release writes the bytes back and
+ * frees the slot. A Cargo reading the fifo and a nested runner holding a socket grant so share one count.
  */
 
 /** The environment name a child reads its parent's pool endpoint from; its count is `CPU_TOKENS_ENV`. */
@@ -35,7 +35,7 @@ export const CPU_POOL_ENV = 'BOUNDED_EXEC_CPU_POOL';
 /** An inherited pool descriptor; only a grant from its endpoint proves a live allocation. */
 export interface InheritedCpuPool {
   readonly socket: string;
-  /** The count the parent names beside its endpoint: 0 for a resident's relay pool, which holds no token. */
+  /** The count the parent names beside its endpoint. */
   readonly tokens: number;
 }
 
@@ -53,41 +53,20 @@ export interface CpuPool {
 
 type CloseOutcome = { ok: true } | { ok: false; error: string };
 
-/**
- * The run's count of descendant work queued for host CPU tokens (specs/cowshed/05_gateway.md, "The bounds start at
- * the grant"). A queued job is not an idle one: its owner stops the run's idle clock while any wait is held. Every
- * pool of one run, its sub-pools included, reports to the same one.
- */
-export interface HostWaits {
-  begin(): void;
-  end(): void;
-}
-
 /** The one line a child sends: a count of whole tokens, at least one. */
 interface CpuPoolRequest {
   op: 'cpu-pool';
   want: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
-  /** Ask the owning pool to serve this allocation as its own child pool, with a jobserver fifo of its own. */
-  children?: boolean;
-}
-
-/**
- * A descendant's word that work it started waits in a host CPU queue (a cowshed job the gateway holds `waiting`). It
- * is held like a grant: the wait lasts while its connection does, so a descendant that dies ends its wait.
- */
-interface HostWaitRequest {
-  op: 'host-wait';
 }
 
 /** The pool's answers, in `holdLease`'s framing. */
 type CpuPoolReply =
   | { ok: true; lease: 'queued' }
-  | { ok: true; lease: 'granted'; tokens: number; pool?: string }
-  | { ok: true; wait: 'held' }
+  | { ok: true; lease: 'granted'; tokens: number }
   | { ok: false; code: 'invalid-request'; error: string };
 
-/** Exactly a request's fields, as the gateway's own pools read them: any other field is an invalid request. */
-const isRequest = typia.createEquals<CpuPoolRequest | HostWaitRequest>();
+/** Exactly a request's fields: any other field is an invalid request. */
+const isRequest = typia.createEquals<CpuPoolRequest>();
 const stringifyReply = typia.json.createStringify<CpuPoolReply>();
 
 /** A request over this many bytes is refused as `invalid-request` (specs/cowshed/05_gateway.md, "Wire"). */
@@ -107,14 +86,12 @@ const run = promisify(execFile);
 
 /**
  * A child's phase. Tokens are owed back only while `holding`: the bytes it took from the jobserver fifo, and whether it
- * holds the pool's implicit slot. A queued child holds nothing; a `waiting` child holds a host wait on the run's idle
- * clock.
+ * holds the pool's implicit slot. A queued child holds nothing.
  */
 type Phase =
   | { readonly kind: 'reading' }
   | { readonly kind: 'queued' }
   | { readonly kind: 'holding'; readonly bytes: number; readonly slot: boolean }
-  | { readonly kind: 'waiting' }
   | { readonly kind: 'done' };
 
 /** A child connection and what the pool owes it. Its grant, or its place in line, ends with the connection. */
@@ -127,7 +104,6 @@ interface Child {
 interface Waiter {
   readonly child: Child;
   readonly want: number;
-  readonly children: boolean;
 }
 
 /** One framed reply line. The newline is the framing; every reply goes through here. */
@@ -135,16 +111,12 @@ const frame = (reply: CpuPoolReply): string => `${stringifyReply(reply)}\n`;
 
 /**
  * The inherited descriptor, or null when malformed or absent. A missing or bare count, or an empty
- * or NUL-bearing endpoint, proves no allocation. A resident's relay pool names a count of 0 beside its
- * endpoint: it holds no token for its lifetime and asks the host for each child that asks it, so zero is
- * valid only with the endpoint, and every other count is a positive whole number. A valid descriptor still
- * needs a live endpoint grant (specs/cowshed/05_gateway.md, "Host CPU budget", "A resident holds no token").
+ * or NUL-bearing endpoint, proves no allocation; the count is a positive whole number. A valid
+ * descriptor still needs a live endpoint grant.
  */
 export function readInheritedCpuPool(environment: Readonly<NodeJS.ProcessEnv>): InheritedCpuPool | null {
   const socket = environment[CPU_POOL_ENV];
-  const count = environment[CPU_TOKENS_ENV];
-  // Zero is valid only as the literal 0 a relay pool names; any other count must be a positive safe integer.
-  const tokens = count === '0' ? 0 : parseInheritedTokens(count);
+  const tokens = parseInheritedTokens(environment[CPU_TOKENS_ENV]);
   if (socket === undefined || socket.length === 0 || socket.includes('\0') || tokens === null) {
     return null;
   }
@@ -152,11 +124,16 @@ export function readInheritedCpuPool(environment: Readonly<NodeJS.ProcessEnv>): 
 }
 
 /**
- * Ask the immediate parent pool for `want` tokens. Neither the inherited count nor the host's core count bounds the
- * ask: a lent pool grants at most what it holds, and a gate's or a resident's relay pool asks the host for each
- * child. A granted lease is the child's local allocation: its connection is the grant, and closing it returns only
- * that allocation. An absent endpoint allows normal host acquisition; a connected endpoint's refusal
- * or protocol failure must fail admission rather than taking a second grant above its parent.
+ * Tokens a parent pool lent, held until released, or why there are none. `closed` resolves when the grant's
+ * connection closes, however it closes, so a sub-pool built on the grant ends with it.
+ */
+export type TokenGrant = { granted: true; tokens: number; release: () => void; closed: Promise<void> } | Unleased;
+
+/**
+ * Ask the immediate parent pool for `want` tokens. The inherited count does not bound the ask: a pool grants at
+ * most what it holds. A granted lease is the child's local allocation: its connection is the grant, and closing it
+ * returns only that allocation. An absent endpoint grants nothing and refuses nothing; a connected endpoint's refusal
+ * or protocol failure must fail admission rather than run the child beside its parent's count.
  */
 export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number): Promise<TokenGrant> {
   if (!Number.isSafeInteger(want) || want < 1) {
@@ -186,7 +163,7 @@ export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number
       reason: `the parent CPU pool granted ${JSON.stringify(tokens)} tokens for ${want}`,
     };
   }
-  return { granted: true, tokens, release: lease.release, closed: lease.closed, inherited: true };
+  return { granted: true, tokens, release: lease.release, closed: lease.closed };
 }
 
 /** A thrown value's message. */
@@ -339,14 +316,12 @@ function watchFifo(
 
 /**
  * Make a pool of `tokens` that lives while `closed` does: when `closed` resolves the pool refuses
- * grants, ends its child connections, drains its jobserver fifo and removes its directory. A child's
- * `host-wait` is reported to `waits` for as long as its connection holds it; a sub-pool reports to the
- * same `waits`. Setup failures are values; a non-positive or unsafe count is a programmer bug and throws.
+ * grants, ends its child connections, drains its jobserver fifo and removes its directory. Setup
+ * failures are values; a non-positive or unsafe count is a programmer bug and throws.
  */
 export async function createCpuPool(
   tokens: number,
   closed: Promise<void>,
-  waits: HostWaits,
 ): Promise<{ ok: true; pool: CpuPool } | { ok: false; error: string }> {
   if (!Number.isSafeInteger(tokens) || tokens < 1) {
     throw new RangeError(`a CPU pool holds a positive safe integer of tokens, not ${tokens}`);
@@ -381,9 +356,6 @@ export async function createCpuPool(
   // Every failure the pool records, including one its listener reports while it runs. The outcome reads them.
   const failures: string[] = [];
   const queue: Waiter[] = [];
-  // Allocated only for children that need the owner to serve their local sub-ledger.
-  let subpools: Set<CpuPool> | undefined;
-  let creating: Promise<void>[] | undefined;
   const children = new Set<Socket>();
   let resolveStarted!: (failure: Error | null) => void;
   const started = new Promise<Error | null>((done) => {
@@ -461,34 +433,7 @@ export async function createCpuPool(
       const slot = granted > bytes;
       if (slot) slotLent = true;
       waiter.child.phase = { kind: 'holding', bytes, slot };
-      if (!waiter.children) {
-        waiter.child.socket.write(frame({ ok: true, lease: 'granted', tokens: granted }));
-        continue;
-      }
-      const ended = new Promise<void>((done) => {
-        if (waiter.child.socket.destroyed) done();
-        else waiter.child.socket.once('close', done);
-      });
-      const creation = createCpuPool(granted, ended, waits).then(async (made) => {
-        if (!made.ok) {
-          failures.push(made.error);
-          // Keep holding until close credits exactly this allocation once.
-          waiter.child.socket.end(frame({ ok: false, code: 'invalid-request', error: made.error }));
-          return;
-        }
-        subpools ??= new Set();
-        subpools.add(made.pool);
-        if (waiter.child.phase.kind !== 'holding' || closing) {
-          const outcome = await made.pool.close();
-          if (!outcome.ok) failures.push(outcome.error);
-          return;
-        }
-        waiter.child.socket.write(
-          frame({ ok: true, lease: 'granted', tokens: granted, pool: made.pool.environment[CPU_POOL_ENV] }),
-        );
-      });
-      creating ??= [];
-      creating.push(creation);
+      waiter.child.socket.write(frame({ ok: true, lease: 'granted', tokens: granted }));
     }
     stopWatching();
     if (!closing) returnTokens(inHand);
@@ -520,8 +465,6 @@ export async function createCpuPool(
         // A closing pool drains its fifo whole; until then the bytes go back for the next holder.
         if (child.phase.slot) slotLent = false;
         if (!closing) returnTokens(child.phase.bytes);
-      } else if (child.phase.kind === 'waiting') {
-        waits.end();
       }
       child.phase = { kind: 'done' };
       drain(0);
@@ -573,22 +516,12 @@ export async function createCpuPool(
         parsed = undefined;
       }
       if (!isRequest(parsed)) {
-        refuse(
-          child,
-          'a request is {"op":"cpu-pool","want":<a whole number of tokens, at least 1>} or {"op":"host-wait"}',
-        );
+        refuse(child, 'a request is {"op":"cpu-pool","want":<a whole number of tokens, at least 1>}');
         return;
       }
       const request = parsed;
-      if (request.op === 'host-wait') {
-        // Counted from here until the connection closes, which `close` reports however it ends.
-        child.phase = { kind: 'waiting' };
-        waits.begin();
-        socket.write(frame({ ok: true, wait: 'held' }));
-        return;
-      }
       child.phase = { kind: 'queued' };
-      queue.push({ child, want: request.want, children: request.children === true });
+      queue.push({ child, want: request.want });
       socket.write(frame({ ok: true, lease: 'queued' }));
       drain(0);
     });
@@ -616,13 +549,6 @@ export async function createCpuPool(
             done();
           });
         });
-      }
-      if (creating !== undefined) await Promise.all(creating);
-      if (subpools !== undefined) {
-        for (const pool of subpools) {
-          const outcome = await pool.close();
-          if (!outcome.ok) failures.push(outcome.error);
-        }
       }
       // The fifo's bytes are drained before it goes: a Cargo that outlives the pool keeps its descriptor and the tokens
       // it holds, and takes no more.

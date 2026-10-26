@@ -18,24 +18,12 @@ import {
   CPU_POOL_ENV,
   type CpuPool,
   createCpuPool,
-  type HostWaits,
   type InheritedCpuPool,
   readInheritedCpuPool,
+  type TokenGrant,
   takeParentCpuTokens,
 } from './cpu-pool.js';
-import {
-  askAcrossInstall,
-  CPU_TOKENS_ENV,
-  type CpuBudget,
-  gatewayCpuBudget,
-  type InstallRetry,
-  type RetryClock,
-  runnerDemand,
-  sizeRunner,
-  type TokenGrant,
-  wallClock,
-} from './cpu-tokens.js';
-import { GATEWAY_SOCKET, type InstallRestart } from './gateway-lease.js';
+import { GATEWAY_SOCKET } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { LockWait } from './lock-wait.js';
@@ -63,6 +51,7 @@ import {
   ramTempPaths,
 } from './ram-temp.js';
 import { createRunnerLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
+import { CPU_TOKENS_ENV, runnerDemand, sizeRunner } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import type { BoundedExecOptions } from './schema.js';
 import {
@@ -97,9 +86,9 @@ const EXIT_CODE_BY_SIGNAL: Partial<Record<NodeJS.Signals, number>> = {
 /** The pool descriptor: only a grant may give it, so neither the target's nor the inherited environment passes it on. */
 const POOL_ENV = [CPU_TOKENS_ENV, CPU_POOL_ENV];
 /**
- * The variables the CPU budget sets for the command it grants: no target's environment may set them. A jobserver the
- * executor itself inherits, a parent make's, still reaches an ungranted command by Cargo's own rule; a granted one's
- * sub-pool names its own fifo over it.
+ * The variables a grant sets for the command it sizes: no target's environment may set them. A jobserver the executor
+ * itself inherits, a parent make's or its cowshed job's, still reaches an ungranted command by Cargo's own rule; a
+ * granted one's sub-pool names its own fifo over it.
  */
 const BUDGET_ENV = [...POOL_ENV, 'CARGO_MAKEFLAGS', 'MAKEFLAGS', 'MFLAGS'];
 
@@ -205,7 +194,7 @@ export default function boundedExecExecutor(
 }
 
 /**
- * Runs with the normal process, RAM lease and CPU-budget owners, with an optional stdout sink, on the user's RAM temp
+ * Runs with the normal process, RAM lease and CPU pool owners, with an optional stdout sink, on the user's RAM temp
  * volume where there is one, through the host's own gateway: the Nx executor's runs, never a test's.
  */
 export function runDefaultBoundedExec(
@@ -213,36 +202,29 @@ export function runDefaultBoundedExec(
   context: BoundedExecContext,
 ): Promise<BoundedExecResult> {
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
-  return runBoundedExecWith(
-    options,
-    context,
-    (cowshed) =>
-      process.platform === 'darwin'
-        ? new RamTempVolume(
-            ramTempPaths(userInfo(), PRODUCTION),
-            RAM_TEMP_CAPACITY_BYTES,
-            createHostCommands(GATEWAY_SOCKET, undefined, undefined, cowshed),
-            undefined,
-            undefined,
-            'optional',
-          )
-        : null,
-    GATEWAY_SOCKET,
+  return runBoundedExecWith(options, context, (cowshed) =>
+    process.platform === 'darwin'
+      ? new RamTempVolume(
+          ramTempPaths(userInfo(), PRODUCTION),
+          RAM_TEMP_CAPACITY_BYTES,
+          createHostCommands(GATEWAY_SOCKET, undefined, undefined, cowshed),
+          undefined,
+          undefined,
+          'optional',
+        )
+      : null,
   );
 }
 
 /**
- * The default runner with every owner but its RAM volume and the gateway its CPU budget asks, which its caller names:
- * `volume` makes the volume for the cowshed the run's disk commands go through, and `gatewaySocket` is the gateway the
- * run takes its CPU tokens from. The Nx executor names the host's own; a host proof passes a fixture volume
- * (`fixtureRamVolume`) and the control socket of its fixture gateway, so no test leases, creates or detaches the user's
- * volume, or takes tokens from the user's gateway.
+ * The default runner with every owner but its RAM volume, which its caller makes: `volume` makes the volume for the
+ * cowshed the run's disk commands go through. The Nx executor makes the user's; a host proof passes a fixture volume
+ * (`fixtureRamVolume`), so no test leases, creates or detaches the user's volume.
  */
 export function runBoundedExecWith(
   options: BoundedExecOptions,
   context: BoundedExecContext,
   volume: (cowshed: string | undefined) => TempVolume | null,
-  gatewaySocket: string,
 ): Promise<BoundedExecResult> {
   // A target that names the cowshed its disk commands run through names it for this run's own RAM volume work and
   // for its command alike. Nx resolves `{workspaceRoot}/…` in an option to a workspace-relative path, which the
@@ -264,17 +246,7 @@ export function runBoundedExecWith(
   // A command a parent's CPU pool started draws its tokens from that pool. The pool is named by the environment the
   // parent set for this command; a run no parent started has none.
   const inherited = readInheritedCpuPool(process.env);
-  return runBoundedExec(
-    run,
-    context,
-    createProcessTreeKiller(),
-    tempVolume,
-    gatewayCpuBudget(gatewaySocket),
-    inherited,
-    captureHangDiagnostics,
-    wallClock,
-    owner,
-  );
+  return runBoundedExec(run, context, createProcessTreeKiller(), tempVolume, inherited, captureHangDiagnostics, owner);
 }
 
 /**
@@ -301,64 +273,21 @@ export function recordContext(context: NxTaskContext): BoundedExecContext {
 }
 
 /**
- * The host budget's grant, asked across an install that restarts the gateway (05_gateway.md, "A queued CPU ask
- * outlives an install").
- * `parentCut` is the install that cut off a parent pool's queued ask, so the run asks the host at once, with no ask
- * of its own first. Otherwise the run's own ask is the one cut off. Either way the ask is retried once against the
- * gateway the install starts, and `say` names the install that cut it off.
- */
-async function takeHostAcrossInstall(
-  budget: CpuBudget,
-  want: number,
-  checkout: string,
-  command: string,
-  parentCut: InstallRestart | null,
-  clock: RetryClock,
-  say: (message: string) => void,
-): Promise<InstallRetry> {
-  const ask = () => budget.take(want, checkout, command);
-  let source: string;
-  let install: InstallRestart;
-  if (parentCut !== null) {
-    source = 'parent pool';
-    install = parentCut;
-  } else {
-    const first = await ask();
-    if (first.granted || first.cause !== 'install-restart') {
-      return first;
-    }
-    source = 'gateway';
-    install = first.install;
-  }
-  // A pool child's pool ended with the old gateway: it asks the host as background work, and says so.
-  const asked = source === 'parent pool' ? " as background work, not at its pool's class" : '';
-  say(
-    `cowshed: cpu-tokens ${source} cut off by install ${install.pid} (${install.binary}) restarting the gateway; asking the gateway it starts once${asked}, within ${install.servesWithinMs} ms\n`,
-  );
-  return askAcrossInstall(ask, install, clock);
-}
-
-/**
- * Run the command once its runner holds CPU tokens from `budget` (`cpu-tokens.ts`), sized to the
- * grant; `null`, or a budget nobody serves, runs it as asked. Both bounds start once it is
- * granted: a wait for the host is not the command's time.
+ * Run the command, sized to the tokens its parent's CPU pool (`cpu-pool.ts`) lends it; a run that inherits no pool
+ * runs it as asked. Both bounds start once it is granted: a wait for the pool is not the command's time.
  *
- * `inherited` is the parent's CPU pool (`cpu-pool.ts`) that lends this run its tokens. The run asks that pool first
- * and the host budget only when the pool refuses. Whatever it is granted, the run serves its own sub-pool to its
- * descendants, closed before the grant returns. A grant whose connection closes while the command runs (a gateway
- * restart, or the lending parent's exit) ends its accounting, never the command: the command runs on over budget to
- * its own exit, and the run says so. An install that restarts the gateway while the ask waits is asked once more
- * against the gateway it starts; if none serves within the install's bound, the run is refused.
+ * `inherited` is the parent's pool: an enclosing bounded-exec's sub-pool or the Nx run's own (`run-cpu-pool.ts`). A
+ * granted run serves a sub-pool of its grant to its own descendants, closed before the grant returns. A grant whose
+ * connection closes while the command runs (the lending parent's exit) ends its accounting, never the command: the
+ * command runs on over budget to its own exit, and the run says so.
  */
 export async function runBoundedExec(
   options: BoundedExecOptions,
   context: BoundedExecContext,
   killer: ProcessTreeKiller,
   tempVolume: TempVolume | null,
-  budget: CpuBudget | null,
   inherited: InheritedCpuPool | null = null,
   captureDiagnostics: typeof captureHangDiagnostics = captureHangDiagnostics,
-  retryClock: RetryClock = wallClock,
   owner: SubtreeOwner | null = null,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
@@ -406,7 +335,7 @@ export async function runBoundedExec(
   };
 
   // A leg that runs bun runs the Bun its workspace declares, or it does not run. This comes before the RAM lease and the
-  // CPU tokens: a refusal that waited in the CPU queue first would say nothing for minutes.
+  // CPU tokens: a refusal that waited in its pool's queue first would say nothing for minutes.
   const runtime = await checkRuntimePin({
     root: context.root,
     command: requested,
@@ -556,68 +485,34 @@ export async function runBoundedExec(
     return tempReleased;
   };
 
-  // The wait is one span line, as cowshed's own spans read. On a host without a gateway the Nx run serves its own
-  // pool (`run-cpu-pool.ts`), taken below as a parent's; a command no pool and no gateway answers runs exactly as
+  // The wait is one span line, as cowshed's own spans read. Every Nx run that inherits no pool serves its own
+  // (`run-cpu-pool.ts`), so a task takes its tokens from a parent's pool; a command that inherits none runs exactly as
   // asked and nothing is said.
   const cores = availableParallelism();
   const demand = runnerDemand(requested, options.parallelism, cores, process.env, options.env);
   const asked = Date.now();
-  // A run a parent's CPU pool serves takes its tokens there. Only an absent pool, or one an install's restart cut off,
-  // leaves the host budget to ask. A pool that answered and refused is a live budget of its own -- a lent grant, or a
-  // gate's or a resident's relay to the host -- so asking the host beside it would count the run twice; the run fails
-  // instead.
+  // A pool that answered and refused is a live budget, and running beside it would count the run twice: the run fails
+  // instead. A pool whose endpoint is gone (its holder exited) lends nothing, and the run goes on as asked.
   let grant: GrantedTokens | null = null;
   let parentRefusal: string | null = null;
-  // The parent's gateway is gone with the install's restart, so its run asks the host across the restart at once.
-  let parentCut: { install: InstallRestart; reason: string } | null = null;
   if (inherited !== null) {
     const fromParent = await takeParentCpuTokens(inherited, demand.want);
     if (fromParent.granted) {
       grant = fromParent;
-    } else if (fromParent.cause === 'install-restart') {
-      parentCut = { install: fromParent.install, reason: fromParent.reason };
     } else if (fromParent.cause === 'absent') {
-      appendStderr(
-        `cowshed: cpu-tokens parent pool absent: ${fromParent.reason}; asking the host budget as background work, not at the pool's class\n`,
-      );
+      appendStderr(`cowshed: cpu-pool parent pool absent: ${fromParent.reason}; running the command as asked\n`);
     } else {
       parentRefusal = fromParent.reason;
     }
-  }
-  let unbudgeted: string | null = null;
-  let restartRefusal: string | null = null;
-  if (grant === null && parentRefusal === null && budget !== null) {
-    const fromHost = await takeHostAcrossInstall(
-      budget,
-      demand.want,
-      context.root,
-      requested,
-      parentCut?.install ?? null,
-      retryClock,
-      appendStderr,
-    );
-    if (fromHost.granted) {
-      grant = fromHost;
-    } else if (fromHost.cause === 'install-deadline') {
-      restartRefusal = fromHost.reason;
-    } else if (fromHost.cause !== 'absent') {
-      unbudgeted = fromHost.reason;
-    }
-  } else if (parentCut !== null) {
-    parentRefusal = parentCut.reason;
   }
   const waitedMs = Date.now() - asked;
   let cpu: BoundedExecRecord['cpu'];
   let sized: { command: string; env: Record<string, string> } = { command: requested, env: {} };
   if (grant !== null) {
     sized = sizeRunner(demand, requested, grant.tokens);
-    cpu = { tokens: grant.tokens, want: demand.want, waitedMs, ...(grant.inherited ? { inherited: true } : {}) };
+    cpu = { tokens: grant.tokens, want: demand.want, waitedMs };
     appendStderr(
-      `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=ok ${grant.inherited ? 'inherited=true ' : ''}tokens=${grant.tokens}/${demand.want} runner=${demand.kind}\n`,
-    );
-  } else if (unbudgeted !== null) {
-    appendStderr(
-      `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=err runner=${demand.kind} runs unbudgeted: ${unbudgeted}\n`,
+      `cowshed: cpu-pool wait done elapsed=${waitedMs}ms status=ok tokens=${grant.tokens}/${demand.want} runner=${demand.kind}\n`,
     );
   }
   // The run's sub-pool and grant are given back exactly once, however the run ends. The sub-pool closes first, so no
@@ -639,8 +534,8 @@ export async function runBoundedExec(
     return cpuReleased;
   };
   // Records the run's verdict when it has a task to record as. An `expiry` is set only when a bound ended the run.
-  // An `operational` run failed on its CPU budget (a sub-pool that did not close): an ordinary failure, whatever
-  // bound also fired, so it is never judged as a bound.
+  // An `operational` run failed on its CPU pool (a sub-pool that did not close): an ordinary failure, whatever bound also
+  // fired, so it is never judged as a bound.
   const recordRun = async (
     exitCode: number,
     expiry: ExpiredBound | null,
@@ -672,35 +567,13 @@ export async function runBoundedExec(
     return { success: false, terminalOutput: outputChunks.join('') };
   };
   if (parentRefusal !== null) {
-    return refuse(
-      `cowshed: cpu-tokens parent pool refused: ${parentRefusal}; refusing to run the command without asking the host budget\n`,
-    );
+    return refuse(`cowshed: cpu-pool parent pool refused: ${parentRefusal}; refusing to run the command\n`);
   }
-
-  if (restartRefusal !== null) {
-    return refuse(`cowshed: cpu-tokens ${restartRefusal}; refusing to run the command\n`);
-  }
-
-  // Descendant work queued for host CPU tokens, as its pool hears it (`host-wait`): while any is held the idle clock
-  // is stopped, because a queued job is not an idle one (specs/cowshed/05_gateway.md, "The bounds start at the
-  // grant"). The clock it stops is made with the command below; a wait held before then is counted and honoured there.
-  let heldWaits = 0;
-  let idleClock: { stop(): void; restart(): void } | null = null;
-  const hostWaits: HostWaits = {
-    begin: () => {
-      heldWaits += 1;
-      if (heldWaits === 1) idleClock?.stop();
-    },
-    end: () => {
-      heldWaits -= 1;
-      if (heldWaits === 0) idleClock?.restart();
-    },
-  };
 
   // A granted run serves a sub-pool of its own grant, so its descendants draw from that and never from above it.
-  // A pool that cannot be set up refuses the run: no command runs unbudgeted.
+  // A pool that cannot be set up refuses the run: no granted command runs beside its grant.
   if (grant !== null) {
-    const created = await createCpuPool(grant.tokens, grant.closed, hostWaits);
+    const created = await createCpuPool(grant.tokens, grant.closed);
     if (!created.ok) {
       return refuse(`cowshed: cpu pool unavailable: ${created.error}; refusing to run the command\n`);
     }
@@ -785,17 +658,11 @@ export async function runBoundedExec(
     clearTimeout(captureTimer);
     idleCapture?.controller.abort();
   };
-  // What is left of the current no-progress interval. A finished test sets it back to `idleTimeoutMs`; a held host
-  // wait keeps it unspent: the clock is stopped while descendant work is queued for CPU tokens, and runs on from where
-  // it stopped once the last wait ends. `queuedMs` is the queued time this interval has not counted, for the report.
-  let idleLeftMs = idleTimeoutMs ?? 0;
-  let queuedMs = 0;
-  let queuedSinceMs: number | null = null;
-  const scheduleIdle = (limitMs: number, leftMs: number): void => {
+  const scheduleIdle = (limitMs: number): void => {
     clearTimeout(idleTimer);
     cancelCapture();
     const capture: NonNullable<typeof idleCapture> = {
-      expiresAtMs: Date.now() + leftMs,
+      expiresAtMs: Date.now() + limitMs,
       controller: new AbortController(),
       result: { kind: 'pending', startedAtMs: null },
     };
@@ -833,55 +700,15 @@ export async function runBoundedExec(
             },
           );
       },
-      Math.max(0, leftMs - HANG_CAPTURE_MS),
+      Math.max(0, limitMs - HANG_CAPTURE_MS),
     );
-    idleTimer = setTimeout(() => expire({ kind: 'idle', limitMs, tests: progress.inFlight() }, queuedMs), leftMs);
+    idleTimer = setTimeout(() => expire({ kind: 'idle', limitMs, tests: progress.inFlight() }), limitMs);
   };
   const armIdleTimer = (): void => {
     if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || !isTesting()) {
       return;
     }
-    idleLeftMs = idleTimeoutMs;
-    queuedMs = 0;
-    if (queuedSinceMs !== null) {
-      queuedSinceMs = Date.now();
-      return;
-    }
-    scheduleIdle(idleTimeoutMs, idleLeftMs);
-  };
-  idleClock = {
-    stop: () => {
-      if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || queuedSinceMs !== null) {
-        return;
-      }
-      const now = Date.now();
-      queuedSinceMs = now;
-      if (idleCapture !== undefined) {
-        idleLeftMs = Math.max(0, idleCapture.expiresAtMs - now);
-      }
-      clearTimeout(idleTimer);
-      cancelCapture();
-      idleCapture = undefined;
-      appendStderr(
-        `bounded-exec: idle clock stopped: a descendant's work is queued for host CPU tokens; ${idleLeftMs}ms of idleTimeoutMs=${idleTimeoutMs} left\n`,
-      );
-    },
-    restart: () => {
-      if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || queuedSinceMs === null) {
-        return;
-      }
-      const waitedMs = Date.now() - queuedSinceMs;
-      queuedMs += waitedMs;
-      queuedSinceMs = null;
-      if (!isTesting()) {
-        appendStderr(`bounded-exec: host CPU wait ended after ${waitedMs}ms; no test runner is active\n`);
-        return;
-      }
-      appendStderr(
-        `bounded-exec: idle clock restarted: no descendant's work is queued for host CPU tokens after ${waitedMs}ms; ${idleLeftMs}ms of idleTimeoutMs=${idleTimeoutMs} left\n`,
-      );
-      scheduleIdle(idleTimeoutMs, idleLeftMs);
-    },
+    scheduleIdle(idleTimeoutMs);
   };
 
   // Only the CHILD's own output is read for progress. The diagnostics below go
@@ -1001,8 +828,7 @@ export async function runBoundedExec(
   // the reader unable to tell a wedged toolchain from a loaded machine — the
   // two have opposite fixes.
   let termination: Promise<void> = Promise.resolve();
-  // `queuedMs` is the time the idle interval did not count because descendant work was queued for host CPU tokens.
-  const expire = (bound: ExpiredBound, queuedMs = 0): void => {
+  const expire = (bound: ExpiredBound): void => {
     if (state.settled || state.expiry !== null) {
       return;
     }
@@ -1012,9 +838,7 @@ export async function runBoundedExec(
     const elapsedMs = Date.now() - startedAt;
     appendStderr(
       bound.kind === 'idle'
-        ? `\nCommand made no progress: no test finished for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs})${
-            queuedMs > 0 ? `, not counting ${queuedMs}ms queued for host CPU tokens,` : ''
-          } after ${elapsedMs}ms of runtime; ${
+        ? `\nCommand made no progress: no test finished for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs}) after ${elapsedMs}ms of runtime; ${
             bound.tests.length > 0
               ? `still running: ${bound.tests.join(', ')}`
               : 'the runner named no test still running'
@@ -1113,13 +937,11 @@ export async function runBoundedExec(
   const totalTimer =
     timeoutMs === undefined ? undefined : setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
   armIdleTimer();
-  // A wait its pool heard before the command started stops the clock it was not yet there to stop.
-  if (heldWaits > 0) idleClock.stop();
 
-  // A grant's connection is a ledger entry, not the command's owner (05_gateway.md "Host CPU budget": a gateway
-  // restart forgets every grant, and what runs under it runs on over budget until it finishes). Its close, while the
-  // command runs, is said and changes nothing else; only a bound or a signal stops the command. Our own release after
-  // the command settled is not a loss; `cpuReleased` marks it.
+  // A grant's connection is a ledger entry, not the command's owner: the lending parent's exit ends it, and what runs
+  // under it runs on over budget until it finishes. Its close, while the command runs, is said and changes nothing
+  // else; only a bound or a signal stops the command. Our own release after the command settled is not a loss;
+  // `cpuReleased` marks it.
   if (grant !== null) {
     const held = grant;
     void held.closed.then(() => {
@@ -1127,7 +949,7 @@ export async function runBoundedExec(
         return;
       }
       appendStderr(
-        `cowshed: cpu-tokens grant ended: the ${held.inherited ? 'parent pool' : 'gateway'} closed its ${held.tokens}-token grant while the command ran; it runs on over budget until it ends: ${command}\n`,
+        `cowshed: cpu-pool grant ended: the parent pool closed its ${held.tokens}-token grant while the command ran; it runs on over budget until it ends: ${command}\n`,
       );
     });
   }

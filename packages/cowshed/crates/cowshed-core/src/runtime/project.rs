@@ -5666,7 +5666,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         "land check `{check}` never ran ({failure:?}): {}",
                         read_job_stderr_tail(&handle, job_id).await
                     ),
-                    "read the host CPU ledger with `cowshed gateway status`, then retry land",
+                    "read the job's stderr above and `cowshed gateway status` for the host, then retry land",
                 ));
             }
             let exited = std::time::SystemTime::now();
@@ -6290,7 +6290,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// Main's due seed, compacted (16_build_volumes.md, "Seed compaction"). Under main's image
     /// lock, main's seed is refreshed as a fork of main refreshes it and cloned aside; the clone is
-    /// copied with no lock held, holding while a gate job or a land runs. Under the lock again the
+    /// copied with no lock held, holding while a land runs. Under the lock again the
     /// seed is refreshed once more, and the copy is published when the seed it holds is still
     /// main's latest. When a land, a fork's reseed or that refresh replaced it, the latest is
     /// cloned aside and the copy caught up to it with no lock held, writing only what it changed,
@@ -6531,7 +6531,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// A compaction's copy or catch-up, `work`, whose every check asks this controller, on its own
     /// task, whether to go on: an answer, not a timer, so the work is asked exactly as often as it
-    /// checks. While a gate job or a land runs, the controller says why once in the compaction's
+    /// checks. While a land runs, the controller says why once in the compaction's
     /// log, holds [`SEED_COMPACTION_WAIT`] and answers `Wait`; the work asks again.
     async fn between_gates<T, Work>(
         &self,
@@ -6543,8 +6543,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         use super::build_volumes::{Admission, SEED_COMPACTION_WAIT};
         type Answer = tokio::sync::oneshot::Sender<Admission>;
         let (asks, mut asked) = tokio::sync::mpsc::channel::<Answer>(1);
-        let unanswered =
-            || Admission::Stop("nothing answers whether a gate job or a land runs".to_owned());
+        let unanswered = || Admission::Stop("nothing answers whether a land runs".to_owned());
         let admit: Box<dyn FnMut() -> Admission + Send> = Box::new(move || {
             let (reply, answer) = tokio::sync::oneshot::channel();
             if asks.blocking_send(reply).is_err() {
@@ -6590,16 +6589,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
     }
 
-    /// Why a seed compaction's copy waits now (16_build_volumes.md, "Seed compaction"): a gate
-    /// job holds or waits for CPU tokens, or a land holds or waits for a repository's turn, whose
-    /// gate may run as plain host work the CPU ledger does not count. `Err` is why it stops:
-    /// either cannot be read, and not knowing is no permission. No gateway runs no gate job.
+    /// Why a seed compaction's copy waits now (16_build_volumes.md, "Seed compaction"): a land holds
+    /// or waits for a repository's turn. `Err` is why it stops: the turns cannot be read, and not
+    /// knowing is no permission.
     async fn why_compaction_waits(&self) -> std::result::Result<Option<String>, String> {
-        if let Some(why) =
-            super::build_volumes::gates_hold(self.gateway_control.gates_in_flight().await)?
-        {
-            return Ok(Some(why));
-        }
         let root =
             crate::land_turn::land_turn_root(&crate::host_dirs::support_directory(&self.home));
         let turns = crate::land_turn::observe_all(&root, None)
@@ -9994,10 +9987,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             },
             workspace_volume,
             job_sampling: super::supervisor::JobSamplingPolicy::default(),
-            // Every job's command spawns under a grant from this host's gateway CPU budget.
-            cpu: std::sync::Arc::new(super::job_cpu::GatewayJobCpu::new(
-                self.descriptor.storage.control_socket(),
-            )),
             // A job's end releases the volume it held when an adoption or reseed superseded it
             // while the job ran: inside this controller, awaited before the job is told ended,
             // and a release that cannot run or fails is that job's terminal failure.
@@ -17191,16 +17180,16 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let (handle, build_volume) = self.admit_build_state(&workspace).await?;
         self.reconcile_gateway_for_work(&workspace, &incarnation, &handle)
             .await?;
-        // This controller runs in the requester's process, so a pool it inherited is the
-        // requester's: the job waits on it and on the host ledger at once, and the first grant
-        // serves it (05_gateway.md "Work a holder starts draws on its grant").
+        // This controller runs in the requester's process, so a jobserver it inherited is the
+        // requester's job's: the new job reads it too when its sandbox can open it (05_gateway.md
+        // "Parallelism inside a job").
         handle
             .exec_from(
                 token.as_ref(),
                 build_volume,
                 request,
                 source,
-                super::job_cpu::requester_cpu_pool(),
+                super::job_cpu::requester_jobserver(),
             )
             .await
     }
@@ -19506,7 +19495,10 @@ mod removal_supervisor_tests {
                 .send(ProcessEvent::Started {
                     job_id: request.job_id,
                     process: process.clone(),
-                    nice: request.cpu.nice,
+                    #[cfg(target_os = "macos")]
+                    nice: Some(request.cpu.nice),
+                    #[cfg(not(target_os = "macos"))]
+                    nice: None,
                 })
                 .await
                 .map_err(|_| CowshedError::internal("test process event channel closed"))?;

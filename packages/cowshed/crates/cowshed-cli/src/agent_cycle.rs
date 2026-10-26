@@ -1,15 +1,13 @@
 //! The decisions of stopping and reloading a LaunchAgent, and of whether an install may restart
 //! the gateway now, pure over what the shell observed (05_gateway.md "Install order and
-//! rollback", "An install refuses while a land or a gate runs"). `gateway_service` is the shell:
-//! it runs `launchctl`, watches the old process's exit in the kernel, and reads the land-turn
-//! tickets and the CPU ledger. Nothing here does I/O or reads a clock.
+//! rollback", "An install refuses while a land runs"). `gateway_service` is the shell: it runs
+//! `launchctl`, watches the old process's exit in the kernel, and reads the land-turn tickets.
+//! Nothing here does I/O or reads a clock.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
 use cowshed_core::CowshedError;
-use cowshed_core::api::GateJobRef;
 use cowshed_core::land_turn::{RepoTurns, Ticket};
 
 /// A loaded agent as `launchctl print` reports it.
@@ -183,11 +181,8 @@ pub const fn reload(held: Held) -> Reload {
 /// Work that a gateway restart would cut off now.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Busy {
-    /// A land holds its repository's turn: between its steps nothing of it shows in the ledger,
-    /// and the restart would refuse its next step's connection.
+    /// A land holds its repository's turn: the restart would refuse its next step's connection.
     LandTurn { repo: String, holder: Ticket },
-    /// A gate job holds or wants CPU tokens: its pool is gateway state a restart ends.
-    GateJob(GateJobRef),
 }
 
 impl fmt::Display for Busy {
@@ -198,15 +193,14 @@ impl fmt::Display for Busy {
                 "the land of {} holds the {repo} land turn (ticket {}, pid {})",
                 holder.workspace, holder.number, holder.pid
             ),
-            Self::GateJob(gate) => write!(formatter, "gate job {} at {}", gate.job, gate.checkout),
         }
     }
 }
 
 /// Everything a restart of the gateway would cut off now: the holder of each repository's land
 /// turn (its first live ticket; a queued land behind it runs nothing yet, and its first step
-/// waits for the install slot), then each gate job holding or wanting tokens.
-pub fn restart_blockers(turns: &[RepoTurns], gates: &BTreeSet<GateJobRef>) -> Vec<Busy> {
+/// waits for the install slot).
+pub fn restart_blockers(turns: &[RepoTurns]) -> Vec<Busy> {
     turns
         .iter()
         .filter_map(|queue| {
@@ -215,7 +209,6 @@ pub fn restart_blockers(turns: &[RepoTurns], gates: &BTreeSet<GateJobRef>) -> Ve
                 holder: holder.clone(),
             })
         })
-        .chain(gates.iter().cloned().map(Busy::GateJob))
         .collect()
 }
 
@@ -234,7 +227,7 @@ pub fn refusal(busy: &[Busy]) -> Option<CowshedError> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        "rerun it once they have ended; `cowshed gateway status` lists the land turns and gate jobs",
+        "rerun it once they have ended; `cowshed gateway status` lists the land turns",
     ))
 }
 
@@ -306,13 +299,6 @@ mod tests {
         })
     }
 
-    fn gates() -> impl Strategy<Value = BTreeSet<GateJobRef>> {
-        proptest::collection::btree_set(
-            (any::<u64>(), "/[a-z]{1,8}").prop_map(|(job, checkout)| GateJobRef { job, checkout }),
-            0..4,
-        )
-    }
-
     proptest! {
         /// The agent's own pid and exit timeout are read, never a nested block's.
         #[test]
@@ -364,14 +350,11 @@ mod tests {
             prop_assert_eq!(reload(Held::TearingDown(remains)), Reload::Blocked(remains));
         }
 
-        /// An install refuses exactly while a land holds a turn or a gate job holds or wants
-        /// tokens, naming each turn's holder once and every gate job; a queued land is not named.
+        /// An install refuses exactly while a land holds a turn, naming each turn's holder once; a
+        /// queued land is not named.
         #[test]
-        fn an_install_refuses_exactly_while_a_land_or_a_gate_runs(
-            turns in queues(),
-            gates in gates(),
-        ) {
-            let busy = restart_blockers(&turns, &gates);
+        fn an_install_refuses_exactly_while_a_land_runs(turns in queues()) {
+            let busy = restart_blockers(&turns);
             let holders: Vec<Busy> = turns
                 .iter()
                 .filter_map(|queue| queue.tickets.first().map(|holder| Busy::LandTurn {
@@ -379,13 +362,9 @@ mod tests {
                     holder: holder.clone(),
                 }))
                 .collect();
-            prop_assert_eq!(&busy[..holders.len()], &holders[..]);
-            prop_assert_eq!(
-                &busy[holders.len()..],
-                &gates.iter().cloned().map(Busy::GateJob).collect::<Vec<_>>()[..]
-            );
+            prop_assert_eq!(&busy, &holders);
             match refusal(&busy) {
-                None => prop_assert!(holders.is_empty() && gates.is_empty()),
+                None => prop_assert!(holders.is_empty()),
                 Some(error) => {
                     prop_assert_eq!(error.code, cowshed_core::ErrorCode::Conflict);
                     for blocker in &busy {

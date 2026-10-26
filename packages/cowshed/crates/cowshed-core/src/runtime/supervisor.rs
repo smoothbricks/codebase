@@ -57,7 +57,7 @@ use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::fsio::AnchoredDirectory;
 
 use crate::runtime::child_fence::ChildFence;
-use crate::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant, ProbationOutcome};
+use crate::runtime::job_cpu::Jobserver;
 use crate::runtime::job_groups::Birth;
 use crate::runtime::job_progress::{JobProgressStream, ProgressRead};
 use crate::runtime::job_resources::{
@@ -192,9 +192,6 @@ pub struct WorkspaceSupervisorConfig {
     pub workspace_volume: Option<VolumeMountpoint>,
     /// How each job's resources are sampled.
     pub job_sampling: JobSamplingPolicy,
-    /// The host CPU budget every job's command is admitted through before it spawns (05_gateway.md
-    /// "Host CPU budget"): the gateway's grant, held until the job concludes.
-    pub cpu: Arc<dyn JobCpuAdmission>,
     /// Told each build volume whose job hold ended; `None` tells nothing.
     pub build_volume_released: Option<BuildVolumeReleased>,
     /// How long the shed may go unused before the keeper stops its Nx daemon: main's
@@ -381,59 +378,9 @@ impl Default for WorkspaceSupervisorConfig {
             volume_labels: None,
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
-            cpu: Arc::new(ImmediateCpu),
             build_volume_released: None,
             nx_daemon_idle: NxDaemonIdle::DEFAULT,
         }
-    }
-}
-
-/// A CPU budget that grants each request its whole want at once, and a resident its pool alone:
-/// in-crate tests' stand-in for the gateway. Its pool names no live socket; nothing in these
-/// tests asks it for tokens.
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct ImmediateCpu;
-
-#[cfg(test)]
-impl JobCpuAdmission for ImmediateCpu {
-    fn background_share(&self) -> std::num::NonZeroUsize {
-        std::num::NonZeroUsize::new(4).expect("four")
-    }
-
-    fn admit(
-        &self,
-        ask: JobCpuAsk,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobCpuGrant>> + Send>> {
-        Box::pin(async move {
-            let pool = PathBuf::from("/nonexistent/cowshed-cpu-pool.sock");
-            Ok(match ask.class {
-                ExecClass::Resident | ExecClass::InteractiveResident => {
-                    JobCpuGrant::resident(pool, Box::new(()))
-                }
-                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
-                    let fifo = PathBuf::from("/nonexistent/cowshed-cpu-pool.fifo");
-                    JobCpuGrant::new(
-                        super::job_cpu::HeldTokens {
-                            tokens: ask.want,
-                            fifo,
-                        },
-                        pool,
-                        Box::new(()),
-                    )
-                }
-            })
-        })
-    }
-
-    fn activation(
-        &self,
-        _checkout: PathBuf,
-        _command: String,
-        _parent: Option<String>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<super::job_cpu::ActivationStake>> + Send>>
-    {
-        Box::pin(async { Ok(super::job_cpu::ActivationStake::new(Box::new(()))) })
     }
 }
 
@@ -495,27 +442,7 @@ pub struct CheckpointBarrier {
 pub enum ProcessSignal {
     Term,
     Kill,
-    /// Stop the job's processes where they are: its probation ended without a grant
-    /// (05_gateway.md "A one-token job starts on probation").
-    Stop,
-    /// Continue a stopped job: its grant came, or it is being killed.
-    Continue,
 }
-
-/// How long a job runs on the probation token before its grant: until it has used this much CPU
-/// or run this long since its first process, whichever comes first, as the sampling clock reads
-/// it (05_gateway.md "A one-token job starts on probation").
-const PROBATION_CPU: Duration = Duration::from_secs(1);
-const PROBATION_WALL: Duration = Duration::from_secs(2);
-
-/// A job on probation's wall and CPU milliseconds at `sample`, once either reached its bound.
-fn probation_spent(sample: &JobResourceSample) -> Option<(u64, u64)> {
-    let wall = sample.wall_ms.get();
-    let cpu = sample.cpu_user_ms.get() + sample.cpu_sys_ms.get();
-    (u128::from(wall) >= PROBATION_WALL.as_millis() || u128::from(cpu) >= PROBATION_CPU.as_millis())
-        .then_some((wall, cpu))
-}
-
 /// What a spawn runs, in the form the spawner executes it.
 #[derive(Clone, Debug)]
 pub enum SpawnCommand {
@@ -659,7 +586,7 @@ pub struct ProcessSpawnRequest {
     /// Where the command runs: in the workspace's sandbox, or a trusted coordinator's gate at the
     /// host boundary.
     pub scope: ExecScope,
-    /// The CPU grant and class nice the command alone runs under.
+    /// The job's jobserver and, on macOS, its class nice, which the command alone runs under.
     pub cpu: CpuPlacement,
     /// Native Linux admission owns this cgroup before any command can start. Injected sinks
     /// without native processes have no kernel membership.
@@ -667,132 +594,57 @@ pub struct ProcessSpawnRequest {
     pub cgroup: Option<Arc<super::job_cgroup::JobCgroup>>,
 }
 
-/// What a spawn places a job's owned command under: its CPU grant, served to the command as the
-/// live pool and count every nested runner borrows from (05_gateway.md "Nested runners use a
-/// parent-held sub-ledger") and as the make jobserver fifo Cargo reads (05_gateway.md "Cargo
-/// reads its holder's jobserver"), and the nice its class runs at. A resident holds no tokens:
-/// its count is 0, it has no fifo, and its pool asks the host for each child (05_gateway.md "A
-/// resident holds no token").
+/// What a spawn places a job's owned command under (05_gateway.md "Classes", "Parallelism inside
+/// a job"): the jobserver fifo its build tree reads and the count its test threads and Nx tasks are
+/// sized to, and on macOS the nice its class runs at. On Linux the job's cgroup carries its class.
 #[derive(Clone, Debug)]
 pub struct CpuPlacement {
-    pub held: Option<super::job_cpu::HeldTokens>,
-    pub pool: PathBuf,
+    pub fifo: PathBuf,
+    pub tokens: std::num::NonZeroUsize,
+    #[cfg(target_os = "macos")]
     pub nice: i32,
-    /// The job's class: a gate's pool is a relay whose runners each size their own test threads
-    /// to their own host grant (05_gateway.md "Gate admission").
-    pub class: ExecClass,
-    /// Whether a shell activation the spawn runs is already under a token the job holds.
-    pub activation: ActivationCover,
-}
-
-/// What a command's start activates, judged when a resident is admitted (05_gateway.md "A
-/// resident's start holds one token"). Only an activation is work a resident's start does, so
-/// only [`Self::Activates`] asks the stake that bounds it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShellStart {
-    /// The command's directory selects no `.envrc`: no shell activates.
-    Bare,
-    /// An exec host of the command's shell has activated already and waits, idle or as the
-    /// spare, of its current generation.
-    Activated,
-    /// The shell activates before the command: no activated host waits, or a one-shot child
-    /// enters the shell itself.
-    Activates,
-}
-
-impl ShellStart {
-    /// Whether a resident starting so asks one background token for its start.
-    pub fn stakes(self) -> bool {
-        match self {
-            Self::Bare | Self::Activated => false,
-            Self::Activates => true,
-        }
-    }
-}
-
-/// Whether the host budget already bounds a shell activation a job's spawn runs (05_gateway.md
-/// "A resident's start holds one token").
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ActivationCover {
-    /// The job holds tokens, or a resident holds its start stake: an activation counts against
-    /// them.
-    Held,
-    /// A resident that asked no stake, its start judged to activate nothing. A pooled spawn that
-    /// must activate after all -- its warm host taken, or its shell's inputs changed, since the
-    /// judgment -- asks the stake then, drawing on `parent` beside the host when it names one.
-    Unheld { parent: Option<String> },
-}
-
-/// The make flags a held grant exports to Cargo and make, ahead of its fifo's path.
-const JOBSERVER_FIFO_FLAGS: &str = "-j --jobserver-auth=fifo:";
-
-/// The jobserver fifo a command's environment names as its grant's, read back from the
-/// `CARGO_MAKEFLAGS` [`CpuPlacement::environment`] sets. The exec host, the first process inside
-/// the sandbox, opens it before the command runs and says on the job's stderr when it cannot.
-pub fn granted_jobserver_fifo(environment: &BTreeMap<OsString, OsString>) -> Option<&Path> {
-    environment
-        .get(OsStr::new("CARGO_MAKEFLAGS"))?
-        .as_bytes()
-        .strip_prefix(JOBSERVER_FIFO_FLAGS.as_bytes())
-        .map(|fifo| Path::new(OsStr::from_bytes(fifo)))
 }
 
 impl CpuPlacement {
-    /// The variables only the grant's authority sets, laid over the caller's: a caller cannot
-    /// name a pool, a count or a jobserver it was not granted. The fifo is the pool's own, whose
-    /// bytes its socket children take, so the two never count one token twice. Test threads take
-    /// no jobserver token, so they are sized to the grant where the caller named no count, except
-    /// under a gate: its pool is a relay that lends nothing, every runner its command starts asks
-    /// the host and sizes its own test threads to that grant, and a count here would be the
-    /// ceiling every one of them reads (05_gateway.md "The holder exports it").
+    /// The variables only the job's supervisor sets, laid over the caller's: a caller cannot name
+    /// a jobserver or a count its job was not served. Test threads take no jobserver token, so they
+    /// are sized to the count where the caller named none (05_gateway.md "Cargo reads its holder's
+    /// jobserver").
     pub(super) fn environment(
         &self,
         caller: &BTreeMap<String, String>,
     ) -> Vec<(OsString, OsString)> {
-        let tokens = self.held.as_ref().map_or(0, |held| held.tokens.get());
+        let tokens = OsString::from(self.tokens.to_string());
+        let mut flags = OsString::from(super::job_cpu::JOBSERVER_FIFO_FLAGS);
+        flags.push(&self.fifo);
         let mut environment = vec![
             (
-                OsString::from("BOUNDED_EXEC_CPU_POOL"),
-                self.pool.clone().into_os_string(),
+                OsString::from(super::job_cpu::CPU_TOKENS_ENV),
+                tokens.clone(),
             ),
-            (
-                OsString::from("BOUNDED_EXEC_CPU_TOKENS"),
-                OsString::from(tokens.to_string()),
-            ),
+            (OsString::from("CARGO_MAKEFLAGS"), flags.clone()),
+            (OsString::from("MAKEFLAGS"), flags),
         ];
-        if let Some(held) = &self.held {
-            let mut flags = OsString::from(JOBSERVER_FIFO_FLAGS);
-            flags.push(&held.fifo);
-            environment.push((OsString::from("CARGO_MAKEFLAGS"), flags.clone()));
-            environment.push((OsString::from("MAKEFLAGS"), flags));
-            let sized_by_this_grant = match self.class {
-                ExecClass::Background
-                | ExecClass::Interactive
-                | ExecClass::Resident
-                | ExecClass::InteractiveResident => true,
-                ExecClass::Gate => false,
-            };
-            for name in ["RUST_TEST_THREADS", "NEXTEST_TEST_THREADS"] {
-                if sized_by_this_grant && !caller.contains_key(name) {
-                    environment.push((OsString::from(name), OsString::from(tokens.to_string())));
-                }
-            }
-            if sized_by_this_grant {
-                let tasks = OsString::from(nx_parallel(caller, tokens).to_string());
-                environment.push((OsString::from("NX_PARALLEL"), tasks.clone()));
-                environment.push((
-                    OsString::from(crate::workspace_environment::NX_PARALLEL_RESTORE_ENV),
-                    tasks,
-                ));
+        for name in ["RUST_TEST_THREADS", "NEXTEST_TEST_THREADS"] {
+            if !caller.contains_key(name) {
+                environment.push((OsString::from(name), tokens.clone()));
             }
         }
+        let tasks = OsString::from(nx_parallel(caller, self.tokens.get()).to_string());
+        environment.push((OsString::from("NX_PARALLEL"), tasks.clone()));
+        environment.push((
+            OsString::from(crate::workspace_environment::NX_PARALLEL_RESTORE_ENV),
+            tasks,
+        ));
         environment
     }
 }
 
-/// How many Nx tasks a command holding `tokens` runs at once: a caller's count below the grant,
-/// else the grant. A percentage, or anything else that is not a count, is the grant: Nx reads a
-/// percentage of the host's cores, which the grant already bounds.
+/// How many Nx tasks a command whose jobserver holds `tokens` runs at once: a caller's count below
+/// it, else `tokens`. A percentage, or anything else that is not a count, is `tokens`: Nx reads a
+/// percentage of the host's cores, which the count already bounds. Measured 2026-10-26: `cowshed
+/// exec <ws> -- nx run-many` on a count of 2 ran 11 task processes at once (16 GB RSS, host load
+/// 39), since the devenv shell's `NX_PARALLEL=100%` let Nx start a task per core.
 fn nx_parallel(caller: &BTreeMap<String, String>, tokens: usize) -> usize {
     caller
         .get("NX_PARALLEL")
@@ -804,319 +656,51 @@ fn nx_parallel(caller: &BTreeMap<String, String>, tokens: usize) -> usize {
 #[cfg(test)]
 mod cpu_placement_tests {
     use super::*;
-    #[cfg(target_os = "macos")]
-    use cowshed_os::test_backstop::ChildBackstop as _;
 
-    /// Only a start that activates a shell asks a resident's stake: a directory with no
-    /// `.envrc` activates nothing, and a host that has activated waits ready.
+    /// A caller's own counts below the job's are the caller's, a percentage or a larger count is
+    /// the job's, and the jobserver is the job's whatever the caller sent.
     #[test]
-    fn a_resident_stakes_only_a_start_that_activates() {
-        assert!(!ShellStart::Bare.stakes());
-        assert!(!ShellStart::Activated.stakes());
-        assert!(ShellStart::Activates.stakes());
-    }
-
-    fn placement(held: Option<usize>) -> CpuPlacement {
-        CpuPlacement {
-            held: held.map(|tokens| super::super::job_cpu::HeldTokens {
-                tokens: std::num::NonZeroUsize::new(tokens).expect("a grant holds a token"),
-                fifo: PathBuf::from("/pool/j"),
-            }),
-            pool: PathBuf::from("/pool/p.sock"),
+    fn a_caller_keeps_only_its_lower_counts_and_never_its_jobserver() {
+        let placement = CpuPlacement {
+            fifo: PathBuf::from("/pool/j"),
+            tokens: std::num::NonZeroUsize::new(4).expect("four"),
+            #[cfg(target_os = "macos")]
             nice: 10,
-            class: ExecClass::Background,
-            activation: ActivationCover::Held,
-        }
-    }
-
-    /// The environment `placement` exports over `caller`, as names and values.
-    fn exported(placement: &CpuPlacement, caller: &[(&str, &str)]) -> BTreeMap<String, String> {
-        let caller = caller
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect();
-        placement
-            .environment(&caller)
-            .into_iter()
-            .map(|(name, value)| {
-                (
-                    name.into_string().expect("a UTF-8 name"),
-                    value.into_string().expect("a UTF-8 value"),
-                )
-            })
-            .collect()
-    }
-
-    fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect()
-    }
-
-    /// A held grant exports its fifo to Cargo and make, and sizes test threads to the grant
-    /// (05_gateway.md "Cargo reads its holder's jobserver").
-    #[test]
-    fn a_held_grant_exports_its_jobserver_and_test_threads_to_the_command() {
-        assert_eq!(
-            exported(&placement(Some(3)), &[]),
-            expected(&[
-                ("BOUNDED_EXEC_CPU_POOL", "/pool/p.sock"),
-                ("BOUNDED_EXEC_CPU_TOKENS", "3"),
-                ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
-                ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
-                ("RUST_TEST_THREADS", "3"),
-                ("NEXTEST_TEST_THREADS", "3"),
-                ("NX_PARALLEL", "3"),
-                ("COWSHED_NX_PARALLEL", "3"),
-            ])
-        );
-    }
-
-    /// Nx's task fan-out is the grant's. Measured 2026-10-26: `cowshed exec <ws> -- nx run-many`
-    /// on 2 tokens ran 11 task processes at once (16 GB RSS, host load 39), since the devenv
-    /// shell's `NX_PARALLEL=100%` let Nx start a task per core whatever the job held. A
-    /// grant-sized class exports `NX_PARALLEL` as its count, below any larger caller count and in
-    /// place of a percentage, and `COWSHED_NX_PARALLEL`, which `.cowshed/env` restores after a
-    /// devenv shell sets its own; a gate exports neither, since its tasks ask the host one by one.
-    #[test]
-    fn nx_task_fan_out_is_the_grants() {
-        let nx = |placement: &CpuPlacement, caller: &[(&str, &str)]| {
-            let exported = exported(placement, caller);
-            (
-                exported.get("NX_PARALLEL").cloned(),
-                exported.get("COWSHED_NX_PARALLEL").cloned(),
-            )
         };
-        let count = |n: &str| (Some(n.to_owned()), Some(n.to_owned()));
-        assert_eq!(nx(&placement(Some(2)), &[]), count("2"));
-        assert_eq!(
-            nx(&placement(Some(2)), &[("NX_PARALLEL", "100%")]),
-            count("2")
-        );
-        assert_eq!(nx(&placement(Some(2)), &[("NX_PARALLEL", "8")]), count("2"));
-        assert_eq!(nx(&placement(Some(4)), &[("NX_PARALLEL", "3")]), count("3"));
-        let gate = CpuPlacement {
-            class: ExecClass::Gate,
-            ..placement(Some(1))
+        let exported = |caller: &[(&str, &str)]| -> BTreeMap<OsString, OsString> {
+            let caller = caller
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect();
+            placement.environment(&caller).into_iter().collect()
         };
-        assert_eq!(nx(&gate, &[]), (None, None));
-        assert_eq!(nx(&placement(None), &[]), (None, None));
-    }
-
-    /// A gate's pool is a relay that lends nothing: every runner its command starts asks the host
-    /// and sizes its test threads to that runner's own grant, so the gate's own grant sets no
-    /// test-thread count that a runner would read as its ceiling (05_gateway.md "The holder
-    /// exports it").
-    #[test]
-    fn a_gate_relay_exports_its_jobserver_and_no_test_threads() {
-        let gate = CpuPlacement {
-            class: ExecClass::Gate,
-            ..placement(Some(1))
+        let read = |exported: &BTreeMap<OsString, OsString>, name: &str| {
+            exported
+                .get(OsStr::new(name))
+                .map(|value| value.to_string_lossy().into_owned())
         };
+        let named = exported(&[
+            ("RUST_TEST_THREADS", "8"),
+            ("NX_PARALLEL", "100%"),
+            ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/caller"),
+        ]);
+        assert_eq!(read(&named, "RUST_TEST_THREADS"), None);
+        assert_eq!(read(&named, "NEXTEST_TEST_THREADS").as_deref(), Some("4"));
+        assert_eq!(read(&named, "NX_PARALLEL").as_deref(), Some("4"));
         assert_eq!(
-            exported(&gate, &[]),
-            expected(&[
-                ("BOUNDED_EXEC_CPU_POOL", "/pool/p.sock"),
-                ("BOUNDED_EXEC_CPU_TOKENS", "1"),
-                ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
-                ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
-            ])
+            read(&named, "CARGO_MAKEFLAGS").as_deref(),
+            Some("-j --jobserver-auth=fifo:/pool/j")
         );
-    }
-
-    /// A test-thread count the caller named is the caller's: the grant sets only the other one.
-    /// The jobserver is the grant's whatever the caller sent.
-    #[test]
-    fn a_caller_named_test_thread_count_is_kept_and_its_jobserver_is_not() {
-        assert_eq!(
-            exported(
-                &placement(Some(2)),
-                &[
-                    ("RUST_TEST_THREADS", "8"),
-                    ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/caller"),
-                ],
-            ),
-            expected(&[
-                ("BOUNDED_EXEC_CPU_POOL", "/pool/p.sock"),
-                ("BOUNDED_EXEC_CPU_TOKENS", "2"),
-                ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
-                ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
-                ("NEXTEST_TEST_THREADS", "2"),
-                ("NX_PARALLEL", "2"),
-                ("COWSHED_NX_PARALLEL", "2"),
-            ])
-        );
-    }
-
-    /// A resident holds no token: its pool and a zero count, no jobserver, no test-thread sizing
-    /// (05_gateway.md "A resident holds no token").
-    #[test]
-    fn a_resident_exports_its_pool_and_no_jobserver() {
-        assert_eq!(
-            exported(&placement(None), &[]),
-            expected(&[
-                ("BOUNDED_EXEC_CPU_POOL", "/pool/p.sock"),
-                ("BOUNDED_EXEC_CPU_TOKENS", "0"),
-            ])
-        );
-    }
-
-    /// The exec host reads back the fifo a held grant exported, and none where no grant set one.
-    #[test]
-    fn the_granted_fifo_is_read_back_from_the_exported_flags() {
-        let environment = |placement: &CpuPlacement| -> BTreeMap<OsString, OsString> {
-            placement
-                .environment(&BTreeMap::new())
-                .into_iter()
-                .collect()
-        };
-        assert_eq!(
-            granted_jobserver_fifo(&environment(&placement(Some(3)))),
-            Some(Path::new("/pool/j"))
-        );
-        assert_eq!(granted_jobserver_fifo(&environment(&placement(None))), None);
-        let foreign = BTreeMap::from([(
-            OsString::from("CARGO_MAKEFLAGS"),
-            OsString::from("-j4 --jobserver-auth=3,4"),
-        )]);
-        assert_eq!(granted_jobserver_fifo(&foreign), None);
-    }
-
-    /// A band lowers from whatever nice the supervisor itself runs at, so a supervisor started
-    /// nice -- under `cowshed exec --host`, a gate's runner -- still places every class, and the
-    /// lowest priority bounds the bands rather than refusing them (05_gateway.md "Bands").
-    #[test]
-    fn class_nice_lowers_from_the_supervisors_own() {
-        let classes = [
-            ExecClass::Interactive,
-            ExecClass::InteractiveResident,
-            ExecClass::Gate,
-            ExecClass::Background,
-            ExecClass::Resident,
-        ];
-        for (own, placed) in [
-            (0, [0, 0, 5, 10, 10]),
-            (10, [10, 10, 15, LOWEST_NICE, LOWEST_NICE]),
-            (17, [17, 17, LOWEST_NICE, LOWEST_NICE, LOWEST_NICE]),
-            (LOWEST_NICE, [LOWEST_NICE; 5]),
-        ] {
+        for (caller, tasks) in [("3", "3"), ("8", "4"), ("0", "4")] {
+            let exported = exported(&[("NX_PARALLEL", caller)]);
             assert_eq!(
-                classes.map(|class| class_nice(own, class)),
-                placed,
-                "supervisor at nice {own}"
+                read(&exported, "NX_PARALLEL").as_deref(),
+                Some(tasks),
+                "{caller}"
             );
         }
     }
-
-    /// The bound is the kernel's own: a held command placed at the lowest nice reads that same
-    /// nice back, the readback every placement requires.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_lowest_nice_is_placed_and_read_back() {
-        use cowshed_os::fork_lock::Spawn as _;
-        // The command waits on its stdin, whose writer this test holds until it has placed it.
-        let mut child = std::process::Command::new("/bin/cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn_locked()
-            .expect("a command to place");
-        let placed = place_nice(child.id(), LOWEST_NICE);
-        child.kill().expect("end the placed command");
-        child.wait_bounded().expect("reap the placed command");
-        assert_eq!(
-            placed.map_err(|failure| format!("{failure:?}")),
-            Ok(LOWEST_NICE)
-        );
-    }
 }
-
-/// The lowest priority setpriority places and reads back: Darwin places PRIO_MAX, 20, itself;
-/// Linux stops at MAX_NICE, 19, below its PRIO_MAX of 20, and clamps a larger request to it
-/// (getpriority(2)), so a placement asking 20 there would read back 19 and be refused.
-#[cfg(target_os = "macos")]
-pub const LOWEST_NICE: i32 = libc::PRIO_MAX;
-#[cfg(target_os = "linux")]
-pub const LOWEST_NICE: i32 = 19;
-/// The nice a class's command runs at, its row of 05_gateway.md "Bands", from `own`, the nice this
-/// supervisor runs at: interactive and an interactive resident at the supervisor's own, a gate
-/// five below it, background and a resident ten below it, never past the kernel's lowest
-/// priority. Only lowering: raising a priority above the supervisor's own takes a privilege no
-/// supervisor holds. The two residents differ here and nowhere else.
-pub(super) const fn class_nice(own: i32, class: ExecClass) -> i32 {
-    let below = match class {
-        ExecClass::Interactive | ExecClass::InteractiveResident => 0,
-        ExecClass::Gate => 5,
-        ExecClass::Background | ExecClass::Resident => 10,
-    };
-    let nice = own.saturating_add(below);
-    if nice > LOWEST_NICE {
-        LOWEST_NICE
-    } else {
-        nice
-    }
-}
-
-/// The nice this supervisor runs at, which its classes' bands are placed from ("Bands").
-fn own_nice() -> i32 {
-    super::shell_host::clear_errno();
-    // SAFETY: a plain read of this process's own priority.
-    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-    // -1 is a nice as well as getpriority's error; a process reading its own priority has no
-    // error to report, so a set errno here is an impossible state, not a placement.
-    let read = io::Error::last_os_error();
-    assert!(
-        nice != -1 || read.raw_os_error() == Some(0),
-        "this process reads its own nice: {read}"
-    );
-    nice
-}
-
-/// Set the held command `pid` -- forked, leading its own group, not yet running anything of the
-/// job's -- to `nice`, and read back what its kernel entry holds: the nice the command is
-/// observed at. Only a child held at its observation fence is placed here, never a host or this
-/// supervisor.
-#[cfg(target_os = "macos")]
-pub(super) fn place_nice(pid: u32, nice: i32) -> std::result::Result<i32, PriorityFailure> {
-    let failure = |observed, errno| PriorityFailure {
-        pid,
-        requested: nice,
-        observed,
-        errno,
-    };
-    // SAFETY: plain system calls naming a child this supervisor's spawn holds unreleased.
-    if unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, nice) } == -1 {
-        return Err(failure(None, io::Error::last_os_error().raw_os_error()));
-    }
-    super::shell_host::clear_errno();
-    // SAFETY: as above.
-    let observed = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
-    if observed == -1
-        && let Some(errno) = io::Error::last_os_error().raw_os_error()
-        && errno != 0
-    {
-        return Err(failure(None, Some(errno)));
-    }
-    if observed == nice {
-        Ok(observed)
-    } else {
-        Err(failure(Some(observed), None))
-    }
-}
-
-/// The command as the gateway's admission diagnostics name it: an argv's words, or that it is a
-/// script.
-fn command_label(command: &ExecCommand) -> String {
-    match command {
-        ExecCommand::Argv(argv) => argv
-            .iter()
-            .map(|argument| argument.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" "),
-        ExecCommand::Script(_) => "script".to_owned(),
-    }
-}
-
 #[derive(Debug)]
 pub enum ProcessEvent {
     Output {
@@ -1194,19 +778,14 @@ pub enum ProcessEvent {
     Started {
         job_id: JobId,
         process: OwnedProcess,
-        /// The nice the command was observed at once placed, before it ran anything.
-        nice: i32,
+        /// The nice the command was observed at once placed, before it ran anything; none on
+        /// Linux, where the job's cgroup carries its class.
+        nice: Option<i32>,
     },
     /// A warm-shell job ended before any command started; nothing is left running.
     LaunchFailed {
         job_id: JobId,
         error: CowshedError,
-    },
-    /// A job started on the probation token heard how its wait for its grant ended
-    /// (05_gateway.md "A one-token job starts on probation").
-    Probation {
-        job_id: JobId,
-        outcome: ProbationOutcome,
     },
     /// A script job's text did not parse; nothing ran and its stderr carries the diagnostic.
     ScriptSyntax {
@@ -1271,6 +850,7 @@ pub trait SpawnSink: Send {
         &mut self,
         _authority: &WorkspaceAuthoritySnapshot,
         _job_id: JobId,
+        _class: ExecClass,
     ) -> Result<Option<Arc<super::job_cgroup::JobCgroup>>> {
         Ok(None)
     }
@@ -1280,19 +860,6 @@ pub trait SpawnSink: Send {
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>>;
-
-    /// What a command in `mode` at `cwd`, under `policy`, would activate if it started now
-    /// (05_gateway.md "A resident's start holds one token"). A sink that keeps no exec hosts
-    /// knows of none that has activated, so by default the start activates.
-    async fn shell_start(
-        &mut self,
-        _policy: &SandboxPolicy,
-        _cwd: &Path,
-        _mode: crate::api::dto::RunSandboxMode,
-        _scope: ExecScope,
-    ) -> ShellStart {
-        ShellStart::Activates
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1408,7 +975,6 @@ impl ArtifactSink for ArtifactStoreSink {
                 class: record.scheduling.class(),
                 scope: record.scheduling.scope(),
                 nice: record.nice,
-                cpu_tokens: record.cpu_tokens,
             }))
     }
 
@@ -2004,19 +1570,18 @@ async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
 }
 
 /// The caller's variables a child may take: no bypass of managed Git configuration, no
-/// agent-harness `CI` in a development checkout, and no CPU authority but the job's own grant.
-/// GitHub/Forgejo Actions identifies real CI with `GITHUB_ACTIONS=true`; a bare `CI` changes
-/// Cargo unit identities but names no runner. A caller's make jobserver (`CARGO_MAKEFLAGS`,
-/// `MAKEFLAGS`, `MFLAGS`) would run the job's builds on someone else's tokens, and the job's own
-/// jobserver and pool markers are the grant's to set ([`CpuPlacement`]).
+/// agent-harness `CI` in a development checkout, and no jobserver but the job's own. GitHub/Forgejo
+/// Actions identifies real CI with `GITHUB_ACTIONS=true`; a bare `CI` changes Cargo unit identities
+/// but names no runner. A caller's make jobserver (`CARGO_MAKEFLAGS`, `MAKEFLAGS`, `MFLAGS`) would
+/// run the job's builds on another job's tokens, and the job's own jobserver and count are its
+/// supervisor's to set ([`CpuPlacement`]).
 /// What the sandbox owns or withholds is laid over this by [`SandboxEnvironment`].
-/// Variables that name a CPU authority; only a job's own grant sets them.
-const CALLER_CPU_AUTHORITY: [&str; 5] = [
+/// Variables that name a jobserver or its count; only the job's supervisor sets them.
+const CALLER_CPU_AUTHORITY: [&str; 4] = [
     "CARGO_MAKEFLAGS",
     "MAKEFLAGS",
     "MFLAGS",
-    "BOUNDED_EXEC_CPU_POOL",
-    "BOUNDED_EXEC_CPU_TOKENS",
+    super::job_cpu::CPU_TOKENS_ENV,
 ];
 pub(super) fn caller_environment(
     caller: &BTreeMap<String, String>,
@@ -2473,15 +2038,13 @@ pub struct SystemSpawnSink {
 }
 
 impl SystemSpawnSink {
-    /// A sink whose commands under a workspace `.envrc` run in warm hosts of `program`; a spare
-    /// host's activation asks `cpu` for its token.
+    /// A sink whose commands under a workspace `.envrc` run in warm hosts of `program`.
     pub fn with_shell_host(
         program: super::shell_host::ShellHostProgram,
         config: super::shell_pool::ShellPoolConfig,
-        cpu: Arc<dyn JobCpuAdmission>,
     ) -> Self {
         Self {
-            shells: Some(super::shell_job::WorkspaceShells::new(program, config, cpu)),
+            shells: Some(super::shell_job::WorkspaceShells::new(program, config)),
             #[cfg(target_os = "linux")]
             cgroups: None,
         }
@@ -2495,6 +2058,7 @@ impl SpawnSink for SystemSpawnSink {
         &mut self,
         authority: &WorkspaceAuthoritySnapshot,
         job_id: JobId,
+        class: ExecClass,
     ) -> Result<Option<Arc<super::job_cgroup::JobCgroup>>> {
         if !self
             .cgroups
@@ -2512,51 +2076,11 @@ impl SpawnSink for SystemSpawnSink {
         self.cgroups
             .as_ref()
             .expect("authority was established above")
-            .admit(job_id)
+            .admit(job_id, class)
             .map(Arc::new)
             .map(Some)
             .map_err(cgroup_error)
     }
-
-    /// A directory with no `.envrc` activates nothing, one-shot or pooled. Under an `.envrc`,
-    /// the shell's pool says whether an activated host waits; with no exec host program the
-    /// one-shot child activates the shell itself. The host boundary's command enters whatever
-    /// shell it names after its spawn, so it is judged to activate.
-    async fn shell_start(
-        &mut self,
-        policy: &SandboxPolicy,
-        cwd: &Path,
-        mode: crate::api::dto::RunSandboxMode,
-        scope: ExecScope,
-    ) -> ShellStart {
-        if scope == ExecScope::HostGate {
-            return ShellStart::Activates;
-        }
-        // A cwd or profile that cannot be resolved fails the job's spawn with this same cause;
-        // until then its start is judged to activate, which keeps its stake.
-        let Ok(cwd) = crate::exec::contained_cwd(&policy.ceiling().workspace_mount, cwd) else {
-            return ShellStart::Activates;
-        };
-        let Ok(policy) = policy.for_cwd(&cwd) else {
-            return ShellStart::Activates;
-        };
-        let (sandbox, _) = policy.child(mode);
-        let Some(directory) = shell_directory(sandbox) else {
-            return ShellStart::Bare;
-        };
-        match &self.shells {
-            Some(shells) => {
-                shells
-                    .start(
-                        sandbox.mode == crate::sandbox::RunSandboxMode::ReadOnly,
-                        directory,
-                    )
-                    .await
-            }
-            None => ShellStart::Activates,
-        }
-    }
-
     async fn spawn(
         &mut self,
         request: ProcessSpawnRequest,
@@ -2583,6 +2107,7 @@ impl SpawnSink for SystemSpawnSink {
             return spawn_fenced(
                 command,
                 request.job_id,
+                #[cfg(target_os = "macos")]
                 request.cpu.nice,
                 #[cfg(target_os = "linux")]
                 cgroup,
@@ -2650,8 +2175,7 @@ impl SpawnSink for SystemSpawnSink {
             );
         }
         let mut environment = environment.child(&request.env);
-        // The grant's pool, count and jobserver are the authority's, laid over whatever the
-        // caller named.
+        // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
         environment.extend(request.cpu.environment(&request.env));
         if let Some(program) = argv.first() {
             // Shell activation, when the profile has one, sets PATH inside the sandbox.
@@ -2668,6 +2192,7 @@ impl SpawnSink for SystemSpawnSink {
         spawn_fenced(
             sandboxed_command(&plan, &environment),
             request.job_id,
+            #[cfg(target_os = "macos")]
             request.cpu.nice,
             #[cfg(target_os = "linux")]
             cgroup,
@@ -2715,7 +2240,7 @@ fn refused_cgroup(
 /// The host-boundary command of a trusted coordinator's host exec, at whatever class it was
 /// admitted: its argv exec'd directly in the workspace, outside every sandbox profile and without
 /// shell activation, so it keeps the host authority real APFS images need. Its environment is exactly the caller's (credential
-/// names already withheld), with the CPU grant's pool and count laid over it and
+/// names already withheld), with the job's jobserver and count laid over it and
 /// `NX_DAEMON_START=never` last, so no job's Nx client starts a daemon (04_sandbox.md). Admission
 /// refused a host-gate script, which needs the sandboxed exec host's interpreter.
 fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio::process::Command> {
@@ -2757,14 +2282,14 @@ fn refuse_unstartable(program: &OsStr, cwd: &Path, path: Option<&OsStr>) -> Resu
     }
 }
 
-/// Spawn `command` as a job's one-shot leader: in a process group of its own, at `nice`, reaped
-/// only inside its [`ChildFence`]. On macOS the child is held before exec until its native
-/// observer watches it and this process placed its nice; elsewhere the child sets and verifies its
-/// own nice before exec, and a refusal fails the spawn with the kernel's errno.
+/// Spawn `command` as a job's one-shot leader: in a process group of its own, reaped only inside
+/// its [`ChildFence`]. On macOS the child is held before exec until its native observer watches it
+/// and this process placed its class's `nice`; on Linux it enters the job's cgroup, which carries
+/// its class, before exec.
 async fn spawn_fenced(
     mut command: tokio::process::Command,
     job_id: JobId,
-    nice: i32,
+    #[cfg(target_os = "macos")] nice: i32,
     #[cfg(target_os = "linux")] cgroup: Arc<super::job_cgroup::JobCgroup>,
     #[cfg(target_os = "macos")] monitor: ProcessMonitor,
     events: mpsc::Sender<ProcessEvent>,
@@ -2821,61 +2346,19 @@ async fn spawn_fenced(
                     map_exec_error(ExecError::from(classify_spawn_error(error)))
                 }
                 HeldSpawnError::Priority(failure) => CowshedError::priority(failure),
-            })?
+            })
+            .map(|(child, nice)| (child, Some(nice)))?
     };
-    // No fence holds the child here: it places its own nice before exec and reports exactly what
-    // it observed on a private pipe, so a refusal is typed and a placement is the read-back.
+    // No fence holds the child here: the job's cgroup, which it enters before exec, carries its
+    // class (05_gateway.md "Classes").
     #[cfg(not(target_os = "macos"))]
-    let (mut child, nice) = {
-        let (reported, report) = super::shell_host::nice_pipe().map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot prepare the command's nice report: {error}"),
-                "inspect descriptor availability before retrying the command",
-            )
-        })?;
-        let report_end = std::os::fd::AsRawFd::as_raw_fd(&report);
-        // SAFETY: getpid/setpriority/getpriority/write and an errno store run between fork and
-        // exec, on a stack buffer and a descriptor this closure only names.
-        unsafe {
-            command.pre_exec(move || super::shell_host::report_own_nice(report_end, nice));
-        }
-        let spawned = command.into_std().spawn_locked();
-        // The child wrote before exec or never got that far; this end only kept the pipe open.
-        drop(report);
-        match (spawned, super::shell_host::read_nice_report(reported)) {
-            (Ok(child), Ok(Some(Ok(observed)))) => (child, observed),
-            (Err(_), Ok(Some(Err(failure)))) => return Err(CowshedError::priority(failure)),
-            (Err(error), _) => {
-                return Err(map_exec_error(ExecError::from(classify_spawn_error(error))));
-            }
-            (Ok(mut child), report) => {
-                // Exec happened, so the child placed and reported its nice; a report that does not
-                // say so leaves the command's nice unknown, and it must not run on unobserved.
-                let pid = i32::try_from(child.id()).unwrap_or(i32::MAX);
-                // SAFETY: this unreaped child leads its own group, made before its nice.
-                let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
-                let kill = (killed == -1).then(io::Error::last_os_error);
-                let waited = cowshed_os::deadline::reap(
-                    "command without a nice report",
-                    &mut child,
-                    &cowshed_os::deadline::start(
-                        "reap unobserved command",
-                        cowshed_os::deadline::REAP,
-                    ),
-                    cowshed_os::deadline::Progress::Signalled {
-                        signal: libc::SIGKILL,
-                    },
-                );
-                if waited.is_err() {
-                    cowshed_os::deadline::collect_later("command without a nice report", child);
-                }
-                return Err(CowshedError::internal(format!(
-                    "the command started without a readable nice report ({report:?}); group \
-                     kill {kill:?}; reap {waited:?}"
-                )));
-            }
-        }
-    };
+    let (mut child, nice) = (
+        command
+            .into_std()
+            .spawn_locked()
+            .map_err(|error| map_exec_error(ExecError::from(classify_spawn_error(error))))?,
+        None,
+    );
     let spawned = Instant::now();
     let fence = std::sync::Arc::new(ChildFence::new(child.id())?);
     let process = OwnedProcess {
@@ -2975,7 +2458,7 @@ fn spawn_observed(
         let mut placed = None;
         let observed = gate.observe(|pid| {
             monitor.watch(pid).map_err(io::Error::other)?;
-            let placement = place_nice(pid, nice);
+            let placement = super::placement::macos::place_nice(pid, nice);
             let refused = placement
                 .as_ref()
                 .err()
@@ -3138,8 +2621,9 @@ struct SystemRunningProcess {
     /// The command as this process observed it right after spawning it.
     process: OwnedProcess,
     stdin: StdinLane,
-    /// The nice the command was observed at once placed.
-    nice: i32,
+    /// The nice the command was observed at once placed; none on Linux, where the job's cgroup
+    /// carries its class.
+    nice: Option<i32>,
     #[cfg(target_os = "linux")]
     cgroup: Arc<super::job_cgroup::JobCgroup>,
     #[cfg(target_os = "macos")]
@@ -3157,7 +2641,7 @@ impl RunningProcess for SystemRunningProcess {
     }
 
     fn nice(&self) -> Option<i32> {
-        Some(self.nice)
+        self.nice
     }
 
     #[cfg(target_os = "macos")]
@@ -3183,8 +2667,6 @@ impl RunningProcess for SystemRunningProcess {
             match signal {
                 ProcessSignal::Term => self.cgroup.terminate(),
                 ProcessSignal::Kill => self.cgroup.kill(),
-                ProcessSignal::Stop => self.cgroup.freeze(true),
-                ProcessSignal::Continue => self.cgroup.freeze(false),
             }
             .map_err(cgroup_error)
         }
@@ -3193,8 +2675,6 @@ impl RunningProcess for SystemRunningProcess {
             .signal(match signal {
                 ProcessSignal::Term => libc::SIGTERM,
                 ProcessSignal::Kill => libc::SIGKILL,
-                ProcessSignal::Stop => libc::SIGSTOP,
-                ProcessSignal::Continue => libc::SIGCONT,
             })
             .map_err(crate::runtime::child_fence::NotSignalled::into_error)
     }
@@ -3394,11 +2874,12 @@ impl WorkspaceSupervisorHandle {
     /// swap").
     ///
     /// `source` is who asks: only a coordinator may run a gate or reach the host boundary. The
-    /// answer comes at admission, once the job is durable and `queued` for its CPU grant, never
-    /// at its spawn: the caller holds the job's id while it waits, reads its state, and kills it
-    /// to withdraw it from the gateway's queue (07_api.md, "CLI and API exec parity"). A
-    /// refusal that arrives after admission — the gateway's, or the class nice that cannot be
-    /// placed — fails the job, typed on its record and said on its stderr.
+    /// answer comes at admission, once the job is durable and `queued`, never at its spawn: the
+    /// caller holds the job's id while a background start waits for memory pressure to drop,
+    /// reads its state, and kills it to withdraw it (07_api.md, "CLI and API exec parity"). A
+    /// refusal that arrives after admission -- a jobserver that cannot be made, an unreadable
+    /// memory pressure, or a class nice that cannot be placed -- fails the job, typed on its record
+    /// and said on its stderr.
     pub async fn exec(
         &self,
         session: Option<&SessionToken>,
@@ -3410,16 +2891,16 @@ impl WorkspaceSupervisorHandle {
             .await
     }
 
-    /// [`Self::exec`] for a requester that holds a live CPU pool: the job waits on `cpu_parent`
-    /// and on the host ledger at once, and the first grant serves it (05_gateway.md "Work a holder
-    /// starts draws on its grant"). `None` asks the host alone, as `exec` does.
+    /// [`Self::exec`] for a requester whose own job serves it a jobserver: the new job reads
+    /// `parent_jobserver` too when its sandbox can open it (05_gateway.md "Parallelism inside a
+    /// job"). `None` serves the job a fifo of its own, as `exec` does.
     pub async fn exec_from(
         &self,
         session: Option<&SessionToken>,
         build_volume: Option<PathBuf>,
         request: ExecRequest,
         source: AdmissionSource,
-        cpu_parent: Option<String>,
+        parent_jobserver: Option<super::job_cpu::InheritedJobserver>,
     ) -> Result<JobId> {
         self.call(|reply| Command::Exec {
             authority: self.authority.clone(),
@@ -3427,7 +2908,7 @@ impl WorkspaceSupervisorHandle {
             build_volume,
             request: Box::new(request),
             source,
-            cpu_parent,
+            parent_jobserver,
             reply,
         })
         .await
@@ -3847,11 +3328,7 @@ impl WorkspaceSupervisor {
             config.artifacts.clone(),
         )?;
         let spawner = match config.shell_host.clone() {
-            Some(program) => SystemSpawnSink::with_shell_host(
-                program,
-                config.shell_pool,
-                Arc::clone(&config.cpu),
-            ),
+            Some(program) => SystemSpawnSink::with_shell_host(program, config.shell_pool),
             None => SystemSpawnSink::default(),
         };
         Self::start_with_sinks(
@@ -3919,7 +3396,6 @@ impl WorkspaceSupervisor {
             labelling: tokio::task::JoinSet::new(),
             job_sampling: config.job_sampling,
             sample_clock: None,
-            cpu: config.cpu,
             build_volume_released: config.build_volume_released,
             admissions: tokio::task::JoinSet::new(),
         };
@@ -3959,8 +3435,8 @@ pub(super) enum Command {
         build_volume: Option<PathBuf>,
         request: Box<ExecRequest>,
         source: AdmissionSource,
-        /// The requester's live CPU pool, which the job's tokens come from ([`JobCpuAsk::parent`]).
-        cpu_parent: Option<String>,
+        /// The requester's jobserver fifo, which the job reads too when its sandbox can open it.
+        parent_jobserver: Option<super::job_cpu::InheritedJobserver>,
         reply: oneshot::Sender<Result<JobId>>,
     },
     Detach {
@@ -4148,8 +3624,13 @@ enum KillReason {
     WaitFailure,
     /// A script did not parse, so nothing ran.
     ScriptSyntax,
-    /// The host CPU budget refused the job, so nothing ran.
+    /// The job's admission failed: its jobserver could not be made, or the host's memory
+    /// pressure could not be read; nothing ran.
     CpuAdmission,
+    /// Ended at critical host memory pressure (05_gateway.md "Memory pressure"); macOS only: on
+    /// Linux each job's cgroup ceilings bound its memory.
+    #[cfg(target_os = "macos")]
+    Memory,
 }
 
 /// A job's stdin as the actor delivers it, in input order: the bytes the pump wrote to the
@@ -4555,7 +4036,7 @@ struct JobStateRecord {
         crate::build_volume::BuildVolumeId,
         crate::build_volume::BuildVolumeHold,
     )>,
-    /// Where the job stands with the host CPU budget.
+    /// Where the job stands with its admission.
     cpu: CpuStanding,
     /// Why the job failed before any status of its own could say, when it did.
     failure: Option<JobFailure>,
@@ -4591,32 +4072,26 @@ fn admission_env_sha256(
     }
     Sha256Digest::from_bytes(digest.finalize().into())
 }
-/// Where a job stands with the host CPU budget (05_gateway.md "Host CPU budget").
+/// Where a job stands with its admission (05_gateway.md "Memory pressure", "Parallelism inside a
+/// job").
 enum CpuStanding {
-    /// Asking the gateway; the command spawns when the grant arrives.
+    /// Admitting: a background start waits for memory pressure to drop; the command spawns once
+    /// its jobserver is served.
     Queued(Box<PendingSpawn>),
-    /// Cancelled while queued: it left the gateway's queue, and nothing ever spawned.
+    /// Cancelled while queued: nothing ever spawned.
     Withdrawn,
-    /// The grant the command runs under, held until the job concludes, whatever ends it; a
-    /// resident's start stake within it returns when its command starts.
-    Granted { grant: JobCpuGrant },
-    /// Holding nothing: the request was refused, or the job concluded and returned its grant.
+    /// The jobserver the command runs with, held until the job concludes, whatever ends it.
+    Admitted { _jobserver: Jobserver },
+    /// Holding nothing: the admission failed, or the job concluded and let its jobserver go.
     Settled,
 }
 
-/// What a queued job's spawn needs once its grant arrives, as admission settled it: the authority
+/// What a queued job's spawn needs once it is admitted, as admission settled it: the authority
 /// and sandbox it was admitted under, never ones adopted while it waited.
 struct PendingSpawn {
-    /// Aborting it drops the gateway request, which leaves the queue. Its task id tells this
-    /// ask's answer from one an earlier, withdrawn ask of the job delivered before its abort.
+    /// Aborting it ends the admission's wait. Its task id tells this admission's answer from one a
+    /// withdrawn admission of the job delivered before its abort.
     asking: tokio::task::AbortHandle,
-    /// The count the job asks for, kept to ask again ([`SupervisorActor::rebind_keeper_start`]).
-    want: std::num::NonZeroUsize,
-    /// The holder's live pool a resident's start stake draws on beside the host, if any.
-    parent: Option<String>,
-    /// What a resident's start activates, judged at its admission; `None` for a class that
-    /// holds tokens, which an activation counts against.
-    start: Option<ShellStart>,
     authority: WorkspaceAuthoritySnapshot,
     policy: SandboxPolicy,
     command: SpawnCommand,
@@ -4795,13 +4270,11 @@ struct SupervisorActor {
     job_sampling: JobSamplingPolicy,
     /// The job sampling clock: running while a job owns a process.
     sample_clock: Option<tokio::time::Interval>,
-    /// See [`WorkspaceSupervisorConfig::cpu`].
-    cpu: Arc<dyn JobCpuAdmission>,
     /// See [`WorkspaceSupervisorConfig::build_volume_released`].
     build_volume_released: Option<BuildVolumeReleased>,
-    /// Each queued job's CPU request, answered off the actor's path, so status, kill and every
-    /// other command are served while jobs wait for their grants.
-    admissions: tokio::task::JoinSet<(JobId, Result<JobCpuGrant>)>,
+    /// Each queued job's admission, answered off the actor's path, so status, kill and every
+    /// other command are served while a background start waits for memory.
+    admissions: tokio::task::JoinSet<(JobId, Result<Jobserver>)>,
 }
 
 /// Runtime teardown transfers the same jobs to one retirement worker. The actor joins for a
@@ -5074,8 +4547,7 @@ impl SupervisorActor {
                 granted = self.admissions.join_next_with_id(), if !self.admissions.is_empty() => {
                     match granted {
                         Some(Ok((asked, (job_id, granted)))) => {
-                            self.spawn_granted(asked, job_id, granted).await;
-                            self.rebind_keeper_start();
+                            self.spawn_admitted(asked, job_id, granted).await;
                         }
                         // A withdrawn request: its job ended while it was queued.
                         Some(Err(error)) if error.is_cancelled() => {}
@@ -5156,11 +4628,11 @@ impl SupervisorActor {
     /// A tick of the sampling clock: a supervisor boundary for every job that owns a process,
     /// each kept as its latest sample. With none left, the clock stops until a job owns one.
     /// A failed tick leaves the latest sample standing; every read observes again and returns
-    /// that failure itself.
+    /// that failure itself. On macOS each tick also reads the host's memory pressure
+    /// ([`Self::end_for_memory`]).
     fn sample_jobs(&mut self) {
         let mut live = false;
-        let mut spent = Vec::new();
-        for (job_id, job) in &mut self.jobs {
+        for job in self.jobs.values_mut() {
             let Some(sampler) = job.sampling.live() else {
                 continue;
             };
@@ -5174,84 +4646,74 @@ impl SupervisorActor {
                 #[cfg(target_os = "macos")]
                 job.monitor.as_ref(),
             ) {
-                if let CpuStanding::Granted { grant } = &job.cpu
-                    && grant.on_probation()
-                    && let Some((wall, cpu)) = probation_spent(&sample)
-                {
-                    spent.push((*job_id, wall, cpu));
-                }
                 job.info.resources = Some(sample);
             }
         }
         if !live {
             self.sample_clock = None;
         }
-        for (job_id, wall, cpu) in spent {
-            self.end_probation(job_id, wall, cpu);
-        }
+        #[cfg(target_os = "macos")]
+        self.end_for_memory();
     }
 
-    /// A job on probation reached its bound without a grant (05_gateway.md "A one-token job
-    /// starts on probation"): stop its processes where they are, return the probation token, and
-    /// say so on its stderr. Its grant continues it.
-    fn end_probation(&mut self, job_id: JobId, wall_ms: u64, cpu_ms: u64) {
-        let Some(job) = self.jobs.get_mut(&job_id) else {
-            return;
-        };
-        let CpuStanding::Granted { grant } = &mut job.cpu else {
-            return;
-        };
-        let stopped = job
-            .process
-            .as_mut()
-            .map(|process| process.signal_process_tree(ProcessSignal::Stop));
-        grant.end_probation();
-        job.info.cpu_tokens = None;
-        let line = match stopped {
-            Some(Ok(())) | None => format!(
-                "cowshed: jobserver probation over after {wall_ms} ms, {cpu_ms} ms CPU; stopped \
-                 until its token is granted\n"
-            ),
-            Some(Err(error)) => format!(
-                "cowshed: jobserver probation over after {wall_ms} ms, {cpu_ms} ms CPU; the job \
-                 could not be stopped ({}), so it runs on outside the budget until its token is \
-                 granted\n",
-                error.message
-            ),
-        };
-        self.process_output(job_id, StreamKind::Stderr, Bytes::from(line));
-    }
-
-    /// A job's probation wait ended: granted, its one token is the job's; or the gateway is gone
-    /// without a grant, and the job runs on unaccounted (05_gateway.md "Crash safety by
-    /// connection"). A job its probation's end stopped is continued either way.
-    fn probation_settled(&mut self, job_id: JobId, outcome: ProbationOutcome) {
-        let Some(job) = self.jobs.get_mut(&job_id) else {
-            return;
-        };
-        if job.terminal() {
-            return;
-        }
-        let CpuStanding::Granted { grant } = &mut job.cpu else {
-            return;
-        };
-        let stopped = grant.probation_settled();
-        job.info.cpu_tokens = match outcome {
-            Ok(()) => grant.tokens(),
-            Err(_) => None,
-        };
-        if !stopped {
-            return;
-        }
-        if let Some(process) = job.process.as_mut()
-            && let Err(error) = process.signal_process_tree(ProcessSignal::Continue)
+    /// End the youngest background or resident job while the host is at critical memory pressure
+    /// (05_gateway.md "Memory pressure"), through the ordinary kill, one at a time on the sampling
+    /// tick while the pressure lasts: work nobody waits on gives way before the host swaps every job
+    /// (measured 2026-10-26: six acceptance runs of one repository put 5.9 of 7 GB in swap). The
+    /// job fails `memory`, its stderr naming the level and its resident memory. A gate and
+    /// interactive work are never ended; Linux leaves this to each job's cgroup ceilings.
+    #[cfg(target_os = "macos")]
+    fn end_for_memory(&mut self) {
+        use cowshed_gateway_types::host_status::MemoryPressure;
+        // One job at a time: the next is ended only once the last one ended for memory is gone.
+        if self
+            .jobs
+            .values()
+            .any(|job| !job.terminal() && job.kill_reason == Some(KillReason::Memory))
         {
-            let line = format!(
-                "cowshed: job {} could not be continued after its probation: {}\n",
+            return;
+        }
+        let level = match crate::host_pressure::read_memory_pressure() {
+            Ok(MemoryPressure::Darwin { level }) => level,
+            Ok(MemoryPressure::Psi { .. }) => {
+                unreachable!("macOS reports a memorystatus level, never PSI")
+            }
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot read the host's memory pressure, so no job is ended for \
+                     memory: {error}"
+                );
+                return;
+            }
+        };
+        let running = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| !job.terminal() && job.kill_reason.is_none() && job.birth.is_some())
+            .map(|(job_id, job)| (*job_id, job.info.class, job.started_at));
+        let Some(job_id) = crate::host_pressure::job_to_end(level, running) else {
+            return;
+        };
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.failure = Some(JobFailure::Memory);
+        let line = format!(
+            "cowshed: the host is at {level:?} memory pressure; this {:?} job, the youngest that \
+             may be ended, ends with {} resident\n",
+            job.info.class,
+            job.info.resources.as_ref().map_or_else(
+                || "unsampled memory".to_owned(),
+                |sample| format!("{} bytes", u64::from(sample.rss_bytes))
+            )
+        );
+        self.process_output(job_id, StreamKind::Stderr, Bytes::from(line));
+        if let Err(error) = self.begin_kill(job_id, KillReason::Memory) {
+            cowshed_os::eprintln!(
+                "cowshed: cannot end job {} for memory: {}",
                 job_id.get(),
                 error.message
             );
-            self.process_output(job_id, StreamKind::Stderr, Bytes::from(line));
         }
     }
     async fn handle_command(&mut self, command: Command) {
@@ -5299,7 +4761,7 @@ impl SupervisorActor {
                 build_volume,
                 request,
                 source,
-                cpu_parent,
+                parent_jobserver,
                 reply,
             } => {
                 // Answered at admission: the job is durable and queued, or refused.
@@ -5310,7 +4772,7 @@ impl SupervisorActor {
                         build_volume,
                         *request,
                         source,
-                        cpu_parent,
+                        parent_jobserver,
                     )
                     .await;
                 if admitted.is_ok() {
@@ -6065,9 +5527,9 @@ impl SupervisorActor {
         .collect()
     }
 
-    /// Admit one job, granted `build_volume`, and ask the host CPU budget for it: once this
-    /// returns the job is durable and queued, and its command spawns when the grant arrives
-    /// ([`Self::spawn_granted`]). The request is fenced first: only a coordinator's exec runs a
+    /// Admit one job, granted `build_volume`: once this returns the job is durable and queued, and
+    /// its command spawns once its admission serves it a jobserver ([`Self::spawn_admitted`]). The
+    /// request is fenced first: only a coordinator's exec runs a
     /// gate or reaches the host boundary. A keyed repeat answers the job it already admitted.
     async fn admit_exec(
         &mut self,
@@ -6076,7 +5538,7 @@ impl SupervisorActor {
         build_volume: Option<PathBuf>,
         request: ExecRequest,
         source: AdmissionSource,
-        cpu_parent: Option<String>,
+        parent_jobserver: Option<super::job_cpu::InheritedJobserver>,
     ) -> Result<JobId> {
         self.validate_authority(&authority)
             .and_then(|()| {
@@ -6097,16 +5559,12 @@ impl SupervisorActor {
         // The host boundary takes no session overlay a worker controls. Environment names do
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
-        let share = self.cpu.background_share();
-        let scheduling =
-            JobScheduling::requested(request.scope, request.class, request.want, share)
-                .ok_or_else(|| {
-                    CowshedError::usage(
-                        "a resident holds no CPU token, so it wants none: its descendants ask its \
-                     pool for their own",
-                        "drop --want from a resident exec",
-                    )
-                })?;
+        let scheduling = JobScheduling::requested(
+            request.scope,
+            request.class,
+            request.want,
+            super::job_cpu::host_cores(),
+        );
         // The host boundary has no sandbox to narrow and no exec host to interpret a script.
         if scheduling.scope() == ExecScope::HostGate {
             if matches!(request.command, ExecCommand::Script(_)) {
@@ -6298,7 +5756,9 @@ impl SupervisorActor {
                 JobId::new(value).map_err(|error| CowshedError::internal(error.to_string()))
             })?;
         #[cfg(target_os = "linux")]
-        let cgroup = self.spawner.admit_cgroup(&self.authority, job_id)?;
+        let cgroup = self
+            .spawner
+            .admit_cgroup(&self.authority, job_id, scheduling.class())?;
         {
             let _span = cowshed_os::timing::span("admit", "record");
             let admitted = self.artifacts.admit(
@@ -6371,7 +5831,6 @@ impl SupervisorActor {
             class: scheduling.class(),
             scope: scheduling.scope(),
             nice: None,
-            cpu_tokens: None,
             containment: None,
             outlived: Vec::new(),
             outlived_incomplete: false,
@@ -6398,21 +5857,11 @@ impl SupervisorActor {
             .map(WorkspacePath::as_path)
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        let start = match scheduling.class() {
-            ExecClass::Resident | ExecClass::InteractiveResident => Some(
-                self.spawner
-                    .shell_start(&self.policy, &cwd, mode, scheduling.scope())
-                    .await,
-            ),
-            ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => None,
-        };
-        let asking = self.ask_cpu(
+        let asking = self.admit_cpu(
             job_id,
             scheduling.class(),
             scheduling.want(),
-            command_label(&info.command),
-            cpu_parent.clone(),
-            start,
+            parent_jobserver,
         );
         let job = JobStateRecord {
             info,
@@ -6454,9 +5903,6 @@ impl SupervisorActor {
             build_hold,
             cpu: CpuStanding::Queued(Box::new(PendingSpawn {
                 asking,
-                want: scheduling.want(),
-                parent: cpu_parent,
-                start,
                 authority: self.authority.clone(),
                 // Rendered when this authority was taken. The request may narrow the ceiling,
                 // never widen it, and narrowing one job alters no other job.
@@ -6492,14 +5938,14 @@ impl SupervisorActor {
         Ok(())
     }
 
-    /// The host CPU budget answered `asked`, a queued job's ask: spawn its command under the
-    /// grant, or fail the job with the refusal. A job that already ended, or one asking again
-    /// since (`asked` is not its current ask), returns the grant at once, by dropping it.
-    async fn spawn_granted(
+    /// `asked`, a queued job's admission, answered: spawn its command with its jobserver, or fail
+    /// the job with the refusal. A job that already ended, or one admitted again since (`asked` is
+    /// not its current admission), lets the jobserver go at once, by dropping it.
+    async fn spawn_admitted(
         &mut self,
         asked: tokio::task::Id,
         job_id: JobId,
-        granted: Result<JobCpuGrant>,
+        admitted: Result<Jobserver>,
     ) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
@@ -6515,9 +5961,6 @@ impl SupervisorActor {
         };
         let PendingSpawn {
             asking: _,
-            want: _,
-            parent,
-            start: _,
             authority,
             policy,
             command,
@@ -6527,8 +5970,8 @@ impl SupervisorActor {
             scope,
             stdin,
         } = *pending;
-        let grant = match granted {
-            Ok(grant) => grant,
+        let jobserver = match admitted {
+            Ok(jobserver) => jobserver,
             Err(error) => {
                 job.failure = Some(JobFailure::CpuAdmission);
                 self.fail_before_command(job_id, KillReason::CpuAdmission, error)
@@ -6537,33 +5980,18 @@ impl SupervisorActor {
             }
         };
         let cpu = CpuPlacement {
-            held: grant.held().cloned(),
-            pool: grant.pool().to_path_buf(),
-            nice: class_nice(own_nice(), job.info.class),
-            class: job.info.class,
-            activation: if grant.held().is_some() || grant.holds_start() {
-                ActivationCover::Held
-            } else {
-                ActivationCover::Unheld { parent }
-            },
+            fifo: jobserver.fifo().to_path_buf(),
+            tokens: jobserver.tokens(),
+            #[cfg(target_os = "macos")]
+            nice: super::placement::macos::nice_from(
+                super::placement::macos::own_nice(),
+                job.info.class,
+            ),
         };
-        job.info.cpu_tokens = grant.tokens();
         job.info.state = JobState::Running;
-        let mut grant = grant;
-        // A job lent the probation token hears its grant on a task of its own.
-        if let Some(outcome) = grant.probation_outcome() {
-            let events = self.events.clone();
-            tokio::spawn(async move {
-                // A grant dropped before its wait ended reports to a job that has concluded.
-                let outcome = outcome
-                    .await
-                    .unwrap_or_else(|_| Err("the probation's wait was dropped".to_owned()));
-                let _ = events
-                    .send(ProcessEvent::Probation { job_id, outcome })
-                    .await;
-            });
-        }
-        job.cpu = CpuStanding::Granted { grant };
+        job.cpu = CpuStanding::Admitted {
+            _jobserver: jobserver,
+        };
         // Read before the job's first process is dispatched, so nothing it writes precedes its
         // baseline: a warm host may start the command before its start is reported here. Its
         // run counts from here too: the wait for the host is not the command's time.
@@ -6627,8 +6055,6 @@ impl SupervisorActor {
             clock_observation(job);
         }
         if let Some(owned) = process.process() {
-            // A one-shot command is the job's first process: it has started.
-            command_started(job_id, job);
             own_process(job, owned.clone(), self.job_sampling.leaf_coverage);
             adopt_birth(job, self.group_ledger.is_some(), owned.birth.clone());
             self.arm_sample_clock();
@@ -6735,111 +6161,28 @@ impl SupervisorActor {
         }
     }
 
-    /// Ask the host budget for `job_id`'s CPU, off the actor's path: the actor keeps serving
-    /// every command while the gateway queues the request. Aborting the returned handle -- a
-    /// withdrawal, or this supervisor ending -- drops the request and closes its connection,
-    /// which leaves the queue. A resident holds no token for its life, but its shell's
-    /// activation is work: a resident whose `start` activates first waits for one token, which
-    /// it holds until its command starts, drawing on `parent`, a holder's live pool, when it
-    /// names one; one whose start activates nothing asks its pool at once (05_gateway.md "A
-    /// resident's start holds one token").
-    fn ask_cpu(
+    /// Admit `job_id`'s command off the actor's path ([`super::job_cpu::admit`]): the actor keeps
+    /// serving every command while a background start waits for memory pressure to drop. Aborting
+    /// the returned handle -- a withdrawal, or this supervisor ending -- ends the wait.
+    fn admit_cpu(
         &mut self,
         job_id: JobId,
         class: ExecClass,
         want: std::num::NonZeroUsize,
-        command: String,
-        parent: Option<String>,
-        start: Option<ShellStart>,
+        parent: Option<super::job_cpu::InheritedJobserver>,
     ) -> tokio::task::AbortHandle {
-        let checkout = self.workspace_root.clone();
-        let start = start.filter(|start| start.stakes()).map(|_| {
-            self.cpu
-                .activation(checkout.clone(), command.clone(), parent.clone())
-        });
-        let ask = self.cpu.admit(JobCpuAsk {
-            class,
-            want,
-            checkout,
-            command,
-            job: (
-                self.authority.repo_id.clone(),
-                self.authority.workspace_incarnation.clone(),
-                job_id,
-            ),
-            parent,
-        });
+        let directory = super::job_cpu::cpu_pool_directory(
+            &self.policy.ceiling().store_root,
+            &self.authority.workspace_incarnation,
+        );
         self.admissions.spawn(super::job_cpu::reporting(
             job_id,
             self.events.clone(),
             async move {
-                let granted = match start {
-                    Some(start) => match start.await {
-                        Ok(stake) => ask.await.map(|grant| grant.holding_until_started(stake)),
-                        Err(error) => Err(error),
-                    },
-                    None => ask.await,
-                };
-                (job_id, granted)
+                let admitted = super::job_cpu::admit(class, want, directory, parent).await;
+                (job_id, admitted)
             },
         ))
-    }
-
-    /// A kept daemon's start still waiting at the host, asked under no holder, draws on the
-    /// oldest running gate job's pool once one runs (05_gateway.md "A kept daemon a land waits on
-    /// starts as the land's gate task"): a land waits on that daemon, so its start is the gate's
-    /// work whenever the gate began. Its background ask is withdrawn, leaving the host queue, and
-    /// asked again with the gate's pool beside the host. A start already drawing on a pool keeps
-    /// it, and one with no gate running keeps waiting as background.
-    fn rebind_keeper_start(&mut self) {
-        let Some(pool) = self.gate_pool() else {
-            return;
-        };
-        let Some(job_id) = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting) else {
-            return;
-        };
-        let Some(job) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let CpuStanding::Queued(pending) = &job.cpu else {
-            return;
-        };
-        if job.terminal() || pending.parent.is_some() {
-            return;
-        }
-        pending.asking.abort();
-        let (class, want, command, start) = (
-            job.info.class,
-            pending.want,
-            command_label(&job.info.command),
-            pending.start,
-        );
-        cowshed_os::eprintln!(
-            "cowshed: the Nx daemon start job {} waited at the host as background; a gate job runs now, so its start asks again on that gate's pool {pool}",
-            job_id.get()
-        );
-        let asking = self.ask_cpu(job_id, class, want, command, Some(pool.clone()), start);
-        if let Some(job) = self.jobs.get_mut(&job_id)
-            && let CpuStanding::Queued(pending) = &mut job.cpu
-        {
-            pending.asking = asking;
-            pending.parent = Some(pool);
-        }
-    }
-
-    /// The CPU pool of the oldest gate job this supervisor runs: a land's gate or its rebase's
-    /// task-hash job, whose tasks ask the host through that pool at the gate's rank. A kept daemon's
-    /// start draws its stake on it (05_gateway.md "A resident's start holds one token"), since the
-    /// land waits on that daemon; with no gate running, the start asks the host as background.
-    fn gate_pool(&self) -> Option<String> {
-        self.jobs
-            .values()
-            .find_map(|job| match (job.info.class, &job.cpu) {
-                (ExecClass::Gate, CpuStanding::Granted { grant }) => {
-                    Some(grant.pool().to_string_lossy().into_owned())
-                }
-                _ => None,
-            })
     }
 
     fn current_build_volume_grant(&self) -> Result<Option<PathBuf>> {
@@ -6950,19 +6293,16 @@ impl SupervisorActor {
             return;
         };
         let authority = self.authority.clone();
-        let gate_pool = self.gate_pool();
         let started = match self.current_build_volume_grant() {
             // The keeper is the supervisor's own coordinator-side work.
             Ok(grant) => {
-                // The keeper is a resident: it holds no token. A land waits on its daemon, so while
-                // the shed runs a gate job its start's stake draws on that gate's pool.
                 self.admit_exec(
                     authority,
                     None,
                     grant,
                     request,
                     AdmissionSource::Coordinator,
-                    gate_pool,
+                    None,
                 )
                 .await
             }
@@ -7090,7 +6430,7 @@ impl SupervisorActor {
             // Behind a queued write the lane is not this write's to take: it would overtake.
             Some(process) if delivery.queued.is_empty() => process.try_write_stdin(bytes.clone()),
             Some(_) => Ok(false),
-            // Waiting for its CPU grant: the write waits in order until the command spawns.
+            // Waiting for its admission: the write waits in order until the command spawns.
             None if matches!(job.cpu, CpuStanding::Queued(_)) => Ok(false),
             None => {
                 let _ = reply.send(Err(CowshedError::conflict(
@@ -7147,7 +6487,7 @@ impl SupervisorActor {
             return;
         }
         let Some(process) = job.process.as_mut() else {
-            // Waiting for its CPU grant: the close follows the input once the command spawns.
+            // Waiting for its admission: the close follows the input once the command spawns.
             if matches!(job.cpu, CpuStanding::Queued(_)) {
                 job.close_stdin_when_drained = true;
                 job.close_waiters.push(reply);
@@ -7508,9 +6848,6 @@ impl SupervisorActor {
                 end_job_stdin(job);
             }
             ProcessEvent::StdinReady { job_id } => self.flush_stdin(job_id),
-            ProcessEvent::Probation { job_id, outcome } => {
-                self.probation_settled(job_id, outcome);
-            }
             ProcessEvent::StdinBroken { job_id, error } => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     let refusal = stdin_delivery_unknown(job.stdin_delivery.delivered, &error);
@@ -7565,9 +6902,7 @@ impl SupervisorActor {
                 let ledger = self.group_ledger.is_some();
                 let coverage = self.job_sampling.leaf_coverage;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    // A warm host's command started: its shell has activated.
-                    command_started(job_id, job);
-                    job.info.nice = Some(nice);
+                    job.info.nice = nice;
                     let birth = process.birth.clone();
                     own_process(job, process, coverage);
                     adopt_birth(job, ledger, birth);
@@ -7729,8 +7064,8 @@ impl SupervisorActor {
         if initiate || reason == KillReason::OutputLimit {
             job.kill_reason = Some(reason);
         }
-        // A job still waiting for its CPU grant has nothing to signal: withdrawing its request
-        // leaves the gateway's queue, and the job ends without a command.
+        // A job still waiting for its admission has nothing to signal: withdrawing it ends its
+        // wait, and the job ends without a command.
         if matches!(job.cpu, CpuStanding::Queued(_)) {
             if let CpuStanding::Queued(pending) =
                 std::mem::replace(&mut job.cpu, CpuStanding::Withdrawn)
@@ -7741,18 +7076,6 @@ impl SupervisorActor {
             job.stderr_eof = true;
             end_job_stdin(job);
             return Ok(());
-        }
-        // A job its probation's end stopped acts on its kill only once continued.
-        if let CpuStanding::Granted { grant } = &job.cpu
-            && grant.probation_stopped()
-            && let Some(process) = job.process.as_mut()
-            && let Err(error) = process.signal_process_tree(ProcessSignal::Continue)
-        {
-            cowshed_os::eprintln!(
-                "cowshed: job {} stopped on probation could not be continued for its kill: {}",
-                job_id.get(),
-                error.message
-            );
         }
         // A command not yet born -- its warm host still activating outside the job's cgroup, or
         // its placement pending -- has not entered the cgroup, so an empty membership proves
@@ -7984,6 +7307,8 @@ impl SupervisorActor {
                         | KillReason::ScriptSyntax
                         | KillReason::CpuAdmission,
                     ) => JobState::Failed,
+                    #[cfg(target_os = "macos")]
+                    Some(KillReason::Memory) => JobState::Failed,
                     None => match job.exit.as_ref().expect("ready terminal job has exit") {
                         ExitStatus::Exited { .. } => JobState::Exited,
                         ExitStatus::Signaled { .. } => JobState::Signaled,
@@ -8077,7 +7402,6 @@ impl SupervisorActor {
             duration_ms: Some(duration_ms),
             resources: job.info.resources.clone(),
             failure,
-            cpu_tokens: job.info.cpu_tokens,
             nice: job.info.nice,
             containment: job.info.containment.clone(),
             outlived: job.info.outlived.clone(),
@@ -8137,7 +7461,7 @@ impl SupervisorActor {
         // Nor does it run on its build volume any more: a release may take it, and the
         // controller's release is awaited before the job is told ended, so a volume superseded
         // while the job ran is gone by then, or the job's end says why it is not. Nor does it
-        // hold its CPU grant: dropping it returns every token to the gateway's ledger.
+        // keep its jobserver: letting it go unlinks the job's own fifo.
         let mut state = state;
         if let Some((volume, hold)) = job.build_hold.take() {
             drop(hold);
@@ -8843,20 +8167,6 @@ fn unlaunched(error: &CowshedError) -> JobFailure {
         JobFailure::Priority
     } else {
         JobFailure::Unlaunched
-    }
-}
-
-/// The job's command started, however its spawn reports it: a one-shot spawn's process at once, a
-/// warm host's with [`ProcessEvent::Started`] after its shell activated. A resident's start stake
-/// returns its token here, at the first of the two it sees (05_gateway.md "A resident's start
-/// holds one token").
-fn command_started(job_id: JobId, job: &mut JobStateRecord) {
-    if let CpuStanding::Granted { grant } = &mut job.cpu
-        && grant.started()
-    {
-        cowshed_os::timing::event("jobserver", || {
-            format!("release activation job={}", job_id.get())
-        });
     }
 }
 
@@ -9623,11 +8933,10 @@ mod workspace_toolchain_tests {
             mode: crate::api::dto::RunSandboxMode::ReadWrite,
             scope: ExecScope::Workspace,
             cpu: CpuPlacement {
-                held: None,
-                pool: PathBuf::from("/pool/p.sock"),
+                fifo: PathBuf::from("/pool/j"),
+                tokens: std::num::NonZeroUsize::MIN,
+                #[cfg(target_os = "macos")]
                 nice: 0,
-                class: ExecClass::Background,
-                activation: ActivationCover::Held,
             },
         };
         let (events, _received) = mpsc::channel(16);
@@ -10830,7 +10139,6 @@ mod lifecycle_commitment_tests {
             volume_labels: None,
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
-            cpu: defaults.cpu,
             build_volume_released: None,
             nx_daemon_idle: defaults.nx_daemon_idle,
         };
@@ -11271,11 +10579,10 @@ mod sandbox_environment_tests {
             mode: crate::api::dto::RunSandboxMode::ReadWrite,
             scope: ExecScope::HostGate,
             cpu: CpuPlacement {
-                held: None,
-                pool: PathBuf::from("/pool/p.sock"),
+                fifo: PathBuf::from("/pool/j"),
+                tokens: std::num::NonZeroUsize::MIN,
+                #[cfg(target_os = "macos")]
                 nice: 0,
-                class: ExecClass::Gate,
-                activation: ActivationCover::Held,
             },
             #[cfg(target_os = "linux")]
             cgroup: None,

@@ -265,7 +265,6 @@ fn running_job() -> JobInfo {
         failure: None,
         class: cowshed_core::api::ExecClass::Background,
         scope: cowshed_core::api::ExecScope::Workspace,
-        cpu_tokens: None,
         nice: None,
         containment: None,
         outlived: Vec::new(),

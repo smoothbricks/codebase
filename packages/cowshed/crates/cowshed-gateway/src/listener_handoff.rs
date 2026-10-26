@@ -9,10 +9,6 @@
 //! install's copies keep each socket listening, so the kernel queues a client's connection instead
 //! of refusing it, and the new gateway serves it once the session is restored.
 //!
-//! The socket also names the install serving it ([`installing`]): a draining gateway that finds
-//! one is being restarted by it, and tells every CPU ask it cuts off which install that is
-//! (05_gateway.md "A queued CPU ask outlives an install").
-//!
 //! Every failure falls back to what a restart did before: no install serving the socket, an old
 //! gateway that gives nothing, or a failed take all leave the new gateway binding fresh, and the
 //! install closes whatever it holds before a failed taker binds.
@@ -30,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cowshed_core::runtime::shell_host::{read_frame, send_with_descriptors};
-use cowshed_gateway_types::InstallRestart;
 use serde::{Deserialize, Serialize};
 
 /// The handoff socket beside the gateway's control socket, under the store the sandbox denies.
@@ -55,10 +50,6 @@ enum Frame {
     End,
     /// The receiver holds every descriptor it was sent.
     Ok,
-    /// A draining gateway asks which install serves the socket.
-    Who,
-    /// The install serving the socket, as it names itself.
-    Installing { install: InstallRestart },
 }
 
 fn send(stream: &UnixStream, frame: &Frame, descriptor: Option<BorrowedFd<'_>>) -> io::Result<()> {
@@ -154,20 +145,6 @@ fn connect(path: &Path) -> io::Result<Option<UnixStream>> {
     Ok(Some(stream))
 }
 
-/// The install serving `path`, as it names itself, or `None` when none serves it: the evidence a
-/// draining gateway gives every CPU ask it cuts off (05_gateway.md "A queued CPU ask outlives an
-/// install").
-pub fn installing(path: &Path) -> io::Result<Option<InstallRestart>> {
-    let Some(stream) = connect(path)? else {
-        return Ok(None);
-    };
-    send(&stream, &Frame::Who, None)?;
-    match receive(&stream)? {
-        (Frame::Installing { install }, _) => Ok(Some(install)),
-        (other, _) => Err(unexpected(&other)),
-    }
-}
-
 /// Give the install serving `path` a duplicate of each listener, as a draining gateway's first
 /// step: how many it took, `0` when no install serves `path`.
 pub fn give(path: &Path, listeners: &[(SocketAddr, BorrowedFd<'_>)]) -> io::Result<usize> {
@@ -245,8 +222,8 @@ pub struct HandoffServer {
 }
 
 impl HandoffServer {
-    /// Serve `path` as `install`, replacing a socket a crashed install left there.
-    pub fn start(path: &Path, install: InstallRestart) -> io::Result<Self> {
+    /// Serve `path`, replacing a socket a crashed install left there.
+    pub fn start(path: &Path) -> io::Result<Self> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) => {
                 use std::os::unix::fs::FileTypeExt as _;
@@ -271,7 +248,7 @@ impl HandoffServer {
             .name("listener-handoff".to_owned())
             .spawn({
                 let stop = Arc::clone(&stop);
-                move || serve(&listener, &stop, &install)
+                move || serve(&listener, &stop)
             })?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -297,7 +274,7 @@ impl Drop for HandoffServer {
     }
 }
 
-fn serve(listener: &UnixListener, stop: &AtomicBool, install: &InstallRestart) {
+fn serve(listener: &UnixListener, stop: &AtomicBool) {
     // The listeners held since the last give; dropped (closed) once taken or when serving ends.
     let mut held: Vec<(SocketAddr, OwnedFd)> = Vec::new();
     loop {
@@ -318,26 +295,15 @@ fn serve(listener: &UnixListener, stop: &AtomicBool, install: &InstallRestart) {
         if !same_user(&stream) {
             continue;
         }
-        if let Err(error) = exchange(&stream, &mut held, install) {
+        if let Err(error) = exchange(&stream, &mut held) {
             cowshed_os::eprintln!("cowshed: a listener handoff exchange failed: {error}");
         }
     }
 }
 
-fn exchange(
-    stream: &UnixStream,
-    held: &mut Vec<(SocketAddr, OwnedFd)>,
-    install: &InstallRestart,
-) -> io::Result<()> {
+fn exchange(stream: &UnixStream, held: &mut Vec<(SocketAddr, OwnedFd)>) -> io::Result<()> {
     stream.set_write_timeout(Some(HANDOFF_BOUND))?;
     match receive(stream)? {
-        (Frame::Who, _) => send(
-            stream,
-            &Frame::Installing {
-                install: install.clone(),
-            },
-            None,
-        ),
         (Frame::Give { listeners }, _) => {
             let mut given = Vec::with_capacity(listeners);
             for _ in 0..listeners {
@@ -408,35 +374,12 @@ mod tests {
         (listener.local_addr().expect("address"), listener)
     }
 
-    fn this_install() -> InstallRestart {
-        InstallRestart {
-            pid: std::process::id(),
-            binary: PathBuf::from("/opt/cowshed/bin/cowshed"),
-            serves_within_ms: 180_000,
-        }
-    }
-
-    /// A draining gateway learns which install restarts it from the socket itself, and nothing
-    /// when no install serves it: the evidence every CPU ask it cuts off is given.
-    #[test]
-    fn the_handoff_socket_names_the_install_serving_it_and_nothing_else() {
-        let path = socket_path("who");
-        assert_eq!(installing(&path).expect("no socket"), None);
-        let server = HandoffServer::start(&path, this_install()).expect("serve");
-        assert_eq!(installing(&path).expect("served"), Some(this_install()));
-        // Asking leaves the listener exchange as it was.
-        let (address, old) = listener();
-        assert_eq!(give(&path, &[(address, old.as_fd())]).expect("give"), 1);
-        drop(server);
-        assert_eq!(installing(&path).expect("gone"), None);
-    }
-
     /// The whole point: a connection made while neither gateway holds the listener is queued,
     /// not refused, and the taker accepts it.
     #[test]
     fn a_listener_given_and_taken_queues_the_connections_made_between() {
         let path = socket_path("round-trip");
-        let server = HandoffServer::start(&path, this_install()).expect("serve");
+        let server = HandoffServer::start(&path).expect("serve");
         let (address, old) = listener();
         assert_eq!(give(&path, &[(address, old.as_fd())]).expect("give"), 1);
         drop(old);
@@ -477,7 +420,7 @@ mod tests {
     #[test]
     fn after_a_failed_take_the_install_holds_no_listener() {
         let path = socket_path("failed-take");
-        let server = HandoffServer::start(&path, this_install()).expect("serve");
+        let server = HandoffServer::start(&path).expect("serve");
         let (address, old) = listener();
         give(&path, &[(address, old.as_fd())]).expect("give");
         drop(old);

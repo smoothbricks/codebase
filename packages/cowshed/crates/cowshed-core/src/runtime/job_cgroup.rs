@@ -9,13 +9,15 @@
 //! when that cgroup was delegated to it -- the directory, `cgroup.procs` and
 //! `cgroup.subtree_control` writable by its effective uid (cgroup-v2.rst, "Delegation"). The
 //! controller moves itself into the leaf [`CONTROLLER_LEAF`], because a cgroup that distributes
-//! controllers to children may hold no process of its own, then enables the accounting
-//! controllers below. The tree under that root is:
+//! controllers to children may hold no process of its own, then enables [`Controller::ENABLED`]
+//! below. Every job sits in its class's cgroup, which carries the class's weight and memory
+//! bounds (`placement/linux.rs`): weights compare siblings only, so the class is the one level
+//! every job shares with every other job, whatever its workspace. The tree under that root is:
 //!
 //! ```text
-//! <delegated>/controller            the controller process itself
-//! <delegated>/ws-<incarnation>/     one workspace incarnation's jobs
-//! <delegated>/ws-<incarnation>/job-<id>
+//! <delegated>/controller                       the controller process itself
+//! <delegated>/<class>/                         gate, interactive or background
+//! <delegated>/<class>/job-<incarnation>-<id>   one job of one workspace incarnation
 //! ```
 //!
 //! A job is never given a name or a path to choose: its first process enters its cgroup through a
@@ -25,11 +27,11 @@
 //!
 //! # Identity
 //!
-//! A job cgroup is named by its workspace incarnation and job id, and identified by its cgroup id
-//! (the directory's inode number on cgroup2). Admission creates it exclusively, so a name that
-//! already exists is refused rather than reused. A lookup -- a restarted controller finding the
-//! job its predecessor admitted -- reaches only cgroups of its own incarnation and accepts one only
-//! if it is still the cgroup that admission recorded.
+//! A job cgroup is named by its class, its workspace incarnation and its job id, and identified
+//! by its cgroup id (the directory's inode number on cgroup2). Admission creates it exclusively,
+//! so a name that already exists, under any class, is refused rather than reused. A lookup -- a
+//! restarted controller finding the job its predecessor admitted -- reaches only cgroups of its
+//! own incarnation and accepts one only if it is still the cgroup that admission recorded.
 //!
 //! # Counters
 //!
@@ -64,13 +66,14 @@ use std::time::{Duration, Instant};
 use cowshed_os::deadline::{self, Bound, Deadline, Expired, Progress};
 use cowshed_os::process::ExitWatch;
 
-use crate::api::dto::JobId;
+use crate::api::dto::{ExecClass, JobId};
 use crate::api::resources::{
     ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, ResourceUnitError, StorageIoBytes,
     StorageIoTotals,
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::runtime::live_membership::{LiveMember, LiveMembership};
+use crate::runtime::placement::linux::ClassCgroup;
 
 /// Where the unified cgroup hierarchy is mounted.
 pub const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
@@ -82,30 +85,33 @@ pub const CONTROLLER_LEAF: &str = "controller";
 /// `statfs.f_type` as signed `__fsword_t` and musl as `c_ulong`, so it is compared by value.
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
 
-const INCARNATION_PREFIX: &str = "ws-";
 const JOB_PREFIX: &str = "job-";
 
-/// A cgroup v2 controller a job's accounting reads.
+/// A cgroup v2 controller job cgroups use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Controller {
     Cpu,
     Memory,
     Io,
+    Pids,
 }
 
 impl Controller {
-    /// Every controller job accounting needs: `cpu.stat`, `memory.current`/`memory.peak` and
-    /// `io.stat` exist only where these are enabled.
-    pub const ACCOUNTING: [Self; 3] = [Self::Cpu, Self::Memory, Self::Io];
+    /// Every controller a job cgroup needs: accounting reads `cpu.stat`, `memory.current`/
+    /// `memory.peak` and `io.stat`, class placement writes `cpu.weight.nice` and the memory
+    /// bounds, and a job's `pids.max` bounds its tasks. Each file exists only where its
+    /// controller is enabled.
+    pub const ENABLED: [Self; 4] = [Self::Cpu, Self::Memory, Self::Io, Self::Pids];
 
-    /// The fixed request for [`Self::ACCOUNTING`], kept in step by the controller-request test.
-    const ACCOUNTING_REQUEST: &str = "+cpu +memory +io";
+    /// The fixed request for [`Self::ENABLED`], kept in step by the controller-request test.
+    const ENABLED_REQUEST: &str = "+cpu +memory +io +pids";
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
             Self::Memory => "memory",
             Self::Io => "io",
+            Self::Pids => "pids",
         }
     }
 }
@@ -205,6 +211,11 @@ pub enum CgroupError {
         counter: &'static str,
         #[source]
         source: ResourceUnitError,
+    },
+    #[error("sysconf reports no physical memory ({pages} pages of {page_size} bytes)")]
+    PhysicalMemory {
+        pages: libc::c_long,
+        page_size: libc::c_long,
     },
 }
 
@@ -380,16 +391,16 @@ fn make_directory(path: &Path) -> Result<bool> {
     }
 }
 
-/// Distribute the accounting controllers from `path` to its children.
-fn enable_accounting(path: &Path) -> Result<()> {
+/// Distribute [`Controller::ENABLED`] from `path` to its children.
+fn enable_controllers(path: &Path) -> Result<()> {
     let available = fs::read_to_string(path.join("cgroup.controllers")).map_err(failed_in(
         "read",
         path,
         "cgroup.controllers",
     ))?;
-    require_controllers(path, &available, &Controller::ACCOUNTING)?;
+    require_controllers(path, &available, &Controller::ENABLED)?;
     let control = path.join("cgroup.subtree_control");
-    fs::write(&control, Controller::ACCOUNTING_REQUEST).map_err(failed("write", &control))
+    fs::write(&control, Controller::ENABLED_REQUEST).map_err(failed("write", &control))
 }
 
 /// The controller's authority over the cgroup subtree delegated to it.
@@ -445,13 +456,13 @@ impl CgroupAuthority {
             &root,
             "cgroup.controllers",
         ))?;
-        require_controllers(&root, &available, &Controller::ACCOUNTING)?;
+        require_controllers(&root, &available, &Controller::ENABLED)?;
         let leaf = root.join(CONTROLLER_LEAF);
         make_directory(&leaf)?;
         let procs = leaf.join("cgroup.procs");
         // "0" names the writing process: all of its threads move together.
         fs::write(&procs, "0").map_err(failed("write", &procs))?;
-        enable_accounting(&root)?;
+        enable_controllers(&root)?;
         Ok(Self { root })
     }
 
@@ -460,16 +471,19 @@ impl CgroupAuthority {
         &self.root
     }
 
-    /// The cgroups of one workspace incarnation's jobs, created on first use.
+    /// The cgroups of one workspace incarnation's jobs. Each class cgroup is made and placed here
+    /// if it is not already: they are shared by every incarnation under this root, and placing a
+    /// class again writes the same values.
     pub fn incarnation(&self, incarnation: &WorkspaceIncarnation) -> Result<IncarnationCgroups> {
-        let path = self
-            .root
-            .join(format!("{INCARNATION_PREFIX}{}", incarnation.as_str()));
-        make_directory(&path)?;
-        enable_accounting(&path)?;
+        for class in ClassCgroup::ALL {
+            let path = self.root.join(class.name());
+            make_directory(&path)?;
+            enable_controllers(&path)?;
+            class.place(&path)?;
+        }
         Ok(IncarnationCgroups {
             incarnation: incarnation.clone(),
-            path,
+            root: self.root.clone(),
         })
     }
 }
@@ -478,24 +492,31 @@ impl CgroupAuthority {
 #[derive(Debug)]
 pub struct IncarnationCgroups {
     incarnation: WorkspaceIncarnation,
-    path: PathBuf,
+    root: PathBuf,
 }
 
-/// What names one job's cgroup durably: its workspace incarnation, its job id, and the cgroup
-/// id admission created.
+/// What names one job's cgroup durably: its workspace incarnation, its job id, its class cgroup,
+/// and the cgroup id admission created.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobCgroupIdentity {
     incarnation: WorkspaceIncarnation,
     job_id: JobId,
+    class: ClassCgroup,
     cgroup_id: u64,
 }
 
 impl JobCgroupIdentity {
-    /// An identity as a record of an earlier admission holds it.
-    pub fn recorded(incarnation: WorkspaceIncarnation, job_id: JobId, cgroup_id: u64) -> Self {
+    /// An identity as a record of an earlier admission of a job of `class` holds it.
+    pub fn recorded(
+        incarnation: WorkspaceIncarnation,
+        job_id: JobId,
+        class: ExecClass,
+        cgroup_id: u64,
+    ) -> Self {
         Self {
             incarnation,
             job_id,
+            class: ClassCgroup::of(class),
             cgroup_id,
         }
     }
@@ -518,34 +539,50 @@ impl IncarnationCgroups {
         &self.incarnation
     }
 
-    fn job_path(&self, job_id: JobId) -> PathBuf {
-        self.path.join(format!("{JOB_PREFIX}{}", job_id.get()))
+    fn job_path(&self, job_id: JobId, class: ClassCgroup) -> PathBuf {
+        self.root.join(class.name()).join(format!(
+            "{JOB_PREFIX}{}-{}",
+            self.incarnation.as_str(),
+            job_id.get()
+        ))
     }
 
-    /// Create `job_id`'s cgroup. It must not exist: a cgroup that does belongs to an earlier
-    /// admission of the same id, and joining it would charge this job with that one's usage.
-    pub fn admit(&self, job_id: JobId) -> Result<JobCgroup> {
-        let path = self.job_path(job_id);
+    /// Create `job_id`'s cgroup in its class's cgroup, with what a job of `class` carries written
+    /// before any process can enter it. It must not exist under any class: one that does belongs
+    /// to an earlier admission of the same id, and joining it would charge this job with that
+    /// one's usage.
+    pub fn admit(&self, job_id: JobId, class: ExecClass) -> Result<JobCgroup> {
+        let class = ClassCgroup::of(class);
+        for other in ClassCgroup::ALL {
+            let path = self.job_path(job_id, other);
+            if path.try_exists().map_err(failed("stat", &path))? {
+                return Err(CgroupError::AlreadyExists { path });
+            }
+        }
+        let path = self.job_path(job_id, class);
         if !make_directory(&path)? {
             return Err(CgroupError::AlreadyExists { path });
         }
         let admitted = (|| {
             let directory = open_directory(&path)?;
             let cgroup_id = cgroup_id(&directory).map_err(failed("fstat", &path))?;
-            JobCgroup::open(
+            let job = JobCgroup::open(
                 JobCgroupIdentity {
                     incarnation: self.incarnation.clone(),
                     job_id,
+                    class,
                     cgroup_id,
                 },
                 path,
                 directory,
-            )
+            )?;
+            class.place_job(&job.path)?;
+            Ok(job)
         })();
         admitted.map_err(|admission| {
-            // Only this attempt created this directory and no placement was issued. A missing
+            // Only this attempt created this directory and no [`Placement`] was issued. A missing
             // kernel interface must not leave a reused-name refusal hiding the original cause.
-            let path = self.job_path(job_id);
+            let path = self.job_path(job_id, class);
             match fs::remove_dir(&path) {
                 Ok(()) => admission,
                 Err(source) => CgroupError::AdmissionCleanup {
@@ -566,7 +603,7 @@ impl IncarnationCgroups {
                 found: identity.incarnation.clone(),
             });
         }
-        let path = self.job_path(identity.job_id);
+        let path = self.job_path(identity.job_id, identity.class);
         let directory = open_directory(&path)?;
         let found = cgroup_id(&directory).map_err(failed("fstat", &path))?;
         if found != identity.cgroup_id {
@@ -580,38 +617,52 @@ impl IncarnationCgroups {
     }
 
     /// Every job cgroup of this incarnation not yet retired, in job id order: what a restarted
-    /// controller finds its predecessor left. Anything else in the incarnation's cgroup is an
-    /// integrity failure, never skipped.
+    /// controller finds its predecessor left. A class cgroup holds every incarnation's jobs, so
+    /// another incarnation's are passed over; anything else in it, or a cgroup of this
+    /// incarnation's name that names no job, is an integrity failure, never skipped.
     pub fn outstanding(&self) -> Result<Vec<JobCgroupIdentity>> {
-        let entries = fs::read_dir(&self.path).map_err(failed("readdir", &self.path))?;
+        let own = format!("{JOB_PREFIX}{}-", self.incarnation.as_str());
         let mut identities = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(failed("readdir", &self.path))?;
-            let file_type = entry.file_type().map_err(|source| CgroupError::Io {
-                call: "stat",
-                path: entry.path(),
-                source,
-            })?;
-            if !file_type.is_dir() {
-                continue;
-            }
-            let path = entry.path();
-            let job_id = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_prefix(JOB_PREFIX))
-                .and_then(|id| id.parse::<u64>().ok())
-                .and_then(|id| JobId::new(id).ok())
-                .ok_or_else(|| CgroupError::Malformed {
-                    path: path.clone(),
-                    detail: "a child cgroup of an incarnation that names no job".to_owned(),
+        for class in ClassCgroup::ALL {
+            let directory = self.root.join(class.name());
+            let entries = fs::read_dir(&directory).map_err(failed("readdir", &directory))?;
+            for entry in entries {
+                let entry = entry.map_err(failed("readdir", &directory))?;
+                let file_type = entry.file_type().map_err(|source| CgroupError::Io {
+                    call: "stat",
+                    path: entry.path(),
+                    source,
                 })?;
-            let directory = open_directory(&path)?;
-            identities.push(JobCgroupIdentity {
-                incarnation: self.incarnation.clone(),
-                job_id,
-                cgroup_id: cgroup_id(&directory).map_err(failed("fstat", &path))?,
-            });
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let path = entry.path();
+                let name = entry.file_name();
+                let Some(name) = name.to_str().filter(|name| name.starts_with(JOB_PREFIX)) else {
+                    return Err(CgroupError::Malformed {
+                        path,
+                        detail: "a child cgroup of a class cgroup that names no job".to_owned(),
+                    });
+                };
+                let Some(id) = name.strip_prefix(own.as_str()) else {
+                    continue;
+                };
+                let job_id = id
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|id| JobId::new(id).ok())
+                    .ok_or_else(|| CgroupError::Malformed {
+                        path: path.clone(),
+                        detail: "a job cgroup of this incarnation that names no job id".to_owned(),
+                    })?;
+                let directory = open_directory(&path)?;
+                identities.push(JobCgroupIdentity {
+                    incarnation: self.incarnation.clone(),
+                    job_id,
+                    class,
+                    cgroup_id: cgroup_id(&directory).map_err(failed("fstat", &path))?,
+                });
+            }
         }
         identities.sort_by_key(|identity| identity.job_id);
         Ok(identities)
@@ -759,7 +810,7 @@ impl JobCgroup {
             &path,
             "cgroup.controllers",
         ))?;
-        require_controllers(&path, &available, &Controller::ACCOUNTING)?;
+        require_controllers(&path, &available, &Controller::ENABLED)?;
         let procs = open_at(directory.as_raw_fd(), c"cgroup.procs", libc::O_WRONLY)
             .map_err(failed_in("open", &path, "cgroup.procs"))?;
         let kill =
@@ -832,19 +883,6 @@ impl JobCgroup {
     /// in a different session or a descendant cgroup is still a member. This is not an exit proof.
     pub fn kill(&self) -> Result<()> {
         self.issue_kill()?.1
-    }
-
-    /// Freeze or thaw the complete membership through `cgroup.freeze`: a job whose probation
-    /// ended without a grant waits frozen until its grant (05_gateway.md "A one-token job starts
-    /// on probation"). A process that enters a frozen cgroup is frozen with it.
-    pub fn freeze(&self, frozen: bool) -> Result<()> {
-        let freeze = open_at(self.directory.as_raw_fd(), c"cgroup.freeze", libc::O_WRONLY)
-            .map_err(failed_in("open", &self.path, "cgroup.freeze"))?;
-        write_one(freeze.as_raw_fd(), if frozen { b"1" } else { b"0" }).map_err(failed_in(
-            "write",
-            &self.path,
-            "cgroup.freeze",
-        ))
     }
 
     /// [`Self::kill`] with its refusal kept apart from what failed beside it: `Err` when
@@ -1722,13 +1760,13 @@ mod tests {
     }
 
     #[test]
-    fn the_accounting_request_enables_exactly_the_accounting_controllers() {
-        let expected = Controller::ACCOUNTING
+    fn the_request_enables_exactly_the_enabled_controllers() {
+        let expected = Controller::ENABLED
             .iter()
             .map(|controller| format!("+{controller}"))
             .collect::<Vec<_>>()
             .join(" ");
-        assert_eq!(Controller::ACCOUNTING_REQUEST, expected);
+        assert_eq!(Controller::ENABLED_REQUEST, expected);
     }
 
     #[test]
@@ -1753,9 +1791,9 @@ mod tests {
     #[test]
     fn a_missing_controller_is_named_never_assumed() {
         let path = Path::new("/sys/fs/cgroup/x");
-        require_controllers(path, "cpuset cpu io memory pids\n", &Controller::ACCOUNTING)
-            .expect("all three offered");
-        let missing = require_controllers(path, "io memory pids\n", &Controller::ACCOUNTING);
+        require_controllers(path, "cpuset cpu io memory pids\n", &Controller::ENABLED)
+            .expect("all four offered");
+        let missing = require_controllers(path, "io memory pids\n", &Controller::ENABLED);
         assert!(
             matches!(
                 missing,

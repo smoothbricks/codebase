@@ -153,8 +153,8 @@ export type Readiness =
 
 /**
  * statusJson is the stdout of 'cowshed --json gateway status'. An install refuses, and restarts nothing, while a land
- * holds its repository's turn or a gate job holds or wants CPU tokens (05_gateway.md, "An install refuses while a land
- * or a gate runs"; cowshed-cli agent_cycle.rs restart_blockers): the holder of each repository's turn is the first
+ * holds its repository's turn (05_gateway.md, "An install refuses while a land runs"; cowshed-cli agent_cycle.rs
+ * restart_blockers): the holder of each repository's turn is the first
  * ticket of its queue, a queued land behind it is not a blocker. This is that decision over the status the CLI prints,
  * so a refusal is named before the install is tried; the install still checks under its own slot. No daemon answering
  * means nothing to restart and nothing to cut off. A held install slot defers too: an install takes the slot first and
@@ -173,14 +173,13 @@ export function installReadiness(statusJson: string): Readiness {
   if (status.running) {
     if (typeof status.landTurnsError === 'string') blockers.push(`land turns unreadable: ${status.landTurnsError}`);
     const lands = landTurnHolders(status.landTurns);
-    const gates = gateJobs(status.cpuBudget);
-    if (lands === undefined || gates === undefined) {
+    if (lands === undefined) {
       return {
         kind: 'unknown',
-        why: 'cowshed gateway status reported land turns or a CPU ledger in a shape this reader does not know',
+        why: 'cowshed gateway status reported land turns in a shape this reader does not know',
       };
     }
-    blockers.push(...lands, ...gates);
+    blockers.push(...lands);
   }
   return blockers.length === 0 ? { kind: 'ready' } : { kind: 'busy', blockers };
 }
@@ -227,33 +226,6 @@ function landTurnHolders(queues: unknown): readonly string[] | undefined {
     );
   }
   return holders;
-}
-
-/**
- * One line per gate job that holds or wants tokens, oldest first: the jobs of gateJobs and of gateQueue, each named
- * once. A ledger the daemon did not answer ('unanswered') names no job, as the install itself reads it. Undefined when
- * malformed.
- */
-function gateJobs(cpuBudget: unknown): readonly string[] | undefined {
-  if (cpuBudget === undefined) return [];
-  if (!isRecord(cpuBudget)) return undefined;
-  if (typeof cpuBudget.unanswered === 'string') return [];
-  const ledger = cpuBudget.ledger;
-  if (!isRecord(ledger)) return undefined;
-  const jobs = new Map<string, { readonly job: number; readonly checkout: string }>();
-  for (const list of [ledger.gateJobs, ledger.gateQueue]) {
-    if (!Array.isArray(list)) return undefined;
-    for (const entry of list) {
-      if (!isRecord(entry) || typeof entry.job !== 'number' || typeof entry.checkout !== 'string') return undefined;
-      jobs.set(`${entry.job} ${entry.checkout}`, { job: entry.job, checkout: entry.checkout });
-    }
-  }
-  return [...jobs.values()]
-    .sort(
-      (left, right) =>
-        left.job - right.job || (left.checkout < right.checkout ? -1 : left.checkout > right.checkout ? 1 : 0),
-    )
-    .map((gate) => `gate job ${gate.job} at ${gate.checkout}`);
 }
 
 /** What one run of setup came to. */

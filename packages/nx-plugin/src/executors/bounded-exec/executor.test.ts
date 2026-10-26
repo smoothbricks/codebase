@@ -9,22 +9,12 @@ import { dirname, join } from 'node:path';
 import { enclosingTreeMarker, outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
 import { FAKE_BUN_INVOKED, FAKE_BUN_RAN, fakeBun } from '../../__tests__/fake-bun.js';
-import {
-  closeServer,
-  fakeClock,
-  GRANT_THREE,
-  GRANT_TWO,
-  listen,
-  restartedBy,
-  scripted,
-} from '../../__tests__/gateway-stand-in.js';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { type StandInMode, standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processGroupHasMembers } from '../../process-group.js';
 import { ownedSocketDirectory, processesOf } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
-import { CPU_TOKENS_ENV, type CpuBudget, gatewayCpuBudget, type TokenGrant } from './cpu-tokens.js';
 import {
   type BoundedExecContext,
   type BoundedExecResult,
@@ -50,6 +40,7 @@ import {
   type Result,
   ramTempPaths,
 } from './ram-temp.js';
+import { CPU_TOKENS_ENV } from './runner-sizing.js';
 import { readRecord, type TempVolumeSpace, VERDICT_FILE } from './verdict.js';
 
 const workspaces: string[] = [];
@@ -61,9 +52,10 @@ const originalStderrWrite = process.stderr.write;
 const nextestWant = 8;
 
 /**
- * Every sizing variable a holder exports to its command (specs/cowshed/05_gateway.md, "Sized to the grant", "Cargo reads
- * its holder's jobserver"). This suite's own process runs under them when a gate's `bounded-exec` started it, and the
- * executor reads them as inherited ceilings and pool beside the ones its cases construct, so the suite clears them
+ * Every sizing variable a holder exports to its command (specs/cowshed/05_gateway.md, "Runners are sized to the count",
+ * "Cargo reads its holder's jobserver"). This suite's own process runs under them when a gate's `bounded-exec` started
+ * it, and the executor reads them as inherited ceilings and pool beside the ones its cases construct, so the suite clears
+ * them
  * (specs/cowshed/08_testing.md: fixtures clear every inherited sizing variable before they set their own).
  */
 const INHERITED_SIZING_ENV = [
@@ -139,7 +131,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
-      null,
     );
 
     expect(result.success).toBe(true);
@@ -154,7 +145,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "process.exit(7)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
-      null,
       null,
     );
 
@@ -177,7 +167,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
-      null,
     );
 
     expect(result.success).toBe(true);
@@ -196,7 +185,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
-      null,
     );
 
     expect(result.success).toBe(false);
@@ -213,7 +201,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "process.stdin.resume()"', idleTimeoutMs: 100, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
-      null,
       null,
     );
 
@@ -248,7 +235,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           workspace.context,
           createProcessTreeKiller(),
           null,
-          null,
         ),
     );
 
@@ -257,56 +243,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('Command made no progress: no test finished for 400ms (idleTimeoutMs=400)');
     expect(result.terminalOutput).toContain('still running: fake tests::hangs (cwd=');
     expect(result.terminalOutput).not.toContain('fake tests::quick (cwd=');
-  });
-
-  it("stops the idle clock while a descendant's work is queued for host CPU tokens, and runs it on after", async () => {
-    const workspace = await createWorkspace();
-    // The runner finishes a test, then says through its pool that work it started is queued for host tokens, ends that
-    // wait and goes silent. While the wait is held the clock moves well past the bound and nothing fires; once the wait
-    // ends the same move ends the run.
-    await workspace.write(
-      'queued-runner.js',
-      [
-        "const { connect } = require('node:net');",
-        "console.error('        PASS [   0.010s] (1/2) fake tests::quick');",
-        `const socket = connect(process.env.${CPU_POOL_ENV});`,
-        `socket.on('connect', () => socket.write('{"op":"host-wait"}\\n'));`,
-        "socket.once('data', (reply) => { console.log('host wait ' + reply.toString().trim()); socket.end(); });",
-        "socket.on('close', () => setInterval(() => {}, 60_000));",
-        '',
-      ].join('\n'),
-    );
-    const budget: CpuBudget = {
-      async take() {
-        return heldGrant(1, []);
-      },
-    };
-
-    const { result } = await onProgressClock(
-      (chunk) => chunk.includes('bounded-exec: idle clock'),
-      1_000,
-      () =>
-        runBoundedExec(
-          { command: 'node queued-runner.js', idleTimeoutMs: 400, killAfterMs: 0 },
-          workspace.context,
-          createProcessTreeKiller(),
-          null,
-          budget,
-        ),
-    );
-
-    const output = result.terminalOutput;
-    expect(result.success).toBe(false);
-    expect(output).toContain('host wait {"ok":true,"wait":"held"}');
-    const stopped = output.indexOf(
-      "bounded-exec: idle clock stopped: a descendant's work is queued for host CPU tokens",
-    );
-    const restarted = output.indexOf('bounded-exec: idle clock restarted');
-    const expired = output.indexOf('Command made no progress: no test finished for 400ms (idleTimeoutMs=400)');
-    // The 1000 ms move while the wait was held fired nothing; the one after it ended the run.
-    expect(stopped).toBeGreaterThan(-1);
-    expect(restarted).toBeGreaterThan(stopped);
-    expect(expired).toBeGreaterThan(restarted);
   });
 
   it('emits a completed pre-expiry snapshot or an explicit incomplete capture without waiting for it', async () => {
@@ -324,7 +260,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
             { command: 'node snapshot-clock.js', idleTimeoutMs: 2 * HANG_CAPTURE_MS, killAfterMs: 0 },
             workspace.context,
             createProcessTreeKiller(),
-            null,
             null,
             null,
             async (request) => {
@@ -401,7 +336,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         },
         workspace.context,
         killer,
-        null,
         null,
         null,
         (request) => {
@@ -494,7 +428,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
             createProcessTreeKiller(),
             null,
             null,
-            null,
             async (request) => {
               signals.push(request.signal);
               const ordinal = signals.length;
@@ -547,7 +480,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           workspace.context,
           createProcessTreeKiller(),
           null,
-          null,
         ),
     );
 
@@ -582,7 +514,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           workspace.context,
           createProcessTreeKiller(),
           null,
-          null,
         ),
     );
 
@@ -616,7 +547,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           workspace.context,
           createProcessTreeKiller(),
           null,
-          null,
         ),
     );
 
@@ -632,7 +562,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node runaway.js', timeoutMs: 300, idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
-      null,
       null,
     );
 
@@ -671,7 +600,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         { command: 'node silent.js', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
         workspace.context,
         createProcessTreeKiller(),
-        null,
         null,
       );
       await started;
@@ -722,7 +650,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       termination.killer,
       null,
-      null,
     );
 
     await termination.armed();
@@ -760,7 +687,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       killer,
       null,
-      null,
     );
 
     expect(result.success).toBe(false);
@@ -797,7 +723,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       killer,
       null,
-      null,
     );
 
     if (signalled === undefined) throw new Error('the killer was never asked to signal the command');
@@ -826,7 +751,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'node -e "process.stdin.resume()"', timeoutMs: 50, killAfterMs: 10 },
       workspace.context,
       killer,
-      null,
       null,
     );
     // The command never exits and the killer delivers nothing, so the run returned by giving up on the tree after its
@@ -863,7 +787,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
-      null,
     );
     const suppressed = await runBoundedExec(
       {
@@ -875,7 +798,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
       workspace.context,
       createProcessTreeKiller(),
-      null,
       null,
     );
 
@@ -927,7 +849,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       { command: 'exec node spawn-child.js', timeoutMs: 50, killAfterMs: 50 },
       workspace.context,
       termination.killer,
-      null,
       null,
     );
 
@@ -1059,8 +980,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
-      null,
-      undefined,
       undefined,
       await standInOwner(workspace.root),
     );
@@ -1090,8 +1009,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
-      null,
-      undefined,
       undefined,
       await standInOwner(workspace.root),
     );
@@ -1124,8 +1041,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
-      null,
-      undefined,
       undefined,
       await standInOwner(workspace.root),
     );
@@ -1164,8 +1079,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         createProcessTreeKiller(),
         null,
         null,
-        null,
-        undefined,
         undefined,
         await standInOwner(workspace.root),
       );
@@ -1197,7 +1110,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       volume,
-      null,
     );
 
     expect(result.success).toBe(true);
@@ -1224,8 +1136,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
-      null,
-      undefined,
       undefined,
       await standInOwner(workspace.root, { admission: 'notMember', retire: 'retire' }),
     );
@@ -1247,8 +1157,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       null,
       null,
-      null,
-      undefined,
       undefined,
       await standInOwner(workspace.root, { admission: 'admitted', retire: 'fail' }),
     );
@@ -1289,8 +1197,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
             createProcessTreeKiller(),
             volume,
             null,
-            null,
-            undefined,
             undefined,
             supervised,
           );
@@ -1355,8 +1261,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         createProcessTreeKiller(),
         volume,
         null,
-        null,
-        undefined,
         undefined,
         await standInOwner(workspace.root),
       );
@@ -1400,8 +1304,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           createProcessTreeKiller(),
           volume,
           null,
-          null,
-          undefined,
           undefined,
           supervised,
         );
@@ -1431,8 +1333,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         createProcessTreeKiller(),
         volume,
         null,
-        null,
-        undefined,
         undefined,
         await standInOwner(workspace.root),
       );
@@ -1459,8 +1359,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
-      null,
-      undefined,
       undefined,
       await standInOwner(workspace.root),
     );
@@ -1488,8 +1386,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         createProcessTreeKiller(),
         volume,
         null,
-        null,
-        undefined,
         undefined,
         await standInOwner(workspace.root),
       );
@@ -1515,8 +1411,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
-      null,
-      undefined,
       undefined,
       await standInOwner(workspace.root),
     );
@@ -1561,8 +1455,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
-      null,
-      undefined,
       undefined,
       await standInOwner(workspace.root),
     );
@@ -1588,78 +1480,22 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     ]);
   });
 
-  it('keeps inherited nextest and Cargo ceilings under oversized grants', async () => {
-    const previousNextest = process.env.NEXTEST_TEST_THREADS;
-    const previousCargo = process.env.CARGO_BUILD_JOBS;
-    const previousRust = process.env.RUST_TEST_THREADS;
-    process.env.NEXTEST_TEST_THREADS = '6';
-    process.env.CARGO_BUILD_JOBS = '4';
-    process.env.RUST_TEST_THREADS = '6';
-    try {
-      for (const tokens of [15, 18]) {
-        const workspace = await createWorkspace();
-        const asked: number[] = [];
-        const released: number[] = [];
-        const budget: CpuBudget = {
-          async take(want) {
-            asked.push(want);
-            return heldGrant(tokens, released);
-          },
-        };
-        // Cargo's ceiling bounds its ask; its rustc count is then the sub-pool's jobserver fifo, and its test threads
-        // are sized under their own ceiling, never to the target's 64.
-        for (const scenario of [
-          { runner: 'nextest run', variable: 'NEXTEST_TEST_THREADS', cap: 6 },
-          { runner: 'cargo test', variable: 'RUST_TEST_THREADS', cap: 4 },
-        ]) {
-          const command = `node -e "console.log('cap=' + process.env.${scenario.variable} + ' held=' + process.env.BOUNDED_EXEC_CPU_TOKENS)" # ${scenario.runner}`;
-          const result = await runBoundedExec(
-            {
-              command,
-              timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-              parallelism: 18,
-              env: { NEXTEST_TEST_THREADS: '64', CARGO_BUILD_JOBS: '64', RUST_TEST_THREADS: '64' },
-            },
-            workspace.context,
-            createProcessTreeKiller(),
-            null,
-            budget,
-          );
-          expect(result.success).toBe(true);
-          expect(asked.at(-1)).toBe(scenario.cap);
-          expect(result.terminalOutput).toContain(`cap=${scenario.cap} held=${tokens}`);
-        }
-        expect(released).toEqual([tokens, tokens]);
-      }
-    } finally {
-      if (previousNextest === undefined) delete process.env.NEXTEST_TEST_THREADS;
-      else process.env.NEXTEST_TEST_THREADS = previousNextest;
-      if (previousCargo === undefined) delete process.env.CARGO_BUILD_JOBS;
-      else process.env.CARGO_BUILD_JOBS = previousCargo;
-      if (previousRust === undefined) delete process.env.RUST_TEST_THREADS;
-      else process.env.RUST_TEST_THREADS = previousRust;
-    }
-  });
-
   it("names the run's own jobserver fifo to its command, never one the target's env names", async () => {
     const workspace = await createWorkspace();
-    const released: number[] = [];
     const injected = '-j --jobserver-auth=fifo:/injected';
     const command = `node -e "console.log(JSON.stringify([process.env.CARGO_MAKEFLAGS, process.env.MAKEFLAGS, process.env.${CPU_POOL_ENV}]))"`;
-    const result = await runBoundedExec(
-      {
-        command,
-        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-        env: { CARGO_MAKEFLAGS: injected, MAKEFLAGS: injected, MFLAGS: injected },
-      },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      {
-        async take() {
-          return heldGrant(2, released);
+    const result = await withPool(2, (pool) =>
+      runBoundedExec(
+        {
+          command,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          env: { CARGO_MAKEFLAGS: injected, MAKEFLAGS: injected, MFLAGS: injected },
         },
-      },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        inheritedFrom(pool),
+      ),
     );
     expect(result.success).toBe(true);
     for (const name of ['CARGO_MAKEFLAGS', 'MAKEFLAGS', 'MFLAGS']) {
@@ -1672,85 +1508,16 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       /^\["-j --jobserver-auth=fifo:(\/\S+)\/j","-j --jobserver-auth=fifo:\1\/j","\1\/p\.sock"\]$/m,
     );
     expect(result.terminalOutput).not.toContain('/injected');
-    expect(released).toEqual([2]);
   });
 
-  it('starts the runner once granted, sized to its grant, and returns the tokens when it exits', async () => {
+  it('says nothing and runs as asked when it inherits no pool', async () => {
     const workspace = await createWorkspace();
-    const asked: { want: number; checkout: string; command: string }[] = [];
-    const released: number[] = [];
-    const budget: CpuBudget = {
-      async take(want, checkout, command) {
-        asked.push({ want, checkout, command });
-        return heldGrant(3, released);
-      },
-    };
-    // `nextest run` in a trailing comment makes the shell command a nextest runner by invocation.
-    const command =
-      "node -e \"console.log('threads=' + process.env.NEXTEST_TEST_THREADS + ' tokens=' + process.env.BOUNDED_EXEC_CPU_TOKENS)\" # nextest run";
-
-    const result = await runBoundedExec(
-      { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8, env: { NEXTEST_TEST_THREADS: '64' } },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      budget,
-    );
-
-    expect(result.success).toBe(true);
-    expect(asked).toEqual([{ want: nextestWant, checkout: workspace.root, command }]);
-    expect(result.terminalOutput).toContain(`threads=${Math.min(3, nextestWant)} tokens=3`);
-    expect(result.terminalOutput).toMatch(
-      new RegExp(
-        `^cowshed: cpu-tokens wait done elapsed=\\d+ms status=ok tokens=3/${nextestWant} runner=nextest$`,
-        'm',
-      ),
-    );
-    expect(released).toEqual([3]);
-  });
-
-  it('runs the command as asked, saying why, when the budget refuses', async () => {
-    const workspace = await createWorkspace();
-    const budget: CpuBudget = {
-      async take() {
-        return { granted: false, cause: 'predates', reason: 'the gateway predates the CPU budget' };
-      },
-    };
-
-    // A nextest runner configured for 64 threads keeps them: nothing sizes it without a grant.
-    const result = await runBoundedExec(
-      {
-        command: 'node -e "console.log(\'threads=\' + process.env.NEXTEST_TEST_THREADS)" # nextest run',
-        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-        env: { NEXTEST_TEST_THREADS: '64' },
-      },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      budget,
-    );
-
-    expect(result.success).toBe(true);
-    expect(result.terminalOutput).toContain('threads=64');
-    expect(result.terminalOutput).toContain(
-      'status=err runner=nextest runs unbudgeted: the gateway predates the CPU budget',
-    );
-  });
-
-  it('says nothing and runs as asked where no gateway listens', async () => {
-    const workspace = await createWorkspace();
-    const budget: CpuBudget = {
-      async take() {
-        return { granted: false, cause: 'absent', reason: 'no socket' };
-      },
-    };
 
     const result = await runBoundedExec(
       { command: 'node -e "console.log(\'ran\')"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       null,
-      budget,
     );
 
     expect(result.success).toBe(true);
@@ -1803,16 +1570,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(select(undefined, undefined, undefined)).toBeUndefined();
   });
 
-  it('sizes a runner to the grant its parent pool lent, takes nothing from the host, and returns nothing to it', async () => {
+  it('sizes a runner to the grant its parent pool lent', async () => {
     const workspace = await createWorkspace();
-    const asked: number[] = [];
-    const released: number[] = [];
-    const budget: CpuBudget = {
-      async take(want) {
-        asked.push(want);
-        return heldGrant(1, released);
-      },
-    };
     const lent = lentCount(nextestWant, 3);
 
     const result = await withPool(3, (pool) =>
@@ -1825,19 +1584,21 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         workspace.context,
         createProcessTreeKiller(),
         null,
-        budget,
         inheritedFrom(pool),
       ),
     );
 
     expect(result.success).toBe(true);
-    expect(asked).toEqual([]);
-    expect(released).toEqual([]);
     expect(result.terminalOutput).toContain(`tokens=${lent}\n`);
-    expect(result.terminalOutput).toContain(`inherited=true tokens=${lent}/${nextestWant} runner=nextest`);
+    expect(result.terminalOutput).toMatch(
+      new RegExp(
+        `^cowshed: cpu-pool wait done elapsed=\\d+ms status=ok tokens=${lent}/${nextestWant} runner=nextest$`,
+        'm',
+      ),
+    );
   });
 
-  it('lends a runner no more than it asks for, even with no budget client', async () => {
+  it('lends a runner no more than it asks for', async () => {
     const workspace = await createWorkspace();
     const lent = lentCount(2, 16);
 
@@ -1851,92 +1612,33 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         workspace.context,
         createProcessTreeKiller(),
         null,
-        null,
         inheritedFrom(pool),
       ),
     );
 
     expect(result.success).toBe(true);
     expect(result.terminalOutput).toContain(`threads=${lent}\n`);
-    expect(result.terminalOutput).toContain(`inherited=true tokens=${lent}/2 runner=nextest`);
+    expect(result.terminalOutput).toContain(`status=ok tokens=${lent}/2 runner=nextest`);
   });
 
-  it('takes and returns its own grant when no parent lent one', async () => {
+  it('records the grant its parent pool lent', async () => {
     const workspace = await createWorkspace();
-    const asked: number[] = [];
-    const released: number[] = [];
-    const budget: CpuBudget = {
-      async take(want) {
-        asked.push(want);
-        return heldGrant(3, released);
-      },
-    };
-
-    const result = await runBoundedExec(
-      { command: 'node -e "console.log(1)" # nextest run', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8 },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      budget,
-      null,
-    );
-
-    expect(result.success).toBe(true);
-    expect(asked).toEqual([nextestWant]);
-    expect(released).toEqual([3]);
-    expect(result.terminalOutput).toMatch(
-      new RegExp(
-        `^cowshed: cpu-tokens wait done elapsed=\\d+ms status=ok tokens=3/${nextestWant} runner=nextest$`,
-        'm',
-      ),
-    );
-    expect(result.terminalOutput).not.toContain('inherited');
-  });
-
-  it('records a borrowed grant as inherited, and an owned grant without that mark', async () => {
-    const workspace = await createWorkspace();
-    const command = 'node -e "0" # nextest run';
-    const task = { id: 'app:test', hash: null };
-    const borrowedDir = join(workspace.root, 'borrowed');
-    const ownedDir = join(workspace.root, 'owned');
-    const budget: CpuBudget = {
-      async take() {
-        return heldGrant(3, []);
-      },
-    };
+    const directory = join(workspace.root, 'borrowed');
     const lent = lentCount(nextestWant, 3);
 
-    const borrowed = await withPool(3, (pool) =>
+    const result = await withPool(3, (pool) =>
       runBoundedExec(
-        { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8 },
-        { ...workspace.context, record: { task, directory: borrowedDir } },
+        { command: 'node -e "0" # nextest run', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8 },
+        { ...workspace.context, record: { task: { id: 'app:test', hash: null }, directory } },
         createProcessTreeKiller(),
-        null,
         null,
         inheritedFrom(pool),
       ),
     );
-    const owned = await runBoundedExec(
-      { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8 },
-      { ...workspace.context, record: { task, directory: ownedDir } },
-      createProcessTreeKiller(),
-      null,
-      budget,
-      null,
-    );
 
-    expect(borrowed.success).toBe(true);
-    expect(owned.success).toBe(true);
-    const borrowedRecord: unknown = JSON.parse(await readFile(join(borrowedDir, VERDICT_FILE), 'utf8'));
-    expect(borrowedRecord).toHaveProperty('cpu', {
-      tokens: lent,
-      want: nextestWant,
-      waitedMs: expect.any(Number),
-      inherited: true,
-    });
-    const ownedRecord: unknown = JSON.parse(await readFile(join(ownedDir, VERDICT_FILE), 'utf8'));
-    expect(ownedRecord).toHaveProperty('cpu', { tokens: 3, want: nextestWant, waitedMs: expect.any(Number) });
-    expect(ownedRecord).not.toHaveProperty('cpu.inherited');
+    expect(result.success).toBe(true);
+    const record: unknown = JSON.parse(await readFile(join(directory, VERDICT_FILE), 'utf8'));
+    expect(record).toHaveProperty('cpu', { tokens: lent, want: nextestWant, waitedMs: expect.any(Number) });
   });
 
   it('keeps a command running when its borrowed grant closes, and judges it by its own exit', async () => {
@@ -1949,7 +1651,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     // The run says the grant ended on its stderr; that line is the signal the close was heard while the command runs.
     const { promise: heard, resolve: hear } = Promise.withResolvers<void>();
     process.stderr.write = captureWrite([], (text) => {
-      if (text.includes('cpu-tokens grant ended')) hear();
+      if (text.includes('cpu-pool grant ended')) hear();
     });
     const result = await withPool(1, async (pool) => {
       const running = runBoundedExec(
@@ -1959,7 +1661,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         },
         { ...workspace.context, record: { task: { id: 'outlives-its-grant', hash: null }, directory } },
         createProcessTreeKiller(),
-        null,
         null,
         inheritedFrom(pool),
       );
@@ -1972,7 +1673,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       return running;
     });
     expect(result.terminalOutput).toContain(
-      'cowshed: cpu-tokens grant ended: the parent pool closed its 1-token grant while the command ran; it runs on over budget until it ends',
+      'cowshed: cpu-pool grant ended: the parent pool closed its 1-token grant while the command ran; it runs on over budget until it ends',
     );
     expect(result.terminalOutput).not.toContain('Force-killing');
     expect(result.success).toBe(true);
@@ -1980,16 +1681,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(record).toHaveProperty('verdict.outcome', 'passed');
   });
 
-  it('asks the host budget when a parent pool refuses its descriptor, and says why', async () => {
+  it('runs the command as asked, and says so, when its parent pool is gone', async () => {
     const workspace = await createWorkspace();
-    const asked: number[] = [];
-    const released: number[] = [];
-    const budget: CpuBudget = {
-      async take(want) {
-        asked.push(want);
-        return heldGrant(3, released);
-      },
-    };
     const gone = { socket: join(workspace.root, 'gone.sock'), tokens: 3 };
 
     const result = await runBoundedExec(
@@ -2001,17 +1694,14 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
-      budget,
       gone,
     );
 
     expect(result.success).toBe(true);
-    expect(asked).toEqual([nextestWant]);
-    expect(released).toEqual([3]);
-    expect(result.terminalOutput).toContain("; asking the host budget as background work, not at the pool's class");
-    expect(result.terminalOutput).toContain('cowshed: cpu-tokens parent pool absent: ');
-    expect(result.terminalOutput).toContain(`status=ok tokens=3/${nextestWant} runner=nextest`);
-    expect(result.terminalOutput).not.toContain('inherited=true');
+    expect(result.terminalOutput).toContain('ran\n');
+    expect(result.terminalOutput).toContain('cowshed: cpu-pool parent pool absent: ');
+    expect(result.terminalOutput).toContain('; running the command as asked');
+    expect(result.terminalOutput).not.toContain('status=ok');
   });
 
   it('ignores a target env that names the CPU budget, when no budget grants it', async () => {
@@ -2026,7 +1716,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       workspace.context,
       createProcessTreeKiller(),
       null,
-      null,
     );
 
     expect(result.success).toBe(true);
@@ -2038,37 +1727,32 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   it('sizes the command from its own grant, whatever the target env names', async () => {
     const workspace = await createWorkspace();
-    const released: number[] = [];
-    const budget: CpuBudget = {
-      async take() {
-        return heldGrant(2, released);
-      },
-    };
 
-    const result = await runBoundedExec(
-      {
-        command: 'node -e "console.log(\'tokens=\' + process.env.BOUNDED_EXEC_CPU_TOKENS)" # nextest run',
-        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-        parallelism: 8,
-        env: { BOUNDED_EXEC_CPU_TOKENS: '977' },
-      },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      budget,
+    const result = await withPool(2, (pool) =>
+      runBoundedExec(
+        {
+          command: 'node -e "console.log(\'tokens=\' + process.env.BOUNDED_EXEC_CPU_TOKENS)" # nextest run',
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          parallelism: 8,
+          env: { BOUNDED_EXEC_CPU_TOKENS: '977' },
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        inheritedFrom(pool),
+      ),
     );
 
     expect(result.success).toBe(true);
     expect(result.terminalOutput).toContain('tokens=2\n');
     expect(result.terminalOutput).not.toContain('977');
-    expect(released).toEqual([2]);
   });
 
-  it('refuses the run when its parent pool answers with a refusal, asking no host budget', async () => {
+  it('refuses the run when its parent pool answers with a refusal', async () => {
     const socketDirectory = await ownedSocketDirectory('cpu-refuse-', 'p.sock');
     workspaces.push(socketDirectory);
     const socket = join(socketDirectory, 'p.sock');
-    // A live pool that refuses answers `other`, not `absent`: the run must fail, not ask the host.
+    // A live pool that refuses answers `other`, not `absent`: the run must fail, not run beside it.
     const refusing = createServer((connection) => {
       connection.once('data', () => {
         connection.end('{"ok":false,"code":"refused","error":"the pool is shutting down"}\n');
@@ -2076,13 +1760,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     });
     await new Promise<void>((resolve) => refusing.listen(socket, resolve));
     const workspace = await createWorkspace();
-    const asked: number[] = [];
-    const budget: CpuBudget = {
-      async take(want) {
-        asked.push(want);
-        return heldGrant(1, []);
-      },
-    };
     try {
       const result = await runBoundedExec(
         { command: 'touch ran.marker', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
@@ -2092,15 +1769,12 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         },
         createProcessTreeKiller(),
         null,
-        budget,
         { socket, tokens: 3 },
       );
 
       expect(result.success).toBe(false);
-      expect(asked).toEqual([]);
       expect(await exists(join(workspace.root, 'ran.marker'))).toBe(false);
-      expect(result.terminalOutput).toContain('cowshed: cpu-tokens parent pool refused: ');
-      expect(result.terminalOutput).toContain('refusing to run the command without asking the host budget');
+      expect(result.terminalOutput).toContain('cowshed: cpu-pool parent pool refused: ');
       expect(await readFile(join(workspace.root, 'refused', VERDICT_FILE), 'utf8')).toMatch(/"outcome":\s*"failed"/);
     } finally {
       await new Promise<void>((resolve) => refusing.close(() => resolve()));
@@ -2126,13 +1800,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           retained: [],
         },
       });
-      const asked: number[] = [];
-      const budget: CpuBudget = {
-        async take(want) {
-          asked.push(want);
-          return heldGrant(1, []);
-        },
-      };
       const record = { task: { id: 'compiler:test-3', hash: 'h' }, directory: join(workspace.root, 'record') };
 
       const result = await runBoundedExec(
@@ -2144,7 +1811,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         { ...workspace.context, record },
         createProcessTreeKiller(),
         volume,
-        budget,
       );
 
       expect(result.success).toBe(false);
@@ -2153,9 +1819,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(result.terminalOutput).toContain('is Bun 1.4.2');
       expect(result.terminalOutput).toContain(bun);
       expect(result.terminalOutput).toContain("PATH from the target's env");
-      // Nothing was asked of the host: no RAM lease, no CPU tokens, and the command never ran.
+      // Nothing was asked of the host: no RAM lease, and the command never ran.
       expect(volume.order).toEqual([]);
-      expect(asked).toEqual([]);
       expect(await exists(join(workspace.root, 'bin', FAKE_BUN_RAN))).toBe(false);
       expect(await readRecord(record.directory)).toEqual({
         task: record.task.id,
@@ -2178,7 +1843,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         workspace.context,
         createProcessTreeKiller(),
         null,
-        null,
       );
 
       expect(result.success).toBe(true);
@@ -2198,7 +1862,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         },
         workspace.context,
         createProcessTreeKiller(),
-        null,
         null,
       );
 
@@ -2220,7 +1883,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           workspace.context,
           createProcessTreeKiller(),
           null,
-          null,
         );
 
         expect(result.success).toBe(false);
@@ -2232,153 +1894,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     });
   });
 
-  it('asks the gateway once more across an install that restarts it, and runs on the grant it takes', async () => {
-    const socketDirectory = await ownedSocketDirectory('cpu-restart-', 'gw.sock');
-    workspaces.push(socketDirectory);
-    const socket = join(socketDirectory, 'gw.sock');
-    // The install cuts the first ask off and closes this gateway; the one it starts grants while the run waits.
-    let current = await listen(socket, scripted([restartedBy(1234)]));
-    const workspace = await createWorkspace();
-    const clock = fakeClock(async () => {
-      await closeServer(current);
-      current = await listen(socket, scripted([GRANT_TWO]));
-    });
-    try {
-      const result = await runBoundedExec(
-        {
-          command: 'touch ran.marker # nextest run',
-          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-          parallelism: nextestWant,
-        },
-        workspace.context,
-        createProcessTreeKiller(),
-        null,
-        gatewayCpuBudget(socket),
-        null,
-        undefined,
-        clock,
-      );
-
-      expect(result.success).toBe(true);
-      expect(result.terminalOutput).toContain(
-        'cowshed: cpu-tokens gateway cut off by install 1234 (/abs/cowshed) restarting the gateway; asking the gateway it starts once, within 180000 ms',
-      );
-      expect(result.terminalOutput).toContain(`status=ok tokens=2/${nextestWant} runner=nextest`);
-      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(true);
-    } finally {
-      await closeServer(current);
-    }
-  });
-
-  it('refuses the run once the install that restarts the gateway has not brought one up within its bound', async () => {
-    const socketDirectory = await ownedSocketDirectory('cpu-restart-', 'gw.sock');
-    workspaces.push(socketDirectory);
-    const socket = join(socketDirectory, 'gw.sock');
-    // Every ask is cut off by install 1234, which keeps answering for the gateway it restarted until the bound runs out.
-    const gateway = await listen(socket, (client) => {
-      client.once('data', () => client.end(restartedBy(1234, 300)));
-    });
-    const workspace = await createWorkspace();
-    try {
-      const result = await runBoundedExec(
-        {
-          command: 'touch ran.marker # nextest run',
-          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-          parallelism: nextestWant,
-        },
-        workspace.context,
-        createProcessTreeKiller(),
-        null,
-        gatewayCpuBudget(socket),
-        null,
-        undefined,
-        fakeClock(),
-      );
-
-      expect(result.success).toBe(false);
-      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(false);
-      expect(result.terminalOutput).toContain(
-        'cowshed: cpu-tokens the install 1234 (/abs/cowshed) restarting the gateway did not bring up one that serves within 300 ms; waited 300 ms; refusing to run the command',
-      );
-    } finally {
-      await closeServer(gateway);
-    }
-  });
-
-  it('never retries a refusal other than an install restart, and runs unbudgeted on it as before', async () => {
-    const socketDirectory = await ownedSocketDirectory('cpu-restart-', 'gw.sock');
-    workspaces.push(socketDirectory);
-    const socket = join(socketDirectory, 'gw.sock');
-    let asks = 0;
-    const gateway = await listen(socket, (client) => {
-      asks += 1;
-      client.once('data', () => client.end('{"ok":false,"code":"rejected","error":"the gateway is shutting down"}\n'));
-    });
-    const workspace = await createWorkspace();
-    try {
-      const result = await runBoundedExec(
-        {
-          command: 'touch ran.marker # nextest run',
-          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-          parallelism: nextestWant,
-        },
-        workspace.context,
-        createProcessTreeKiller(),
-        null,
-        gatewayCpuBudget(socket),
-        null,
-        undefined,
-        fakeClock(),
-      );
-
-      expect(asks).toBe(1);
-      expect(result.success).toBe(true);
-      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(true);
-      expect(result.terminalOutput).toContain('runs unbudgeted: ');
-    } finally {
-      await closeServer(gateway);
-    }
-  });
-
-  it('asks the host budget at once when an install cuts off the parent pool, and runs on its grant', async () => {
-    const parentDirectory = await ownedSocketDirectory('cpu-restart-', 'parent.sock');
-    workspaces.push(parentDirectory);
-    const hostDirectory = await ownedSocketDirectory('cpu-restart-', 'gw.sock');
-    workspaces.push(hostDirectory);
-    const parentSocket = join(parentDirectory, 'parent.sock');
-    const hostSocket = join(hostDirectory, 'gw.sock');
-    const parent = await listen(parentSocket, scripted([restartedBy(1234)]));
-    const host = await listen(hostSocket, scripted([GRANT_THREE]));
-    const workspace = await createWorkspace();
-    try {
-      const result = await runBoundedExec(
-        {
-          command: 'touch ran.marker # nextest run',
-          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-          parallelism: nextestWant,
-        },
-        workspace.context,
-        createProcessTreeKiller(),
-        null,
-        gatewayCpuBudget(hostSocket),
-        { socket: parentSocket, tokens: 3 },
-        undefined,
-        fakeClock(),
-      );
-
-      expect(result.success).toBe(true);
-      expect(result.terminalOutput).toContain(
-        "cowshed: cpu-tokens parent pool cut off by install 1234 (/abs/cowshed) restarting the gateway; asking the gateway it starts once as background work, not at its pool's class, within 180000 ms",
-      );
-      expect(result.terminalOutput).toContain(`status=ok tokens=3/${nextestWant} runner=nextest`);
-      expect(result.terminalOutput).not.toContain('parent pool absent');
-      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(true);
-    } finally {
-      await closeServer(parent);
-      await closeServer(host);
-    }
-  });
-
   it('never gives a command a budget it was not granted, whatever pool or count its environment names', async () => {
     const workspace = await createWorkspace();
     await workspace.write('probe.js', BUDGET_PROBE);
@@ -2388,11 +1903,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     process.env[CPU_POOL_ENV] = '/stale.sock';
     process.env[CPU_TOKENS_ENV] = '5';
     try {
-      const absent: CpuBudget = {
-        async take() {
-          return { granted: false, cause: 'absent', reason: 'no budget socket' };
-        },
-      };
       const unbudgeted = await withPool(3, (pool) =>
         runBoundedExec(
           {
@@ -2403,37 +1913,33 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           workspace.context,
           createProcessTreeKiller(),
           null,
-          absent,
         ),
       );
       expect(unbudgeted.terminalOutput).toContain('[null,null]\n[null,null]\n');
 
-      const released: number[] = [];
       let injected = '';
-      const granted = await withPool(3, (pool) => {
-        injected = inheritedFrom(pool).socket;
-        return runBoundedExec(
-          {
-            command: 'node probe.js',
-            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-            env: { ...pool.environment, [CPU_TOKENS_ENV]: '9' },
-          },
-          workspace.context,
-          createProcessTreeKiller(),
-          null,
-          {
-            async take() {
-              return heldGrant(2, released);
+      const granted = await withPool(2, (lending) =>
+        withPool(3, (pool) => {
+          injected = inheritedFrom(pool).socket;
+          return runBoundedExec(
+            {
+              command: 'node probe.js',
+              timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+              parallelism: 2,
+              env: { ...pool.environment, [CPU_TOKENS_ENV]: '9' },
             },
-          },
-        );
-      });
+            workspace.context,
+            createProcessTreeKiller(),
+            null,
+            inheritedFrom(lending),
+          );
+        }),
+      );
       const [own, grandchild] = granted.terminalOutput.split('\n').filter((line) => line.startsWith('['));
       expect(own).toBe(grandchild);
       expect(own).toMatch(/,"2"\]$/);
       expect(own).not.toContain(injected);
       expect(own).not.toContain('/stale.sock');
-      expect(released).toEqual([2]);
     } finally {
       if (previousPool === undefined) {
         delete process.env[CPU_POOL_ENV];
@@ -2654,27 +2160,9 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/** A granted host grant whose `closed` resolves on release, as the gateway's does when the grant's socket closes. */
-function heldGrant(tokens: number, released: number[]): TokenGrant {
-  let closeGrant!: () => void;
-  const closed = new Promise<void>((resolve) => {
-    closeGrant = resolve;
-  });
-  return {
-    granted: true,
-    tokens,
-    release: () => {
-      released.push(tokens);
-      closeGrant();
-    },
-    closed,
-  };
-}
-
-/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own, and no run owns the
- * host waits its children report. */
+/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own. */
 async function withPool<T>(tokens: number, body: (pool: CpuPool) => Promise<T>): Promise<T> {
-  const created = await createCpuPool(tokens, new Promise<void>(() => {}), { begin() {}, end() {} });
+  const created = await createCpuPool(tokens, new Promise<void>(() => {}));
   if (!created.ok) {
     throw new Error(`cpu pool: ${created.error}`);
   }

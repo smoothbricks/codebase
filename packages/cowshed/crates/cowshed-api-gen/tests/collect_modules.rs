@@ -345,12 +345,12 @@ fn collect_binds_each_declaration_to_its_module_and_refuses_a_duplicate_name() {
         model.modules["DaemonStatus"],
         "cowshed_gateway_types::status"
     );
-    // The class an exec names is the exec API's own declaration (ExecClass), apart from the ledger's
-    // wire class; the budget a refusal reports is the gateway's own declaration.
+    // The class an exec names is the exec API's own declaration (ExecClass); the host readings
+    // status reports are the gateway types' own declaration.
     assert_eq!(model.modules["ExecClass"], "cowshed_core::api::dto");
     assert_eq!(
-        model.modules["CpuBudgetStatus"],
-        "cowshed_gateway_types::cpu_budget"
+        model.modules["HostReadings"],
+        "cowshed_gateway_types::host_status"
     );
     // The modules map is derived from the records, so the two cannot disagree.
     assert_eq!(model.modules.len(), model.api.records.len());

@@ -506,14 +506,14 @@ struct ExecWire {
     class: ExecClass,
     want: Option<NonZeroUsize>,
     scope: ExecScope,
-    /// The requester's live CPU pool ([`crate::runtime::job_cpu::JobCpuAsk::parent`]); absent
-    /// when the requester holds none.
+    /// The requester's own jobserver fifo, which the job reads too when its sandbox can open it
+    /// (05_gateway.md "Parallelism inside a job"); absent when the requester was started by none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    cpu_parent: Option<String>,
+    parent_jobserver: Option<super::job_cpu::InheritedJobserver>,
 }
 
 /// The controller route that admitted an exec. The route is the authority for the gate class and
-/// the host-gate scope (05_gateway.md "Host CPU budget", 07_api.md "Capability split"): no request
+/// the host-gate scope (05_gateway.md "Classes", 07_api.md "Capability split"): no request
 /// field, environment value or caller claim selects it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -528,10 +528,9 @@ pub enum AdmissionSource {
 
 impl AdmissionSource {
     /// Whether this route may admit an exec of class in scope. A worker admits background,
-    /// interactive and either resident's work in the workspace sandbox and nothing else --
-    /// interactive buys a band and no token, and a resident holds no token, so neither claims
-    /// anything a worker may not -- and anything more is refused as the typed class-not-permitted
-    /// error, before any record, process or gateway request exists.
+    /// interactive and either resident's work in the workspace sandbox and nothing else -- none of
+    /// them claims anything a worker may not -- and anything more is refused as the typed
+    /// class-not-permitted error, before any record or process exists.
     pub fn admit(self, class: ExecClass, scope: ExecScope) -> Result<()> {
         match (self, class, scope) {
             (Self::Coordinator, _, _)
@@ -2805,7 +2804,7 @@ async fn answer(
                     build_volume,
                     exec,
                     source,
-                    request.cpu_parent,
+                    request.parent_jobserver,
                 )
                 .await?;
             if let Some(writer) = writer {
@@ -3516,7 +3515,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             build_volume,
             request,
             source,
-            cpu_parent,
+            parent_jobserver,
             reply,
         } => {
             forward_exec(
@@ -3526,7 +3525,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 build_volume,
                 *request,
                 source,
-                cpu_parent,
+                parent_jobserver,
                 reply,
             )
             .await;
@@ -3786,7 +3785,7 @@ async fn forward_exec(
     build_volume: Option<PathBuf>,
     request: ExecRequest,
     source: AdmissionSource,
-    cpu_parent: Option<String>,
+    parent_jobserver: Option<super::job_cpu::InheritedJobserver>,
     reply: oneshot::Sender<Result<JobId>>,
 ) {
     let (stdin, payload, stream) = match request.stdin {
@@ -3822,7 +3821,7 @@ async fn forward_exec(
             class: request.class,
             want: request.want,
             scope: request.scope,
-            cpu_parent,
+            parent_jobserver,
         }),
     };
     let admitted = call::<JobId>(path, &authority, call_request, payload).await;

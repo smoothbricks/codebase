@@ -1070,7 +1070,8 @@ store's APFS container, including files inside a different attached image, can w
 file descriptor can defer reclamation until its last close, so an unlink-only timer is not an end-to-end release timer.
 Background I/O priority (`IOPOL_THROTTLE`) prolongs that wait instead of shortening it: the freeing thread's own
 metadata reads are throttled with it, so the same free takes longer and holds the container's work longer. Cowshed
-instead frees at normal disk priority and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs per
+instead frees at normal disk priority, as everything it starts runs (05_gateway.md, "On macOS nothing cowshed starts is
+throttled for I/O"), and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs per
 cut**, then unlinks the empty file. The gateway's cleanup starts each entry at 1,024 runs and sizes each next cut by the
 time the one before it takes: past 100 ms (`CUT_TARGET`) the next cut is halved, down to 64 runs (`STEP_FLOOR`), and
 under 50 ms it is doubled, up to 1,024 (`next_cut`), so a cut that holds the container long is followed by smaller ones.

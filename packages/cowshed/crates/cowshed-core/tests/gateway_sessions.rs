@@ -148,14 +148,6 @@ struct FakeControl {
 
 #[async_trait]
 impl GatewayControl for FakeControl {
-    async fn gates_in_flight(
-        &self,
-    ) -> std::result::Result<
-        std::collections::BTreeSet<cowshed_core::api::dto::GateJobRef>,
-        GatewayStatusError,
-    > {
-        Ok(std::collections::BTreeSet::new())
-    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.status
             .lock()
@@ -968,14 +960,6 @@ impl FencedGateway {
 
 #[async_trait]
 impl GatewayControl for FencedGateway {
-    async fn gates_in_flight(
-        &self,
-    ) -> std::result::Result<
-        std::collections::BTreeSet<cowshed_core::api::dto::GateJobRef>,
-        GatewayStatusError,
-    > {
-        Ok(std::collections::BTreeSet::new())
-    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.status_read.store(true, Ordering::SeqCst);
         Ok(status(

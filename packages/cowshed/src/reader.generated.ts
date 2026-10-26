@@ -42,17 +42,10 @@ type ReaderName =
   | 'CHARGED_MEMORY_USAGE'
   | 'CHECKPOINT_INFO'
   | 'CHECKPOINT_RESULT'
-  | 'CPU_BACKGROUND_STAKE'
-  | 'CPU_BUDGET_STATUS'
-  | 'CPU_CHECKOUT_STATUS'
-  | 'CPU_GATE_JOB'
-  | 'CPU_GATE_WAITER'
-  | 'CPU_HOLDER'
-  | 'CPU_PROBATION'
   | 'CPU_TOTALS'
-  | 'CPU_WAITER'
   | 'CREDENTIAL_REPORT'
   | 'CREDENTIAL_ROUTE'
+  | 'DARWIN_PRESSURE_LEVEL'
   | 'DATABASE_HOLDER'
   | 'DEFRAGMENT_RESULT'
   | 'DISK_COMMAND_EVENT'
@@ -85,21 +78,25 @@ type ReaderName =
   | 'FOLD_OUTCOME'
   | 'FOLD_OUTCOME__KEPT'
   | 'FOLD_OUTCOME__RETIRED'
-  | 'GATEWAY_CPU_BUDGET'
   | 'GATEWAY_STATUS'
   | 'GC_CANDIDATE'
   | 'GC_DEFERRED'
   | 'GC_REASON'
   | 'GC_REPORT'
   | 'GRANT_SET'
+  | 'HOST_JOBS'
   | 'HOST_LOAD_SAMPLE'
+  | 'HOST_READINGS'
+  | 'HOST_SCHEDULING'
   | 'IDENTITY_REPORT'
+  | 'IMAGE_CLEANUP'
   | 'JOB_ACCOUNTING'
   | 'JOB_ACCOUNTING__LINUX_CGROUP_V2'
   | 'JOB_ACCOUNTING__MAC_OS_RUSAGE_CHILDREN'
   | 'JOB_CONTAINMENT'
   | 'JOB_CONTAINMENT__KERNEL'
   | 'JOB_CONTAINMENT__OBSERVED'
+  | 'JOB_COUNT'
   | 'JOB_FAILURE'
   | 'JOB_INFO_REF'
   | 'JOB_JOURNAL_CURSOR'
@@ -149,6 +146,10 @@ type ReaderName =
   | 'LAND_SEED__UNCHANGED'
   | 'LAND_TURN_QUEUE'
   | 'LEAF'
+  | 'LOAD_AVERAGES'
+  | 'LOAD_READING'
+  | 'LOAD_READING__READ'
+  | 'LOAD_READING__UNREAD'
   | 'LOCK_CUSTODY'
   | 'LOCK_DESCRIPTOR'
   | 'LOCK_HOLDER'
@@ -157,6 +158,12 @@ type ReaderName =
   | 'LOCK_OBSERVATION'
   | 'LOCK_OPERATION'
   | 'LOGS_CHUNK'
+  | 'MEMORY_PRESSURE'
+  | 'MEMORY_PRESSURE_READING'
+  | 'MEMORY_PRESSURE_READING__READ'
+  | 'MEMORY_PRESSURE_READING__UNREAD'
+  | 'MEMORY_PRESSURE__DARWIN'
+  | 'MEMORY_PRESSURE__PSI'
   | 'MIRROR_INFO'
   | 'MOUNT_RESULT'
   | 'NX_STATE_CLEAR_RESULT'
@@ -231,12 +238,6 @@ type ReaderName =
   | 'SEQ__BUILD_STATE_LINK'
   | 'SEQ__CACHE_MISS'
   | 'SEQ__CHECKPOINT_INFO'
-  | 'SEQ__CPU_BACKGROUND_STAKE'
-  | 'SEQ__CPU_CHECKOUT_STATUS'
-  | 'SEQ__CPU_GATE_JOB'
-  | 'SEQ__CPU_GATE_WAITER'
-  | 'SEQ__CPU_HOLDER'
-  | 'SEQ__CPU_WAITER'
   | 'SEQ__CREDENTIAL_ROUTE'
   | 'SEQ__DATABASE_HOLDER'
   | 'SEQ__EGRESS_RULE'
@@ -247,6 +248,7 @@ type ReaderName =
   | 'SEQ__FOLDED_WORKSPACE'
   | 'SEQ__GC_CANDIDATE'
   | 'SEQ__GC_DEFERRED'
+  | 'SEQ__JOB_COUNT'
   | 'SEQ__JOB_INFO_REF'
   | 'SEQ__JOB_PROCESS_SAMPLE'
   | 'SEQ__LAND_TURN_QUEUE'
@@ -265,6 +267,7 @@ type ReaderName =
   | 'SEQ__TICKET'
   | 'SEQ__TREE_HOLDER'
   | 'SEQ__TURN_EVENT'
+  | 'SEQ__UNANSWERED_SUPERVISOR'
   | 'SEQ__UNATTRIBUTED_CHECK'
   | 'SEQ__UNLANDED_PATH'
   | 'SEQ__UNPROVEN_WORKSPACE'
@@ -282,6 +285,10 @@ type ReaderName =
   | 'STORAGE_IO_TOTALS'
   | 'STREAM_INFO_REF'
   | 'SUPERVISOR_RECOVERY'
+  | 'SWAP_READING'
+  | 'SWAP_READING__READ'
+  | 'SWAP_READING__UNREAD'
+  | 'SWAP_USAGE_WIRE'
   | 'TAGGED_BYTES_ENCODING'
   | 'TAGGED_BYTES_REF'
   | 'TICKET'
@@ -290,6 +297,7 @@ type ReaderName =
   | 'TREE_HOLD_KIND'
   | 'TURN_EVENT'
   | 'TURN_EVENT_KIND'
+  | 'UNANSWERED_SUPERVISOR'
   | 'UNATTRIBUTED_CHECK'
   | 'UNATTRIBUTED_RUN'
   | 'UNATTRIBUTED_RUN__BEGAN_BEFORE_CHECK'
@@ -512,91 +520,11 @@ const READERS: Readers<ReaderName> = {
     ],
   },
   CHECKPOINT_RESULT: { kind: 'record', fields: [['label', 'LEAF']] },
-  CPU_BACKGROUND_STAKE: {
-    kind: 'record',
-    fields: [
-      ['checkout', 'LEAF'],
-      ['held', 'LEAF'],
-      ['holders', 'SEQ__CPU_HOLDER'],
-      ['waiters', 'SEQ__CPU_WAITER'],
-    ],
-  },
-  CPU_BUDGET_STATUS: {
-    kind: 'record',
-    fields: [
-      ['total', 'LEAF'],
-      ['held', 'LEAF'],
-      ['checkouts', 'SEQ__CPU_CHECKOUT_STATUS'],
-      ['gateJobs', 'SEQ__CPU_GATE_JOB'],
-      ['gateQueue', 'SEQ__CPU_GATE_WAITER'],
-      ['background', 'SEQ__CPU_BACKGROUND_STAKE'],
-      ['probation', 'CPU_PROBATION'],
-    ],
-  },
-  CPU_CHECKOUT_STATUS: {
-    kind: 'record',
-    fields: [
-      ['checkout', 'LEAF'],
-      ['held', 'LEAF'],
-      ['running', 'LEAF'],
-      ['waiting', 'LEAF'],
-    ],
-  },
-  CPU_GATE_JOB: {
-    kind: 'record',
-    fields: [
-      ['repository', 'LEAF'],
-      ['checkout', 'LEAF'],
-      ['job', 'LEAF'],
-      ['held', 'LEAF'],
-      ['holders', 'SEQ__CPU_HOLDER'],
-    ],
-  },
-  CPU_GATE_WAITER: {
-    kind: 'record',
-    fields: [
-      ['repository', 'LEAF'],
-      ['checkout', 'LEAF'],
-      ['job', 'LEAF'],
-      ['pid', 'LEAF'],
-      ['command', 'LEAF'],
-      ['want', 'LEAF'],
-      ['waitedMs', 'LEAF'],
-    ],
-  },
-  CPU_HOLDER: {
-    kind: 'record',
-    fields: [
-      ['pid', 'LEAF'],
-      ['command', 'LEAF'],
-      ['tokens', 'LEAF'],
-      ['want', 'LEAF'],
-      ['heldMs', 'LEAF'],
-    ],
-  },
-  CPU_PROBATION: {
-    kind: 'record',
-    fields: [
-      ['checkout', 'LEAF'],
-      ['pid', 'LEAF'],
-      ['command', 'LEAF'],
-      ['lentMs', 'LEAF'],
-    ],
-  },
   CPU_TOTALS: {
     kind: 'record',
     fields: [
       ['userUs', 'LEAF'],
       ['sysUs', 'LEAF'],
-    ],
-  },
-  CPU_WAITER: {
-    kind: 'record',
-    fields: [
-      ['pid', 'LEAF'],
-      ['command', 'LEAF'],
-      ['want', 'LEAF'],
-      ['waitedMs', 'LEAF'],
     ],
   },
   CREDENTIAL_REPORT: { kind: 'record', fields: [['routes', 'SEQ__CREDENTIAL_ROUTE']] },
@@ -608,6 +536,14 @@ const READERS: Readers<ReaderName> = {
       ['pathPrefixes', 'LEAF'],
       ['withheldEnvNames', 'LEAF'],
       ['installed', 'LEAF'],
+    ],
+  },
+  DARWIN_PRESSURE_LEVEL: {
+    kind: 'external',
+    arms: [
+      ['normal', 'LEAF'],
+      ['warning', 'LEAF'],
+      ['critical', 'LEAF'],
     ],
   },
   DATABASE_HOLDER: {
@@ -800,13 +736,6 @@ const READERS: Readers<ReaderName> = {
   },
   FOLD_OUTCOME__KEPT: { kind: 'record', fields: [['reason', 'FOLD_KEPT']] },
   FOLD_OUTCOME__RETIRED: { kind: 'record', fields: [] },
-  GATEWAY_CPU_BUDGET: {
-    kind: 'external',
-    arms: [
-      ['ledger', 'CPU_BUDGET_STATUS'],
-      ['unanswered', 'LEAF'],
-    ],
-  },
   GATEWAY_STATUS: {
     kind: 'record',
     fields: [
@@ -820,7 +749,7 @@ const READERS: Readers<ReaderName> = {
       ['healing', 'STARTUP_HEAL'],
       ['recovering', 'SUPERVISOR_RECOVERY'],
       ['staleDaemon', 'STALE_DAEMON_BINARY'],
-      ['cpuBudget', 'GATEWAY_CPU_BUDGET'],
+      ['scheduling', 'HOST_SCHEDULING'],
       ['pendingInstall', 'LEAF'],
       ['landTurns', 'SEQ__LAND_TURN_QUEUE'],
       ['landTurnsError', 'LEAF'],
@@ -887,11 +816,34 @@ const READERS: Readers<ReaderName> = {
       ['loopbackAny', 'LEAF'],
     ],
   },
+  HOST_JOBS: {
+    kind: 'record',
+    fields: [
+      ['counts', 'SEQ__JOB_COUNT'],
+      ['unanswered', 'SEQ__UNANSWERED_SUPERVISOR'],
+    ],
+  },
   HOST_LOAD_SAMPLE: {
     kind: 'record',
     fields: [
       ['load1', 'LEAF'],
       ['cores', 'LEAF'],
+    ],
+  },
+  HOST_READINGS: {
+    kind: 'record',
+    fields: [
+      ['load', 'LOAD_READING'],
+      ['memoryPressure', 'MEMORY_PRESSURE_READING'],
+      ['swap', 'SWAP_READING'],
+    ],
+  },
+  HOST_SCHEDULING: {
+    kind: 'record',
+    fields: [
+      ['readings', 'HOST_READINGS'],
+      ['jobs', 'HOST_JOBS'],
+      ['imageCleanup', 'IMAGE_CLEANUP'],
     ],
   },
   IDENTITY_REPORT: {
@@ -901,6 +853,13 @@ const READERS: Readers<ReaderName> = {
       ['added', 'LEAF'],
       ['identity', 'BOUND_IDENTITY'],
       ['identities', 'SEQ__BOUND_IDENTITY'],
+    ],
+  },
+  IMAGE_CLEANUP: {
+    kind: 'record',
+    fields: [
+      ['waiting', 'LEAF'],
+      ['unread', 'LEAF'],
     ],
   },
   JOB_ACCOUNTING: {
@@ -938,6 +897,14 @@ const READERS: Readers<ReaderName> = {
   },
   JOB_CONTAINMENT__KERNEL: { kind: 'record', fields: [] },
   JOB_CONTAINMENT__OBSERVED: { kind: 'record', fields: [['lost', 'SEQ__PROCESS_COVERAGE_GAP']] },
+  JOB_COUNT: {
+    kind: 'record',
+    fields: [
+      ['class', 'EXEC_CLASS'],
+      ['state', 'JOB_STATE'],
+      ['jobs', 'LEAF'],
+    ],
+  },
   JOB_FAILURE: {
     kind: 'external',
     arms: [
@@ -945,6 +912,7 @@ const READERS: Readers<ReaderName> = {
       ['supervisorLost', 'LEAF'],
       ['cpuAdmission', 'LEAF'],
       ['priority', 'LEAF'],
+      ['memory', 'LEAF'],
       ['unlaunched', 'LEAF'],
     ],
   },
@@ -973,7 +941,6 @@ const READERS: Readers<ReaderName> = {
       ['class', 'EXEC_CLASS'],
       ['scope', 'EXEC_SCOPE'],
       ['nice', 'LEAF'],
-      ['cpuTokens', 'LEAF'],
       ['containment', 'JOB_CONTAINMENT'],
       ['outlived', 'SEQ__OUTLIVED_PROCESS'],
       ['outlivedIncomplete', 'LEAF'],
@@ -1303,6 +1270,24 @@ const READERS: Readers<ReaderName> = {
     ],
   },
   LEAF: { kind: 'leaf' },
+  LOAD_AVERAGES: {
+    kind: 'record',
+    fields: [
+      ['one', 'LEAF'],
+      ['five', 'LEAF'],
+      ['fifteen', 'LEAF'],
+    ],
+  },
+  LOAD_READING: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['read', 'LOAD_READING__READ'],
+      ['unread', 'LOAD_READING__UNREAD'],
+    ],
+  },
+  LOAD_READING__READ: { kind: 'record', fields: [['load', 'LOAD_AVERAGES']] },
+  LOAD_READING__UNREAD: { kind: 'record', fields: [['error', 'LEAF']] },
   LOCK_CUSTODY: {
     kind: 'external',
     arms: [
@@ -1394,6 +1379,26 @@ const READERS: Readers<ReaderName> = {
       ['nextOffset', 'LEAF'],
     ],
   },
+  MEMORY_PRESSURE: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['darwin', 'MEMORY_PRESSURE__DARWIN'],
+      ['psi', 'MEMORY_PRESSURE__PSI'],
+    ],
+  },
+  MEMORY_PRESSURE_READING: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['read', 'MEMORY_PRESSURE_READING__READ'],
+      ['unread', 'MEMORY_PRESSURE_READING__UNREAD'],
+    ],
+  },
+  MEMORY_PRESSURE_READING__READ: { kind: 'record', fields: [['pressure', 'MEMORY_PRESSURE']] },
+  MEMORY_PRESSURE_READING__UNREAD: { kind: 'record', fields: [['error', 'LEAF']] },
+  MEMORY_PRESSURE__DARWIN: { kind: 'record', fields: [['level', 'DARWIN_PRESSURE_LEVEL']] },
+  MEMORY_PRESSURE__PSI: { kind: 'record', fields: [['someAvg10', 'LEAF']] },
   MIRROR_INFO: {
     kind: 'record',
     fields: [
@@ -1788,7 +1793,6 @@ const READERS: Readers<ReaderName> = {
       ['class', 'EXEC_CLASS'],
       ['scope', 'EXEC_SCOPE'],
       ['nice', 'LEAF'],
-      ['cpuTokens', 'LEAF'],
       ['containment', 'JOB_CONTAINMENT'],
       ['outlived', 'SEQ__OUTLIVED_PROCESS'],
       ['outlivedIncomplete', 'LEAF'],
@@ -1799,12 +1803,6 @@ const READERS: Readers<ReaderName> = {
   SEQ__BUILD_STATE_LINK: { kind: 'seq', element: 'BUILD_STATE_LINK' },
   SEQ__CACHE_MISS: { kind: 'seq', element: 'CACHE_MISS' },
   SEQ__CHECKPOINT_INFO: { kind: 'seq', element: 'CHECKPOINT_INFO' },
-  SEQ__CPU_BACKGROUND_STAKE: { kind: 'seq', element: 'CPU_BACKGROUND_STAKE' },
-  SEQ__CPU_CHECKOUT_STATUS: { kind: 'seq', element: 'CPU_CHECKOUT_STATUS' },
-  SEQ__CPU_GATE_JOB: { kind: 'seq', element: 'CPU_GATE_JOB' },
-  SEQ__CPU_GATE_WAITER: { kind: 'seq', element: 'CPU_GATE_WAITER' },
-  SEQ__CPU_HOLDER: { kind: 'seq', element: 'CPU_HOLDER' },
-  SEQ__CPU_WAITER: { kind: 'seq', element: 'CPU_WAITER' },
   SEQ__CREDENTIAL_ROUTE: { kind: 'seq', element: 'CREDENTIAL_ROUTE' },
   SEQ__DATABASE_HOLDER: { kind: 'seq', element: 'DATABASE_HOLDER' },
   SEQ__EGRESS_RULE: { kind: 'seq', element: 'EGRESS_RULE' },
@@ -1815,6 +1813,7 @@ const READERS: Readers<ReaderName> = {
   SEQ__FOLDED_WORKSPACE: { kind: 'seq', element: 'FOLDED_WORKSPACE' },
   SEQ__GC_CANDIDATE: { kind: 'seq', element: 'GC_CANDIDATE' },
   SEQ__GC_DEFERRED: { kind: 'seq', element: 'GC_DEFERRED' },
+  SEQ__JOB_COUNT: { kind: 'seq', element: 'JOB_COUNT' },
   SEQ__JOB_INFO_REF: { kind: 'seq', element: 'JOB_INFO_REF' },
   SEQ__JOB_PROCESS_SAMPLE: { kind: 'seq', element: 'JOB_PROCESS_SAMPLE' },
   SEQ__LAND_TURN_QUEUE: { kind: 'seq', element: 'LAND_TURN_QUEUE' },
@@ -1833,6 +1832,7 @@ const READERS: Readers<ReaderName> = {
   SEQ__TICKET: { kind: 'seq', element: 'TICKET' },
   SEQ__TREE_HOLDER: { kind: 'seq', element: 'TREE_HOLDER' },
   SEQ__TURN_EVENT: { kind: 'seq', element: 'TURN_EVENT' },
+  SEQ__UNANSWERED_SUPERVISOR: { kind: 'seq', element: 'UNANSWERED_SUPERVISOR' },
   SEQ__UNATTRIBUTED_CHECK: { kind: 'seq', element: 'UNATTRIBUTED_CHECK' },
   SEQ__UNLANDED_PATH: { kind: 'seq', element: 'UNLANDED_PATH' },
   SEQ__UNPROVEN_WORKSPACE: { kind: 'seq', element: 'UNPROVEN_WORKSPACE' },
@@ -1917,6 +1917,23 @@ const READERS: Readers<ReaderName> = {
     ],
   },
   SUPERVISOR_RECOVERY: { kind: 'record', fields: [['supervisors', 'LEAF']] },
+  SWAP_READING: {
+    kind: 'internal',
+    tag: 'kind',
+    arms: [
+      ['read', 'SWAP_READING__READ'],
+      ['unread', 'SWAP_READING__UNREAD'],
+    ],
+  },
+  SWAP_READING__READ: { kind: 'record', fields: [['swap', 'SWAP_USAGE_WIRE']] },
+  SWAP_READING__UNREAD: { kind: 'record', fields: [['error', 'LEAF']] },
+  SWAP_USAGE_WIRE: {
+    kind: 'record',
+    fields: [
+      ['usedBytes', 'LEAF'],
+      ['totalBytes', 'LEAF'],
+    ],
+  },
   TAGGED_BYTES_ENCODING: {
     kind: 'external',
     arms: [
@@ -1983,6 +2000,13 @@ const READERS: Readers<ReaderName> = {
       ['taken', 'LEAF'],
       ['finished', 'LEAF'],
       ['abandoned', 'LEAF'],
+    ],
+  },
+  UNANSWERED_SUPERVISOR: {
+    kind: 'record',
+    fields: [
+      ['socket', 'LEAF'],
+      ['error', 'LEAF'],
     ],
   },
   UNATTRIBUTED_CHECK: {

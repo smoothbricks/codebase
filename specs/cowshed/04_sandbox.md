@@ -160,19 +160,18 @@ writes — but cannot add a permission absent from the enclosing execution profi
 (allow file-read* file-read-data (literal "<actual installed cowshed binary>"))
 (allow process-exec (literal "<actual installed cowshed binary>"))
 (allow file-read-metadata … the stable name and ancestor literals …)
-;; The workspace's CPU pool directory, <store>/run/cpu/<incarnation>: connect to a
-;; pool socket, and read and write the make jobserver FIFO beside it (05_gateway.md,
-;; "Cargo reads its holder's jobserver"); never list the directory or open anything
-;; else there. It lies under the store deny above, so these rules follow that deny
-;; and the mount-root deny: SBPL is last-match-wins, and emitted before them the
-;; denies re-denied the FIFO's open with EPERM, so every sandboxed Cargo ran without
-;; its jobserver, outside the CPU budget. The profile is rendered per workspace, not
-;; per job, so the scope is the workspace's pool directory, never one job's fifo.
+;; The workspace's CPU pool directory, <store>/run/cpu/<incarnation>: read and write
+;; its jobs' make jobserver FIFOs (05_gateway.md, "Cargo reads its holder's
+;; jobserver"); never list the directory or open anything else there. It lies
+;; under the store deny above, so these rules follow that deny and the mount-root
+;; deny: SBPL is last-match-wins, and emitted before them the denies re-denied the
+;; FIFO's open with EPERM, so every sandboxed Cargo ran without its jobserver. The
+;; profile is rendered per workspace, not per job, so the scope is the workspace's
+;; pool directory, never one job's fifo.
 ;; Ancestors and entries resolve by metadata only: neither the directory nor
 ;; run/cpu, which holds every sibling workspace's pool directory, is listable.
 (allow file-read-metadata … the pool directory's ancestor literals …)
 (allow file-read-metadata (subpath "<cpu pool dir>"))
-(allow network-outbound (remote unix-socket (path-prefix "<cpu pool dir>/")))
 (allow file-read-data file-write-data
   (require-all (subpath "<cpu pool dir>") (vnode-type FIFO)))
 ;; All other HOME carve-backs come only from detected capabilities' contributions
@@ -1110,46 +1109,46 @@ starting one; the patched Nx's `NX_DAEMON_START=never` is that setting, and ever
 supervisor therefore keeps that daemon alive itself. At start, and every 5 s while it admits jobs, it probes the record:
 present, its process alive, its socket accepting. When the probe fails while the shed is in use (below) it runs
 `node <project>/node_modules/nx/dist/src/daemon/server/start.js --kept` as one read-write resident maintenance job, at
-most one at a time: the daemon answers clients that hold their own CPU tokens and is idle between them, so it holds none
-(05_gateway.md, "A resident holds no token") and keeping it costs the shed none of its share of the host. The foreground
-process stays owned by that job's real birth and group and keeps its shared build-volume hold for its lifetime
-(16_build_volumes.md, "The Nx daemon stays on"). The process that starts a daemon owns its restart. The supervisor's own
-start is no use: a supervisor that runs no job and holds no session starts no daemon. A supervisor starts for reasons
-that run nothing on the mount, such as a failed `rm` that restores its workspace (02_workspaces.md). Measured
-2026-10-21: such a supervisor launched a daemon at once, and the next `rm` was refused naming the daemon's launch
-processes, which no record named yet, so every retry started another. A job's admission and a named session's opening
-are use at that moment, and the keeper probes at once: a job that ends between two probes is still use, and the daemon
-starts alongside the first command rather than up to a probe interval after it. A daemon the keeper started stops,
-rather than restarts, when its installation changes (a root lockfile or a linked plugin, the patched Nx's validity
-checks); the keeper starts its successor. `--kept` is how the keeper says so: a successor the old daemon spawned itself
-would run outside the job, and a land skips adopting a volume whose daemon its ledger cannot prove (16_build_volumes.md,
-Land step 4), discarding the gate's whole cache for an ordinary plugin rebuild. A daemon a client started outside a
-keeper, such as main's host daemon, keeps restarting itself, since no keeper would. In a shed whose shell is activated,
-`node` is the one that shell declares (15_capabilities.md, "Bootstrap executables"); in one without, it is the `node`
-`execvp` would find on the job's own bootstrap PATH (the capability `tools/bin` links, the workspace's `.cowshed/bin`,
-the system directories), run by its absolute path. A start that cannot run — no executable `node` anywhere on that PATH
-(`ENOENT`, or `EACCES` when one exists but cannot execute) — admits no job and is named on the supervisor's stderr when
-its reason changes; each probe repeats the lookup (`stat`s only), and the first that finds a `node` starts it. A lookup
-that cannot tell (a directory it may not read) runs `node`, bounded below. A daemon that served and then stopped — idle,
-or a kept daemon that stopped for its successor — is followed by a successor at the next probe and is no failure. Any
-other failed start (its job ended, or was refused admission, with no daemon live and none seen live while it ran) is
-reported there too and tried again at the next probe, at most 3 in a row: an exit status cannot classify it, since
-`sandbox-exec` exits 71 both for an `execvp` it could not make and for a child that exited 71. After 3 the keeper starts
-none for 60 s, then one; each further failure doubles the pause, up to 15 min. So a failure that does not clear costs at
-most 3 starts and then one per pause, and never halts the keeper: a halted keeper would leave every host client to start
-its own daemon outside the sandbox. A daemon found live, whoever started it, ends the pause and resets it to 60 s. Each
-change of pause is said on the supervisor's stderr with its failures, its length and the cap, and the supervisor answers
-the refusal or the pause (failures, time left, length, cap) to whoever asks the keeper's state. A lifecycle verb about
-to take its census of the mount stops the keeper's starts first and ends the start it has in flight unless that start's
-daemon is live (02_workspaces.md, "Holders cowshed does not run"); the keeper then answers `Stopped`, says so once on
-stderr, and counts the ended start as no failure, until the shed's next job or named session resumes it. A stop of an
-idle shed's live daemon that fails is likewise tried at most 3 times in a row, and again only after a probe finds it
-gone. A host client finds the daemon through the shared record and connects to it instead of starting one outside the
-sandbox. Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon is the host's. A fork
-deletes the record from the build volume; a land deletes the landing workspace's and gives the adopted volume the
-target's record of a live unsandboxed daemon in its place (16_build_volumes.md). A repository shell that exports either
-directory unconditionally replaces the checkout's, like any export, and splits the state again; a repository shell that
-sets them keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
+most one at a time: the daemon is idle between the clients it answers, so as a resident (05_gateway.md, "Classes")
+keeping it costs the host nothing while it waits. The foreground process stays owned by that job's real birth and group
+and keeps its shared build-volume hold for its lifetime (16_build_volumes.md, "The Nx daemon stays on"). The process
+that starts a daemon owns its restart. The supervisor's own start is no use: a supervisor that runs no job and holds no
+session starts no daemon. A supervisor starts for reasons that run nothing on the mount, such as a failed `rm` that
+restores its workspace (02_workspaces.md). Measured 2026-10-21: such a supervisor launched a daemon at once, and the
+next `rm` was refused naming the daemon's launch processes, which no record named yet, so every retry started another. A
+job's admission and a named session's opening are use at that moment, and the keeper probes at once: a job that ends
+between two probes is still use, and the daemon starts alongside the first command rather than up to a probe interval
+after it. A daemon the keeper started stops, rather than restarts, when its installation changes (a root lockfile or a
+linked plugin, the patched Nx's validity checks); the keeper starts its successor. `--kept` is how the keeper says so: a
+successor the old daemon spawned itself would run outside the job, and a land skips adopting a volume whose daemon its
+ledger cannot prove (16_build_volumes.md, Land step 4), discarding the gate's whole cache for an ordinary plugin
+rebuild. A daemon a client started outside a keeper, such as main's host daemon, keeps restarting itself, since no
+keeper would. In a shed whose shell is activated, `node` is the one that shell declares (15_capabilities.md, "Bootstrap
+executables"); in one without, it is the `node` `execvp` would find on the job's own bootstrap PATH (the capability
+`tools/bin` links, the workspace's `.cowshed/bin`, the system directories), run by its absolute path. A start that
+cannot run — no executable `node` anywhere on that PATH (`ENOENT`, or `EACCES` when one exists but cannot execute) —
+admits no job and is named on the supervisor's stderr when its reason changes; each probe repeats the lookup (`stat`s
+only), and the first that finds a `node` starts it. A lookup that cannot tell (a directory it may not read) runs `node`,
+bounded below. A daemon that served and then stopped — idle, or a kept daemon that stopped for its successor — is
+followed by a successor at the next probe and is no failure. Any other failed start (its job ended, or was refused
+admission, with no daemon live and none seen live while it ran) is reported there too and tried again at the next probe,
+at most 3 in a row: an exit status cannot classify it, since `sandbox-exec` exits 71 both for an `execvp` it could not
+make and for a child that exited 71. After 3 the keeper starts none for 60 s, then one; each further failure doubles the
+pause, up to 15 min. So a failure that does not clear costs at most 3 starts and then one per pause, and never halts the
+keeper: a halted keeper would leave every host client to start its own daemon outside the sandbox. A daemon found live,
+whoever started it, ends the pause and resets it to 60 s. Each change of pause is said on the supervisor's stderr with
+its failures, its length and the cap, and the supervisor answers the refusal or the pause (failures, time left, length,
+cap) to whoever asks the keeper's state. A lifecycle verb about to take its census of the mount stops the keeper's
+starts first and ends the start it has in flight unless that start's daemon is live (02_workspaces.md, "Holders cowshed
+does not run"); the keeper then answers `Stopped`, says so once on stderr, and counts the ended start as no failure,
+until the shed's next job or named session resumes it. A stop of an idle shed's live daemon that fails is likewise tried
+at most 3 times in a row, and again only after a probe finds it gone. A host client finds the daemon through the shared
+record and connects to it instead of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the
+operator's checkout, and its daemon is the host's. A fork deletes the record from the build volume; a land deletes the
+landing workspace's and gives the adopted volume the target's record of a live unsandboxed daemon in its place
+(16_build_volumes.md). A repository shell that exports either directory unconditionally replaces the checkout's, like
+any export, and splits the state again; a repository shell that sets them keeps a value already present
+(`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
 
 A kept daemon costs its host a resident Node process (about 0.65 GB RSS in a 56-project consumer's shed, its plugins
 loaded in it rather than in workers) and a file watcher that recomputes the project graph on every change in the tree,
@@ -1391,11 +1390,11 @@ beside the code they pin: `cowshed-core`'s Seatbelt tests execute supervisor and
 `/usr/bin/sandbox-exec` (protected job artifacts refuse writes, hardlinks and parent replacement), and the
 host-controller probes in `cowshed-core/tests/devenv_runtime_dir.rs` exercise Unix sockets outside the workspace tree, a
 proxy bypass to unallocated loopback ports, private-environment symlinks that try to redirect host preparation, and the
-CPU pool directory behind a protected-root deny, whose jobserver fifo and pool socket open while a regular file there
-and both directory listings stay refused. `cowshed-core`'s `no_allow_precedes_a_deny_that_covers_it` renders every role
-with a pool directory, a store socket and a store temp dir and fails on any allow a later deny of an overlapping file
-operation covers. The list below is the corpus on Seatbelt and Landlock; each category requires denial and
-untouched-artifact assertions:
+CPU pool directory behind a protected-root deny, whose jobserver fifo opens while a regular file there and both
+directory listings stay refused. `cowshed-core`'s `no_allow_precedes_a_deny_that_covers_it` renders every role with a
+pool directory, a store socket and a store temp dir and fails on any allow a later deny of an overlapping file operation
+covers. The list below is the corpus on Seatbelt and Landlock; each category requires denial and untouched-artifact
+assertions:
 
 - write outside granted roots (absolute, relative, `..`-traversal, symlink pivot, hardlink);
 - read `~/.ssh`, `~/.aws`, Keychains, any `/private/cowshed/store` path outside the carve-backs (grant files, CA keys,

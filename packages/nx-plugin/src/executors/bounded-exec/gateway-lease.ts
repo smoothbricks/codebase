@@ -1,9 +1,9 @@
 import { connect } from 'node:net';
 
 /**
- * The client half of a lease held on the cowshed gateway's control socket: the host
- * disk-lifecycle lease (`disk-lease.ts`) and the host CPU budget (`cpu-tokens.ts`) speak the same
- * protocol (specs/cowshed/05_gateway.md, "Disk-lifecycle lease" and "Host CPU budget").
+ * The client half of a lease held on a unix socket: the gateway's host disk-lifecycle lease
+ * (`disk-lease.ts`) and a parent's CPU pool (`cpu-pool.ts`) speak the same protocol
+ * (specs/cowshed/05_gateway.md, "Disk-lifecycle lease").
  *
  * The client writes one request line and keeps the connection open without half-closing it. The
  * gateway answers `queued` at once and `granted` when the lease is the client's, and the lease
@@ -26,37 +26,13 @@ export interface LeaseBounds {
 
 /**
  * Why a lease is not held: no gateway listens, the gateway predates this kind of lease, the gateway
- * knows the lease but predates a field the request names (it refuses the field at once), an install
- * restarted the gateway while the ask was queued (`install-restart`), or any other refusal, silence
- * or breakage.
+ * knows the lease but predates a field the request names (it refuses the field at once), or any
+ * other refusal, silence or breakage.
  */
-export type UnleasedCause = 'absent' | 'predates' | 'predates-field' | 'other' | 'install-restart';
+export type UnleasedCause = 'absent' | 'predates' | 'predates-field' | 'other';
 
-type PlainCause = Exclude<UnleasedCause, 'install-restart'>;
-
-/** The code of the one answer a gateway sends a cut-off ask before it closes the connection. */
-export const INSTALL_RESTART_CODE = 'install-restart';
-
-/**
- * The install that restarted the gateway and cut a queued ask off: its pid, the binary it runs, and
- * how long, in ms, the gateway it starts is bound to serve within (05_gateway.md, "A queued CPU ask outlives an install").
- */
-export interface InstallRestart {
-  pid: number;
-  binary: string;
-  servesWithinMs: number;
-}
-
-/** A refusal: the lease is not held, and why. `install-restart` names the install that cut the ask off. */
-export type Unleased =
-  | { granted: false; cause: PlainCause; reason: string; code?: string }
-  | {
-      granted: false;
-      cause: 'install-restart';
-      reason: string;
-      code: typeof INSTALL_RESTART_CODE;
-      install: InstallRestart;
-    };
+/** A refusal: the lease is not held, and why. */
+export type Unleased = { granted: false; cause: UnleasedCause; reason: string; code?: string };
 
 /**
  * A granted lease with its `granted` answer, held until released, or why there is none. `closed`
@@ -67,25 +43,9 @@ export type HeldLease =
   | { granted: true; answer: Readonly<Record<string, unknown>>; release: () => void; closed: Promise<void> }
   | Unleased;
 
-const isCount = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-
-/** The `install` an `install-restart` answer names, or `null` when it does not name a whole install. */
-function parseInstallRestart(value: unknown): InstallRestart | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const fields: Readonly<Record<string, unknown>> = Object.fromEntries(Object.entries(value));
-  const { pid, binary, servesWithinMs } = fields;
-  if (!isCount(pid) || typeof binary !== 'string' || !isCount(servesWithinMs)) {
-    return null;
-  }
-  return { pid, binary, servesWithinMs };
-}
-
 /**
  * Ask the gateway at `socket` for the lease `request` names, `what` in its messages ("disk
- * leases", "the CPU budget"). A gateway from before one-line requests says nothing until it reads
+ * leases", "the parent CPU pool"). A gateway from before one-line requests says nothing until it reads
  * EOF, so a request not queued within `ackMs` is half-closed and that gateway's refusal read; a
  * gateway that reads the line but does not know the operation refuses it at once. Both predate the
  * lease.
@@ -103,7 +63,7 @@ export function holdLease(
   const promise = new Promise<HeldLease>((settled) => {
     resolve = settled;
   });
-  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a unix-socket connect completes or fails at once; the request's ack is bounded by bounds.ackMs and then bounds.afterCloseMs, and a queued lease's grant by bounds.grantMs, or by nothing for CPU tokens, which have no admission deadline (05_gateway.md, "Host CPU budget")
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a unix-socket connect completes or fails at once; the request's ack is bounded by bounds.ackMs and then bounds.afterCloseMs, and a queued lease's grant by bounds.grantMs, or, for a parent CPU pool's grant (grantMs null), by its siblings returning their tokens
   const connection = connect(socket);
   // `closed` is made when a consumer reads it, so a lease nobody watches allocates no promise. The
   // flag, not `connection.destroyed`, says the socket really closed: `destroy()` sets that flag before
@@ -124,7 +84,7 @@ export function holdLease(
     }
     resolve(outcome);
   };
-  const unleased = (reason: string, cause: PlainCause = 'other', code?: string) =>
+  const unleased = (reason: string, cause: UnleasedCause = 'other', code?: string) =>
     settle({ granted: false, cause, reason, ...(code === undefined ? {} : { code }) });
   const wait = (ms: number, onExpiry: () => void) => {
     clearTimeout(timer);
@@ -135,11 +95,11 @@ export function holdLease(
     try {
       parsed = JSON.parse(line);
     } catch {
-      unleased(`the gateway answered something that is not an answer: ${line}`);
+      unleased(`the lease endpoint ${socket} answered something that is not an answer: ${line}`);
       return;
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      unleased(`the gateway answered something that is not an answer: ${line}`);
+      unleased(`the lease endpoint ${socket} answered something that is not an answer: ${line}`);
       return;
     }
     const fields: Readonly<Record<string, unknown>> = Object.fromEntries(Object.entries(parsed));
@@ -147,39 +107,25 @@ export function holdLease(
     if (fields.ok !== true) {
       const error = String(fields.error ?? '');
       const why = `${String(fields.code ?? 'refused')}: ${error}`;
-      if (fields.code === INSTALL_RESTART_CODE) {
-        const install = parseInstallRestart(fields.install);
-        if (install === null) {
-          unleased(
-            `the gateway refused the lease (${why}; the install it names is malformed: ${fields.install === undefined ? 'missing' : JSON.stringify(fields.install)})`,
-            'other',
-            INSTALL_RESTART_CODE,
-          );
-        } else {
-          settle({
-            granted: false,
-            cause: 'install-restart',
-            reason: `the gateway refused the lease (${why})`,
-            code: INSTALL_RESTART_CODE,
-            install,
-          });
-        }
-      } else if (state === 'half-closed' || error.endsWith('unknown gateway control operation')) {
-        unleased(`the gateway predates ${what} (${why}); restart it with \`cowshed setup\``, 'predates');
+      if (state === 'half-closed' || error.endsWith('unknown gateway control operation')) {
+        unleased(
+          `the lease endpoint ${socket} predates ${what} (${why}); restart it with \`cowshed setup\``,
+          'predates',
+        );
       } else if (error.endsWith('contains an unknown field')) {
         unleased(
-          `the gateway predates a field of ${what} (${why}); restart it with \`cowshed setup\``,
+          `the lease endpoint ${socket} predates a field of ${what} (${why}); restart it with \`cowshed setup\``,
           'predates-field',
         );
       } else {
         unleased(
-          `the gateway refused the lease (${why})`,
+          `the lease endpoint ${socket} refused the lease (${why})`,
           'other',
           typeof fields.code === 'string' ? fields.code : undefined,
         );
       }
     } else if (state === 'half-closed') {
-      unleased('the gateway did not queue the request in time; it is alive but overloaded');
+      unleased(`the lease endpoint ${socket} did not queue the request in time; it is alive but overloaded`);
     } else if (state === 'asked' && lease === 'queued') {
       state = 'queued';
       onQueued?.();
@@ -187,7 +133,7 @@ export function holdLease(
       if (grantMs === null) {
         clearTimeout(timer);
       } else {
-        wait(grantMs, () => unleased(`the gateway granted nothing within ${grantMs} ms`));
+        wait(grantMs, () => unleased(`the lease endpoint ${socket} granted nothing within ${grantMs} ms`));
       }
     } else if (state === 'queued' && lease === 'granted') {
       settle({
@@ -203,7 +149,7 @@ export function holdLease(
         },
       });
     } else {
-      unleased(`the gateway answered out of turn: ${line}`);
+      unleased(`the lease endpoint ${socket} answered out of turn: ${line}`);
     }
   };
   connection.on('connect', () => {
@@ -212,7 +158,7 @@ export function holdLease(
     wait(bounds.ackMs, () => {
       state = 'half-closed';
       connection.end();
-      wait(bounds.afterCloseMs, () => unleased('the gateway answered nothing'));
+      wait(bounds.afterCloseMs, () => unleased(`the lease endpoint ${socket} answered nothing`));
     });
   });
   connection.on('data', (chunk: Buffer) => {
@@ -225,14 +171,14 @@ export function holdLease(
   });
   connection.on('error', (error) => {
     if (state === 'connecting') {
-      unleased(`the gateway's control socket ${socket} does not answer (${error.message})`, 'absent');
+      unleased(`nothing answers for ${what} at ${socket} (${error.message})`, 'absent');
     } else {
       unleased(error.message);
     }
   });
   connection.on('close', () => {
     socketClosed = true;
-    unleased('the gateway closed the lease connection');
+    unleased(`the lease connection for ${what} at ${socket} closed`);
   });
   return promise;
 }

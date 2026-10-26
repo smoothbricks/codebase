@@ -254,15 +254,15 @@ counters remain UnreadFinalUsage, never zeroes, and cannot replace identity, anc
 A whole job's membership read, exit watch and signal take the same public reads. The job-groups proof holds a
 setuid-root `top` in a test-owned group: its membership record names root's effective uid, and its exact life is watched
 and ended by SIGTERM. The combined read refused that member with EPERM, and with it the retirement of a job whose leader
-exited while Nx's setuid `ps` ran: the job stayed draining with its CPU tokens and its client never saw its end.
+exited while Nx's setuid `ps` ran: the job stayed draining and its client never saw its end.
 
 A refusal that still happens must end the client, not hang it. The host-controller lane's
 `host_controller_a_refused_retirement_answers_its_client_and_its_survivors_exits_conclude_it` runs a real supervisor job
 whose member runs `lsof` as root through `sudo -n`. lsof's real uid is root's, so the kernel refuses retirement's signal
 to it with EPERM when the leader exits; SIGTERM is ignored so sudo neither ends nor relays it before that refusal. The
-parked `wait` and stdout follower both get that refusal, the job stays draining with its tokens and its hold, and once
-the test closes the file lsof watches, their exits re-run the retirement, which seals the job and returns its tokens. It
-needs the same passwordless sudo grant for `/usr/sbin/lsof`.
+parked `wait` and stdout follower both get that refusal, the job stays draining with its hold, and once the test closes
+the file lsof watches, their exits re-run the retirement, which seals the job. It needs the same passwordless sudo grant
+for `/usr/sbin/lsof`.
 
 The exit-watch fallback is proven on the real kernel in the ordinary lane: registering launchd (pid 1, which no user may
 SIGKILL) yields the withheld watch and the observer's own child the status watch. A scripted withheld exit folds no
@@ -533,24 +533,6 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   metadata, grant/CA, and `.restore.json` facts; converge idempotently; accept only the corresponding token/incarnation;
   and leave no `.restore-fences`, runtime journal, or second mutable fact (the restore audit record may be emitted more
   than once across retries — it gates nothing).
-- **CPU admission bound**: over any generated host size and sequence of background asks, gate asks and departures on the
-  gateway's host ledger, no background request is passed by more than `(k + 1)·⌊N/2⌋` later background grants, k the
-  requests of its checkout queued ahead of it when it asked (05_gateway.md, "No background request is passed over
-  without bound"); gate-class grants are not counted.
-- **CPU admission is work-conserving**: over the same generated sequences, with no gate-class request holding or waiting
-  a token stays free while background waits only when two or more checkouts wait and a waiting request wants more than
-  the free tokens; a gate-class request never waits beside a free token; and beside gate work background is granted
-  `min(want, free)` while no eligible gate-class request waits, with no one-token clamp (05_gateway.md, "Room for a
-  gate", the owner's rulings, 2026-10-22 and 2026-10-26).
-- **Gate-class order, table-driven**: rows of host size, background held before a gate, the gate's tokens and a
-  newcomer's want give the newcomer's grant: `min(want, free)` while no eligible gate-class request waits, the waiting
-  gate's want first while one does, and the one-token floor for a starved checkout or a younger repository's head while
-  the work behind the oldest gate job holds under half the host; rows of returned tokens give the oldest eligible
-  gate-class request the tokens it asks for before any background; rows of gate requests by repository give each its
-  answer (run now, or wait naming the gate job heading its repository) and the transition that releases it; rows of
-  queued asks give each its typed cause (`repository-gate` or `tokens`) (05_gateway.md, "One gate per repository", "Room
-  for a gate"). Over the socket, a released image nudged while a land's gate holds tokens is freed with the gate still
-  holding (05_gateway.md, "Deleting released images").
 
 ## Integration tests (real substrate)
 
@@ -673,23 +655,12 @@ unchanged (16_build_volumes.md, "Targets and seeds"). The native build-volume ho
 `--nocapture --quiet` so inherited single-thread libtest formatting cannot prefix its actual-PID record. Its
 kernel-holder, forced-release diagnostics, checkout-label ownership and reclamation assertions remain exact.
 
-The holder's configuration is proved against the gateway's own contract over its real control socket, with no Cargo and
-no compile (`cowshed-gateway`'s `tests/jobserver_fifo.rs`). A reader standing in for Cargo takes and writes back fifo
-bytes as Cargo's jobserver client does. A job grant asked as the supervisor asks it (`pool: true`) names a `0600` fifo
-beside its pool socket holding exactly `g − 1` bytes (none for `g = 1`). The pool's socket lends the fifo's bytes first
-and the holder's own token last: a one-token pool lends its implicit token to a socket child; while the reader holds a
-larger pool's bytes, the next child waits and is granted once the reader writes them back. A closed child's tokens reach
-the child waiting behind it, the fifo holds `g − 1` bytes again once every child has closed and never more, and the host
-ledger holds the job's `g` alone throughout. `CpuPlacement::environment`'s unit tests in `cowshed-core`'s supervisor
-hold what a job's command receives: `CARGO_MAKEFLAGS`/`MAKEFLAGS` naming the held fifo, `RUST_TEST_THREADS` and
-`NEXTEST_TEST_THREADS` at `g` unless the caller named them, and for a resident its pool, a zero count and no jobserver.
-How Cargo reads a jobserver is Cargo's own to test; an end-to-end proof with real Cargo belongs in a nightly, not the
-gate. A test whose jobs only its fixture gateway's ledger may budget runs as a requester holding no pool: the controller
-runs in the test's process, and an exec from a holder also waits on the holder's pool (05_gateway.md, "Work a holder
-starts draws on its grant"), so a test that inherits its runner's pool is testing that runner's grant. It runs its body
-again in a child test process without the pool markers, `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS`, rather than editing
-the environment of a process other tests may share. The `bounded-exec` executor suite likewise clears every inherited
-sizing variable for its own run, so a gate's grant to the suite's process is no ceiling on the runners its cases size.
+A job's jobserver is proved against its own contract with no Cargo and no compile: the supervisor's unit tests hold what
+a job's command receives — `CARGO_MAKEFLAGS`/`MAKEFLAGS` naming the job's own fifo, `BOUNDED_EXEC_CPU_TOKENS` and
+`RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS` at `g` unless the caller named them, a caller's own jobserver variables never
+passed — and a fifo of `g − 1` bytes. How Cargo reads a jobserver is Cargo's own to test; an end-to-end proof with real
+Cargo belongs in a nightly, not the gate. The `bounded-exec` executor suite clears every inherited sizing variable for
+its own run, so the count of the job that runs the suite is no ceiling on the runners its cases size.
 
 Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
 or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its
@@ -758,16 +729,17 @@ owns their package-scoped selection filters, and the code-time wrapper rules sel
 exceptions shards exclude those filters. The root `host-e2e` target depends on both groups and on
 `cowshed:host-napi-test`; the root `gate` target depends on every project's `lint`, `test` and `build` plus `host-e2e`.
 The land wrapper (`tooling/land-host.sh`) runs `nx run-many -t gate --parallel=$(sysctl -n hw.ncpu)` after rebasing and
-stopping the workspace's daemon. **The landing gate is never CPU-limited**: it runs at the core count, at default
-priority, with no `taskpolicy -b` and no outer deadline, because it is the run that moves main. Measured 2026-10-16: the
-same gate took 40 minutes capped at `--parallel=2` under `taskpolicy -b` and 4m44s uncapped, and two per-test timeouts
-that reproduced in every capped run did not reproduce once the cap was removed - the failures were the cap, not the
-tests. Exploratory runs are the ones that get limited, and they are limited by being stopped rather than by being niced.
-This reaches the same checks as naming the ordinary targets, both host groups and `cowshed:host-napi-test` explicitly,
-but Nx owns the target list. Ordinary `test` remains free of the expensive host groups and of that proof: Rule 2 keeps
-the inner loop cheap, while the explicit land gate includes host coverage and each proof replays from cache unless its
-own inputs changed. `nx run-many -t host-e2e` is the focused host proof. Every test has one runner, and non-macOS
-inference supplies neither APFS runner; package-declared placeholders and explicit dependency edges may remain.
+stopping the workspace's daemon. **The landing gate is never CPU-limited**: it runs at the core count, at gate class
+(05_gateway.md, "Classes"), with no QoS clamp, no I/O throttle and no outer deadline, because it is the run that moves
+main. Measured 2026-10-16: the same gate took 40 minutes capped at `--parallel=2` under `taskpolicy -b` and 4m44s
+uncapped, and two per-test timeouts that reproduced in every capped run did not reproduce once the cap was removed - the
+failures were the cap, not the tests. Exploratory runs are the ones that get limited, and they are limited by being
+stopped rather than by being niced. This reaches the same checks as naming the ordinary targets, both host groups and
+`cowshed:host-napi-test` explicitly, but Nx owns the target list. Ordinary `test` remains free of the expensive host
+groups and of that proof: Rule 2 keeps the inner loop cheap, while the explicit land gate includes host coverage and
+each proof replays from cache unless its own inputs changed. `nx run-many -t host-e2e` is the focused host proof. Every
+test has one runner, and non-macOS inference supplies neither APFS runner; package-declared placeholders and explicit
+dependency edges may remain.
 
 `cowshed:host-napi-test` is the built addon's host proof, run against this checkout's launcher and CLI binary, which is
 why it depends on `build`. `host.napi.test.ts` runs `openHost`: each host row answers what its verb prints, refusals are
@@ -801,15 +773,14 @@ without publishing them: the cache never blocks a land (05_gateway.md, "Publicat
 
 Every test target, the groups included, is bounded by progress alone: the run ends when the time since the last finished
 test reaches its configured `idleTimeoutMs` (`BOUNDED_TEST_IDLE_TIMEOUT_MS` in the plugin's test-target policy), and
-names the tests still running. Time a descendant reports its own work queued for host CPU tokens is not idle time and is
-not counted (05_gateway.md, "A queued descendant is not idle"). There is no count-multiplied outer wall-clock budget and
-no per-test bound kills a test: a Bun leg deletes Bun's own 5000 ms per-test deadline with `--timeout=0`, and no test
-carries one of its own (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries
-`--no-tests=fail`, so a filter that selects nothing fails rather than passing a run of no test. The RAM host walk and
-real-process CPU-pool production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing
-case bounds, and so do the Nx daemon proofs that apply their own Seatbelt profile (a refused daemon stop, a stopped
-FSEvents stream), which `sandbox_apply` refuses inside a cowshed job. The shards exclude `*-host.test.ts`; the host
-target names each owned host file.
+names the tests still running. There is no count-multiplied outer wall-clock budget and no per-test bound kills a test:
+a Bun leg deletes Bun's own 5000 ms per-test deadline with `--timeout=0`, and no test carries one of its own
+(`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a filter that
+selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
+production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds, and so do
+the Nx daemon proofs that apply their own Seatbelt profile (a refused daemon stop, a stopped FSEvents stream), which
+`sandbox_apply` refuses inside a cowshed job. The shards exclude `*-host.test.ts`; the host target names each owned host
+file.
 
 Drain fixtures read report publications on native directory-write events and await the serving task and resident's
 completion directly. CPU-admission holders announce readiness on stdout before blocking on their open stdin; consumers
@@ -882,8 +853,8 @@ force-kills the command and its group empties. On macOS the snapshot carries the
 
 Re-executed libtest fixture roles that report a line protocol use `--nocapture --quiet`. With an inherited
 `RUST_TEST_THREADS=1`, ordinary libtest output prefixes the first report with its unfinished test-name line; a reader
-waiting for a report at the start of a line then waits forever. Quiet formatting preserves the CPU grant and the exact
-report parser. The held-parent CPU and listening-group regressions must also pass under a one-token runner.
+waiting for a report at the start of a line then waits forever. Quiet formatting preserves the inherited count and the
+exact report parser. The held-parent CPU and listening-group regressions must also pass under a one-thread runner.
 
 Disk-child warning tests release an owned child after observing the required warnings rather than assuming a wall-clock
 sleep gave the waiter enough turns. Shell-pool tests observe release-time dirty-event processing before asserting that

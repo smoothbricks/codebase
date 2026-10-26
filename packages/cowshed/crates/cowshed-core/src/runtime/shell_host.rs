@@ -16,8 +16,7 @@
 //! The host stays outside the job's cgroup; a missing placement refuses the command. macOS
 //! instead carries its existing observation-ready and observation-go descriptors after stdio.
 //!
-//! A command's exchange: `REQUEST_RUN` or `REQUEST_SCRIPT`, then `REPLY_NICE_REFUSED` (a child that
-//! placed its own nice was refused it and never ran; the exchange ends) or `REPLY_STARTED`, any number of
+//! A command's exchange: `REQUEST_RUN` or `REQUEST_SCRIPT`, then `REPLY_STARTED`, any number of
 //! `REQUEST_SIGNAL`s, `REPLY_EXITED` once the command's leader exited, more `REQUEST_SIGNAL`s while
 //! its descendants run on, and `REQUEST_RELEASE` once the job concluded, answered by
 //! `REPLY_RELEASED`. Until the release the host holds the leader unreaped, so its group id names
@@ -36,7 +35,6 @@ use std::path::{Path, PathBuf};
 use super::job_groups::{Birth, GroupLeader};
 use super::process_tree::TreeOwner;
 use crate::api::dto::{ExitStatus, JobId};
-use crate::error::PriorityFailure;
 
 /// The argument that turns the `cowshed` binary into an exec host.
 pub const SHELL_HOST_ARGUMENT: &str = "--cowshed-shell-host";
@@ -58,12 +56,11 @@ pub const REQUEST_APPROVE: u8 = 1;
 /// Evaluate `.envrc` once: `[owner tag, job id only for Job, directory]`, descriptors `[stderr]`.
 /// See [`FrameWriter::tree_owner`]; the boundary rejects an unknown owner tag by name.
 pub const REQUEST_ACTIVATE: u8 = 2;
-/// Fork an argv into a new process group: `[argv, cwd, overlay, child nice]`, descriptors
+/// Fork an argv into a new process group: `[argv, cwd, overlay]`, descriptors
 /// `[stdin, stdout, stderr]`, followed on Linux by `[cgroup_placement]` and on macOS by
-/// `[observation_ready, observation_go]`. Linux enters the cgroup before exec. The child nice
-/// is [`FrameWriter::child_nice`].
+/// `[observation_ready, observation_go]`. Linux enters the cgroup before exec.
 pub const REQUEST_RUN: u8 = 3;
-/// Run a rendered script: `[text, bindings, cwd, overlay, child nice]`, descriptors `[stdin,
+/// Run a rendered script: `[text, bindings, cwd, overlay]`, descriptors `[stdin,
 /// stdout, stderr]`, followed on Linux by `[cgroup_placement]` and on macOS by
 /// `[observation_ready, observation_go]`. The host parses before it forks. The child enters
 /// its Linux cgroup immediately after fork, or waits at the macOS observation fence, then
@@ -110,10 +107,6 @@ pub const REPLY_HOST_FAILED: u8 = 8;
 pub const REPLY_RELEASED: u8 = 9;
 /// A `REQUEST_SIGNAL` could not be delivered to the command's group: `[signal, reason]`.
 pub const REPLY_SIGNAL_FAILED: u8 = 10;
-/// The forked command could not run at its nice and never ran: `[priority failure]`
-/// ([`FrameWriter::priority_failure`]). Sent instead of `REPLY_STARTED`/`REPLY_EXITED`; the
-/// host holds nothing and serves its next command.
-pub const REPLY_NICE_REFUSED: u8 = 11;
 
 /// A script binding's value kind on the wire.
 pub const BINDING_SCALAR: u8 = 0;
@@ -126,10 +119,6 @@ const BIRTH_UNOBSERVED: u32 = 1;
 /// An [`ExitStatus`]'s kind on the wire.
 const EXIT_CODE: u32 = 0;
 const EXIT_SIGNAL: u32 = 1;
-
-/// A command request's child nice on the wire ([`FrameWriter::child_nice`]).
-const CHILD_NICE_SUPERVISED: u32 = 0;
-const CHILD_NICE_SELF: u32 = 1;
 
 /// Activation ownership is a sum type, never a sentinel job id.
 const TREE_OWNER_JOB: u32 = 1;
@@ -201,28 +190,6 @@ impl FrameWriter {
             TreeOwner::Job(job_id) => self.u32(TREE_OWNER_JOB).u64(job_id.get()),
             TreeOwner::Spare => self.u32(TREE_OWNER_SPARE),
         }
-    }
-    /// A command request's last field: `[0]` when the supervisor sets the command's nice on the
-    /// held child through the observation fence (macOS), `[1, nice]` when the forked child sets
-    /// it itself before it runs anything ([`report_own_nice`]), because no hold exists to set it
-    /// through.
-    pub fn child_nice(self, nice: Option<i32>) -> Self {
-        match nice {
-            None => self.u32(CHILD_NICE_SUPERVISED),
-            Some(nice) => self.u32(CHILD_NICE_SELF).i32(nice),
-        }
-    }
-
-    /// `[pid, requested, observed kind, observed, errno kind, errno]`: kind 1 names an observed
-    /// value, kind 0 none (its value then 0). Nothing absent is filled in.
-    pub fn priority_failure(self, failure: &PriorityFailure) -> Self {
-        let optional = |frame: Self, value: Option<i32>| match value {
-            Some(value) => frame.u32(1).i32(value),
-            None => frame.u32(0).i32(0),
-        };
-        let frame = self.u32(failure.pid).i32(failure.requested);
-        let frame = optional(frame, failure.observed);
-        optional(frame, failure.errno)
     }
 
     pub fn u64(mut self, value: u64) -> Self {
@@ -331,31 +298,6 @@ impl<'a> FrameReader<'a> {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    /// [`FrameWriter::priority_failure`].
-    pub fn priority_failure(&mut self) -> io::Result<PriorityFailure> {
-        let pid = self.u32()?;
-        let requested = self.i32()?;
-        let observed = self.optional_i32()?;
-        let errno = self.optional_i32()?;
-        Ok(PriorityFailure {
-            pid,
-            requested,
-            observed,
-            errno,
-        })
-    }
-
-    fn optional_i32(&mut self) -> io::Result<Option<i32>> {
-        match (self.u32()?, self.i32()?) {
-            (0, 0) => Ok(None),
-            (1, value) => Ok(Some(value)),
-            (kind, value) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("malformed optional value (kind {kind}, value {value})"),
-            )),
-        }
-    }
-
     /// Decode ownership at the activation boundary; no numeric id denotes a spare.
     pub fn tree_owner(&mut self) -> io::Result<TreeOwner> {
         match self.u32()? {
@@ -372,17 +314,6 @@ impl<'a> FrameReader<'a> {
             tag => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown activation tree owner tag {tag}"),
-            )),
-        }
-    }
-    /// [`FrameWriter::child_nice`]: `None` when the supervisor places the held child itself.
-    pub fn child_nice(&mut self) -> io::Result<Option<i32>> {
-        match self.u32()? {
-            CHILD_NICE_SUPERVISED => Ok(None),
-            CHILD_NICE_SELF => self.i32().map(Some),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown child nice kind {other}"),
             )),
         }
     }
@@ -448,167 +379,16 @@ impl<'a> FrameReader<'a> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Child nice
+// Nice readback
 
 /// Clear this thread's `errno`: `getpriority` returns -1 for a nice of -1 as well as for an
-/// error, so only a cleared `errno` tells them apart. A plain store; async-signal-safe.
+/// error, so only a cleared `errno` tells them apart. A plain store; async-signal-safe. macOS
+/// only: Linux places no nice (its job cgroup carries the class).
+#[cfg(target_os = "macos")]
 pub(crate) fn clear_errno() {
     // SAFETY: the location is this thread's own errno.
-    #[cfg(target_os = "macos")]
     unsafe {
         *libc::__error() = 0;
-    }
-    // SAFETY: as above.
-    #[cfg(target_os = "linux")]
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
-}
-
-/// A nice report's outcome on its pipe ([`report_own_nice`]).
-const NICE_PLACED: u32 = 0;
-const NICE_SET_REFUSED: u32 = 1;
-const NICE_READ_REFUSED: u32 = 2;
-const NICE_MISMATCH: u32 = 3;
-/// `[outcome, pid, requested, observed, errno]`, each four little-endian bytes: within
-/// `PIPE_BUF`, so one write lands whole.
-const NICE_REPORT_BYTES: usize = 20;
-
-/// The pipe a child that places its own nice reports on: both ends close-on-exec, made under
-/// the fork lock, so no other spawn carries an end past its `exec` and the parent's read ends
-/// once the child has written or ended.
-pub fn nice_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    cowshed_os::fork_lock::create(|| {
-        let mut ends = [0; 2];
-        // SAFETY: space for both descriptors, protected from a concurrent fork until CLOEXEC.
-        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: these fresh descriptors have no other owners.
-        let (read, write) =
-            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
-        for end in [&read, &write] {
-            // SAFETY: a plain fcntl of this owned descriptor.
-            if unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok((read, write))
-    })
-}
-
-/// Called in a forked child before it runs anything of the job's (between fork and exec, or
-/// before a script child reports its group) where no observation fence holds it: set this
-/// process's nice to `nice`, read it back, and write exactly what happened to `report`
-/// ([`read_nice_report`]) -- this pid, the nice asked for, the nice read back, the errno -- so
-/// a refusal reaches the supervisor typed, never as a bare spawn errno. Only `getpid`,
-/// `setpriority`, `getpriority`, `write` and an `errno` store run: no allocation, no lock.
-/// `Err` unless the read-back equals `nice`, so a command that runs is known to run at it.
-pub fn report_own_nice(report: RawFd, nice: i32) -> io::Result<()> {
-    let errno = || io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    // SAFETY: plain system calls on this process's own identity and scheduling priority.
-    let pid = unsafe { libc::getpid() };
-    // SAFETY: as above.
-    let (outcome, observed, cause) =
-        if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) } == -1 {
-            (NICE_SET_REFUSED, 0, errno())
-        } else {
-            clear_errno();
-            // SAFETY: as above.
-            let read = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-            let cause = errno();
-            if read == -1 && cause != 0 {
-                (NICE_READ_REFUSED, 0, cause)
-            } else if read == nice {
-                (NICE_PLACED, read, 0)
-            } else {
-                (NICE_MISMATCH, read, 0)
-            }
-        };
-    let mut record = [0_u8; NICE_REPORT_BYTES];
-    for (slot, value) in record.as_chunks_mut::<4>().0.iter_mut().zip([
-        outcome.to_le_bytes(),
-        pid.to_le_bytes(),
-        nice.to_le_bytes(),
-        observed.to_le_bytes(),
-        cause.to_le_bytes(),
-    ]) {
-        slot.copy_from_slice(&value);
-    }
-    let mut written = 0;
-    while written < record.len() {
-        // SAFETY: writes from this stack buffer to the report descriptor this child holds.
-        let wrote = unsafe {
-            libc::write(
-                report,
-                record[written..].as_ptr().cast(),
-                record.len() - written,
-            )
-        };
-        match usize::try_from(wrote) {
-            Ok(wrote) => written += wrote,
-            Err(_) if errno() == libc::EINTR => {}
-            Err(_) => return Err(io::Error::last_os_error()),
-        }
-    }
-    match outcome {
-        NICE_PLACED => Ok(()),
-        _ if cause != 0 => Err(io::Error::from_raw_os_error(cause)),
-        _ => Err(io::Error::from(io::ErrorKind::Other)),
-    }
-}
-
-/// What a child wrote with [`report_own_nice`], read once the parent dropped its own write end:
-/// `None` when the child ended before placing its nice (its spawn failed earlier), the nice it
-/// was observed at, or the exact failure. A torn or unknown report is `InvalidData`.
-pub fn read_nice_report(
-    report: OwnedFd,
-) -> io::Result<Option<std::result::Result<i32, PriorityFailure>>> {
-    use std::io::Read as _;
-    let mut file = std::fs::File::from(report);
-    let mut record = [0_u8; NICE_REPORT_BYTES];
-    let mut filled = 0;
-    while filled < record.len() {
-        match file.read(&mut record[filled..]) {
-            Ok(0) => break,
-            Ok(read) => filled += read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    if filled == 0 {
-        return Ok(None);
-    }
-    if filled < record.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("truncated nice report ({filled} of {NICE_REPORT_BYTES} bytes)"),
-        ));
-    }
-    let field = |index: usize| {
-        let mut bytes = [0_u8; 4];
-        bytes.copy_from_slice(&record[index * 4..index * 4 + 4]);
-        bytes
-    };
-    let outcome = u32::from_le_bytes(field(0));
-    let pid = u32::from_le_bytes(field(1));
-    let requested = i32::from_le_bytes(field(2));
-    let observed = i32::from_le_bytes(field(3));
-    let errno = i32::from_le_bytes(field(4));
-    let failure = |observed, errno| PriorityFailure {
-        pid,
-        requested,
-        observed,
-        errno,
-    };
-    match outcome {
-        NICE_PLACED => Ok(Some(Ok(observed))),
-        NICE_SET_REFUSED | NICE_READ_REFUSED => Ok(Some(Err(failure(None, Some(errno))))),
-        NICE_MISMATCH => Ok(Some(Err(failure(Some(observed), None)))),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown nice report outcome {other}"),
-        )),
     }
 }
 
@@ -1007,116 +787,6 @@ mod tests {
         assert_eq!(fields.bytes().unwrap(), b"/w");
         assert_eq!(fields.list().unwrap(), vec![b"K".as_slice(), b"V"]);
         fields.finish().unwrap();
-    }
-
-    /// A request's child nice crosses the wire as the side that places it: the supervisor
-    /// through the fence, or the child itself with the exact value; an unknown kind is refused.
-    #[test]
-    fn a_child_nice_names_who_places_it() {
-        for nice in [None, Some(0), Some(10)] {
-            let frame = FrameWriter::new(REQUEST_RUN)
-                .child_nice(nice)
-                .finish()
-                .unwrap();
-            let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
-            assert_eq!(fields.child_nice().unwrap(), nice);
-            fields.finish().unwrap();
-        }
-        let frame = FrameWriter::new(REQUEST_RUN).u32(7).finish().unwrap();
-        let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
-        assert!(fields.child_nice().is_err());
-    }
-
-    /// A forked child places itself at its class's nice and reports the nice it reads back;
-    /// lowering below the nice it inherited needs a privilege it lacks, and the report carries
-    /// that refusal typed -- the child's own pid, the nice asked for, the kernel's errno, no
-    /// observed value -- instead of a bare errno or a nice nobody saw.
-    #[test]
-    fn a_child_reports_its_own_nice_and_a_typed_refusal_to_lower_it() {
-        let (placed_read, placed_write) = nice_pipe().unwrap();
-        let (lowered_read, lowered_write) = nice_pipe().unwrap();
-        let (placed_end, lowered_end) = (placed_write.as_raw_fd(), lowered_write.as_raw_fd());
-        // SAFETY: the forked child runs only async-signal-safe calls and leaves with _exit.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
-        if pid == 0 {
-            let placed = report_own_nice(placed_end, 10).is_ok();
-            let lowered = report_own_nice(lowered_end, 0).is_err();
-            // SAFETY: ends the forked test child without the harness's destructors.
-            unsafe { libc::_exit(if placed && lowered { 0 } else { 1 }) }
-        }
-        drop((placed_write, lowered_write));
-        let (reaped, status) =
-            cowshed_os::test_backstop::waitpid(pid, 0).expect("reap the child forked above");
-        assert_eq!(reaped, pid);
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "the child placed itself at 10 and could not return to 0 (status {status})"
-        );
-        assert_eq!(read_nice_report(placed_read).unwrap(), Some(Ok(10)));
-        let Some(Err(refused)) = read_nice_report(lowered_read).unwrap() else {
-            panic!("lowering the nice is refused");
-        };
-        assert_eq!(
-            (refused.pid, refused.requested, refused.observed),
-            (pid.cast_unsigned(), 0, None)
-        );
-        assert!(
-            refused
-                .errno
-                .is_some_and(|errno| errno == libc::EPERM || errno == libc::EACCES),
-            "{refused:?}"
-        );
-    }
-
-    /// A child that ended before it placed anything reports nothing, never a placement.
-    #[test]
-    fn an_unwritten_nice_report_is_none() {
-        let (read, write) = nice_pipe().unwrap();
-        drop(write);
-        assert_eq!(read_nice_report(read).unwrap(), None);
-    }
-
-    /// A refusal crosses the wire exactly: an absent observation stays absent.
-    #[test]
-    fn a_priority_failure_crosses_the_wire_unchanged() {
-        for failure in [
-            PriorityFailure {
-                pid: 41,
-                requested: 10,
-                observed: None,
-                errno: Some(libc::EPERM),
-            },
-            PriorityFailure {
-                pid: 41,
-                requested: 0,
-                observed: Some(5),
-                errno: None,
-            },
-        ] {
-            let frame = FrameWriter::new(REPLY_NICE_REFUSED)
-                .priority_failure(&failure)
-                .finish()
-                .unwrap();
-            let (tag, mut fields) = FrameReader::new(&frame[4..]).unwrap();
-            assert_eq!(tag, REPLY_NICE_REFUSED);
-            assert_eq!(fields.priority_failure().unwrap(), failure);
-            fields.finish().unwrap();
-        }
-        let frame = FrameWriter::new(REPLY_NICE_REFUSED)
-            .u32(41)
-            .i32(10)
-            .u32(0)
-            .i32(7)
-            .u32(0)
-            .i32(0)
-            .finish()
-            .unwrap();
-        let (_, mut fields) = FrameReader::new(&frame[4..]).unwrap();
-        assert!(
-            fields.priority_failure().is_err(),
-            "an absent value names none"
-        );
     }
 
     /// An observed leader always carries its identity, a non-positive group is refused, and an

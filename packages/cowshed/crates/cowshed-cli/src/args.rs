@@ -495,9 +495,8 @@ pub struct ExecArgs {
     /// The class the command is admitted under (`--class`): background unless the caller names
     /// interactive work it waits on, the operator's gate, or a resident.
     pub class: ExecClass,
-    /// The most CPU tokens the command can use at once (`--want`); its grant is between one and
-    /// this. `None` asks for the class's own: the background share of the host for background
-    /// and interactive work, one token for a gate.
+    /// The most slots the job's own jobserver holds (`--want`), at most the host's cores, which its
+    /// make, Cargo and test runners share. `None` gives the job the host's cores.
     pub want: Option<NonZeroUsize>,
     /// Where the command runs: the workspace sandbox, or `--host`, the host boundary outside it.
     pub scope: ExecScope,
@@ -2961,8 +2960,8 @@ const EXEC: CommandSpec = CommandSpec {
     about: &[
         "Runs one argv — never a shell string — inside the workspace's sandbox, with the cwd at the workspace root. Child stdout and stderr pass through as opaque bytes and the child's exit code passes through untouched; only a denial cowshed has authoritative evidence for is reported as one.",
         "Waits for the command however long it runs and exits with its status. With `--timeout`, a command still running then keeps running under the workspace supervisor and exec exits 103 naming its job; `--background` prints the job id and returns at once. No CLI verb reattaches to a job: the cowshed API does. `--session` keeps a named session's cwd and variables across calls.",
-        "Every job but a resident takes host CPU tokens from the gateway before its command starts. An ordinary command is `background` and asks for the background share of the host, half of its tokens, so the runners it starts run side by side; `--want <n>` names the tokens a command can use at once instead, and its grant is between one and `n`. Background work takes free tokens; gate-class asks are served first. `--class interactive` names a command someone is waiting on: it takes its tokens as background work does and runs at its supervisor's own nice, ahead of a gate at +5 and background at +10 whenever cores are contended, and a workspace may ask for it. `--class gate` admits the command as the operator's gate: it starts at once on free tokens, and otherwise waits for whole returned tokens ahead of queued background work, however long that takes, background then taking the tokens no waiting gate ask wants; it runs at nice +5. Only this trusted route may ask for a gate; a workspace's own capability is refused. A foreground job lives as long as this exec does: if exec ends first, however it ends, the job is killed and its tokens return, so a gate whose lander is gone never keeps its place ahead of the next and a caller's timeout leaves no orphan; `--timeout` lets it run on, and `--background` never holds it. `--host` runs the command once at the host boundary, outside the workspace sandbox, at the class it names: host work at the default class takes a background token like any other, and only `--class gate` takes the repository's gate order.",
-        "`--class resident` admits a process that stays up to serve requests and is idle between them — a daemon, a worker. It holds no token and starts at once: its descendants ask its pool for their own tokens, each as background work for the workspace, so it costs the host tokens only while a request of its runs. A resident wants none, so it takes no `--want`. It runs at nice +10; `--class interactive-resident` is the same resident at nice 0, for a worker whose requests someone waits on, and differs in nothing else.",
+        "Every job starts at once at its class's nice (on Linux, its job cgroup's weight), and the kernel schedules it beside everything else on the host: cowshed never decides whether runnable work runs. An ordinary command is `background` and runs at nice +10. `--class interactive` names a command someone is waiting on: it runs at its supervisor's own nice, ahead of a gate at +5 and background at +10 whenever cores are contended, and a workspace may ask for it. `--class gate` admits the command as the operator's gate, at nice +5. Only this trusted route may ask for a gate; a workspace's own capability is refused. Every job has its own jobserver with as many slots as the host has cores, which its make, Cargo and test runners share, and a `cowshed exec` it starts in its own workspace shares it too; `--want <n>` gives the job fewer. A background job waits, queued, while the host reports memory pressure, and starts once it eases; on macOS, while pressure is critical, the youngest background or resident job is ended and fails with `memory`. A foreground job lives as long as this exec does: if exec ends first, however it ends, the job is killed, so a gate whose lander is gone never holds up the next land and a caller's timeout leaves no orphan; `--timeout` lets it run on, and `--background` never holds it. `--host` runs the command once at the host boundary, outside the workspace sandbox, at the class it names.",
+        "`--class resident` admits a process that stays up to serve requests and is idle between them — a daemon, a worker — at nice +10; an idle resident costs the host nothing. `--class interactive-resident` is the same resident at nice 0, for a worker whose requests someone waits on, and differs in nothing else.",
     ],
     options: &[
         Opt {
@@ -3011,11 +3010,11 @@ const EXEC: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--want <n>",
-            meaning: "the CPU tokens the command can use at once (default: the background share, half the host's tokens; one for a gate); its grant is between one and n",
+            meaning: "the slots of the job's own jobserver, which its build and test runners share (default and ceiling: the host's cores)",
         },
         Opt {
             spelling: "--class <background|interactive|gate|resident|interactive-resident>",
-            meaning: "admit the command as background work (default), as work someone waits on, as the operator's gate, or as a resident that holds no token, at background or interactive nice",
+            meaning: "admit the command as background work (default), as work someone waits on, as the operator's gate, or as a resident, at background or interactive nice",
         },
         Opt {
             spelling: "--host",
@@ -3097,12 +3096,6 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
     if host && session.is_some() {
         return Err(UsageError::new(
             "--host runs outside any named session",
-            USAGE,
-        ));
-    }
-    if class.is_resident() && want.is_some() {
-        return Err(UsageError::new(
-            "--class resident takes no --want: a resident holds no token, and its descendants ask its pool for their own",
             USAGE,
         ));
     }
@@ -5078,31 +5071,6 @@ mod tests {
             (
                 vec!["exec", "raven", "--class", "foreground", "--", "x"],
                 "--class must be background, interactive, gate, resident or interactive-resident",
-            ),
-            (
-                vec![
-                    "exec", "raven", "--class", "resident", "--want", "4", "--", "x",
-                ],
-                "--class resident takes no --want",
-            ),
-            (
-                vec![
-                    "exec", "raven", "--class", "resident", "--want", "1", "--", "x",
-                ],
-                "--class resident takes no --want",
-            ),
-            (
-                vec![
-                    "exec",
-                    "raven",
-                    "--class",
-                    "interactive-resident",
-                    "--want",
-                    "4",
-                    "--",
-                    "x",
-                ],
-                "--class resident takes no --want",
             ),
             (
                 vec!["exec", "raven", "--want", "0", "--", "x"],

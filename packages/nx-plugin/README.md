@@ -1099,7 +1099,7 @@ Concrete targets come from concrete files:
   per-crate exclusions cannot drift; every crate piece excludes it with `not (…)`, so each test is selected by exactly
   one target. The runner is not inferred off macOS, where nextest applies the group nowhere and no piece excludes its
   tests. It is a `bounded-exec` run of the group's selection under the same progress bound as every test target, and
-  asks for one CPU token, matching the group's one runnable test process instead of reserving idle host capacity. The
+  asks for one CPU token, matching the group's one runnable test process instead of holding tokens it cannot use. The
   run carries `--no-fail-fast`: an ordinary test failure does not stop the group's remaining tests, and a failed verdict
   lists the failed ones. It carries `--no-tests=fail`, so a filter that selects no test fails the group. Ignored tests
   keep their explicit lane. A crate named `group-*` is refused, since its runner name would collide. A repository's
@@ -1770,13 +1770,6 @@ its inherited lifetime FIFO. EOF is the terminal ownership event; a later `after
 again. Darwin can answer `EPERM` for an unreaped zombie-only group, and an ambient `ps` scan is not an ownership proof.
 Failed fixtures retain their cleanup obligation rather than suppressing signal errors.
 
-A job waiting for a CPU token is queued, not idle. A descendant whose own work waits in the host's CPU queue (a test's
-scratch cowshed project, say) writes `{"op":"host-wait"}` on the `BOUNDED_EXEC_CPU_POOL` it inherited and holds the
-connection while the work waits; while any such wait is held, the idle clock is stopped and keeps the time it had left,
-and it runs on from there when the last wait closes. stderr says `bounded-exec: idle clock stopped` and `… restarted`,
-and an expiry names the queued time it did not count (`specs/cowshed/05_gateway.md`, "A queued descendant is not idle").
-`timeoutMs` is never stopped.
-
 The final-ten-second pre-signal snapshot attributes the runner's process tree, its leader and leaf call stacks and
 observed resources, with explicit incomplete/raced results and no delay to termination. Its timing, visibility and
 evidence contract is defined in `specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
@@ -1896,12 +1889,12 @@ exists. Every path derives from the namespace (`ramTempPaths(user, namespace)`):
 its gateway's control socket `<root>/gateway.sock`. None of them can be a name production uses, so no guard compares a
 fixture's paths or gateway socket with production's. The size is the one name a namespace does not derive: no other
 process's, and `fixtureRamVolume` refuses the user's own. Its real fixture gateway (`ram_fixture <ns>`) attaches the
-disk; every facade and non-facade disk command, and the CPU tokens of the runner the proof drives, go through that
-gateway's own socket. The proof names it: `createHostCommands`, `gatewayCpuBudget` and `runBoundedExecWith` take their
-gateway socket from their caller with no default, and the Nx executor passes the host's own. Teardown detaches only
-exact registry identities its attaches recorded, never disks selected by UID or size alone, then removes the root,
-unless a volume is still mounted below it. The host target depends on `cowshed:ram-fixture`, which builds the native
-helper before any test; no test compiles or installs a gateway.
+disk; every facade and non-facade disk command goes through that gateway's own socket. The proof names it:
+`createHostCommands` takes its gateway socket from its caller with no default, `runBoundedExecWith` takes the volume its
+caller makes, and the Nx executor passes the host's own. Teardown detaches only exact registry identities its attaches
+recorded, never disks selected by UID or size alone, then removes the root, unless a volume is still mounted below it.
+The host target depends on `cowshed:ram-fixture`, which builds the native helper before any test; no test compiles or
+installs a gateway.
 
 RAM is optional acceleration for the production executor, not a correctness prerequisite. Gateway absence, an
 unsupported RAM operation, or unproven legacy ownership yields a typed unavailable reason and one report of the actual
@@ -2073,67 +2066,57 @@ Test code waits through `cowshed_os::test_backstop`'s helpers, each bounded by t
 raw wait, with its WHY, only where a helper thread would change what it measures. SmoothBricks runs it from
 `cowshed:wait-why`, which `cowshed:lint` depends on.
 
-Without an inherited parent pool, a `bounded-exec` command takes CPU tokens from cowshed's host budget before it starts,
-when the gateway answers on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on
-one host keep their runnable work near the core count instead of each sizing its runners to the whole machine. It asks
-for the runner's requested parallelism, read from the runner's own flag rather than the core count — nextest's
-`--test-threads` or one per core (one for `--no-capture`, which runs tests serially), `bun test --parallel=N` N,
-Stryker's `--concurrency` N or N% (default one per core less one past four cores), Vitest's `--maxWorkers` N or N%
-(default one per core less one), `go test -p` (default `GOMAXPROCS`), cargo-mutants' `--jobserver-tasks` (default one
-per core, whatever `--jobs` says), a cargo build one per core, anything else one, or the target's `parallelism` option —
-bounded by positive inherited `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` ceilings. A configured count can lower an
-inherited ceiling, never raise it. The runner uses `min(bounded request, granted tokens)`: nextest's environment and
-named flag, Bun's parallel flag, Stryker's, Vitest's and go's worker flag (added when the command names none),
-cargo-mutants' jobserver tasks, `--jobs` and per-process test threads, and a cargo build's libtest and nextest test
-threads are sized to that limit. Cargo's rustc count needs no flag: the run's sub-pool is a GNU make jobserver fifo that
-`CARGO_MAKEFLAGS` and `MAKEFLAGS` name, so Cargo, its build scripts and every nested `cargo` share the grant's count
-with the sub-pool's socket children, and no grant sets `CARGO_BUILD_JOBS`. A command whose runner the executor cannot
-see (a script) gets `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its whole held grant, since test threads take
-no jobserver token. A runner that starts its own workers or jobserver (cargo-mutants, Stryker, Vitest, `go test`)
-ignores that fifo, so it must run under `bounded-exec`, whose runner kinds size its own flag; the inferred `mutation`
-target does. Test threads retain their independent inherited/configured ceilings. `BOUNDED_EXEC_CPU_TOKENS`, the
-sub-ledger and telemetry still name the actual held grant. The gateway shares tokens fairly between checkouts (Nx
-workspace roots). `timeoutMs` and `idleTimeoutMs` start at the grant. The tokens go back when the command exits, or with
-the executor's socket when it is killed. The wait prints one
-`cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. On a host whose gateway socket does not exist
-(a CI runner, a machine without cowshed), the plugin's `preTasksExecution` serves each Nx run that inherits no pool its
-own `BOUNDED_EXEC_CPU_POOL` of one token per core, with its jobserver fifo in `CARGO_MAKEFLAGS` for the Cargo that
-`nx:run-commands` starts, and `postTasksExecution` closes it: the run's targets, started side by side under
-`NX_PARALLEL=100%`, queue for its cores instead of each sizing its runner to the whole host
-(`specs/cowshed/05_gateway.md`, "A run without a gateway budgets itself"). Its scope is one run. A command no pool and
-no gateway answers runs exactly as configured and nothing is said; a gateway from before the budget runs it unbudgeted
-and stderr says so.
+A `bounded-exec` command takes its CPU tokens from the CPU pool it inherits before it starts
+(`specs/cowshed/05_gateway.md`, "Host scheduling", "Parallelism inside a job"), so the runners of one build tree keep
+their runnable work within that tree's count instead of each sizing its runners to the whole machine. It asks for the
+runner's requested parallelism, read from the runner's own flag rather than the core count — nextest's `--test-threads`
+or one per core (one for `--no-capture`, which runs tests serially), `bun test --parallel=N` N, Stryker's
+`--concurrency` N or N% (default one per core less one past four cores), Vitest's `--maxWorkers` N or N% (default one
+per core less one), `go test -p` (default `GOMAXPROCS`), cargo-mutants' `--jobserver-tasks` (default one per core,
+whatever `--jobs` says), a cargo build one per core, anything else one, or the target's `parallelism` option — bounded
+by positive inherited `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` ceilings. A configured count can lower an inherited
+ceiling, never raise it. The runner uses `min(bounded request, granted tokens)`: nextest's environment and named flag,
+Bun's parallel flag, Stryker's, Vitest's and go's worker flag (added when the command names none), cargo-mutants'
+jobserver tasks, `--jobs` and per-process test threads, and a cargo build's libtest and nextest test threads are sized
+to that limit. Cargo's rustc count needs no flag: the run's sub-pool is a GNU make jobserver fifo that `CARGO_MAKEFLAGS`
+and `MAKEFLAGS` name, so Cargo, its build scripts and every nested `cargo` share the grant's count with the sub-pool's
+socket children, and no grant sets `CARGO_BUILD_JOBS`. A command whose runner the executor cannot see (a script) gets
+`RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its whole held grant, since test threads take no jobserver token.
+A runner that starts its own workers or jobserver (cargo-mutants, Stryker, Vitest, `go test`) ignores that fifo, so it
+must run under `bounded-exec`, whose runner kinds size its own flag; the inferred `mutation` target does. Test threads
+retain their independent inherited/configured ceilings. `BOUNDED_EXEC_CPU_TOKENS`, the sub-pool and telemetry still name
+the actual held grant. `timeoutMs` and `idleTimeoutMs` start at the grant. The tokens go back when the command exits, or
+with the executor's socket when it is killed. The wait prints one
+`cowshed: cpu-pool wait done elapsed=… tokens=<granted>/<asked>` line.
+
+The plugin's `preTasksExecution` serves each Nx run that inherits no pool its own `BOUNDED_EXEC_CPU_POOL`, and
+`postTasksExecution` closes it (`specs/cowshed/05_gateway.md`, "Every Nx run budgets itself"). It holds one token per
+core, or the run's inherited positive `BOUNDED_EXEC_CPU_TOKENS` when that is fewer: inside a `cowshed exec` job that
+count is the job's own, so the job's `--want` bounds the run. Its jobserver fifo is in `CARGO_MAKEFLAGS` for the Cargo
+that `nx:run-commands` starts, so the run's targets, started side by side under `NX_PARALLEL=100%`, queue for its tokens
+instead of each sizing its runner to the whole host. Its scope is one run. A command that inherits no pool runs exactly
+as configured, sized only by the ceilings it inherits, and nothing is said; a cowshed job's own jobserver fifo still
+reaches it by Cargo's own rule ("Cargo reads its holder's jobserver").
 
 A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count, and the same count as a make
 jobserver fifo beside it: `g − 1` token bytes, the command holding the implicit first, which the pool lends a socket
 child only once the fifo is empty. A socket grant takes fifo bytes first and that slot last, and its release writes the
 bytes back; the pool waits for a fifo byte on the event loop, so a token Cargo writes back wakes the queued child. Its
-close drains and removes the fifo. A nested default executor asks that immediate parent pool for its own demand, instead
-of taking from the host while the parent holds its grant; the pool grants at most what it can. A lent pool accounts for
-siblings together; each admitted child serves only its own allocation to grandchildren. Closing a child's connection
-returns its local allocation, never the parent's upstream grant. Upstream loss revokes the downstream pool, so a dead
-parent grants nothing more; a command whose grant closes while it runs (a gateway restart, or the lending parent's exit)
-runs on over budget to its own exit, and stderr says `cowshed: cpu-tokens grant ended`. A bare count or absent endpoint
-follows normal host admission. A connected parent pool's refusal or protocol failure instead fails admission: taking
-from the host then could wait on the parent's own grant. `options.env` cannot inject either marker, nor a jobserver
-(`CARGO_MAKEFLAGS`, `MAKEFLAGS`, `MFLAGS`); a parent make's jobserver the executor inherits still reaches an ungranted
-command. Parent-pool grants record `cpu.inherited: true` and their actual local wait; the span also says
-`inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing accounting. Command bounds stay
-unchanged.
+close drains and removes the fifo. A nested default executor asks that immediate parent pool for its own demand; the
+pool grants at most what it can. A lent pool accounts for siblings together; each admitted child serves only its own
+allocation to grandchildren. Closing a child's connection returns its local allocation, never the parent's upstream
+grant. Upstream loss revokes the downstream pool, so a dead parent grants nothing more; a command whose grant closes
+while it runs (the lending parent's exit) runs on over budget to its own exit, and stderr says
+`cowshed: cpu-pool grant ended`. A bare count proves no pool. An absent endpoint lends nothing: the command runs as
+configured, and stderr says so. A connected parent pool's refusal or protocol failure instead fails admission: running
+beside it would count the command twice. `options.env` cannot inject either marker, nor a jobserver (`CARGO_MAKEFLAGS`,
+`MAKEFLAGS`, `MFLAGS`); a parent make's jobserver the executor inherits still reaches an ungranted command. The verdict
+records the grant and its actual local wait as `cpu`. Pool setup, listener and cleanup errors fail rather than bypassing
+accounting. Command bounds stay unchanged.
 
-The absent-parent fixture uses the executor's injectable budget with a real, controlled outer pool as its backing. It
-proves a positive allocation and re-acquires it after the command ends, rather than depending on free tokens in the
-host-wide gateway while the test runner itself holds an allocation. A bare count or unbudgeted success is not proof. A
-land gate (`tooling/land-host.sh`) enters the existing task server with
-`cowshed exec <workspace> --class gate --host [--want N] -- COMMAND [ARGS...]` after daemon-stop. It requires a real
-gateway jobserver `class: "gate"` grant for its own orchestrator; its live pool lends nothing of its own and relays
-every child's ask to the host as a gate-class request, so each task the gate starts is served FIFO ahead of every other
-exec's queued work. No environment-only class or unbudgeted fallback is accepted. The gate waits for its grant with no
-deadline, ahead of queued background work. Running background tests/FIFOs are never shrunk, frozen or killed to
-manufacture tokens. Requested/granted count and actual queue wait are logged, and a child's nonzero exit is preserved
-exactly. Compiling Cargo under the live pool takes a local allocation and receives its own private child pool, so
-grandchildren never compete with their occupied ancestor. See `specs/cowshed/05_gateway.md`, "Gate admission: FIFO ahead
-of background, never starving it", for the guarantee and its deliberate limits.
+A land gate (`tooling/land-host.sh`) runs as `cowshed exec <workspace> --class gate --host -- COMMAND [ARGS...]` after
+daemon-stop. It is never CPU-limited: its class sets the priority the kernel schedules it at, and its Nx run serves its
+own pool like any other (`specs/cowshed/05_gateway.md`, "Host scheduling", "Classes").
 
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:
@@ -2212,11 +2195,11 @@ A workspace that runs this plugin from a linked checkout, where no lockfile sees
 task by the executor's module closure. The executor's `executors.json` record names, under `outputNeutral`, the modules
 that closure may stop at: their bytes and their imports are not keyed, while the bytes of every module that imports them
 are. A module is output-neutral when everything it hands the executor is either a failure or one of the values that
-already differ between runs of one task key: the CPU grant a host gives and whether its gateway answers at all, the
-volume and path of the run's `TMPDIR`, the directory a CPU pool's socket binds in, and timing. No key holds any of
-those, and Nx caches only passing runs, so a cached pass is sound only if the command's result holds whichever of them a
-run gets. A change to such a module moves which of them a run gets, or fails more runs; it never changes what a given
-value does to the command, which the keyed modules decide. Each entry, and what the executor takes from it:
+already differ between runs of one task key: the CPU grant a pool gives and whether a gateway answers at all, the volume
+and path of the run's `TMPDIR`, the directory a CPU pool's socket binds in, and timing. No key holds any of those, and
+Nx caches only passing runs, so a cached pass is sound only if the command's result holds whichever of them a run gets.
+A change to such a module moves which of them a run gets, or fails more runs; it never changes what a given value does
+to the command, which the keyed modules decide. Each entry, and what the executor takes from it:
 
 - `ram-temp.js`, with `ram-temp-held.js`, `ram-attach.js`, `ram-detach.js` and `disk-lease.js`: the RAM temp lease. The
   command sees the lease's directory as its `TMPDIR`, on a volume of the lease's capacity. Off macOS, without a
@@ -2224,9 +2207,9 @@ value does to the command, which the keyed modules decide. Each entry, and what 
   that cannot be taken, released or recorded, or leftovers the supervisor cannot retire within the lease's grace, fail
   the run or are said on stderr. The variable naming the cowshed executable, which the command does see, lives in the
   core `owned-subtree.ts`.
-- `gateway-lease.js`: the gateway's lease protocol, its socket path and the grant it reads from an answer. The grant
-  reaches the command only through `cpu-tokens.js`, as a token count; a gateway that is absent or refuses leaves the
-  command unsized, as on any host without a gateway, and an install that outlives its deadline fails the run.
+- `gateway-lease.js`: the lease protocol the gateway's disk lease and a parent CPU pool speak, the gateway's socket path
+  and the grant it reads from an answer. A CPU grant reaches the command only through `cpu-pool.js` and
+  `runner-sizing.js`, as a token count; an absent endpoint leaves the command unsized, and a refusal fails the run.
 - `hang-diagnostics.js`: the snapshot taken shortly before the no-progress bound fires. It probes with `ps`, `lsof` and
   `sample`, which suspends the runner for about a second, and signals nothing but its own probes. Its text and lock
   waits are read only once the bound has expired the run, which fails it.
@@ -2234,7 +2217,7 @@ value does to the command, which the keyed modules decide. Each entry, and what 
   the host census the executor quotes when a lease release fails, and the directory a CPU pool binds its socket in. A
   directory that cannot be made refuses the run.
 
-`cpu-tokens.js`, `cpu-pool.js` and `progress.js` are not output-neutral although they schedule: `sizeRunner` decides
+`runner-sizing.js`, `cpu-pool.js` and `progress.js` are not output-neutral although they schedule: `sizeRunner` decides
 what a token count does to the command's parallelism flags and test-thread variables, `cpu-pool.js` writes the jobserver
 flags into `MAKEFLAGS` and `CARGO_MAKEFLAGS`, and `withProgressReport` adds `--dots` to `bun test` and `-json` to
 `go test`. They stay keyed until those functions move into modules of their own. A module that comes to decide what a

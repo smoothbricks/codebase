@@ -52,8 +52,6 @@ pub(crate) use compaction::{
 };
 pub(crate) use reseed::ReseedWorkspace;
 
-pub(crate) use compaction::gates_hold;
-
 /// A workspace at one incarnation: whose seed a seed is.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Owner {
@@ -8421,12 +8419,12 @@ fn main() {
             .volumes
             .copy_compaction(
                 stage().await,
-                Box::new(|| super::Admission::Stop("gate jobs run: job 7 in /w".to_owned())),
+                Box::new(|| super::Admission::Stop("a land holds a turn".to_owned())),
             )
             .await
             .unwrap();
         assert!(
-            matches!(&stopped, SeedCompaction::Stopped { why, .. } if why == "gate jobs run: job 7 in /w"),
+            matches!(&stopped, SeedCompaction::Stopped { why, .. } if why == "a land holds a turn"),
             "{stopped:?}"
         );
         assert_eq!(
@@ -8457,7 +8455,7 @@ fn main() {
             .copy_compaction(
                 stage().await,
                 Box::new(move || {
-                    // Held twice, as while a gate job or a land runs, then let go on.
+                    // Held twice, as while a land runs, then let go on.
                     if counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
                         super::Admission::Wait
                     } else {

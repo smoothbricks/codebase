@@ -231,10 +231,8 @@ const ticket = (number: number, workspace: string, pid: number) => ({
 });
 
 describe('installReadiness', () => {
-  it('is ready when nothing holds a land turn or gate tokens', () => {
-    expect(
-      installReadiness(status({ cpuBudget: { ledger: { gateJobs: [], gateQueue: [], background: [] } } })),
-    ).toEqual({ kind: 'ready' });
+  it('is ready when nothing holds a land turn', () => {
+    expect(installReadiness(status({}))).toEqual({ kind: 'ready' });
   });
 
   it('is ready when no daemon answers: an install that restarts nothing checks nothing', () => {
@@ -281,27 +279,6 @@ describe('installReadiness', () => {
     });
   });
 
-  it('names each gate job once, oldest first, whether it holds tokens or waits for them', () => {
-    const ledger = {
-      gateJobs: [
-        { repository: 'o/a', checkout: '/w/b', job: 7, held: 2 },
-        { repository: 'o/a', checkout: '/w/a', job: 3, held: 1 },
-      ],
-      gateQueue: [
-        { repository: 'o/a', checkout: '/w/b', job: 7, want: 4 },
-        { repository: 'o/c', checkout: '/w/c', job: 5, want: 1 },
-      ],
-    };
-    expect(installReadiness(status({ cpuBudget: { ledger } }))).toEqual({
-      kind: 'busy',
-      blockers: ['gate job 3 at /w/a', 'gate job 5 at /w/c', 'gate job 7 at /w/b'],
-    });
-  });
-
-  it('names no gate job for a gateway that did not answer its ledger, as the install itself reads it', () => {
-    expect(installReadiness(status({ cpuBudget: { unanswered: 'unknown op cpu-budget' } }))).toEqual({ kind: 'ready' });
-  });
-
   it('refuses to guess when the land turns could not be read', () => {
     expect(installReadiness(status({ landTurnsError: 'permission denied' }))).toEqual({
       kind: 'busy',
@@ -315,8 +292,6 @@ describe('installReadiness', () => {
     ['a status without a running state', JSON.stringify({ ok: true, result: { installed: true } })],
     ['a land queue without tickets', status({ landTurns: [{ repo: 'gadgets' }] })],
     ['a ticket without a pid', status({ landTurns: [{ repo: 'gadgets', tickets: [{ number: 1, workspace: 'w' }] }] })],
-    ['a ledger without gate lists', status({ cpuBudget: { ledger: {} } })],
-    ['a gate job without a checkout', status({ cpuBudget: { ledger: { gateJobs: [{ job: 1 }], gateQueue: [] } } })],
     ['a pending install that is not a boolean', status({ pendingInstall: 'yes' })],
   ];
   for (const [name, text] of unreadable) {
@@ -579,7 +554,7 @@ function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
   set('affected.json', '["cowshed"]');
   set('doctor.json', doctor(finding('host-volume', 'info'), finding('project-checks-skipped', 'error')));
   set('doctor.exit', '5');
-  set('status.json', status({ cpuBudget: { ledger: { gateJobs: [], gateQueue: [], background: [] } } }));
+  set('status.json', status({}));
   set('setup.json', JSON.stringify({ ok: true, result: {} }));
   set('setup.exit', '0');
   return {
@@ -727,16 +702,13 @@ describe('land-install.sh', () => {
       'status.json',
       status({
         landTurns: [{ repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99)] }],
-        cpuBudget: {
-          ledger: { gateJobs: [{ job: 7, checkout: '/w/gadget-land', held: 3 }], gateQueue: [], background: [] },
-        },
       }),
     );
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
     const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
     expect(onlyLine(run.stdout).text).toBe(
-      `deferred: the land of gadget-land holds the gadgets land turn (ticket 4, pid 99); gate job 7 at /w/gadget-land; rerun direnv exec ${install.main} ${binary} setup`,
+      `deferred: the land of gadget-land holds the gadgets land turn (ticket 4, pid 99); rerun direnv exec ${install.main} ${binary} setup`,
     );
     expect(install.log('staged.log')).toEqual([
       '--json doctor [turn free] [cwd /]',
@@ -808,7 +780,6 @@ describe('land-install.sh', () => {
       'status.1.json',
       status({
         landTurns: [{ repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99)] }],
-        cpuBudget: { ledger: { gateJobs: [], gateQueue: [], background: [] } },
       }),
     );
     install.set(

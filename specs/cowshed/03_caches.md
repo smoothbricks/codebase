@@ -203,12 +203,11 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
 - **Cargo reads its budget from its holder, never from a `cargo` of cowshed's** (2026-10-19, after the owner asked on
   2026-10-17 why cargo wrappers are needed, rather than configuring it properly). `cargo` in the managed environment is
-  the project toolchain's own; nothing installed answers to the name, and an install removes the `cargo` link earlier
-  installs planted (05_gateway.md, "The installed cowshed"). A CPU grant reaches Cargo as the variables Cargo already
-  reads, exported by the process that holds the grant: `CARGO_MAKEFLAGS` and `MAKEFLAGS` naming the grant's make
-  jobserver fifo, and `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its count where unset (05_gateway.md, "Cargo
-  reads its holder's jobserver"). A Cargo no holder started — a host shell's, rust-analyzer's — runs exactly as Cargo
-  does unconfigured.
+  the project toolchain's own; nothing installed answers to the name, and an install removes the `cargo` link earlier installs planted
+  (05_gateway.md, "The installed cowshed"). A job's jobserver reaches Cargo as the variables Cargo already reads,
+  exported by the supervisor that serves it: `CARGO_MAKEFLAGS` and `MAKEFLAGS` naming the job's make jobserver fifo, and
+  `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its count where unset (05_gateway.md, "Cargo reads its holder's
+  jobserver"). A Cargo no job started — a host shell's, rust-analyzer's — runs exactly as Cargo does unconfigured.
 - **Tool homes stay where the tool keeps them.** Every layer-3 cache lives at its tool's own default location in the
   host user's HOME, the one place the host's own tools already use without configuration, and cowshed shares that exact
   path into the sandbox of every project whose detector names the tool (15_capabilities.md). There is no cache volume,
@@ -577,13 +576,13 @@ twenty minutes of gate for a one-line change).
   `.rs` or naming a `Cargo.toml`, and `smoo monorepo update` removes it. While a consumer workspace's `production` named
   `{projectRoot}/crates/**/*`, one Rust integration test (`crates/<crate>/tests/*.rs`) re-keyed 237 TypeScript tasks,
   the lint, typecheck, test and tsc-js of about 31 projects, in one land (2026-10-23, the owner's report).
-- **A gate's runners size their own test threads.** The gate's orchestrator holds one CPU token and its pool relays
-  every runner's ask to the host, so it exports no `RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS` (05_gateway.md, "The
-  holder exports it"). While it exported 1, every Rust suite in every gate ran on one thread: `tokens=1/1` in each
-  runner from 2026-10-20, and cowshed-cli's 487 tests summed to their 1225 s wall, the tail of a 24m55s gate for a
-  three-file Rust change.
-- **A suite that outlasts the rest of the gate is sharded.** A runner keeps the size its grant gave it at its start, so
-  one long runner finishes on the tokens it started with while the host idles. cowshed-cli runs in eight hash partitions
+- **A gate's runners size their own test threads.** Every job, a gate's included, exports `RUST_TEST_THREADS` and
+  `NEXTEST_TEST_THREADS` at its jobserver count, the host's cores unless it asks fewer (05_gateway.md, "Parallelism
+  inside a job"). While a gate's orchestrator held one CPU token and exported 1, every Rust suite in every gate ran on
+  one thread: `tokens=1/1` in each runner from 2026-10-20, and cowshed-cli's 487 tests summed to their 1225 s wall, the
+  tail of a 24m55s gate for a three-file Rust change.
+- **A suite that outlasts the rest of the gate is sharded.** A runner keeps the thread count it started with, so one
+  long runner finishes alone while the rest of the host idles. cowshed-cli runs in eight hash partitions
   (`[package.metadata.smoothbricks.test] shards = 8`), as cowshed-core does: 492 tests, the longest runner 95 s. The
   slow tests of both are named with their measured time in `.config/nextest-timings.json` and dealt onto their exception
   shards longest first; only the rest is hashed (nx-plugin README, cargo test targets), since a hash left cowshed-core's

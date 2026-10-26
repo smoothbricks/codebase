@@ -1,31 +1,13 @@
-import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { describe, expect, it } from 'bun:test';
 import { CPU_POOL_ENV, readInheritedCpuPool, takeParentCpuTokens } from './cpu-pool.js';
-import { CPU_TOKENS_ENV } from './cpu-tokens.js';
 import { holdLease } from './gateway-lease.js';
 import { closeRunCpuPool, serveRunCpuPool } from './run-cpu-pool.js';
+import { CPU_TOKENS_ENV } from './runner-sizing.js';
 
-const directories: string[] = [];
-
-afterEach(() => {
-  for (const directory of directories.splice(0)) {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-/** A gateway socket path in a fresh directory: absent unless the test makes it. */
-function gatewayPath(): string {
-  const directory = mkdtempSync(join(tmpdir(), 'run-cpu-pool-'));
-  directories.push(directory);
-  return join(directory, 'gateway.sock');
-}
-
-describe('a run without a gateway', () => {
+describe("an Nx run's own CPU pool", () => {
   it('serves its tasks one pool of one token per core, so a second runner waits for the first', async () => {
     const env: NodeJS.ProcessEnv = {};
-    await serveRunCpuPool({ id: 'run-477' }, gatewayPath(), env, 4);
+    await serveRunCpuPool({ id: 'run-477' }, env, 4);
     const pool = readInheritedCpuPool(env);
     if (pool === null) {
       throw new Error(`the run published no pool: ${JSON.stringify(env)}`);
@@ -65,15 +47,19 @@ describe('a run without a gateway', () => {
 
   it('leaves a run that inherits a pool to that pool', async () => {
     const env: NodeJS.ProcessEnv = { [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' };
-    await serveRunCpuPool({ id: 'nested' }, gatewayPath(), env, 4);
+    await serveRunCpuPool({ id: 'nested' }, env, 4);
     expect(env).toEqual({ [CPU_POOL_ENV]: '/parent/pool.sock', [CPU_TOKENS_ENV]: '2' });
   });
 
-  it('leaves a run on a host whose gateway socket exists to the gateway, answering or not', async () => {
-    const gateway = gatewayPath();
-    writeFileSync(gateway, '');
-    const env: NodeJS.ProcessEnv = {};
-    await serveRunCpuPool({ id: 'gateway-host' }, gateway, env, 4);
-    expect(env).toEqual({});
+  it("takes a cowshed job's smaller inherited count as its size, and never more than the cores", async () => {
+    for (const [inherited, cores, size] of [
+      ['3', 8, 3],
+      ['16', 8, 8],
+    ] as const) {
+      const env: NodeJS.ProcessEnv = { [CPU_TOKENS_ENV]: inherited };
+      await serveRunCpuPool({ id: `sized-${inherited}` }, env, cores);
+      expect(readInheritedCpuPool(env)?.tokens).toBe(size);
+      await closeRunCpuPool({ id: `sized-${inherited}` });
+    }
   });
 });

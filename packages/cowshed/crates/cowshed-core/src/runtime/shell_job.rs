@@ -16,26 +16,25 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use super::child_fence::{ChildFence, NotSignalled};
 #[cfg(target_os = "linux")]
 use super::job_cgroup::JobCgroup;
-use super::job_cpu::JobCpuAdmission;
 use super::job_groups::Birth;
 use super::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, Inherited, MAX_FRAME_BYTES,
     REPLY_ACTIVATED, REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_ADOPTION_REFUSED,
-    REPLY_APPROVED, REPLY_EXITED, REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED,
-    REPLY_SCRIPT_SYNTAX, REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_ADOPT,
-    REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus,
+    REPLY_APPROVED, REPLY_EXITED, REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX,
+    REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_ADOPT, REQUEST_APPROVE,
+    REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus,
     SHELL_HOST_DIRECTORY, ShellHostProgram, dropped_host_end, send_with_descriptors,
 };
 use super::shell_inherit::{self, Placement, VerifiedActivation};
@@ -45,8 +44,8 @@ use super::shell_watch::{
     decode_direnv_watches,
 };
 use super::supervisor::{
-    ActivationCover, OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment,
-    ShellStart, StdinLane, process_termination_from_wait, run_system_output, run_system_stdin,
+    OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane,
+    process_termination_from_wait, run_system_output, run_system_stdin,
 };
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
@@ -97,8 +96,6 @@ fn pool_key(
 pub(super) struct WorkspaceShells {
     program: ShellHostProgram,
     config: ShellPoolConfig,
-    /// The host CPU budget a spare's activation asks its token from: a spare runs for no job.
-    cpu: Arc<dyn JobCpuAdmission>,
     /// Keyed by (read-only, `.envrc` directory or none); a changed identity replaces the pool,
     /// whose idle hosts end with it and whose executing hosts are not returned.
     pools: BTreeMap<(bool, Option<PathBuf>), (Sha256Digest, ShellPool<HostActivator>)>,
@@ -128,35 +125,19 @@ pub(super) struct PooledSpawn<'a> {
     pub grant_revision: u64,
     /// The grants of that revision, which an evaluation's result can depend on.
     pub grants: &'a crate::sandbox::SandboxGrants,
-    /// The job's CPU grant and class nice, which the command alone runs under, never its host.
+    /// The job's jobserver and, on macOS, its class nice, which the command alone runs under, never
+    /// its host.
     pub cpu: &'a super::supervisor::CpuPlacement,
     #[cfg(target_os = "macos")]
     pub monitor: super::process_monitor::ProcessMonitor,
 }
 
 impl WorkspaceShells {
-    pub(super) fn new(
-        program: ShellHostProgram,
-        config: ShellPoolConfig,
-        cpu: Arc<dyn JobCpuAdmission>,
-    ) -> Self {
+    pub(super) fn new(program: ShellHostProgram, config: ShellPoolConfig) -> Self {
         Self {
             program,
             config,
-            cpu,
             pools: BTreeMap::new(),
-        }
-    }
-
-    /// What a command under `envrc_directory`'s shell activates if it starts now: nothing when
-    /// that shell's pool holds an activated host of its current generation, idle or the spare
-    /// (05_gateway.md "A resident's start holds one token"). The judgment reserves no host:
-    /// another command may take it, an input may change, or a changed identity may replace the
-    /// pool before this one acquires, which [`run_pooled`] covers.
-    pub(super) async fn start(&self, read_only: bool, envrc_directory: PathBuf) -> ShellStart {
-        match self.pools.get(&(read_only, Some(envrc_directory))) {
-            Some((_, pool)) if matches!(pool.ready().await, Ok(true)) => ShellStart::Activated,
-            Some(_) | None => ShellStart::Activates,
         }
     }
 
@@ -186,7 +167,6 @@ impl WorkspaceShells {
                         environment: base,
                         grants: spawn.grants.clone(),
                         envrc_directory: spawn.envrc_directory.clone(),
-                        cpu: Arc::clone(&self.cpu),
                     }),
                     self.config,
                 );
@@ -194,8 +174,7 @@ impl WorkspaceShells {
                 pool
             }
         };
-        // The grant's pool, count and jobserver are the authority's, laid over whatever the
-        // caller named.
+        // The job's jobserver and count are its supervisor's, laid over whatever the caller named.
         let mut overlay = spawn.environment.overlay(spawn.caller);
         overlay.extend(spawn.cpu.environment(spawn.caller));
         let (stdin_read, stdin_write) = pipe().map_err(pipe_error)?;
@@ -243,8 +222,8 @@ impl WorkspaceShells {
                 command: spawn.command,
                 cwd: spawn.cwd,
                 overlay,
+                #[cfg(target_os = "macos")]
                 nice: spawn.cpu.nice,
-                activation: spawn.cpu.activation.clone(),
                 #[cfg(target_os = "linux")]
                 cgroup: spawn.cgroup,
                 #[cfg(target_os = "macos")]
@@ -337,14 +316,6 @@ fn null_device() -> io::Result<OwnedFd> {
 pub(super) struct JobControl {
     target: Mutex<Target>,
     requested: AtomicI32,
-    /// Woken by each request, for a run still waiting before any target exists.
-    signalled: Notify,
-    /// Whether the job is stopped: its probation ended without a grant (05_gateway.md "A
-    /// one-token job starts on probation"). A target published while it is, is stopped too.
-    stopped: AtomicBool,
-    /// The activation hosts a stop reached, continued with the job whatever its target is by
-    /// then: a host stopped just as it finished activating has already published its command.
-    stopped_hosts: Mutex<Vec<Arc<ChildFence>>>,
     #[cfg(target_os = "linux")]
     cgroup: Arc<JobCgroup>,
 }
@@ -388,34 +359,6 @@ impl Target {
             )),
         }
     }
-
-    /// Stop (`SIGSTOP`, or a frozen cgroup) or continue the job's processes where they are.
-    fn suspend(&self, stopped: bool, #[cfg(target_os = "linux")] cgroup: &JobCgroup) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        if !matches!(self, Self::Host(_)) {
-            return cgroup
-                .freeze(stopped)
-                .map_err(super::supervisor::cgroup_error);
-        }
-        let signal = if stopped {
-            libc::SIGSTOP
-        } else {
-            libc::SIGCONT
-        };
-        match self {
-            Self::Host(fence) => fence.signal(signal).map_err(NotSignalled::into_error),
-            Self::Command(host) => host.send(signal).map_err(|_| {
-                CowshedError::conflict(
-                    "the job's run no longer forwards signals to its host: the host is gone",
-                    "inspect the job's status",
-                )
-            }),
-            // Stopped as it is published (`JobControl::publish`).
-            Self::Pending => Ok(()),
-            // Nothing of it is left to stop or continue.
-            Self::Finished => Ok(()),
-        }
-    }
 }
 
 impl JobControl {
@@ -424,9 +367,6 @@ impl JobControl {
         Self {
             target: Mutex::new(Target::Pending),
             requested: AtomicI32::new(0),
-            signalled: Notify::new(),
-            stopped: AtomicBool::new(false),
-            stopped_hosts: Mutex::new(Vec::new()),
             #[cfg(target_os = "linux")]
             cgroup,
         }
@@ -444,76 +384,16 @@ impl JobControl {
                 &self.cgroup,
             )
         };
-        let stopped = if self.stopped.load(Ordering::SeqCst) {
-            self.stop(&published)
-        } else {
-            Ok(())
-        };
         *target = published;
-        delivered.and(stopped)
-    }
-
-    /// Stop `target`, remembering an activation host it stops so the job's continuation reaches
-    /// it whatever the target is by then.
-    fn stop(&self, target: &Target) -> Result<()> {
-        if let Target::Host(fence) = target {
-            self.stopped_hosts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(Arc::clone(fence));
-        }
-        target.suspend(
-            true,
-            #[cfg(target_os = "linux")]
-            &self.cgroup,
-        )
-    }
-
-    /// Stop or continue the job where it is, recording no request: its probation ended without
-    /// a grant, or its grant came, or it is being killed (05_gateway.md "A one-token job starts
-    /// on probation").
-    fn suspend(&self, stopped: bool) -> Result<()> {
-        self.stopped.store(stopped, Ordering::SeqCst);
-        let target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
-        if stopped {
-            return self.stop(&target);
-        }
-        for host in self
-            .stopped_hosts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain(..)
-        {
-            // A host that has exited, or been reaped, has nothing left to continue.
-            let _ = host.signal(libc::SIGCONT);
-        }
-        target.suspend(
-            false,
-            #[cfg(target_os = "linux")]
-            &self.cgroup,
-        )
+        delivered
     }
 
     fn finish(&self) {
         *self.target.lock().unwrap_or_else(PoisonError::into_inner) = Target::Finished;
     }
 
-    /// The signal requested of the job, once there is one.
-    async fn requested(&self) -> i32 {
-        loop {
-            let notified = self.signalled.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match self.requested.load(Ordering::SeqCst) {
-                0 => notified.await,
-                signal => return signal,
-            }
-        }
-    }
-
     fn signal(&self, signal: i32) -> Result<()> {
         self.requested.store(signal, Ordering::SeqCst);
-        self.signalled.notify_waiters();
         self.target
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -572,8 +452,6 @@ impl RunningProcess for PooledProcess {
         match signal {
             ProcessSignal::Term => self.control.signal(libc::SIGTERM),
             ProcessSignal::Kill => self.control.signal(libc::SIGKILL),
-            ProcessSignal::Stop => self.control.suspend(true),
-            ProcessSignal::Continue => self.control.suspend(false),
         }
     }
 }
@@ -591,10 +469,10 @@ struct RunCommand {
     command: HostCommand,
     cwd: PathBuf,
     overlay: Vec<(OsString, OsString)>,
-    /// The nice the command runs at, its class's.
+    /// The nice the command runs at, its class's (macOS); on Linux the job's cgroup carries its
+    /// class.
+    #[cfg(target_os = "macos")]
     nice: i32,
-    /// Whether a shell activation for this command already counts against a token of the job's.
-    activation: ActivationCover,
     #[cfg(target_os = "linux")]
     cgroup: Arc<JobCgroup>,
     #[cfg(target_os = "macos")]
@@ -712,31 +590,6 @@ async fn run_pooled(
         Acquired::Warm(checkout) => checkout,
         Acquired::Activate(ticket) => {
             let activator = ticket.activator();
-            // A resident judged to start on an activated host found none here: its shell's
-            // activation is work the budget bounds, so it asks the stake now and holds it while
-            // the shell activates (05_gateway.md "A resident's start holds one token"). A kill
-            // while it waits ends the job as the kill would have ended its activation.
-            let _stake = match (&command.activation, &activator.envrc_directory) {
-                (ActivationCover::Unheld { parent }, Some(_)) => {
-                    let asked = activator.cpu.activation(
-                        activator.workspace_mount.clone(),
-                        format!(
-                            "job {} shell activation in {}",
-                            job_id.get(),
-                            activator.home().display()
-                        ),
-                        parent.clone(),
-                    );
-                    tokio::select! {
-                        stake = asked => match stake {
-                            Ok(stake) => Some(stake),
-                            Err(error) => return Outcome::NotLaunched(error),
-                        },
-                        signal = control.requested() => return decode(signal),
-                    }
-                }
-                (ActivationCover::Unheld { .. }, None) | (ActivationCover::Held, _) => None,
-            };
             let mut host = match activator.spawn_host().await {
                 Ok(host) => host,
                 Err(error) => return Outcome::NotLaunched(error),
@@ -836,10 +689,6 @@ async fn run_pooled(
         }
         Ok(Started::Unexecutable(exit)) => return Outcome::Exited(exit),
         Ok(Started::ScriptSyntax) => return Outcome::ScriptSyntax,
-        // The host is intact and holds nothing; the job fails typed, saying why on its stderr.
-        Ok(Started::NiceRefused(failure)) => {
-            return Outcome::NotLaunched(CowshedError::priority(failure));
-        }
         Err(error) => {
             checkout.poison();
             return Outcome::NotLaunched(error);
@@ -940,14 +789,14 @@ impl Drop for ExecHost {
 }
 
 enum Started {
-    /// The command runs at `nice`; the host observed its group leader before it could reap it.
-    Running { birth: Birth, nice: i32 },
+    /// The command runs; the host observed its group leader before it could reap it. `nice` is
+    /// the one this process placed it at through the fence (macOS); none on Linux, where the
+    /// job's cgroup carries its class.
+    Running { birth: Birth, nice: Option<i32> },
     /// The argv could not be executed; the host already wrote why to the job's stderr.
     Unexecutable(ExitStatus),
     /// The script did not parse; the host already wrote why to the job's stderr.
     ScriptSyntax,
-    /// The forked command could not run at its nice and never ran; the host holds nothing.
-    NiceRefused(crate::error::PriorityFailure),
 }
 
 /// The first fields of a script request: its text and its bindings.
@@ -1035,15 +884,6 @@ impl ExecHost {
                         .into_iter(),
                 )
             })
-            // macOS holds the forked command at its observation fence, where this process sets
-            // its nice; without a hold the child sets its own before it runs anything.
-            .map(|frame| {
-                frame.child_nice(if cfg!(target_os = "macos") {
-                    None
-                } else {
-                    Some(command.nice)
-                })
-            })
             .and_then(FrameWriter::finish)
             .map_err(|error| protocol_error("request", error))?;
         #[cfg(target_os = "macos")]
@@ -1086,7 +926,7 @@ impl ExecHost {
                 let mut placed = None;
                 let observed = gate.observe(|pid| {
                     monitor.watch(pid).map_err(io::Error::other)?;
-                    let placement = super::supervisor::place_nice(pid, nice);
+                    let placement = super::placement::macos::place_nice(pid, nice);
                     let refused = placement
                         .as_ref()
                         .err()
@@ -1106,19 +946,26 @@ impl ExecHost {
             observed.map_err(pipe_error)?;
             placed
         };
-        // The child verified its own nice before exec; one it could not set never starts.
+        // On Linux the job's cgroup carries its class: no nice is placed.
         #[cfg(not(target_os = "macos"))]
-        let placed = Some(command.nice);
+        let placed: Option<i32> = None;
         let payload = self.receive().await?;
         let (tag, mut fields) =
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
         let started = match tag {
-            REPLY_STARTED => Started::Running {
-                birth: fields.birth().map_err(|e| protocol_error("reply", e))?,
-                nice: placed.ok_or_else(|| {
-                    protocol_error("reply", "a command started that its fence never held")
-                })?,
-            },
+            REPLY_STARTED => {
+                #[cfg(target_os = "macos")]
+                if placed.is_none() {
+                    return Err(protocol_error(
+                        "reply",
+                        "a command started that its fence never held",
+                    ));
+                }
+                Started::Running {
+                    birth: fields.birth().map_err(|e| protocol_error("reply", e))?,
+                    nice: placed,
+                }
+            }
             REPLY_EXITED => {
                 Started::Unexecutable(fields.exit().map_err(|e| protocol_error("reply", e))?)
             }
@@ -1126,11 +973,6 @@ impl ExecHost {
                 fields.bytes().map_err(|e| protocol_error("reply", e))?;
                 Started::ScriptSyntax
             }
-            REPLY_NICE_REFUSED => Started::NiceRefused(
-                fields
-                    .priority_failure()
-                    .map_err(|e| protocol_error("reply", e))?,
-            ),
             other => return Err(protocol_error("reply", format!("unexpected tag {other}"))),
         };
         fields
@@ -1366,8 +1208,6 @@ pub(super) struct HostActivator {
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
     envrc_directory: Option<PathBuf>,
-    /// The host CPU budget a spare's activation holds one token of while it runs.
-    cpu: Arc<dyn JobCpuAdmission>,
 }
 
 impl HostActivator {
@@ -1813,38 +1653,22 @@ impl Activator for HostActivator {
     type Output = (JobId, (OwnedFd, OwnedFd));
 
     /// A spare's activation output has no job to belong to and is discarded; its failure only
-    /// means no spare exists, and the next command activates for itself. It runs for no job, so
-    /// it holds one background token of its own while it activates (11_shell.md, spare): a
-    /// refused or unreachable budget is a failure like any other, and leaves no spare.
+    /// means no spare exists, and the next command activates for itself.
     async fn activate(
         &self,
         predicted: Vec<PathBuf>,
         output: Option<Self::Output>,
     ) -> Activation<ExecHost> {
-        let (owner, output, _stake) = match output {
-            Some((job_id, output)) => (TreeOwner::Job(job_id), output, None),
-            None => {
-                let stake = match self
-                    .cpu
-                    .activation(
-                        self.workspace_mount.clone(),
-                        format!("shell spare activation in {}", self.home().display()),
-                        None,
-                    )
-                    .await
-                {
-                    Ok(stake) => stake,
-                    Err(error) => return Activation::Broken { error },
-                };
-                match (null_device(), null_device()) {
-                    (Ok(stdout), Ok(stderr)) => (TreeOwner::Spare, (stdout, stderr), Some(stake)),
-                    (Err(error), _) | (_, Err(error)) => {
-                        return Activation::Broken {
-                            error: pipe_error(error),
-                        };
-                    }
+        let (owner, output) = match output {
+            Some((job_id, output)) => (TreeOwner::Job(job_id), output),
+            None => match (null_device(), null_device()) {
+                (Ok(stdout), Ok(stderr)) => (TreeOwner::Spare, (stdout, stderr)),
+                (Err(error), _) | (_, Err(error)) => {
+                    return Activation::Broken {
+                        error: pipe_error(error),
+                    };
                 }
-            }
+            },
         };
         let mut host = match self.spawn_host().await {
             Ok(host) => host,

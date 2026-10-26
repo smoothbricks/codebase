@@ -2,7 +2,6 @@ use std::{
     collections::BTreeSet,
     fmt,
     net::SocketAddr,
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -21,18 +20,16 @@ use zeroize::{Zeroize, Zeroizing};
 use cowshed_os::deadline::{self, Peer, PeerStream, WaitError};
 
 use cowshed_gateway_types::{
-    CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
-    EgressMode, FIRST_LAUNCH_OP, FirstLaunch, FirstLaunchProbe, HostPattern, JOBSERVER_OP,
-    LeaseClass, LeaseState, MirrorRoute, PhaseShare, RAM_DETACH_OP, RAM_LEASE_OP, RESIDENT_POOL_OP,
-    RamAttachRefusal, RamDetached, RamDiskAttached, RamDiskDevice, RamDiskEntry, RamDiskSectors,
-    RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus, TaskRunCaps,
-    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant, EgressMode, FIRST_LAUNCH_OP, FirstLaunch,
+    FirstLaunchProbe, HostPattern, LeaseClass, LeaseState, MirrorRoute, PhaseShare, RAM_DETACH_OP,
+    RAM_LEASE_OP, RamAttachRefusal, RamDetached, RamDiskAttached, RamDiskDevice, RamDiskEntry,
+    RamDiskSectors, RamDisks, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus,
+    TaskRunCaps, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
     actor::{GatewayError, GatewayHandle},
     config::{CONTROL_TCP_ADDR, StartupProbe},
-    cpu_budget::CpuBudget,
     disk_lease::{Claim, DiskLeases},
     interfaces::AuditEvent,
     repo_mirror::{MirrorInfo, RepoMirrorError, RepoMirrorHandle, RepoMirrorRequest},
@@ -43,8 +40,8 @@ use crate::{
 };
 
 const MAX_CONTROL_MESSAGE: u64 = 1024 * 1024;
-/// The longest checkout path a `cpu-tokens` request may name; a longer one is refused.
-const MAX_CHECKOUT: usize = 4096;
+/// The longest unit or owner name a `task-admit` request may carry; a longer one is refused.
+const MAX_NAME: usize = 4096;
 const MAX_AUDIT_TAIL_LIMIT: usize = 1024;
 const CONTROLLER_CREDENTIAL_BYTES: usize = 32;
 const CONTROLLER_CREDENTIAL_PREFIX: &str = "cctl1_";
@@ -122,15 +119,6 @@ impl GatewayControlClient {
         .ok_or(ControlError::InvalidResponse)
     }
 
-    /// The host CPU budget's ledger (05_gateway.md "Host CPU budget", Wire): who holds and who
-    /// waits for tokens, and the gate queue in the order returned tokens go to it.
-    pub async fn cpu_budget(&self) -> Result<CpuBudgetStatus, ControlError> {
-        self.send(&ControlRequest::CpuBudget)
-            .await?
-            .cpu_budget
-            .ok_or(ControlError::InvalidResponse)
-    }
-
     /// Clear the project's Nx accepted-task store (03_caches.md, "Nx accepted-task artifact
     /// service"). A refusal while the project's Nx work is in flight is [`ControlFailureCode::Busy`]
     /// and names that work.
@@ -153,33 +141,6 @@ impl GatewayControlClient {
             .await?
             .first_launch
             .ok_or(ControlError::InvalidResponse)
-    }
-
-    /// The gate jobs a gateway restart now would cut off (05_gateway.md, "An install refuses
-    /// while a land or a gate runs"): every gate job whose runners hold tokens and every gate job a
-    /// waiting request serves, oldest first. It reads `gateJobs` and `gateQueue` of the
-    /// `cpu-budget` answer and nothing else of the ledger, so an install reads the gates of a
-    /// running gateway of another build, whose ledger has fields this one lacks or does not know.
-    pub async fn gates_in_flight(
-        &self,
-    ) -> Result<BTreeSet<cowshed_core::api::GateJobRef>, ControlError> {
-        let response: GatesResponse = self.exchange(&ControlRequest::CpuBudget).await?;
-        if !response.ok {
-            return Err(ControlError::Rejected {
-                code: response.code.ok_or(ControlError::InvalidResponse)?,
-                message: response.error.ok_or(ControlError::InvalidResponse)?,
-            });
-        }
-        let gates = response.cpu_budget.ok_or(ControlError::InvalidResponse)?;
-        Ok(gates
-            .gate_jobs
-            .into_iter()
-            .chain(gates.gate_queue)
-            .map(|gate| cowshed_core::api::GateJobRef {
-                job: gate.job,
-                checkout: gate.checkout,
-            })
-            .collect())
     }
 
     pub async fn install(&self, session: &WorkspaceSession) -> Result<(), ControlError> {
@@ -454,8 +415,6 @@ enum ControlRequest {
         repo_id: String,
         device: String,
     },
-    /// The host CPU budget's ledger.
-    CpuBudget,
     /// One unit's terminal outcome: the fact its dependents read.
     TaskTerminal {
         unit: String,
@@ -494,7 +453,6 @@ impl ControlRequest {
             Self::SimApprove { .. } => "sim-approve",
             Self::SimList { .. } => "sim-list",
             Self::SimBoot { .. } => "sim-boot",
-            Self::CpuBudget => "cpu-budget",
             Self::TaskTerminal { .. } => "task-terminal",
             Self::TaskQueue => "task-queue",
             Self::NxCacheClear { .. } => "nx-cache-clear",
@@ -506,7 +464,7 @@ impl ControlRequest {
 }
 
 /// A request as the control socket reads it: a one-shot [`ControlRequest`] answered and closed,
-/// or a disk lease or CPU tokens, held for as long as its client keeps the connection open.
+/// or a RAM disk, disk or task-unit lease, held for as long as its client keeps the connection open.
 enum Incoming {
     Request(ControlRequest),
     /// A RAM disk held for the connection until it keeps or releases it (05_gateway.md, "RAM
@@ -519,34 +477,15 @@ enum Incoming {
         share: PhaseShare,
         command: String,
     },
-    CpuTokens {
-        want: NonZeroUsize,
-        checkout: String,
-        command: String,
-    },
-    Jobserver {
-        want: NonZeroUsize,
-        checkout: String,
-        command: String,
-        options: JobserverOptions,
-    },
-    /// A resident job's pool: no token, no queue place; each child it serves asks the host.
-    ResidentPool {
-        checkout: String,
-        command: String,
-        job: JobserverJobIn,
-    },
     TaskAdmit {
         unit: String,
         owner: String,
         incarnation: Option<String>,
         deps: Vec<String>,
         leases: Vec<LeaseClass>,
-        want: usize,
         priority: u32,
         urgent: bool,
         class: TaskClass,
-        cost: Option<u64>,
         deadline: Option<u64>,
         caps: Option<TaskRunCaps>,
         command: String,
@@ -564,16 +503,8 @@ struct DiskLeaseIn {
     command: String,
 }
 
-/// A `cpu-tokens` request's fields, read the way [`DiskLeaseIn`] is.
-#[derive(Deserialize)]
-struct CpuTokensIn {
-    want: NonZeroUsize,
-    checkout: String,
-    command: String,
-}
-
-/// A `task-admit` request's fields, read the way [`CpuTokensIn`] is. A unit with no `want` asks
-/// for no CPU; `deadline` is an absolute cache-domain deadline in epoch milliseconds.
+/// A `task-admit` request's fields, read the way [`DiskLeaseIn`] is; `deadline` is an absolute
+/// cache-domain deadline in epoch milliseconds.
 #[derive(Deserialize)]
 struct TaskAdmitIn {
     unit: String,
@@ -585,15 +516,11 @@ struct TaskAdmitIn {
     #[serde(default)]
     leases: Vec<LeaseClass>,
     #[serde(default)]
-    want: usize,
-    #[serde(default)]
     priority: u32,
     #[serde(default)]
     urgent: bool,
     #[serde(default)]
     class: TaskClass,
-    #[serde(default)]
-    cost: Option<u64>,
     #[serde(default)]
     deadline: Option<u64>,
     #[serde(default)]
@@ -602,95 +529,10 @@ struct TaskAdmitIn {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JobserverIn {
-    #[serde(flatten)]
-    tokens: CpuTokensIn,
-    #[serde(default)]
-    class: crate::jobserver::JobserverAdmission,
-    #[serde(default)]
-    pool: bool,
-    job: Option<JobserverJobIn>,
-    /// The requester's live CPU pool, which the job waits on beside the host ledger: the first
-    /// grant serves it.
-    parent_pool: Option<String>,
-    /// The requester can start the job before its grant and stop it when its probation ends
-    /// (05_gateway.md "A one-token job starts on probation").
-    #[serde(default)]
-    probation: bool,
-}
-
-struct JobserverOptions {
-    admission: crate::cpu_budget::Class,
-    pool_job: Option<JobserverJobIn>,
-    parent_pool: Option<PathBuf>,
-    /// The requester offered to run the job on probation.
-    probation: bool,
-}
-
-impl JobserverOptions {
-    /// Whether this ask may be lent the probation token (05_gateway.md "A one-token job starts on
-    /// probation"): a background ask for one token, for a job whose pool it asks for, naming no
-    /// requester's pool, from a requester that can stop the job it starts. A larger ask's command
-    /// sizes its runners when it starts, and they keep that size.
-    fn lendable(&self, want: NonZeroUsize) -> bool {
-        self.probation
-            && want == NonZeroUsize::MIN
-            && self.admission == crate::cpu_budget::Class::Background
-            && self.pool_job.is_some()
-            && self.parent_pool.is_none()
-    }
-}
-
-/// A `resident-pool` request's fields: the checkout its children's asks are for, what the
-/// resident runs, and the trusted job identity that scopes its pool. It names no `want`.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ResidentPoolIn {
-    checkout: String,
-    command: String,
-    job: JobserverJobIn,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct JobserverJobIn {
-    repo_id: cowshed_core::repository::RepoId,
-    workspace_incarnation: String,
-    job_id: std::num::NonZeroU64,
-}
-
-#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AuthenticatedControlRequestIn {
     controller_credential: String,
     request: serde_json::Value,
-}
-
-/// What [`GatewayControlClient::gates_in_flight`] reads of a `cpu-budget` answer: its outcome and
-/// the gate work, and nothing else. Unknown fields are not refused here, unlike everywhere else
-/// on this wire: an install reads the ledger of the gateway it is about to replace.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GatesResponse {
-    ok: bool,
-    code: Option<ControlFailureCode>,
-    error: Option<String>,
-    cpu_budget: Option<GatesWire>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GatesWire {
-    gate_jobs: Vec<GateWire>,
-    gate_queue: Vec<GateWire>,
-}
-
-/// A running gate job or a waiting gate-class request, by the gate job it serves.
-#[derive(Deserialize)]
-struct GateWire {
-    checkout: String,
-    job: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -715,22 +557,6 @@ struct ControlResponse {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lease: Option<LeaseState>,
-    /// How many CPU tokens a `cpu-tokens` grant holds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tokens: Option<usize>,
-    /// The jobserver fifo a `jobserver` grant names for `CARGO_MAKEFLAGS`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fifo: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cpu_pool: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cpu_budget: Option<CpuBudgetStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    queue: Option<cowshed_gateway_types::cpu_budget::CpuQueueWait>,
-    /// Why a queued ask waits, and for whom.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cause: Option<cowshed_gateway_types::CpuWaitCause>,
     /// What a selected task-server unit runs under.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_grant: Option<TaskGrant>,
@@ -740,9 +566,6 @@ struct ControlResponse {
     /// What an `nx-cache-clear` deleted.
     #[serde(skip_serializing_if = "Option::is_none")]
     nx_cache_cleared: Option<cowshed_core::api::NxStoreClearResult>,
-    /// The install that cut a queued CPU ask off, beside [`ControlFailureCode::InstallRestart`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    install: Option<cowshed_gateway_types::InstallRestart>,
     /// The whole disk a `ram-lease` attached and the registry entry it registers as.
     #[serde(skip_serializing_if = "Option::is_none")]
     ram_disk: Option<RamDiskAttached>,
@@ -777,9 +600,6 @@ pub enum ControlFailureCode {
     Rejected,
     /// Work the operation would cut off is running; the message names it. Retry once it ends.
     Busy,
-    /// A queued CPU ask an install cut off as it restarts the gateway; `install` names it. Ask
-    /// the gateway it starts, once ([`cowshed_gateway_types::INSTALL_RESTART_CODE`]).
-    InstallRestart,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1003,9 +823,7 @@ pub(crate) struct ControlServices {
     pub audit_tail: Option<AuditTailHandle>,
     pub startup: Option<Arc<dyn StartupProbe>>,
     pub disk_leases: DiskLeases,
-    pub cpu_budget: CpuBudget,
     pub task_server: crate::task_server::TaskServer,
-    pub jobserver: crate::jobserver::JobserverFifos,
     pub ram_disks: Option<Arc<dyn RamDisks>>,
     pub ram_leases: crate::ram_lease::Records,
     pub first_launch: Option<Arc<dyn FirstLaunchProbe>>,
@@ -1037,7 +855,6 @@ impl fmt::Debug for ControlServices {
             .field("audit_tail", &self.audit_tail)
             .field("startup", &self.startup)
             .field("disk_leases", &self.disk_leases)
-            .field("cpu_budget", &self.cpu_budget)
             .field("task_server", &self.task_server)
             .field("ram_disks", &self.ram_disks)
             .field("ram_leases", &self.ram_leases)
@@ -1166,130 +983,15 @@ async fn serve<R, W>(
             )
             .await;
         }
-        Ok(Incoming::CpuTokens {
-            want,
-            checkout,
-            command,
-        }) => {
-            let (stake, granted) = services.cpu_budget.ask(
-                Arc::from(checkout),
-                want,
-                Claim::new(&command, pid),
-                crate::cpu_budget::Rank::Background,
-            );
-            let budget = services.cpu_budget.clone();
-            hold(
-                reader,
-                writer,
-                stake,
-                granted,
-                |tokens| ControlResponse {
-                    tokens: Some(tokens),
-                    ..lease(LeaseState::Granted)
-                },
-                "CPU budget",
-                |_| cpu_ask_cut_off(&budget),
-            )
-            .await;
-        }
-        Ok(Incoming::Jobserver {
-            want,
-            checkout,
-            command,
-            options,
-        }) => {
-            // An exec from a holder waits on its requester's live pool and on the host ledger at
-            // once: the first grant serves it and the other ask is withdrawn (05_gateway.md "Work
-            // a holder starts draws on its grant"). Only a pool that cannot be reached is absent.
-            let parent = match options.parent_pool.as_deref() {
-                None => None,
-                Some(path) => match connect_parent(path).await {
-                    Ok(stream) => Some((path.to_path_buf(), stream)),
-                    // Only a pool that cannot be reached is absent: no socket file, or one no
-                    // socket is attached to. Darwin refuses a full queue too, which is a pool that
-                    // is there.
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::NotFound
-                            || (error.kind() == std::io::ErrorKind::ConnectionRefused
-                                && matches!(
-                                    cowshed_os::deadline::occupant(path),
-                                    Ok(cowshed_os::deadline::Occupant::Absent
-                                        | cowshed_os::deadline::Occupant::Stopped)
-                                )) =>
-                    {
-                        cowshed_os::eprintln!(
-                            "cowshed: the requester's CPU pool {} does not answer ({error}); `{command}` asks the host budget alone",
-                            path.display()
-                        );
-                        None
-                    }
-                    // Not absent: asking the host alone would admit the job twice beside a live pool.
-                    Err(error) => {
-                        let mut writer = writer;
-                        let refused = failure(
-                            ControlFailureCode::Rejected,
-                            format!(
-                                "the requester's CPU pool {} did not take its connect ({error}) and is not shown absent; `{command}` is refused",
-                                path.display()
-                            ),
-                        );
-                        let _ = write_response(&mut writer, &refused).await;
-                        return;
-                    }
-                },
-            };
-            let checkout: Arc<str> = Arc::from(checkout);
-            let claim = Claim::new(&command, pid);
-            let rank = options.admission.rank();
-            let lendable = options.lendable(want);
-            let admission = services.cpu_budget.ask_jobserver(
-                Arc::clone(&checkout),
-                want,
-                claim,
-                rank,
-                lendable,
-            );
-            hold_jobserver(
-                reader,
-                writer,
-                want,
-                admission,
-                parent,
-                services.jobserver.clone(),
-                options,
-                services.cpu_budget.clone(),
-                checkout,
-                &command,
-            )
-            .await;
-        }
-        Ok(Incoming::ResidentPool {
-            checkout,
-            command,
-            job,
-        }) => {
-            hold_resident_pool(
-                reader,
-                writer,
-                &services.jobserver,
-                services.cpu_budget.clone(),
-                Arc::from(checkout),
-                &command,
-                &job,
-            )
-            .await;
-        }
         Ok(Incoming::TaskAdmit {
             unit,
             owner,
             incarnation,
             deps,
             leases,
-            want,
             priority,
             urgent,
             class,
-            cost,
             deadline,
             caps,
             command,
@@ -1300,11 +1002,9 @@ async fn serve<R, W>(
                 incarnation: incarnation.map(Arc::from),
                 deps: deps.into_iter().map(Arc::from).collect(),
                 leases,
-                want,
                 priority,
                 urgent,
                 class,
-                cost,
                 deadline,
                 caps,
                 command: Arc::from(command),
@@ -1336,7 +1036,7 @@ async fn serve<R, W>(
     }
 }
 
-/// Hold one lease for this connection — a disk lease or CPU tokens — whose stake is `stake`:
+/// Hold one lease for this connection — a disk lease or a task unit — whose stake is `stake`:
 /// answer `queued` at once, the `granted` answer once the scheduler admits it, then hold until the
 /// client closes. A client that closes while queued leaves the queue; either way, dropping the
 /// stake gives back whatever it held. A scheduler that drops the grant is answered `stopped`.
@@ -1388,650 +1088,6 @@ async fn hold<R, W, S, G>(
     drop(stake);
 }
 
-/// Hold one jobserver grant: answer `queued` at once; on grant, create the
-/// fifo, name it in the granted answer, and hold until the client closes. The
-/// fifo is then drained and unlinked, and dropping the stake returns all of
-/// its tokens, including any a killed client read and never wrote back.
-///
-/// An exec from a holder (`parent`, its requester's live pool) waits on that pool and on the
-/// host ledger at once, and the first grant serves it (05_gateway.md "Work a holder starts draws
-/// on its grant"). The loser is withdrawn, which is said on stderr and as a timing event: the
-/// host stake dropped leaves the ledger's queue, and the pool connection closed leaves the pool's.
-/// A pool that answers and refuses before the host grants refuses the job. One ask is never
-/// granted twice, and each grant is accounted by the ledger that made it.
-#[allow(clippy::too_many_arguments)]
-async fn hold_jobserver<R, W>(
-    mut reader: R,
-    mut writer: W,
-    want: NonZeroUsize,
-    crate::cpu_budget::JobserverAsk {
-        stake,
-        granted,
-        queued,
-        lent,
-    }: crate::cpu_budget::JobserverAsk,
-    parent: Option<(PathBuf, cowshed_os::fork_lock::Fenced<UnixStream>)>,
-    fifos: crate::jobserver::JobserverFifos,
-    options: JobserverOptions,
-    budget: CpuBudget,
-    checkout: Arc<str>,
-    command: &str,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let (queue, cause) = match queued.await {
-        Ok(Some(crate::cpu_budget::Queued { mut wait, cause })) => {
-            wait.request.repository = wait
-                .request
-                .repository
-                .take()
-                .or_else(|| options.pool_job.as_ref().map(|job| job.repo_id.to_string()));
-            (Some(wait), Some(cause))
-        }
-        Ok(None) => (None, None),
-        Err(_) => {
-            let _ = write_response(&mut writer, &cpu_ask_cut_off(&budget)).await;
-            return;
-        }
-    };
-    if write_response(
-        &mut writer,
-        &ControlResponse {
-            queue,
-            cause,
-            ..lease(LeaseState::Queued)
-        },
-    )
-    .await
-    .is_err()
-    {
-        return;
-    }
-    let asked = std::time::Instant::now();
-    let job = match &options.pool_job {
-        Some(job) => format!(
-            "{}/{} job {}",
-            job.repo_id, job.workspace_incarnation, job.job_id
-        ),
-        None => command.to_owned(),
-    };
-    let refuse = |path: &Path, why: String| {
-        failure(
-            ControlFailureCode::Rejected,
-            format!(
-                "the requester's CPU pool {} {why} before the host granted `{job}`; the job is refused",
-                path.display()
-            ),
-        )
-    };
-    let mut parent = match parent {
-        None => None,
-        Some((path, stream)) => {
-            let mut stream = BufReader::new(stream);
-            let request = format!(
-                "{}\n",
-                serde_json::json!({ "op": "cpu-pool", "want": want })
-            );
-            if let Err(error) = stream.get_mut().write_all(request.as_bytes()).await {
-                let why = format!("cannot be asked ({error})");
-                let _ = write_response(&mut writer, &refuse(&path, why)).await;
-                return;
-            }
-            Some((path, stream))
-        }
-    };
-    /// Which ledger's grant arrived first, and its count; or the probation token, lent first.
-    enum Winner {
-        Host(usize),
-        Pool(usize),
-        Probation,
-    }
-    let mut granted = granted;
-    let mut discard = [0_u8; 64];
-    let winner = tokio::select! {
-        biased;
-        answer = &mut granted => match answer {
-            Ok(tokens) => Winner::Host(tokens),
-            Err(_) => {
-                let _ = write_response(&mut writer, &cpu_ask_cut_off(&budget)).await;
-                return;
-            }
-        },
-        answer = async {
-            match parent.as_mut() {
-                Some((path, stream)) => parent_grant(stream, want)
-                    .await
-                    .map_err(|why| refuse(path, why)),
-                None => std::future::pending().await,
-            }
-        } => match answer {
-            Ok(tokens) => Winner::Pool(tokens),
-            Err(refusal) => {
-                let _ = write_response(&mut writer, &refusal).await;
-                return;
-            }
-        },
-        // An ask that is granted, or never may be lent, is never told: its sender is dropped.
-        () = async {
-            let told = match lent {
-                Some(lent) => lent.await.is_ok(),
-                None => false,
-            };
-            if !told {
-                std::future::pending::<()>().await;
-            }
-        } => Winner::Probation,
-        _ = reader.read(&mut discard) => return,
-    };
-    let waited = asked.elapsed().as_millis();
-    let tokens = match (winner, parent) {
-        (Winner::Host(tokens), None) => tokens,
-        (Winner::Host(tokens), Some((path, stream))) => {
-            // Closing the pool connection leaves the pool's queue.
-            drop(stream);
-            withdrawn(
-                &job,
-                tokens,
-                "the host ledger",
-                &format!("the requester's CPU pool {}", path.display()),
-                waited,
-            );
-            tokens
-        }
-        (Winner::Pool(tokens), Some((path, stream))) => {
-            // Dropping the stake leaves the host ledger's queue; a host grant that raced in
-            // returns with it.
-            drop(stake);
-            withdrawn(
-                &job,
-                tokens,
-                &format!("the requester's CPU pool {}", path.display()),
-                "the host ledger",
-                waited,
-            );
-            hold_parent_grant(
-                reader,
-                writer,
-                stream,
-                &path,
-                (tokens, asked),
-                fifos,
-                options.pool_job,
-            )
-            .await;
-            return;
-        }
-        (Winner::Pool(_), None) => unreachable!("only a requester's pool grants from a pool"),
-        (Winner::Probation, None) => {
-            let job = options
-                .pool_job
-                .expect("only an ask for its job's pool is lent the probation token");
-            hold_probation(reader, writer, stake, granted, &fifos, &job, &budget, asked).await;
-            return;
-        }
-        (Winner::Probation, Some(_)) => {
-            unreachable!("an ask naming its requester's pool is never lent the probation token")
-        }
-    };
-    let named = job.clone();
-    let source = options.pool_job.as_ref().map(|job| {
-        // A gate's children rank as the gate job does, by its age, at every return; background
-        // children share the grant they were lent.
-        let source = match options.admission {
-            crate::cpu_budget::Class::Gate(repo) => crate::jobserver::PoolSource::Relay {
-                host: budget.clone(),
-                checkout,
-                repo,
-                job: stake.job(),
-                tokens: std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
-            },
-            // A grant below its ask tops up from the host ledger while tokens nobody waits for
-            // are free (05_gateway.md "All at once").
-            crate::cpu_budget::Class::Background if want.get() > tokens => {
-                crate::jobserver::PoolSource::Growing {
-                    tokens: std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
-                    growing: crate::jobserver::Growing {
-                        grower: stake.grower(),
-                        want: want.get(),
-                        named,
-                    },
-                }
-            }
-            crate::cpu_budget::Class::Background => crate::jobserver::PoolSource::Lent(
-                std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
-            ),
-        };
-        (source, job)
-    });
-    let Some(served) = answer_grant(
-        &mut writer,
-        &fifos,
-        tokens,
-        source,
-        asked,
-        LeaseState::Granted,
-    )
-    .await
-    else {
-        return;
-    };
-    // Hold until the client closes. The fifo holds the grant's `g − 1` bytes, and a growing
-    // pool's added ones while they are in use (05_gateway.md "All at once").
-    while let Ok(read) = reader.read(&mut discard).await
-        && read > 0
-    {}
-    served.close().await;
-    drop(stake);
-}
-
-/// Hold a one-token job on probation (05_gateway.md "A one-token job starts on probation"): serve
-/// its pool, whose holder's own token is the probation token, and answer `probation`; answer
-/// `granted`, naming the same pool and fifo, when the ledger grants the job its one token, and
-/// hold that grant until the client closes. The client's `probation-over` returns the probation
-/// token and keeps the ask's place; its close, or any other line, leaves the queue.
-#[allow(clippy::too_many_arguments)]
-async fn hold_probation<R, W>(
-    reader: R,
-    mut writer: W,
-    stake: crate::cpu_budget::Stake,
-    mut granted: tokio::sync::oneshot::Receiver<usize>,
-    fifos: &crate::jobserver::JobserverFifos,
-    job: &JobserverJobIn,
-    budget: &CpuBudget,
-    asked: std::time::Instant,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let Some(mut served) = answer_grant(
-        &mut writer,
-        fifos,
-        1,
-        Some((crate::jobserver::PoolSource::Probation, job)),
-        asked,
-        LeaseState::Probation,
-    )
-    .await
-    else {
-        return;
-    };
-    let mut lines = BufReader::new(reader);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        tokio::select! {
-            biased;
-            answer = &mut granted => match answer {
-                Ok(tokens) => {
-                    if let Served::Pool(pool) = &mut served {
-                        pool.grant_probation();
-                    }
-                    if write_response(&mut writer, &served.answer(tokens, LeaseState::Granted))
-                        .await
-                        .is_err()
-                    {
-                        served.close().await;
-                        return;
-                    }
-                    cowshed_os::eprintln!(
-                        "cowshed: timing lease-grant scheduler=\"jobserver\" elapsed_ns={} tokens={tokens} after=probation",
-                        asked.elapsed().as_nanos(),
-                    );
-                    break;
-                }
-                Err(_) => {
-                    let _ = write_response(&mut writer, &cpu_ask_cut_off(budget)).await;
-                    served.close().await;
-                    return;
-                }
-            },
-            read = async { (&mut lines).take(4097).read_line(&mut line).await } => match read {
-                Ok(read) if read > 0 && line.ends_with('\n') && probation_over(&line) => {
-                    stake.probation_over();
-                }
-                // EOF, a broken socket, or a line a probation client never sends: it is gone
-                // or confused, and either way it leaves the queue.
-                _ => {
-                    served.close().await;
-                    return;
-                }
-            },
-        }
-    }
-    // Hold the grant until the client closes. A `probation-over` that crossed the grant is
-    // discarded with whatever else it sends.
-    let mut discard = [0_u8; 64];
-    while let Ok(read) = lines.read(&mut discard).await
-        && read > 0
-    {}
-    served.close().await;
-    drop(stake);
-}
-
-/// Whether `line` is exactly a probation's end: `{"op":"probation-over"}`.
-fn probation_over(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
-        value.as_object().is_some_and(|object| {
-            object.len() == 1
-                && object.get("op").and_then(serde_json::Value::as_str)
-                    == Some(cowshed_gateway_types::PROBATION_OVER_OP)
-        })
-    })
-}
-
-/// What a jobserver grant is served as: a job's private pool, whose make jobserver fifo holds the
-/// grant's tokens and lends them to its children, or a bare fifo for a client that serves none.
-enum Served {
-    Pool(crate::jobserver::CpuPool),
-    Fifo(crate::jobserver::JobserverFifo),
-}
-
-impl Served {
-    /// The fifo the grant names for `CARGO_MAKEFLAGS`.
-    fn fifo(&self) -> &Path {
-        match self {
-            Self::Pool(pool) => pool.fifo().expect("a token-holding pool has a fifo"),
-            Self::Fifo(fifo) => fifo.path(),
-        }
-    }
-
-    /// The answer naming `tokens` of this grant, its fifo and, for a job, its pool.
-    fn answer(&self, tokens: usize, state: LeaseState) -> ControlResponse {
-        ControlResponse {
-            cpu_pool: match self {
-                Self::Pool(pool) => Some(pool.path().to_string_lossy().into_owned()),
-                Self::Fifo(_) => None,
-            },
-            tokens: Some(tokens),
-            fifo: Some(self.fifo().to_string_lossy().into_owned()),
-            ..lease(state)
-        }
-    }
-
-    /// Close the pool and drain and unlink the fifo; tokens a client still holds are its own.
-    async fn close(self) {
-        match self {
-            Self::Pool(pool) => {
-                if let Err(error) = pool.close().await {
-                    cowshed_os::eprintln!("cowshed: jobserver CPU pool did not close: {error}");
-                }
-            }
-            Self::Fifo(fifo) => fifo.drain_and_unlink(),
-        }
-    }
-}
-
-/// Serve a granted jobserver — for a job, its private pool and that pool's fifo; otherwise a
-/// fifo of its own — and answer it as `state`: `granted`, or `probation` for a job lent the
-/// probation token. `None` once it cannot be made, which is answered, or the client is gone.
-async fn answer_grant<W>(
-    writer: &mut W,
-    fifos: &crate::jobserver::JobserverFifos,
-    tokens: usize,
-    pool: Option<(crate::jobserver::PoolSource, &JobserverJobIn)>,
-    asked: std::time::Instant,
-    state: LeaseState,
-) -> Option<Served>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let served = match pool {
-        None => fifos
-            .create(tokens)
-            .map(Served::Fifo)
-            .map_err(|error| format!("cannot create the jobserver fifo: {error}")),
-        Some((source, job)) => fifos
-            .create_pool(source, &job.workspace_incarnation)
-            .map(|pool| {
-                cowshed_os::timing::event("jobserver", || {
-                    format!(
-                        "pool {tokens} for {}/{} job {} at {}",
-                        job.repo_id,
-                        job.workspace_incarnation,
-                        job.job_id,
-                        pool.path().display()
-                    )
-                });
-                Served::Pool(pool)
-            })
-            .map_err(|error| format!("cannot serve the job's CPU pool: {error}")),
-    };
-    let served = match served {
-        Ok(served) => served,
-        Err(error) => {
-            let _ = write_response(writer, &failure(ControlFailureCode::Rejected, error)).await;
-            return None;
-        }
-    };
-    if write_response(writer, &served.answer(tokens, state))
-        .await
-        .is_err()
-    {
-        served.close().await;
-        return None;
-    }
-    cowshed_os::eprintln!(
-        "cowshed: timing lease-grant scheduler=\"jobserver\" elapsed_ns={} tokens={tokens} lease={state:?}",
-        asked.elapsed().as_nanos(),
-    );
-    Some(served)
-}
-
-/// Connect to a requester's live CPU pool. Only a pool that cannot be reached is absent.
-async fn connect_parent(path: &Path) -> std::io::Result<cowshed_os::fork_lock::Fenced<UnixStream>> {
-    // connect_unix fences each poll so no concurrently spawned child keeps this descriptor
-    // past exec, and ends a connect the pool never answers at the handshake bound.
-    let budget = deadline::start("jobserver parent pool", deadline::HANDSHAKE);
-    let peer = Peer::unix("requester CPU pool", path);
-    let stream = deadline::connect_unix(&budget, &peer, path).await?;
-    Ok(cowshed_os::fork_lock::Fenced::new(stream))
-}
-
-/// What a requester's pool granted: the first `granted` line after its `queued`, a whole count
-/// between one and `want`, or why it gave none. Its refusal is the job's refusal.
-async fn parent_grant<R>(parent: &mut R, want: NonZeroUsize) -> Result<usize, String>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    use tokio::io::AsyncBufReadExt as _;
-    loop {
-        let mut line = String::new();
-        match parent.read_line(&mut line).await {
-            Ok(0) => return Err("closed without granting".to_owned()),
-            Ok(_) => {}
-            Err(error) => return Err(format!("stopped answering ({error})")),
-        }
-        let answer: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|error| format!("answered with no JSON line ({error})"))?;
-        if answer["ok"] != true {
-            let code = answer["code"].as_str().unwrap_or("refused");
-            let error = answer["error"].as_str().unwrap_or("no diagnostic");
-            return Err(format!("refused ({code}: {error})"));
-        }
-        match answer["lease"].as_str() {
-            Some("queued") => continue,
-            Some("granted") => {
-                return answer["tokens"]
-                    .as_u64()
-                    .and_then(|tokens| usize::try_from(tokens).ok())
-                    .filter(|tokens| (1..=want.get()).contains(tokens))
-                    .ok_or_else(|| format!("granted {} tokens for {want}", answer["tokens"]));
-            }
-            _ => return Err(format!("answered {}", line.trim_end())),
-        }
-    }
-}
-
-/// Say that `job`'s first grant came from `winner` and its ask of `loser` was withdrawn, on
-/// stderr and as a jobserver timing event (05_gateway.md "Work a holder starts draws on its
-/// grant").
-fn withdrawn(job: &str, tokens: usize, winner: &str, loser: &str, waited_ms: u128) {
-    cowshed_os::eprintln!(
-        "cowshed: `{job}` was granted {tokens} token(s) by {winner}; its ask of {loser} was withdrawn after {waited_ms} ms"
-    );
-    cowshed_os::timing::event("jobserver", || {
-        format!(
-            "grant {job} tokens={tokens} by {winner}; {loser} ask withdrawn after {waited_ms}ms"
-        )
-    });
-}
-
-/// Serve a job the grant its requester's live pool made, as a host grant is served: its fifo
-/// and, for a job, its own lent pool. The host ledger holds no place for it, since its tokens are
-/// the requester's. The pool's end ends the job's accounting, never its work: its own pool lends
-/// nothing more and the job runs on to its own exit, as across a gateway restart. The client's
-/// close returns the tokens to the pool.
-async fn hold_parent_grant<R, W>(
-    mut reader: R,
-    mut writer: W,
-    mut parent: BufReader<cowshed_os::fork_lock::Fenced<UnixStream>>,
-    parent_path: &Path,
-    (tokens, asked): (usize, std::time::Instant),
-    fifos: crate::jobserver::JobserverFifos,
-    pool_job: Option<JobserverJobIn>,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut discard = [0_u8; 64];
-    let source = pool_job.as_ref().map(|job| {
-        (
-            crate::jobserver::PoolSource::Lent(
-                NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
-            ),
-            job,
-        )
-    });
-    let Some(served) = answer_grant(
-        &mut writer,
-        &fifos,
-        tokens,
-        source,
-        asked,
-        LeaseState::Granted,
-    )
-    .await
-    else {
-        return;
-    };
-    let mut served = Some(served);
-    let mut parent_open = true;
-    let mut parent_byte = [0_u8; 1];
-    loop {
-        tokio::select! {
-            read = reader.read(&mut discard) => if !matches!(read, Ok(read) if read > 0) { break },
-            // A pool says nothing after its grant: any byte or end is the end of that grant.
-            _ = parent.read(&mut parent_byte), if parent_open => {
-                parent_open = false;
-                cowshed_os::eprintln!(
-                    "cowshed: the requester's CPU pool {} ended its {tokens}-token grant; the job runs on over budget until it ends, and its own pool lends nothing more",
-                    parent_path.display()
-                );
-                // Its own pool's fifo goes with it: a Cargo that holds it open keeps what it reads.
-                if matches!(served, Some(Served::Pool(_)))
-                    && let Some(pool) = served.take()
-                {
-                    pool.close().await;
-                }
-            }
-        }
-    }
-    if let Some(served) = served {
-        served.close().await;
-    }
-    drop(parent);
-}
-
-/// Hold one resident job's pool: answer `queued`, then at once `granted` with the pool and no
-/// tokens, since a resident takes no place in the ledger; serve it until the client closes. Each
-/// child that asks the pool asks the host budget itself, at background class, for `checkout`
-/// (05_gateway.md "A resident holds no token"), so the resident costs tokens only while a
-/// request of its runs, and closing the pool ends every child's local grant with it.
-async fn hold_resident_pool<R, W>(
-    mut reader: R,
-    mut writer: W,
-    fifos: &crate::jobserver::JobserverFifos,
-    budget: CpuBudget,
-    checkout: Arc<str>,
-    command: &str,
-    job: &JobserverJobIn,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    // The same two answers every held CPU request gets, so a supervisor reads one protocol.
-    if write_response(&mut writer, &lease(LeaseState::Queued))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let source = crate::jobserver::PoolSource::Resident {
-        host: budget,
-        checkout,
-    };
-    let pool = match fifos.create_pool(source, &job.workspace_incarnation) {
-        Ok(pool) => pool,
-        Err(error) => {
-            let _ = write_response(
-                &mut writer,
-                &failure(
-                    ControlFailureCode::Rejected,
-                    format!("cannot serve the resident job's CPU pool: {error}"),
-                ),
-            )
-            .await;
-            return;
-        }
-    };
-    cowshed_os::timing::event("jobserver", || {
-        format!(
-            "resident pool for {}/{} job {} at {}: {command}",
-            job.repo_id,
-            job.workspace_incarnation,
-            job.job_id,
-            pool.path().display()
-        )
-    });
-    let answer = ControlResponse {
-        cpu_pool: Some(pool.path().to_string_lossy().into_owned()),
-        ..lease(LeaseState::Granted)
-    };
-    if write_response(&mut writer, &answer).await.is_ok() {
-        let mut discard = [0_u8; 64];
-        while let Ok(read) = reader.read(&mut discard).await
-            && read > 0
-        {}
-    }
-    if let Err(error) = pool.close().await {
-        cowshed_os::eprintln!("cowshed: resident CPU pool did not close: {error}");
-    }
-}
-
-/// A checkout a CPU request names: a path of 1 to [`MAX_CHECKOUT`] bytes.
-fn checked_checkout(checkout: &str) -> Result<(), ControlError> {
-    if checkout.is_empty() || checkout.len() > MAX_CHECKOUT {
-        return Err(ControlError::Encoding(format!(
-            "a cpu-tokens checkout must name a path of 1 to {MAX_CHECKOUT} bytes"
-        )));
-    }
-    Ok(())
-}
-
-/// The trusted job identity a private CPU pool is scoped by: a JavaScript-safe job id and a
-/// workspace incarnation the pool directory layout accepts.
-fn checked_job(job: JobserverJobIn) -> Result<JobserverJobIn, ControlError> {
-    if job.job_id.get() > 9_007_199_254_740_991 {
-        return Err(ControlError::Encoding(
-            "jobId must be a positive JavaScript-safe integer".to_owned(),
-        ));
-    }
-    cowshed_gateway_types::cpu_pool_directory(Path::new("."), &job.workspace_incarnation)
-        .map_err(|error| ControlError::Encoding(error.to_string()))?;
-    Ok(job)
-}
-
 fn parse_control_request(bytes: &[u8]) -> Result<Incoming, ControlError> {
     let value =
         serde_json::from_slice(bytes).map_err(|error| ControlError::Encoding(error.to_string()))?;
@@ -2057,7 +1113,6 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "sim-approve" => &["op", "approval"],
         "sim-list" => &["op", "repoId"],
         "sim-boot" => &["op", "repoId", "device"],
-        "cpu-budget" => &["op"],
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
         "nx-cache-clear" => &["op", "repoId"],
@@ -2072,29 +1127,14 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             "incarnation",
             "deps",
             "leases",
-            "want",
             "priority",
             "urgent",
             "class",
-            "cost",
             "deadline",
             "caps",
             "command",
         ],
         DISK_LEASE_OP => &["op", "class", "share", "command"],
-        CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
-        JOBSERVER_OP => &[
-            "op",
-            "want",
-            "checkout",
-            "command",
-            "class",
-            "pool",
-            "job",
-            "parentPool",
-            "probation",
-        ],
-        RESIDENT_POOL_OP => &["op", "checkout", "command", "job"],
         _ => {
             return Err(ControlError::Encoding(
                 "unknown gateway control operation".to_owned(),
@@ -2127,110 +1167,6 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             command,
         });
     }
-    if op == RESIDENT_POOL_OP {
-        let ResidentPoolIn {
-            checkout,
-            command,
-            job,
-        } = serde_json::from_value(value).map_err(encoding)?;
-        checked_checkout(&checkout)?;
-        return Ok(Incoming::ResidentPool {
-            checkout,
-            command,
-            job: checked_job(job)?,
-        });
-    }
-    let jobserver = op == JOBSERVER_OP;
-    if op == CPU_TOKENS_OP || jobserver {
-        let (tokens, options) = if jobserver {
-            let JobserverIn {
-                tokens,
-                class,
-                pool,
-                job,
-                parent_pool,
-                probation,
-            } = serde_json::from_value(value).map_err(encoding)?;
-            if let Some(parent) = &parent_pool
-                && (!Path::new(parent).is_absolute()
-                    || parent.len() > MAX_CHECKOUT
-                    || parent.contains('\0'))
-            {
-                return Err(ControlError::Encoding(format!(
-                    "a parentPool is an absolute socket path of at most {MAX_CHECKOUT} bytes \
-                     without NUL"
-                )));
-            }
-            let pool_job = if pool {
-                let job = job.ok_or_else(|| {
-                    ControlError::Encoding(
-                        "a private CPU pool requires the trusted job identity".to_owned(),
-                    )
-                })?;
-                Some(checked_job(job)?)
-            } else {
-                None
-            };
-            let admission = match class {
-                crate::jobserver::JobserverAdmission::Background => {
-                    crate::cpu_budget::Class::Background
-                }
-                crate::jobserver::JobserverAdmission::Gate => {
-                    let job = pool_job.as_ref().ok_or_else(|| {
-                        ControlError::Encoding(
-                            "a gate requires a private CPU pool and the trusted repository/job identity".to_owned(),
-                        )
-                    })?;
-                    if parent_pool.is_some() {
-                        return Err(ControlError::Encoding(
-                            "a gate is admitted by the host repository queue, never a parentPool"
-                                .to_owned(),
-                        ));
-                    }
-                    crate::cpu_budget::Class::Gate(Arc::from(job.repo_id.as_str()))
-                }
-            };
-            (
-                tokens,
-                JobserverOptions {
-                    admission,
-                    pool_job,
-                    parent_pool: parent_pool.map(PathBuf::from),
-                    probation,
-                },
-            )
-        } else {
-            (
-                serde_json::from_value(value).map_err(encoding)?,
-                JobserverOptions {
-                    admission: crate::cpu_budget::Class::Background,
-                    pool_job: None,
-                    parent_pool: None,
-                    probation: false,
-                },
-            )
-        };
-        let CpuTokensIn {
-            want,
-            checkout,
-            command,
-        } = tokens;
-        checked_checkout(&checkout)?;
-        return Ok(if jobserver {
-            Incoming::Jobserver {
-                want,
-                checkout,
-                command,
-                options,
-            }
-        } else {
-            Incoming::CpuTokens {
-                want,
-                checkout,
-                command,
-            }
-        });
-    }
     if op == TASK_ADMIT_OP {
         let TaskAdmitIn {
             unit,
@@ -2238,19 +1174,17 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             incarnation,
             deps,
             leases,
-            want,
             priority,
             urgent,
             class,
-            cost,
             deadline,
             caps,
             command,
         } = serde_json::from_value(value).map_err(encoding)?;
         for named in [&unit, &owner] {
-            if named.is_empty() || named.len() > MAX_CHECKOUT {
+            if named.is_empty() || named.len() > MAX_NAME {
                 return Err(ControlError::Encoding(format!(
-                    "a task-admit unit and owner must name 1 to {MAX_CHECKOUT} bytes"
+                    "a task-admit unit and owner must name 1 to {MAX_NAME} bytes"
                 )));
             }
         }
@@ -2265,11 +1199,9 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             incarnation,
             deps,
             leases,
-            want,
             priority,
             urgent,
             class,
-            cost,
             deadline,
             caps,
             command,
@@ -2288,10 +1220,6 @@ async fn serve_request<W>(
     W: AsyncWrite + Unpin,
 {
     let (response, mut subscription) = match request {
-        // `cpu-budget` is the one request a client of another build reads with a reader that
-        // ignores unknown fields, which would take a heartbeat line for an answer with no gate
-        // jobs; it answers from the ledger at once, so it is never heartbeated.
-        Ok(request @ ControlRequest::CpuBudget) => dispatch(request, &services).await,
         Ok(request) => answered(&mut writer, &services.handle, dispatch(request, &services)).await,
         Err(error) => {
             let code = if matches!(error, ControlError::Unauthorized) {
@@ -2574,19 +1502,6 @@ async fn dispatch(
             match services.sim_broker.boot_device(repo_id, device).await {
                 Ok(()) => success(),
                 Err(error) => sim_rejected(error),
-            },
-            None,
-        ),
-        ControlRequest::CpuBudget => (
-            match services.cpu_budget.status().await {
-                Some(budget) => ControlResponse {
-                    cpu_budget: Some(budget),
-                    ..success()
-                },
-                None => failure(
-                    ControlFailureCode::Rejected,
-                    "the gateway's CPU budget has stopped".to_owned(),
-                ),
             },
             None,
         ),
@@ -3012,16 +1927,9 @@ fn success() -> ControlResponse {
         code: None,
         error: None,
         lease: None,
-        tokens: None,
-        fifo: None,
-        cpu_pool: None,
-        cpu_budget: None,
-        queue: None,
-        cause: None,
         task_grant: None,
         task_queue: None,
         nx_cache_cleared: None,
-        install: None,
         ram_disk: None,
         ram_detach: None,
         first_launch: None,
@@ -3051,22 +1959,6 @@ fn scheduler_stopped(scheduler: &str) -> ControlResponse {
         ControlFailureCode::Rejected,
         format!("the gateway's {scheduler} has stopped"),
     )
-}
-
-/// The refusal of a queued CPU ask whose grant the budget dropped: cut off for the install
-/// restarting the gateway, which it names, so its client asks the gateway that install starts
-/// once (05_gateway.md "A queued CPU ask outlives an install"); otherwise the budget stopped.
-fn cpu_ask_cut_off(budget: &CpuBudget) -> ControlResponse {
-    match budget.installing() {
-        Some(install) => ControlResponse {
-            install: Some(install.clone()),
-            ..failure(
-                ControlFailureCode::InstallRestart,
-                crate::cpu_budget::cut_off_by(install),
-            )
-        },
-        None => scheduler_stopped("CPU budget"),
-    }
 }
 
 fn invalid_session(error: String) -> ControlResponse {
@@ -3210,12 +2102,6 @@ mod tests {
             r#"{"op":"disk-lease","class":"compute","command":"diskutil"}"#,
             r#"{"op":"disk-lease","class":"storage","share":"half","command":"diskutil"}"#,
             r#"{"op":"disk-lease","class":"storage"}"#,
-            r#"{"op":"cpu-tokens","want":0,"checkout":"/w","command":"nextest"}"#,
-            r#"{"op":"cpu-tokens","want":-1,"checkout":"/w","command":"nextest"}"#,
-            r#"{"op":"cpu-tokens","want":4,"checkout":"","command":"nextest"}"#,
-            r#"{"op":"cpu-tokens","want":4,"command":"nextest"}"#,
-            r#"{"op":"cpu-tokens","want":4,"checkout":"/w","command":"nextest","pid":1}"#,
-            r#"{"op":"cpu-budget","verbose":true}"#,
             r#"{"op":"first-launch","x":1}"#,
         ] {
             assert!(parse_control_request(request.as_bytes()).is_err());
@@ -3239,17 +2125,6 @@ mod tests {
                 share: PhaseShare::Alone,
                 command,
             }) if command == "/usr/bin/hdiutil detach"
-        ));
-        assert!(matches!(
-            parse_control_request(
-                br#"{"op":"cpu-tokens","want":64,"checkout":"/w","command":"cargo nextest run"}"#
-            ),
-            Ok(Incoming::CpuTokens { want, checkout, command })
-                if want.get() == 64 && checkout == "/w" && command == "cargo nextest run"
-        ));
-        assert!(matches!(
-            parse_control_request(br#"{"op":"cpu-budget"}"#),
-            Ok(Incoming::Request(ControlRequest::CpuBudget))
         ));
         assert!(matches!(
             parse_control_request(br#"{"op":"nx-cache-clear","repoId":"acme/widget"}"#),
@@ -3301,16 +2176,6 @@ mod tests {
         ] {
             assert!(parse_control_request(refused).is_err());
         }
-        assert!(
-            parse_control_request(
-                format!(
-                    r#"{{"op":"cpu-tokens","want":1,"checkout":"{}","command":"x"}}"#,
-                    "c".repeat(MAX_CHECKOUT + 1)
-                )
-                .as_bytes()
-            )
-            .is_err()
-        );
         assert!(
             serde_json::from_str::<AuthenticatedControlRequestIn>(
                 r#"{"controllerCredential":"secret","request":{"op":"status"},"extra":true}"#,
@@ -3366,57 +2231,6 @@ mod tests {
             expect_eof(&mut reader).await,
             Err(ControlError::MessageTooLarge)
         ));
-    }
-
-    /// An install reads the gates of the gateway it is about to replace, which is of another
-    /// build (05_gateway.md "An install refuses while a land or a gate runs"). A ledger that lacks
-    /// a field this build reports (here `holders`, with a `running` this build no longer reads)
-    /// still names its gates, while the full ledger read refuses it: a refused read would let the
-    /// install restart the gateway without refusing, and cut a running land off.
-    #[tokio::test]
-    async fn an_install_reads_the_gates_of_a_ledger_from_another_build() {
-        // Under `/tmp`: a bind path is capped at `sun_path`'s 104 bytes.
-        let id = Uuid::new_v4().simple().to_string();
-        let root = test_fixture_dir::secure_fixture_dir(&format!("csgates-{}", &id[..8]));
-        let socket = root.path().join("gateway.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
-        let answer = serde_json::json!({"ok": true, "cpuBudget": {"total": 4, "held": 3,
-            "checkouts": [{"checkout": "/w/land", "held": 2, "running": 2, "waiting": 1},
-                {"checkout": "/w/f", "held": 1, "running": 1, "waiting": 0}],
-            "gateJobs": [{"checkout": "/w/land", "job": 3, "held": 2, "running": 2}],
-            "gateQueue": [{"checkout": "/w/other", "job": 5, "want": 2},
-                {"checkout": "/w/land", "job": 3, "want": 1}],
-            "background": [{"checkout": "/w/f", "held": 1, "running": 1, "waiting": 0}]}});
-        let answering = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().await.expect("accept");
-                let request = read_request_line(&mut stream).await.expect("one request");
-                assert_eq!(request.as_slice(), b"{\"op\":\"cpu-budget\"}\n");
-                stream
-                    .write_all(format!("{answer}\n").as_bytes())
-                    .await
-                    .expect("answer");
-            }
-        });
-        let client = GatewayControlClient::new(socket).expect("client");
-        assert_eq!(
-            client.gates_in_flight().await.expect("the gates"),
-            BTreeSet::from([
-                cowshed_core::api::GateJobRef {
-                    job: 3,
-                    checkout: "/w/land".into(),
-                },
-                cowshed_core::api::GateJobRef {
-                    job: 5,
-                    checkout: "/w/other".into(),
-                },
-            ])
-        );
-        assert!(
-            client.cpu_budget().await.is_err(),
-            "the full ledger of another build is not this build's"
-        );
-        answering.await.expect("the answers");
     }
 
     /// A daemon that takes the request and never answers, not even a heartbeat, is named

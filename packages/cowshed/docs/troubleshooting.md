@@ -358,12 +358,12 @@ checkout's build, run its own `packages/cowshed/bin/cowshed setup`; a plain `cow
 installs nothing new. A `cowshed` on `PATH` that is a link into a checkout runs whatever that checkout last built, which
 is how the two drift apart; setup repoints such a link at the installed copy.
 
-Setup exits 4 without installing or restarting anything while a restart would cut work off: a land holding its
-repository's turn, or a gate job holding or wanting CPU tokens. Its storage repair, which runs first, stays done. The
-refusal names each blocker; rerun setup once they have ended (`cowshed gateway status` lists the land turns and gate
-jobs). No install window is needed and setup never waits for them. If an earlier install failed and left the gateway
-agent unloaded, the error says so and names the `launchctl bootstrap gui/<uid> '<plist>'` that loads it;
-`launchctl kickstart` cannot load an agent launchd does not hold ("Could not find service").
+Setup exits 4 without installing or restarting anything while a restart would cut a land off: a land holding its
+repository's turn. Its storage repair, which runs first, stays done. The refusal names each land; rerun setup once they
+have ended (`cowshed gateway status` lists the land turns). No install window is needed and setup never waits for them.
+If an earlier install failed and left the gateway agent unloaded, the error says so and names the
+`launchctl bootstrap gui/<uid> '<plist>'` that loads it; `launchctl kickstart` cannot load an agent launchd does not
+hold ("Could not find service").
 
 ## `cowshed exec` says a workspace supervisor is another cowshed build
 

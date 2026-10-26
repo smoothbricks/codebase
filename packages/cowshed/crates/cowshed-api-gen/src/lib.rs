@@ -50,7 +50,7 @@ pub fn collect_api(project: &Path) -> Result<ir::Api, String> {
         let module = module_of("cowshed_core", name)?;
         parse_module(&core.join(name), &module, true, &mut api)?;
     }
-    for name in ["cpu_budget.rs", "status.rs"] {
+    for name in ["host_status.rs", "status.rs"] {
         let source = project.join("crates/cowshed-gateway-types/src").join(name);
         let module = module_of("cowshed_gateway_types", name)?;
         parse_module(&source, &module, true, &mut api)?;

@@ -2643,7 +2643,7 @@ mod tests {
             ProcessEvent::Started {
                 job_id,
                 process: owned(&command),
-                nice: 10,
+                nice: Some(10),
             },
             1,
         )

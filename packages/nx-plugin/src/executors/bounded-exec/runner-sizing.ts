@@ -1,17 +1,14 @@
-import { setTimeout as delay } from 'node:timers/promises';
-import { holdLease, type InstallRestart, type Unleased } from './gateway-lease.js';
 import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
 
 /**
- * The client half of cowshed's host CPU budget (specs/cowshed/05_gateway.md, "Host CPU budget").
+ * How a runner's parallelism is read from its command and sized to the tokens its CPU pool lends
+ * (specs/cowshed/05_gateway.md, "Host scheduling", "Parallelism inside a job").
  *
- * Every gate on a host sizes its runners to the whole machine: Nx runs a task per core and each
- * nextest run under it runs a test thread per core again, so a few concurrent gates keep the load
- * average several times the core count and tests that do no disk work time out waiting for a CPU.
- * The cowshed gateway holds one budget of CPU tokens for the host, about one per core. Before it
- * starts a runner, bounded-exec asks for as many tokens as the runner would run threads or
- * processes at once, and sizes the runner to the grant: every gate keeps running in parallel, and
- * the total stays near the core count.
+ * A runner sizes itself to the whole machine unless something sizes it: Nx runs a task per core and
+ * each nextest run under it runs a test thread per core again. Before it starts a runner,
+ * bounded-exec asks its parent's pool for as many tokens as the runner would run threads or
+ * processes at once and sizes the runner to the grant, so the runners of one build tree together
+ * stay within that tree's pool.
  */
 
 /** How a runner's parallelism is set, which decides what it asks for and how a grant sizes it. */
@@ -39,7 +36,7 @@ export interface TestThreadCeilings {
 }
 
 /**
- * What a runner asks the budget for. A cargo build, and a process whose script may start Cargo, carry the test-thread
+ * What a runner asks its pool for. A cargo build, and a process whose script may start Cargo, carry the test-thread
  * ceilings their sizing keeps; cargo-mutants carries how many cargo processes it runs at once, which share its grant.
  */
 export type Demand =
@@ -287,8 +284,9 @@ export function withInvocationFlag(
  * so they cannot outrank that size. `CPU_TOKENS_ENV` still reports the actual held grant.
  *
  * Cargo's rustc count is the pool's: the executor's sub-pool exports its jobserver fifo, so no `CARGO_BUILD_JOBS`
- * comes from the grant (specs/cowshed/05_gateway.md, "The jobserver fifo"). Test threads take no jobserver token, so a
- * cargo build's test threads are its size, and a process's, whose script may start Cargo, are its whole held grant.
+ * comes from the grant (specs/cowshed/05_gateway.md, "Cargo reads its holder's jobserver"). Test threads take no
+ * jobserver token, so a cargo build's test threads are its size, and a process's, whose script may start Cargo, are
+ * its whole held grant.
  */
 export function sizeRunner(
   demand: Demand,
@@ -357,9 +355,8 @@ function inheritedCeiling(inherited: string | undefined, configured: string | un
 
 /**
  * The count `CPU_TOKENS_ENV` names, as a positive safe integer, or `null` when absent or malformed. It is
- * descriptor input only: a count proves nothing about a live pool and grants nothing. A missing or malformed
- * descriptor follows normal host admission; a valid one still needs a grant from its endpoint. Connection
- * absence follows the host path, while a connected parent's refusal fails admission to avoid hold-and-wait.
+ * descriptor input only: a count proves nothing about a live pool and grants nothing. It is a ceiling the
+ * runner keeps, and the size an Nx run's own pool takes (`run-cpu-pool.ts`).
  */
 export function parseInheritedTokens(value: string | undefined): number | null {
   if (value === undefined || !INHERITED_COUNT.test(value)) {
@@ -367,105 +364,4 @@ export function parseInheritedTokens(value: string | undefined): number | null {
   }
   const tokens = Number(value);
   return Number.isSafeInteger(tokens) ? tokens : null;
-}
-
-/**
- * Tokens held until released, or why the runner starts without the budget. `closed` resolves when
- * the grant's connection closes, however it closes, so a sub-pool built on the grant ends with it.
- * `inherited` marks tokens a parent's CPU pool lent, not tokens the host gateway granted.
- */
-export type TokenGrant =
-  | { granted: true; tokens: number; release: () => void; closed: Promise<void>; inherited?: true }
-  | Unleased;
-
-/** Where bounded-exec takes its tokens; the gateway in production, a fake in tests. */
-export interface CpuBudget {
-  take(want: number, checkout: string, command: string): Promise<TokenGrant>;
-}
-
-/**
- * The gateway at `socket`'s budget. The caller names the gateway, with no default: the Nx executor the host's own, a
- * host proof its fixture's. A grant has no deadline: the wait is how the budget works, and
- * the gateway answers `queued` at once, so a client knows it is alive. `checkout` is the Nx
- * workspace root: the gateway shares tokens fairly between checkouts.
- */
-export function gatewayCpuBudget(socket: string): CpuBudget {
-  return {
-    async take(want, checkout, command) {
-      const lease = await holdLease(socket, { op: 'cpu-tokens', want, checkout, command }, 'the CPU budget', {
-        ackMs: 2_000,
-        afterCloseMs: 5_000,
-        grantMs: null,
-      });
-      if (!lease.granted) {
-        return lease;
-      }
-      const tokens = lease.answer.tokens;
-      if (typeof tokens !== 'number' || !Number.isInteger(tokens) || tokens < 1 || tokens > want) {
-        lease.release();
-        return {
-          granted: false,
-          cause: 'other',
-          reason: `the gateway granted ${JSON.stringify(tokens)} tokens for ${want}`,
-        };
-      }
-      return { granted: true, tokens, release: lease.release, closed: lease.closed };
-    },
-  };
-}
-
-/** The clock a retry waits on: the wall clock in production, a fake one in tests. */
-export interface RetryClock {
-  now(): number;
-  sleep(ms: number): Promise<void>;
-}
-
-export const wallClock: RetryClock = {
-  now: Date.now,
-  sleep: delay,
-};
-
-/** How long a retry waits between asks of the gateway it starts, in ms. */
-const RETRY_EVERY_MS = 100;
-
-/** A retry's outcome: the ask's own answer, or the install's deadline passing with no gateway serving. */
-export type InstallRetry =
-  | TokenGrant
-  | { granted: false; cause: 'install-deadline'; reason: string; install: InstallRestart; waitedMs: number };
-
-/**
- * Retry a cut-off ask against the gateway the install starts (05_gateway.md, "A queued CPU ask outlives an install"), every
- * 100 ms until the install's `servesWithinMs` has passed. A gateway not yet bound (`absent`) keeps the wait
- * going, and so does the same install's restart, since its old gateway still drains. Any other answer is
- * returned as-is, so a refusal is never retried.
- */
-export async function askAcrossInstall(
-  ask: () => Promise<TokenGrant>,
-  install: InstallRestart,
-  clock: RetryClock = wallClock,
-): Promise<InstallRetry> {
-  const started = clock.now();
-  const deadline = started + install.servesWithinMs;
-  for (;;) {
-    await clock.sleep(RETRY_EVERY_MS);
-    const now = clock.now();
-    if (now >= deadline) {
-      const waitedMs = now - started;
-      return {
-        granted: false,
-        cause: 'install-deadline',
-        reason: `the install ${install.pid} (${install.binary}) restarting the gateway did not bring up one that serves within ${install.servesWithinMs} ms; waited ${waitedMs} ms`,
-        install,
-        waitedMs,
-      };
-    }
-    const answer = await ask();
-    if (answer.granted) {
-      return answer;
-    }
-    if (answer.cause === 'absent' || (answer.cause === 'install-restart' && answer.install.pid === install.pid)) {
-      continue;
-    }
-    return answer;
-  }
 }

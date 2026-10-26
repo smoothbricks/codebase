@@ -1,5 +1,5 @@
 import typia from 'typia';
-import { invocationSpan, withInvocationFlag } from './cpu-tokens.js';
+import { invocationSpan, withInvocationFlag } from './runner-sizing.js';
 import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
 
 /**

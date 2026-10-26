@@ -100,9 +100,11 @@
   qualification; B13's macOS Census and sampling clock are canonical (specs/cowshed/07_api.md, "Job monitoring" and
   "Process-tree observations").
 
-- Before any host fallback, distinguish a nested executor's failed connect caused by a full listen backlog or local
-  file-descriptor exhaustion from an absent parent pool. Classifying every connect error as an absent endpoint does not
-  prove that the parent released its upstream grant (`specs/cowshed/05_gateway.md:387` "Host CPU budget").
+- Before a nested executor runs its command as asked for want of a parent pool, distinguish a failed connect caused by a
+  full listen backlog or local file-descriptor exhaustion from an absent parent pool. `holdLease`
+  (`packages/nx-plugin/src/executors/bounded-exec/gateway-lease.ts`) classifies every connect error as an absent
+  endpoint, and the executor (`packages/nx-plugin/src/executors/bounded-exec/executor.ts`) then runs the command without
+  a grant beside a live pool (`specs/cowshed/05_gateway.md` "Every Nx run budgets itself").
 
 - Measure cold `new`, `fork` and `checkpoint` on RAW images against the ≤ 1 s budgets. The clonefile and attach figures
   behind those budgets come from a benchmark of an earlier image format, and no RAW timing backs them

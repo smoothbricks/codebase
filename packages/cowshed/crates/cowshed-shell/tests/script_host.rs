@@ -316,7 +316,10 @@ impl Host {
         let mut jobs = self.jobs.borrow_mut();
         let id =
             cowshed_core::api::JobId::new(u64::try_from(jobs.len()).unwrap() + 1).expect("job id");
-        let job = self.cgroups.admit(id).expect("admit the protocol job");
+        let job = self
+            .cgroups
+            .admit(id, cowshed_core::api::ExecClass::Background)
+            .expect("admit the protocol job");
         let placement = job.placement().expect("open the cgroup placement");
         jobs.push(job);
         placement.into_descriptor()
@@ -478,7 +481,6 @@ fn submit_request(
         .unwrap()
         .list(std::iter::empty())
         .unwrap()
-        .child_nice(None)
         .finish()
         .unwrap();
     #[cfg(target_os = "macos")]

@@ -68,10 +68,10 @@ with lookup metadata; the install directory and controller records remain closed
 control socket remains host-only ([04 Sandbox](../../../specs/cowshed/04_sandbox.md), installed-cowshed exception).
 
 Nothing installed answers to `cargo`, and setup removes the `cargo -> cowshed` link earlier installs planted. A job's
-CPU grant reaches Cargo as configuration Cargo already reads: the process holding the grant exports `CARGO_MAKEFLAGS`
-naming the grant's make jobserver fifo, and the test-thread counts. A Cargo no holder started runs as it does
-unconfigured ([03 Caches](../../../specs/cowshed/03_caches.md), "Cargo reads its budget from its holder";
-[05 Gateway](../../../specs/cowshed/05_gateway.md#host-cpu-budget)).
+jobserver reaches Cargo as configuration Cargo already reads: the job's supervisor exports `CARGO_MAKEFLAGS` naming the
+job's own make jobserver fifo, and the test-thread counts. A Cargo no job started runs as it does unconfigured
+([03 Caches](../../../specs/cowshed/03_caches.md), "Cargo reads its budget from its holder";
+[05 Gateway](../../../specs/cowshed/05_gateway.md#parallelism-inside-a-job)).
 
 From a checkout of this repository, build the host's release CLI with `nx run cowshed:cli-<platform>:production`
 (`cli-arm64-macos` on Apple silicon; `nx build cowshed -c production` builds it too, with the TypeScript library and

@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { shellWord } from '../../runtime-input.js';
-import { invocationSpan, withInvocationFlag } from './cpu-tokens.js';
+import { invocationSpan, withInvocationFlag } from './runner-sizing.js';
 import { GO_TEST } from './verdict.js';
 
 const CARGO_TEST = /^cargo(?:\s+(?:-\S+|\+\S+))*\s+test(?=\s|$)/;

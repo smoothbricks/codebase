@@ -77,37 +77,6 @@ done. They are independent of each other.
 - Acceptance: aborting a following read ends it promptly; aborting a non-following read rejects with an abort error; an
   unaborted read returns its full range.
 
-## CPU budget through Cargo's jobserver
-
-- Spec: `specs/cowshed/05_gateway.md` "Host CPU budget" (Outside `bounded-exec`, The jobserver fifo, The jobserver run,
-  Where the launcher cannot budget) and `03_caches.md` "The `cargo` jobserver launcher": one jobserver fifo per client
-  process. The launcher, first on `PATH`, picks one of four cases: an inherited live jobserver runs `cargo` as asked; a
-  `bounded-exec` grant runs it with `CARGO_BUILD_JOBS`/`RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS` set to
-  `BOUNDED_EXEC_CPU_TOKENS` where unset; a subcommand that compiles nothing (`metadata`, `fmt`, `locate-project`,
-  `--version`, … as listed in 05) runs directly; any other sends `{"op":"jobserver","want":<one per core>,…}`, gets a
-  grant of `g` tokens plus a fifo path, spawns the next `cargo` on `PATH` with `CARGO_MAKEFLAGS`/`MAKEFLAGS` =
-  `-j --jobserver-auth=fifo:<path>` and `RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS`/`BOUNDED_EXEC_CPU_TOKENS` = `g` where
-  unset, waits, and keeps the connection open while it lives. The gateway creates the fifo (`0600`, the client's user),
-  holds its own `O_RDWR` descriptor on it until the drain, writes `g − 1` token bytes, and on connection close drains
-  it, unlinks it, and returns all `g` tokens to the ledger, so tokens a killed process held are credited; it removes
-  leftover fifos at startup.
-- Code: `crates/cowshed-cli/src/launchd.rs:411` notes that cargo creates its own jobserver; the gateway serves none and
-  has no `jobserver` control operation. No launcher exists: `crates/cowshed-core/src/runtime/supervisor.rs:901-920`
-  builds the bootstrap `PATH` as the private `tools/bin`, then `.cowshed/bin/` (which holds the `xcrun` shim and runtime
-  tool links, `capabilities/installations.rs:22-25`), then system directories; shell activation then owns `PATH`
-  (`specs/cowshed/03_caches.md`, build wiring).
-- Work: the `jobserver` operation (with `want`) in the gateway's control socket and `cpu_budget` ledger (fifo creation
-  in the gateway's private runtime directory, ownership from peer credentials, the gateway's own `O_RDWR` descriptor,
-  drain/unlink/return on close, the startup sweep of leftover fifos); the launcher with its four cases, the subcommand
-  parse past global options and `+toolchain`, and the variables each case sets, resolving the next `cargo` by skipping
-  its own directory; placing it ahead of shell activation's entries in the supervisor's spawn environment and in the
-  `.envrc` wiring; the 05 jobserver and launcher tests.
-- Acceptance: a host-shell `cargo build` and a `bounded-exec` task running together never hold more tokens than the host
-  has cores (`{"op":"cpu-budget"}` shows both); a host-shell `cargo test` granted `g` tokens runs at most `g` test
-  threads; a `SIGKILL`ed `cargo` mid-build leaves `held` back at its previous value and its fifo unlinked; a `cargo` run
-  inside `bounded-exec` and a nested `cargo` from a build script take no second grant, and a `cargo build` started by a
-  one-token `process` runner's script runs one job; `cargo metadata` on a saturated host returns without queueing.
-
 ## Job id in the proxy userinfo
 
 - Spec: `specs/cowshed/03_caches.md:127-135` and `:273-275`: a job's proxy variables carry `job-<job_id>` as the

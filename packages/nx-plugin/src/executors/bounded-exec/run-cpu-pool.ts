@@ -1,47 +1,50 @@
-import { lstat } from 'node:fs/promises';
 import { availableParallelism } from 'node:os';
 import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import { type CpuPool, createCpuPool, readInheritedCpuPool } from './cpu-pool.js';
+import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
 /**
- * The CPU budget of an Nx run on a host without a gateway (specs/cowshed/05_gateway.md, "Host CPU budget", "A run
- * without a gateway").
+ * The CPU pool of an Nx run (specs/cowshed/05_gateway.md, "Host scheduling", "Parallelism inside a job", "Every Nx run
+ * budgets itself").
  *
- * Every runner sizes itself to the whole host unless something budgets it, and without a gateway nothing did: under
- * `NX_PARALLEL=100%` Nx starts every target side by side and each one's runner takes the whole machine. The run
- * therefore serves its own pool of one token per core, as a gateway-granted executor serves its children, and every
- * task inherits it: `bounded-exec` takes from it as from any parent pool, FIFO, the head taking `min(want, free)` once
- * one token is free, and a Cargo that Nx's own `nx:run-commands` starts reads its jobserver fifo through the
- * `CARGO_MAKEFLAGS` the pool exports, so the runners of one run together stay within the cores.
+ * Every runner sizes itself to the whole host unless something sizes it: under `NX_PARALLEL=100%` Nx starts every
+ * target side by side and each one's runner takes the whole machine. The run therefore serves its own pool, as a
+ * granted executor serves its children, and every task inherits it: `bounded-exec` takes from it as from any parent
+ * pool, FIFO, the head taking `min(want, free)` once one token is free, and a Cargo that Nx's own `nx:run-commands`
+ * starts reads its jobserver fifo through the `CARGO_MAKEFLAGS` the pool exports, so the runners of one run together
+ * stay within its count.
  *
- * The run serves it only when nothing else budgets it: it inherits no pool, and the gateway's control socket does
- * not exist. Only `ENOENT` proves the gateway absent; a socket that exists but does not answer may be a live,
- * saturated gateway, and a run budgeting itself beside it would count the host twice.
+ * A run that inherits a pool (an enclosing executor's) takes from that one and serves none. Otherwise its pool holds
+ * one token per core, or the inherited positive `BOUNDED_EXEC_CPU_TOKENS` when that is fewer: inside a cowshed job
+ * that count is the job's own, so the job's `--want` bounds the run.
  */
 
 /** The pools this process serves, by Nx run id, until that run's `postTasksExecution`. */
 const pools = new Map<string, CpuPool>();
 
 /**
- * Serve `context`'s run a pool of `cores` tokens and publish it in `env`, which every task inherits, when the run
- * inherits no pool and no gateway exists at `gateway`. A pool that cannot be made is said and leaves the run
- * unbudgeted, as a run without a gateway was before.
+ * Serve `context`'s run a pool of `min(inherited count, cores)` tokens and publish it in `env`, which every task
+ * inherits, unless the run inherits a pool. A pool that cannot be made is said, and the run's tasks are then sized only
+ * by the ceilings they inherit.
  */
 export async function serveRunCpuPool(
   context: Pick<PreTasksExecutionContext, 'id'>,
-  gateway: string,
   env: NodeJS.ProcessEnv = process.env,
   cores: number = availableParallelism(),
 ): Promise<void> {
-  if (readInheritedCpuPool(env) !== null || !(await absent(gateway))) {
+  if (readInheritedCpuPool(env) !== null) {
     return;
   }
+  const inherited = parseInheritedTokens(env[CPU_TOKENS_ENV]);
   // The pool lives until the run's `postTasksExecution` closes it, or with this process.
-  const made = await createCpuPool(cores, new Promise<void>(() => {}), { begin() {}, end() {} });
+  const made = await createCpuPool(
+    inherited === null ? cores : Math.min(inherited, cores),
+    new Promise<void>(() => {}),
+  );
   if (!made.ok) {
     logger.warn(
-      `bounded-exec: no gateway at ${gateway}, and this run's CPU pool failed (${made.error}); its tasks run unbudgeted`,
+      `bounded-exec: this run's CPU pool failed (${made.error}); its tasks are sized only by the ceilings they inherit`,
     );
     return;
   }
@@ -61,15 +64,5 @@ export async function closeRunCpuPool(context: Pick<PostTasksExecutionContext, '
   const closed = await pool.close();
   if (!closed.ok) {
     logger.warn(`bounded-exec: this run's CPU pool did not close cleanly: ${closed.error}`);
-  }
-}
-
-async function absent(path: string): Promise<boolean> {
-  try {
-    await lstat(path);
-    return false;
-  } catch (error) {
-    const code = error instanceof Error && 'code' in error ? error.code : undefined;
-    return code === 'ENOENT' || code === 'ENOTDIR';
   }
 }

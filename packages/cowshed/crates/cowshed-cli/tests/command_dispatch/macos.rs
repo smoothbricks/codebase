@@ -27,14 +27,14 @@ use cowshed_core::storage::apfs::{ApfsSubstrateConfig, build_volume_label};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::{ErrorCode, Result};
 use cowshed_gateway::{
-    ArrowAuditConfig, ArrowAuditSink, CpuBudgetLimits, CredentialError, CredentialProvider,
-    CredentialQuery, CredentialRecord, Gateway, GatewayConfig, MirrorCacheConfig, SystemConnector,
+    ArrowAuditConfig, ArrowAuditSink, CredentialError, CredentialProvider, CredentialQuery,
+    CredentialRecord, Gateway, GatewayConfig, MirrorCacheConfig, SystemConnector,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::NO_PROGRESS;
 use cowshed_os::test_backstop::{
-    AsyncCommandBackstop as _, AsyncUnixStreamBackstop as _, ChildBackstop as _,
-    CommandBackstop as _, FileBackstop as _, UnixStreamBackstop as _,
+    AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _, FileBackstop as _,
+    UnixStreamBackstop as _,
 };
 use std::cell::Cell;
 use std::ffi::OsString;
@@ -97,10 +97,6 @@ struct Fixture {
     storage: ValidatedHostStorage,
     granted: PathBuf,
     gateway: Option<Gateway>,
-    /// The tokens its gateway's CPU ledger serves: the host's by default, or a fixed small
-    /// host's, so a scenario whose admission depends on the host's size runs as a small CI
-    /// runner runs it.
-    cpu_budget: CpuBudgetLimits,
 }
 
 impl Fixture {
@@ -164,7 +160,6 @@ impl Fixture {
             storage,
             granted,
             gateway: None,
-            cpu_budget: CpuBudgetLimits::default(),
         }
     }
 
@@ -207,7 +202,6 @@ impl Fixture {
         let config = GatewayConfig {
             control_socket: Some(self.storage.control_socket()),
             mirror_cache: MirrorCacheConfig::new(cache),
-            cpu_budget: self.cpu_budget,
             ..GatewayConfig::default()
         };
         let connector =
@@ -4429,9 +4423,8 @@ async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
     // retires the supervisors it serves, and a supervisor retires only once its keeper's daemon
     // stopped (04_sandbox.md): shutdown returns after that stop saw the daemon exit, and the
     // daemon's plugin workers follow it out.
-    // As for w1, w2's keeper starts its daemon at the run's admission, and the start's one-token
-    // stake (05_gateway.md, "A resident's start holds one token") waits behind the run's tokens,
-    // so the record may follow the run's end.
+    // As for w1, w2's keeper starts its daemon at the run's admission, so the record may follow the
+    // run's end.
     eventually(|| recorded_daemon(&w2).is_some()).await;
     let kept = recorded_daemon(&w2).expect("w2's run left its kept daemon recorded");
     assert!(
@@ -4970,32 +4963,15 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
 /// admitted afterwards resolves main's link to the adopted volume (16_build_volumes.md, "Process
 /// lifetime across a swap", "Garbage collection").
 ///
-/// The job that runs across the adoption is a loop that sleeps between ticks: a resident, which
-/// holds no CPU token for its lifetime (05_gateway.md, "A resident holds no token"). The ledger
-/// has three tokens, as the macOS arm64 CI runner has. Run as an ordinary background job while
-/// background beside gate work was held to one token, the loop held that token, so the land's
-/// `--check` job queued behind it at `check-wait` and the land never reached its adoption:
-/// it hung on that runner until the idle bound, twice, and hung the same way here with this
-/// ledger at three tokens, while at four it passed. The jobs draw on that fixture ledger, never on
-/// a pool this test's runner holds ([`holds_no_cpu_pool`]), so every run sees the runner's room.
+/// The job that runs across the adoption is a loop that sleeps between ticks.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one()
  {
-    if !holds_no_cpu_pool(
-        "macos::directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one",
-    )
-    .await
-    {
-        return;
-    }
     let rust = RustToolchain::of_this_test();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: None,
         rust: Some(&rust),
     });
-    fixture.cpu_budget = CpuBudgetLimits {
-        tokens: std::num::NonZeroUsize::new(3).expect("three tokens"),
-    };
     let mut service = serve_project(&mut fixture, &[]).await;
     assert_target_on_build_volume(&fixture.checkout);
     let layout = build_volumes(&fixture);
@@ -6817,8 +6793,8 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
     sh(&mut service, "outputs", &nx_run_many(node, "build")).await;
-    // The keeper started the shed's daemon at the run's admission, behind the run's tokens
-    // (04_sandbox.md, the kept daemon), so its record may follow the run's end. The patched Nx
+    // The keeper started the shed's daemon at the run's admission (04_sandbox.md, the kept
+    // daemon), so its record may follow the run's end. The patched Nx
     // daemon claims the record when it starts and replaces one of another workspace root as
     // stale, so the foreign record is copied in only once the kept daemon holds it.
     eventually(|| recorded_daemon(&topic).is_some()).await;
@@ -6939,7 +6915,7 @@ async fn default_land_never_signals_a_foreign_nominee_during_retirement(
     git(&topic, &["commit", "-q", "-am", "change output input"]);
     sh(&mut service, "outputs", &nx_run_many(node, "build")).await;
     // The run put the shed in use at its admission, and the keeper started its daemon alongside
-    // it, behind the run's tokens (04_sandbox.md, the kept daemon), so its record may follow the
+    // it (04_sandbox.md, the kept daemon), so its record may follow the
     // run's end. The patched Nx daemon claims the record when it starts and replaces one that
     // names no Nx version or root as stale, so the nominee is forged only once the kept daemon
     // holds the record: a forgery written first would be replaced, not left for the land.
@@ -7869,320 +7845,6 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
         leftovers.is_empty(),
         "terminal cleanup removed the install marker: {leftovers:?}"
     );
-    drop(worker);
-    drop(coordinator);
-    connection.abort();
-    runtime.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-}
-
-/// The fixture gateway's ledger, read whole.
-async fn cpu_budget(socket: &Path) -> cowshed_gateway_types::CpuBudgetStatus {
-    cowshed_gateway::GatewayControlClient::new(socket.to_path_buf())
-        .expect("an absolute control socket")
-        .cpu_budget()
-        .await
-        .expect("the gateway answers its ledger")
-}
-
-/// The checkout [`LoadedHost`] holds the host for.
-const LOADING_CHECKOUT: &str = "/loaded-host/another-checkout";
-
-/// Another checkout's background work holding the whole host, taking every free token,
-/// in the fixture gateway's real ledger (05_gateway.md, "Room for a gate"), and its one-token job
-/// running on the probation token beyond it (05_gateway.md, "A one-token job starts on
-/// probation"): a background job of this project then waits for a returned token, as on a host
-/// other work has loaded. Without the probation hold a one-token ask starts at once, and an exec
-/// that names no want asks one token on a host of at most three, ⌊N/2⌋ (measured: publish runs
-/// 40202667203 and 40216849079 on a 3-CPU macOS arm64 runner). Its tokens return when it drops.
-struct LoadedHost {
-    _lease: tokio::io::BufReader<tokio::net::UnixStream>,
-    _probation: tokio::io::BufReader<tokio::net::UnixStream>,
-}
-
-impl LoadedHost {
-    async fn hold(socket: &Path) -> Self {
-        let total = cpu_budget(socket).await.total;
-        let whole = serde_json::to_string(&cowshed_gateway_types::CpuTokensRequest::new(
-            std::num::NonZeroUsize::new(total).expect("a host has a token"),
-            LOADING_CHECKOUT,
-            "another checkout's background build",
-        ))
-        .expect("encode the request");
-        let lease = Self::ask(socket, whole, "granted").await;
-        // The supervisor's ask for a one-token job it can stop. This holder never writes
-        // `probation-over`, so the probation token stays lent until it drops.
-        let one = serde_json::json!({
-            "op": "jobserver", "want": 1, "checkout": LOADING_CHECKOUT,
-            "command": "another checkout's one-token job", "class": "background",
-            "pool": true, "probation": true,
-            "job": { "repoId": "loaded-host/another-checkout",
-                "workspaceIncarnation": "0123456789abcdef0123456789abcdef", "jobId": 1 }
-        })
-        .to_string();
-        let probation = Self::ask(socket, one, "probation").await;
-        Self {
-            _lease: lease,
-            _probation: probation,
-        }
-    }
-
-    /// Send `request` on a new control connection and hold it once the gateway answers `lease`.
-    async fn ask(
-        socket: &Path,
-        mut request: String,
-        lease: &str,
-    ) -> tokio::io::BufReader<tokio::net::UnixStream> {
-        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-        let mut stream = tokio::net::UnixStream::connect_bounded(socket)
-            .await
-            .expect("connect the gateway's control socket");
-        request.push('\n');
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("ask the gateway's ledger");
-        let mut held = tokio::io::BufReader::new(stream);
-        loop {
-            let mut line = String::new();
-            held.read_line(&mut line)
-                .await
-                .expect("the gateway answers");
-            let answer: serde_json::Value =
-                serde_json::from_str(&line).expect("a JSON answer line");
-            assert_eq!(answer["ok"], true, "{answer}");
-            if answer["lease"] == lease {
-                return held;
-            }
-        }
-    }
-}
-
-/// The one request the gateway holds waiting for a checkout other than the loading one, once the
-/// supervisor's ask for it reached the ledger. The ask leaves the supervisor off its actor path
-/// after the exec answered, so the ledger is read until it shows; a request that never arrives is
-/// a hang the leg's no-progress backstop decides.
-async fn queued_request(socket: &Path) -> cowshed_gateway_types::CpuWaiter {
-    loop {
-        let ledger = cpu_budget(socket).await;
-        let waiting: Vec<_> = ledger
-            .background
-            .into_iter()
-            .filter(|stake| stake.checkout != LOADING_CHECKOUT)
-            .flat_map(|stake| stake.waiters)
-            .collect();
-        if let Ok([waiter]) = <[_; 1]>::try_from(waiting) {
-            return waiter;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Every variable a holder hands its CPU grant to the process it starts by (05_gateway.md,
-/// "Nested runners use a parent-held sub-ledger", "Cargo reads its holder's jobserver").
-const HOLDER_CPU_BUDGET: [&str; 5] = [
-    "BOUNDED_EXEC_CPU_POOL",
-    "BOUNDED_EXEC_CPU_TOKENS",
-    "CARGO_MAKEFLAGS",
-    "MAKEFLAGS",
-    "MFLAGS",
-];
-
-/// Marks the child test process [`holds_no_cpu_pool`] starts.
-const NO_CPU_POOL_CHILD: &str = "COWSHED_TEST_NO_CPU_POOL_CHILD";
-
-/// Whether this process is a requester that holds no CPU pool, so `test`'s body runs here. The
-/// controller runs in the requester's process, and a job draws on the requester's live pool, never
-/// on the host ledger (05_gateway.md, "Work a holder starts draws on its grant"); a test process a
-/// gate's runner started holds that runner's pool. A test whose jobs only its fixture gateway's
-/// ledger may budget therefore runs `test` again in a child test process whose environment names
-/// none of [`HOLDER_CPU_BUDGET`] (08_testing.md: fixtures clear every inherited sizing variable),
-/// answers `false` once that child passed, and its body runs only in the child. A child, not
-/// `remove_var`, since the tests of one binary may share its process and its environment.
-async fn holds_no_cpu_pool(test: &str) -> bool {
-    if std::env::var_os(NO_CPU_POOL_CHILD).is_some() {
-        return true;
-    }
-    let mut child = tokio::process::Command::new(std::env::current_exe().expect("test executable"));
-    child
-        .args(["--exact", test, "--nocapture"])
-        .env(NO_CPU_POOL_CHILD, "1");
-    for name in HOLDER_CPU_BUDGET {
-        child.env_remove(name);
-    }
-    let status = child
-        .status_bounded()
-        .await
-        .expect("run the scenario in a child test process");
-    assert!(
-        status.success(),
-        "{test}, run by a requester that holds no CPU pool: {status}"
-    );
-    false
-}
-
-/// An exec on a loaded host answers at its admission, not at its CPU grant (05_gateway.md, "The
-/// task server owns the live grant and nice"; 11_shell.md, "Server-owned CPU admission and nice
-/// placement"). Measured before: `cowshed exec --background` returned at the grant, 25 s later on
-/// a loaded host, so a waiting job had no id to read or cancel. Here the gateway's real ledger is
-/// held whole by another checkout: the CLI's `--background` exec prints its job `queued` while the
-/// gateway holds its request, and it runs once the load returns its tokens; a keyed API exec
-/// answers with its id while queued, reads queued, and its kill withdraws the request without a
-/// command. Both execs ask that ledger only because their requester holds no pool of its own
-/// ([`holds_no_cpu_pool`]).
-#[tokio::test]
-async fn directory_an_exec_on_a_loaded_host_answers_at_admission_and_cancels_while_queued() {
-    if !holds_no_cpu_pool(
-        "macos::directory_an_exec_on_a_loaded_host_answers_at_admission_and_cancels_while_queued",
-    )
-    .await
-    {
-        return;
-    }
-    let mut fixture = Fixture::directory();
-    let mut service = serve_project(&mut fixture, &[]).await;
-    let socket = fixture.storage.control_socket();
-
-    let load = LoadedHost::hold(&socket).await;
-    let ran = fixture.checkout.join("ran");
-    let (stdout, stderr) = succeed(
-        &mut service,
-        [
-            "--json",
-            "exec",
-            "main",
-            "--background",
-            "--",
-            "/bin/sh",
-            "-c",
-            "printf ran > ran",
-        ],
-    )
-    .await;
-    let answer: serde_json::Value =
-        serde_json::from_slice(&stdout).expect("one JSON envelope on stdout");
-    let info = &answer["result"];
-    assert_eq!(
-        (
-            info["state"].as_str(),
-            info["class"].as_str(),
-            &info["pid"],
-            &info["cpuTokens"]
-        ),
-        (
-            Some("queued"),
-            Some("background"),
-            &serde_json::Value::Null,
-            &serde_json::Value::Null
-        ),
-        "the backgrounded exec answered while its job waits for the host: {answer}\n{stderr}"
-    );
-    let waiting = queued_request(&socket).await;
-    // An exec that names no want asks for the background share of the gateway's host, ⌊N/2⌋
-    // of its N tokens (05_gateway.md "Room for a gate"), not one token.
-    let share = cpu_budget(&socket).await.background_limit();
-    assert_eq!(waiting.want, share, "{waiting:?}");
-    assert!(!ran.exists(), "nothing ran while the host is loaded");
-    drop(load);
-    eventually(|| fs::read(&ran).is_ok_and(|bytes| bytes == b"ran")).await;
-    service
-        .shutdown()
-        .await
-        .expect("stop the CLI bridge so the API's runtime is the only controller");
-
-    let runtime = cowshed_core::runtime::ProjectRuntime::open_directory_existing_at(
-        &fixture.checkout,
-        RecoveryScope::Workspaces([WorkspaceName::main()].into()),
-        fixture.storage.clone(),
-        cowshed_cli::gateway_service::runtime_control,
-    )
-    .await
-    .expect("reopen the project runtime");
-    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-    let connection = tokio::spawn(cowshed_core::api::server::serve_controller_connection(
-        server.into(),
-        cowshed_core::api::server::ConnectionAuthority::Coordinator {
-            repo_id: runtime.descriptor().repo_id.clone(),
-        },
-        runtime.router(),
-    ));
-    let (cowshed, token) = cowshed_core::Cowshed::connect(client.into())
-        .await
-        .expect("controller handshake");
-    let project = cowshed
-        .open(&fixture.checkout)
-        .await
-        .expect("open the project");
-    let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
-    let worker = coordinator.worker("main").await.expect("main's worker");
-
-    let load = LoadedHost::hold(&socket).await;
-    let never = fixture.checkout.join("never");
-    let job = worker
-        .exec(cowshed_core::api::ExecRequest {
-            command: cowshed_core::api::dto::ExecCommand::Argv(vec![
-                cowshed_core::api::CommandArg::from("/bin/sh"),
-                cowshed_core::api::CommandArg::from("-c"),
-                cowshed_core::api::CommandArg::from("printf ran > never"),
-            ]),
-            cwd: None,
-            mode: cowshed_core::api::RunSandboxMode::ReadWrite,
-            env: std::collections::HashMap::new(),
-            trace: None,
-            stdin: cowshed_core::api::StdinSource::Empty,
-            stdout_copy: None,
-            stderr_copy: None,
-            admission_key: Some(
-                cowshed_core::api::dto::AdmissionKey::new("loaded-host-op").expect("a key"),
-            ),
-            class: cowshed_core::api::ExecClass::Background,
-            want: None,
-            scope: cowshed_core::api::ExecScope::Workspace,
-        })
-        .await
-        .expect("a keyed exec answers at admission while the host is loaded");
-    let queued = job.status().await.expect("the queued job's status");
-    assert_eq!(
-        (
-            queued.state,
-            queued.class,
-            queued.pid,
-            queued.cpu_tokens,
-            queued.nice
-        ),
-        (
-            cowshed_core::api::dto::JobState::Queued,
-            cowshed_core::api::ExecClass::Background,
-            None,
-            None,
-            None
-        ),
-        "the answer's job is queued: its class is set and it holds no grant"
-    );
-    queued_request(&socket).await;
-    job.kill().await.expect("kill the queued job");
-    let ended = job
-        .wait()
-        .await
-        .expect("the cancelled job's terminal record");
-    assert_eq!(
-        (ended.state, ended.pid, ended.exit, ended.cpu_tokens),
-        (cowshed_core::api::dto::JobState::Killed, None, None, None),
-        "killed while queued: it never ran"
-    );
-    let ledger = cpu_budget(&socket).await;
-    assert!(
-        ledger
-            .background
-            .iter()
-            .filter(|stake| stake.checkout != LOADING_CHECKOUT)
-            .all(|stake| stake.waiters.is_empty() && stake.held == 0),
-        "the kill withdrew the request from the gateway's queue: {ledger:?}"
-    );
-    drop(load);
-    assert!(!never.exists(), "the cancelled job's command never ran");
-
-    drop(job);
     drop(worker);
     drop(coordinator);
     connection.abort();

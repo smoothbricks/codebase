@@ -16,9 +16,9 @@
 //! exactly a value the daemon accepts, and `cowshed-gateway`'s own validators report through it.
 
 pub mod cleanup;
-pub mod cpu_budget;
 pub mod disk_lease;
 pub mod first_launch;
+pub mod host_status;
 pub mod policy;
 pub mod ram_disk;
 pub mod repo_id;
@@ -27,14 +27,6 @@ pub mod status;
 pub mod task_server;
 
 pub use cleanup::RELEASED_OP;
-pub use cpu_budget::{
-    CPU_POOL_ENV, CPU_TOKENS_ENV, CPU_TOKENS_OP, CpuBackgroundStake, CpuBudgetStatus,
-    CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder, CpuProbation, CpuTokensRequest,
-    CpuWaitCause, CpuWaiter, HOLD_LIMIT, INSTALL_RESTART_CODE, INSTALL_SERVES_WITHIN,
-    InstallRestart, JOBSERVER_OP, JobserverAnswer, JobserverClass, JobserverJob, JobserverRequest,
-    PROBATION_OVER_OP, RESIDENT_POOL_OP, ResidentPoolRequest, background_limit, background_share,
-    cpu_pool_directory, host_tokens, inherited_cpu_pool,
-};
 pub use disk_lease::{
     DISK_LEASE_OP, DISK_PHASE_MEMBERS, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState,
     PhaseShare,

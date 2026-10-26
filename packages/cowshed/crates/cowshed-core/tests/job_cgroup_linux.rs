@@ -39,7 +39,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cowshed_core::api::dto::JobId;
+use cowshed_core::api::dto::{ExecClass, JobId};
 use cowshed_core::error::ErrorCode;
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
@@ -588,7 +588,7 @@ fn control() {
 // Scenarios
 
 fn descendants_inherit_the_job(jobs: &IncarnationCgroups) {
-    let job = jobs.admit(job_id(1)).expect("admit");
+    let job = jobs.admit(job_id(1), ExecClass::Background).expect("admit");
     let child = Workload {
         burn_before_ms: 100,
         ..Workload::default()
@@ -614,11 +614,11 @@ fn descendants_inherit_the_job(jobs: &IncarnationCgroups) {
 }
 
 fn concurrent_jobs_stay_apart(jobs: &IncarnationCgroups) {
-    let small = jobs.admit(job_id(2)).expect("admit");
-    let large = jobs.admit(job_id(3)).expect("admit");
+    let small = jobs.admit(job_id(2), ExecClass::Background).expect("admit");
+    let large = jobs.admit(job_id(3), ExecClass::Background).expect("admit");
     assert!(
         matches!(
-            jobs.admit(job_id(2)),
+            jobs.admit(job_id(2), ExecClass::Background),
             Err(CgroupError::AlreadyExists { .. })
         ),
         "a second admission never joins the first one's cgroup"
@@ -648,7 +648,7 @@ fn concurrent_jobs_stay_apart(jobs: &IncarnationCgroups) {
 /// A reused host's idle work before a job is its own: here the spawner itself burns before it
 /// starts the job's first process, and none of that reaches the job.
 fn a_spawners_earlier_work_is_not_charged(jobs: &IncarnationCgroups) {
-    let job = jobs.admit(job_id(4)).expect("admit");
+    let job = jobs.admit(job_id(4), ExecClass::Background).expect("admit");
     let before = cpu_us(libc::RUSAGE_SELF);
     burn(300);
     let spawner_burned = cpu_us(libc::RUSAGE_SELF) - before;
@@ -671,7 +671,7 @@ fn a_spawners_earlier_work_is_not_charged(jobs: &IncarnationCgroups) {
 /// The control: a process that ran before it was moved into the job's cgroup took its first
 /// CPU with it, and the job's counters miss it. Admission must place before execution.
 fn late_migration_misses_initial_cpu(jobs: &IncarnationCgroups) {
-    let job = jobs.admit(job_id(5)).expect("admit");
+    let job = jobs.admit(job_id(5), ExecClass::Background).expect("admit");
     let mut late = Spawned::unplaced(&Workload {
         burn_before_ms: 300,
         pause: true,
@@ -709,8 +709,8 @@ fn late_migration_misses_initial_cpu(jobs: &IncarnationCgroups) {
 /// sum, yet the job's `cpu.stat` keeps every microsecond of theirs; a concurrent unrelated job's
 /// CPU never enters it.
 fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
-    let burst = jobs.admit(job_id(8)).expect("admit");
-    let unrelated = jobs.admit(job_id(9)).expect("admit");
+    let burst = jobs.admit(job_id(8), ExecClass::Background).expect("admit");
+    let unrelated = jobs.admit(job_id(9), ExecClass::Background).expect("admit");
     let before = burst.cpu().expect("cpu before");
     let child = Workload {
         burn_before_ms: 40,
@@ -763,7 +763,9 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
 /// resets.
 fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     const MIB: u64 = 1 << 20;
-    let job = jobs.admit(job_id(10)).expect("admit");
+    let job = jobs
+        .admit(job_id(10), ExecClass::Background)
+        .expect("admit");
     let page_cache_file = in_scratch("page-cache");
     let mut running = Spawned::placed(
         &job,
@@ -883,8 +885,12 @@ fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
          scratch {} is filesystem type {f_type:#x}, which no loop device backs on this host",
         directory.display()
     );
-    let job = jobs.admit(job_id(11)).expect("admit");
-    let neighbour_job = jobs.admit(job_id(12)).expect("admit");
+    let job = jobs
+        .admit(job_id(11), ExecClass::Background)
+        .expect("admit");
+    let neighbour_job = jobs
+        .admit(job_id(12), ExecClass::Background)
+        .expect("admit");
     // Cached by the controller, outside every job: the job's read of it is served from memory.
     let cached = in_scratch("cached");
     fill_page_cache(&cached, 32);
@@ -1014,7 +1020,7 @@ fn storage_io_outlives_its_processes(jobs: &IncarnationCgroups) {
 }
 
 fn retirement_waits_for_the_last_process(jobs: &IncarnationCgroups) {
-    let job = jobs.admit(job_id(6)).expect("admit");
+    let job = jobs.admit(job_id(6), ExecClass::Background).expect("admit");
     let identity = job.identity().clone();
     let mut running = Spawned::placed(
         &job,
@@ -1052,7 +1058,11 @@ fn restart_lookup_keeps_the_identity_under_its_incarnation(
     authority: &CgroupAuthority,
     jobs: &IncarnationCgroups,
 ) {
-    let identity = jobs.admit(job_id(7)).expect("admit").identity().clone();
+    let identity = jobs
+        .admit(job_id(7), ExecClass::Background)
+        .expect("admit")
+        .identity()
+        .clone();
     // A restarted controller reaches the same incarnation afresh.
     let restarted = authority
         .incarnation(jobs.incarnation())
@@ -1080,6 +1090,7 @@ fn restart_lookup_keeps_the_identity_under_its_incarnation(
     let forged = JobCgroupIdentity::recorded(
         identity.incarnation().clone(),
         identity.job_id(),
+        ExecClass::Background,
         identity.cgroup_id() + 1,
     );
     assert!(matches!(
@@ -1137,7 +1148,10 @@ fn kill_reaches_the_escapee(
     println!("escape fixture {scenario}: start");
     let job = native_admission(sink, authority, job_id(id));
     let path = relative(job.path());
-    let layout = format!("/ws-{}/job-{id}", authority.workspace_incarnation.as_str());
+    let layout = format!(
+        "/background/job-{}-{id}",
+        authority.workspace_incarnation.as_str()
+    );
     assert!(
         path.ends_with(&layout),
         "{scenario}: {path} is not the {layout} cgroup of the job"
@@ -1395,10 +1409,12 @@ fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
     let (here, there) = (authority_snapshot(&first), authority_snapshot(&second));
     let jobs = authority.incarnation(&first).expect("incarnation");
     let others = authority.incarnation(&second).expect("incarnation");
-    let existing = jobs.admit(job_id(1)).expect("an earlier admission");
+    let existing = jobs
+        .admit(job_id(1), ExecClass::Background)
+        .expect("an earlier admission");
     let mut sink = SystemSpawnSink::default();
     let refusal = sink
-        .admit_cgroup(&here, job_id(1))
+        .admit_cgroup(&here, job_id(1), ExecClass::Background)
         .expect_err("a name in use is refused, never adopted or admitted uncontained");
     assert_eq!(
         refusal.code,
@@ -1418,13 +1434,13 @@ fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
         "the refused admission left the earlier one untouched"
     );
     let admitted = sink
-        .admit_cgroup(&here, job_id(2))
+        .admit_cgroup(&here, job_id(2), ExecClass::Background)
         .expect("admit")
         .expect("a cgroup");
     assert_eq!(admitted.path().parent(), existing.path().parent());
     assert_eq!(admitted.identity().job_id(), job_id(2));
     let elsewhere = sink
-        .admit_cgroup(&there, job_id(1))
+        .admit_cgroup(&there, job_id(1), ExecClass::Background)
         .expect("admit")
         .expect("a cgroup");
     assert_ne!(elsewhere.path(), existing.path());
@@ -1433,7 +1449,7 @@ fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
     retire_outstanding(&others);
 }
 
-/// The kernel's own hierarchy limit refuses a new cgroup beneath an incarnation. The library and
+/// The kernel's own hierarchy limit refuses a new cgroup beneath a class cgroup. The library and
 /// the supervisor's sink both report it and create nothing: the same job is admitted once the
 /// limit is lifted.
 fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
@@ -1445,11 +1461,11 @@ fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
     let limit = first
         .path()
         .parent()
-        .expect("the incarnation's cgroup")
+        .expect("the class cgroup")
         .join("cgroup.max.descendants");
     std::fs::write(&limit, "0").expect("set the descendant limit");
-    let library = jobs.admit(job_id(2));
-    let native = sink.admit_cgroup(&snapshot, job_id(2));
+    let library = jobs.admit(job_id(2), ExecClass::Background);
+    let native = sink.admit_cgroup(&snapshot, job_id(2), ExecClass::Background);
     let listed = jobs.outstanding();
     // Lifted before anything is judged, so a failed assertion cannot leave the scope refusing.
     std::fs::write(&limit, "max").expect("lift the descendant limit");
@@ -1475,23 +1491,23 @@ fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
     retire_outstanding(&jobs);
 }
 
-/// A cgroup the incarnation gives no memory controller cannot be opened for accounting. That
+/// A cgroup its class cgroup gives no memory controller cannot be opened for accounting. That
 /// refusal comes after the kernel created the directory -- the place a missing `cgroup.kill` is
 /// refused too -- so it must take the directory away again, and the job's name is free to try
 /// once the controller is back.
 fn a_cgroup_without_a_controller_is_removed_again(authority: &CgroupAuthority) {
     let incarnation = incarnation(7);
     let jobs = authority.incarnation(&incarnation).expect("incarnation");
-    let probe = jobs.admit(job_id(1)).expect("admit");
+    let probe = jobs.admit(job_id(1), ExecClass::Background).expect("admit");
     let distribution = probe
         .path()
         .parent()
-        .expect("the incarnation's cgroup")
+        .expect("the class cgroup")
         .join("cgroup.subtree_control");
     let sealed = probe.terminal().expect("sealed");
     sealed.retire().expect("retire");
     std::fs::write(&distribution, "-memory").expect("withhold the memory controller");
-    let refused = jobs.admit(job_id(2));
+    let refused = jobs.admit(job_id(2), ExecClass::Background);
     let listed = jobs.outstanding();
     std::fs::write(&distribution, "+memory").expect("restore the memory controller");
     let refusal = refused.expect_err("a cgroup without the memory controller is refused");
@@ -1505,7 +1521,7 @@ fn a_cgroup_without_a_controller_is_removed_again(authority: &CgroupAuthority) {
         "the refused admission left a cgroup behind: {listed:?}"
     );
     let retry = jobs
-        .admit(job_id(2))
+        .admit(job_id(2), ExecClass::Background)
         .expect("the refused job's name is free again");
     let sealed = retry.terminal().expect("sealed");
     sealed.retire().expect("retire");
@@ -1519,7 +1535,7 @@ fn an_unwritable_cgroup_kill_refuses_attachment(authority: &CgroupAuthority) {
 
     let incarnation = incarnation(8);
     let jobs = authority.incarnation(&incarnation).expect("incarnation");
-    let job = jobs.admit(job_id(1)).expect("admit");
+    let job = jobs.admit(job_id(1), ExecClass::Background).expect("admit");
     let identity = job.identity().clone();
     let kill = job.path().join("cgroup.kill");
     let writable = std::fs::metadata(&kill)
@@ -1584,7 +1600,7 @@ fn an_unending_member_is_named_past_the_reap_bound(authority: &CgroupAuthority) 
     let jobs = authority
         .incarnation(&incarnation(11))
         .expect("incarnation");
-    let job = jobs.admit(job_id(1)).expect("admit");
+    let job = jobs.admit(job_id(1), ExecClass::Background).expect("admit");
     let mut command = workload_command(&Workload {
         pause: true,
         ..Workload::default()
@@ -1686,7 +1702,9 @@ fn shared_finalization_removes_only_the_admitted_hierarchy(authority: &CgroupAut
     );
     assert!(jobs.outstanding().expect("outstanding").is_empty());
 
-    let replacement = jobs.admit(job_id(1)).expect("a new cgroup at the old path");
+    let replacement = jobs
+        .admit(job_id(1), ExecClass::Background)
+        .expect("a new cgroup at the old path");
     assert_ne!(replacement.identity(), &original);
     assert_eq!(
         late_host.finish(REAP).expect("cached final counters"),
@@ -3195,7 +3213,7 @@ fn native_admission(
     id: JobId,
 ) -> Arc<JobCgroup> {
     let admitted = sink
-        .admit_cgroup(authority, id)
+        .admit_cgroup(authority, id, ExecClass::Background)
         .unwrap_or_else(|error| panic!("native admission of job {}: {error}", id.get()));
     admitted.unwrap_or_else(|| {
         panic!(

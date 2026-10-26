@@ -105,7 +105,6 @@ describe('Cargo test progress host proofs', () => {
         { root },
         createProcessTreeKiller(),
         null,
-        null,
       );
       // The unfixed executor dies at the first gate: no terminal or second gate will arrive.
       // Resolve absent-event waits before joining the exchanges instead of hanging the baseline.
@@ -231,7 +230,6 @@ fn main() {
           },
         },
         null,
-        null,
       );
       expect(advanced, result.terminalOutput).toBe(true);
       expect(output).toContain('test completed_body ... ok\n');
@@ -271,7 +269,6 @@ fn main() {
         },
         { root },
         createProcessTreeKiller(),
-        null,
         null,
       );
       expect(result.success).toBe(false);

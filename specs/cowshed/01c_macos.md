@@ -115,17 +115,16 @@ Find the symptom in the left column and follow the link.
   holds 103 bytes and the terminating NUL.
 - **Rule.** Every socket cowshed binds sits at a short fixed-length path — `gateway.sock` and `listener-handoff.sock` at
   the store's top, `run/manager.sock`, supervisor sockets at `<store>/run/<32-hex digest>.sock` with their
-  `<store>/run/<32-hex digest>.members.sock` twins, CPU-pool endpoints at `<store>/run/cpu/<22 bytes>/<22 bytes>`, a
-  workspace's runtime directory behind its `/tmp/cs-<12-hex>` link — and a test fixture whose socket path is used as
-  spelled takes its root from the short scratch parent (`COWSHED_RUNTIME_LINK`, else `/tmp`), never from `TMPDIR`, while
-  a fixture rooted under `TMPDIR` reaches its sockets through a short alias in the runtime link.
+  `<store>/run/<32-hex digest>.members.sock` twins, a workspace's runtime directory behind its `/tmp/cs-<12-hex>` link —
+  and a test fixture whose socket path is used as spelled takes its root from the short scratch parent
+  (`COWSHED_RUNTIME_LINK`, else `/tmp`), never from `TMPDIR`, while a fixture rooted under `TMPDIR` reaches its sockets
+  through a short alias in the runtime link.
 - **Owners.** [04_sandbox.md §Fixture roots under /tmp](./04_sandbox.md#fixture-roots-under-tmp) (states the bound);
   [11_shell.md §Protocol](./11_shell.md#protocol) (supervisor socket digest);
   [01_storage.md §Directory layout](./01_storage.md#directory-layout) (root-level sockets);
   [01_storage.md §Shared temporary scratch](./01_storage.md#shared-temporary-scratch) (the fixture suffix length);
   [08_testing.md §Fixtures](./08_testing.md#fixtures) (fixture roots);
   [08_testing.md §Integration tests (real substrate)](./08_testing.md#integration-tests-real-substrate) (scratch roots);
-  [05_gateway.md §Host CPU budget](./05_gateway.md#host-cpu-budget) (CPU-pool endpoints);
   [05_gateway.md §The installed cowshed](./05_gateway.md#the-installed-cowshed) (`listener-handoff.sock`). Code:
   [`cowshed-core/src/sandbox.rs`] `workspace_runtime_link`; [`cowshed-core/src/runtime/supervisor_socket.rs`]
   `socket_path`; [`cowshed-gateway-types/src/lib.rs`] `production_control_socket`; [`cowshed-apfs/src/disk_lease.rs`]

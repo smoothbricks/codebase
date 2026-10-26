@@ -5,12 +5,9 @@ use cowshed_os::test_backstop::{
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::future::Future;
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -27,9 +24,6 @@ use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap}
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
-use cowshed_core::runtime::job_cpu::{
-    ActivationStake, HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant,
-};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
@@ -116,7 +110,6 @@ impl SpawnSink for FakeSpawner {
             events,
             backpressure: self.backpressure,
             writes: 0,
-            nice: request.cpu.nice,
         }))
     }
 }
@@ -124,8 +117,6 @@ impl SpawnSink for FakeSpawner {
 struct FakeProcess {
     job_id: JobId,
     process: OwnedProcess,
-    /// The nice the spawn was asked for, standing in for the one a real spawn observes.
-    nice: i32,
     observations: mpsc::UnboundedSender<ProcessObservation>,
     /// Where an unbackpressured fake reports each write it took as written to the child.
     events: mpsc::Sender<ProcessEvent>,
@@ -142,7 +133,7 @@ impl RunningProcess for FakeProcess {
     }
 
     fn nice(&self) -> Option<i32> {
-        Some(self.nice)
+        None
     }
 
     #[cfg(target_os = "macos")]
@@ -486,223 +477,9 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         volume_labels: None,
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
-        cpu: Arc::new(ImmediateCpu),
         build_volume_released: None,
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
     }
-}
-
-/// The pool and jobserver fifo every test grant names; nothing in these tests connects to them.
-const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
-const TEST_FIFO: &str = "/nonexistent/cowshed-test-cpu-pool.fifo";
-
-fn held(tokens: NonZeroUsize) -> HeldTokens {
-    HeldTokens {
-        tokens,
-        fifo: PathBuf::from(TEST_FIFO),
-    }
-}
-
-/// The nice a class `below` the supervisor's own is placed at: these supervisors run in this test
-/// process, so its own nice is theirs (05_gateway.md "Bands").
-fn class_nice(below: i32) -> i32 {
-    // SAFETY: a plain read of this process's own priority.
-    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-    (own + below).min(cowshed_core::runtime::supervisor::LOWEST_NICE)
-}
-
-/// The gateway's CPU budget for these tests: each request is granted its whole want at once, so
-/// a job spawns as soon as it is admitted; a resident is granted its pool alone, as the gateway
-/// answers one.
-#[derive(Debug)]
-struct ImmediateCpu;
-
-/// The background share every test budget here reports: neither one token nor a host's.
-const TEST_SHARE: NonZeroUsize = NonZeroUsize::new(5).unwrap();
-
-impl JobCpuAdmission for ImmediateCpu {
-    fn background_share(&self) -> NonZeroUsize {
-        TEST_SHARE
-    }
-
-    fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
-        Box::pin(async move {
-            let pool = PathBuf::from(TEST_POOL);
-            Ok(match ask.class {
-                ExecClass::Resident | ExecClass::InteractiveResident => {
-                    JobCpuGrant::resident(pool, Box::new(()))
-                }
-                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
-                    JobCpuGrant::new(held(ask.want), pool, Box::new(()))
-                }
-            })
-        })
-    }
-
-    fn activation(
-        &self,
-        _checkout: PathBuf,
-        _command: String,
-        _parent: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
-        Box::pin(async { Ok(ActivationStake::new(Box::new(()))) })
-    }
-}
-
-/// A CPU budget a test answers by hand. Each request arrives as a [`CpuRequest`]; dropping a
-/// request before its answer (a job withdrawn while queued) and returning a grant are reported.
-/// Activation stakes arrive as [`StakeRequest`]s when the test reads them, else are granted at once.
-#[derive(Debug)]
-struct ScriptedCpu {
-    requests: mpsc::UnboundedSender<CpuRequest>,
-    stakes: Option<mpsc::UnboundedSender<StakeRequest>>,
-}
-
-struct CpuRequest {
-    ask: JobCpuAsk,
-    answer: tokio::sync::oneshot::Sender<Result<NonZeroUsize>>,
-    withdrawn: tokio::sync::oneshot::Receiver<()>,
-    released: tokio::sync::oneshot::Receiver<()>,
-}
-
-/// One activation stake asked of a [`ScriptedCpu`]: what activates, the holder's pool it draws
-/// on, the test's answer, and the stake's return to the budget.
-struct StakeRequest {
-    command: String,
-    parent: Option<String>,
-    answer: tokio::sync::oneshot::Sender<Result<()>>,
-    released: tokio::sync::oneshot::Receiver<()>,
-}
-
-/// Sends once when dropped, unless disarmed first.
-struct Signal(Option<tokio::sync::oneshot::Sender<()>>);
-
-impl Signal {
-    fn disarm(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for Signal {
-    fn drop(&mut self) {
-        if let Some(signal) = self.0.take() {
-            let _ = signal.send(());
-        }
-    }
-}
-
-impl JobCpuAdmission for ScriptedCpu {
-    fn background_share(&self) -> NonZeroUsize {
-        TEST_SHARE
-    }
-
-    fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
-        let requests = self.requests.clone();
-        Box::pin(async move {
-            let (answer, answered) = tokio::sync::oneshot::channel();
-            let (withdraw, withdrawn) = tokio::sync::oneshot::channel();
-            let (release, released) = tokio::sync::oneshot::channel();
-            let queued = Signal(Some(withdraw));
-            let class = ask.class;
-            requests
-                .send(CpuRequest {
-                    ask,
-                    answer,
-                    withdrawn,
-                    released,
-                })
-                .expect("the test reads its CPU requests");
-            let tokens = answered.await.expect("the test answers each request")?;
-            queued.disarm();
-            let pool = PathBuf::from(TEST_POOL);
-            let holder = Box::new(Signal(Some(release)));
-            // A resident is granted its pool alone, whatever count the test answered.
-            Ok(match class {
-                ExecClass::Resident | ExecClass::InteractiveResident => {
-                    JobCpuGrant::resident(pool, holder)
-                }
-                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
-                    JobCpuGrant::new(held(tokens), pool, holder)
-                }
-            })
-        })
-    }
-
-    fn activation(
-        &self,
-        _checkout: PathBuf,
-        command: String,
-        parent: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
-        let stakes = self.stakes.clone();
-        Box::pin(async move {
-            let Some(stakes) = stakes else {
-                return Ok(ActivationStake::new(Box::new(())));
-            };
-            let (answer, answered) = tokio::sync::oneshot::channel();
-            let (release, released) = tokio::sync::oneshot::channel();
-            stakes
-                .send(StakeRequest {
-                    command,
-                    parent,
-                    answer,
-                    released,
-                })
-                .expect("the test reads its stake requests");
-            answered.await.expect("the test answers each stake")?;
-            Ok(ActivationStake::new(Box::new(Signal(Some(release)))))
-        })
-    }
-}
-
-/// A fake-spawner harness whose CPU requests the test answers by hand.
-fn scripted_harness(label: &str) -> (Harness, mpsc::UnboundedReceiver<CpuRequest>, TempRoot) {
-    let root = workspace_root(label);
-    let (requests, asked) = mpsc::unbounded_channel();
-    let h = harness_with_config(
-        WorkspaceSupervisorConfig {
-            cpu: Arc::new(ScriptedCpu {
-                requests,
-                stakes: None,
-            }),
-            ..config(&root)
-        },
-        1,
-        1024,
-        false,
-        false,
-    );
-    (h, asked, root)
-}
-
-/// A [`scripted_harness`] whose activation stakes the test answers by hand too. `warm`: its
-/// spawns are a warm host's, whose command starts with a `Started` event the test sends;
-/// otherwise one-shot spawns, whose command has started when the spawn returns.
-fn staked_harness(
-    label: &str,
-    warm: bool,
-) -> (
-    Harness,
-    mpsc::UnboundedReceiver<CpuRequest>,
-    mpsc::UnboundedReceiver<StakeRequest>,
-    TempRoot,
-) {
-    let root = workspace_root(label);
-    let (requests, asked) = mpsc::unbounded_channel();
-    let (stakes, staked) = mpsc::unbounded_channel();
-    let config = WorkspaceSupervisorConfig {
-        cpu: Arc::new(ScriptedCpu {
-            requests,
-            stakes: Some(stakes),
-        }),
-        ..config(&root)
-    };
-    let h = if warm {
-        warm_harness(config)
-    } else {
-        harness_with_config(config, 1, 1024, false, false)
-    };
-    (h, asked, staked, root)
 }
 
 fn gate(request: ExecRequest) -> ExecRequest {
@@ -2221,7 +1998,6 @@ impl SpawnSink for ReapedGroupSpawner {
             events,
             backpressure: false,
             writes: 0,
-            nice: request.cpu.nice,
         }))
     }
 }
@@ -3675,109 +3451,6 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
     );
 }
 
-/// The CPU budget of [`ImmediateCpu`], reporting a background share of its own.
-#[derive(Debug)]
-struct ShareCpu(NonZeroUsize);
-
-impl JobCpuAdmission for ShareCpu {
-    fn background_share(&self) -> NonZeroUsize {
-        self.0
-    }
-
-    fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
-        ImmediateCpu.admit(ask)
-    }
-
-    fn activation(
-        &self,
-        checkout: PathBuf,
-        command: String,
-        parent: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
-        ImmediateCpu.activation(checkout, command, parent)
-    }
-}
-
-/// A keyed request is the request its caller named (07_api.md "Keyed admission and restart
-/// attachment"). One that names no want resolves to the background share of whichever
-/// supervisor admits it, and that share may differ from one supervisor to the next, so a replay
-/// that names none is the same request and answers its one job; a replay that names the share
-/// the first admission resolved to is another request. Measured in a land gate: a
-/// replay compared by its resolved want was refused as a want change.
-#[tokio::test]
-async fn a_keyed_exec_that_names_no_want_answers_its_one_job_whatever_share_each_supervisor_has() {
-    let (mut supervisor_config, _root) = isolated_config("keyed-share");
-    let three = NonZeroUsize::new(3).unwrap();
-    supervisor_config.cpu = Arc::new(ShareCpu(three));
-    let mut first = real_store_harness(supervisor_config.clone());
-    let (remote, _path) = served(&first.handle).await;
-    let job = remote
-        .exec(
-            None,
-            None,
-            keyed("op-share", StdinSource::Empty),
-            AdmissionSource::Worker,
-        )
-        .await
-        .unwrap();
-    let spawned = first.spawned.recv().await.unwrap();
-    assert_eq!(
-        spawned.request.cpu.held.as_ref().map(|held| held.tokens),
-        Some(three),
-        "the first supervisor resolved the unnamed want to its share"
-    );
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    first.handle.wait(job).await.unwrap();
-    first.handle.quiesce().await.unwrap();
-    first
-        .handle
-        .retire(NxDaemonRetirement::Recorded)
-        .await
-        .unwrap();
-    drop(first);
-
-    supervisor_config.cpu = Arc::new(ShareCpu(NonZeroUsize::new(7).unwrap()));
-    let mut second = real_store_harness(supervisor_config);
-    let (remote, _path) = served(&second.handle).await;
-    assert_eq!(
-        remote
-            .exec(
-                None,
-                None,
-                keyed("op-share", StdinSource::Empty),
-                AdmissionSource::Worker,
-            )
-            .await
-            .unwrap(),
-        job,
-        "the same unnamed request answers its one job under another share"
-    );
-    let named = remote
-        .exec(
-            None,
-            None,
-            ExecRequest {
-                want: Some(three),
-                ..keyed("op-share", StdinSource::Empty)
-            },
-            AdmissionSource::Worker,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(
-        named.admission_source(),
-        Some(&AdmissionRefusal::KeyConflict {
-            job_id: job,
-            fields: vec![AdmissionField::Want],
-        }),
-        "naming the share it resolved to is another request"
-    );
-    assert!(
-        second.spawned.try_recv().is_err(),
-        "no repeat spawned anything"
-    );
-}
-
 #[tokio::test]
 async fn an_absent_key_is_none_only_for_the_current_supervisor_authority() {
     use cowshed_core::runtime::supervisor_socket;
@@ -4059,7 +3732,11 @@ async fn sealed_reads_preserve_unread_history_without_hiding_readable_jobs() {
             config.authority.grant_revision,
             &request(StdinSource::Empty).command,
             None,
-            JobScheduling::default(),
+            JobScheduling::new(
+                ExecScope::Workspace,
+                ExecClass::Background,
+                NonZeroUsize::MIN,
+            ),
         )
         .unwrap();
     store
@@ -5716,7 +5393,7 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
         ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         },
         1,
     )
@@ -5796,7 +5473,7 @@ async fn a_served_supervisor_s_progress_starts_at_ownership_and_ends_at_the_seal
         ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         },
         0,
     )
@@ -5903,7 +5580,7 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
         ProcessEvent::Started {
             job_id,
             process: owned(&leader, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         },
         0,
     )
@@ -6044,7 +5721,7 @@ async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
         .send(ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         })
         .await
         .unwrap();
@@ -6134,7 +5811,7 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
         .send(ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         })
         .await
         .unwrap();
@@ -6413,7 +6090,7 @@ async fn a_job_s_cpu_keeps_the_descendants_that_ended_between_samples() {
         ProcessEvent::Started {
             job_id,
             process: owned(&leader.child, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         },
         0,
     )
@@ -6532,7 +6209,7 @@ async fn an_activation_and_its_command_each_count_once() {
         ProcessEvent::Started {
             job_id,
             process: owned(&command.child, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         },
         1,
     )
@@ -6655,7 +6332,7 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         ProcessEvent::Started {
             job_id,
             process: owned(&leader.child, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         },
         0,
     )
@@ -6816,7 +6493,7 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
         ProcessEvent::Started {
             job_id,
             process: owned(&leader.child, Instant::now()),
-            nice: 10,
+            nice: Some(10),
         },
         0,
     )
@@ -6902,7 +6579,7 @@ async fn a_linux_job_s_sample_names_its_missing_accounting_source() {
         ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
-            nice: 10,
+            nice: None,
         },
         0,
     )
@@ -6965,8 +6642,7 @@ const NX_PROBES: Duration = Duration::from_secs(60);
 /// A shed's code is unsigned and Nx's daemon runs it, so the daemon a host client connects to is
 /// one the shed's supervisor keeps alive inside the sandbox: a read-write resident job of the
 /// project's own `nx`, started once the shed is in use, never a second while one runs, and again
-/// once the daemon it started is gone. A resident holds no CPU token, so keeping the daemon
-/// leaves the shed's share of the host whole (05_gateway.md "A resident holds no token").
+/// once the daemon it started is gone.
 #[tokio::test(start_paused = true)]
 async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     let (supervisor_config, _root) = nx_project("raven");
@@ -6980,16 +6656,8 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     };
     assert_eq!(argv, &nx_daemon_start(&project));
     assert_eq!(first.request.mode, RunSandboxMode::ReadWrite);
-    assert_eq!(
-        (first.request.cpu.held.as_ref(), first.request.cpu.nice),
-        (None, class_nice(10)),
-        "the daemon holds no token and runs at background nice"
-    );
     let started = h.handle.info(first.request.job_id).await.unwrap();
-    assert_eq!(
-        (started.class, started.cpu_tokens),
-        (ExecClass::Resident, None)
-    );
+    assert_eq!(started.class, ExecClass::Resident);
     assert!(
         first.request.cwd.as_os_str().is_empty(),
         "run from the project root"
@@ -7040,93 +6708,6 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     std::fs::write(&record, &live).unwrap();
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();
-}
-
-/// A land resets its shed's Nx daemon and waits for the kept successor before its first gate, so while
-/// the shed runs a gate job the keeper's start is that gate's work: its start stake draws on the
-/// gate job's pool, where it is ranked as one of the gate's tasks, and only the start of a shed
-/// that runs no gate job asks the host alone as background (05_gateway.md "A resident's start
-/// holds one token"). A named session puts the shed in use without a gate job, since a
-/// supervisor's own start is no use (04_sandbox.md, the kept daemon).
-/// Measured 2026-10-21: a land's rebase ran its gate-class task-hash job in
-/// an idle shed, the keeper asked its start at once, and the start's background stake waited 324 s
-/// behind other work while the land waited on the daemon and gave up. A start still waiting when a
-/// gate job begins is the gate's work too. Measured 2026-10-22 in shed icm-no-python: the task-hash
-/// gate ended at 04:39:32, the keeper's start queued as background at 04:39:35, the land's gate
-/// began at 04:39:46 and waited on that daemon, and the start's stake stayed in the background
-/// queue for over 35 minutes, because only a start asked while a gate ran drew on its pool.
-#[tokio::test(start_paused = true)]
-async fn a_kept_daemons_start_draws_on_the_gate_job_its_shed_runs() {
-    let (config, _root) = nx_project("land");
-    let (requests, mut asked) = mpsc::unbounded_channel();
-    let (stakes, mut staked) = mpsc::unbounded_channel();
-    let config = WorkspaceSupervisorConfig {
-        cpu: Arc::new(ScriptedCpu {
-            requests,
-            stakes: Some(stakes),
-        }),
-        ..config
-    };
-    let mut h = harness_with_config(config, 1, 1024, false, false);
-    let _in_use = open_named(&h.handle, "build").await;
-    let mut idle = staked
-        .recv()
-        .await
-        .expect("the keeper's first start asks its stake");
-    assert_eq!(
-        idle.parent, None,
-        "the start of a shed that runs no gate job asks the host alone"
-    );
-
-    let gate_job = h
-        .handle
-        .exec(
-            None,
-            None,
-            gate(request(StdinSource::Empty)),
-            AdmissionSource::Coordinator,
-        )
-        .await
-        .expect("the land's gate is admitted");
-    let gate_cpu = asked.recv().await.expect("the gate asks its tokens");
-    assert_eq!(gate_cpu.ask.class, ExecClass::Gate);
-    gate_cpu.answer.send(Ok(NonZeroUsize::MIN)).unwrap();
-    let gate_spawned = h.spawned.recv().await.expect("the gate runs");
-
-    // The start still waits as background: once the gate runs it is asked again on the gate's
-    // pool, and its background stake leaves the host queue.
-    let rebound = staked
-        .recv()
-        .await
-        .expect("the waiting start is asked again once the gate runs");
-    assert_eq!(
-        rebound.parent.as_deref(),
-        Some(TEST_POOL),
-        "the waiting start a land waits on draws on the land's gate pool"
-    );
-    // The background stake was withdrawn: its ask dropped, leaving the host queue.
-    idle.answer.closed().await;
-
-    // That start is refused, so the keeper's next probe starts again, under the gate at once.
-    rebound
-        .answer
-        .send(Err(CowshedError::conflict("the host is full", "wait")))
-        .unwrap();
-    let under_gate = staked
-        .recv()
-        .await
-        .expect("the keeper starts again while the gate runs");
-    assert_eq!(
-        under_gate.parent.as_deref(),
-        Some(TEST_POOL),
-        "the start a land waits on draws on the land's gate pool"
-    );
-    under_gate
-        .answer
-        .send(Err(CowshedError::conflict("the test ends", "none")))
-        .unwrap();
-    complete(&gate_spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(gate_job).await.unwrap();
 }
 
 /// A foreground keeper is an ordinary owned job for draining, not developer activity. Even before
@@ -7272,8 +6853,6 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
         child: std::process::Child,
         process: OwnedProcess,
         job: JobId,
-        /// The nice the spawn was asked for, standing in for the one a real spawn observes.
-        nice: i32,
         events: mpsc::Sender<ProcessEvent>,
         reaped: mpsc::UnboundedSender<std::process::ExitStatus>,
         reported: bool,
@@ -7300,7 +6879,6 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 child,
                 process,
                 job: request.job_id,
-                nice: request.cpu.nice,
                 events,
                 reaped: self.reaped.clone(),
                 reported: false,
@@ -7314,7 +6892,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
         }
 
         fn nice(&self) -> Option<i32> {
-            Some(self.nice)
+            None
         }
 
         #[cfg(target_os = "macos")]
@@ -7344,9 +6922,6 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 match signal {
                     ProcessSignal::Term => libc::SIGTERM,
                     ProcessSignal::Kill => libc::SIGKILL,
-                    ProcessSignal::Stop | ProcessSignal::Continue => {
-                        unreachable!("this fixture's job is never lent the probation token")
-                    }
                 },
             )
             .expect("signal the fixture's held job group");
@@ -8710,469 +8285,11 @@ async fn per_job_fixed_cost_measurement() {
     }
 }
 
-/// An exec that names no want asks the CPU budget for the background share it reports, ⌊N/2⌋
-/// of the host's N tokens and at least one (05_gateway.md "The task server owns the live grant
-/// and nice"), not one token. Measured 2026-10-21 with one: an `nx run-many` under a default
-/// `cowshed exec` handed that token to its runners one after another, which waited up to 887 s
-/// for it, 21m19s against 5m54s on the host route.
-#[tokio::test]
-async fn an_exec_that_names_no_want_asks_for_the_background_share() {
-    let (h, mut asked, _root) = scripted_harness("cpu-share");
-    let handle = h.handle.clone();
-    let exec = tokio::spawn(async move {
-        handle
-            .exec(
-                None,
-                None,
-                request(StdinSource::Empty),
-                AdmissionSource::Worker,
-            )
-            .await
-    });
-    let cpu = asked.recv().await.expect("the job asks the CPU budget");
-    assert_eq!(
-        (cpu.ask.class, cpu.ask.want),
-        (ExecClass::Background, TEST_SHARE),
-        "an unnamed want is the budget's background share"
-    );
-    exec.await
-        .unwrap()
-        .expect("the exec answers at its admission");
-}
-
-/// A job is durable and queued before the gateway grants it anything; the actor answers status
-/// meanwhile and spawns nothing. The command spawns under the actual grant -- its count, its live
-/// pool, its class's nice -- and the grant is held until the job concludes, then returned.
-#[tokio::test]
-async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() {
-    let (mut h, mut asked, root) = scripted_harness("cpu-grant");
-    let handle = h.handle.clone();
-    let exec = tokio::spawn(async move {
-        handle
-            .exec(
-                None,
-                None,
-                ExecRequest {
-                    want: NonZeroUsize::new(6),
-                    ..request(StdinSource::Empty)
-                },
-                AdmissionSource::Worker,
-            )
-            .await
-    });
-    let cpu = asked.recv().await.expect("the job asks the CPU budget");
-    let job = JobId::new(1).unwrap();
-    assert_eq!(
-        (cpu.ask.class, cpu.ask.want),
-        (ExecClass::Background, NonZeroUsize::new(6).unwrap())
-    );
-    assert_eq!(cpu.ask.checkout, root.join("workspace"));
-    assert_eq!(cpu.ask.job.2, job);
-    let queued = h.handle.info(job).await.unwrap();
-    assert_eq!(
-        (
-            queued.state,
-            queued.class,
-            queued.scope,
-            queued.nice,
-            queued.cpu_tokens
-        ),
-        (
-            JobState::Queued,
-            ExecClass::Background,
-            ExecScope::Workspace,
-            None,
-            None
-        ),
-        "a queued job owns no command and names no placement"
-    );
-    assert!(
-        h.spawned.try_recv().is_err(),
-        "nothing spawns before the grant"
-    );
-
-    cpu.answer.send(Ok(NonZeroUsize::new(4).unwrap())).unwrap();
-    assert_eq!(exec.await.unwrap().unwrap(), job);
-    let spawned = h.spawned.recv().await.unwrap();
-    assert_eq!(
-        (
-            spawned.request.cpu.held.clone(),
-            spawned.request.cpu.pool.as_path(),
-            spawned.request.cpu.nice,
-            spawned.request.scope,
-        ),
-        (
-            Some(held(NonZeroUsize::new(4).unwrap())),
-            Path::new(TEST_POOL),
-            class_nice(10),
-            ExecScope::Workspace
-        ),
-        "the command runs under the granted count, not its want, at background nice"
-    );
-    let running = h.handle.info(job).await.unwrap();
-    assert_eq!(
-        (running.state, running.cpu_tokens, running.nice),
-        (
-            JobState::Running,
-            NonZeroUsize::new(4),
-            Some(class_nice(10))
-        )
-    );
-    let mut released = cpu.released;
-    assert!(
-        released.try_recv().is_err(),
-        "the grant is held while the job runs"
-    );
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    let ended = h.handle.wait(job).await.unwrap();
-    assert_eq!(
-        (ended.cpu_tokens, ended.nice, ended.class),
-        (
-            NonZeroUsize::new(4),
-            Some(class_nice(10)),
-            ExecClass::Background
-        )
-    );
-    released
-        .await
-        .expect("the concluded job returned its grant to the gateway");
-}
-
-/// A resident's admission up to its spawn: the stake asked before its pool, and the spawn under
-/// both. What reports the stake's return, what reports the pool's, and the spawn.
-async fn admit_resident(
-    h: &mut Harness,
-    asked: &mut mpsc::UnboundedReceiver<CpuRequest>,
-    staked: &mut mpsc::UnboundedReceiver<StakeRequest>,
-) -> (
-    JobId,
-    tokio::sync::oneshot::Receiver<()>,
-    tokio::sync::oneshot::Receiver<()>,
-    Spawned,
-) {
-    let job = h
-        .handle
-        .exec(
-            None,
-            None,
-            ExecRequest {
-                class: ExecClass::Resident,
-                ..request(StdinSource::Empty)
-            },
-            AdmissionSource::Coordinator,
-        )
-        .await
-        .expect("answered at admission");
-    let StakeRequest {
-        command,
-        parent,
-        answer,
-        released: stake_released,
-    } = staked
-        .recv()
-        .await
-        .expect("the resident asks its start stake");
-    assert!(!command.is_empty(), "the stake names what activates");
-    assert_eq!(
-        parent, None,
-        "a coordinator's resident draws on no holder's pool"
-    );
-    assert!(
-        asked.try_recv().is_err(),
-        "no pool is asked before the stake is held"
-    );
-    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Queued);
-    answer.send(Ok(())).unwrap();
-    let pool = asked.recv().await.expect("then it asks its pool");
-    assert_eq!(pool.ask.class, ExecClass::Resident);
-    pool.answer.send(Ok(NonZeroUsize::MIN)).unwrap();
-    let spawned = h.spawned.recv().await.unwrap();
-    (job, stake_released, pool.released, spawned)
-}
-
-/// A resident holds no token for its life, but its shell's activation is work: it first waits
-/// for one background token, asks for its zero-token pool only once that stake is held, holds the
-/// stake while a warm host's shell activates, and returns it when its command starts -- keeping its
-/// pool to the end (05_gateway.md "A resident's start holds one token").
-#[tokio::test]
-async fn a_resident_holds_one_token_until_its_warm_command_starts_and_none_after() {
-    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-warm", true);
-    let (job, mut stake_released, mut pool_released, spawned) =
-        admit_resident(&mut h, &mut asked, &mut staked).await;
-    // The actor has handled the spawn's return once it answers this.
-    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Running);
-    assert!(
-        stake_released.try_recv().is_err(),
-        "the stake is held while the shell activates, before the command starts"
-    );
-    let command = lone_group();
-    spawned
-        .events
-        .send(ProcessEvent::Started {
-            job_id: job,
-            process: owned(&command, Instant::now()),
-            nice: 10,
-        })
-        .await
-        .unwrap();
-    stake_released
-        .await
-        .expect("the command started: the stake returned its token");
-    assert!(
-        pool_released.try_recv().is_err(),
-        "the resident keeps its pool while it runs"
-    );
-    end_group(&command);
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(job).await.unwrap();
-    reap(command);
-    pool_released
-        .await
-        .expect("the concluded resident returned its pool");
-}
-
-/// A one-shot spawn -- a direct `/bin/sh`, no warm host -- reports no `Started`: its command has
-/// started when the spawn returns its process. Its stake returns then, never held for the
-/// resident's life (measured 2026-10-20: a direct ticker resident held the stake, the one
-/// background token of a three-token ledger, and starved the work admitted after it).
-#[tokio::test]
-async fn a_one_shot_resident_returns_its_stake_when_its_spawn_returns() {
-    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-one-shot", false);
-    let (job, stake_released, mut pool_released, spawned) =
-        admit_resident(&mut h, &mut asked, &mut staked).await;
-    stake_released
-        .await
-        .expect("the one-shot command started with its spawn: the stake returned its token");
-    assert!(
-        pool_released.try_recv().is_err(),
-        "the resident keeps its pool while it runs"
-    );
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(job).await.unwrap();
-    pool_released
-        .await
-        .expect("the concluded resident returned its pool");
-}
-
-/// A resident whose spawn fails never starts a command: its stake returns with its grant when the
-/// failed job concludes, never held past it.
-#[tokio::test]
-async fn a_resident_whose_spawn_fails_returns_its_stake_with_its_grant() {
-    let root = workspace_root("cpu-resident-spawn-failed");
-    let (requests, mut asked) = mpsc::unbounded_channel();
-    let (stakes, mut staked) = mpsc::unbounded_channel();
-    let config = WorkspaceSupervisorConfig {
-        cpu: Arc::new(ScriptedCpu {
-            requests,
-            stakes: Some(stakes),
-        }),
-        ..config(&root)
-    };
-    let mut h = harness_with_config(config, 1, 1024, true, false);
-    let job = h
-        .handle
-        .exec(
-            None,
-            None,
-            ExecRequest {
-                class: ExecClass::Resident,
-                ..request(StdinSource::Empty)
-            },
-            AdmissionSource::Coordinator,
-        )
-        .await
-        .expect("answered at admission");
-    let stake = staked.recv().await.expect("the start stake");
-    stake.answer.send(Ok(())).unwrap();
-    let pool = asked.recv().await.expect("the pool");
-    pool.answer.send(Ok(NonZeroUsize::MIN)).unwrap();
-    let ended = h.handle.wait(job).await.unwrap();
-    assert_eq!(ended.state, JobState::Failed);
-    stake
-        .released
-        .await
-        .expect("the failed spawn's job returned its stake");
-    pool.released.await.expect("and its pool");
-    assert!(h.spawned.try_recv().is_err(), "no command ran");
-}
-
-/// A resident whose start stake is refused fails before any command, as any refused admission:
-/// no pool is asked and nothing spawns.
-#[tokio::test]
-async fn a_resident_whose_start_stake_is_refused_fails_before_any_command() {
-    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-refused", false);
-    let job = h
-        .handle
-        .exec(
-            None,
-            None,
-            ExecRequest {
-                class: ExecClass::Resident,
-                ..request(StdinSource::Empty)
-            },
-            AdmissionSource::Coordinator,
-        )
-        .await
-        .expect("answered at admission");
-    let stake = staked
-        .recv()
-        .await
-        .expect("the resident asks its start stake");
-    stake
-        .answer
-        .send(Err(CowshedError::conflict(
-            "the gateway is gone",
-            "start it",
-        )))
-        .unwrap();
-    let ended = h.handle.wait(job).await.unwrap();
-    assert_eq!(
-        (ended.state, ended.failure),
-        (JobState::Failed, Some(JobFailure::CpuAdmission))
-    );
-    assert!(asked.try_recv().is_err(), "no pool was asked");
-    assert!(h.spawned.try_recv().is_err(), "no command ran");
-}
-
-/// Cancelling a job still waiting for its grant withdraws its request from the gateway's queue:
-/// nothing spawns, nothing is signalled, and the job ends killed without a placement.
-#[tokio::test]
-async fn a_job_killed_while_queued_leaves_the_queue_without_a_command() {
-    let (mut h, mut asked, _root) = scripted_harness("cpu-withdraw");
-    let job = h
-        .handle
-        .exec(
-            None,
-            None,
-            request(StdinSource::Empty),
-            AdmissionSource::Worker,
-        )
-        .await
-        .expect("an exec is answered at admission");
-    let cpu = asked.recv().await.unwrap();
-    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Queued);
-    h.handle.kill(job).await.unwrap();
-    cpu.withdrawn
-        .await
-        .expect("the cancelled job's request left the queue");
-    let ended = h.handle.wait(job).await.unwrap();
-    assert_eq!(
-        (ended.state, ended.nice, ended.cpu_tokens, ended.failure),
-        (JobState::Killed, None, None, None)
-    );
-    assert!(h.spawned.try_recv().is_err(), "nothing spawned");
-    assert!(h.process.try_recv().is_err(), "nothing was signalled");
-}
-
-/// A job killed while it waits for its grant is reported over the supervisor's socket, where a
-/// workspace's owner polls it: killed, with no pid and no exit status, because it never ran. Its
-/// owner, having seen it end, retires the workspace. A projection that refused this state left
-/// the owner unable to see the job end, so the owner kept the workspace forever.
-#[tokio::test]
-async fn a_job_killed_while_queued_is_reported_over_the_socket_and_its_workspace_retires() {
-    let (h, mut asked, _root) = scripted_harness("cpu-withdraw-served");
-    let (remote, _path) = served(&h.handle).await;
-    let job = remote
-        .exec(
-            None,
-            None,
-            request(StdinSource::Empty),
-            AdmissionSource::Worker,
-        )
-        .await
-        .expect("an exec is answered at admission");
-    let cpu = asked.recv().await.unwrap();
-    remote.kill(job).await.unwrap();
-    cpu.withdrawn
-        .await
-        .expect("the cancelled job's request left the queue");
-    let ended = remote.info(job).await.expect("the killed job is reported");
-    assert_eq!(
-        (
-            ended.state,
-            ended.pid,
-            ended.exit.as_ref(),
-            ended.resources.as_ref()
-        ),
-        (JobState::Killed, None, None, None),
-        "killed before its command existed: nothing ran, so nothing exited"
-    );
-    assert_eq!(
-        remote
-            .list()
-            .await
-            .expect("the workspace's jobs are listed"),
-        vec![ended],
-        "one job killed while queued does not refuse the list its owner stops jobs from"
-    );
-    remote
-        .retire(NxDaemonRetirement::Recorded)
-        .await
-        .expect("the workspace retires once its killed job is seen to end");
-}
-
-/// A refused admission -- a gate whose bound elapsed, a gateway that is not there -- fails the
-/// job before any command. Its caller was answered at admission, before the gateway said
-/// anything, so it reads the refusal on the job's stderr, the record types the failure, and the
-/// exit is the refusal's wrapper code.
-#[tokio::test]
-async fn a_refused_cpu_admission_fails_the_job_before_any_command() {
-    let (mut h, mut asked, _root) = scripted_harness("cpu-refused");
-    let refusal = || {
-        CowshedError::conflict(
-            "gateway refused the CPU grant: /w: 8 tokens in 1 running grant(s)",
-            "retry once the holders finish",
-        )
-    };
-    let job = h
-        .handle
-        .exec(
-            None,
-            None,
-            request(StdinSource::Empty),
-            AdmissionSource::Worker,
-        )
-        .await
-        .expect("answered at admission, before the gateway answers");
-    let cpu = asked.recv().await.unwrap();
-    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Queued);
-    cpu.answer.send(Err(refusal())).unwrap();
-    let ended = h.handle.wait(job).await.unwrap();
-    assert_eq!(
-        (
-            ended.state,
-            ended.failure,
-            ended.nice,
-            ended.cpu_tokens,
-            ended.exit
-        ),
-        (
-            JobState::Failed,
-            Some(JobFailure::CpuAdmission),
-            None,
-            None,
-            Some(ExitStatus::Exited {
-                code: refusal().exec_wrapper_exit_code().into()
-            })
-        )
-    );
-    let stderr = h
-        .handle
-        .log_read(job, StreamKind::Stderr, 0, false)
-        .await
-        .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&stderr.bytes),
-        format!("cowshed: {}\n", refusal().message)
-    );
-    assert!(h.spawned.try_recv().is_err(), "no command ran");
-}
-
 /// A worker asking for a gate, or for the host boundary, is refused with the typed
-/// class-not-permitted error before anything exists: no record, no gateway request, no spawn.
+/// class-not-permitted error before anything exists: no record, no spawn.
 #[tokio::test]
 async fn a_worker_gate_is_refused_before_any_record_request_or_spawn() {
-    let (mut h, mut asked, _root) = scripted_harness("cpu-worker-gate");
+    let (mut h, _root) = harness(1, 1024, false, false);
     for scope in [ExecScope::Workspace, ExecScope::HostGate] {
         let refused = h
             .handle
@@ -9190,215 +8307,8 @@ async fn a_worker_gate_is_refused_before_any_record_request_or_spawn() {
         assert_eq!(refused.code, ErrorCode::SandboxDenied, "{scope:?}");
         assert!(refused.cpu_admission_source().is_some(), "{scope:?}");
     }
-    assert!(asked.try_recv().is_err(), "no gateway request");
     assert!(h.artifacts.try_recv().is_err(), "no job record");
     assert!(h.spawned.try_recv().is_err(), "no spawn");
-}
-
-/// A worker may ask for interactive work, the class of a command its requester waits on
-/// (05_gateway.md "Bands"): the supervisor asks the CPU budget with that class -- which its
-/// gateway admission sends as background -- and places the command at the supervisor's own nice,
-/// above a gate's +5 and background's +10, and the job reports both.
-#[tokio::test]
-async fn a_worker_interactive_job_asks_its_class_and_runs_above_the_gate() {
-    let (mut h, mut asked, _root) = scripted_harness("cpu-interactive");
-    let handle = h.handle.clone();
-    let exec = tokio::spawn(async move {
-        handle
-            .exec(
-                None,
-                None,
-                ExecRequest {
-                    class: ExecClass::Interactive,
-                    want: NonZeroUsize::new(2),
-                    ..request(StdinSource::Empty)
-                },
-                AdmissionSource::Worker,
-            )
-            .await
-    });
-    let cpu = asked.recv().await.unwrap();
-    assert_eq!(
-        (cpu.ask.class, cpu.ask.want),
-        (ExecClass::Interactive, NonZeroUsize::new(2).unwrap())
-    );
-    cpu.answer.send(Ok(NonZeroUsize::new(2).unwrap())).unwrap();
-    let job = exec.await.unwrap().unwrap();
-    let spawned = h.spawned.recv().await.unwrap();
-    assert_eq!(
-        spawned.request.cpu.nice,
-        class_nice(0),
-        "interactive runs above the gate"
-    );
-    let info = h.handle.info(job).await.unwrap();
-    assert_eq!(
-        (info.class, info.nice, info.cpu_tokens),
-        (
-            ExecClass::Interactive,
-            Some(class_nice(0)),
-            NonZeroUsize::new(2)
-        )
-    );
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(job).await.unwrap();
-}
-
-/// A coordinator's gate asks for its tokens, runs five below the supervisor's own nice, and may
-/// name the host boundary for an argv; a host-gate script, which needs the sandboxed exec host, is
-/// refused before any effect.
-#[tokio::test]
-async fn a_coordinator_gate_runs_at_gate_nice_and_may_reach_the_host_boundary() {
-    let (mut h, mut asked, _root) = scripted_harness("cpu-gate");
-    for scope in [ExecScope::Workspace, ExecScope::HostGate] {
-        let handle = h.handle.clone();
-        let exec = tokio::spawn(async move {
-            handle
-                .exec(
-                    None,
-                    None,
-                    ExecRequest {
-                        want: NonZeroUsize::new(8),
-                        scope,
-                        ..gate(request(StdinSource::Empty))
-                    },
-                    AdmissionSource::Coordinator,
-                )
-                .await
-        });
-        let cpu = asked.recv().await.unwrap();
-        assert_eq!(
-            (cpu.ask.class, cpu.ask.want),
-            (ExecClass::Gate, NonZeroUsize::new(8).unwrap())
-        );
-        cpu.answer.send(Ok(NonZeroUsize::new(8).unwrap())).unwrap();
-        let job = exec.await.unwrap().unwrap();
-        let spawned = h.spawned.recv().await.unwrap();
-        assert_eq!(
-            (spawned.request.scope, spawned.request.cpu.nice),
-            (scope, class_nice(5))
-        );
-        let info = h.handle.info(job).await.unwrap();
-        assert_eq!(
-            (info.class, info.scope, info.nice),
-            (ExecClass::Gate, scope, Some(class_nice(5)))
-        );
-        complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-        h.handle.wait(job).await.unwrap();
-    }
-    let script = ExecRequest {
-        command: ExecCommand::Script(
-            cowshed_core::api::ScriptCommand::new(vec!["true".to_owned()], Vec::new()).unwrap(),
-        ),
-        scope: ExecScope::HostGate,
-        ..gate(request(StdinSource::Empty))
-    };
-    let refused = h
-        .handle
-        .exec(None, None, script, AdmissionSource::Coordinator)
-        .await
-        .unwrap_err();
-    assert_eq!(refused.code, ErrorCode::Usage);
-    // A host gate still takes no session overlay; environment names restrict only its records.
-    let session = open_named(&h.handle, "gate").await;
-    let refused = h
-        .handle
-        .exec(
-            Some(&session),
-            None,
-            ExecRequest {
-                scope: ExecScope::HostGate,
-                ..gate(request(StdinSource::Empty))
-            },
-            AdmissionSource::Coordinator,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(refused.code, ErrorCode::Usage);
-    assert!(
-        asked.try_recv().is_err(),
-        "the refused host gates asked nothing"
-    );
-    assert!(h.spawned.try_recv().is_err(), "nothing spawned");
-}
-
-/// The host scope says where a coordinator's command runs, not how it is scheduled: a host job
-/// at the default class asks the CPU budget as background work -- never the repository's gate
-/// order -- runs at background nice, and reports both its class and its scope.
-#[tokio::test]
-async fn a_coordinator_host_job_at_the_default_class_asks_a_background_token() {
-    let (mut h, mut asked, _root) = scripted_harness("cpu-host-background");
-    // The exec answers at admission, before any grant (11_shell.md).
-    let job = h
-        .handle
-        .exec(
-            None,
-            None,
-            ExecRequest {
-                want: NonZeroUsize::new(4),
-                scope: ExecScope::HostGate,
-                ..request(StdinSource::Empty)
-            },
-            AdmissionSource::Coordinator,
-        )
-        .await
-        .expect("the coordinator admits host work at the default class");
-    let cpu = asked.recv().await.unwrap();
-    assert_eq!(
-        (cpu.ask.class, cpu.ask.want),
-        (ExecClass::Background, NonZeroUsize::new(4).unwrap())
-    );
-    cpu.answer.send(Ok(NonZeroUsize::new(4).unwrap())).unwrap();
-    let spawned = h.spawned.recv().await.unwrap();
-    assert_eq!(
-        (spawned.request.scope, spawned.request.cpu.nice),
-        (ExecScope::HostGate, class_nice(10))
-    );
-    let info = h.handle.info(job).await.unwrap();
-    assert_eq!(
-        (info.class, info.scope, info.nice, info.cpu_tokens),
-        (
-            ExecClass::Background,
-            ExecScope::HostGate,
-            Some(class_nice(10)),
-            NonZeroUsize::new(4)
-        )
-    );
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(job).await.unwrap();
-}
-
-/// The production store keeps the job's class, scope, granted tokens and observed nice in its
-/// terminal record, so the sealed job says what it ran under after its supervisor is gone.
-#[tokio::test]
-async fn the_sealed_record_keeps_the_class_scope_grant_and_observed_nice() {
-    let (supervisor_config, _root) = isolated_config("cpu-sealed");
-    let mut h = real_store_harness(supervisor_config);
-    let job = h
-        .handle
-        .exec(
-            None,
-            None,
-            ExecRequest {
-                want: NonZeroUsize::new(2),
-                ..gate(request(StdinSource::Empty))
-            },
-            AdmissionSource::Coordinator,
-        )
-        .await
-        .unwrap();
-    let spawned = h.spawned.recv().await.unwrap();
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(job).await.unwrap();
-    let sealed = h.handle.sealed(job).await.unwrap();
-    assert_eq!(
-        (sealed.class, sealed.scope, sealed.cpu_tokens, sealed.nice),
-        (
-            ExecClass::Gate,
-            ExecScope::Workspace,
-            NonZeroUsize::new(2),
-            Some(class_nice(5))
-        )
-    );
 }
 
 /// Public plaintext is a record projection, not an execution policy. Both scopes preserve the
@@ -9553,7 +8463,7 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
                 // SAFETY: the fixture still owns this live leader.
                 let observed = unsafe { libc::getpriority(libc::PRIO_PROCESS, command.id()) };
                 assert_ne!(observed, -1, "fixture leader priority is observable");
-                observed
+                Some(observed)
             },
         },
         0,
@@ -9659,7 +8569,7 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
                 // SAFETY: the fixture still owns this live leader.
                 let observed = unsafe { libc::getpriority(libc::PRIO_PROCESS, leader.child.id()) };
                 assert_ne!(observed, -1, "fixture leader priority is observable");
-                observed
+                Some(observed)
             },
         },
         0,
@@ -9718,17 +8628,14 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
     reap(leader);
 }
 
-/// A real native supervisor, including its protected credentials and ownership ledger, whose
-/// CPU budget is `cpu`.
+/// A real native supervisor, including its protected credentials and ownership ledger.
 #[cfg(target_os = "macos")]
 fn native_process_fixture(
     name: &str,
     membership: Option<&std::path::Path>,
-    cpu: Arc<dyn JobCpuAdmission>,
 ) -> (WorkspaceSupervisorHandle, PathBuf, TempRoot) {
     let (mut config, root) = isolated_config(name);
     config.default_cwd = None;
-    config.cpu = cpu;
     config.term_grace = Duration::from_secs(1);
     std::fs::create_dir_all(&config.sandbox.home).unwrap();
     std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
@@ -9789,8 +8696,7 @@ async fn terminal_descendant_reproduction(
     use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
     use std::io::Read as _;
 
-    let (handle, ledger, root) =
-        native_process_fixture("terminal-descendant", None, Arc::new(ImmediateCpu));
+    let (handle, ledger, root) = native_process_fixture("terminal-descendant", None);
     let socket = root.join("child.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let script = r#"
@@ -10101,133 +9007,6 @@ fn report_with_descriptor(
     (report, descriptor)
 }
 
-/// A refused membership retirement answers its client instead of hanging it, keeps the job held
-/// with its CPU tokens, and its survivors' exits conclude the job (11_shell.md, "Shell activation
-/// and process reuse"). The job runs `/usr/sbin/lsof` as root through `sudo -n`. lsof's real uid is
-/// root's, so when the leader exits the kernel refuses retirement's signal to it (EPERM); SIGTERM
-/// is ignored so sudo neither ends nor relays it first. The parked `wait` and log follower get
-/// that refusal and the hold outlives it. Once this test closes the file lsof watches, lsof and
-/// sudo exit on their own, and the observer holding no running life re-runs the retirement, which
-/// seals the job and returns its tokens. Needs this host's passwordless sudo grant for
-/// `/usr/sbin/lsof`; every cow sandbox denies `/usr/bin/sudo` itself, so it runs in the host lane.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-async fn host_controller_a_refused_retirement_answers_its_client_and_its_survivors_exits_conclude_it()
- {
-    use cowshed_core::runtime::supervisor_socket;
-    use std::io::BufRead as _;
-
-    let (requests, mut asked) = mpsc::unbounded_channel();
-    let (handle, _ledger, root) = native_process_fixture(
-        "refused-retirement",
-        None,
-        Arc::new(ScriptedCpu {
-            requests,
-            stakes: None,
-        }),
-    );
-    // lsof lists this process's hold on `watched` once a second, and ends once nothing holds it.
-    let watched = root.join("watched");
-    let holding = std::fs::File::create(&watched).unwrap();
-    let listing_path = root.join("listing");
-    let fifo = std::ffi::CString::new(listing_path.as_os_str().as_bytes()).unwrap();
-    // SAFETY: a NUL-terminated path in this test's own root.
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    let job = handle
-        .exec(
-            None,
-            None,
-            ExecRequest {
-                command: ExecCommand::Argv(vec![
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    r#"trap '' TERM; /usr/bin/sudo -n /usr/sbin/lsof -nP +r 1 -a -p "$1" "$2" > "$3" & read _"#
-                        .into(),
-                    "refused-retirement".into(),
-                    CommandArg::from(std::process::id().to_string()),
-                    CommandArg::from(watched.into_os_string()),
-                    CommandArg::from(listing_path.clone().into_os_string()),
-                ]),
-                cwd: None,
-                scope: ExecScope::HostGate,
-                ..gate(request(StdinSource::Open))
-            },
-            AdmissionSource::Coordinator,
-        )
-        .await
-        .unwrap();
-    let cpu = asked.recv().await.unwrap();
-    cpu.answer.send(Ok(NonZeroUsize::new(2).unwrap())).unwrap();
-    let mut released = cpu.released;
-    // lsof's first listing is the readiness event: sudo started it and it runs as root.
-    let (listing, header) = tokio::task::spawn_blocking(move || {
-        let mut listing = std::io::BufReader::new(std::fs::File::open(listing_path).unwrap());
-        let mut header = String::new();
-        listing.read_line(&mut header).unwrap();
-        (listing, header)
-    })
-    .await
-    .unwrap();
-    assert!(
-        header.starts_with("COMMAND"),
-        "sudo -n /usr/sbin/lsof ended before listing; this host must grant it without a password"
-    );
-    let (_remote, socket) = served(&handle).await;
-    let hold = supervisor_socket::hold(&socket, &authority().workspace_incarnation, job)
-        .await
-        .unwrap();
-    // The client's wait and its stdout follower, each in the actor's mailbox before the leader
-    // exits: one poll sends each command.
-    let mut waiting = std::pin::pin!(handle.wait(job));
-    let mut following = std::pin::pin!(handle.log_read(job, StreamKind::Stdout, 0, true));
-    assert!(
-        tokio::time::timeout(Duration::ZERO, &mut waiting)
-            .await
-            .is_err()
-    );
-    assert!(
-        tokio::time::timeout(Duration::ZERO, &mut following)
-            .await
-            .is_err()
-    );
-    handle
-        .stdin_write(job, 0, Bytes::from_static(b"\n"))
-        .await
-        .unwrap();
-
-    let refusal = waiting.await.unwrap_err();
-    assert!(
-        refusal.message.contains("proc_signal_with_audittoken")
-            && refusal.message.contains("Operation not permitted"),
-        "{refusal:?}"
-    );
-    assert_eq!(
-        following.await.unwrap_err(),
-        refusal,
-        "the follower ends with the refusal"
-    );
-    assert_eq!(handle.info(job).await.unwrap().state, JobState::Draining);
-    assert_eq!(
-        released.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty),
-        "a refusal keeps the job's tokens"
-    );
-    hold.release().await.expect("the hold outlives the refusal");
-
-    drop(holding);
-    released
-        .await
-        .expect("the concluded job returns its tokens");
-    let ended = handle.wait(job).await.unwrap();
-    assert_eq!(
-        (ended.state, ended.exit),
-        (JobState::Exited, Some(ExitStatus::Exited { code: 0 }))
-    );
-    drop(listing);
-    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
-}
-
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn terminal_reaps_a_detached_descendant_still_holding_output_open() {
@@ -10242,8 +9021,7 @@ async fn a_declared_resident_survives_unrelated_terminal_and_refused_start() {
     use cowshed_core::runtime::job_groups::Process;
     use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
 
-    let (handle, ledger, _root) =
-        native_process_fixture("resident-membership", None, Arc::new(ImmediateCpu));
+    let (handle, ledger, _root) = native_process_fixture("resident-membership", None);
     let resident = handle
         .exec(
             None,
@@ -10271,7 +9049,6 @@ async fn a_declared_resident_survives_unrelated_terminal_and_refused_start() {
     assert_eq!(ready.bytes, Bytes::from_static(b"ready"));
     let held = handle.info(resident).await.unwrap();
     assert_eq!(held.class, ExecClass::Resident);
-    assert_eq!(held.cpu_tokens, None);
     let pid = held.pid.unwrap();
     let life = Darwin.record(pid).unwrap().unwrap();
     let exit = Process::observe(i32::try_from(pid).unwrap())
@@ -10365,8 +9142,7 @@ fn native_runtime_drop_retires_observed_detached_membership() {
         .build()
         .unwrap();
     let (handle, ledger, _root, peer, life, exit) = runtime.block_on(async {
-        let (handle, ledger, root) =
-            native_process_fixture("runtime-drop-membership", None, Arc::new(ImmediateCpu));
+        let (handle, ledger, root) = native_process_fixture("runtime-drop-membership", None);
         let socket = root.join("child.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let script = r#"
@@ -10472,8 +9248,7 @@ async fn membership_endpoint_is_job_bound_and_never_admits_coordinator_authority
 
     let sockets = TempRoot::new_in(&temp_parent::canonical_parent(), "cs-members");
     let socket = sockets.join("s.sock");
-    let (handle, ledger, root) =
-        native_process_fixture("subtree-endpoint", Some(&socket), Arc::new(ImmediateCpu));
+    let (handle, ledger, root) = native_process_fixture("subtree-endpoint", Some(&socket));
     let bound = supervisor_socket::bind(&socket).await.unwrap();
     let serving = tokio::spawn(supervisor_socket::serve(bound, handle.clone(), None, None));
     supervisor_socket::hello(&socket).await.unwrap();
@@ -11184,8 +9959,7 @@ async fn a_sealed_job_keeps_no_process_observation() {
     // The lives each job runs, as the script below counts them, and each one's argv bytes.
     const LIVES: usize = 32;
     const ARGV_BYTES: usize = 64 * 128;
-    let (handle, _ledger, _root) =
-        native_process_fixture("concluded-observation", None, Arc::new(ImmediateCpu));
+    let (handle, _ledger, _root) = native_process_fixture("concluded-observation", None);
     // Each of 32 lives runs an 8 KiB argv and forks a child that shares it until its own exec,
     // as a compiler driver and the tools it starts do.
     let argv: Vec<CommandArg> = (0..64)

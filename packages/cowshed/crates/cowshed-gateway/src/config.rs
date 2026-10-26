@@ -16,7 +16,6 @@ use crate::cache::{
     CacheConfig, DEFAULT_FILL_WAIT_TIMEOUT, DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES,
     DEFAULT_METADATA_TTL,
 };
-use crate::cpu_budget::CpuBudgetLimits;
 use crate::disk_lease::DiskLeaseLimits;
 use crate::task_server::TaskServerLimits;
 
@@ -262,8 +261,6 @@ pub struct GatewayConfig {
     pub mirror_cache: MirrorCacheConfig,
     /// The host disk-lifecycle lease served on the control socket (05_gateway.md).
     pub disk_lease: DiskLeaseLimits,
-    /// The host CPU budget served on the control socket (05_gateway.md).
-    pub cpu_budget: CpuBudgetLimits,
     /// The task server that schedules work units on the control socket (05_gateway.md).
     pub task_server: TaskServerLimits,
     /// SHA-256 of the executable this daemon runs, reported in its status so a client can tell
@@ -301,7 +298,6 @@ impl Default for GatewayConfig {
             command_capacity: NonZeroUsize::new(1024).expect("1024 is non-zero"),
             mirror_cache: MirrorCacheConfig::default(),
             disk_lease: DiskLeaseLimits::default(),
-            cpu_budget: CpuBudgetLimits::default(),
             task_server: TaskServerLimits::default(),
             executable_sha256: None,
             startup: None,

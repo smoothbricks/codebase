@@ -4,7 +4,6 @@ use cowshed_os::test_backstop::CommandBackstop as _;
 use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
-use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -137,7 +136,6 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: Some(10),
-        cpu_tokens: NonZeroUsize::new(1),
         containment: None,
         outlived: Vec::new(),
         outlived_incomplete: false,
@@ -613,7 +611,6 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
             "class": "background",
             "scope": "workspace",
             "nice": 10,
-            "cpuTokens": 1,
             "stdin": {"kind":"workspaceFile","bytes":12,"workspacePath":"fixtures/input.bin","complete":true}
         })
     );
@@ -679,7 +676,6 @@ fn root_job_info_requires_explicit_null_cwd() {
         "class": "background",
         "scope": "workspace",
         "nice": 10,
-        "cpuTokens": 1,
         "stdin": {"kind":"workspaceFile","bytes":12,"workspacePath":"fixtures/input.bin","complete":true}
     });
 
@@ -745,7 +741,6 @@ fn a_job_killed_before_it_ran_has_no_exit_and_one_that_ran_keeps_its_own() {
     never_ran.exit = None;
     never_ran.resources = None;
     never_ran.nice = None;
-    never_ran.cpu_tokens = None;
     let value = serde_json::to_value(&never_ran).expect("a job killed while queued is projected");
     assert!(value.get("exit").is_none() && value.get("pid").is_none());
     assert_eq!(
@@ -1260,93 +1255,14 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         healing: None,
         recovering: None,
         stale_daemon: None,
-        cpu_budget: None,
         pending_install: false,
         land_turns: Vec::new(),
         land_turns_error: None,
+        scheduling: None,
     };
     assert_eq!(
         serde_json::to_value(&status).unwrap(),
         json!({"installed":true,"running":true,"socket":"/store/gateway.sock","cliVersion":"1.4.0","daemonVersion":"1.3.0","activeWorkspaces":2})
-    );
-    // The CPU ledger is the daemon's own `cpu-budget` answer, verbatim; a daemon that answered
-    // `status` but not `cpu-budget` says why, and is never an empty ledger.
-    let ledger = GatewayStatus {
-        cpu_budget: Some(GatewayCpuBudget::Ledger(
-            cowshed_gateway_types::CpuBudgetStatus {
-                total: 18,
-                held: 13,
-                checkouts: vec![cowshed_gateway_types::CpuCheckoutStatus {
-                    checkout: "/w/land".into(),
-                    held: 13,
-                    running: 2,
-                    waiting: 1,
-                }],
-                gate_jobs: vec![cowshed_gateway_types::CpuGateJob {
-                    repository: "owner/repo".into(),
-                    checkout: "/w/land".into(),
-                    job: 7,
-                    held: 12,
-                    holders: vec![cowshed_gateway_types::CpuHolder {
-                        pid: Some(4120),
-                        command: "nx run-many -t gate".into(),
-                        tokens: 12,
-                        want: 18,
-                        held_ms: 125_000,
-                    }],
-                }],
-                gate_queue: vec![cowshed_gateway_types::CpuGateWaiter {
-                    repository: "owner/repo".into(),
-                    checkout: "/w/land".into(),
-                    job: 7,
-                    pid: Some(4133),
-                    command: "child CPU pool".into(),
-                    want: 6,
-                    waited_ms: 3_000,
-                }],
-                background: vec![cowshed_gateway_types::CpuBackgroundStake {
-                    checkout: "/w/land".into(),
-                    held: 1,
-                    holders: vec![cowshed_gateway_types::CpuHolder {
-                        pid: None,
-                        command: "cargo test".into(),
-                        tokens: 1,
-                        want: 18,
-                        held_ms: 7,
-                    }],
-                    waiters: Vec::new(),
-                }],
-                probation: None,
-            },
-        )),
-        land_turns: Vec::new(),
-        land_turns_error: None,
-        ..status.clone()
-    };
-    assert_eq!(
-        serde_json::to_value(&ledger).unwrap()["cpuBudget"],
-        json!({"ledger":{"total":18,"held":13,
-            "checkouts":[{"checkout":"/w/land","held":13,"running":2,"waiting":1}],
-            "gateJobs":[{"repository":"owner/repo","checkout":"/w/land","job":7,"held":12,"holders":[
-                {"pid":4120,"command":"nx run-many -t gate","tokens":12,"want":18,"heldMs":125000}]}],
-            "gateQueue":[{"repository":"owner/repo","checkout":"/w/land","job":7,"pid":4133,"command":"child CPU pool",
-                "want":6,"waitedMs":3000}],
-            "background":[{"checkout":"/w/land","held":1,"waiters":[],"holders":[
-                {"command":"cargo test","tokens":1,"want":18,"heldMs":7}]}]}})
-    );
-    assert_eq!(
-        serde_json::from_value::<GatewayStatus>(serde_json::to_value(&ledger).unwrap()).unwrap(),
-        ledger
-    );
-    let unanswered = GatewayStatus {
-        cpu_budget: Some(GatewayCpuBudget::Unanswered(
-            "gateway control rejected operation (InvalidRequest): unknown op".into(),
-        )),
-        ..status.clone()
-    };
-    assert_eq!(
-        serde_json::to_value(unanswered).unwrap()["cpuBudget"],
-        json!({"unanswered":"gateway control rejected operation (InvalidRequest): unknown op"})
     );
     // An install that holds the slot says so; a free slot says nothing.
     let pending = GatewayStatus {
@@ -1746,8 +1662,8 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
 }
 
 /// The scheduling facts of a job are explicit on its JSON projection: the class and scope it was
-/// admitted under always, and the nice its command was observed at and the CPU tokens its grant
-/// held only once there is something to say: never null, never a fabricated zero.
+/// admitted under always, and the nice its command was observed at only once there is
+/// something to say: never null, never a fabricated zero.
 #[test]
 fn job_info_reports_admitted_scheduling_and_observations_exactly() {
     let info = finished_job(None);
@@ -1755,14 +1671,11 @@ fn job_info_reports_admitted_scheduling_and_observations_exactly() {
     assert_eq!(value["class"], json!("background"));
     assert_eq!(value["scope"], json!("workspace"));
     assert_eq!(value["nice"], json!(10));
-    assert_eq!(value["cpuTokens"], json!(1));
 
     let mut unobserved = info.clone();
     unobserved.nice = None;
-    unobserved.cpu_tokens = None;
     let value = serde_json::to_value(&unobserved).expect("unobserved job JSON");
     assert!(value.get("nice").is_none());
-    assert!(value.get("cpuTokens").is_none());
     assert_eq!(
         serde_json::from_value::<JobInfo>(value).expect("decode"),
         unobserved
@@ -1772,19 +1685,17 @@ fn job_info_reports_admitted_scheduling_and_observations_exactly() {
     let mut gate = info;
     gate.class = ExecClass::Gate;
     gate.nice = Some(0);
-    gate.cpu_tokens = NonZeroUsize::new(12);
     let value = serde_json::to_value(&gate).expect("gate job JSON");
     assert_eq!(value["class"], json!("gate"));
     assert_eq!(value["nice"], json!(0));
-    assert_eq!(value["cpuTokens"], json!(12));
     assert_eq!(
         serde_json::from_value::<JobInfo>(value).expect("decode"),
         gate
     );
 }
 
-/// A job's class and scope are required on the wire, each refuses an unknown spelling, a zero
-/// grant is not a grant, a host job may be of any class, and a queued job has observed no nice.
+/// A job's class and scope are required on the wire, each refuses an unknown spelling, a host
+/// job may be of any class, and a queued job has observed no nice.
 #[test]
 fn job_info_requires_its_class_and_scope_and_refuses_impossible_scheduling() {
     let info = finished_job(None);
@@ -1801,7 +1712,6 @@ fn job_info_requires_its_class_and_scope_and_refuses_impossible_scheduling() {
         ("class", json!("foreground")),
         ("scope", json!("host")),
         ("nice", json!("10")),
-        ("cpuTokens", json!(0)),
     ] {
         let mut changed = value.clone();
         changed[field] = invalid;
@@ -1831,7 +1741,7 @@ fn job_info_requires_its_class_and_scope_and_refuses_impossible_scheduling() {
     queued.nice = None;
     queued
         .validate()
-        .expect("a queued job may already hold its grant");
+        .expect("a queued job validates without an observed nice");
 }
 
 /// A sealed record keeps the scheduling facts after the supervisor that ran the job is gone, and
@@ -1851,7 +1761,6 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
         class: ExecClass::Gate,
         scope: ExecScope::HostGate,
         nice: None,
-        cpu_tokens: NonZeroUsize::new(12),
         containment: None,
         outlived: Vec::new(),
         outlived_incomplete: false,
@@ -1860,7 +1769,6 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
     assert_eq!(value["failure"], json!("priority"));
     assert_eq!(value["class"], json!("gate"));
     assert_eq!(value["scope"], json!("hostGate"));
-    assert_eq!(value["cpuTokens"], json!(12));
     assert!(value.get("nice").is_none());
     assert_eq!(
         serde_json::from_value::<SealedJob>(value).expect("decode"),
@@ -2006,7 +1914,6 @@ fn a_job_states_its_retirement_receipt_exactly_and_only_where_it_can_have_one() 
     refused.exit = None;
     refused.resources = None;
     refused.nice = None;
-    refused.cpu_tokens = None;
     refused
         .validate()
         .expect("a start refused before its command ran states no receipt");
@@ -2054,7 +1961,6 @@ fn a_job_states_its_retirement_receipt_exactly_and_only_where_it_can_have_one() 
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
-        cpu_tokens: None,
         containment: Some(observed.clone()),
         outlived: survivors.clone(),
         outlived_incomplete: false,
@@ -2156,7 +2062,6 @@ fn incomplete_retirement_metadata_round_trips_and_refuses_impossible_job_receipt
     never_born.exit = None;
     never_born.resources = None;
     never_born.nice = None;
-    never_born.cpu_tokens = None;
     never_born.containment = None;
     never_born.validate().unwrap();
     let never_born_wire = serde_json::to_value(&never_born).unwrap();
@@ -2204,7 +2109,6 @@ fn sealed_receipts_preserve_incomplete_metadata_and_refuse_orphaned_markers() {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
-        cpu_tokens: None,
         containment: Some(JobContainment::Kernel),
         outlived: Vec::new(),
         outlived_incomplete: true,
@@ -2387,7 +2291,6 @@ fn admission_records_contain_only_the_public_environment_names() {
         "MAKEFLAGS",
         "CARGO_MAKEFLAGS",
         "MFLAGS",
-        "BOUNDED_EXEC_CPU_POOL",
         "BOUNDED_EXEC_CPU_TOKENS",
         "LD_PRELOAD",
         "DYLD_INSERT_LIBRARIES",

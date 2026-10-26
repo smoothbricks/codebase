@@ -368,9 +368,8 @@ pub(crate) fn kept_project(read_write: &SandboxConfig) -> Option<&Path> {
 
 /// The read-write resident job that starts the daemon of the Nx project at `project_root`: the
 /// project's own `nx`, run by [`daemon_node`] from the project root inside the workspace at
-/// `workspace_root`. The daemon stays up to answer clients that hold their own tokens and is idle
-/// between them, so it holds none (05_gateway.md "A resident holds no token"): keeping it costs
-/// the shed none of its share of the host.
+/// `workspace_root`. The daemon stays up to answer clients and is idle between them, and an idle
+/// process costs the host nothing (05_gateway.md "Classes"): it runs at the resident class.
 ///
 /// Every error is permanent for the supervisor's sandbox: a start that can never run is refused
 /// here, named, before any job exists.

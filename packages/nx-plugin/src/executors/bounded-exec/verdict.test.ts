@@ -86,7 +86,7 @@ async function verdictOf(
   process.stdout.write = () => true;
   process.stderr.write = () => true;
   const killer = (await prepareKiller?.(root)) ?? createProcessTreeKiller();
-  await runBoundedExec({ command, killAfterMs: 0, ...bounds }, context, killer, null, null);
+  await runBoundedExec({ command, killAfterMs: 0, ...bounds }, context, killer, null);
   const record = await readRecord(context.record?.directory ?? '');
   expect(record?.task).toBe('app:test');
   expect(record?.hash).toBe('42');
@@ -168,7 +168,6 @@ describe('bounded-exec verdicts', () => {
           { command: 'node runner.js', idleTimeoutMs: 400, killAfterMs: 0 },
           context,
           createProcessTreeKiller(),
-          null,
           null,
         ),
     );
@@ -647,7 +646,6 @@ process.stdin.resume();
                 },
                 context,
                 createProcessTreeKiller(),
-                null,
                 null,
               ),
           );

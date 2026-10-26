@@ -1,9 +1,13 @@
 # Work-queue and host-scheduling design: state of the art, mapped onto cowshed's incidents
 
-Status: the research under a design that the owner approved on 2026-10-26 (`agent-todo/cowshed-os-scheduling.md`), which
-is being implemented in a reduced scope. The research's recommendation (§4) was the input; where the design's decisions
-differ from it, the design governs: the bands of §4 "Add" 1 are the owner's nice values 0 / +5 / +10 rather than weights
-of 100 : 10, and `io.weight` and the gate's `memory.low` are out of scope.
+Status: the research under a design that the owner approved on 2026-10-26 (`agent-todo/cowshed-os-scheduling.md`), whose
+first scope has landed. The research's recommendation (§4) was the input; where the landed design differs from it, the
+design governs: the bands of §4 "Add" 1 are the owner's nice values 0 / +5 / +10 rather than weights of 100 : 10, so the
+gate is not at the top weight; on Linux the weights sit on class cgroups above the job cgroups; the gateway keeps no
+one-gate-per-repository rule (§4 "Keep" 3), since the land turn serializes lands; and `io.weight` is out of scope. Where
+this file describes cowshed's own system, it describes main 33aaff9cc0, before the landing: the ledger in the present
+tense, and the spec section names and line numbers it cites, which the landing replaced with
+`specs/cowshed/05_gateway.md` "Host scheduling".
 
 Written 2026-10-26 for the owner's question of that day: "What is SOTA in work queue design? I feel like we reinvent
 scheduling painfully for a dumb reason." Read-only research; every external claim carries a URL, every inference is
@@ -26,7 +30,7 @@ no token"), yet the ledger cannot see whether the thread is running; so an idle 
 CPU for 50 minutes ([f5cff758e8](#incidents)) is not a bug in the policy, it is the policy. Six of the seven incidents
 below are consequences of doing in userspace, without usage information, what the kernel does with it.
 
-## 1. Our system, as the specs state it
+## 1. Our system before the landing, as the specs stated it at main 33aaff9cc0
 
 - Host-wide CPU token ledger in the gateway; a job asks `want` tokens, is granted "all at once" or waits, and "a running
   grant cannot be shrunk: Cargo's implicit make token and libtest/nextest threads sized from the original grant do not

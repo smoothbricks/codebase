@@ -22,9 +22,10 @@ is the host-installed CLI of `packages/cowshed`.
   `.cowshed/workspace.json` `workspace` field, whose `role` says shed or main). **main** is the shared checkout
   (`cowshed path main`); never edit code there. These commands run from the trusted host shell: a sandboxed worker's
   cowshed CLI is refused at its first write, so it hands fork, land, `rm` and `gc` to its lead.
-- **cowshed exec**: `cowshed exec <ws> -- <cmd>` runs a build, test or bench under cowshed's jobserver, which admits
-  work by CPU tokens so host load stays schedulable. Work started outside it holds no token and starves everyone. Host
-  targets that a sandbox can't run (`host-e2e`) use `cowshed exec <ws> --host -- direnv exec . <cmd>`.
+- **cowshed exec**: `cowshed exec <ws> -- <cmd>` runs a build, test or bench as a cowshed job: its class sets the
+  priority the kernel schedules it at, and its own jobserver (`--want`, at most one token per core) bounds the compiler
+  and test threads it starts. Work started outside it has neither, so it competes with every job unweighted and
+  unbounded. Host targets that a sandbox can't run (`host-e2e`) use `cowshed exec <ws> --host -- direnv exec . <cmd>`.
 - **Land**: the land command (see Commands). Under the repository's **land turn** (a FIFO queue per repo, holder named),
   it rebases the shed onto `main`, refuses what the rebased tree adds that no production code reaches
   (`@smoothbricks/codebase:wiring`), runs the repo's gate (`tooling/land-host.sh`: `nx run-many -t gate`, the root
@@ -81,7 +82,7 @@ is the host-installed CLI of `packages/cowshed`.
    progress, never on a sleep or a per-test deadline. A missing test, an infrastructure error or a timeout is never the
    intended red. A race gets a real interleaving, never serialization. An expensive host fixture stays out of ordinary
    test dependencies; the land gate reaches its dedicated target when its inputs change. A test tears down the fixtures
-   it physically owns on every exit path. _Enforced by: cowshed tokens; the root `lint` policies `TEST-CLOCK-ORACLE`
+   it physically owns on every exit path. _Enforced by: `cowshed exec`; the root `lint` policies `TEST-CLOCK-ORACLE`
    (deadlines and elapsed-time asserts) and `TEST-ONE-WALK` (duplicate walks), on changed tests only
    (`packages/nx-plugin/README.md`)._
 6. **Workarounds.** When a step fails, or you are about to make a failing, slow or blocked step pass without fixing its
@@ -91,8 +92,7 @@ is the host-installed CLI of `packages/cowshed`.
    compatibility shim; a waiver list; a test-only code path) → stop and fix the cause at its owner: a tolerated failure
    is a defect with a receipt (`specs/cowshed/05_gateway.md`, "Deadlines": "the failure is the diagnosis"). What a
    contract designs is not a workaround: a transient error retried by its declared policy
-   (`specs/lmao/01r_transient_errors_and_retry.md`), a reconnect a spec defines (a cowshed client's one ask after an
-   install restart, `05_gateway.md`), a bound that is the product's contract, an additive protocol reader that follows
+   (`specs/lmao/01r_transient_errors_and_retry.md`), a reconnect a spec defines, a bound that is the product's contract, an additive protocol reader that follows
    its evolution contract. Before settling for a workaround, measure the right change: files, lines and contract
    surfaces (wire, codec, spec, another shed), counted with `codegraph_explore`, LSP or `rg`. A small one is done in the
    unit, coordinated with the path's owner; a large one goes to its owner with the count. "It would be bigger" without a

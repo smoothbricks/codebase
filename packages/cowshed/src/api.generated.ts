@@ -348,6 +348,11 @@ export type CacheMiss = {
   readonly inputsError?: string;
 };
 
+/**
+ * A share in hundredths of a percent, as `/proc/pressure/*` prints it (`avg10=12.34` is 1234).
+ */
+export type CentiPercent = number & tags.Type<'uint32'> & tags.Maximum<10000>;
+
 export type ChangeRepoIdRequest = {
   readonly repoId: RepoId;
   readonly newRepoId: RepoId;
@@ -495,170 +500,13 @@ export type CpuAdmissionRefusal =
       readonly class: ExecClass;
       readonly scope: ExecScope;
     })
-  | ({ readonly reason: 'gatewayUnavailable' } & {
-      readonly socket: string;
+  | ({ readonly reason: 'jobserver' } & {
+      readonly directory: string;
       readonly error: string;
     })
-  | ({ readonly reason: 'gatewayRefused' } & {
-      readonly code: string;
+  | ({ readonly reason: 'memoryPressure' } & {
       readonly error: string;
-    })
-  | ({ readonly reason: 'cutOffByInstall' } & {
-      readonly install: InstallRestart;
-      readonly error: string;
-    })
-  | ({ readonly reason: 'installDidNotServe' } & {
-      readonly install: InstallRestart;
-      readonly waitedMs: number & tags.Type<'uint64'>;
-    })
-  | ({ readonly reason: 'protocol' } & {
-      readonly detail: string;
     });
-
-/**
- * One checkout's background-class stake: what it holds, who of it waits, and each granted lease.
- */
-export type CpuBackgroundStake = {
-  readonly checkout: string;
-  /**
-   * Tokens its granted background runners hold: the sum of its holders' tokens.
-   */
-  readonly held: number & tags.Type<'uint64'>;
-  /**
-   * Its granted leases, one per background runner holding tokens, the oldest grant first.
-   */
-  readonly holders: ReadonlyArray<CpuHolder>;
-  /**
-   * Its background requests waiting for a grant, in the order it serves them.
-   */
-  readonly waiters: ReadonlyArray<CpuWaiter>;
-};
-
-/**
- * The budget as the gateway reports it in its status: the host total, how many tokens are held,
- * and by whom. `held` plus the free tokens is always `total`.
- */
-export type CpuBudgetStatus = {
-  readonly total: number & tags.Type<'uint64'>;
-  readonly held: number & tags.Type<'uint64'>;
-  /**
-   * One entry per checkout holding or waiting for tokens, every class together.
-   */
-  readonly checkouts: ReadonlyArray<CpuCheckoutStatus>;
-  /**
-   * The gate jobs whose runners hold tokens, oldest job first: the first is the head of the
-   * gate queue, the land every returned token goes to while it wants one.
-   */
-  readonly gateJobs: ReadonlyArray<CpuGateJob>;
-  /**
-   * The gate-class requests waiting, in the order returned tokens go to them: the oldest gate
-   * job's first, and within one job in the order its tasks asked.
-   */
-  readonly gateQueue: ReadonlyArray<CpuGateWaiter>;
-  /**
-   * Each checkout's background-class stake alone, for the checkouts that have one: what is
-   * served behind the gate jobs.
-   */
-  readonly background: ReadonlyArray<CpuBackgroundStake>;
-  /**
-   * The request running on the probation token, if one is lent: it holds no ledger token and
-   * still waits in `background` for its own.
-   */
-  readonly probation?: CpuProbation;
-};
-
-export type CpuCheckoutStatus = {
-  readonly checkout: string;
-  /**
-   * Tokens its granted runners hold.
-   */
-  readonly held: number & tags.Type<'uint64'>;
-  /**
-   * Runners holding tokens.
-   */
-  readonly running: number & tags.Type<'uint64'>;
-  /**
-   * Runners waiting for a grant.
-   */
-  readonly waiting: number & tags.Type<'uint64'>;
-};
-
-/**
- * One gate job's runners that hold tokens, in one checkout.
- */
-export type CpuGateJob = {
-  readonly repository: string;
-  readonly checkout: string;
-  /**
-   * The gate job, as its admission number: the smaller is the older job.
-   */
-  readonly job: number & tags.Type<'uint64'>;
-  /**
-   * Tokens its granted runners hold: the sum of its holders' tokens.
-   */
-  readonly held: number & tags.Type<'uint64'>;
-  /**
-   * Its granted leases, one per runner holding tokens, the oldest grant first.
-   */
-  readonly holders: ReadonlyArray<CpuHolder>;
-};
-
-/**
- * One waiting gate-class request: the gate job it serves, and the request itself.
- */
-export type CpuGateWaiter = {
-  readonly repository: string;
-  readonly checkout: string;
-  /**
-   * The gate job it serves, as that job's admission number: the smaller is the older job.
-   */
-  readonly job: number & tags.Type<'uint64'>;
-  /**
-   * The client process, when its socket named one.
-   */
-  readonly pid?: number & tags.Type<'int32'>;
-  /**
-   * What the client said the tokens are for.
-   */
-  readonly command: string;
-  /**
-   * The tokens it asked for.
-   */
-  readonly want: number & tags.Type<'uint64'>;
-  /**
-   * Milliseconds since it asked.
-   */
-  readonly waitedMs: number & tags.Type<'uint64'>;
-};
-
-/**
- * One granted lease, as the ledger knows it: the client that holds it, what it said the tokens
- * are for, and since when. A lease is one connection, granted once; its age is the grant's, not
- * its process's. The ledger never scans processes: `pid` is the socket's peer, and `ps -p <pid>`
- * tells the rest.
- */
-export type CpuHolder = {
-  /**
-   * The client process, when its socket named one.
-   */
-  readonly pid?: number & tags.Type<'int32'>;
-  /**
-   * What the client said the tokens are for.
-   */
-  readonly command: string;
-  /**
-   * The tokens it was granted.
-   */
-  readonly tokens: number & tags.Type<'uint64'>;
-  /**
-   * The tokens it asked for.
-   */
-  readonly want: number & tags.Type<'uint64'>;
-  /**
-   * Milliseconds since its grant.
-   */
-  readonly heldMs: number & tags.Type<'uint64'>;
-};
 
 /**
  * CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
@@ -682,55 +530,11 @@ export type CpuMicrosDelta = number &
 export type CpuMillis = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
 /**
- * The one request the probation token is lent to: whose job runs before its grant, for which
- * checkout, and since when (05_gateway.md "A one-token job starts on probation").
- */
-export type CpuProbation = {
-  readonly checkout: string;
-  /**
-   * The client process, when its socket named one.
-   */
-  readonly pid?: number & tags.Type<'int32'>;
-  /**
-   * What the client said the token is for.
-   */
-  readonly command: string;
-  /**
-   * Milliseconds since the token was lent.
-   */
-  readonly lentMs: number & tags.Type<'uint64'>;
-};
-
-/**
  * User and system CPU time, each cumulative from the start of whatever it counts.
  */
 export type CpuTotals = {
   readonly userUs: CpuMicros;
   readonly sysUs: CpuMicros;
-};
-
-/**
- * One waiting request, as the ledger knows it: the client that asked, what for, how many
- * tokens, and since when. Every entry is one connection: a gate job whose tasks all wait is one
- * entry per task, told apart by pid, command and age.
- */
-export type CpuWaiter = {
-  /**
-   * The client process, when its socket named one.
-   */
-  readonly pid?: number & tags.Type<'int32'>;
-  /**
-   * What the client said the tokens are for.
-   */
-  readonly command: string;
-  /**
-   * The tokens it asked for.
-   */
-  readonly want: number & tags.Type<'uint64'>;
-  /**
-   * Milliseconds since it asked.
-   */
-  readonly waitedMs: number & tags.Type<'uint64'>;
 };
 
 /**
@@ -785,6 +589,13 @@ export type CredentialSecretSource =
       readonly argv: ReadonlyArray<string>;
     })
   | { readonly kind: 'upload' };
+
+/**
+ * macOS `kern.memorystatus_vm_pressure_level`. The sysctl answers the dispatch level, not the
+ * kernel's internal one: Normal 1, Warning 2 (the kernel's Warning and Urgent both), Critical 4
+ * (`sysctl_memorystatus_vm_pressure_level` in XNU `bsd/kern/kern_memorystatus_notify.c`).
+ */
+export type DarwinPressureLevel = 'normal' | 'warning' | 'critical';
 
 export type DatabaseHolder = {
   readonly pid: number & tags.Type<'int32'>;
@@ -900,11 +711,9 @@ export type ErrorCode =
   | 'integrity';
 
 /**
- * The class an exec is admitted under: one row of 05_gateway.md "Bands", fixing at the job's
- * birth both its place in the token order and the nice it runs at. It is the exec's own axis,
- * apart from the ledger's wire class ([`cowshed_gateway_types::JobserverClass`]): interactive
- * asks the ledger as background and a resident asks with its own operation, so neither reaches
- * the ledger as a class of its own.
+ * The class an exec is admitted under (05_gateway.md "Classes"), fixed at the job's birth. It
+ * sets the nice the job's command runs at and whether memory pressure makes the job wait or ends
+ * it; it grants no CPU, since the kernel schedules every class.
  */
 export type ExecClass = 'background' | 'interactive' | 'gate' | 'resident' | 'interactive-resident';
 
@@ -933,15 +742,15 @@ export type ExecParams = {
   readonly stderrCopy: OutputPublication | null;
   readonly admissionKey?: AdmissionKey;
   /**
-   * The class the job is admitted under (05_gateway.md "Bands"), omitted for background, which
+   * The class the job is admitted under (05_gateway.md "Classes"), omitted for background, which
    * is what ordinary exec asks for: `interactive` for a command its requester awaits, and
-   * `resident` for one that serves requests and holds no token, which a worker may ask for;
-   * only the coordinator.exec route admits the gate class.
+   * `resident` for one that serves requests, which a worker may ask for; only the
+   * coordinator.exec route admits the gate class.
    */
   readonly class?: ExecClass;
   /**
-   * The most CPU tokens the command can use at once; omitted for its class's own, the
-   * background share of the host for background and interactive work.
+   * The count the job's jobserver holds, at most the host's cores; omitted for the host's cores
+   * (05_gateway.md "Parallelism inside a job").
    */
   readonly want?: number & tags.Type<'uint64'> & tags.Minimum<1>;
   /**
@@ -1196,24 +1005,6 @@ export type ForkRequest = {
   readonly options: ForkOptions;
 };
 
-/**
- * One gate job that holds or wants CPU tokens, as the gateway's `gates_in_flight` names it.
- */
-export type GateJobRef = {
-  /**
-   * The gate job's admission number: the smaller is the older job.
-   */
-  readonly job: number & tags.Type<'uint64'>;
-  readonly checkout: string;
-};
-
-/**
- * What `gateway status` read of the host CPU budget (05_gateway.md "Host CPU budget"): the
- * daemon's own ledger, or the reason a daemon that answered `status` did not answer `cpu-budget`
- * — never an empty ledger standing in for one it could not read.
- */
-export type GatewayCpuBudget = { readonly ledger: CpuBudgetStatus } | { readonly unanswered: string };
-
 export type GatewayStatus = {
   /**
    * Whether launchd has the gateway agent loaded.
@@ -1249,10 +1040,11 @@ export type GatewayStatus = {
    */
   readonly staleDaemon?: StaleDaemonBinary;
   /**
-   * The host CPU ledger the answering daemon serves on `cpu-budget`, or why it gave none.
-   * Absent when no daemon answered `status`.
+   * The host's scheduling as its kernel, its workspace supervisors and its store report it
+   * (05_gateway.md "Status"), read by the CLI beside the daemon. Absent from an install's
+   * health wait, which reads none of it.
    */
-  readonly cpuBudget?: GatewayCpuBudget;
+  readonly scheduling?: HostScheduling;
   /**
    * True while an install holds the install slot (`dev.cowshed/install.lock`), read without
    * taking it (05_gateway.md "A pending install is visible"). Absent on the wire while free.
@@ -1506,6 +1298,20 @@ export type HostAttachAllRequest = {
 export type HostCores = number & tags.Type<'uint32'> & tags.Minimum<1> & tags.Maximum<65535>;
 
 /**
+ * The jobs of every live workspace supervisor on the host, counted by class and state.
+ */
+export type HostJobs = {
+  /**
+   * One row per class and state that has a job: queued, running or draining.
+   */
+  readonly counts?: ReadonlyArray<JobCount>;
+  /**
+   * The supervisors whose job list could not be read: their jobs are in no count.
+   */
+  readonly unanswered?: ReadonlyArray<UnansweredSupervisor>;
+};
+
+/**
  * Every adopted project's listing (`ls --all`), measured for landing when asked.
  */
 export type HostListRequest = {
@@ -1532,6 +1338,16 @@ export type HostPathRequest = {
 };
 
 /**
+ * The kernel readings `gateway status` reports; each answers for itself, so one failed read
+ * never hides the others.
+ */
+export type HostReadings = {
+  readonly load: LoadReading;
+  readonly memoryPressure: MemoryPressureReading;
+  readonly swap: SwapReading;
+};
+
+/**
  * A host operation that names nothing: the host is its whole subject.
  */
 export type HostRequest = { readonly [key in string]: never };
@@ -1540,6 +1356,26 @@ export type HostRequest = { readonly [key in string]: never };
  * Which host connection this is, fixed by its handshake: each serves exactly one scope.
  */
 export type HostRole = 'host' | 'sccache';
+
+/**
+ * What `gateway status` reads of the host's scheduling (05_gateway.md "Status"). Every number is
+ * a reading of the kernel, a supervisor's job list or a store listing, never a count of cowshed's
+ * own, and a reading that failed says why instead of standing in as zero.
+ */
+export type HostScheduling = {
+  /**
+   * Load, memory pressure and swap, as the kernel reports them.
+   */
+  readonly readings: HostReadings;
+  /**
+   * The jobs every live workspace supervisor lists.
+   */
+  readonly jobs: HostJobs;
+  /**
+   * Released images the store's `.deleting` directories hold for the gateway's cleanup.
+   */
+  readonly imageCleanup: ImageCleanup;
+};
 
 /**
  * `identity add <remote>`.
@@ -1562,16 +1398,15 @@ export type IdentityReport = {
 };
 
 /**
- * The install restarting a gateway, as it names itself on the listener handoff socket and as the
- * gateway passes it on to every CPU ask it cuts off: the evidence a log line names.
+ * The released images waiting for the gateway's one-at-a-time cleanup (05_gateway.md "Deleting
+ * released images"), as a listing of the store's `.deleting` directories finds them.
  */
-export type InstallRestart = {
-  readonly pid: number & tags.Type<'uint32'>;
-  readonly binary: string;
+export type ImageCleanup = {
+  readonly waiting: number & tags.Type<'uint64'>;
   /**
-   * How long the install waits for the gateway it starts to serve ([`INSTALL_SERVES_WITHIN`]).
+   * Each directory the listing could not read, with why: its images are in no count.
    */
-  readonly servesWithinMs: number & tags.Type<'uint64'>;
+  readonly unread?: ReadonlyArray<string>;
 };
 
 /**
@@ -1611,9 +1446,18 @@ export type JobContainment =
     });
 
 /**
+ * How many of the host's live jobs have one class and one state.
+ */
+export type JobCount = {
+  readonly class: ExecClass;
+  readonly state: JobState;
+  readonly jobs: number & tags.Type<'uint64'>;
+};
+
+/**
  * Why a job failed when no command's own status explains it.
  */
-export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority' | 'unlaunched';
+export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority' | 'memory' | 'unlaunched';
 
 export type JobId = number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>;
 
@@ -1640,7 +1484,6 @@ export type JobInfoRef = {
   readonly class: ExecClass;
   readonly scope: ExecScope;
   readonly nice?: number & tags.Type<'int32'>;
-  readonly cpuTokens?: number & tags.Type<'uint64'> & tags.Minimum<1>;
   readonly containment?: JobContainment;
   readonly outlived?: ReadonlyArray<OutlivedProcess>;
   readonly outlivedIncomplete?: boolean;
@@ -2254,6 +2097,31 @@ export type ListRequest = {
 };
 
 /**
+ * One `getloadavg(3)` average: the run-queue length over its window. Finite and non-negative.
+ */
+export type LoadAverage = number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>;
+
+/**
+ * The host's load over the last 1, 5 and 15 minutes.
+ */
+export type LoadAverages = {
+  readonly one: LoadAverage;
+  readonly five: LoadAverage;
+  readonly fifteen: LoadAverage;
+};
+
+/**
+ * The host's load, or why the kernel did not report it.
+ */
+export type LoadReading =
+  | ({ readonly kind: 'read' } & {
+      readonly load: LoadAverages;
+    })
+  | ({ readonly kind: 'unread' } & {
+      readonly error: string;
+    });
+
+/**
  * What the kernel shows of one descriptor on the locked inode.
  */
 export type LockCustody = 'holds' | 'open' | 'recorded' | 'unexposed';
@@ -2446,6 +2314,28 @@ export type MainLineage =
     })
   | ({ readonly kind: 'kept' } & {
       readonly why: string;
+    });
+
+/**
+ * The host's memory pressure, as its kernel states it.
+ */
+export type MemoryPressure =
+  | ({ readonly kind: 'darwin' } & {
+      readonly level: DarwinPressureLevel;
+    })
+  | ({ readonly kind: 'psi' } & {
+      readonly someAvg10: CentiPercent;
+    });
+
+/**
+ * The host's memory pressure, or why it could not be read.
+ */
+export type MemoryPressureReading =
+  | ({ readonly kind: 'read' } & {
+      readonly pressure: MemoryPressure;
+    })
+  | ({ readonly kind: 'unread' } & {
+      readonly error: string;
     });
 
 export type MirrorInfo = {
@@ -3274,7 +3164,6 @@ export type SealedJobRef = {
   readonly class: ExecClass;
   readonly scope: ExecScope;
   readonly nice?: number & tags.Type<'int32'>;
-  readonly cpuTokens?: number & tags.Type<'uint64'> & tags.Minimum<1>;
   readonly containment?: JobContainment;
   readonly outlived?: ReadonlyArray<OutlivedProcess>;
   readonly outlivedIncomplete?: boolean;
@@ -3558,6 +3447,36 @@ export type SupervisorRecovery = {
   readonly supervisors: number & tags.Type<'uint64'> & tags.Minimum<1>;
 };
 
+/**
+ * A byte count of swap, exact in every projection.
+ */
+export type SwapBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * The host's swap, or why it could not be read.
+ */
+export type SwapReading =
+  | ({ readonly kind: 'read' } & {
+      readonly swap: SwapUsage;
+    })
+  | ({ readonly kind: 'unread' } & {
+      readonly error: string;
+    });
+
+/**
+ * Swap in use and swap configured: macOS `vm.swapusage`, Linux `/proc/meminfo`. Never more in
+ * use than configured: a reading that says so is malformed, not clamped.
+ */
+export type SwapUsage = SwapUsageWire;
+
+/**
+ * [`SwapUsage`] as it travels: a decoded pair passes the same check a reader's does.
+ */
+export type SwapUsageWire = {
+  readonly usedBytes: SwapBytes;
+  readonly totalBytes: SwapBytes;
+};
+
 export type TaggedBytesEncoding = 'utf8' | 'base64';
 
 export type TaggedBytesRef = {
@@ -3673,6 +3592,14 @@ export type TurnEvent = {
  * What happened to a ticket, as the turn log records it.
  */
 export type TurnEventKind = 'queued' | 'taken' | 'finished' | 'abandoned';
+
+/**
+ * A workspace supervisor socket whose job list could not be read, and why.
+ */
+export type UnansweredSupervisor = {
+  readonly socket: string;
+  readonly error: string;
+};
 
 /**
  * A landed check without an attributable run summary in the landing workspace's cache.

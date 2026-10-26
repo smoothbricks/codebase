@@ -30,8 +30,7 @@ use std::path::Path;
 use brush_builtins::ShellBuilderExt as _;
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::shell_host::{
-    CONTROL_DESCRIPTOR, FrameWriter, REPLY_EXITED, REPLY_NICE_REFUSED, REPLY_SCRIPT_SYNTAX,
-    REPLY_STARTED, nice_pipe, read_nice_report, report_own_nice,
+    CONTROL_DESCRIPTOR, FrameWriter, REPLY_EXITED, REPLY_SCRIPT_SYNTAX, REPLY_STARTED,
 };
 use cowshed_core::script::Binding;
 
@@ -49,7 +48,6 @@ pub(crate) fn run(
     [stdin, stdout, stderr]: [OwnedFd; 3],
 ) -> io::Result<()> {
     let crate::CommandPlacement {
-        nice,
         #[cfg(target_os = "linux")]
         cgroup,
         #[cfg(target_os = "macos")]
@@ -99,13 +97,6 @@ pub(crate) fn run(
     let job_descriptors = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
     let (ready_read, ready_write) = close_on_exec_pipe()?;
     let ready = [ready_read.as_raw_fd(), ready_write.as_raw_fd()];
-    // Where no fence holds the child, it reports the nice it placed itself at on this pipe.
-    let report = nice
-        .map(|nice| nice_pipe().map(|ends| (nice, ends)))
-        .transpose()?;
-    let child_nice = report
-        .as_ref()
-        .map(|(nice, (reported, report))| (*nice, [reported.as_raw_fd(), report.as_raw_fd()]));
     #[cfg(target_os = "macos")]
     let held = hold.raw();
 
@@ -128,7 +119,6 @@ pub(crate) fn run(
             job_descriptors,
             ready,
             cwd,
-            child_nice,
             variables,
             program,
             #[cfg(target_os = "macos")]
@@ -140,28 +130,16 @@ pub(crate) fn run(
     drop(cgroup);
     #[cfg(target_os = "macos")]
     drop(hold);
-    let mut reported = report.map(|(_, (reported, report))| {
-        drop(report);
-        reported
-    });
     // A signal for the job reaches its group the moment the start is reported, so the group must
     // exist first. Only the child creates it: two creations of one group race, and macOS
-    // refuses the loser with EPERM. The child reports once its group exists and it runs at its
-    // nice; an end of file means it ended before it could, having said why on the job's stderr.
+    // refuses the loser with EPERM. The child reports once its group exists. An end of file
+    // means it ended before it could, having said why on the job's stderr.
     // That child never started the job: its exit is the answer, and no pid is handed out.
     let mut ready = std::fs::File::from(ready_read);
     loop {
         match io::Read::read(&mut ready, &mut [0_u8]) {
             Ok(1) => break,
             Ok(_) => {
-                let refused =
-                    reported
-                        .take()
-                        .map(read_nice_report)
-                        .and_then(|report| match report {
-                            Ok(Some(Err(failure))) => Some(failure),
-                            _ => None,
-                        });
                 let exit = cowshed_core::runtime::job_groups::await_exit_unreaped(pid);
                 // SAFETY: reaping this host's own child, which has exited and nothing else waits
                 // for.
@@ -170,13 +148,6 @@ pub(crate) fn run(
                 #[allow(clippy::disallowed_methods)]
                 unsafe {
                     libc::waitpid(pid, std::ptr::null_mut(), 0);
-                }
-                // A child refused its nice never ran the script; the refusal is the answer.
-                if let Some(failure) = refused {
-                    return reply(
-                        socket,
-                        FrameWriter::new(REPLY_NICE_REFUSED).priority_failure(&failure),
-                    );
                 }
                 return reply(socket, FrameWriter::new(REPLY_EXITED).exit(&exit?));
             }
@@ -247,7 +218,6 @@ fn child(
     [stdin, stdout, stderr]: [i32; 3],
     [ready_read, ready_write]: [i32; 2],
     cwd: &Path,
-    nice: Option<(i32, [i32; 2])>,
     variables: Vec<(String, brush_core::ShellVariable)>,
     program: brush_parser::ast::Program,
     #[cfg(target_os = "macos")] [hold_ready, hold_go]: [i32; 2],
@@ -259,9 +229,6 @@ fn child(
     unsafe {
         libc::close(CONTROL_DESCRIPTOR);
         libc::close(ready_read);
-        if let Some((_, [reported, _])) = nice {
-            libc::close(reported);
-        }
         if libc::setpgid(0, 0) != 0 {
             refuse(
                 stderr,
@@ -278,15 +245,6 @@ fn child(
             }
             libc::close(hold_ready);
             libc::close(hold_go);
-        }
-        // A child its supervisor cannot hold sets its own nice before it reports, so a script
-        // that runs is known to run at it. A refusal is reported typed on its pipe, which the
-        // host answers with; the supervisor says why on the job's stderr.
-        if let Some((nice, [_, report])) = nice {
-            if report_own_nice(report, nice).is_err() {
-                libc::_exit(126);
-            }
-            libc::close(report);
         }
         // The group exists: the host may give the supervisor this pid. A host that stopped
         // reading has nothing to learn, so a failed write changes nothing here.

@@ -524,13 +524,12 @@ faster than it catches up, is started again by the next land that freezes main's
   copied at 26 MB/s, about four hours; at normal priority one copied 209 GB in 440 s. The clone stays until the copy is
   published, for a catch-up to read which blocks a newer seed still shares with it. Forks and lands of main proceed
   throughout the copy and clone the seed as it stands.
-- **It holds for gates and lands.** After its first chunk and every GiB after that, the copy, and a catch-up's writes
-  and its punches of at most 8 MiB alike, ask whether any gate job holds or waits for CPU tokens (`cpu-budget`) and
-  whether a land holds or waits for any repository's turn (05_gateway.md, "Land turns"). A land's gate can run as plain
-  host work the CPU ledger does not count, and a land that starts the compaction still holds its own turn. While either
-  runs, the writer holds where it is, says once in its log what it waits for, and checks both again every **15 s**; it
-  says how long it waited when it goes on. If the gateway's answer or the land turns cannot be read, it stops, and the
-  copy is removed. The seed is left as it was. A gateway that is not running runs no gate.
+- **It holds for lands.** After its first chunk and every GiB after that, the copy, and a catch-up's writes and its
+  punches of at most 8 MiB alike, ask whether a land holds or waits for any repository's turn (05_gateway.md, "Land
+  turns"); a land that starts the compaction still holds its own turn. A gate-class job outside a land does not hold it:
+  a class is a nice, not a lock (05_gateway.md, "Classes"). While a land runs, the writer holds where it is, says once
+  in its log what it waits for, and checks again every **15 s**; it says how long it waited when it goes on. If the land
+  turns cannot be read, it stops, and the copy is removed. The seed is left as it was.
 - **Publication.** Under main's image lock again, main's seed is refreshed once more exactly as a fork of main refreshes
   it, so a write main's live volume took during the copy reaches the seed now rather than at the next fork. The copy is
   published only if the seed it holds is still main's latest. It is registered as a new seed of main at that seed's tree

@@ -17,10 +17,7 @@
 //! case: a variant absent from the corpus is a variant the TypeScript side is unverified against.
 //! `nx run cowshed:wire-fixtures` regenerates it and runs ahead of every cargo test target.
 
-use std::{
-    collections::BTreeMap, ffi::OsString, num::NonZeroUsize, os::unix::ffi::OsStringExt,
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
 
 use cowshed_core::{
     api::{
@@ -242,7 +239,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
-        cpu_tokens: None,
         containment: None,
         outlived: Vec::new(),
         outlived_incomplete: false,
@@ -341,7 +337,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: Some(10),
-        cpu_tokens: NonZeroUsize::new(4),
         containment: None,
         outlived: Vec::new(),
         outlived_incomplete: false,
@@ -378,7 +373,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Gate,
         scope: ExecScope::Workspace,
         nice: Some(5),
-        cpu_tokens: NonZeroUsize::new(8),
         containment: None,
         outlived: Vec::new(),
         outlived_incomplete: false,
@@ -428,7 +422,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: Some(10),
-        cpu_tokens: NonZeroUsize::new(2),
         containment: None,
         outlived: Vec::new(),
         outlived_incomplete: false,
@@ -481,7 +474,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: Some(10),
-        cpu_tokens: NonZeroUsize::new(1),
         containment: None,
         outlived: Vec::new(),
         outlived_incomplete: false,
@@ -516,7 +508,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
-        cpu_tokens: None,
         ..exited.clone()
     };
 
@@ -544,12 +535,11 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
-        cpu_tokens: None,
         ..exited.clone()
     };
 
-    // A job whose host CPU admission failed before its command ran: the gateway was unreachable.
-    // It holds no grant and was never observed, and it is the one job that ran as the host gate.
+    // A job whose admission failed before its command ran: its jobserver fifo could not be made.
+    // It was never observed, and it is the one job that ran as the host gate.
     let cpu_admission_failed = JobInfo {
         job_id: JobId::new(9).expect("fixture job id"),
         state: JobState::Failed,
@@ -557,17 +547,18 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         pid: None,
         resources: None,
         stdout: inline_stream(""),
-        stderr: inline_stream("jobserver admission is unavailable: connection refused\n"),
+        stderr: inline_stream(
+            "cowshed: the job's jobserver fifo could not be made: No space left on device\n",
+        ),
         failure: Some(cowshed_core::api::JobFailure::CpuAdmission),
         class: ExecClass::Gate,
         scope: ExecScope::HostGate,
         nice: None,
-        cpu_tokens: None,
         ..exited.clone()
     };
 
-    // A job whose grant was held but whose owned child could not be placed at its nice: the child
-    // was killed before its command ran, so no nice was observed.
+    // A job whose owned child could not be placed at its class nice: the child was killed before
+    // its command ran, so no nice was observed.
     let priority_failed = JobInfo {
         job_id: JobId::new(10).expect("fixture job id"),
         state: JobState::Failed,
@@ -580,7 +571,6 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
-        cpu_tokens: NonZeroUsize::new(1),
         ..exited.clone()
     };
 
@@ -600,36 +590,32 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
-        cpu_tokens: NonZeroUsize::new(1),
         ..exited.clone()
     };
 
-    // A job its requester waits on: it held background tokens and ran at the supervisor's own
-    // nice, above a gate (05_gateway.md "Bands").
+    // A job its requester waits on: it ran at the supervisor's own nice, above a gate
+    // (05_gateway.md "Classes").
     let interactive = JobInfo {
         job_id: JobId::new(11).expect("fixture job id"),
         resources: None,
         class: ExecClass::Interactive,
         scope: ExecScope::Workspace,
         nice: Some(0),
-        cpu_tokens: NonZeroUsize::new(2),
         ..exited.clone()
     };
 
-    // A resident that served its requests and ended: it held no token, so it names none, and its
-    // observed nice stands alone.
+    // A resident that served its requests and ended: its observed nice stands alone.
     let resident = JobInfo {
         job_id: JobId::new(12).expect("fixture job id"),
         resources: None,
         class: ExecClass::Resident,
         scope: ExecScope::Workspace,
         nice: Some(10),
-        cpu_tokens: None,
         ..exited.clone()
     };
 
-    // The same resident at interactive nice: it held no token either, and differs only in the
-    // nice it was observed at (05_gateway.md "A resident holds no token").
+    // The same resident at interactive nice: it differs only in the nice it was observed at
+    // (05_gateway.md "Classes").
     let interactive_resident = JobInfo {
         job_id: JobId::new(13).expect("fixture job id"),
         class: ExecClass::InteractiveResident,
@@ -694,6 +680,24 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ..retired_observed.clone()
     };
 
+    // A background job ended at critical host memory pressure, as a cancel ends one: it failed for
+    // memory, and its stderr names the pressure level and its resident sum (05_gateway.md "Memory
+    // pressure").
+    let memory_ended = JobInfo {
+        job_id: JobId::new(19).expect("fixture job id"),
+        state: JobState::Failed,
+        resources: None,
+        exit: Some(ExitStatus::Signaled {
+            signal: 15,
+            core_dumped: false,
+        }),
+        stdout: inline_stream(""),
+        stderr: inline_stream(
+            "cowshed: ended at critical memory pressure with 6442450944 resident bytes\n",
+        ),
+        failure: Some(cowshed_core::api::JobFailure::Memory),
+        ..signaled.clone()
+    };
     let list = vec![queued.clone(), running.clone()];
 
     BTreeMap::from([
@@ -714,6 +718,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             document("job status", &cpu_admission_failed),
         ),
         ("priorityFailed", document("job status", &priority_failed)),
+        ("memoryEnded", document("job status", &memory_ended)),
         ("unlaunched", document("job status", &unlaunched)),
         ("interactive", document("job status", &interactive)),
         ("resident", document("job status", &resident)),
@@ -1792,7 +1797,7 @@ fn every_scheduling_fact_appears_in_the_corpus() {
         ("scope", ["workspace", "hostGate"].as_slice()),
         (
             "failure",
-            ["scriptSyntax", "cpuAdmission", "priority"].as_slice(),
+            ["scriptSyntax", "cpuAdmission", "priority", "memory"].as_slice(),
         ),
     ] {
         for spelling in spellings {
@@ -1804,20 +1809,18 @@ fn every_scheduling_fact_appears_in_the_corpus() {
             );
         }
     }
-    for field in ["nice", "cpuTokens"] {
-        assert!(
-            documents
-                .iter()
-                .any(|document| document.get(field).is_some()),
-            "no job carries {field}"
-        );
-        assert!(
-            documents
-                .iter()
-                .any(|document| document.get(field).is_none()),
-            "no job omits {field}"
-        );
-    }
+    assert!(
+        documents
+            .iter()
+            .any(|document| document.get("nice").is_some()),
+        "no job carries nice"
+    );
+    assert!(
+        documents
+            .iter()
+            .any(|document| document.get("nice").is_none()),
+        "no job omits nice"
+    );
     assert!(
         documents.iter().any(|document| document["nice"] == 0),
         "a gate's observed nice zero is a real observation"

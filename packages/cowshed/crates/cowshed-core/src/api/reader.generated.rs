@@ -122,63 +122,7 @@ static CHARGED_MEMORY_USAGE: Reader =
 static CHECKPOINT_INFO: Reader =
     Reader::Record(&[("label", &LEAF), ("revision", &LEAF), ("pinned", &LEAF)]);
 static CHECKPOINT_RESULT: Reader = Reader::Record(&[("label", &LEAF)]);
-static CPU_BACKGROUND_STAKE: Reader = Reader::Record(&[
-    ("checkout", &LEAF),
-    ("held", &LEAF),
-    ("holders", &SEQ__CPU_HOLDER),
-    ("waiters", &SEQ__CPU_WAITER),
-]);
-static CPU_BUDGET_STATUS: Reader = Reader::Record(&[
-    ("total", &LEAF),
-    ("held", &LEAF),
-    ("checkouts", &SEQ__CPU_CHECKOUT_STATUS),
-    ("gateJobs", &SEQ__CPU_GATE_JOB),
-    ("gateQueue", &SEQ__CPU_GATE_WAITER),
-    ("background", &SEQ__CPU_BACKGROUND_STAKE),
-    ("probation", &CPU_PROBATION),
-]);
-static CPU_CHECKOUT_STATUS: Reader = Reader::Record(&[
-    ("checkout", &LEAF),
-    ("held", &LEAF),
-    ("running", &LEAF),
-    ("waiting", &LEAF),
-]);
-static CPU_GATE_JOB: Reader = Reader::Record(&[
-    ("repository", &LEAF),
-    ("checkout", &LEAF),
-    ("job", &LEAF),
-    ("held", &LEAF),
-    ("holders", &SEQ__CPU_HOLDER),
-]);
-static CPU_GATE_WAITER: Reader = Reader::Record(&[
-    ("repository", &LEAF),
-    ("checkout", &LEAF),
-    ("job", &LEAF),
-    ("pid", &LEAF),
-    ("command", &LEAF),
-    ("want", &LEAF),
-    ("waitedMs", &LEAF),
-]);
-static CPU_HOLDER: Reader = Reader::Record(&[
-    ("pid", &LEAF),
-    ("command", &LEAF),
-    ("tokens", &LEAF),
-    ("want", &LEAF),
-    ("heldMs", &LEAF),
-]);
-static CPU_PROBATION: Reader = Reader::Record(&[
-    ("checkout", &LEAF),
-    ("pid", &LEAF),
-    ("command", &LEAF),
-    ("lentMs", &LEAF),
-]);
 static CPU_TOTALS: Reader = Reader::Record(&[("userUs", &LEAF), ("sysUs", &LEAF)]);
-static CPU_WAITER: Reader = Reader::Record(&[
-    ("pid", &LEAF),
-    ("command", &LEAF),
-    ("want", &LEAF),
-    ("waitedMs", &LEAF),
-]);
 static CREDENTIAL_REPORT: Reader = Reader::Record(&[("routes", &SEQ__CREDENTIAL_ROUTE)]);
 static CREDENTIAL_ROUTE: Reader = Reader::Record(&[
     ("repoId", &LEAF),
@@ -187,6 +131,8 @@ static CREDENTIAL_ROUTE: Reader = Reader::Record(&[
     ("withheldEnvNames", &LEAF),
     ("installed", &LEAF),
 ]);
+static DARWIN_PRESSURE_LEVEL: Reader =
+    Reader::External(&[("normal", &LEAF), ("warning", &LEAF), ("critical", &LEAF)]);
 static DATABASE_HOLDER: Reader = Reader::Record(&[("pid", &LEAF), ("command", &LEAF)]);
 static DEFRAGMENT_RESULT: Reader = Reader::Record(&[
     ("workspace", &LEAF),
@@ -288,8 +234,6 @@ static FOLD_OUTCOME: Reader = Reader::Internal {
 };
 static FOLD_OUTCOME__KEPT: Reader = Reader::Record(&[("reason", &FOLD_KEPT)]);
 static FOLD_OUTCOME__RETIRED: Reader = Reader::Record(&[]);
-static GATEWAY_CPU_BUDGET: Reader =
-    Reader::External(&[("ledger", &CPU_BUDGET_STATUS), ("unanswered", &LEAF)]);
 static GATEWAY_STATUS: Reader = Reader::Record(&[
     ("installed", &LEAF),
     ("running", &LEAF),
@@ -301,7 +245,7 @@ static GATEWAY_STATUS: Reader = Reader::Record(&[
     ("healing", &STARTUP_HEAL),
     ("recovering", &SUPERVISOR_RECOVERY),
     ("staleDaemon", &STALE_DAEMON_BINARY),
-    ("cpuBudget", &GATEWAY_CPU_BUDGET),
+    ("scheduling", &HOST_SCHEDULING),
     ("pendingInstall", &LEAF),
     ("landTurns", &SEQ__LAND_TURN_QUEUE),
     ("landTurnsError", &LEAF),
@@ -349,13 +293,28 @@ static GRANT_SET: Reader = Reader::Record(&[
     ("sim", &SEQ__SIM_VERB),
     ("loopbackAny", &LEAF),
 ]);
+static HOST_JOBS: Reader = Reader::Record(&[
+    ("counts", &SEQ__JOB_COUNT),
+    ("unanswered", &SEQ__UNANSWERED_SUPERVISOR),
+]);
 static HOST_LOAD_SAMPLE: Reader = Reader::Record(&[("load1", &LEAF), ("cores", &LEAF)]);
+static HOST_READINGS: Reader = Reader::Record(&[
+    ("load", &LOAD_READING),
+    ("memoryPressure", &MEMORY_PRESSURE_READING),
+    ("swap", &SWAP_READING),
+]);
+static HOST_SCHEDULING: Reader = Reader::Record(&[
+    ("readings", &HOST_READINGS),
+    ("jobs", &HOST_JOBS),
+    ("imageCleanup", &IMAGE_CLEANUP),
+]);
 static IDENTITY_REPORT: Reader = Reader::Record(&[
     ("repoId", &LEAF),
     ("added", &LEAF),
     ("identity", &BOUND_IDENTITY),
     ("identities", &SEQ__BOUND_IDENTITY),
 ]);
+static IMAGE_CLEANUP: Reader = Reader::Record(&[("waiting", &LEAF), ("unread", &LEAF)]);
 static JOB_ACCOUNTING: Reader = Reader::Internal {
     tag: "kind",
     arms: &[
@@ -386,11 +345,17 @@ static JOB_CONTAINMENT: Reader = Reader::Internal {
 };
 static JOB_CONTAINMENT__KERNEL: Reader = Reader::Record(&[]);
 static JOB_CONTAINMENT__OBSERVED: Reader = Reader::Record(&[("lost", &SEQ__PROCESS_COVERAGE_GAP)]);
+static JOB_COUNT: Reader = Reader::Record(&[
+    ("class", &EXEC_CLASS),
+    ("state", &JOB_STATE),
+    ("jobs", &LEAF),
+]);
 static JOB_FAILURE: Reader = Reader::External(&[
     ("scriptSyntax", &LEAF),
     ("supervisorLost", &LEAF),
     ("cpuAdmission", &LEAF),
     ("priority", &LEAF),
+    ("memory", &LEAF),
     ("unlaunched", &LEAF),
 ]);
 static JOB_INFO_REF: Reader = Reader::Record(&[
@@ -416,7 +381,6 @@ static JOB_INFO_REF: Reader = Reader::Record(&[
     ("class", &EXEC_CLASS),
     ("scope", &EXEC_SCOPE),
     ("nice", &LEAF),
-    ("cpuTokens", &LEAF),
     ("containment", &JOB_CONTAINMENT),
     ("outlived", &SEQ__OUTLIVED_PROCESS),
     ("outlivedIncomplete", &LEAF),
@@ -625,6 +589,17 @@ static LAND_TURN_QUEUE: Reader = Reader::Record(&[
     ("abandoned", &SEQ__TURN_EVENT),
 ]);
 static LEAF: Reader = Reader::Leaf;
+static LOAD_AVERAGES: Reader =
+    Reader::Record(&[("one", &LEAF), ("five", &LEAF), ("fifteen", &LEAF)]);
+static LOAD_READING: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("read", &LOAD_READING__READ),
+        ("unread", &LOAD_READING__UNREAD),
+    ],
+};
+static LOAD_READING__READ: Reader = Reader::Record(&[("load", &LOAD_AVERAGES)]);
+static LOAD_READING__UNREAD: Reader = Reader::Record(&[("error", &LEAF)]);
 static LOCK_CUSTODY: Reader = Reader::External(&[
     ("holds", &LEAF),
     ("open", &LEAF),
@@ -680,6 +655,24 @@ static LOCK_OPERATION: Reader = Reader::External(&[
     ("mint-template", &LEAF),
 ]);
 static LOGS_CHUNK: Reader = Reader::Record(&[("eof", &LEAF), ("nextOffset", &LEAF)]);
+static MEMORY_PRESSURE: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("darwin", &MEMORY_PRESSURE__DARWIN),
+        ("psi", &MEMORY_PRESSURE__PSI),
+    ],
+};
+static MEMORY_PRESSURE_READING: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("read", &MEMORY_PRESSURE_READING__READ),
+        ("unread", &MEMORY_PRESSURE_READING__UNREAD),
+    ],
+};
+static MEMORY_PRESSURE_READING__READ: Reader = Reader::Record(&[("pressure", &MEMORY_PRESSURE)]);
+static MEMORY_PRESSURE_READING__UNREAD: Reader = Reader::Record(&[("error", &LEAF)]);
+static MEMORY_PRESSURE__DARWIN: Reader = Reader::Record(&[("level", &DARWIN_PRESSURE_LEVEL)]);
+static MEMORY_PRESSURE__PSI: Reader = Reader::Record(&[("someAvg10", &LEAF)]);
 static MIRROR_INFO: Reader = Reader::Record(&[("url", &LEAF), ("mirror", &LEAF)]);
 static MOUNT_RESULT: Reader = Reader::Record(&[
     ("workspace", &LEAF),
@@ -936,7 +929,6 @@ static SEALED_JOB_REF: Reader = Reader::Record(&[
     ("class", &EXEC_CLASS),
     ("scope", &EXEC_SCOPE),
     ("nice", &LEAF),
-    ("cpuTokens", &LEAF),
     ("containment", &JOB_CONTAINMENT),
     ("outlived", &SEQ__OUTLIVED_PROCESS),
     ("outlivedIncomplete", &LEAF),
@@ -946,12 +938,6 @@ static SEQ__BRANCH_LANDING: Reader = Reader::Seq(&BRANCH_LANDING);
 static SEQ__BUILD_STATE_LINK: Reader = Reader::Seq(&BUILD_STATE_LINK);
 static SEQ__CACHE_MISS: Reader = Reader::Seq(&CACHE_MISS);
 static SEQ__CHECKPOINT_INFO: Reader = Reader::Seq(&CHECKPOINT_INFO);
-static SEQ__CPU_BACKGROUND_STAKE: Reader = Reader::Seq(&CPU_BACKGROUND_STAKE);
-static SEQ__CPU_CHECKOUT_STATUS: Reader = Reader::Seq(&CPU_CHECKOUT_STATUS);
-static SEQ__CPU_GATE_JOB: Reader = Reader::Seq(&CPU_GATE_JOB);
-static SEQ__CPU_GATE_WAITER: Reader = Reader::Seq(&CPU_GATE_WAITER);
-static SEQ__CPU_HOLDER: Reader = Reader::Seq(&CPU_HOLDER);
-static SEQ__CPU_WAITER: Reader = Reader::Seq(&CPU_WAITER);
 static SEQ__CREDENTIAL_ROUTE: Reader = Reader::Seq(&CREDENTIAL_ROUTE);
 static SEQ__DATABASE_HOLDER: Reader = Reader::Seq(&DATABASE_HOLDER);
 static SEQ__EGRESS_RULE: Reader = Reader::Seq(&EGRESS_RULE);
@@ -962,6 +948,7 @@ static SEQ__FINDING: Reader = Reader::Seq(&FINDING);
 static SEQ__FOLDED_WORKSPACE: Reader = Reader::Seq(&FOLDED_WORKSPACE);
 static SEQ__GC_CANDIDATE: Reader = Reader::Seq(&GC_CANDIDATE);
 static SEQ__GC_DEFERRED: Reader = Reader::Seq(&GC_DEFERRED);
+static SEQ__JOB_COUNT: Reader = Reader::Seq(&JOB_COUNT);
 static SEQ__JOB_PROCESS_SAMPLE: Reader = Reader::Seq(&JOB_PROCESS_SAMPLE);
 static SEQ__LAND_TURN_QUEUE: Reader = Reader::Seq(&LAND_TURN_QUEUE);
 static SEQ__LOCK_DESCRIPTOR: Reader = Reader::Seq(&LOCK_DESCRIPTOR);
@@ -977,6 +964,7 @@ static SEQ__SKILL_INSTALL: Reader = Reader::Seq(&SKILL_INSTALL);
 static SEQ__TAGGED_BYTES_REF: Reader = Reader::Seq(&TAGGED_BYTES_REF);
 static SEQ__TICKET: Reader = Reader::Seq(&TICKET);
 static SEQ__TURN_EVENT: Reader = Reader::Seq(&TURN_EVENT);
+static SEQ__UNANSWERED_SUPERVISOR: Reader = Reader::Seq(&UNANSWERED_SUPERVISOR);
 static SEQ__UNATTRIBUTED_CHECK: Reader = Reader::Seq(&UNATTRIBUTED_CHECK);
 static SEQ__UNLANDED_PATH: Reader = Reader::Seq(&UNLANDED_PATH);
 static SEQ__UNPROVEN_WORKSPACE: Reader = Reader::Seq(&UNPROVEN_WORKSPACE);
@@ -1018,6 +1006,16 @@ static STREAM_INFO_REF: Reader = Reader::Record(&[
     ("summary", &OUTPUT_SUMMARY),
 ]);
 static SUPERVISOR_RECOVERY: Reader = Reader::Record(&[("supervisors", &LEAF)]);
+static SWAP_READING: Reader = Reader::Internal {
+    tag: "kind",
+    arms: &[
+        ("read", &SWAP_READING__READ),
+        ("unread", &SWAP_READING__UNREAD),
+    ],
+};
+static SWAP_READING__READ: Reader = Reader::Record(&[("swap", &SWAP_USAGE_WIRE)]);
+static SWAP_READING__UNREAD: Reader = Reader::Record(&[("error", &LEAF)]);
+static SWAP_USAGE_WIRE: Reader = Reader::Record(&[("usedBytes", &LEAF), ("totalBytes", &LEAF)]);
 static TAGGED_BYTES_ENCODING: Reader = Reader::External(&[("utf8", &LEAF), ("base64", &LEAF)]);
 static TAGGED_BYTES_REF: Reader =
     Reader::Record(&[("encoding", &TAGGED_BYTES_ENCODING), ("data", &LEAF)]);
@@ -1054,6 +1052,7 @@ static TURN_EVENT_KIND: Reader = Reader::External(&[
     ("finished", &LEAF),
     ("abandoned", &LEAF),
 ]);
+static UNANSWERED_SUPERVISOR: Reader = Reader::Record(&[("socket", &LEAF), ("error", &LEAF)]);
 static UNATTRIBUTED_CHECK: Reader = Reader::Record(&[
     ("check", &LEAF),
     ("cache", &LEAF),

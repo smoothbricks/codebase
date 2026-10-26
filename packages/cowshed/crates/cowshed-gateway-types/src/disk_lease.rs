@@ -114,10 +114,6 @@ pub enum LeaseState {
     Queued,
     /// The client may run its command now, and holds the lease until it closes the connection.
     Granted,
-    /// A one-token job's command may start before its grant, on the host's probation token; its
-    /// `granted` follows when the ledger reaches it (05_gateway.md "A one-token job starts on
-    /// probation"). Only a jobserver request that offered `probation` is answered so.
-    Probation,
 }
 
 /// One answer line, as a client reads it. Fields the client has no use for are ignored, so the

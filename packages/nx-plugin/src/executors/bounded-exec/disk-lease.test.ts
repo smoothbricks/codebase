@@ -117,8 +117,7 @@ describe('cowshed disk-lifecycle lease client', () => {
     expect(await lease).toEqual({
       granted: false,
       cause: 'predates',
-      reason:
-        'the gateway predates disk leases (invalid-request: unknown gateway control operation); restart it with `cowshed setup`',
+      reason: `the lease endpoint ${socket} predates disk leases (invalid-request: unknown gateway control operation); restart it with \`cowshed setup\``,
     });
   });
 
@@ -178,7 +177,7 @@ describe('cowshed disk-lifecycle lease client', () => {
     expect(await lease).toEqual({
       granted: false,
       cause: 'other',
-      reason: 'the gateway granted nothing within 500 ms',
+      reason: `the lease endpoint ${socket} granted nothing within 500 ms`,
     });
   });
 

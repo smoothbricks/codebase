@@ -580,7 +580,7 @@ installed dependencies, build state, tracked edits and untracked files. Every fo
 to its own `cowshed/<ws>` branch from the source's `HEAD`, never the source's branch. Grants start closed with a fresh
 CA and platform endpoint identity; neither source grants nor endpoints carry over. No pool or pre-warming. The source
 image remains live and mounted throughout capture. A fork never asks about or waits for gate-class work (05_gateway.md,
-"Room for a gate").
+"Host scheduling").
 
 1. `flock` the source's image lock. Flush its source volume and backing file for freshness without unmounting,
    detaching, sealing, or changing its mount flags. Source shells, editors and watchers continue to use it.
@@ -1598,7 +1598,7 @@ canonical path with canonical flags, mounts the linked build volume again and, o
 socket/netns and starts exactly one connector before admitting execs. On macOS a session attaches on use: the gateway's
 startup pass mounts mains only (05_gateway.md, "Startup contract"), and every verb that reaches a detached session
 attaches it; Linux uses its platform service/controller lifecycle. An explicit `attach` of a detached workspace, like a
-fork, never waits for gate-class work (05_gateway.md, "Room for a gate"); an attach of a mounted workspace attaches
+fork, never waits for gate-class work (05_gateway.md, "Host scheduling"); an attach of a mounted workspace attaches
 nothing.
 
 ### Making room for an attach

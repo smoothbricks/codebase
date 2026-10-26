@@ -348,7 +348,6 @@ impl Gateway {
             )
         };
         let actor = tokio::spawn(state.run());
-        let cpu_budget = crate::cpu_budget::CpuBudget::start(config.cpu_budget);
         let cleanup = Arc::new(std::sync::OnceLock::new());
         let control = match &config.control_socket {
             Some(path) => {
@@ -365,20 +364,10 @@ impl Gateway {
                         ram_leases: crate::ram_lease::Records::beside(path),
                         first_launch: config.first_launch.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
-                        cpu_budget: cpu_budget.clone(),
-                        task_server: crate::task_server::TaskServer::start(
-                            config.task_server,
-                            cpu_budget,
-                        ),
+                        task_server: crate::task_server::TaskServer::start(config.task_server),
                         cleanup: Arc::clone(&cleanup),
-                        jobserver: crate::jobserver::JobserverFifos::start(
-                            path.parent()
-                                .map(|parent| parent.join("jobserver"))
-                                .unwrap_or_else(|| std::path::PathBuf::from("jobserver")),
-                        ),
                     },
                     config.control_tcp.as_ref(),
-                    config.listener_handoff.clone(),
                 ) {
                     Ok(control) => Some(control),
                     Err(error) => {
@@ -3288,16 +3277,7 @@ struct ControlRuntime {
     path: std::path::PathBuf,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
-    /// The budget whose queued asks a restart by an install cuts off before the socket stops.
-    cpu_budget: crate::cpu_budget::CpuBudget,
-    /// Where an install restarting this gateway names itself.
-    listener_handoff: Option<std::path::PathBuf>,
 }
-
-/// How long a stop waits for every queued CPU ask to be told which install cut it off. Each is
-/// one short line to a local socket; the bound only keeps a client that does not read from
-/// holding the drain.
-const CUT_OFF_BOUND: Duration = Duration::from_secs(2);
 
 impl ControlRuntime {
     fn start(
@@ -3305,7 +3285,6 @@ impl ControlRuntime {
         authorized_uid: u32,
         services: crate::control::ControlServices,
         tcp: Option<&ControlTcpConfig>,
-        listener_handoff: Option<std::path::PathBuf>,
     ) -> Result<Self, GatewayError> {
         use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 
@@ -3376,7 +3355,6 @@ impl ControlRuntime {
             &services.ram_leases,
         ));
         let capacity = 1024;
-        let cpu_budget = services.cpu_budget.clone();
         let (stop, stopped) = watch::channel(false);
         let unix_services = services.clone();
         let unix_stopped = stopped.clone();
@@ -3401,68 +3379,17 @@ impl ControlRuntime {
             path: path.to_path_buf(),
             stop,
             tasks,
-            cpu_budget,
-            listener_handoff,
         })
     }
 
-    /// Stop serving. When an install serving the handoff socket is restarting this gateway, every
-    /// queued CPU ask is first told which install cut it off, so its client asks the gateway that
-    /// install starts once instead of failing on a closed connection (05_gateway.md "A queued
-    /// CPU ask outlives an install"). With no install, or one that does not answer, the asks are
-    /// cut off unnamed, as before.
+    /// Stop serving: end every control connection and remove the socket.
     async fn stop(mut self) {
-        if let Some(path) = self.listener_handoff.take() {
-            match restarting_install(path).await {
-                Ok(Ok(Some(install))) => {
-                    let named = format!("install {} ({})", install.pid, install.binary.display());
-                    match timeout(CUT_OFF_BOUND, self.cpu_budget.cut_off(install)).await {
-                        Ok(told) => cowshed_os::eprintln!(
-                            "cowshed: told {told} queued CPU ask(s) that {named} is restarting \
-                         this gateway; each asks the gateway it starts once"
-                        ),
-                        Err(_) => cowshed_os::eprintln!(
-                            "cowshed: not every queued CPU ask was told within {} s that {named} \
-                         is restarting this gateway; the rest are cut off unnamed",
-                            CUT_OFF_BOUND.as_secs()
-                        ),
-                    }
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => cowshed_os::eprintln!(
-                    "cowshed: the install serving the handoff socket did not say who it is, so \
-                 queued CPU asks are cut off unnamed: {error}"
-                ),
-                Err(error) => {
-                    cowshed_os::eprintln!("cowshed: the handoff identity task failed: {error}")
-                }
-            }
-        }
         let _ = self.stop.send(true);
         for task in self.tasks.drain(..) {
             let _ = task.await;
         }
         let _ = std::fs::remove_file(self.path);
     }
-}
-
-/// The install restarting this gateway, as it names itself on the handoff socket.
-#[cfg(target_os = "macos")]
-async fn restarting_install(
-    path: std::path::PathBuf,
-) -> Result<std::io::Result<Option<cowshed_gateway_types::InstallRestart>>, tokio::task::JoinError>
-{
-    tokio::task::spawn_blocking(move || crate::listener_handoff::installing(&path)).await
-}
-
-/// Linux serves no handoff socket (it binds no TCP workspace listener to carry), so no install
-/// names itself and a restart cuts the CPU queue off unnamed.
-#[cfg(not(target_os = "macos"))]
-async fn restarting_install(
-    _path: std::path::PathBuf,
-) -> Result<std::io::Result<Option<cowshed_gateway_types::InstallRestart>>, tokio::task::JoinError>
-{
-    Ok(Ok(None))
 }
 
 async fn run_unix_control(

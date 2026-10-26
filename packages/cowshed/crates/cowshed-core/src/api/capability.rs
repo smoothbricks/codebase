@@ -2540,7 +2540,7 @@ impl Coordinator {
     }
 
     /// Admits one job under coordinator authority: the only route that may ask for the gate class or
-    /// the host-gate scope (05_gateway.md "Host CPU budget"). The worker capability supplies only
+    /// the host-gate scope (05_gateway.md "Classes"). The worker capability supplies only
     /// the workspace incarnation the job is fenced to; the returned handle carries that fence like
     /// any job of that worker, and the request is admitted as the coordinator's, never the worker's.
     /// A host gate runs in no session. Custom environment names do not restrict execution;

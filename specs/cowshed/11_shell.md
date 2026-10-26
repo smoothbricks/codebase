@@ -326,10 +326,8 @@ bounded cache (four hosts) of hosts that are executing or were just returned; a 
 takes the most recently returned idle host, else the spare — whose replacement starts activating in the background —
 else activates a host of its own. Commands never queue for a host. One actor owns each pool's state; nothing locks. A
 supervisor that lives only as long as a short-lived controller process keeps no spare, which would end unused with it. A
-spare's activation runs for no job, so no job's grant bounds it: it first asks one background token of the workspace's
-checkout with an activation stake (05_gateway.md, "A resident's start holds one token") and holds it until its
-activation ends, whatever ends it. A stake that is refused, or a gateway that cannot be reached, is a failed activation
-like any other: there is no spare, and the next command activates for itself.
+spare's activation asks for nothing and runs at the supervisor's own nice, as every warm host does; a failed activation
+is like any other: there is no spare, and the next command activates for itself.
 
 **Activation belongs to the job that waited on it.** A command that activates a host receives the activation's output on
 its own stdout and stderr, and until its command starts that host's process group is the job's: a kill reaches the
@@ -1101,14 +1099,13 @@ closes admission, so a job admitted in between is owed and waited for like a lis
 recorded before or after the drain begins is decided under one lock, so it is never lost between the two, and the drain
 settles only once every exec in flight on its socket has recorded its requester or been refused.
 
-A resident (`Resident` or `InteractiveResident`, 05_gateway.md "A resident holds no token") never finishes on its own:
-it runs each request its requester sends it, and nothing else reaches it. So a draining supervisor ends a running
-resident once its requester has exited, with the ordinary retirement (TERM, the grace, KILL), and the job ends `killed`.
-The drain report, the stderr line and the retirement's settlement name each such job, its requester's pid and how that
-exit was observed. Any other job a requester leaves — a `--background` exec, a released hold — still runs to its own
-end. Measured 2026-10-22: after an install, a drained supervisor of the replaced build served an embedder's feedback Nx
-worker whose controller had died with the replaced gateway, and refused the next fleet's commands for as long as the
-worker lived.
+A resident (`Resident` or `InteractiveResident`, 05_gateway.md "Classes") never finishes on its own: it runs each
+request its requester sends it, and nothing else reaches it. So a draining supervisor ends a running resident once its
+requester has exited, with the ordinary retirement (TERM, the grace, KILL), and the job ends `killed`. The drain report,
+the stderr line and the retirement's settlement name each such job, its requester's pid and how that exit was observed.
+Any other job a requester leaves — a `--background` exec, a released hold — still runs to its own end. Measured
+2026-10-22: after an install, a drained supervisor of the replaced build served an embedder's feedback Nx worker whose
+controller had died with the replaced gateway, and refused the next fleet's commands for as long as the worker lived.
 
 A draining supervisor serves the ends of the jobs it ran before it retires. Their clients are of its own build, and the
 workspace's next supervisor is of another, whose protocol they cannot speak: measured 2026-10-20, an exec client of the
@@ -1301,42 +1298,46 @@ answered without hanging, and retirement may proceed after the child has ended. 
 lost-job recovery for records that genuinely remained unterminated, preserving the distinction between a child's exit, a
 protected terminal record, and its controller commitment.
 
-## Server-owned CPU admission and nice placement
+## Job admission and class placement
 
-The supervisor's exec admission records Queued durably, acquires the gateway jobserver off the actor path, and spawns
-only under the actual grant, or on the probation token, which stops the job at its bound until that grant
-(05_gateway.md, Host CPU budget, "A one-token job starts on probation"); the job reads `cpuTokens` 1 while it runs on
-either and none while it is stopped. Status/cancel remain responsive while queued. **Every exec answers at admission**,
-foreground, `--background` and API caller alike (07_api.md, "CLI and API exec parity"): the answer is the job id while
-the job is `queued` with class and scope set and `cpuTokens`/`nice` absent, so its caller reads the grant from the job's
-status (`running`, `cpuTokens`, `nice`) and cancels it with kill while it waits. A foreground CLI exec therefore holds
-its job (05_gateway.md, "A job lives with its requester") from admission, not from spawn, so a requester killed while
-its job is queued withdraws it. A refusal after admission — the gateway's, or the class nice that cannot be placed —
-fails the job: `failed`, failure `cpuAdmission` or `priority`, exit the refusal's wrapper code, and its cause on the
-job's stderr; the exec call itself succeeded. Measured 2026-10-19 before this: a `cowshed exec --background` on a loaded
-host answered at its grant, 25 s later, so a queued job had no id to read or cancel. Killing a queued job withdraws its
-request and seals Killed without a command. Detaching (`--background`, `--timeout`, `JobHandle::detach`) promotes the
-captured prefixes to their protected files before it answers. The grant stays held until the owned job concludes. Caller
-MAKEFLAGS/CARGO_MAKEFLAGS/MFLAGS and BOUNDED_EXEC_CPU_* never substitute for that allocation; actual pool/count override
-caller env after filtering.
+The supervisor's exec admission records Queued durably and spawns the job at once at its class (05_gateway.md, "Host
+scheduling"): nothing stands between them but a background job's start while the host reports memory pressure
+(05_gateway.md, "Memory pressure"), which keeps the job `queued`, names the reading on its stderr and reads again every
+2 s off the actor path. Status/cancel remain responsive while queued. **Every exec answers at admission**, foreground,
+`--background` and API caller alike (07_api.md, "CLI and API exec parity"): the answer is the job id while the job is
+`queued` with class and scope set and `nice` absent, so its caller reads the placement from the job's status (`running`,
+`nice`) and cancels it with kill while it waits. A foreground CLI exec therefore holds its job (05_gateway.md, "A job
+lives with its requester") from admission, not from spawn, so a requester killed while its job is queued withdraws it. A
+refusal after admission — a jobserver fifo that cannot be made, a memory pressure that cannot be read, or a class nice
+that cannot be placed — fails the job: `failed`, failure `cpuAdmission` or `priority`, exit the refusal's wrapper code,
+and its cause on the job's stderr; the exec call itself succeeded. A Linux job cgroup the delegation cannot place is
+refused before the record, so it fails the exec call itself (07_api.md). Measured 2026-10-19 with the answer at a CPU
+grant: a `cowshed exec --background` on a loaded host answered 25 s later, so a queued job had no id to read or cancel.
+Killing a queued job withdraws it and seals Killed without a command. A background or resident job ended at macOS
+Critical pressure seals `failed`, failure `memory` (05_gateway.md, "Memory pressure"). Detaching (`--background`,
+`--timeout`, `JobHandle::detach`) promotes the captured prefixes to their protected files before it answers. The
+supervisor creates the job's jobserver fifo at admission and unlinks it at the job's end (05_gateway.md, "Parallelism
+inside a job"); caller MAKEFLAGS/CARGO_MAKEFLAGS/MFLAGS and BOUNDED_EXEC_CPU_* never pass through, and the job's own
+count overrides caller env after filtering.
 
 Gate is trusted coordinator/operator only; workers default Background / Workspace, may ask Interactive, Resident or
-InteractiveResident, and cannot request Gate or HostGate. The owned command's nice is its class's row of 05_gateway.md
-"Bands" — Interactive and InteractiveResident 0 / Gate +5 / Background and Resident +10 — not the reusable host's or
-supervisor's. An interactive job asks the gateway as background; its class reaches the ledger only as that. On macOS
-placement/read-back occurs while the existing observation fence holds the child. On Linux the child reports placement
-before exec or group reporting on a private CLOEXEC pipe: a 20-byte stack record of outcome, actual pid, requested,
-observed and errno. No allocation occurs in the forked report path. REPLY_NICE_REFUSED (tag11) carries the typed failure
-in the warm-host exchange; absence is explicit, not a guessed nice. A script that exits before reporting its group
-answers EXITED, never STARTED. Failed placement is priority, and observed nice stays absent until placement succeeds.
+InteractiveResident, and cannot request Gate or HostGate. The owned command's place is its class's row of 05_gateway.md
+"Classes" — Interactive and InteractiveResident nice 0 / Gate +5 / Background and Resident +10, on macOS below the
+supervisor's own nice — not the reusable host's or supervisor's. On macOS the supervisor places that nice with
+`setpriority(PRIO_PROCESS)` and reads it back while the existing observation fence holds the child; it never applies
+`PRIO_DARWIN_BG`, a QoS clamp or a disk I/O policy (05_gateway.md, "On macOS nothing cowshed starts is throttled for
+I/O"). A refusal fails the job `priority` supervisor-side, and observed nice stays absent until placement succeeds;
+absence is explicit, not a guessed nice. On Linux no nice is placed: the job's first process enters its class cgroup's
+job cgroup through the placement descriptor before exec (05_gateway.md, "Classes"), and the job's record carries no
+nice.
 
 HostGate is an explicitly authorized argv host one-shot of any class on this same server, without ExecutedChild or
 activation; it preserves the real-APFS host boundary and refuses scripts, read-only mode and sessions, never custom
 environment names. Its record-only public environment projection and full authored-env commitment are defined in
 07_api.md, Task server scheduling and trusted host gates; execution and canonical activation retain all ordinary project
-variables. No ordinary workspace sandbox is widened. The single sandbox builder allows only connection and file metadata
-in the gateway-derived workspace CPU-pool scope, not directory data, file writes, socket binding, the global control
-socket or another workspace's pool.
+variables. No ordinary workspace sandbox is widened. The single sandbox builder allows only file metadata and fifo reads
+and writes in the workspace's CPU pool directory, not directory data, regular-file writes, socket connection or binding,
+the global control socket or another workspace's pool.
 
 Job records use layout14: layout10's cpu_class, cpu_want, cpu_wait_ms, cpu_tokens, cpu_nice and cpu_scope columns remain
 an exact prefix, followed by layout11's admission_env_sha256 for the complete non-withheld authored environment,
@@ -1345,12 +1346,13 @@ layout13's nullable retirement_containment and retirement_outlived wire-JSON col
 retirement_outlived_incomplete. Those three are all null without a receipt or all present with one; any partial receipt
 is damaged. An empty list with a true marker remains an honest receipt of proven-empty membership with incomplete
 metadata. Layout13 and earlier stores are set aside whole, never decoded with an invented false marker. cpu_want is the
-want its admission resolved. cpu_wait_ms is retired since gate admission lost its bound (05_gateway.md, "No admission
-deadline, for any class"): layouts grow only by trailing columns, so it stays, written null; an earlier record's
-positive bound still reads, a zero one is damage, and no bound is read into the record. JobAdmission.env is the public
-plaintext projection only for every scope; keyed Env comparison uses the digest, including after restart. Records retain
-typed cpuAdmission/priority failures. Earlier histories are retained untouched and set aside. Per 07_api.md Keyed
-admission, existing incarnations must be renewed before new keyed exec: unverifiable historical keys are refused as
-unprovable, never migrated into an attestation they did not record. Unkeyed operator CLI exec remains available.
-Controller-only discovery runs locate-project/metadata --no-deps --offline under its ordinary child sandbox outside job
-admission, retaining the explicit noncompiling exemption rather than claiming a grant or recorded nice.
+job's jobserver count, `min(want, cores)`, for every class. Layouts grow only by trailing columns, so retired columns
+stay, written null: cpu_wait_ms since gate admission lost its bound, an earlier record's positive bound still reading
+and a zero one being damage; cpu_tokens since no job holds host tokens (05_gateway.md, "Host scheduling"), ignored on
+read. JobAdmission.env is the public plaintext projection only for every scope; keyed Env comparison uses the digest,
+including after restart. Records retain typed cpuAdmission/priority/memory failures. Earlier histories are retained
+untouched and set aside. Per 07_api.md Keyed admission, existing incarnations must be renewed before new keyed exec:
+unverifiable historical keys are refused as unprovable, never migrated into an attestation they did not record. Unkeyed
+operator CLI exec remains available. Controller-only discovery runs locate-project/metadata --no-deps --offline under
+its ordinary child sandbox outside job admission, retaining the explicit noncompiling exemption rather than claiming a
+jobserver or recorded nice.

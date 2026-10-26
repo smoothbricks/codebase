@@ -1966,13 +1966,10 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
             json!({"class": "interactive"}),
             "a worker admits work its requester waits on",
         ),
-        (
-            json!({"class": "resident"}),
-            "a worker admits a resident that holds no token",
-        ),
+        (json!({"class": "resident"}), "a worker admits a resident"),
         (
             json!({"class": "interactive-resident"}),
-            "a worker admits a resident at interactive nice, which holds no token either",
+            "a worker admits a resident at interactive nice",
         ),
     ] {
         assert_eq!(
@@ -2556,65 +2553,6 @@ impl RunningProcess for ScriptedProcess {
     }
 }
 
-/// A host CPU budget that grants every job what it asks for at once, as an idle host does. The
-/// pool socket it names serves no connection: no job here runs a nested runner.
-#[derive(Debug)]
-struct GrantingCpu;
-
-impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
-    /// Neither one token nor a host's share.
-    fn background_share(&self) -> NonZeroUsize {
-        NonZeroUsize::new(5).unwrap()
-    }
-
-    fn admit(
-        &self,
-        ask: cowshed_core::runtime::job_cpu::JobCpuAsk,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<cowshed_core::runtime::job_cpu::JobCpuGrant>>
-                + Send,
-        >,
-    > {
-        Box::pin(async move {
-            let pool = PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock");
-            Ok(match ask.class {
-                cowshed_core::api::ExecClass::Resident
-                | cowshed_core::api::ExecClass::InteractiveResident => {
-                    cowshed_core::runtime::job_cpu::JobCpuGrant::resident(pool, Box::new(()))
-                }
-                cowshed_core::api::ExecClass::Background
-                | cowshed_core::api::ExecClass::Interactive
-                | cowshed_core::api::ExecClass::Gate => {
-                    cowshed_core::runtime::job_cpu::JobCpuGrant::new(
-                        cowshed_core::runtime::job_cpu::HeldTokens {
-                            tokens: ask.want,
-                            fifo: PathBuf::from("/nonexistent/cowshed-test-cpu-pool.fifo"),
-                        },
-                        pool,
-                        Box::new(()),
-                    )
-                }
-            })
-        })
-    }
-
-    fn activation(
-        &self,
-        _checkout: PathBuf,
-        _command: String,
-        _parent: Option<String>,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<cowshed_core::runtime::job_cpu::ActivationStake>> + Send>,
-    > {
-        Box::pin(async {
-            Ok(cowshed_core::runtime::job_cpu::ActivationStake::new(
-                Box::new(()),
-            ))
-        })
-    }
-}
-
 struct AcceptedCommitments;
 
 #[async_trait]
@@ -2696,7 +2634,6 @@ fn supervisor_config_of(
         volume_labels: None,
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
-        cpu: std::sync::Arc::new(GrantingCpu),
         build_volume_released: None,
         nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
     }
@@ -4762,7 +4699,7 @@ async fn resource_reads_refuse_unowned_then_observe_and_keep_the_sealed_sample()
         .send(ProcessEvent::Started {
             job_id: job.id(),
             process: owned,
-            nice: 10,
+            nice: Some(10),
         })
         .await
         .expect("publish ownership");

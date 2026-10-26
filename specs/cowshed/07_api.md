@@ -200,19 +200,14 @@ pub struct ExecRequest {
     pub admission_key: Option<AdmissionKey>, // idempotent admission within the exact workspace incarnation
 
     pub class: ExecClass,                 // Background by default; Interactive for work its requester awaits;
-                                          // Gate requires trusted coordinator; Resident holds no token, its
-                                          // pool asks the host per child (05_gateway.md "Bands")
-    pub want: Option<NonZeroUsize>,       // None: the class's own, the background share ⌊N/2⌋ for Background
-                                          // and Interactive, 1 for Gate (05_gateway.md "The task server owns
-                                          // the live grant and nice"); actual command demand, bounded to
-                                          // granted tokens; a Resident names none
+                                          // Gate requires trusted coordinator (05_gateway.md "Classes")
+    pub want: Option<NonZeroUsize>,       // the job's jobserver count, min(want, cores); None: cores
+                                          // (05_gateway.md "Parallelism inside a job")
     pub scope: ExecScope,                 // Workspace default; HostGate: coordinator route only, any class
 }
 
-/// The exec's own class: one row of 05_gateway.md "Bands" (token order and nice). Not the gateway
-/// ledger's wire class (`cowshed_gateway_types::JobserverClass` = Background | Gate): the
-/// supervisor asks the ledger as background for Interactive and with `resident-pool` for either
-/// resident; InteractiveResident is Resident at nice 0 and differs from it in nothing else.
+/// The exec's own class: one row of 05_gateway.md "Classes" (nice, Linux class cgroup, memory-pressure
+/// wait). InteractiveResident is Resident at nice 0 and differs from it in nothing else.
 pub enum ExecClass { Background, Interactive, Gate, Resident, InteractiveResident }
 // wire: "background" | "interactive" | "gate" | "resident" | "interactive-resident"
 
@@ -231,8 +226,10 @@ pub enum ScriptValue {
 pub enum JobFailure {
     ScriptSyntax,                        // the script did not parse; nothing ran
     SupervisorLost,                      // its supervisor ended without seeing it end (11_shell.md)
-    CpuAdmission,                        // its CPU grant was refused or lost; its command never ran
+    CpuAdmission,                        // its admission failed before its command ran: jobserver fifo not made,
+                                         // memory pressure unreadable; the stderr names the cause
     Priority,                            // its class nice could not be placed; its command never ran
+    Memory,                              // ended at macOS Critical memory pressure (05_gateway.md "Memory pressure")
     Unlaunched,                          // anything else kept its command from launching
 }
 
@@ -1382,12 +1379,12 @@ an observed process until a read names its image again: its CPU covers nothing a
 observed CPU's share of the accounted total, never more than the whole; observed CPU beyond the total stays in the
 signed reconciliation.
 
-A Linux job's membership and accounting source are its own cgroup v2, `ws-<incarnation>/job-<id>`. Admission creates it
-before recording or dispatching the job; the controller's open `Placement` descriptor moves the first process into it
-before exec (or before a pooled host interprets a script). A supervisor without delegation refuses admission with
-`NotDelegated`, naming the unwritable directory, `cgroup.procs`, or `cgroup.subtree_control`. A cgroup that cannot be
-created, or whose `cgroup.kill` cannot be opened, likewise refuses the job; there is no uncontained fallback. Changing
-sessions, including after the parent exits, does not change membership.
+A Linux job's membership and accounting source are its own cgroup v2, `<class>/job-<incarnation>-<id>` (05_gateway.md
+"Classes"). Admission creates it before recording or dispatching the job; the controller's open `Placement` descriptor
+moves the first process into it before exec (or before a pooled host interprets a script). A supervisor without
+delegation refuses admission with `NotDelegated`, naming the unwritable directory, `cgroup.procs`, or
+`cgroup.subtree_control`. A cgroup that cannot be created, or whose `cgroup.kill` cannot be opened, likewise refuses the
+job; there is no uncontained fallback. Changing sessions, including after the parent exits, does not change membership.
 
 Terminal retirement signals the cgroup's observed members through pidfds, grants TERM one grace deadline, then writes
 `cgroup.kill` if membership remains. The job seals only after `cgroup.events` reads `populated 0`; `poll(POLLPRI)` wakes
@@ -1605,44 +1602,45 @@ supervisor that ran the job retires.
   `script = { parts: string[], values: ({word:string} | {words:string[]})[] }` obeys the `ScriptCommand` bounds above.
   `failure` is present only on a `failed` job: `"scriptSyntax"` when its script did not parse (exit
   `{kind:"exited",code:2}`, diagnostic on stderr), `"supervisorLost"` in the terminal record the next supervisor seals
-  for a job its lost predecessor never saw end (11_shell.md), and, for a job whose command never ran, `"cpuAdmission"`
-  or `"priority"` (its CPU grant or class nice refused) or `"unlaunched"` (anything else kept the command from
-  launching: a program, `#!` interpreter or `env` name proven absent, a held child refused before its exec, a host that
-  could not start it). A never-launched job's exit is the refusal's wrapper code; a host process it owned meanwhile does
-  not make its command one that ran, so `failure`, never a `pid` or a sample, says it never ran. The one exception keeps
-  its own shape: a cold activation that itself fails ends the job with the activation's status and no `failure`
-  (11_shell.md, "Activation belongs to the job that waited on it"). Protected Arrow stores a script in the `argv` column
-  as the two arguments `\0script` and the script's JSON, a pair no argv can produce. Every element of `argv` is the
-  exact tagged `CommandArg` object `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization
-  selects `utf8` if and only if the Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64.
-  The controller's request decoder denies unknown fields; a result reader projects them (Reader projection). Every
-  decoder denies unknown encodings and rejects malformed or non-canonical base64, base64 used for valid UTF-8, decoded
-  NUL, arguments above 128 KiB, total argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation the host
-  platform cannot reproduce exactly. Validation happens before RPC dispatch, process allocation/spawn, and
-  protected-artifact effects. Protected Arrow stores `argv` as a required `List<Binary>` and recovery revalidates each
-  raw argument and both bounds. `started` is a full RFC3339 string: `Z` and numeric offsets are accepted. A `:60` value
-  is normalized to UTC and accepted only when it denotes a published IERS leap instant (for example
-  `2016-12-31T18:59:60-05:00`); local `23:59:60` alone is insufficient, and unannounced future leap seconds reject.
-  Calendar, clock, fraction, and offset ranges are validated. `exit` is the discriminated union `{kind:"exited",code}`
-  or `{kind:"signaled",signal,coreDumped}`; it is absent before a process result exists. `outputLimit` is present iff
-  `state == "outputLimit"`. Both serialization and deserialization enforce these state / duration / exit / output-limit
-  invariants. `cwd` is required but nullable on the wire: `null` means the workspace mount root and a string means
-  exactly one validated, normalized workspace-relative `WorkspacePath`. Decoders reject an omitted `cwd`; neither `""`
-  nor `"."` is a root sentinel, and the same `Option<WorkspacePath>` is preserved by Rust, JSON, CLI, N-API, MCP, and
-  Arrow. `draining` is nonterminal: the direct child may have exited, but the actor still holds the process, CPU and
-  volume claims until membership retirement succeeds.
-  `containment = {kind:"kernel"} | {kind:"observed",lost:ProcessCoverageGap[]}` records the successful membership proof,
-  not a promise at admission. Darwin always reports `observed`; even an empty `lost` cannot prove that coalesced fork
-  events missed no life. `outlived` records the live members retirement signalled, including a live leader on
-  cancellation or a live subtree root, as `{index?:number,pid:number,image?:string,signal:number}`. A successful receipt
-  names processes already ended, never survivors left running. `index` absent means its observed-tree index is unknown,
-  not that it had no index; `image` absent means no identity-fenced image read succeeded. No synthetic index or empty
-  image fills either gap. `signal` is the last delivered retirement signal. `outlivedIncomplete` defaults to false and
-  is omitted when false; true means retirement may have ended members absent from `outlived`. Kernel-proven empty
-  membership does not prove exhaustive metadata. An empty `outlived` means the operation ended no processes only when
-  this marker is false. A true marker requires containment and, where the DTO carries one, a spawned pid; receipts are
-  stated only while draining or terminal. A refused/never-spawned job has no containment, no rows and a false marker,
-  never an invented kernel proof. The sealed record retains the receipt unchanged.
+  for a job its lost predecessor never saw end (11_shell.md), `"memory"` for a background or resident job ended at macOS
+  Critical memory pressure (05_gateway.md "Memory pressure"), and, for a job whose command never ran, `"cpuAdmission"`
+  or `"priority"` (its jobserver fifo or memory-pressure read, or its class nice, failed) or `"unlaunched"` (anything
+  else kept the command from launching: a program, `#!` interpreter or `env` name proven absent, a held child refused
+  before its exec, a host that could not start it). A never-launched job's exit is the refusal's wrapper code; a host
+  process it owned meanwhile does not make its command one that ran, so `failure`, never a `pid` or a sample, says it
+  never ran. The one exception keeps its own shape: a cold activation that itself fails ends the job with the
+  activation's status and no `failure` (11_shell.md, "Activation belongs to the job that waited on it"). Protected Arrow
+  stores a script in the `argv` column as the two arguments `\0script` and the script's JSON, a pair no argv can
+  produce. Every element of `argv` is the exact tagged `CommandArg` object
+  `{encoding:"utf8",data:String} | {encoding:"base64",data:String}`. Serialization selects `utf8` if and only if the
+  Unix argument bytes are valid UTF-8; otherwise it emits canonical standard base64. The controller's request decoder
+  denies unknown fields; a result reader projects them (Reader projection). Every decoder denies unknown encodings and
+  rejects malformed or non-canonical base64, base64 used for valid UTF-8, decoded NUL, arguments above 128 KiB, total
+  argv above 1 MiB, an empty vector or `argv[0]`, and a byte representation the host platform cannot reproduce exactly.
+  Validation happens before RPC dispatch, process allocation/spawn, and protected-artifact effects. Protected Arrow
+  stores `argv` as a required `List<Binary>` and recovery revalidates each raw argument and both bounds. `started` is a
+  full RFC3339 string: `Z` and numeric offsets are accepted. A `:60` value is normalized to UTC and accepted only when
+  it denotes a published IERS leap instant (for example `2016-12-31T18:59:60-05:00`); local `23:59:60` alone is
+  insufficient, and unannounced future leap seconds reject. Calendar, clock, fraction, and offset ranges are validated.
+  `exit` is the discriminated union `{kind:"exited",code}` or `{kind:"signaled",signal,coreDumped}`; it is absent before
+  a process result exists. `outputLimit` is present iff `state == "outputLimit"`. Both serialization and deserialization
+  enforce these state / duration / exit / output-limit invariants. `cwd` is required but nullable on the wire: `null`
+  means the workspace mount root and a string means exactly one validated, normalized workspace-relative
+  `WorkspacePath`. Decoders reject an omitted `cwd`; neither `""` nor `"."` is a root sentinel, and the same
+  `Option<WorkspacePath>` is preserved by Rust, JSON, CLI, N-API, MCP, and Arrow. `draining` is nonterminal: the direct
+  child may have exited, but the actor still holds the process, CPU and volume claims until membership retirement
+  succeeds. `containment = {kind:"kernel"} | {kind:"observed",lost:ProcessCoverageGap[]}` records the successful
+  membership proof, not a promise at admission. Darwin always reports `observed`; even an empty `lost` cannot prove that
+  coalesced fork events missed no life. `outlived` records the live members retirement signalled, including a live
+  leader on cancellation or a live subtree root, as `{index?:number,pid:number,image?:string,signal:number}`. A
+  successful receipt names processes already ended, never survivors left running. `index` absent means its observed-tree
+  index is unknown, not that it had no index; `image` absent means no identity-fenced image read succeeded. No synthetic
+  index or empty image fills either gap. `signal` is the last delivered retirement signal. `outlivedIncomplete` defaults
+  to false and is omitted when false; true means retirement may have ended members absent from `outlived`. Kernel-proven
+  empty membership does not prove exhaustive metadata. An empty `outlived` means the operation ended no processes only
+  when this marker is false. A true marker requires containment and, where the DTO carries one, a spawned pid; receipts
+  are stated only while draining or terminal. A refused/never-spawned job has no containment, no rows and a false
+  marker, never an invented kernel proof. The sealed record retains the receipt unchanged.
   `JobSubtreeHandle = {jobId,index,incarnation}` is opaque: the monitor issues a random 32-lower-hex nonce for the
   authenticated retained root, not a client birth identity. Changing its job, index or nonce cannot select another root.
   `JobSubtreeAdmission = {kind:"admitted",handle} | {kind:"refused",reason}` and
@@ -1718,27 +1716,26 @@ supervisor that ran the job retires.
   `FoldedWorkspace = { workspace, head, outcome: { kind: "retired" } | { kind: "kept", reason: { kind: "dirty", files } | { kind: "refused", code, message } } }`;
   preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`;
   `CheckpointQuota = { maxCount, maxBytes }`.
-- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, cpuBudget?, pendingInstall? }`;
+- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, scheduling?, pendingInstall?, landTurns, landTurnsError? }`;
   `pendingInstall?: true` says an install holds the install slot (`dev.cowshed/install.lock`, read without taking it),
   absent while the slot is free (05_gateway.md "A pending install is visible");
   `healing = { mounting: { projects } } | "restoringSessions"` says how far the daemon's startup pass has got — the
   projects it still mounts, never 0, then the sessions it restores from them — and is absent once that pass is over
   (05_gateway.md "Startup contract"); `recovering = { supervisors }` counts the workspace supervisors from before the
-  daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery").
-  `cpuBudget = { ledger: CpuBudgetStatus } | { unanswered: <reason> }` is the daemon's own `cpu-budget` answer verbatim,
-  or the control client's reason a daemon that answered `status` did not answer it (one from before the request refuses
-  it; one from before `gateJobs` or `holders` answers a ledger this build cannot read, and the reason names the missing
-  field); never an empty ledger in its place, and absent when no daemon answered `status`.
-  `CpuBudgetStatus = { total, held, checkouts, gateJobs, gateQueue, background, probation? }`: `checkouts` (every class)
-  is `[{ checkout, held, running, waiting }]`, `background` (background class alone) is
-  `[{ checkout, held, waiting, holders }]`, `gateJobs` is `[{ repository, checkout, job, held, holders }]` oldest job
-  first (the head of the gate queue first), and `gateQueue` is
-  `[{ repository, checkout, job, pid?, command, want, waitedMs }]` in the order returned tokens go to it. `holders` is
-  `[CpuHolder]`, one per granted lease, oldest grant first: `CpuHolder = { pid?, command, tokens, want, heldMs }`, the
-  client's peer pid, the command it named, the tokens it holds now of its `want`, and the milliseconds since its grant —
-  the lease's age, not its process's (05_gateway.md "Host CPU budget", Wire). `probation?` is
-  `CpuProbation = { checkout, pid?, command, lentMs }`, the one request running on the probation token (05_gateway.md "A
-  one-token job starts on probation"), absent when none is lent; it still waits in `background`.
+  daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery"). `scheduling?: HostScheduling`
+  is what the CLI reads on the host for `gateway status` and `doctor` (05_gateway.md "Status"), absent from an install's
+  health wait: `HostScheduling = { readings, jobs, imageCleanup }`.
+  `readings: HostReadings = { load, memoryPressure, swap }`, each `{ kind: "read", … } | { kind: "unread", error }`, a
+  failed kernel read stated and never zero: `load` reads `{ one, five, fifteen }` (`getloadavg`), `memoryPressure` reads
+  `{ kind: "darwin", level: "normal" | "warning" | "critical" }` (`kern.memorystatus_vm_pressure_level`) or
+  `{ kind: "psi", someAvg10 }` in hundredths of a percent (`/proc/pressure/memory`), and `swap` reads
+  `{ usedBytes, totalBytes }` (`vm.swapusage`, `/proc/meminfo`). `jobs: HostJobs = { counts?, unanswered? }`, read from
+  each live workspace supervisor's own job list: `counts` is
+  `[{ class: ExecClass, state: "queued" | "running" | "draining", jobs }]`, one row per class and state with at least
+  one job, and `unanswered` is `[{ socket, error }]` for a supervisor whose list failed, whose jobs are in no count.
+  `imageCleanup: ImageCleanup = { waiting, unread? }`: the entries a listing of the store's `.deleting` directories
+  finds ("Deleting released images"), and each directory that listing could not read. `landTurns`/`landTurnsError` are
+  05_gateway.md "Land turns"'s.
   `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
 `JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and
@@ -1936,7 +1933,7 @@ export interface ScriptCommand {
   values: ScriptValue[];
 }
 export type JobCommand = { argv: CommandArg[]; script?: never } | { script: ScriptCommand; argv?: never };
-export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority' | 'unlaunched';
+export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority' | 'memory' | 'unlaunched';
 
 export type JobInfo = JobCommand & {
   repoId: string;
@@ -2107,14 +2104,14 @@ One boundary answer, no ambiguity:
   workspace retirement records `JobState::Killed` while retaining the operating system's actual `ExitStatus`. A child
   that handles SIGTERM may report `Exited`, including code zero; a child terminated by the signal reports `Signaled`.
   Both are valid in `JobInfo` and `ExecRecord`; neither may omit the observed exit status. A job killed before its
-  command existed — withdrawn while queued for its CPU grant (11_shell.md, "Server-owned CPU admission and nice
-  placement") — never ran: its `JobInfo` is `Killed` with no `pid` and no `exit`. A killed `JobInfo` with a `pid` and no
-  `exit` is refused, so "never ran" and "ran and was killed" never share a projection. Cancellation uses the same
-  membership retirement as spontaneous leader exit: snapshot, TERM, existing grace, KILL where necessary, and native
-  exit proof. A retirement refusal is an error, not permission to release the claim or publish terminal state: it
-  answers `wait` and a following `logs` with the typed error while the job stays held, and on Darwin a refusal that came
-  while members still ran re-runs once they have exited (11_shell.md, "Shell activation and process reuse"). Neither
-  quiet output, elapsed age nor zero CPU authorizes cancellation.
+  command existed — withdrawn while queued for memory pressure (11_shell.md, "Job admission and class placement") —
+  never ran: its `JobInfo` is `Killed` with no `pid` and no `exit`. A killed `JobInfo` with a `pid` and no `exit` is
+  refused, so "never ran" and "ran and was killed" never share a projection. Cancellation uses the same membership
+  retirement as spontaneous leader exit: snapshot, TERM, existing grace, KILL where necessary, and native exit proof. A
+  retirement refusal is an error, not permission to release the claim or publish terminal state: it answers `wait` and a
+  following `logs` with the typed error while the job stays held, and on Darwin a refusal that came while members still
+  ran re-runs once they have exited (11_shell.md, "Shell activation and process reuse"). Neither quiet output, elapsed
+  age nor zero CPU authorizes cancellation.
 - **Binary stdin** is supported without shell interpolation: `ExecOptions.stdin` accepts inline `Uint8Array`,
   backpressured `AsyncIterable<Uint8Array>`, or a workspace-relative file object with the canonical no-follow open.
 - **Stdin lifecycle is observable.** Open occurs after `JobId` allocation; EOF closes child stdin once, cancellation
@@ -2154,18 +2151,18 @@ completion, and normalized workspace-relative source where applicable, never inl
 
 `Coordinator::exec(worker, request)` is the trusted `coordinator.exec` upload route; the worker handle supplies only the
 immutable workspace/incarnation fence. Ordinary `worker.exec` admits Background, Interactive, Resident and
-InteractiveResident in Workspace scope: Interactive buys a band and no token, and a resident of either nice holds none.
-Requesting Gate or HostGate there is typed class-not-permitted before snapshot, record, CPU request or spawn. Scope,
-class and want bind keyed admission just like command/env: changing one under the same key is keyConflict, never a new
-spawn. No class has an admission deadline (05_gateway.md, "No admission deadline, for any class").
+InteractiveResident in Workspace scope. Requesting Gate or HostGate there is typed class-not-permitted before snapshot,
+record or spawn. Scope, class and want bind keyed admission just like command/env: changing one under the same key is
+keyConflict, never a new spawn. No class has an admission deadline: a background start waits out memory pressure for as
+long as it lasts (05_gateway.md, "Memory pressure").
 
 `ExecScope` is Workspace (default) or HostGate. HostGate requires the coordinator route, argv, read-write mode and no
-session, and pairs with every class: it names where the command runs, and the class alone decides its CPU admission
+session, and pairs with every class: it names where the command runs, and the class alone decides its placement
 (06_cli.md, `--host`). It runs one host one-shot without ExecutedChild or shell activation, never a new wrapper. No
 worker gains host authority. The operator gate command explicitly selects its checkout environment. The host child
 starts from an empty environment and gets the ordinary request environment under the existing reserved/credential rules,
-its live grant's pool/count, PWD and `NX_DAEMON_START=never` (no job's Nx client starts a daemon, 04_sandbox.md), not
-the supervisor's environment or authority. CLI HostGate preserves custom operator/project names; ordinary worker
+its job's jobserver fifo and count, PWD and `NX_DAEMON_START=never` (no job's Nx client starts a daemon, 04_sandbox.md),
+not the supervisor's environment or authority. CLI HostGate preserves custom operator/project names; ordinary worker
 activation and overlays remain unchanged.
 
 The public environment-name policy is **record-only**, for **all scopes**: `JobAdmission.env` stores only
@@ -2185,19 +2182,20 @@ alias a previous job, including after supervisor restart; changing a withheld cr
 identity because it cannot reach the command. The existing Arrow record proof covers both projection and commitment. No
 unrecorded private map is retained to make a repeat work.
 
-JobInfo and SealedJob expose admitted class/scope, actual cpuTokens and observed nice (absent before placement).
-CowshedError carries typed cpuAdmission (the gateway's refusal, an invalid request or a protocol failure) and priority
-(actual pid, requested/observed nice and errno). A failed or absent observation is never fabricated.
+JobInfo and SealedJob expose admitted class/scope and observed nice (absent before placement, and always on Linux, where
+the class cgroup places the job). CowshedError carries typed cpuAdmission (a jobserver fifo not made or a memory
+pressure not read) and priority (actual pid, requested/observed nice and errno). A failed or absent observation is never
+fabricated.
 
 Records now use layout14: layout13's columns remain an exact prefix, followed by the nullable boolean
 retirement_outlived_incomplete marker. Layout13 appended the nullable retirement_containment and retirement_outlived
-wire-JSON receipt columns (11_shell.md, "Server-owned CPU admission and nice placement"). Layout12 appended nullable
-UInt64 admission_want, the want a keyed request named, null for one that named none and for every unkeyed record.
-Layout11 appended nullable Binary admission_env_sha256 to layout10, exactly 32 bytes and present exactly for keyed job
-records. Earlier histories are retained untouched and set aside, not migrated or re-keyed. On an existing incarnation
-that may have served keyed work, new keyed exec is refused as unprovable until the incarnation is renewed. **Operators
-must renew existing incarnations before keyed exec after upgrading.** Unkeyed operator CLI exec remains available. This
-is the existing strict history-attestation contract, not silent compatibility.
+wire-JSON receipt columns (11_shell.md, "Job admission and class placement"). Layout12 appended nullable UInt64
+admission_want, the want a keyed request named, null for one that named none and for every unkeyed record. Layout11
+appended nullable Binary admission_env_sha256 to layout10, exactly 32 bytes and present exactly for keyed job records.
+Earlier histories are retained untouched and set aside, not migrated or re-keyed. On an existing incarnation that may
+have served keyed work, new keyed exec is refused as unprovable until the incarnation is renewed. **Operators must renew
+existing incarnations before keyed exec after upgrading.** Unkeyed operator CLI exec remains available. This is the
+existing strict history-attestation contract, not silent compatibility.
 
 ## CLI and API exec parity
 
@@ -2226,7 +2224,7 @@ is one typed field of the same request, decoded by the same validation (`JobSche
 
 The gate class and host scope are the coordinator route's alone on both surfaces (`coordinator.exec`; the CLI is that
 route); a worker capability asks for background, interactive and resident work, a resident at either nice, in its own
-workspace. Queued priority (05_gateway.md, "Queued priority") is a field of neither: no exec request carries one.
+workspace. No exec request carries a priority.
 
 The API also carries what a one-shot CLI process cannot use, none of which asks the scheduler for anything: script
 commands (`ExecCommand::Script`), open stdin written through the job's attachment, the request `env` and `trace`,

@@ -294,7 +294,7 @@ impl<A: Activator> ShellPool<A> {
 
     /// Whether an acquire now would hand back a warm host: an idle one of the current
     /// generation, or the spare. It takes and reserves nothing, so a command that acquires later
-    /// may still find none (05_gateway.md "A resident's start holds one token").
+    /// may still find none.
     pub async fn ready(&self) -> Result<bool> {
         let (reply, receive) = oneshot::channel();
         self.requests

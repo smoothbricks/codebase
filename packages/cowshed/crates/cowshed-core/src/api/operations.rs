@@ -824,14 +824,14 @@ pub struct ExecParams {
     pub stderr_copy: Option<OutputPublication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_key: Option<AdmissionKey>,
-    /// The class the job is admitted under (05_gateway.md "Bands"), omitted for background, which
+    /// The class the job is admitted under (05_gateway.md "Classes"), omitted for background, which
     /// is what ordinary exec asks for: `interactive` for a command its requester awaits, and
-    /// `resident` for one that serves requests and holds no token, which a worker may ask for;
-    /// only the coordinator.exec route admits the gate class.
+    /// `resident` for one that serves requests, which a worker may ask for; only the
+    /// coordinator.exec route admits the gate class.
     #[serde(default, skip_serializing_if = "is_background")]
     pub class: ExecClass,
-    /// The most CPU tokens the command can use at once; omitted for its class's own, the
-    /// background share of the host for background and interactive work.
+    /// The count the job's jobserver holds, at most the host's cores; omitted for the host's cores
+    /// (05_gateway.md "Parallelism inside a job").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub want: Option<NonZeroUsize>,
     /// Where the command runs; omitted for the workspace sandbox.

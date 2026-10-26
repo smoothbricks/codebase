@@ -195,28 +195,15 @@ pub enum CpuAdmissionRefusal {
         class: crate::api::dto::ExecClass,
         scope: crate::api::dto::ExecScope,
     },
-    GatewayUnavailable {
-        socket: std::path::PathBuf,
+    /// The supervisor could not make the job's jobserver fifo in its workspace's pool directory
+    /// (05_gateway.md "Parallelism inside a job").
+    Jobserver {
+        directory: std::path::PathBuf,
         error: String,
     },
-    GatewayRefused {
-        code: String,
-        error: String,
-    },
-    /// A gateway restarted by an install cut this ask off and named that install; asked again
-    /// once (05_gateway.md "A queued CPU ask outlives an install"), else returned as it is.
-    CutOffByInstall {
-        install: cowshed_gateway_types::InstallRestart,
-        error: String,
-    },
-    /// The install that cut this ask off did not bring up a gateway that serves within its bound.
-    InstallDidNotServe {
-        install: cowshed_gateway_types::InstallRestart,
-        waited_ms: u64,
-    },
-    Protocol {
-        detail: String,
-    },
+    /// The host's memory pressure, which a background start waits on, could not be read
+    /// (05_gateway.md "Memory pressure").
+    MemoryPressure { error: String },
 }
 
 /// What placing nice on the owned child observed; absent values were not observed, never guessed.
@@ -456,39 +443,16 @@ impl CowshedError {
                 format!("class-not-permitted: worker exec cannot request {class:?} / {scope:?}"),
                 "use the trusted coordinator/operator gate path; workers admit background, interactive and resident workspace work",
             ),
-            CpuAdmissionRefusal::GatewayUnavailable { socket, error } => Self::environment_missing(
+            CpuAdmissionRefusal::Jobserver { directory, error } => Self::environment_missing(
                 format!(
-                    "jobserver admission at {} is unavailable: {error}",
-                    socket.display()
+                    "cannot make the job's jobserver fifo in {}: {error}",
+                    directory.display()
                 ),
-                "start the owning cowshed gateway; no unbudgeted spawn is permitted",
+                "check the cowshed store's run/cpu permissions and free space",
             ),
-            CpuAdmissionRefusal::GatewayRefused { code, error } => Self::environment_missing(
-                format!("jobserver admission refused ({code}): {error}"),
-                "inspect cowshed gateway status and use the matching installed build",
-            ),
-            CpuAdmissionRefusal::CutOffByInstall { install, error } => Self::environment_missing(
-                format!(
-                    "jobserver admission refused (install-restart) by install {} ({}): {error}",
-                    install.pid,
-                    install.binary.display()
-                ),
-                "inspect cowshed gateway status; no unbudgeted spawn is permitted",
-            ),
-            CpuAdmissionRefusal::InstallDidNotServe { install, waited_ms } => {
-                Self::environment_missing(
-                    format!(
-                        "the install {} ({}) restarting the gateway did not bring up one that serves within {} ms; waited {waited_ms} ms",
-                        install.pid,
-                        install.binary.display(),
-                        install.serves_within_ms
-                    ),
-                    "inspect cowshed gateway status; no unbudgeted spawn is permitted",
-                )
-            }
-            CpuAdmissionRefusal::Protocol { detail } => Self::environment_missing(
-                format!("jobserver admission protocol failed: {detail}"),
-                "inspect the owning gateway; no unbudgeted spawn is permitted",
+            CpuAdmissionRefusal::MemoryPressure { error } => Self::environment_missing(
+                format!("cannot read the host's memory pressure for a background start: {error}"),
+                "run the job as interactive, or fix the host's pressure reading",
             ),
         };
         Self {
@@ -505,7 +469,7 @@ impl CowshedError {
                 "cannot place owned job pid {} at nice {}: observed {:?}, errno {:?}",
                 failure.pid, failure.requested, failure.observed, failure.errno
             ),
-            "interactive runs at the supervisor's own nice and every other class only lower (05_gateway.md \"Bands\"); never request an elevated priority",
+            "interactive runs at the supervisor's own nice and every other class only lower (05_gateway.md \"Classes\"); never request an elevated priority",
         );
         Self {
             cold: Some(Box::new(ColdRefusal::Priority { priority: failure })),
@@ -995,13 +959,14 @@ mod tests {
     #[test]
     fn execution_causes_keep_their_flat_wire_and_unknown_sources_keep_the_envelope() {
         use super::{CpuAdmissionRefusal, PriorityFailure};
-        let admission = CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-            detail: "fixture protocol".to_owned(),
+        let admission = CowshedError::cpu_admission(CpuAdmissionRefusal::Jobserver {
+            directory: std::path::PathBuf::from("/store/run/cpu/x"),
+            error: "denied".to_owned(),
         });
         let value = serde_json::to_value(&admission).expect("serialize admission");
         assert_eq!(
             value["cpuAdmission"],
-            serde_json::json!({"reason":"protocol", "detail":"fixture protocol"})
+            serde_json::json!({"reason":"jobserver", "directory":"/store/run/cpu/x", "error":"denied"})
         );
         assert!(value.get("execution").is_none());
         assert!(value.get("priority").is_none());

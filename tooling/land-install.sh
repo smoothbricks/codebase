@@ -3,8 +3,8 @@
 # once the land's turn has ended. <repo> names the repository's land turn ('cowshed land-turn <repo>'); <before> and
 # <head> are the commits main moved between. The gateway daemon and the cowshed an operator types are one installed
 # artifact that only 'cowshed setup' replaces (specs/cowshed/05_gateway.md, "The installed cowshed"), and setup refuses
-# to restart the gateway while any land holds its turn or any gate job holds tokens, the land that runs it included
-# ("An install refuses while a land or a gate runs"). A land therefore cannot install from inside its own turn. In order:
+# to restart the gateway while any land holds its turn, the land that runs it included ("An install refuses while a land
+# runs"). A land therefore cannot install from inside its own turn. In order:
 #
 # 1. Ask whether the land changed cowshed or a project it depends on (land-install.ts wanted). Nothing else happens
 #    when it did not; when Nx cannot say, the install goes on.
@@ -17,8 +17,8 @@
 # 3. With no turn held, ask the staged build's own doctor whether setup would raise an administrator dialog: its host
 #    storage findings come from the plan setup executes. When it would, or when doctor cannot say, nothing is run
 #    unattended.
-# 4. Ask gateway status for the work an install refuses under: a land turn's holder, a gate job holding or wanting
-#    tokens, or another install holding the install slot, which setup would wait for with no deadline. When there is any,
+# 4. Ask gateway status for the work an install refuses under: a land turn's holder, or another install holding the
+#    install slot, which setup would wait for with no deadline. When there is any,
 #    the install is deferred.
 # 5. Run the staged build's setup once. A refusal it answers is told apart from a build it will not install by a fresh
 #    status: work that began after the first read defers the install too.
@@ -163,8 +163,7 @@ needed\ *)
   ;;
 esac
 
-# What an install would refuse under: a land holding its repository's turn, a gate job holding or wanting tokens, an
-# install holding the slot.
+# What an install would refuse under: a land holding its repository's turn, an install holding the slot.
 gateway_readiness
 case $readiness in
 ready) ;;

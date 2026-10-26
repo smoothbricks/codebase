@@ -11,7 +11,7 @@ use crate::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
 pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
 
 /// The variable `.cowshed/env` restores `NX_PARALLEL` from after a devenv shell sets its own: a
-/// granted job's Nx fan-out (05_gateway.md "Sized to the grant").
+/// job's Nx fan-out, its jobserver count (05_gateway.md "Parallelism inside a job").
 pub const NX_PARALLEL_RESTORE_ENV: &str = "COWSHED_NX_PARALLEL";
 pub const WORKSPACE_TOKEN_ENV: &str = "COWSHED_WORKSPACE_TOKEN";
 pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
@@ -296,8 +296,8 @@ pub(crate) fn write_workspace_environment(
     Ok(())
 }
 
-/// The line that puts a granted job's Nx fan-out back after a devenv shell sourced before
-/// `.cowshed/env` set its own `NX_PARALLEL` (05_gateway.md "Sized to the grant").
+/// The line that puts a job's Nx fan-out back after a devenv shell sourced before `.cowshed/env`
+/// set its own `NX_PARALLEL` (05_gateway.md "Parallelism inside a job").
 fn nx_parallel_restore() -> String {
     format!(
         "if [ -n \"${{{NX_PARALLEL_RESTORE_ENV}-}}\" ]; then export NX_PARALLEL=\"${NX_PARALLEL_RESTORE_ENV}\"; fi\n"

@@ -1073,8 +1073,8 @@ impl CliService for ActorBridge {
             });
         }
         // Every foreground job is held for as long as this process lives, so a client that dies
-        // -- a caller's timeout killing it, `SIGKILL` included -- takes its job and its tokens
-        // with it (05_gateway.md "A job lives with its requester").
+        // -- a caller's timeout killing it, `SIGKILL` included -- takes its job with it
+        // (05_gateway.md "A job lives with its requester").
         let descriptor = self
             .runtime
             .as_ref()
@@ -1178,9 +1178,8 @@ impl ForegroundJob for JobHandle {
 }
 
 /// Hold a foreground job for as long as this process lives (05_gateway.md, "A job lives with its
-/// requester"): a job nobody waits for any more would keep its tokens, and a gate its place at
-/// the head of the gate queue. A job that cannot be held is killed rather than left running for
-/// nobody.
+/// requester"): a job nobody waits for any more would run on for nobody, and a gate would keep
+/// its repository's land waiting. A job that cannot be held is killed rather than left running.
 pub(crate) async fn hold_foreground(
     job: &impl ForegroundJob,
     socket: &Path,
@@ -7475,7 +7474,7 @@ mod tests {
                 daemon_sha256: Some("13f1eec0".into()),
                 cli_sha256: "b4223cd0".into(),
             }),
-            cpu_budget: None,
+            scheduling: None,
             pending_install: false,
             land_turns: Vec::new(),
             land_turns_error: None,
@@ -7506,7 +7505,7 @@ mod tests {
             healing: None,
             recovering: None,
             stale_daemon: None,
-            cpu_budget: None,
+            scheduling: None,
             pending_install: false,
             land_turns: Vec::new(),
             land_turns_error: None,
@@ -7532,7 +7531,7 @@ mod tests {
             healing: None,
             recovering: None,
             stale_daemon: None,
-            cpu_budget: None,
+            scheduling: None,
             pending_install: false,
             land_turns: Vec::new(),
             land_turns_error: None,

@@ -1974,8 +1974,8 @@ mod tests {
     }
 
     /// Three bootstrap directories are reconciled before every sandboxed spawn. Run explicitly
-    /// on the host with `taskpolicy -b cargo test -p cowshed-os bootstrap_reconciliation_cost
-    /// -- --ignored --nocapture --test-threads=1`; timings are observations, not assertions.
+    /// on the host with `cargo test -p cowshed-os bootstrap_reconciliation_cost -- --ignored
+    /// --nocapture --test-threads=1`; timings are observations, not assertions.
     #[test]
     #[ignore = "manual filesystem performance measurement"]
     fn bootstrap_reconciliation_cost() {

@@ -186,12 +186,12 @@
       "started": "2026-01-02T03:04:05Z",
       "state": "failed",
       "stderr": {
-        "bytes": 55,
-        "sha256": "c8b57e681e07a3ffcb3f5ab58f748800735ca3c9a18a1f6d4acee618b2ced87b",
+        "bytes": 77,
+        "sha256": "24717a83bc4afb2e88ee015798c697b3d673503c3c13a73003856a2b18188b31",
         "storage": {
           "artifact": {
             "data": {
-              "data": "jobserver admission is unavailable: connection refused\n",
+              "data": "cowshed: the job's jobserver fifo could not be made: No space left on device\n",
               "encoding": "utf8"
             },
             "kind": "inline"
@@ -199,7 +199,7 @@
           "kind": "captured"
         },
         "summary": {
-          "text": "jobserver admission is unavailable: connection refused\n",
+          "text": "cowshed: the job's jobserver fifo could not be made: No space left on device\n",
           "truncated": false,
           "version": 1
         }
@@ -311,7 +311,6 @@
         }
       ],
       "class": "gate",
-      "cpuTokens": 8,
       "cwd": null,
       "durationMs": 1234,
       "exit": {
@@ -517,7 +516,6 @@
         }
       ],
       "class": "background",
-      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 9,
       "exit": {
@@ -593,7 +591,6 @@
         }
       ],
       "class": "interactive",
-      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 1234,
       "exit": {
@@ -748,7 +745,6 @@
         }
       ],
       "class": "background",
-      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 9,
       "exit": {
@@ -894,7 +890,6 @@
           }
         ],
         "class": "background",
-        "cpuTokens": 4,
         "cwd": "packages/cowshed",
         "grantRevision": 7,
         "jobId": 2,
@@ -1024,6 +1019,87 @@
         "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
       }
     ],
+    "memoryEnded": {
+      "argv": [
+        {
+          "data": "printf",
+          "encoding": "utf8"
+        },
+        {
+          "data": "%s",
+          "encoding": "utf8"
+        },
+        {
+          "data": "//6A",
+          "encoding": "base64"
+        }
+      ],
+      "class": "background",
+      "cwd": null,
+      "durationMs": 9,
+      "exit": {
+        "coreDumped": false,
+        "kind": "signaled",
+        "signal": 15
+      },
+      "failure": "memory",
+      "grantRevision": 9,
+      "jobId": 19,
+      "nice": 10,
+      "pid": 4244,
+      "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "failed",
+      "stderr": {
+        "bytes": 74,
+        "sha256": "dc365ca5d5a99097d89e7d832263da9d346b20ec441f4faf5be9b39d2f669af7",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "cowshed: ended at critical memory pressure with 6442450944 resident bytes\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "cowshed: ended at critical memory pressure with 6442450944 resident bytes\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 0,
+        "complete": true,
+        "kind": "empty"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
     "outputLimit": {
       "argv": [
         {
@@ -1032,7 +1108,6 @@
         }
       ],
       "class": "background",
-      "cpuTokens": 1,
       "cwd": null,
       "durationMs": 50,
       "grantRevision": 9,
@@ -1105,7 +1180,6 @@
         }
       ],
       "class": "background",
-      "cpuTokens": 1,
       "cwd": null,
       "durationMs": 1234,
       "failure": "priority",
@@ -1319,7 +1393,6 @@
       "containment": {
         "kind": "kernel"
       },
-      "cpuTokens": 8,
       "cwd": null,
       "durationMs": 1234,
       "exit": {
@@ -1398,7 +1471,6 @@
       "containment": {
         "kind": "kernel"
       },
-      "cpuTokens": 8,
       "cwd": null,
       "durationMs": 1234,
       "exit": {
@@ -1482,7 +1554,6 @@
       "containment": {
         "kind": "kernel"
       },
-      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 9,
       "exit": {
@@ -1585,7 +1656,6 @@
           }
         ]
       },
-      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 9,
       "exit": {
@@ -1678,7 +1748,6 @@
         }
       ],
       "class": "background",
-      "cpuTokens": 4,
       "cwd": "packages/cowshed",
       "grantRevision": 7,
       "jobId": 2,
@@ -1898,7 +1967,6 @@
         }
       ],
       "class": "background",
-      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 9,
       "exit": {
@@ -2036,7 +2104,6 @@
         }
       ],
       "class": "background",
-      "cpuTokens": 1,
       "cwd": null,
       "durationMs": 1234,
       "exit": {

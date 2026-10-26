@@ -18,6 +18,8 @@ mod held_change;
 pub mod held_lock;
 pub mod host_dirs;
 pub mod host_load;
+pub mod host_pressure;
+pub mod host_readings;
 mod inherited_daemons;
 #[cfg(target_os = "macos")]
 mod inherited_git_locks;

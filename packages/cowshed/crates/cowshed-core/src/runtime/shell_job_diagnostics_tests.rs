@@ -196,7 +196,6 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 environment: BTreeMap::new(),
                 grants: Default::default(),
                 envrc_directory: None,
-                cpu: Arc::new(crate::runtime::supervisor::ImmediateCpu),
             }),
             ShellPoolConfig {
                 prewarm: false,
@@ -216,7 +215,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 authority
                     .incarnation(&incarnation)
                     .expect("incarnation cgroups")
-                    .admit(job_id)
+                    .admit(job_id, crate::api::dto::ExecClass::Background)
                     .expect("admit before descriptor exhaustion"),
             )
         };
@@ -249,8 +248,8 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 command: HostCommand::Argv(vec![OsString::from("true")]),
                 cwd: PathBuf::from("/"),
                 overlay: Vec::new(),
+                #[cfg(target_os = "macos")]
                 nice: 10,
-                activation: super::super::supervisor::ActivationCover::Held,
                 #[cfg(target_os = "linux")]
                 cgroup: Arc::clone(&cgroup),
                 #[cfg(target_os = "macos")]

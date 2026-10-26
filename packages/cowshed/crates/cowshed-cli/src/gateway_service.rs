@@ -18,8 +18,8 @@ use crate::path_entry::PathEntryOutcome;
 use async_trait::async_trait;
 use cowshed_core::api::Coordinator;
 use cowshed_core::api::{
-    EmptyResult, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, LandTurnQueue,
-    StaleDaemonBinary,
+    EmptyResult, ExecClass, GatewayStatus as CliGatewayStatus, HostJobs, HostScheduling,
+    ImageCleanup, JobCount, JobState, LandTurnQueue, StaleDaemonBinary, UnansweredSupervisor,
 };
 use cowshed_core::host_dirs::support_directory;
 use cowshed_core::land_turn as turns;
@@ -41,6 +41,7 @@ use cowshed_gateway::{
     GatewayControlClient, GatewayError, GatewayHandle, MirrorCacheConfig, StartupHeal,
     StartupProbe, SupervisorRecovery, WorkspaceSession,
 };
+use cowshed_gateway_types::host_status::{LoadReading, MemoryPressureReading, SwapReading};
 use cowshed_os::deadline::WaitError;
 use cowshed_os::namespace::HostNamespace;
 use cowshed_os::stdio::Blocking;
@@ -140,14 +141,6 @@ impl ControlSocket {
 
 #[async_trait]
 impl GatewayControl for ControlSocket {
-    async fn gates_in_flight(
-        &self,
-    ) -> std::result::Result<
-        std::collections::BTreeSet<cowshed_core::api::dto::GateJobRef>,
-        GatewayStatusError,
-    > {
-        self.0.gates_in_flight().await.map_err(status_error)
-    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.0.status().await.map_err(status_error)
     }
@@ -416,9 +409,8 @@ async fn reconcile_project_for_backend(
 /// it attaches, checks, and mounts every recorded project's images and restores their sessions
 /// before it serves a workspace (05_gateway.md), and a host carrying several multi-gigabyte mains
 /// needs minutes for that pass. Ten seconds timed out mid-heal and told the user to kickstart a
-/// gateway that was working exactly as intended. The install names it on the handoff socket, and
-/// it bounds the one retry of every CPU ask the restart cuts off.
-const START_DEADLINE: Duration = cowshed_gateway_types::INSTALL_SERVES_WITHIN;
+/// gateway that was working exactly as intended.
+const START_DEADLINE: Duration = Duration::from_secs(180);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the wait says that it is still waiting, and on what.
 const START_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -866,9 +858,9 @@ where
     let bun = invoking_bun()?;
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     // Activation restarts a gateway that runs; one that answers is refused the restart while a
-    // land or a gate of it runs, before the install changes anything.
+    // land runs, before the install changes anything.
     if client.status().await.is_ok() {
-        refuse_restart_while_busy(slot, &home, &client, &mut Blocking::new(io::stderr())).await?;
+        refuse_restart_while_busy(slot, &home)?;
     }
     install_nx_cache_server(&mut executor, &home, &candidate.source)?;
     let spec =
@@ -906,18 +898,16 @@ where
     )
     .await?;
     Ok(CliGatewayStatus {
-        cpu_budget: Some(read_cpu_budget(&client).await),
+        scheduling: Some(read_scheduling(storage.store()).await),
         ..reported
     })
 }
 
 /// The install's side of the listener handoff (05_gateway.md "An install never refuses a client
 /// connection"): serving it from before the restart until the restarted gateway serves carries
-/// every workspace listener across the restart, and names this install to the gateway it
-/// restarts, which passes that on to every CPU ask it cuts off ("A queued CPU ask outlives an
-/// install"). A downgrade serves nothing: an older gateway may not take the listeners, and its own
-/// bind would then meet this install's copies. A handoff that cannot serve is said, and the
-/// restart refuses connections and cuts CPU asks off unnamed, as it did before.
+/// every workspace listener across the restart. A downgrade serves nothing: an older gateway may
+/// not take the listeners, and its own bind would then meet this install's copies. A handoff that
+/// cannot serve is said, and the restart refuses connections, as it did before.
 #[cfg(target_os = "macos")]
 fn carry_listeners(
     control_socket: &Path,
@@ -926,20 +916,12 @@ fn carry_listeners(
     if downgrade == Downgrade::Allow {
         return None;
     }
-    let install = cowshed_gateway_types::InstallRestart {
-        pid: std::process::id(),
-        binary: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cowshed")),
-        serves_within_ms: u64::try_from(START_DEADLINE.as_millis()).unwrap_or(u64::MAX),
-    };
-    match cowshed_gateway::HandoffServer::start(
-        &cowshed_gateway::handoff_path(control_socket),
-        install,
-    ) {
+    match cowshed_gateway::HandoffServer::start(&cowshed_gateway::handoff_path(control_socket)) {
         Ok(server) => Some(server),
         Err(error) => {
             cowshed_os::eprintln!(
                 "cowshed: the handoff socket cannot serve, so this restart carries no workspace \
-             listener and names no install to the CPU asks it cuts off: {error}"
+             listener: {error}"
             );
             None
         }
@@ -999,7 +981,7 @@ where
                     // activation did not restart it onto the bytes just installed. Restart it
                     // once.
                     (None, Some(_), _) if !restarted => {
-                        // The land turns and gates were judged under this slot before the install
+                        // The land turns were judged under this slot before the install
                         // changed anything, and every land step since waits for the slot, so this
                         // restart cuts nothing off. The start deadline is the new daemon's to
                         // meet, not the old one's drain.
@@ -1289,18 +1271,12 @@ pub(crate) fn remove_path_entries(stable: &Path) -> Result<RemovalOutcome> {
 }
 
 /// Stop the gateway while setup moves its mirrors; the installed binary stays. A gateway that
-/// answers is refused the stop while a land or a gate of it runs ([`refuse_restart_while_busy`]):
-/// stopping it cuts them off as a restart does.
+/// answers is refused the stop while a land runs ([`refuse_restart_while_busy`]): stopping it
+/// cuts the land off as a restart does.
 pub(crate) async fn stop_for_host_move(slot: &InstallSlot, roots: &CanonicalRoots) -> Result<()> {
     let client = GatewayControlClient::new(roots.control_socket()).map_err(control_error)?;
     if client.status().await.is_ok() {
-        refuse_restart_while_busy(
-            slot,
-            &canonical_home()?,
-            &client,
-            &mut Blocking::new(io::stderr()),
-        )
-        .await?;
+        refuse_restart_while_busy(slot, &canonical_home()?)?;
     }
     stop_service(roots.namespace(), false).map(|_| ())
 }
@@ -1314,10 +1290,7 @@ pub(crate) async fn start_after_host_move(slot: &InstallSlot, downgrade: Downgra
 
 pub(crate) async fn service_status(roots: &CanonicalRoots) -> Result<CliGatewayStatus> {
     let Ok(status) = observe_service(roots, |client| async move {
-        Ok::<_, Infallible>(match client.status().await {
-            Ok(status) => Some((status, read_cpu_budget(&client).await)),
-            Err(_) => None,
-        })
+        Ok::<_, Infallible>(client.status().await.ok())
     })
     .await?;
     Ok(status)
@@ -1396,7 +1369,7 @@ pub(crate) async fn doctor_service_status(
     let socket = roots.control_socket();
     observe_service(roots, |client| async move {
         match client.status().await {
-            Ok(status) => Ok(Some((status, read_cpu_budget(&client).await))),
+            Ok(status) => Ok(Some(status)),
             Err(ControlError::Wait(WaitError::Silent(silent))) => Err(Unanswered {
                 peer: "the gateway daemon",
                 socket,
@@ -1415,7 +1388,7 @@ async fn observe_service<E, Asked>(
     ask: impl FnOnce(GatewayControlClient) -> Asked,
 ) -> Result<std::result::Result<CliGatewayStatus, E>>
 where
-    Asked: Future<Output = std::result::Result<Option<(DaemonStatus, GatewayCpuBudget)>, E>>,
+    Asked: Future<Output = std::result::Result<Option<DaemonStatus>, E>>,
 {
     let home = canonical_home()?;
     let socket = roots.control_socket();
@@ -1440,15 +1413,15 @@ where
     } else {
         None
     };
-    let (status, cpu_budget) = answered.unzip();
     let (land_turns, land_turns_error) = observe_land_turns(&home);
+    let scheduling = read_scheduling(roots.store()).await;
     let cli_sha256 = executable_digest(&running_executable()?)?;
     Ok(Ok(CliGatewayStatus {
-        cpu_budget,
+        scheduling: Some(scheduling),
         pending_install,
         land_turns,
         land_turns_error,
-        ..cli_status(installed, socket, status.as_ref(), cli_sha256.as_str())
+        ..cli_status(installed, socket, answered.as_ref(), cli_sha256.as_str())
     }))
 }
 
@@ -1484,36 +1457,142 @@ fn observe_land_turns(home: &Path) -> (Vec<LandTurnQueue>, Option<String>) {
     }
 }
 
-/// The host CPU ledger of a daemon that answered `status`, or why it did not answer
-/// `cpu-budget`: a daemon from before that request refuses it, which is not an empty ledger.
-async fn read_cpu_budget(client: &GatewayControlClient) -> GatewayCpuBudget {
-    match client.cpu_budget().await {
-        Ok(ledger) => GatewayCpuBudget::Ledger(ledger),
-        Err(error) => GatewayCpuBudget::Unanswered(error.to_string()),
+/// The host's scheduling as `gateway status` reports it (05_gateway.md "Status"): the kernel's
+/// readings, the live jobs every workspace supervisor lists, and the released images waiting in
+/// the store's `.deleting` directories. All are read here, beside the daemon; none is asked of it.
+async fn read_scheduling(store: &Path) -> HostScheduling {
+    HostScheduling {
+        readings: cowshed_core::host_readings::read(),
+        jobs: read_jobs(store).await,
+        image_cleanup: read_image_cleanup(store),
+    }
+}
+
+/// The live jobs of every workspace supervisor serving in `store`, read from each supervisor's
+/// own job list: the store's `run` directory holds one socket per supervisor
+/// ([`supervisor_socket::socket_path`]). A socket nothing serves any more is no supervisor; one
+/// that does not answer is named with why, and its jobs are in no count.
+async fn read_jobs(store: &Path) -> HostJobs {
+    let run = store.join("run");
+    let sockets = match fs::read_dir(&run) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return HostJobs::default(),
+        Err(error) => {
+            return HostJobs {
+                counts: Vec::new(),
+                unanswered: vec![UnansweredSupervisor {
+                    socket: run,
+                    error: format!("the supervisor socket directory cannot be listed: {error}"),
+                }],
+            };
+        }
+    };
+    let mut live = Vec::new();
+    let mut unanswered = Vec::new();
+    for entry in sockets {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                unanswered.push(UnansweredSupervisor {
+                    socket: run.clone(),
+                    error: format!("the supervisor socket directory cannot be listed: {error}"),
+                });
+                continue;
+            }
+        };
+        if !is_supervisor_socket(store, &path) {
+            continue;
+        }
+        match supervisor_jobs(&path).await {
+            Ok(jobs) => live.extend(jobs.into_iter().map(|job| (job.class, job.state))),
+            Err(error) => unanswered.push(UnansweredSupervisor {
+                socket: path,
+                error: error.to_string(),
+            }),
+        }
+    }
+    HostJobs {
+        counts: count_jobs(live),
+        unanswered,
+    }
+}
+
+/// A workspace supervisor's own socket in the store's `run` directory: neither the membership
+/// socket beside it ([`supervisor_socket::membership_socket_path`]) nor the supervisor manager's
+/// ([`supervisor_manager::manager_socket_path`]).
+fn is_supervisor_socket(store: &Path, path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "sock")
+        && !path
+            .file_stem()
+            .is_some_and(|stem| Path::new(stem).extension().is_some())
+        && path != supervisor_manager::manager_socket_path(store)
+}
+
+/// The jobs the supervisor serving `socket` lists, or none when nothing serves it any more.
+async fn supervisor_jobs(socket: &Path) -> Result<Vec<cowshed_core::api::JobInfo>> {
+    let Some(hello) = supervisor_socket::hello_if_present(socket).await? else {
+        return Ok(Vec::new());
+    };
+    supervisor_socket::connect(socket.to_path_buf(), hello.authority)
+        .list()
+        .await
+}
+
+/// One row per class and state among `jobs` that are still live: queued, running or draining.
+/// An ended job holds nothing the kernel schedules, so it is in no row.
+fn count_jobs(jobs: impl IntoIterator<Item = (ExecClass, JobState)>) -> Vec<JobCount> {
+    let mut counts: Vec<JobCount> = Vec::new();
+    for (class, state) in jobs {
+        if state.is_terminal() {
+            continue;
+        }
+        match counts
+            .iter_mut()
+            .find(|count| count.class == class && count.state == state)
+        {
+            Some(count) => count.jobs += 1,
+            None => counts.push(JobCount {
+                class,
+                state,
+                jobs: 1,
+            }),
+        }
+    }
+    counts
+}
+
+/// The released images the store's `.deleting` directories hold for the gateway's cleanup, and
+/// each directory the listing could not read.
+fn read_image_cleanup(store: &Path) -> ImageCleanup {
+    let listing = cowshed_core::storage::apfs::deleter::leftovers(store);
+    ImageCleanup {
+        waiting: listing.entries.len() as u64,
+        unread: listing
+            .left
+            .into_iter()
+            .filter_map(|left| match left.why {
+                cowshed_core::storage::apfs::release::Why::Failed(error) => {
+                    Some(format!("{}: {error}", left.path.display()))
+                }
+                _ => None,
+            })
+            .collect(),
     }
 }
 
 /// Refuse an install about to restart the running gateway while a land holds its repository's
-/// turn or a gate job holds or wants CPU tokens (05_gateway.md "An install refuses while a land
-/// or a gate runs"); the decision is [`agent_cycle::restart_blockers`]. It never waits for them,
-/// and it runs before the install copies, moves or restarts anything, so a refused install
-/// leaves the installed cowshed and the running gateway as they were. `setup`'s storage repair,
-/// which runs before its install, is not undone.
+/// turn (05_gateway.md "An install refuses while a land runs"); the decision is
+/// [`agent_cycle::restart_blockers`]. It never waits for a land, and it runs before the install
+/// copies, moves or restarts anything, so a refused install leaves the installed cowshed and the
+/// running gateway as they were. `setup`'s storage repair, which runs before its install, is not
+/// undone.
 ///
-/// A restart closes every lease connection, and a gate's pool goes with it ("cpu-tokens parent
-/// pool refused: the gateway closed the lease connection" killed a land mid-gate); between a
-/// land's steps nothing of it shows in the ledger, and a restart there refused its next step's
-/// connection. Checked under the install slot, which every later land step waits for, so nothing
-/// this check did not see starts before the restart. The land turns are read from their tickets
-/// without taking a turn; a queue that cannot be read refuses too, since not knowing whether a
-/// land runs is no permission. A gateway that does not answer `cpu-budget`, a build from before
-/// it, names no gate job, and that is said.
-async fn refuse_restart_while_busy(
-    _slot: &InstallSlot,
-    home: &Path,
-    client: &GatewayControlClient,
-    stderr: &mut impl Write,
-) -> Result<()> {
+/// A restart between a land's steps refused its next step's connection. Checked under the install
+/// slot, which every later land step waits for, so nothing this check did not see starts before
+/// the restart. The land turns are read from their tickets without taking a turn; a queue that
+/// cannot be read refuses too, since not knowing whether a land runs is no permission.
+fn refuse_restart_while_busy(_slot: &InstallSlot, home: &Path) -> Result<()> {
     let root = turns::land_turn_root(&support_directory(home));
     let lands = turns::observe_all(&root, None).map_err(|error| {
         CowshedError::environment_missing(
@@ -1525,18 +1604,7 @@ async fn refuse_restart_while_busy(
             format!("make {} readable, then rerun", root.display()),
         )
     })?;
-    let gates = match client.gates_in_flight().await {
-        Ok(gates) => gates,
-        Err(error) => {
-            writeln!(
-                stderr,
-                "cowshed: the running gateway does not answer cpu-budget, so no gate job of it is known: {error}"
-            )
-            .map_err(output_error)?;
-            BTreeSet::new()
-        }
-    };
-    match agent_cycle::refusal(&agent_cycle::restart_blockers(&lands, &gates)) {
+    match agent_cycle::refusal(&agent_cycle::restart_blockers(&lands)) {
         Some(refusal) => Err(refusal),
         None => Ok(()),
     }
@@ -1920,8 +1988,8 @@ fn cli_status(
                 cli_sha256: cli_sha256.to_owned(),
             })
         }),
-        // The ledger is a second request, asked only of a daemon that answered this one.
-        cpu_budget: None,
+        // The host's scheduling is read beside the daemon, not asked of it.
+        scheduling: None,
         // The slot is observed beside the daemon, not asked of it.
         pending_install: false,
         // The land queues are read beside the daemon, not asked of it.
@@ -2038,7 +2106,7 @@ pub fn emit_gateway_status<W: Write, E: Write>(
             .guidance(&format!("gateway land turns unavailable: {error}"))
             .map_err(output_error)?;
     }
-    for line in status.cpu_budget.iter().flat_map(cpu_budget_lines) {
+    for line in status.scheduling.iter().flat_map(scheduling_lines) {
         output.guidance(&line).map_err(output_error)?;
     }
     Ok(())
@@ -2067,183 +2135,84 @@ fn land_turn_line(queue: &LandTurnQueue) -> String {
     format!("land turn {}: {holds}; waiting: {behind}", queue.repo)
 }
 
-/// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"), in the order the
-/// ledger serves it: tokens held of the total, with what background holds (background takes free
-/// tokens, and gate-class asks are served first); the leases held past the hold limit, oldest
-/// first, so the first lines answer who holds the host and since when (05_gateway.md "The hold
-/// limit"), each listed again under its own gate job or stake; then the request running on the
-/// probation token, if one is lent (05_gateway.md "A one-token job starts on probation"); the
-/// running gate jobs, the head — the oldest — first; the waiting gate-class requests in the order
-/// returned tokens go to them; then each checkout's background stake, served behind them. Each
-/// running gate job and background stake is followed by its leases, oldest grant first, so the
-/// reader sees who holds the tokens and since when rather than guessing from the checkout, and a
-/// background stake by its waiting requests. A queue entry is named by its process and wait age as
-/// a lease is by its grant's: one gate job's tasks are one entry each, and the job's number alone
-/// cannot tell them apart. Or why the daemon gave no ledger.
-fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
-    let ledger = match budget {
-        GatewayCpuBudget::Ledger(ledger) => ledger,
-        GatewayCpuBudget::Unanswered(reason) => {
-            return vec![format!(
-                "gateway cpu budget unavailable: the daemon did not answer cpu-budget: {reason}"
-            )];
-        }
+/// The host's scheduling in the operator's words (05_gateway.md "Status"): load, memory pressure
+/// and swap as the kernel reports them, the live jobs by class and state, then the released images
+/// waiting for cleanup. A reading that failed says why; it never prints as zero.
+fn scheduling_lines(scheduling: &HostScheduling) -> Vec<String> {
+    let readings = &scheduling.readings;
+    let mut lines = vec![
+        match &readings.load {
+            LoadReading::Read { load } => format!(
+                "gateway host load: {:.2} {:.2} {:.2} (1, 5 and 15 minutes)",
+                load.one.get(),
+                load.five.get(),
+                load.fifteen.get()
+            ),
+            LoadReading::Unread { error } => format!("gateway host load unread: {error}"),
+        },
+        match &readings.memory_pressure {
+            MemoryPressureReading::Read { pressure } => {
+                format!("gateway host memory pressure: {pressure}")
+            }
+            MemoryPressureReading::Unread { error } => {
+                format!("gateway host memory pressure unread: {error}")
+            }
+        },
+        match &readings.swap {
+            SwapReading::Read { swap } => format!(
+                "gateway host swap: {} MiB of {} MiB in use",
+                swap.used_bytes().get() >> 20,
+                swap.total_bytes().get() >> 20
+            ),
+            SwapReading::Unread { error } => format!("gateway host swap unread: {error}"),
+        },
+    ];
+    let jobs = &scheduling.jobs;
+    let counted = jobs
+        .counts
+        .iter()
+        .map(|count| {
+            format!(
+                "{} {} {}",
+                wire_word(count.class),
+                wire_word(count.state),
+                count.jobs
+            )
+        })
+        .collect::<Vec<_>>();
+    let counted = match (counted.is_empty(), jobs.unanswered.len()) {
+        (true, 0) => "none live".to_owned(),
+        (true, unread) => format!("none counted; {unread} supervisors unread"),
+        (false, 0) => counted.join(", "),
+        (false, unread) => format!("{}; {unread} supervisors unread", counted.join(", ")),
     };
-    let mut lines = vec![format!(
-        "gateway cpu budget: held {}/{} tokens, background holds {}",
-        ledger.held,
-        ledger.total,
-        ledger.background_held(),
-    )];
-    let limit_minutes = cowshed_gateway_types::HOLD_LIMIT.as_secs() / 60;
-    for (checkout, holder) in leases_past_the_hold_limit(ledger) {
-        lines.push(format!(
-            "gateway cpu hold past {limit_minutes}m: {checkout}: {}",
-            lease_words(holder)
-        ));
-    }
-    if let Some(probation) = &ledger.probation {
-        lines.push(format!(
-            "gateway cpu probation: {}: {}, lent {} ago: {}",
-            probation.checkout,
-            pid_words(probation.pid),
-            age_words(probation.lent_ms),
-            probation.command
-        ));
-    }
-    if ledger.gate_jobs.is_empty() {
-        lines.push("gateway gate head: no gate job is running".to_owned());
-    }
-    for (place, job) in ledger.gate_jobs.iter().enumerate() {
-        let title = if place == 0 {
-            "gateway gate head"
-        } else {
-            "gateway gate job behind the head"
-        };
-        lines.push(format!(
-            "{title}: repository={} {} gate job {}: held {}, running {}",
-            job.repository,
-            job.checkout,
-            job.job,
-            job.held,
-            job.holders.len()
-        ));
-        lines.extend(job.holders.iter().map(|holder| {
-            format!(
-                "gateway gate lease: repository={} {} gate job {}: {}",
-                job.repository,
-                job.checkout,
-                job.job,
-                lease_words(holder)
-            )
-        }));
-    }
-    if ledger.gate_queue.is_empty() {
-        lines.push("gateway gate queue: empty".to_owned());
-    } else {
-        lines.push(format!(
-            "gateway gate queue: {} waiting, in the order returned tokens go to them",
-            ledger.gate_queue.len()
-        ));
-        lines.extend(ledger.gate_queue.iter().enumerate().map(|(place, waiter)| {
-            format!(
-                "gateway gate queue {}: repository={} {} gate job {}: {}",
-                place + 1,
-                waiter.repository,
-                waiter.checkout,
-                waiter.job,
-                waiter_words(waiter.pid, waiter.want, waiter.waited_ms, &waiter.command)
-            )
-        }));
-    }
-    if ledger.background.is_empty() {
-        lines.push("gateway background: none".to_owned());
-    }
-    for stake in &ledger.background {
-        lines.push(format!(
-            "gateway background: {}: held {}, running {}, waiting {}",
-            stake.checkout,
-            stake.held,
-            stake.holders.len(),
-            stake.waiters.len()
-        ));
-        lines.extend(stake.holders.iter().map(|holder| {
-            format!(
-                "gateway background lease: {}: {}",
-                stake.checkout,
-                lease_words(holder)
-            )
-        }));
-        lines.extend(stake.waiters.iter().enumerate().map(|(place, waiter)| {
-            format!(
-                "gateway background queue {}: {}: {}",
-                place + 1,
-                stake.checkout,
-                waiter_words(waiter.pid, waiter.want, waiter.waited_ms, &waiter.command)
-            )
-        }));
-    }
+    lines.push(format!("gateway jobs: {counted}"));
+    lines.extend(jobs.unanswered.iter().map(|unanswered| {
+        format!(
+            "gateway jobs unread: {}: {}",
+            unanswered.socket.display(),
+            unanswered.error
+        )
+    }));
+    lines.push(format!(
+        "gateway image cleanup: {} released images waiting",
+        scheduling.image_cleanup.waiting
+    ));
+    lines.extend(
+        scheduling
+            .image_cleanup
+            .unread
+            .iter()
+            .map(|unread| format!("gateway image cleanup unread: {unread}")),
+    );
     lines
 }
 
-/// Every lease held past the hold limit (05_gateway.md "The hold limit"), a gate job's or a
-/// background stake's, with the checkout it holds for, the oldest grant first.
-fn leases_past_the_hold_limit(
-    ledger: &cowshed_gateway_types::CpuBudgetStatus,
-) -> Vec<(&str, &cowshed_gateway_types::CpuHolder)> {
-    let mut leases = Vec::new();
-    for job in &ledger.gate_jobs {
-        for holder in &job.holders {
-            if holder.past_hold_limit() {
-                leases.push((job.checkout.as_str(), holder));
-            }
-        }
-    }
-    for stake in &ledger.background {
-        for holder in &stake.holders {
-            if holder.past_hold_limit() {
-                leases.push((stake.checkout.as_str(), holder));
-            }
-        }
-    }
-    leases.sort_by_key(|(_, holder)| std::cmp::Reverse(holder.held_ms));
-    leases
-}
-
-/// `pid 71437, 15/18 tokens, granted 34m07s ago: cargo test …`: one lease as the operator reads
-/// it. The age is the grant's; `ps -p <pid>` gives the process's.
-fn lease_words(holder: &cowshed_gateway_types::CpuHolder) -> String {
-    let pid = pid_words(holder.pid);
-    let age = age_words(holder.held_ms);
-    format!(
-        "{pid}, {}/{} tokens, granted {age} ago: {}",
-        holder.tokens, holder.want, holder.command
-    )
-}
-
-/// `pid 71437, want 18, waiting 4m10s: cargo test …`: one waiting request as the operator reads
-/// it. It holds nothing yet; the age is since it asked.
-fn waiter_words(pid: Option<i32>, want: usize, waited_ms: u64, command: &str) -> String {
-    let pid = pid_words(pid);
-    let age = age_words(waited_ms);
-    format!("{pid}, want {want}, waiting {age}: {command}")
-}
-
-/// `pid 71437`, or `pid unknown` when the client's socket named none.
-fn pid_words(pid: Option<i32>) -> String {
-    pid.map_or_else(|| "pid unknown".to_owned(), |pid| format!("pid {pid}"))
-}
-
-/// An age to the second, as the operator reads it: `3s`, `34m07s`, `1h02m05s`.
-fn age_words(ms: u64) -> String {
-    let seconds = ms / 1000;
-    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
-    if hours > 0 {
-        format!("{hours}h{minutes:02}m{seconds:02}s")
-    } else if minutes > 0 {
-        format!("{minutes}m{seconds:02}s")
-    } else {
-        format!("{seconds}s")
+/// A class or a state as the wire spells it, so the status line and the JSON result name it alike.
+fn wire_word(value: impl serde::Serialize) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(word)) => word,
+        other => unreachable!("a unit variant serializes to its wire name, not {other:?}"),
     }
 }
 
@@ -2454,8 +2423,8 @@ where
 }
 
 /// Remove the `cargo` link an earlier install planted beside the stable name. cowshed no longer
-/// answers as `cargo` — a CPU grant reaches Cargo as the make jobserver configuration Cargo reads
-/// itself (05_gateway.md, "Host CPU budget") — so that link would make `cargo` on a `PATH` holding
+/// answers as `cargo` — a job's jobserver reaches Cargo as the make jobserver configuration Cargo
+/// reads itself (05_gateway.md, "Parallelism inside a job") — so that link would make `cargo` on a `PATH` holding
 /// the directory run the cowshed CLI. Anything else named `cargo` there is not cowshed's: it is
 /// refused by its path and what it is, and left as found.
 fn remove_planted_cargo_link<F, C>(
@@ -3095,11 +3064,8 @@ pub async fn refresh_gateway_binary(
         Some(client) => client.status().await.ok(),
         None => None,
     };
-    // Only a daemon that answers is one a restart would cut its gates off from.
-    let gates = client
-        .as_ref()
-        .filter(|_| daemon.is_some())
-        .map(|client| (slot, client));
+    // Only a daemon that answers is one a restart would cut a land off from.
+    let answering = daemon.is_some().then_some(slot);
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     // Held until the restarted gateway serves (`await_healthy` below).
     let _carrying = carry_listeners(&socket, downgrade);
@@ -3112,7 +3078,7 @@ pub async fn refresh_gateway_binary(
             basis,
         },
         daemon.as_ref(),
-        gates,
+        answering,
         &mut executor,
         invoking_bun,
         || gateway_host_identity(home),
@@ -3146,9 +3112,9 @@ struct IncomingBuild<'a> {
     basis: Result<()>,
 }
 
-/// [`refresh_gateway_binary`] with its inputs given. `gates` is the control client of a daemon
-/// that answered: every refresh that gets past the no-op return activates the agent, which
-/// restarts that daemon, so it is first refused while a land or a gate of that daemon runs
+/// [`refresh_gateway_binary`] with its inputs given. `answering` is the install slot when a
+/// daemon answered: every refresh that gets past the no-op return activates the agent, which
+/// restarts that daemon, so it is first refused while a land runs
 /// ([`refuse_restart_while_busy`]). `bun` is asked only when a gateway agent is installed: a host
 /// without one needs no interpreter.
 #[expect(
@@ -3160,7 +3126,7 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     home: &Path,
     incoming: IncomingBuild<'_>,
     daemon: Option<&DaemonStatus>,
-    gates: Option<(&InstallSlot, &GatewayControlClient)>,
+    answering: Option<&InstallSlot>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
     bun: impl FnOnce() -> Result<BunDirectory>,
     identity: impl FnOnce() -> Result<SigningIdentity>,
@@ -3213,8 +3179,8 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     let restarts = binary_is_stale || daemon_is_stale || !plan.is_noop();
     // Before anything is installed: a refusal leaves the installed cowshed and the gateway as
     // they were.
-    if restarts && let Some((slot, client)) = gates {
-        refuse_restart_while_busy(slot, home, client, &mut Blocking::new(io::stderr())).await?;
+    if restarts && let Some(slot) = answering {
+        refuse_restart_while_busy(slot, home)?;
     }
     // The packaged Nx cache server is part of this build's install. A current agent is still
     // repaired, so this runs before the no-op return and before any activation: a missing
@@ -3623,9 +3589,8 @@ mod tests {
 
     type RecordingExecutor = LaunchdExecutor<NativeFilesystem, RecordingGatewayLaunchctl>;
 
-    /// A gateway that is not running answers both status reads `Absent`: its socket is missing,
-    /// which the bounded connect reports as `WaitError::Absent`, so a seed compaction's copy reads
-    /// no gate job and goes on (16_build_volumes.md, "Seed compaction").
+    /// A gateway that is not running answers a status read `Absent`: its socket is missing,
+    /// which the bounded connect reports as `WaitError::Absent`.
     #[tokio::test]
     async fn a_missing_gateway_socket_reads_as_no_gateway() {
         let socket = PathBuf::from(format!(
@@ -3633,10 +3598,6 @@ mod tests {
             std::process::id()
         ));
         let control = ControlSocket::at(socket).unwrap();
-        assert_eq!(
-            control.gates_in_flight().await,
-            Err(GatewayStatusError::Absent)
-        );
         assert!(matches!(
             control.status().await,
             Err(GatewayStatusError::Absent)
@@ -5137,264 +5098,44 @@ mod tests {
         assert_eq!((silent.drain_cause, silent.stale_daemon), (None, None));
     }
 
-    /// A daemon from before `cpu-budget` refuses it as an unknown operation, exactly as a live
-    /// daemon refuses any operation it does not know: `status` reports that refusal as the
-    /// ledger it could not read, never as an idle host with an empty one.
-    #[tokio::test]
-    async fn a_daemon_that_refuses_cpu_budget_is_unanswered_not_an_empty_ledger() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let dir = std::env::temp_dir().join(format!("cscpuview-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch");
-        let socket = dir.join("gateway.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
-        let older_daemon = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut request = String::new();
-            stream.read_to_string(&mut request).await.expect("request");
-            stream
-                .write_all(b"{\"ok\":false,\"code\":\"invalid-request\",\"error\":\"gateway control encoding failed: unknown gateway control operation\"}\n")
-                .await
-                .expect("refuse");
-            request
-        });
-        let client = GatewayControlClient::new(socket).expect("absolute socket");
-        let budget = read_cpu_budget(&client).await;
+    /// A job is counted while it is live, in one row per class and state; an ended job is in no
+    /// row, however many there are.
+    #[test]
+    fn only_live_jobs_are_counted_one_row_per_class_and_state() {
+        let counts = count_jobs([
+            (ExecClass::Background, JobState::Running),
+            (ExecClass::Gate, JobState::Running),
+            (ExecClass::Background, JobState::Exited),
+            (ExecClass::Background, JobState::Running),
+            (ExecClass::Background, JobState::Queued),
+            (ExecClass::Gate, JobState::Failed),
+            (ExecClass::Resident, JobState::Draining),
+        ]);
         assert_eq!(
-            older_daemon.await.expect("daemon"),
-            "{\"op\":\"cpu-budget\"}\n"
+            counts,
+            [
+                JobCount {
+                    class: ExecClass::Background,
+                    state: JobState::Running,
+                    jobs: 2
+                },
+                JobCount {
+                    class: ExecClass::Gate,
+                    state: JobState::Running,
+                    jobs: 1
+                },
+                JobCount {
+                    class: ExecClass::Background,
+                    state: JobState::Queued,
+                    jobs: 1
+                },
+                JobCount {
+                    class: ExecClass::Resident,
+                    state: JobState::Draining,
+                    jobs: 1
+                },
+            ]
         );
-        assert_eq!(
-            budget,
-            GatewayCpuBudget::Unanswered(
-                "gateway control rejected operation (InvalidRequest): gateway control encoding failed: unknown gateway control operation"
-                    .into()
-            )
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The leases `gateway status` names right after the CPU ledger's count: those held past the
-    /// hold limit (05_gateway.md "The hold limit").
-    mod hold_limit {
-        use cowshed_gateway_types::{
-            CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuHolder,
-            CpuProbation,
-        };
-
-        use super::*;
-
-        /// The `heldMs` of a lease whose line reads `granted {minutes}m{seconds:02}s ago`.
-        fn granted_ago(minutes: u64, seconds: u64) -> u64 {
-            (minutes * 60 + seconds) * 1_000
-        }
-
-        /// A lease held by `pid` for `command`, granted `held_ms` ago.
-        fn lease(pid: i32, command: &str, tokens: usize, want: usize, held_ms: u64) -> CpuHolder {
-            CpuHolder {
-                pid: Some(pid),
-                command: command.into(),
-                tokens,
-                want,
-                held_ms,
-            }
-        }
-
-        /// An 18-token host held whole by a gate job's lease of two minutes and a background
-        /// `cargo test` lease of 12 tokens granted `background_held_ms` ago.
-        fn ledger_with_background_lease(background_held_ms: u64) -> GatewayCpuBudget {
-            let gate_lease = lease(31102, "nx run-many -t test", 6, 18, granted_ago(2, 0));
-            let background_lease = lease(
-                29272,
-                "cargo --frozen test -p app_runtime",
-                12,
-                18,
-                background_held_ms,
-            );
-            GatewayCpuBudget::Ledger(CpuBudgetStatus {
-                total: 18,
-                held: 18,
-                checkouts: vec![
-                    CpuCheckoutStatus {
-                        checkout: "/mnt/app/land".into(),
-                        held: 6,
-                        running: 1,
-                        waiting: 0,
-                    },
-                    CpuCheckoutStatus {
-                        checkout: "/mnt/app/account-placement".into(),
-                        held: 12,
-                        running: 1,
-                        waiting: 0,
-                    },
-                ],
-                gate_jobs: vec![CpuGateJob {
-                    repository: "owner/repo".into(),
-                    checkout: "/mnt/app/land".into(),
-                    job: 7,
-                    held: 6,
-                    holders: vec![gate_lease],
-                }],
-                gate_queue: Vec::new(),
-                background: vec![CpuBackgroundStake {
-                    checkout: "/mnt/app/account-placement".into(),
-                    held: 12,
-                    holders: vec![background_lease],
-                    waiters: Vec::new(),
-                }],
-                probation: None,
-            })
-        }
-
-        /// The lines that name a lease past the limit.
-        fn hold_lines(lines: &[String]) -> Vec<&str> {
-            lines
-                .iter()
-                .map(String::as_str)
-                .filter(|line| line.starts_with("gateway cpu hold past"))
-                .collect()
-        }
-
-        /// A lease held past the hold limit is named right after the count, so the first lines of
-        /// `gateway status` answer who holds the host and since when. Measured 2026-10-19: a
-        /// runaway `cargo test` held 12 of 18 tokens for 48 minutes while the status gave only the
-        /// count. The gate job's lease of two minutes is within the limit and is not named.
-        #[test]
-        fn a_lease_held_past_the_limit_is_named_right_after_the_count() {
-            let ledger = ledger_with_background_lease(granted_ago(48, 18));
-            let lines = cpu_budget_lines(&ledger);
-
-            assert_eq!(
-                lines[0],
-                "gateway cpu budget: held 18/18 tokens, background holds 12"
-            );
-            assert_eq!(
-                lines[1],
-                "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo --frozen test -p app_runtime"
-            );
-            assert_eq!(hold_lines(&lines).len(), 1, "{lines:#?}");
-        }
-
-        /// The count reports background holding the whole host as held 18/18, and names no cap
-        /// (the owner's ruling, 2026-10-22).
-        #[test]
-        fn the_count_reports_background_holding_the_whole_host() {
-            let GatewayCpuBudget::Ledger(mut ledger) =
-                ledger_with_background_lease(granted_ago(2, 0))
-            else {
-                unreachable!("the fixture is a ledger")
-            };
-            ledger.gate_jobs.clear();
-            ledger.background[0].held = 18;
-            let lines = cpu_budget_lines(&GatewayCpuBudget::Ledger(ledger));
-
-            assert_eq!(
-                lines[0],
-                "gateway cpu budget: held 18/18 tokens, background holds 18"
-            );
-        }
-
-        /// A lease a second inside the limit is not named: with every lease within it the count is
-        /// followed by the gate head, as it was before the limit existed.
-        #[test]
-        fn a_ledger_with_every_lease_within_the_limit_names_none() {
-            let ledger = ledger_with_background_lease(granted_ago(29, 59));
-            let lines = cpu_budget_lines(&ledger);
-
-            assert!(hold_lines(&lines).is_empty(), "{lines:#?}");
-            assert_eq!(
-                lines[1],
-                "gateway gate head: repository=owner/repo /mnt/app/land gate job 7: held 6, running 1"
-            );
-        }
-
-        /// A gate job's lease and a background stake's, both past the limit, are named together,
-        /// the oldest first and each under the checkout it holds for. The background leases are
-        /// older and younger than the gate's, so neither source's own order is the answer; a lease
-        /// within the limit stays out.
-        #[test]
-        fn leases_past_the_limit_are_named_oldest_first_whether_gate_or_background() {
-            let ledger = GatewayCpuBudget::Ledger(CpuBudgetStatus {
-                total: 18,
-                held: 18,
-                checkouts: vec![
-                    CpuCheckoutStatus {
-                        checkout: "/mnt/app/land".into(),
-                        held: 5,
-                        running: 2,
-                        waiting: 0,
-                    },
-                    CpuCheckoutStatus {
-                        checkout: "/mnt/app/account-placement".into(),
-                        held: 13,
-                        running: 2,
-                        waiting: 0,
-                    },
-                ],
-                gate_jobs: vec![CpuGateJob {
-                    repository: "owner/repo".into(),
-                    checkout: "/mnt/app/land".into(),
-                    job: 4,
-                    held: 5,
-                    holders: vec![
-                        lease(31102, "nx run-many", 4, 18, granted_ago(41, 0)),
-                        lease(31105, "cargo check", 1, 1, granted_ago(2, 0)),
-                    ],
-                }],
-                gate_queue: Vec::new(),
-                background: vec![CpuBackgroundStake {
-                    checkout: "/mnt/app/account-placement".into(),
-                    held: 13,
-                    holders: vec![
-                        lease(29272, "cargo test", 12, 18, granted_ago(48, 18)),
-                        lease(29301, "bun test", 1, 1, granted_ago(31, 5)),
-                    ],
-                    waiters: Vec::new(),
-                }],
-                probation: None,
-            });
-            let lines = cpu_budget_lines(&ledger);
-
-            assert_eq!(
-                lines[..4],
-                [
-                    "gateway cpu budget: held 18/18 tokens, background holds 13",
-                    "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo test",
-                    "gateway cpu hold past 30m: /mnt/app/land: pid 31102, 4/18 tokens, granted 41m00s ago: nx run-many",
-                    "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29301, 1/1 tokens, granted 31m05s ago: bun test",
-                ]
-            );
-            assert_eq!(hold_lines(&lines).len(), 3, "{lines:#?}");
-        }
-
-        /// The request running on the probation token is named after the holds, with its pid and
-        /// how long ago the token was lent to it (05_gateway.md "A one-token job starts on
-        /// probation").
-        #[test]
-        fn the_probation_token_names_the_request_running_on_it() {
-            let GatewayCpuBudget::Ledger(mut ledger) =
-                ledger_with_background_lease(granted_ago(2, 0))
-            else {
-                unreachable!("the fixture is a ledger")
-            };
-            ledger.probation = Some(CpuProbation {
-                checkout: "/mnt/app/shed".into(),
-                pid: Some(4242),
-                command: "git ls-files".into(),
-                lent_ms: 1_500,
-            });
-            let lines = cpu_budget_lines(&GatewayCpuBudget::Ledger(ledger));
-
-            assert_eq!(
-                lines[1],
-                "gateway cpu probation: /mnt/app/shed: pid 4242, lent 1s ago: git ls-files"
-            );
-            assert_eq!(
-                lines[2],
-                "gateway gate head: repository=owner/repo /mnt/app/land gate job 7: held 6, running 1"
-            );
-        }
     }
 
     /// The daemon's control socket and the startup pass it reports — mounts still healing,
@@ -5402,7 +5143,6 @@ mod tests {
     /// where the test wants it.
     #[cfg(target_os = "macos")]
     mod startup {
-        use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
         use std::num::NonZeroUsize;
 
         use cowshed_core::metadata::WorkspaceName;
@@ -5538,7 +5278,7 @@ mod tests {
         /// as `run_daemon` composes them, under `root` with the socket of the supervisor of each
         /// of `workspaces` under `run`. The root goes with the daemon on every exit path.
         struct Daemon {
-            root: crate::temp_root::TempRoot,
+            _root: crate::temp_root::TempRoot,
             socket: PathBuf,
             gateway: Gateway,
             recovery: Recovery,
@@ -5588,7 +5328,7 @@ mod tests {
             .await
             .expect("start the gateway");
             Daemon {
-                root,
+                _root: root,
                 socket,
                 gateway,
                 recovery,
@@ -5711,78 +5451,16 @@ mod tests {
             daemon.gateway.drain().await.expect("drain the gateway");
         }
 
-        /// A land's gate job holding its orchestrator's token on `socket`, as the supervisor's
-        /// gate admission holds it: granted, and held until the returned stream is dropped.
-        async fn hold_gate(socket: &Path, checkout: &str) -> tokio::net::UnixStream {
-            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-
-            let mut stream = tokio::net::UnixStream::connect_bounded(socket)
-                .await
-                .expect("connect");
-            let repo = format!(
-                "owner/{}",
-                Path::new(checkout).file_name().unwrap().to_str().unwrap()
-            );
-            let request = serde_json::json!({ "op": "jobserver", "want": 1,
-                "checkout": checkout, "command": "land gate", "class": "gate", "pool": true,
-                "job": { "repoId": repo, "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
-                    "jobId": 1 } });
-            stream
-                .write_all(format!("{request}\n").as_bytes())
-                .await
-                .expect("ask for the gate's token");
-            {
-                let mut lines = tokio::io::BufReader::new(&mut stream).lines();
-                for lease in ["queued", "granted"] {
-                    let line = lines.next_line().await.expect("read").expect("an answer");
-                    assert!(line.contains(&format!("\"{lease}\"")), "{line}");
-                }
-            }
-            stream
-        }
-
-        /// The measured failures: an install restarted the gateway mid-gate, and every task that
-        /// land admitted afterwards was refused; an install restarted it between a land's steps,
-        /// and the next step's connection was refused. An install now refuses at once, before it
-        /// changes anything, while a gate job holds or wants a token or a land holds its turn,
-        /// naming each; with neither it goes on, silently. It never waits for them.
+        /// The measured failure: an install restarted the gateway between a land's steps, and the
+        /// next step's connection was refused. An install now refuses at once, before it changes
+        /// anything, while a land holds its turn, naming it; with none it goes on. It never waits.
         #[tokio::test]
-        async fn an_install_refuses_while_a_land_turn_or_a_gate_job_runs() {
-            let heal = Arc::new(StartupHealState::mounting(0));
-            heal.restored();
-            let daemon = daemon(gateway_root("csgatewait"), &[], heal).await;
-            let client = GatewayControlClient::new(daemon.socket.clone()).expect("client");
-            let home = daemon.root.to_path_buf();
+        async fn an_install_refuses_while_a_land_turn_runs() {
+            let home = super::scratch_root("install-refuses-land");
             let support = support_directory(&home);
             fs::create_dir_all(&support).expect("support directory");
             let slot = InstallSlot::take(&support).await.expect("the slot");
-            let mut said = Vec::new();
-            refuse_restart_while_busy(&slot, &home, &client, &mut said)
-                .await
-                .expect("nothing runs");
-            assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
-
-            let gate = hold_gate(&daemon.socket, "/w/gate-land").await;
-            let refused = refuse_restart_while_busy(&slot, &home, &client, &mut said)
-                .await
-                .expect_err("a gate job holds a token");
-            assert_eq!(refused.code, ErrorCode::Conflict);
-            assert!(
-                refused.message.contains("gate job ")
-                    && refused.message.contains(" at /w/gate-land"),
-                "{}",
-                refused.message
-            );
-            drop(gate);
-            // The gateway returns the tokens once it reads the lease connection's close.
-            while !client
-                .gates_in_flight()
-                .await
-                .expect("the gates")
-                .is_empty()
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            refuse_restart_while_busy(&slot, &home).expect("nothing runs");
 
             let queue = turns::land_turn_root(&support).join("acme-widget");
             let turn = tokio::task::spawn_blocking(move || {
@@ -5798,9 +5476,8 @@ mod tests {
             .await
             .expect("the turn task")
             .expect("the turn");
-            let refused = refuse_restart_while_busy(&slot, &home, &client, &mut said)
-                .await
-                .expect_err("a land holds its turn");
+            let refused =
+                refuse_restart_while_busy(&slot, &home).expect_err("a land holds its turn");
             assert_eq!(refused.code, ErrorCode::Conflict);
             assert!(
                 refused
@@ -5810,12 +5487,9 @@ mod tests {
                 refused.message
             );
             drop(turn);
-            refuse_restart_while_busy(&slot, &home, &client, &mut said)
-                .await
-                .expect("nothing runs any more");
-            assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
-
-            daemon.gateway.drain().await.expect("drain the gateway");
+            refuse_restart_while_busy(&slot, &home).expect("nothing runs any more");
+            drop(slot);
+            fs::remove_dir_all(home).ok();
         }
 
         /// A gateway that takes the connection and never answers fails each status probe on its

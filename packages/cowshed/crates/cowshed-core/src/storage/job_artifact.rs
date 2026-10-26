@@ -168,16 +168,16 @@ const SAMPLE_COLUMNS: [&str; 5] = [
 /// The first of [`SAMPLE_COLUMNS`].
 const SAMPLE_COLUMN: usize = ADMISSION_COLUMN + ADMISSION_COLUMNS;
 /// The job's host CPU admission and its owned child's placement, which layout 10 appended after
-/// [`SAMPLE_COLUMNS`] (05_gateway.md "Host CPU budget"): the class and the tokens it wants,
-/// present in every job record; `cpu_wait_ms`, retired; then the tokens its grant held and the
-/// nice its command was observed at, present only in the terminal record of a job that was granted
-/// and whose command was observed; then the scope it ran in, present in every job record. Nothing
-/// here is inferred for a job that never got that far.
+/// [`SAMPLE_COLUMNS`] (05_gateway.md "Classes"): the class and the count its jobserver holds, in
+/// every job record; `cpu_wait_ms`, retired; `cpu_tokens`, retired; then the nice its command was
+/// observed at, present only in the terminal record of a job whose command was observed; then the
+/// scope it ran in, present in every job record. Nothing here is inferred for a job that never got
+/// that far.
 ///
-/// `cpu_wait_ms` held a gate's admission bound until gate admission lost its bound. Layouts grow
-/// only by trailing columns, so the column stays: this build writes it null, and a record an
-/// earlier build wrote may still name a positive bound, which nothing enforces: a record is only
-/// checked to name no zero bound, and the bound is never read into it.
+/// `cpu_wait_ms` and `cpu_tokens` are retired: this build writes them null. Layouts grow only by
+/// trailing columns, so both columns keep their place. A record an earlier layout wrote may still
+/// name a positive value; a present value is checked only for a zero one, and neither column is read
+/// into the record.
 const CPU_COLUMNS: [&str; 6] = [
     "cpu_class",
     "cpu_want",
@@ -460,8 +460,6 @@ pub struct JobArtifactRecord {
     pub admission: Option<JobAdmission>,
     /// The host CPU admission the job asked for; every record of the job carries it.
     pub scheduling: JobScheduling,
-    /// The tokens the gateway granted the job; only the terminal record of a granted job.
-    pub cpu_tokens: Option<NonZeroUsize>,
     /// The nice value the job's owned command was observed at right after its spawn set it; only
     /// the terminal record of a job whose command was observed. Never inferred.
     pub nice: Option<i32>,
@@ -495,10 +493,10 @@ pub struct JobAdmission {
     pub stderr_copy: Option<OutputPublication>,
 }
 
-/// The host CPU admission a job asked for (05_gateway.md "Host CPU budget"): the scope it runs
-/// in, its class and the tokens it wants. Either scope pairs with every class, and a resident
-/// asks for no token, so its want is the default one it cannot raise; [`Self::requested`] and
-/// [`Self::new`] are the only ways to one.
+/// The host CPU admission a job asks for (05_gateway.md "Classes"): the scope it runs in, its
+/// class, and the count its jobserver holds (05_gateway.md "Parallelism inside a job"). Either
+/// scope pairs with every class. [`Self::requested`] derives it from a request, and [`Self::new`]
+/// reads it back from a record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobScheduling {
     scope: ExecScope,
@@ -507,41 +505,21 @@ pub struct JobScheduling {
 }
 
 impl JobScheduling {
-    /// The scheduling a request asks for. A want it names is taken as named; one it leaves
-    /// unnamed is its class's own (05_gateway.md "The task server owns the live grant and
-    /// nice"): background and interactive work ask for the background share `share`, the
-    /// ⌊N/2⌋ of the host's N tokens, as the CPU
-    /// admission that will ask for it reports it; a gate asks for the one token its
-    /// orchestrator uses, since its pool asks the host for each of its tasks; a resident asks for
-    /// none. `None` for a resident that names a want.
+    /// The scheduling a request asks for: a want it names is held up to the host's `cores`, and
+    /// one it leaves unnamed is `cores`, whatever its class (05_gateway.md "Parallelism inside a
+    /// job"). Every job's jobserver holds `min(want, cores)` tokens.
     pub fn requested(
         scope: ExecScope,
         class: ExecClass,
         want: Option<NonZeroUsize>,
-        share: NonZeroUsize,
-    ) -> Option<Self> {
-        let want = match (class, want) {
-            (ExecClass::Resident | ExecClass::InteractiveResident, Some(_)) => return None,
-            (ExecClass::Background | ExecClass::Interactive | ExecClass::Gate, Some(want)) => want,
-            (ExecClass::Background | ExecClass::Interactive, None) => share,
-            (ExecClass::Gate | ExecClass::Resident | ExecClass::InteractiveResident, None) => {
-                NonZeroUsize::MIN
-            }
-        };
-        Self::new(scope, class, want)
+        cores: NonZeroUsize,
+    ) -> Self {
+        Self::new(scope, class, want.map_or(cores, |want| want.min(cores)))
     }
 
-    /// A job record's scheduling: `None` for a resident whose want is not the one token it
-    /// holds by default.
-    pub fn new(scope: ExecScope, class: ExecClass, want: NonZeroUsize) -> Option<Self> {
-        match class {
-            ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
-                Some(Self { scope, class, want })
-            }
-            ExecClass::Resident | ExecClass::InteractiveResident => {
-                (want == NonZeroUsize::MIN).then_some(Self { scope, class, want })
-            }
-        }
+    /// A job record's scheduling, its want as recorded.
+    pub fn new(scope: ExecScope, class: ExecClass, want: NonZeroUsize) -> Self {
+        Self { scope, class, want }
     }
 
     pub fn scope(self) -> ExecScope {
@@ -557,7 +535,7 @@ impl JobScheduling {
     }
 }
 
-/// A background job in its workspace that wanted one token.
+/// A background job in its workspace whose jobserver holds one token.
 impl Default for JobScheduling {
     fn default() -> Self {
         Self {
@@ -831,10 +809,10 @@ impl JobArtifactRecord {
                  resource sample",
             ));
         }
-        if !self.state.is_terminal() && (self.cpu_tokens.is_some() || self.nice.is_some()) {
+        if !self.state.is_terminal() && self.nice.is_some() {
             return Err(integrity(
                 0,
-                "only a terminal job record names its granted CPU tokens or its observed nice",
+                "only a terminal job record names its observed nice",
             ));
         }
         if !self.state.is_terminal()
@@ -856,21 +834,6 @@ impl JobArtifactRecord {
             return Err(integrity(
                 0,
                 "an outlived process names its image or none: an empty one stands for neither",
-            ));
-        }
-        // A resident is granted no tokens (05_gateway.md, "A resident holds no token"), so its
-        // observed nice stands alone; every other class's nice is its grant's.
-        let resident = self.scheduling.class().is_resident();
-        if resident && self.cpu_tokens.is_some() {
-            return Err(integrity(
-                0,
-                "a resident job record names no CPU tokens: a resident is granted none",
-            ));
-        }
-        if !resident && self.nice.is_some() && self.cpu_tokens.is_none() {
-            return Err(integrity(
-                0,
-                "a job record names an observed nice only for a command its CPU grant admitted",
             ));
         }
         if let Some(resources) = &self.resources
@@ -923,8 +886,6 @@ pub struct JobEnding {
     pub resources: Option<JobResourceSample>,
     /// Why a failed job failed when no status of its own says so.
     pub failure: Option<crate::api::dto::JobFailure>,
-    /// The tokens the job's CPU grant held; `None` when it was never granted.
-    pub cpu_tokens: Option<NonZeroUsize>,
     /// The nice its command was observed at; `None` when no command was observed.
     pub nice: Option<i32>,
     /// What held the job's process membership while its retirement proved it empty; `None` when
@@ -946,7 +907,6 @@ impl From<JobState> for JobEnding {
             duration_ms: None,
             resources: None,
             failure: None,
-            cpu_tokens: None,
             nice: None,
             containment: None,
             outlived: Vec::new(),
@@ -1552,7 +1512,7 @@ impl ArtifactStore {
             workspace_incarnation: self.workspace_incarnation.clone(),
             job_id,
             sequence: 0,
-            // Admitted, and waiting for its CPU grant: nothing has spawned yet.
+            // Admitted, and no process has spawned for it yet.
             state: JobState::Queued,
             grant_revision,
             command: command.clone(),
@@ -1565,7 +1525,6 @@ impl ArtifactStore {
             resources: None,
             admission: admission.clone(),
             scheduling,
-            cpu_tokens: None,
             nice: None,
             containment: None,
             outlived: Vec::new(),
@@ -2130,7 +2089,6 @@ impl ArtifactStore {
             duration_ms,
             resources,
             failure,
-            cpu_tokens,
             nice,
             containment,
             outlived,
@@ -2185,7 +2143,6 @@ impl ArtifactStore {
                 resources,
                 admission: live.admission.clone(),
                 scheduling: live.scheduling,
-                cpu_tokens,
                 nice,
                 containment,
                 outlived,
@@ -4387,6 +4344,7 @@ fn failure_name(failure: crate::api::dto::JobFailure) -> &'static str {
         crate::api::dto::JobFailure::SupervisorLost => "supervisorLost",
         crate::api::dto::JobFailure::CpuAdmission => "cpuAdmission",
         crate::api::dto::JobFailure::Priority => "priority",
+        crate::api::dto::JobFailure::Memory => "memory",
         crate::api::dto::JobFailure::Unlaunched => "unlaunched",
     }
 }
@@ -4397,6 +4355,7 @@ fn parse_failure(name: &str) -> Result<crate::api::dto::JobFailure, ArtifactErro
         "supervisorLost" => Ok(crate::api::dto::JobFailure::SupervisorLost),
         "cpuAdmission" => Ok(crate::api::dto::JobFailure::CpuAdmission),
         "priority" => Ok(crate::api::dto::JobFailure::Priority),
+        "memory" => Ok(crate::api::dto::JobFailure::Memory),
         "unlaunched" => Ok(crate::api::dto::JobFailure::Unlaunched),
         other => Err(ArtifactError::Arrow(format!(
             "unknown job failure {other:?}"
@@ -4695,9 +4654,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
             scheduling.want(),
         )?)])),
         Arc::new(UInt32Array::from(vec![None::<u32>])),
-        Arc::new(UInt64Array::from(vec![
-            record.cpu_tokens.map(token_column).transpose()?,
-        ])),
+        Arc::new(UInt64Array::from(vec![None::<u64>])),
         Arc::new(Int32Array::from(vec![record.nice])),
         Arc::new(StringArray::from(vec![Some(scope_name(
             scheduling.scope(),
@@ -4824,7 +4781,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
     let exit = decode_exit(batch, EXIT_COLUMN)?;
     let resources = decode_resources(batch, job_id)?;
     let admission = decode_admission(batch, ADMISSION_COLUMN)?;
-    let (scheduling, cpu_tokens, nice) = decode_cpu(batch, CPU_COLUMN)?;
+    let (scheduling, nice) = decode_cpu(batch, CPU_COLUMN)?;
     let (containment, outlived, outlived_incomplete) = decode_retirement(batch, RETIREMENT_COLUMN)?;
     Ok(JobArtifactRecord {
         repo_id,
@@ -4843,7 +4800,6 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         resources,
         admission,
         scheduling,
-        cpu_tokens,
         nice,
         containment,
         outlived,
@@ -4906,17 +4862,18 @@ fn parse_class(name: &str) -> Result<ExecClass, ArtifactError> {
 }
 
 /// The [`CPU_COLUMNS`] of a current-layout job batch, the first at `first`: the scheduling every
-/// job record names, then the granted tokens and observed nice only a terminal record may name.
+/// job record names, then the observed nice only a terminal record may name. The retired columns
+/// are read into nothing; a present value is checked for a zero one.
 fn decode_cpu(
     batch: &RecordBatch,
     first: usize,
-) -> Result<(JobScheduling, Option<NonZeroUsize>, Option<i32>), ArtifactError> {
+) -> Result<(JobScheduling, Option<i32>), ArtifactError> {
     if batch.column(first).is_null(0)
         || batch.column(first + 1).is_null(0)
         || batch.column(first + 5).is_null(0)
     {
         return Err(ArtifactError::Arrow(
-            "a job record names its scope, its CPU class and the tokens it wants".into(),
+            "a job record names its scope, its CPU class and its want".into(),
         ));
     }
     let scope = parse_scope(string(batch, first + 5)?.value(0))?;
@@ -4925,22 +4882,13 @@ fn decode_cpu(
     if !batch.column(first + 2).is_null(0) && uint32(batch, first + 2)?.value(0) == 0 {
         return Err(ArtifactError::Arrow("cpu_wait_ms is zero".into()));
     }
-    let scheduling = JobScheduling::new(scope, class, want)
-        .ok_or_else(|| ArtifactError::Arrow("a resident wants only one token".into()))?;
-    let cpu_tokens = (!batch.column(first + 3).is_null(0))
-        .then(|| {
-            uint64(batch, first + 3).and_then(|column| decode_tokens(column.value(0), "cpu_tokens"))
-        })
-        .transpose()?;
-    if class.is_resident() && cpu_tokens.is_some() {
-        return Err(ArtifactError::Arrow(
-            "a resident job record names cpu_tokens, and a resident is granted none".into(),
-        ));
+    if !batch.column(first + 3).is_null(0) {
+        decode_tokens(uint64(batch, first + 3)?.value(0), "cpu_tokens")?;
     }
     let nice = (!batch.column(first + 4).is_null(0))
         .then(|| int32(batch, first + 4).map(|column| column.value(0)))
         .transpose()?;
-    Ok((scheduling, cpu_tokens, nice))
+    Ok((JobScheduling::new(scope, class, want), nice))
 }
 
 /// The current layout's receipt is wholly absent or wholly present, including its completeness
@@ -7652,7 +7600,6 @@ mod tests {
             resources: None,
             admission: None,
             scheduling: JobScheduling::default(),
-            cpu_tokens: None,
             nice: None,
             containment: None,
             outlived: Vec::new(),
@@ -8069,16 +8016,14 @@ mod tests {
             ExecClass::Gate,
             NonZeroUsize::new(want).unwrap(),
         )
-        .unwrap()
     }
 
-    /// Layout 10 appends the job's CPU class, demand, retired gate bound, granted tokens and
+    /// Layout 10 appends the job's CPU class, demand, retired gate bound, retired token count and
     /// observed nice after layout 9's sample columns, and layout 9 stays the exact prefix.
     #[test]
     fn layout_ten_appends_the_cpu_columns_after_the_complete_layout_nine_prefix() {
         let record = JobArtifactRecord {
             scheduling: gate(6),
-            cpu_tokens: NonZeroUsize::new(4),
             nice: Some(0),
             ..valid_job_record(9)
         };
@@ -8101,11 +8046,10 @@ mod tests {
         assert_eq!(
             round_trip(&record),
             record,
-            "the class, demand, grant and observed nice survive"
+            "the class, demand and observed nice survive"
         );
         let background = JobArtifactRecord {
             scheduling: JobScheduling::default(),
-            cpu_tokens: NonZeroUsize::new(1),
             nice: Some(10),
             ..valid_job_record(9)
         };
@@ -8130,7 +8074,6 @@ mod tests {
             resources: Some(sample(9, 1_234_567, 4242)),
             admission: Some(keyed("op-layout-eleven", AdmittedStdin::Empty)),
             scheduling: gate(6),
-            cpu_tokens: NonZeroUsize::new(4),
             nice: Some(0),
             ..valid_job_record(9)
         };
@@ -8179,8 +8122,7 @@ mod tests {
                 ExecScope::Workspace,
                 ExecClass::Background,
                 NonZeroUsize::new(2).unwrap(),
-            )
-            .unwrap(),
+            ),
             ..valid_job_record(9)
         };
         let batch = job_record_to_batch(&named).unwrap();
@@ -8199,8 +8141,7 @@ mod tests {
                 ExecScope::Workspace,
                 ExecClass::Background,
                 NonZeroUsize::new(9).unwrap(),
-            )
-            .unwrap(),
+            ),
             ..valid_job_record(9)
         };
         let unnamed_batch = job_record_to_batch(&unnamed).unwrap();
@@ -8208,7 +8149,7 @@ mod tests {
         assert_eq!(
             round_trip(&unnamed),
             unnamed,
-            "an unnamed want stays unnamed beside the share it resolved"
+            "an unnamed want stays unnamed beside the count it resolved"
         );
         let zero: ArrayRef = Arc::new(UInt64Array::from(vec![Some(0)]));
         assert_damage(
@@ -8608,7 +8549,6 @@ mod tests {
                     duration_ms: Some(5),
                     resources: None,
                     failure: None,
-                    cpu_tokens: None,
                     nice: None,
                     containment: Some(containment.clone()),
                     outlived: outlived.clone(),
@@ -8909,7 +8849,7 @@ mod tests {
         drop(reopened);
         fs::remove_dir_all(&root).unwrap();
     }
-    /// A job that never reached a grant or an observed command names neither: nothing is
+    /// A job that never spawned, or whose command was never observed, names no nice: nothing is
     /// inferred, and a record that claims a placement it cannot have is damage.
     #[test]
     fn cpu_placement_is_named_only_where_it_was_observed() {
@@ -8918,11 +8858,10 @@ mod tests {
             ..valid_job_record(9)
         };
         let read = round_trip(&never_spawned);
-        assert_eq!((read.cpu_tokens, read.nice), (None, None));
+        assert_eq!(read.nice, None);
 
         let running = JobArtifactRecord {
             state: JobState::Running,
-            cpu_tokens: NonZeroUsize::new(2),
             nice: Some(10),
             ..valid_job_record(9)
         };
@@ -8930,22 +8869,8 @@ mod tests {
             running.validate(),
             Err(ArtifactError::Integrity { .. })
         ));
-        // A nice with no tokens is explained only by a resident, which is granted none: every
-        // class that takes a grant still refuses it, so admitting the resident widens nothing.
-        for (class, scheduling) in [("background", JobScheduling::default()), ("gate", gate(2))] {
-            let unexplained = JobArtifactRecord {
-                scheduling,
-                nice: Some(10),
-                ..valid_job_record(9)
-            };
-            assert!(
-                matches!(unexplained.validate(), Err(ArtifactError::Integrity { .. })),
-                "a {class} record that names a nice names its grant"
-            );
-        }
         let resident =
-            JobScheduling::new(ExecScope::Workspace, ExecClass::Resident, NonZeroUsize::MIN)
-                .unwrap();
+            JobScheduling::new(ExecScope::Workspace, ExecClass::Resident, NonZeroUsize::MIN);
         let ended_resident = JobArtifactRecord {
             scheduling: resident,
             nice: Some(10),
@@ -8953,54 +8878,25 @@ mod tests {
         };
         let read = round_trip(&ended_resident);
         assert_eq!(
-            (read.scheduling.class(), read.cpu_tokens, read.nice),
-            (ExecClass::Resident, None, Some(10)),
-            "a sealed resident names the nice it ran at and no grant"
+            (read.scheduling.class(), read.nice),
+            (ExecClass::Resident, Some(10)),
+            "a sealed resident names the nice it ran at"
         );
-        // The interactive resident differs only in its nice: sealed at 0, still with no grant.
+        // The interactive resident differs only in its nice: sealed at 0.
         let interactive_resident = JobArtifactRecord {
             scheduling: JobScheduling::new(
                 ExecScope::Workspace,
                 ExecClass::InteractiveResident,
                 NonZeroUsize::MIN,
-            )
-            .unwrap(),
+            ),
             nice: Some(0),
             ..valid_job_record(9)
         };
         let read = round_trip(&interactive_resident);
         assert_eq!(
-            (read.scheduling.class(), read.cpu_tokens, read.nice),
-            (ExecClass::InteractiveResident, None, Some(0)),
-            "a sealed interactive resident names the nice it ran at and no grant"
-        );
-        assert!(
-            matches!(
-                JobArtifactRecord {
-                    cpu_tokens: NonZeroUsize::new(2),
-                    ..interactive_resident
-                }
-                .validate(),
-                Err(ArtifactError::Integrity { .. })
-            ),
-            "an interactive resident record that names tokens is refused"
-        );
-        let granted_resident = JobArtifactRecord {
-            cpu_tokens: NonZeroUsize::new(2),
-            ..ended_resident.clone()
-        };
-        assert!(matches!(
-            granted_resident.validate(),
-            Err(ArtifactError::Integrity { .. })
-        ));
-        let stored_granted_resident = replace_column(
-            &admitted(&ended_resident),
-            CPU_COLUMN + 3,
-            Arc::new(UInt64Array::from(vec![Some(2)])),
-        );
-        assert!(
-            batch_to_protected_record(&stored_granted_resident).is_err(),
-            "a stored resident that names tokens is damage"
+            (read.scheduling.class(), read.nice),
+            (ExecClass::InteractiveResident, Some(0)),
+            "a sealed interactive resident names the nice it ran at"
         );
 
         let base = admitted(&JobArtifactRecord {
@@ -9042,54 +8938,33 @@ mod tests {
         assert!(batch_to_protected_record(&zero_tokens).is_err());
     }
 
-    /// A request that names no want takes its class's own (05_gateway.md "The task server owns
-    /// the live grant and nice"): background and interactive work the background share of the
-    /// host, ⌊N/2⌋ of its N cores and at least one; a gate its orchestrator's one token; a
-    /// resident none. A named want is taken as named, and a resident names none. Measured
-    /// 2026-10-21 before: a default `cowshed exec` asked for one token, and the `nx run-many` it
-    /// ran had that one token for every runner it started, which waited for it one after another
-    /// for up to 887 s: 21m19s against 5m54s on the host route.
+    /// A request that names no want takes the host's cores, whatever its class and scope, and a
+    /// named want is held up to those cores (05_gateway.md "Parallelism inside a job").
     #[test]
-    fn an_unnamed_want_is_its_class_share_and_a_named_want_is_exact() {
-        let cores = std::thread::available_parallelism().unwrap().get();
-        let share = NonZeroUsize::new((cores / 2).max(1)).unwrap();
+    fn an_unnamed_want_is_the_host_cores_and_a_named_want_is_held_up_to_them() {
+        let cores = std::thread::available_parallelism().unwrap();
         let two = NonZeroUsize::new(2).unwrap();
-        // The share the CPU admission reports, here a host's: a supervisor never assumes it.
-        assert_eq!(cowshed_gateway_types::background_share(), share);
+        let over = NonZeroUsize::new(cores.get() + 1).unwrap();
         for scope in [ExecScope::Workspace, ExecScope::HostGate] {
-            for (class, unnamed) in [
-                (ExecClass::Background, share),
-                (ExecClass::Interactive, share),
-                (ExecClass::Gate, NonZeroUsize::MIN),
-                (ExecClass::Resident, NonZeroUsize::MIN),
-                (ExecClass::InteractiveResident, NonZeroUsize::MIN),
-            ] {
-                assert_eq!(
-                    JobScheduling::requested(scope, class, None, share).map(JobScheduling::want),
-                    Some(unnamed),
-                    "{class:?} in {scope:?}"
-                );
-            }
             for class in [
                 ExecClass::Background,
                 ExecClass::Interactive,
                 ExecClass::Gate,
+                ExecClass::Resident,
+                ExecClass::InteractiveResident,
             ] {
-                for named in [NonZeroUsize::MIN, two] {
+                assert_eq!(
+                    JobScheduling::requested(scope, class, None, cores).want(),
+                    cores,
+                    "{class:?} in {scope:?}"
+                );
+                for named in [NonZeroUsize::MIN, two, over] {
                     assert_eq!(
-                        JobScheduling::requested(scope, class, Some(named), share)
-                            .map(JobScheduling::want),
-                        Some(named),
+                        JobScheduling::requested(scope, class, Some(named), cores).want(),
+                        named.min(cores),
                         "{class:?} in {scope:?}"
                     );
                 }
-            }
-            for class in [ExecClass::Resident, ExecClass::InteractiveResident] {
-                assert!(
-                    JobScheduling::requested(scope, class, Some(NonZeroUsize::MIN), share)
-                        .is_none(),
-                    "a resident names no want, in {scope:?} too"
-                );
             }
         }
     }
@@ -9102,19 +8977,14 @@ mod tests {
                 ExecClass::Background,
                 ExecClass::Interactive,
                 ExecClass::Gate,
+                ExecClass::Resident,
+                ExecClass::InteractiveResident,
             ] {
-                let scheduling = JobScheduling::new(scope, class, want).unwrap();
+                let scheduling = JobScheduling::new(scope, class, want);
                 assert_eq!(
                     (scheduling.scope(), scheduling.class(), scheduling.want()),
                     (scope, class, want)
                 );
-            }
-            for class in [ExecClass::Resident, ExecClass::InteractiveResident] {
-                assert!(
-                    JobScheduling::new(scope, class, want).is_none(),
-                    "a resident wants no token, in {scope:?} too"
-                );
-                assert!(JobScheduling::new(scope, class, NonZeroUsize::MIN).is_some());
             }
         }
         let ordinary = JobScheduling::default();
@@ -9127,20 +8997,19 @@ mod tests {
             )
         );
         let host_gate = JobArtifactRecord {
-            scheduling: JobScheduling::new(ExecScope::HostGate, ExecClass::Gate, want).unwrap(),
+            scheduling: JobScheduling::new(ExecScope::HostGate, ExecClass::Gate, want),
             ..valid_job_record(9)
         };
         assert_eq!(round_trip(&host_gate), host_gate);
         let host_background = JobArtifactRecord {
-            scheduling: JobScheduling::new(ExecScope::HostGate, ExecClass::Background, want)
-                .unwrap(),
+            scheduling: JobScheduling::new(ExecScope::HostGate, ExecClass::Background, want),
             ..valid_job_record(9)
         };
         assert_eq!(round_trip(&host_background), host_background);
     }
 
     /// A key binds the scheduling it was admitted under with the rest of its request, and the
-    /// terminal record keeps the grant and the observed nice the supervisor reported.
+    /// terminal record keeps the observed nice the supervisor reported.
     #[test]
     fn a_keyed_admission_binds_its_scheduling_and_its_ending_keeps_the_placement() {
         let root = temp_root("admission-scheduling");
@@ -9166,7 +9035,6 @@ mod tests {
                     duration_ms: Some(5),
                     resources: None,
                     failure: None,
-                    cpu_tokens: NonZeroUsize::new(6),
                     nice: Some(0),
                     containment: None,
                     outlived: Vec::new(),
@@ -9174,10 +9042,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            (sealed.record.cpu_tokens, sealed.record.nice),
-            (NonZeroUsize::new(6), Some(0))
-        );
+        assert_eq!(sealed.record.nice, Some(0));
         drop(store);
 
         let mut reopened = store_at(&root, ArtifactConfig::default());
@@ -9191,10 +9056,7 @@ mod tests {
             .sealed(job_id)
             .unwrap()
             .expect("the terminal record");
-        assert_eq!(
-            (record.scheduling, record.cpu_tokens, record.nice),
-            (gate(8), NonZeroUsize::new(6), Some(0))
-        );
+        assert_eq!((record.scheduling, record.nice), (gate(8), Some(0)));
     }
 
     fn argv_true() -> ExecCommand {
@@ -9788,21 +9650,18 @@ mod tests {
     }
 
     /// An ended resident (a shed's Nx daemon, a scratch Nx worker) is sealed with the nice it
-    /// ran at and no tokens, since a resident is granted none, and the store reads its record
-    /// back: a refused seal made every later job list of its workspace fail. A job of a class
-    /// that takes a grant is still refused that shape, so admitting the resident widens nothing.
+    /// ran at, and the store reads its record back.
     #[test]
-    fn an_ended_resident_seals_its_nice_without_tokens_and_reads_back() {
+    fn an_ended_resident_seals_its_nice_and_reads_back() {
         let root = temp_root("resident-seal");
         let mut store = store_at(&root, ArtifactConfig::default());
         let command = crate::api::dto::ExecCommand::Argv(vec!["nx-daemon".into()]);
-        let ended = |cpu_tokens| JobEnding {
+        let ended = || JobEnding {
             state: JobState::Exited,
             exit: Some(ExitStatus::Exited { code: 0 }),
             duration_ms: Some(1),
             resources: None,
             failure: None,
-            cpu_tokens,
             nice: Some(10),
             containment: None,
             outlived: Vec::new(),
@@ -9823,48 +9682,21 @@ mod tests {
             (job_id, token)
         };
         let resident =
-            JobScheduling::new(ExecScope::Workspace, ExecClass::Resident, NonZeroUsize::MIN)
-                .unwrap();
+            JobScheduling::new(ExecScope::Workspace, ExecClass::Resident, NonZeroUsize::MIN);
 
         let (resident_id, token) = begin(&mut store, resident);
         store
-            .finish(token, ended(None))
-            .expect("an ended resident seals with its nice and no tokens");
+            .finish(token, ended())
+            .expect("an ended resident seals with its nice");
         let sealed = store
             .sealed(resident_id)
             .unwrap()
             .expect("the sealed resident reads back")
             .clone();
         assert_eq!(
-            (sealed.scheduling.class(), sealed.cpu_tokens, sealed.nice),
-            (ExecClass::Resident, None, Some(10))
+            (sealed.scheduling.class(), sealed.nice),
+            (ExecClass::Resident, Some(10))
         );
-        let (_, token) = begin(&mut store, resident);
-        assert!(
-            matches!(
-                store.finish(token, ended(NonZeroUsize::new(1))),
-                Err(ArtifactError::Integrity { .. })
-            ),
-            "a resident never names tokens"
-        );
-
-        for (class, scheduling) in [
-            ("background", JobScheduling::default()),
-            (
-                "gate",
-                JobScheduling::new(ExecScope::Workspace, ExecClass::Gate, NonZeroUsize::MIN)
-                    .unwrap(),
-            ),
-        ] {
-            let (_, token) = begin(&mut store, scheduling);
-            assert!(
-                matches!(
-                    store.finish(token, ended(None)),
-                    Err(ArtifactError::Integrity { .. })
-                ),
-                "a {class} job that names a nice names its grant"
-            );
-        }
 
         drop(store);
         fs::remove_dir_all(root).unwrap();

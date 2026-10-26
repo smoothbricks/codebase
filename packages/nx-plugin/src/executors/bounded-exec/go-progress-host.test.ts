@@ -105,7 +105,6 @@ describe('Go test progress host proofs', () => {
         { root },
         createProcessTreeKiller(),
         null,
-        null,
       );
       firstFinished.resolve(false);
       const exchangeErrors = (await Promise.all(exchanges)).filter((error) => error !== undefined);
@@ -148,7 +147,6 @@ describe('Go test progress host proofs', () => {
         { command: 'go test -p=1 -count=1 .', idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
         { root },
         createProcessTreeKiller(),
-        null,
         null,
       );
       expect(advanced).toBe(true);

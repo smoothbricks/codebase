@@ -28,8 +28,9 @@ pub const COWSHED_BINARY_NAME: &str = "cowshed";
 pub const GATEWAY_HOST_NAME: &str = "cowshed-gateway-host";
 
 /// `cargo` in the host-stable directory. Earlier installs linked it beside the stable `cowshed`
-/// name, and that binary answered as `cargo`; cowshed no longer does — a CPU grant reaches Cargo
-/// as the make jobserver configuration Cargo reads itself (05_gateway.md, "Host CPU budget") — so
+/// name, and that binary answered as `cargo`; cowshed no longer does — a job's jobserver reaches
+/// Cargo as the make jobserver configuration Cargo reads itself (05_gateway.md, "Parallelism
+/// inside a job") — so
 /// an install removes the link an earlier one left and nothing creates it.
 pub const CARGO_LINK_NAME: &str = "cargo";
 pub const SCCACHE_BINARY_NAME: &str = "sccache";

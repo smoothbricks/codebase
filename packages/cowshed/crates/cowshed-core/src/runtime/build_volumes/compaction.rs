@@ -3,7 +3,7 @@
 //! [`SEED_COMPACTION_INTERVAL`], the land starts a background process
 //! ([`SEED_COMPACTION_VERB`]) that copies the seed into contiguous space and publishes the copy
 //! in its place. Only the refreshes, the clones and the publication take the target's image lock;
-//! the copy holds nothing a fork or a land waits on, and it waits while a gate job or a land runs.
+//! the copy holds nothing a fork or a land waits on, and it waits while a land runs.
 //! A seed that replaces the copied one meanwhile is caught up to, writing only what it changed. A
 //! compaction that fails is recorded, and no land of the build that failed starts another until
 //! one succeeds.
@@ -50,14 +50,14 @@ const CHECK_EVERY_BYTES: u64 = 1 << 30;
 /// follow, and the next land's compaction starts again.
 pub(crate) const SEED_COMPACTION_CATCH_UPS: usize = 8;
 
-/// How long a compaction's copy holds before it checks again while a gate job or a land runs.
+/// How long a compaction's copy holds before it checks again while a land runs.
 pub(crate) const SEED_COMPACTION_WAIT: Duration = Duration::from_secs(15);
 /// What a compaction's copy is told at a check (16_build_volumes.md, "Seed compaction").
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Admission {
-    /// No gate job runs and no land holds a turn: go on copying.
+    /// No land holds a turn: go on copying.
     Copy,
-    /// A gate job runs or a land holds a turn, and the asker has waited for it a while: check
+    /// A land holds a turn, and the asker has waited for it a while: check
     /// the seed and ask again.
     Wait,
     /// Stop, because of this: whether to wait cannot be decided, and not knowing is no permission.
@@ -104,38 +104,6 @@ pub(crate) fn seconds_since(at: SystemTime) -> u64 {
     SystemTime::now()
         .duration_since(at)
         .map_or(0, |elapsed| elapsed.as_secs())
-}
-
-/// Why a compaction's copy waits for gate jobs, from what the gateway answered
-/// ([`crate::gateway_sessions::GatewayControl::gates_in_flight`]): `Ok(None)` when none runs,
-/// and a gateway that is not running runs none; `Err`, why the copy stops, when whether one runs
-/// cannot be read, since not knowing is no permission.
-pub(crate) fn gates_hold(
-    gates: std::result::Result<
-        std::collections::BTreeSet<crate::api::dto::GateJobRef>,
-        crate::gateway_sessions::GatewayStatusError,
-    >,
-) -> std::result::Result<Option<String>, String> {
-    use crate::gateway_sessions::GatewayStatusError;
-    match gates {
-        Ok(gates) if gates.is_empty() => Ok(None),
-        Ok(gates) => Ok(Some(format!(
-            "gate jobs run: {}",
-            gates
-                .iter()
-                .map(|gate| format!("job {} in {}", gate.job, gate.checkout))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
-        Err(GatewayStatusError::Absent) => Ok(None),
-        Err(GatewayStatusError::Waited(failure)) => Err(format!(
-            "whether a gate job runs cannot be read: {}",
-            failure.message
-        )),
-        Err(GatewayStatusError::Control(error)) => {
-            Err(format!("whether a gate job runs cannot be read: {error}"))
-        }
-    }
 }
 
 /// Start `program __compact-seed <project_root>` in a session of its own, so the land's terminal
@@ -520,25 +488,6 @@ mod tests {
     use cowshed_os::test_backstop::ChildBackstop as _;
 
     const HOUR: Duration = Duration::from_secs(60 * 60);
-
-    #[test]
-    fn a_gateway_that_is_not_running_runs_no_gate_and_one_unread_stops_the_copy() {
-        use crate::api::dto::GateJobRef;
-        use crate::gateway_sessions::GatewayStatusError;
-        assert_eq!(gates_hold(Err(GatewayStatusError::Absent)), Ok(None));
-        assert_eq!(gates_hold(Ok(std::collections::BTreeSet::new())), Ok(None));
-        assert_eq!(
-            gates_hold(Ok(std::collections::BTreeSet::from([GateJobRef {
-                job: 7,
-                checkout: "/w".to_owned(),
-            }]))),
-            Ok(Some("gate jobs run: job 7 in /w".to_owned()))
-        );
-        assert_eq!(
-            gates_hold(Err(GatewayStatusError::Control("refused".to_owned()))),
-            Err("whether a gate job runs cannot be read: refused".to_owned())
-        );
-    }
 
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)

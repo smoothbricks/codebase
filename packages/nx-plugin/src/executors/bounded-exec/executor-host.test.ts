@@ -8,7 +8,6 @@ import { fileURLToPath } from 'node:url';
 import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from '../../bounded-test-policy.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool } from './cpu-pool.js';
-import { CPU_TOKENS_ENV } from './cpu-tokens.js';
 import { resolveCowshedExecutable } from './executor.js';
 import { COWSHED_EXECUTABLE_ENV, SUPERVISOR_SOCKET_ENV } from './owned-subtree.js';
 import {
@@ -19,13 +18,14 @@ import {
   scratchVolume,
   startFixtureGateway,
 } from './ram-temp-fixtures.js';
+import { CPU_TOKENS_ENV } from './runner-sizing.js';
 import type { BoundedExecOptions } from './schema.js';
 import { VERDICT_FILE } from './verdict.js';
 
 /**
- * The production runner's built Node artifact, run in its own process, with the real CPU-budget owner and, on macOS, a
- * RAM volume of this file's own, both served by the fixture gateway of this file's own test namespace: never the user's
- * gateway or volume, which no test leases, creates, detaches or takes tokens from. `test-host` already
+ * The production runner's built Node artifact, run in its own process, with, on macOS, a RAM volume of this file's own,
+ * served by the fixture gateway of this file's own test namespace: never the user's gateway or volume, which no test
+ * leases, creates or detaches. `test-host` already
  * depends on this package's build; these peers must not compile TypeScript inside a test. These proofs need the host
  * (`hdiutil` on darwin), so the pure shards exclude this file.
  */
@@ -54,19 +54,6 @@ function volumeSource(): string {
   if (ramVolume === undefined) throw new Error('the fixture gateway must be ready before a runner starts');
   const { paths, capacity } = ramVolume;
   return `(cowshed) => fixtureRamVolume(${JSON.stringify({ paths, capacity, owned: ramVolume.owned, gatewaySocket: ramVolume.gatewaySocket })}, cowshed)`;
-}
-
-/**
- * A runner script's `runBoundedExecWith` gateway, as a JavaScript string literal: this file's fixture gateway on macOS,
- * which serves the volume's disk work and the run's CPU tokens alike. Elsewhere none is served, so it is a path in the
- * script's own root that nothing listens on, as on a host with no gateway; never the user's.
- */
-function gatewaySource(root: string): string {
-  if (process.platform !== 'darwin') {
-    return JSON.stringify(join(root, 'no-gateway.sock'));
-  }
-  if (ramVolume === undefined) throw new Error('the fixture gateway must be ready before a runner starts');
-  return JSON.stringify(ramVolume.gatewaySocket);
 }
 
 /** The runner scripts' imports: the runner that takes a volume, and the fixture volume it is given. */
@@ -116,7 +103,7 @@ const CHURN_OPTIONS: BoundedExecOptions = { command: 'true', timeoutMs: BOUNDED_
 const CHURN_BEGIN = /^cowshed-test churn [a-z]+ begin [0-9]+$/gm;
 const CHURN_RAN = /^cowshed-test churn [a-z]+ ran [0-9]+$/gm;
 /** The stderr line a run logs when its one token came from the inherited parent pool. */
-const INHERITED_GRANT = /inherited=true tokens=1\/1/g;
+const INHERITED_GRANT = /status=ok tokens=1\/1/g;
 
 interface ChildRun {
   /** The script's file name, so an attribution names the case its child ran. */
@@ -227,7 +214,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       expect(await nested.exited, nested.stderr()).toBe(0);
 
       // The nested run logs its own grant before its command starts; the leaf's grant reaches the same stderr.
-      const granted = [...nested.stderr().matchAll(/inherited=true tokens=(\d+)\//g)].map((match) => Number(match[1]));
+      const granted = [...nested.stderr().matchAll(/status=ok tokens=(\d+)\//g)].map((match) => Number(match[1]));
       expect(granted).toHaveLength(2);
       const [nestedTokens = 0, leafTokens = 0] = granted;
       expect(nestedTokens).toBeGreaterThanOrEqual(1);
@@ -235,7 +222,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       expect(leafTokens).toBeLessThanOrEqual(nestedTokens);
 
       for (const directory of [nestedDirectory, leafDirectory]) {
-        expect(await readFile(join(directory, VERDICT_FILE), 'utf8')).toMatch(/"inherited":\s*true/);
+        expect(await readFile(join(directory, VERDICT_FILE), 'utf8')).toMatch(/"tokens":\s*[1-9]/);
       }
       await expectChurn(churn);
     });
@@ -258,8 +245,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
           })};`,
           `const context = ${JSON.stringify({ root })};`,
           `const volume = ${volumeSource()};`,
-          `const gatewaySocket = ${gatewaySource(root)};`,
-          'const results = await Promise.all(Array.from({ length: 5 }, () => runBoundedExecWith(options, context, volume, gatewaySocket)));',
+          'const results = await Promise.all(Array.from({ length: 5 }, () => runBoundedExecWith(options, context, volume)));',
           "console.log('leases-complete');",
           'process.exitCode = results.every((result) => result.success) ? 0 : 1;',
           '',
@@ -289,7 +275,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       expect(await run.exited, run.stderr()).toBe(0);
       expect(run.stdout().match(/^lease$/gm)).toHaveLength(5);
       expect(run.stdout()).toContain('leases-complete');
-      expect([...run.stderr().matchAll(/inherited=true tokens=1\/1/g)]).toHaveLength(5);
+      expect([...run.stderr().matchAll(/status=ok tokens=1\/1/g)]).toHaveLength(5);
       expect(run.stderr()).not.toContain('RAM temp volume not leased');
     });
   });
@@ -391,65 +377,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
     });
   });
 
-  it('uses a real backing budget after its named pool is absent and returns the allocation', async () => {
-    const root = await createRoot();
-    const stale = await withPool(1, async (pool) => pool.environment);
-    await withPool(1, async (outer) => {
-      const options: BoundedExecOptions = {
-        command: `node -e "console.log('actual-tokens=' + process.env.${CPU_TOKENS_ENV})"`,
-        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-        parallelism: 1,
-      };
-      const directory = join(root, 'stale');
-      const context = { root, record: { task: { id: 'stale', hash: null }, directory } };
-      const script = join(root, 'stale.mjs');
-      await writeFile(
-        script,
-        [
-          `import assert from 'node:assert/strict';`,
-          `import { runBoundedExec, createProcessTreeKiller } from ${JSON.stringify(EXECUTOR)};`,
-          `import { readInheritedCpuPool, takeParentCpuTokens } from ${JSON.stringify(join(dirname(EXECUTOR), 'cpu-pool.js'))};`,
-          RESOURCES_HANDLER,
-          `const backing = readInheritedCpuPool(${JSON.stringify(outer.environment)});`,
-          `const stale = readInheritedCpuPool(${JSON.stringify({ ...stale, [CPU_TOKENS_ENV]: '977' })});`,
-          'assert(backing !== null && stale !== null);',
-          `const options = ${JSON.stringify(options)};`,
-          `const context = ${JSON.stringify(context)};`,
-          'const asked = [];',
-          'const allocations = [];',
-          'let released = 0;',
-          'const budget = { async take(want, checkout, command) {',
-          '  asked.push({ want, checkout, command });',
-          '  const grant = await takeParentCpuTokens(backing, want);',
-          '  assert(grant.granted, grant.reason);',
-          '  allocations.push(grant);',
-          '  return { ...grant, release() { released++; grant.release(); } };',
-          '} };',
-          'const result = await runBoundedExec(options, context, createProcessTreeKiller(), null, budget, stale);',
-          'assert(result.success, result.terminalOutput);',
-          'assert.deepEqual(asked, [{ want: 1, checkout: context.root, command: options.command }]);',
-          'assert.equal(released, 1);',
-          'await allocations[0].closed;',
-          'const returned = await takeParentCpuTokens(backing, 1);',
-          'assert(returned.granted, returned.reason);',
-          'assert.equal(returned.tokens, 1);',
-          'returned.release();',
-          'await returned.closed;',
-          `console.log('actual-allocation-returned');`,
-          '',
-        ].join('\n'),
-      );
-      const run = startChild(script, childEnv(outer.environment));
-      expect(await run.exited, run.stderr()).toBe(0);
-      expect(run.stderr()).toContain('cowshed: cpu-tokens parent pool absent: ');
-      expect(run.stderr()).toContain('status=ok inherited=true tokens=1/1');
-      expect(run.stdout()).toContain('actual-tokens=1');
-      expect(run.stdout()).toContain('actual-allocation-returned');
-      expect(run.stdout()).not.toContain('977');
-      expect(await readFile(join(directory, VERDICT_FILE), 'utf8')).toMatch(/"tokens":\s*1/);
-    });
-  });
-
   it('keeps a command running when its parent pool closes under it, and judges it by its own exit', async () => {
     const root = await createRoot();
     const go = join(root, 'go.fifo');
@@ -470,7 +397,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       await run.printed('started');
       const outcome = await pool.close();
       expect(outcome.ok).toBe(true);
-      await run.said('cowshed: cpu-tokens grant ended: the parent pool closed its 1-token grant');
+      await run.said('cowshed: cpu-pool grant ended: the parent pool closed its 1-token grant');
       expect(run.closed()).toBe(false);
       await writeFile(go, 'go\n');
       expect(await run.exited, run.stderr()).toBe(0);
@@ -511,7 +438,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
           childEnv(pool.environment),
         );
         expect(await next.exited, next.stderr()).toBe(0);
-        expect(next.stderr()).toContain('inherited=true tokens=1/1');
+        expect(next.stderr()).toContain('status=ok tokens=1/1');
       });
     } finally {
       // The sub-pool's directory is private to it; the pool could not remove `stuck`, so the proof removes it.
@@ -540,10 +467,9 @@ function childEnv(extra: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   return { ...env, ...extra };
 }
 
-/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own, and no run owns the
- * host waits its children report. */
+/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own. */
 async function withPool<T>(tokens: number, body: (pool: CpuPool) => Promise<T>): Promise<T> {
-  const created = await createCpuPool(tokens, new Promise<void>(() => {}), { begin() {}, end() {} });
+  const created = await createCpuPool(tokens, new Promise<void>(() => {}));
   if (!created.ok) {
     throw new Error(`cpu pool: ${created.error}`);
   }
@@ -587,7 +513,7 @@ async function writeRunner(
     [
       RUNNER_IMPORTS,
       RESOURCES_HANDLER,
-      `const result = await runBoundedExecWith(${JSON.stringify(options)}, ${JSON.stringify(context)}, ${volumeSource()}, ${gatewaySource(root)});`,
+      `const result = await runBoundedExecWith(${JSON.stringify(options)}, ${JSON.stringify(context)}, ${volumeSource()});`,
       'process.exitCode = result.success ? 0 : 1;',
       '',
     ].join('\n'),
@@ -796,11 +722,10 @@ async function writeChurnWorker(root: string, name: string, stopFile: string): P
       RESOURCES_HANDLER,
       `const options = ${JSON.stringify(CHURN_OPTIONS)};`,
       `const volume = ${volumeSource()};`,
-      `const gatewaySocket = ${gatewaySource(root)};`,
       `const context = ${JSON.stringify({ root })};`,
       `for (let run = 1; !existsSync(${JSON.stringify(stopFile)}); run += 1) {`,
       `  process.stdout.write('cowshed-test churn ${name} begin ' + run + '\\n');`,
-      '  const result = await runBoundedExecWith(options, context, volume, gatewaySocket);',
+      '  const result = await runBoundedExecWith(options, context, volume);',
       '  if (!result.success) {',
       `    process.stderr.write('cowshed host proof churn ${name} failed at run ' + run + ':\\n');`,
       '    process.stderr.write(result.terminalOutput);',

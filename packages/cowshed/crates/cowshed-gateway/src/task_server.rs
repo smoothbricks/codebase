@@ -1,31 +1,33 @@
-//! The gateway's task server: a deterministic scheduler over dependency, ownership, lease and
-//! capacity facts (specs/cowshed/05_gateway.md, "The task server schedules work units").
+//! The gateway's task server: a deterministic scheduler over dependency, ownership and lease
+//! facts and the host's memory pressure (specs/cowshed/05_gateway.md, "The task server schedules
+//! work units").
 //!
 //! Work units admit with the facts of their plan — the units they wait on, the owner that runs
-//! them, the CPU they would use and the serialization windows they hold — and this scheduler
-//! alone decides which ready unit runs next. The order is a pure function of the logged facts and
-//! the host observations: the same facts always select the same units in the same order, and no
-//! model, operator or arrival order is consulted. Strong models propose task boundaries; they do
-//! not choose which ready unit acquires a lease.
+//! them and the serialization windows they hold — and this scheduler alone decides which ready
+//! unit runs next. The order is a pure function of the logged facts: the same facts always select
+//! the same units in the same order, and no model, operator or arrival order is consulted. Strong
+//! models propose task boundaries; they do not choose which ready unit acquires a lease.
 //!
-//! Three rules do the work the operator keeps by hand today:
+//! Four rules do the work the operator keeps by hand today:
 //!
 //! - **Order.** Aged waiters first — the starvation bound, so no unit is outranked forever —
-//!   then the class order (gate-class work first; interactive and background work behind it
-//!   while the host is busy),
-//!   the coordinator's urgent override, leverage (the transitive dependents), the cache-domain
-//!   deadline, resource fit against the free capacity, and finally the stable unit id.
+//!   then the class (gate-class work first, interactive and background work behind it, the same
+//!   on any host), the coordinator's urgent override, leverage (the transitive dependents), the
+//!   cache-domain deadline, and finally the stable unit id.
 //! - **Serialization.** A unit's run holds its lease classes from its selection until its
 //!   terminal fact: one `cowshed new` at a time, image windows serialized, and one checked land
 //!   publication at a time. The land lease is a publication fence — the checked land-authority
-//!   transition — never a whole-host CPU grant; gate groups run concurrently, and an urgent land
-//!   waits behind the turn in progress in publication order.
+//!   transition — and nothing more; gate groups run concurrently, and an urgent land waits behind
+//!   the turn in progress in publication order.
+//! - **Memory.** A background unit is not selected while the host is under memory pressure
+//!   (05_gateway.md "Host scheduling", "Memory pressure"). A selection pass takes at most one
+//!   reading, and only when a background unit would otherwise be selected; while one is held, the
+//!   pass runs again every [`RECHECK_EVERY`]. A reading that cannot be taken holds the unit too and
+//!   the queue names why: an unreadable pressure is not an unpressured host. Gate and interactive
+//!   units never take a reading.
 //! - **Caps.** A unit may declare its own parallelism ceiling — the caps its run kind applies to
-//!   itself — and the grant reports that ceiling clamped to the CPU tokens it holds. The ceiling
-//!   is a clamp on the run's own parallelism, never a grant and never a scheduler default. The
-//!   host budget stays the only allocator: this scheduler holds no token counter and a capacity
-//!   observation never mints a grant. Its asks reach the budget in selection order, and what
-//!   cannot be observed stays unknown.
+//!   itself — and the grant reports it as declared. The grant allocates nothing: the kernel
+//!   schedules CPU among every runnable process, and this scheduler holds no CPU counter.
 //!
 //! Every decision is a logged fact on stderr, without an opt-in environment variable, and the
 //! whole fold is inspectable through the `task-queue` control operation, so a lander reads the queue instead
@@ -33,24 +35,24 @@
 //! speaks: it records the outcome — with the owner and workspace incarnation the receipts bind
 //! to — and releases what the run held.
 
+use std::cell::LazyCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
+use cowshed_core::api::ExecClass;
+use cowshed_core::host_pressure::{self, Decision, HostPressureError, RECHECK_EVERY};
+use cowshed_gateway_types::host_status::{MemoryPressure, MemoryPressureReading};
 use cowshed_gateway_types::{
-    ConfigError, CpuBudgetStatus, LeaseClass, TaskBand, TaskClass, TaskDepWait, TaskGrant,
-    TaskLeaseStatus, TaskLeaseWait, TaskOutcome, TaskQueueStatus, TaskReadyStatus, TaskRunCaps,
-    TaskRunningStatus, TaskWaitingStatus,
+    ConfigError, LeaseClass, TaskBand, TaskClass, TaskDepWait, TaskGrant, TaskLeaseStatus,
+    TaskLeaseWait, TaskOutcome, TaskQueueStatus, TaskReadyStatus, TaskRunCaps, TaskRunningStatus,
+    TaskWaitingStatus,
 };
 use tokio::sync::{mpsc, oneshot};
-
-use crate::cpu_budget::{CpuBudget, Stake};
-use crate::disk_lease::Claim;
 
 /// How many runs at once may hold each serialization class: the turns the operator keeps by
 /// hand today become places on a class. One `cowshed new` at a time, image windows serialized,
@@ -84,7 +86,7 @@ impl LeasePlaces {
 
 /// The task server's policy: the serialization classes' places and the age bound after which a
 /// waiter outranks fresh priority. The scheduler holds no sizing policy: a run's parallelism is
-/// its own declared ceiling clamped to its grant.
+/// its own declared ceiling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskServerLimits {
     pub lease_places: LeasePlaces,
@@ -125,7 +127,7 @@ pub enum TaskRefusal {
     LiveAttempt,
     /// The unit has no live attempt to report on.
     NoLiveAttempt,
-    /// The task scheduler — or the host CPU budget it serves — has stopped.
+    /// The task scheduler has stopped.
     Stopped,
 }
 
@@ -139,8 +141,8 @@ impl fmt::Display for TaskRefusal {
     }
 }
 
-/// The facts a unit admits with. The scheduler selects from these and the host observations:
-/// dependency, ownership, lease and capacity facts, and nothing else.
+/// The facts a unit admits with. The scheduler selects from these and the host's memory pressure:
+/// dependency, ownership and lease facts, and nothing else.
 #[derive(Clone, Debug)]
 pub struct TaskFacts {
     pub unit: Arc<str>,
@@ -151,41 +153,18 @@ pub struct TaskFacts {
     pub deps: Vec<Arc<str>>,
     /// The serialization classes the run holds from selection to terminal.
     pub leases: Vec<LeaseClass>,
-    /// The CPU tokens the run would use; 0 asks for none and takes no budget stake.
-    pub want: usize,
     /// The coordinator's priority, higher first.
     pub priority: u32,
     /// The coordinator's "land now" override; it outranks every leverage.
     pub urgent: bool,
     pub class: TaskClass,
-    /// The predicted resource cost, for the resource-fit ordering key.
-    pub cost: Option<u64>,
     /// The cache-domain deadline in epoch milliseconds, for the cache-deadline ordering key.
     pub deadline: Option<u64>,
-    /// The run's own parallelism ceiling, clamped to its grant; never a grant of its own.
+    /// The run's own parallelism ceiling, reported on its grant as declared.
     pub caps: Option<TaskRunCaps>,
     pub command: Arc<str>,
-    /// The admitting client's pid, named on its CPU claim.
+    /// The admitting client's pid, named on its selection's decision log.
     pub pid: Option<i32>,
-}
-
-/// The host observations the schedule is computed against, folded at every event. What cannot
-/// be read stays unknown and never becomes headroom.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HostFacts {
-    /// The host is busy: gate-class work is live or the CPU ledger reports no free token.
-    busy: bool,
-    /// Free CPU tokens as the ledger reports them; `None` when it cannot be read.
-    cpu_free: Option<usize>,
-}
-
-/// How a unit's predicted cost fits the free capacity: the resource-fit ordering key. Unknown
-/// observations sort behind known ones rather than inventing a fit.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum Fit {
-    Fits,
-    Unfits,
-    Unknown,
 }
 
 #[derive(Debug)]
@@ -207,15 +186,17 @@ struct Unit {
     attempt: u32,
     /// The live attempt's ticket.
     ticket: u64,
+    /// What held the unit back for memory at the last selection pass that reached it: the
+    /// pressure, or why the reading could not be taken. `None` when that pass did not.
+    memory_wait: Option<MemoryPressureReading>,
 }
 
 /// What a [`Ledger`] transition did, for the actor to carry out. Selection effects name the
 /// retained ticket; the ledger owns its facts, so an effect never copies their payload.
 #[derive(Debug)]
 enum Effect {
-    /// The unit's turn came: its lease places are held and its run may start. The actor takes
-    /// its CPU from the host budget — the only allocator — in selection order, and answers the
-    /// client with the grant and the caps its run is sized to.
+    /// The unit's turn came: its lease places are held and its run may start. The actor answers
+    /// the client with the grant: the run's band and its declared ceiling.
     Select {
         ticket: u64,
         attempt: u32,
@@ -282,6 +263,7 @@ impl Ledger {
                 entry,
                 attempt,
                 ticket,
+                memory_wait: None,
             },
         );
         self.tickets.insert(ticket, (unit, attempt));
@@ -289,8 +271,7 @@ impl Ledger {
     }
 
     /// Record `outcome` for the unit's live attempt: the fact its dependents read, and the
-    /// release of its lease classes and CPU grant. The settled attempt's facts come back for the
-    /// decision log.
+    /// release of its lease classes. The settled attempt's facts come back for the decision log.
     fn terminal(
         &mut self,
         unit: &str,
@@ -341,12 +322,19 @@ impl Ledger {
         Some(entry.facts.clone())
     }
 
-    /// Recompute the schedule at this instant and select every unit whose turn came and whose
-    /// lease classes have room, in order. The order is a pure function of the facts: the same
-    /// facts select the same units in the same order, and a lease-blocked unit holds up nothing
-    /// beside it.
-    fn select(&mut self, now: Instant, host: HostFacts, effects: &mut Vec<Effect>) {
-        for ticket in self.ready_order(now, host) {
+    /// Recompute the schedule at this instant and select every unit whose turn came, whose lease
+    /// classes have room and that memory does not hold, in order. The order is a pure function of
+    /// the facts, and the memory decision of the facts and the one reading `read_memory` returns:
+    /// the pass calls it at most once, and only when a unit that waits for memory would otherwise
+    /// be selected. A lease- or memory-held unit holds up nothing beside it.
+    fn select(
+        &mut self,
+        now: Instant,
+        read_memory: impl FnOnce() -> Result<MemoryPressure, HostPressureError>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let reading = LazyCell::new(|| read_memory().map_err(|error| error.to_string()));
+        for ticket in self.ready_order(now) {
             let Some((unit, attempt)) = self.tickets.get(&ticket).cloned() else {
                 continue;
             };
@@ -357,10 +345,13 @@ impl Ledger {
                 self.holders.get(class).map_or(0, |held| held.len())
                     < self.limits.lease_places.places(*class)
             });
-            if !fits {
+            let entry = self.units.get_mut(&unit).expect("checked above");
+            entry.memory_wait = (fits && waits_for_memory(entry.facts.class))
+                .then(|| memory_hold(LazyCell::force(&reading)))
+                .flatten();
+            if !fits || entry.memory_wait.is_some() {
                 continue;
             }
-            let entry = self.units.get_mut(&unit).expect("checked above");
             for class in &entry.facts.leases {
                 self.holders.entry(*class).or_default().push(ticket);
             }
@@ -378,7 +369,7 @@ impl Ledger {
     }
 
     /// The ready units in the exact order the scheduler would grant them.
-    fn ready_order(&self, now: Instant, host: HostFacts) -> Vec<u64> {
+    fn ready_order(&self, now: Instant) -> Vec<u64> {
         let leverage = self.leverage();
         let mut ready: Vec<&Unit> = self
             .units
@@ -386,7 +377,7 @@ impl Ledger {
             .filter(|unit| matches!(unit.state, State::Queued))
             .filter(|unit| unit.facts.deps.iter().all(|dep| self.landed(dep)))
             .collect();
-        ready.sort_by(|a, b| self.order_cmp(a, b, now, host, &leverage));
+        ready.sort_by(|a, b| self.order_cmp(a, b, now, &leverage));
         ready.into_iter().map(|unit| unit.ticket).collect()
     }
 
@@ -425,14 +416,13 @@ impl Ledger {
     }
 
     /// The schedule's total order. Aged waiters run before fresh priority in the order they
-    /// waited — the starvation bound — then the class band, the urgent override, leverage, the
-    /// cache-domain deadline, resource fit, and the stable unit id.
+    /// waited — the starvation bound — then the class, the urgent override, leverage, the
+    /// cache-domain deadline, and the stable unit id.
     fn order_cmp(
         &self,
         a: &Unit,
         b: &Unit,
         now: Instant,
-        host: HostFacts,
         leverage: &HashMap<Arc<str>, usize>,
     ) -> Ordering {
         let aged =
@@ -466,13 +456,8 @@ impl Ledger {
             (false, false) => {}
         }
         let leverage_of = |unit: &Unit| leverage.get(&unit.facts.unit).copied().unwrap_or(0);
-        let fit_of = |unit: &Unit| match (unit.facts.cost, host.cpu_free) {
-            (Some(cost), Some(free)) if cost <= free as u64 => Fit::Fits,
-            (Some(_), Some(_)) => Fit::Unfits,
-            _ => Fit::Unknown,
-        };
-        order_band(&a.facts, host.busy)
-            .cmp(&order_band(&b.facts, host.busy))
+        class_rank(a.facts.class)
+            .cmp(&class_rank(b.facts.class))
             .then_with(|| b.facts.urgent.cmp(&a.facts.urgent))
             .then_with(|| leverage_of(b).cmp(&leverage_of(a)))
             .then_with(|| match (a.facts.deadline, b.facts.deadline) {
@@ -481,31 +466,25 @@ impl Ledger {
                 (None, Some(_)) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
             })
-            .then_with(|| fit_of(a).cmp(&fit_of(b)))
             .then_with(|| a.facts.unit.cmp(&b.facts.unit))
     }
 
-    /// When the oldest unaged waiter becomes an aged one: the actor wakes exactly then, so the
-    /// starvation bound needs no arrival to fire.
-    fn aging_deadline(&self, now: Instant) -> Option<Instant> {
-        self.units
-            .values()
-            .filter(|unit| matches!(unit.state, State::Queued))
+    /// When the actor must next recompute without an arrival: the oldest unaged waiter's age
+    /// bound, or the next memory reading while a unit is held for memory, whichever comes first.
+    fn wake(&self, now: Instant) -> Option<Instant> {
+        let queued = || {
+            self.units
+                .values()
+                .filter(|unit| matches!(unit.state, State::Queued))
+        };
+        let aging = queued()
             .map(|unit| unit.admitted + self.limits.age_bound)
             .filter(|deadline| *deadline > now)
-            .min()
-    }
-
-    /// The host observations at this instant: gate-class work is live or no CPU token is free.
-    fn host_facts(&self, cpu: Option<&CpuBudgetStatus>) -> HostFacts {
-        let cpu_free = cpu.map(|status| status.total.saturating_sub(status.held));
-        let gate_live = self.units.values().any(|unit| {
-            unit.facts.class == TaskClass::Gate && !matches!(unit.state, State::Terminal { .. })
-        });
-        HostFacts {
-            busy: gate_live || cpu_free == Some(0),
-            cpu_free,
-        }
+            .min();
+        let recheck = queued()
+            .any(|unit| unit.memory_wait.is_some())
+            .then(|| now + RECHECK_EVERY);
+        aging.into_iter().chain(recheck).min()
     }
 
     fn unit_of(&self, ticket: u64) -> Option<&Unit> {
@@ -527,18 +506,12 @@ impl Ledger {
             .unwrap_or_default()
     }
 
-    /// The whole fold at this instant: the ready order, what waits on what, and who holds each
-    /// lease. `granted` names the CPU tokens the budget actually granted each selected run.
-    fn status(
-        &self,
-        now: Instant,
-        host: HostFacts,
-        granted: &HashMap<u64, usize>,
-        cpu: Option<CpuBudgetStatus>,
-    ) -> TaskQueueStatus {
+    /// The whole fold at this instant: the ready order with what holds each ready unit back, what
+    /// waits on what, and who holds each lease.
+    fn status(&self, now: Instant) -> TaskQueueStatus {
         let leverage = self.leverage();
         let ready = self
-            .ready_order(now, host)
+            .ready_order(now)
             .into_iter()
             .filter_map(|ticket| {
                 let entry = self.unit_of(ticket)?;
@@ -566,6 +539,7 @@ impl Ledger {
                     leverage: leverage.get(&entry.facts.unit).copied().unwrap_or(0),
                     waited_ms: milliseconds(now.saturating_duration_since(entry.admitted)),
                     blocked_leases,
+                    memory_wait: entry.memory_wait.clone(),
                 })
             })
             .collect();
@@ -601,12 +575,7 @@ impl Ledger {
                     unit: unit.facts.unit.to_string(),
                     owner: unit.facts.owner.to_string(),
                     leases: leases.clone(),
-                    want: unit.facts.want,
-                    cpu_tokens: granted.get(&unit.ticket).copied(),
-                    caps: unit
-                        .facts
-                        .caps
-                        .map(|ceiling| clamp_caps(ceiling, granted.get(&unit.ticket).copied())),
+                    caps: unit.facts.caps,
                     granted_after_ms: milliseconds(now.saturating_duration_since(unit.admitted)),
                 }),
                 _ => None,
@@ -627,29 +596,41 @@ impl Ledger {
             waiting,
             running,
             leases,
-            cpu,
         }
     }
 }
 
-/// The order's class rank (05_gateway.md "Bands", the owner's ruling, 2026-10-17: "the gate class
-/// is served FIFO at highest priority over all other execs"): gate-class work first, interactive
-/// and background work behind it while the host is busy and at parity when it is not.
-fn order_band(facts: &TaskFacts, busy: bool) -> u8 {
-    match facts.class {
+/// The order's class rank: gate-class work first, interactive and background work behind it, the
+/// same on any host.
+const fn class_rank(class: TaskClass) -> u8 {
+    match class {
         TaskClass::Gate => 0,
-        TaskClass::Interactive | TaskClass::Background => u8::from(busy),
+        TaskClass::Interactive | TaskClass::Background => 1,
     }
 }
 
-/// A run's declared ceiling clamped to the tokens its grant holds: a clamp on the run's own
-/// parallelism, never a grant and never a scheduler default. The grant is the authority.
-fn clamp_caps(ceiling: TaskRunCaps, tokens: Option<usize>) -> TaskRunCaps {
-    let clamp = tokens.unwrap_or(usize::MAX);
-    TaskRunCaps {
-        nx_parallel: ceiling.nx_parallel.min(clamp),
-        cargo_jobs: ceiling.cargo_jobs.min(clamp),
-        test_threads: ceiling.test_threads.min(clamp),
+/// Whether a unit of `class` waits for memory pressure to drop: the host's rule for the exec
+/// class the unit runs as, background alone.
+const fn waits_for_memory(class: TaskClass) -> bool {
+    host_pressure::waits_for_memory(match class {
+        TaskClass::Gate => ExecClass::Gate,
+        TaskClass::Interactive => ExecClass::Interactive,
+        TaskClass::Background => ExecClass::Background,
+    })
+}
+
+/// What holds a unit that waits for memory under one pass's `reading`: the pressure when it says
+/// wait, the read failure when no reading could be taken — an unreadable pressure is not an
+/// unpressured host — and nothing when the host is not under pressure.
+fn memory_hold(reading: &Result<MemoryPressure, String>) -> Option<MemoryPressureReading> {
+    match reading {
+        Ok(pressure) => match host_pressure::may_start(*pressure) {
+            Decision::Start => None,
+            Decision::Wait { pressure } => Some(MemoryPressureReading::Read { pressure }),
+        },
+        Err(error) => Some(MemoryPressureReading::Unread {
+            error: error.clone(),
+        }),
     }
 }
 
@@ -671,16 +652,12 @@ enum Message {
     Leave {
         ticket: u64,
     },
-    Granted {
-        ticket: u64,
-        tokens: usize,
-    },
     Queue {
         reply: oneshot::Sender<TaskQueueStatus>,
     },
 }
 
-/// The task server's handle, held by the control plane like the CPU budget and the disk lease.
+/// The task server's handle, held by the control plane like the disk lease.
 #[derive(Clone, Debug)]
 pub struct TaskServer {
     messages: mpsc::UnboundedSender<Message>,
@@ -690,7 +667,7 @@ pub struct TaskServer {
     mint: Arc<Mutex<()>>,
 }
 
-/// One live admission, held open by its connection like a CPU-token stake: dropping it leaves
+/// One live admission, held open by its connection like a disk lease: dropping it leaves
 /// the queue or abandons the run, and a killed client releases everything with its socket.
 #[derive(Debug)]
 pub struct Tenure {
@@ -707,9 +684,9 @@ impl Drop for Tenure {
 }
 
 impl TaskServer {
-    pub fn start(limits: TaskServerLimits, cpu: CpuBudget) -> Self {
+    pub fn start(limits: TaskServerLimits) -> Self {
         let (messages, receiver) = mpsc::unbounded_channel();
-        tokio::spawn(run(limits, cpu, messages.clone(), receiver));
+        tokio::spawn(run(limits, receiver));
         Self {
             messages,
             tickets: Arc::new(AtomicU64::new(1)),
@@ -718,7 +695,7 @@ impl TaskServer {
     }
 
     /// Admit one unit and hold its attempt: the answer is its grant once the scheduler selects
-    /// it — after any CPU ask the budget holds — or a refusal.
+    /// it, or a refusal.
     pub fn ask(
         &self,
         facts: TaskFacts,
@@ -741,7 +718,7 @@ impl TaskServer {
         (tenure, granted)
     }
 
-    /// Record the unit's terminal outcome; its lease classes and CPU grant return at once.
+    /// Record the unit's terminal outcome; its lease classes return at once.
     pub async fn terminal(&self, unit: &str, outcome: TaskOutcome) -> Result<(), TaskRefusal> {
         let (reply, settled) = oneshot::channel();
         self.messages
@@ -763,19 +740,13 @@ impl TaskServer {
     }
 }
 
-async fn run(
-    limits: TaskServerLimits,
-    cpu: CpuBudget,
-    records: mpsc::UnboundedSender<Message>,
-    mut receiver: mpsc::UnboundedReceiver<Message>,
-) {
+async fn run(limits: TaskServerLimits, mut receiver: mpsc::UnboundedReceiver<Message>) {
     let mut ledger = Ledger::new(limits);
     let mut replies: HashMap<u64, oneshot::Sender<Result<TaskGrant, TaskRefusal>>> = HashMap::new();
-    let mut cpu_stakes: HashMap<u64, Stake> = HashMap::new();
-    let mut granted: HashMap<u64, usize> = HashMap::new();
     let mut pending_queue: Vec<oneshot::Sender<TaskQueueStatus>> = Vec::new();
     loop {
-        // Every message — and the oldest waiter's age bound — recomputes the schedule.
+        // Every message, the oldest waiter's age bound and, while a unit is held for memory, the
+        // next reading recompute the schedule.
         let mut follow: Vec<Effect> = Vec::new();
         tokio::select! {
             message = receiver.recv() => match message {
@@ -811,22 +782,19 @@ async fn run(
                         );
                     }
                 }
-                Some(Message::Granted { ticket, tokens }) => {
-                    granted.insert(ticket, tokens);
-                }
                 Some(Message::Queue { reply }) => pending_queue.push(reply),
                 None => return,
             },
-            _ = aging_wake(ledger.aging_deadline(Instant::now())) => {}
+            _ = wake_at(ledger.wake(Instant::now())) => {}
         }
-        let cpu_status = cpu.status().await;
-        let host = ledger.host_facts(cpu_status.as_ref());
-        ledger.select(Instant::now(), host, &mut follow);
+        ledger.select(
+            Instant::now(),
+            host_pressure::read_memory_pressure,
+            &mut follow,
+        );
         for effect in follow {
             match effect {
                 Effect::Release { ticket } => {
-                    cpu_stakes.remove(&ticket);
-                    granted.remove(&ticket);
                     replies.remove(&ticket);
                 }
                 Effect::Select {
@@ -840,74 +808,37 @@ async fn run(
                         .expect("selected ticket remains live")
                         .facts;
                     cowshed_os::eprintln!(
-                        "cowshed: timing task-server select ticket={ticket} unit={:?} attempt={attempt} owner={:?} incarnation={:?} waited_ns={} band={band:?} want={} leases={:?}",
+                        "cowshed: timing task-server select ticket={ticket} unit={:?} attempt={attempt} owner={:?} incarnation={:?} waited_ns={} band={band:?} leases={:?} command={:?} pid={:?}",
                         facts.unit,
                         facts.owner,
                         facts.incarnation,
                         waited.as_nanos(),
-                        facts.want,
                         facts.leases,
+                        facts.command,
+                        facts.pid,
                     );
                     let Some(reply) = replies.remove(&ticket) else {
                         // The client left before its turn: abandon the attempt it freed.
                         ledger.leave(ticket, &mut Vec::new());
                         continue;
                     };
-                    if facts.want == 0 {
-                        let _ = reply.send(Ok(TaskGrant {
-                            unit: facts.unit.to_string(),
-                            band,
-                            caps: facts.caps.map(|ceiling| clamp_caps(ceiling, None)),
-                            cpu_tokens: None,
-                        }));
-                        continue;
-                    }
-                    // The host budget stays the only allocator: selected work submits its ask to
-                    // it, in selection order, and no capacity observation mints a grant here.
-                    let want = NonZeroUsize::new(facts.want).expect("want is positive here");
-                    let (stake, tokens) = cpu.ask(
-                        Arc::clone(&facts.owner),
-                        want,
-                        Claim::new(&facts.command, facts.pid),
-                        crate::cpu_budget::Rank::Background,
-                    );
-                    cpu_stakes.insert(ticket, stake);
-                    let ceiling = facts.caps;
-                    let unit = facts.unit.to_string();
-                    let records = records.clone();
-                    tokio::spawn(async move {
-                        let answer = match tokens.await {
-                            Ok(tokens) => {
-                                let tokens = NonZeroUsize::new(tokens)
-                                    .expect("the budget grants at least one token");
-                                let _ = records.send(Message::Granted {
-                                    ticket,
-                                    tokens: tokens.get(),
-                                });
-                                Ok(TaskGrant {
-                                    unit,
-                                    band,
-                                    caps: ceiling
-                                        .map(|ceiling| clamp_caps(ceiling, Some(tokens.get()))),
-                                    cpu_tokens: Some(tokens),
-                                })
-                            }
-                            Err(_) => Err(TaskRefusal::Stopped),
-                        };
-                        let _ = reply.send(answer);
-                    });
+                    let _ = reply.send(Ok(TaskGrant {
+                        unit: facts.unit.to_string(),
+                        band,
+                        caps: facts.caps,
+                    }));
                 }
             }
         }
         for reply in pending_queue.drain(..) {
-            let _ = reply.send(ledger.status(Instant::now(), host, &granted, cpu_status.clone()));
+            let _ = reply.send(ledger.status(Instant::now()));
         }
     }
 }
 
-/// Sleeps until the oldest waiter's age bound, or forever when there is no waiter to age: the
-/// starvation bound fires on this wake alone, needing no arrival.
-async fn aging_wake(deadline: Option<Instant>) {
+/// Sleeps until `deadline`, or forever when nothing is due: the age bound and the memory
+/// re-check fire on this wake alone, needing no arrival.
+async fn wake_at(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
         None => std::future::pending::<()>().await,
@@ -917,12 +848,12 @@ async fn aging_wake(deadline: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_gateway_types::host_status::DarwinPressureLevel;
 
-    /// A ledger at a controllable clock, fed explicit tickets like the CPU budget's test clock.
+    /// A ledger at a controllable clock, fed explicit tickets.
     struct Clock {
         ledger: Ledger,
         origin: Instant,
-        granted: HashMap<u64, usize>,
     }
 
     impl Clock {
@@ -934,7 +865,6 @@ mod tests {
             Clock {
                 ledger: Ledger::new(limits),
                 origin: Instant::now(),
-                granted: HashMap::new(),
             }
         }
 
@@ -946,9 +876,14 @@ mod tests {
             self.ledger.admit(self.at(ms), ticket, facts)
         }
 
-        fn select(&mut self, ms: u64, host: HostFacts) -> Vec<String> {
+        fn select(&mut self, ms: u64) -> Vec<String> {
+            self.select_under(ms, NORMAL)
+        }
+
+        fn select_under(&mut self, ms: u64, pressure: MemoryPressure) -> Vec<String> {
             let mut effects = Vec::new();
-            self.ledger.select(self.at(ms), host, &mut effects);
+            self.ledger
+                .select(self.at(ms), || Ok(pressure), &mut effects);
             effects
                 .iter()
                 .filter_map(|effect| match effect {
@@ -974,9 +909,9 @@ mod tests {
             effects
         }
 
-        fn ready(&self, ms: u64, host: HostFacts) -> Vec<String> {
+        fn ready(&self, ms: u64) -> Vec<String> {
             self.ledger
-                .ready_order(self.at(ms), host)
+                .ready_order(self.at(ms))
                 .into_iter()
                 .filter_map(|ticket| {
                     self.ledger
@@ -994,11 +929,9 @@ mod tests {
             incarnation: None,
             deps: Vec::new(),
             leases: Vec::new(),
-            want: 0,
             priority: 0,
             urgent: false,
             class: TaskClass::Gate,
-            cost: None,
             deadline: None,
             caps: None,
             command: Arc::from("nx run gate"),
@@ -1006,13 +939,8 @@ mod tests {
         }
     }
 
-    const IDLE: HostFacts = HostFacts {
-        busy: false,
-        cpu_free: Some(16),
-    };
-    const BUSY: HostFacts = HostFacts {
-        busy: true,
-        cpu_free: Some(0),
+    const NORMAL: MemoryPressure = MemoryPressure::Darwin {
+        level: DarwinPressureLevel::Normal,
     };
 
     /// The wrong-order regression: the policy order over leverage, urgency, deadlines and
@@ -1042,43 +970,22 @@ mod tests {
         clock.admit(0, 2, dependent).unwrap();
         clock.admit(0, 1, facts("api")).unwrap();
         // Urgent first; leverage (api) next; then the known deadlines soon-before-far; the
-        // unknown-deadline background unit last even on an idle host; dependents never appear
+        // background unit last, behind gate-class work; dependents never appear
         // before the units they wait on have landed.
         assert_eq!(
-            clock.select(0, IDLE),
+            clock.select(0),
             ["fix", "api", "soon", "far", "bg"],
             "the policy order over the ready set"
         );
         clock.terminal("api", TaskOutcome::Landed);
-        assert_eq!(clock.select(1, IDLE), ["impl"]);
+        assert_eq!(clock.select(1), ["impl"]);
         clock.terminal("impl", TaskOutcome::Landed);
-        assert_eq!(clock.select(2, IDLE), ["tests"]);
+        assert_eq!(clock.select(2), ["tests"]);
     }
 
-    /// The priority policy: background work is demoted behind gate work while the host is busy
-    /// and runs at parity when it is not — facts, not a manual priority flag.
-    #[test]
-    fn background_work_is_demoted_while_the_host_is_busy() {
-        let mut idle = Clock::new(30_000);
-        let mut background = facts("a-bg");
-        background.class = TaskClass::Background;
-        idle.admit(0, 1, background).unwrap();
-        idle.admit(0, 2, facts("z-gate")).unwrap();
-        // On an idle host only the stable id orders them.
-        assert_eq!(idle.ready(0, IDLE), ["a-bg", "z-gate"]);
-        let mut busy = Clock::new(30_000);
-        let mut background = facts("a-bg");
-        background.class = TaskClass::Background;
-        busy.admit(0, 1, background).unwrap();
-        busy.admit(0, 2, facts("z-gate")).unwrap();
-        assert_eq!(busy.ready(0, BUSY), ["z-gate", "a-bg"]);
-    }
-
-    /// The band regression (05_gateway.md "Bands", the owner's ruling, 2026-10-17: interactive
-    /// above gate above regular exec, the gate first for CPU). The wrong results it rules out: a
-    /// background unit reported in the gate's band on a quiet host, the land turn's holder reported
-    /// foreground above work a person or model is waiting on, and an interactive unit ordered for
-    /// CPU ahead of gate work on a busy host.
+    /// The band and class-order regression. The wrong results it rules out: a background unit
+    /// reported in the gate's band, the land turn's holder reported foreground above work a person
+    /// or model is waiting on, and an interactive or background unit ordered ahead of gate work.
     #[test]
     fn every_unit_runs_in_its_class_band_and_gate_work_is_ordered_first() {
         let mut clock = Clock::new(30_000);
@@ -1092,36 +999,56 @@ mod tests {
         clock.admit(0, 2, background).unwrap();
         clock.admit(0, 3, facts("y-gate")).unwrap();
         clock.admit(0, 4, land).unwrap();
-        for host in [IDLE, BUSY] {
-            let bands: Vec<(String, TaskBand)> = clock
-                .ledger
-                .status(clock.at(0), host, &clock.granted, None)
-                .ready
-                .into_iter()
-                .map(|ready| (ready.unit, ready.band))
-                .collect();
-            let band = |unit: &str| {
-                bands
-                    .iter()
-                    .find(|(name, _)| name == unit)
-                    .map(|(_, band)| *band)
-                    .expect("ready unit")
-            };
-            assert_eq!(band("a-interactive"), TaskBand::Foreground, "{host:?}");
-            assert_eq!(band("y-gate"), TaskBand::Normal, "{host:?}");
-            assert_eq!(band("z-land"), TaskBand::Normal, "{host:?}");
-            assert_eq!(band("b-background"), TaskBand::Background, "{host:?}");
-        }
-        // The land's own queue first, then gate work ahead of interactive and background work on
-        // a busy host; on a quiet host only the stable id orders the rest.
+        let bands: Vec<(String, TaskBand)> = clock
+            .ledger
+            .status(clock.at(0))
+            .ready
+            .into_iter()
+            .map(|ready| (ready.unit, ready.band))
+            .collect();
+        let band = |unit: &str| {
+            bands
+                .iter()
+                .find(|(name, _)| name == unit)
+                .map(|(_, band)| *band)
+                .expect("ready unit")
+        };
+        assert_eq!(band("a-interactive"), TaskBand::Foreground);
+        assert_eq!(band("y-gate"), TaskBand::Normal);
+        assert_eq!(band("z-land"), TaskBand::Normal);
+        assert_eq!(band("b-background"), TaskBand::Background);
+        // The land's own queue first, then gate work ahead of interactive and background work.
         assert_eq!(
-            clock.ready(0, BUSY),
+            clock.ready(0),
             ["z-land", "y-gate", "a-interactive", "b-background"]
         );
+    }
+
+    /// The memory rule at its threshold (05_gateway.md "Host scheduling", "Memory pressure"): at
+    /// Warning a background unit is held and its queue entry names the reading, while the gate
+    /// unit beside it is selected; at Normal the background unit goes.
+    #[test]
+    fn a_background_unit_waits_under_memory_pressure_and_a_gate_unit_does_not() {
+        let mut clock = Clock::new(30_000);
+        let mut background = facts("bg");
+        background.class = TaskClass::Background;
+        clock.admit(0, 1, background).unwrap();
+        clock.admit(0, 2, facts("gate")).unwrap();
+        let warning = MemoryPressure::Darwin {
+            level: DarwinPressureLevel::Warning,
+        };
+        assert_eq!(clock.select_under(0, warning), ["gate"]);
+        let status = clock.ledger.status(clock.at(0));
+        let held = status
+            .ready
+            .iter()
+            .find(|ready| ready.unit == "bg")
+            .expect("the held unit stays ready");
         assert_eq!(
-            clock.ready(0, IDLE),
-            ["z-land", "a-interactive", "b-background", "y-gate"]
+            held.memory_wait,
+            Some(MemoryPressureReading::Read { pressure: warning })
         );
+        assert_eq!(clock.select_under(1, NORMAL), ["bg"]);
     }
 
     /// The determinism regression: the same facts produce the same order, however they arrive.
@@ -1135,21 +1062,18 @@ mod tests {
             depending.deps = vec![Arc::from("alpha")];
             let mut urgent = facts("epsilon");
             urgent.urgent = true;
-            let mut priced = facts("zeta");
-            priced.cost = Some(4);
             pieces.push((4, depending));
             pieces.push((5, urgent));
-            pieces.push((6, priced));
             if reverse {
                 pieces.reverse();
             }
             for (ticket, facts) in pieces {
                 clock.admit(0, ticket, facts).unwrap();
             }
-            clock.ready(0, IDLE)
+            clock.ready(0)
         };
         assert_eq!(build(false), build(true));
-        assert_eq!(build(false), ["epsilon", "alpha", "zeta", "beta", "gamma"]);
+        assert_eq!(build(false), ["epsilon", "alpha", "beta", "gamma"]);
     }
 
     /// The starvation regression: one-place class, a stream of fresher urgent arrivals, and a
@@ -1168,7 +1092,7 @@ mod tests {
             arrival.urgent = true;
             arrival.leases = vec![LeaseClass::Image];
             clock.admit(ms, step + 1, arrival).unwrap();
-            let selected = clock.select(ms, IDLE);
+            let selected = clock.select(ms);
             for unit in &selected {
                 ran.push((ms, unit.to_string()));
                 clock.terminal(unit, TaskOutcome::Landed);
@@ -1199,7 +1123,7 @@ mod tests {
         lonely.leases = vec![LeaseClass::Image];
         clock.admit(0, 1, lonely).unwrap();
         assert_eq!(
-            clock.ledger.aging_deadline(clock.at(0)),
+            clock.ledger.wake(clock.at(0)),
             Some(clock.at(200)),
             "the age bound is a wake, not a poll"
         );
@@ -1216,12 +1140,8 @@ mod tests {
         fork_b.leases = vec![LeaseClass::CowshedNew, LeaseClass::Image];
         clock.admit(0, 1, fork_a).unwrap();
         clock.admit(0, 2, fork_b).unwrap();
-        assert_eq!(
-            clock.select(0, IDLE),
-            ["fork-a"],
-            "one cowshed new at a time"
-        );
-        let status = clock.ledger.status(clock.at(0), IDLE, &clock.granted, None);
+        assert_eq!(clock.select(0), ["fork-a"], "one cowshed new at a time");
+        let status = clock.ledger.status(clock.at(0));
         let fork_b_status = status
             .ready
             .iter()
@@ -1243,23 +1163,23 @@ mod tests {
         urgent_land.urgent = true;
         clock.admit(1, 3, turn).unwrap();
         assert_eq!(
-            clock.select(1, IDLE),
+            clock.select(1),
             ["turn"],
             "the turn takes the fence at its own event"
         );
         clock.admit(2, 4, urgent_land).unwrap();
         assert!(
-            clock.select(2, IDLE).is_empty(),
+            clock.select(2).is_empty(),
             "the urgent land waits behind the turn in progress; fork-b waits its class"
         );
         clock.terminal("turn", TaskOutcome::Landed);
         assert_eq!(
-            clock.select(3, IDLE),
+            clock.select(3),
             ["urgent-land"],
             "the urgent land takes the freed fence; fork-b still waits its class"
         );
         clock.terminal("fork-a", TaskOutcome::Landed);
-        assert_eq!(clock.select(4, IDLE), ["fork-b"]);
+        assert_eq!(clock.select(4), ["fork-b"]);
     }
 
     /// The land queue's own order: the publication fence goes to the first claimant in
@@ -1275,21 +1195,21 @@ mod tests {
         urgent.leases = vec![LeaseClass::LandPublication];
         urgent.urgent = true;
         clock.admit(0, 1, holder).unwrap();
-        assert_eq!(clock.select(0, IDLE), ["turn"]);
+        assert_eq!(clock.select(0), ["turn"]);
         clock.admit(1, 2, first).unwrap();
         clock.admit(2, 3, urgent).unwrap();
         assert!(
-            clock.select(2, IDLE).is_empty(),
+            clock.select(2).is_empty(),
             "the turn in progress holds the fence"
         );
         clock.terminal("turn", TaskOutcome::Landed);
         assert_eq!(
-            clock.select(3, IDLE),
+            clock.select(3),
             ["first-land"],
             "the first claimant takes the fence; a later urgent land waits its turn"
         );
         clock.terminal("first-land", TaskOutcome::Landed);
-        assert_eq!(clock.select(4, IDLE), ["urgent-land"]);
+        assert_eq!(clock.select(4), ["urgent-land"]);
     }
 
     /// The queue-entry linearization: the admit fold assigns the entry order, so lands whose
@@ -1306,40 +1226,10 @@ mod tests {
         clock.admit(0, 2, accepted_first).unwrap();
         clock.admit(0, 1, minted_older).unwrap();
         assert_eq!(
-            clock.select(0, IDLE),
+            clock.select(0),
             ["accepted-first"],
             "the fold's entry order, not the caller's ticket mint, is the land order"
         );
-    }
-
-    /// The caps regression: a run's declared ceiling is applied and clamped to the tokens its
-    /// grant holds — the ceiling bounds the run's own parallelism and is never a grant.
-    #[test]
-    fn a_declared_ceiling_clamps_the_runs_parallelism_to_its_grant() {
-        let ceiling = TaskRunCaps {
-            nx_parallel: 2,
-            cargo_jobs: 4,
-            test_threads: 6,
-        };
-        assert_eq!(clamp_caps(ceiling, Some(12)), ceiling);
-        assert_eq!(
-            clamp_caps(ceiling, Some(3)),
-            TaskRunCaps {
-                nx_parallel: 2,
-                cargo_jobs: 3,
-                test_threads: 3,
-            }
-        );
-        assert_eq!(
-            clamp_caps(ceiling, Some(1)),
-            TaskRunCaps {
-                nx_parallel: 1,
-                cargo_jobs: 1,
-                test_threads: 1,
-            }
-        );
-        // No grant clamps nothing: a want-0 unit keeps its own ceiling as declared.
-        assert_eq!(clamp_caps(ceiling, None), ceiling);
     }
 
     /// Ownership: one live attempt per unit, and a delayed holder from a settled attempt can
@@ -1357,6 +1247,6 @@ mod tests {
         clock.admit(2, 3, facts("unit")).unwrap();
         // A delayed leave for the dead ticket changes nothing: the new attempt still runs.
         assert!(clock.leave(1).is_empty());
-        assert_eq!(clock.select(3, IDLE), ["unit"]);
+        assert_eq!(clock.select(3), ["unit"]);
     }
 }
