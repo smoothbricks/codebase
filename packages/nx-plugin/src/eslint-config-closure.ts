@@ -289,6 +289,7 @@ function jitiResolve(jiti: Jiti.Jiti | null, kind: LoadKind, specifier: string, 
 /** Node's own resolution of every load in one layer, from the `node` that runs ESLint; `null` where Node throws. */
 function nodeResolve(loads: readonly PendingLoad[]): (string | null)[] {
   if (loads.length === 0) return [];
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: node resolves the specifiers on its stdin from the filesystem and exits; it waits on no other process
   const output = execFileSync(
     'node',
     ['--experimental-import-meta-resolve', '--no-warnings', '--input-type=module', '--eval', NODE_RESOLVER],

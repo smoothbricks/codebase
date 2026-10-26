@@ -212,6 +212,7 @@ export function cowshedSubtreeOwner(cowshed: string): SubtreeOwner {
       child.stdout.on('data', (chunk: Buffer) => out.push(chunk));
       child.stderr.on('data', (chunk: Buffer) => err.push(chunk));
       child.stdin.end(`${JSON.stringify(handle)}\n`);
+      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the cowshed CLI bounds its own supervisor call (control bound, then the 15 s heartbeat silence; 05_gateway.md, "Deadlines") and exits with the answer or its TIMEOUT/SILENT failure
       return new Promise<SubtreeRetirement>((resolve) => {
         child.once('error', (error) =>
           resolve({ kind: 'failed', detail: `${cowshed} retire-descendants: ${error.message}` }),

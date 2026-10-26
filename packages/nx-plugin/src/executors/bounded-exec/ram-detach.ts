@@ -75,6 +75,7 @@ export function detachGatewayRamDisk(
   let finished = false;
   const pending = { pid: null, completion };
   const unknown = (reason: string): CommandOutput => ({ status: 1, stdout: '', stderr: reason, pending });
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a unix-socket connect completes or fails at once, and the silence timer listen() arms below ends the whole exchange (05_gateway.md, "Deadlines")
   const connection = connect(socket);
   const finish = (output: CommandOutput | null, reason = 'gateway detach terminal status unavailable') => {
     if (finished) return;

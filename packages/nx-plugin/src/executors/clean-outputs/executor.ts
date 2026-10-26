@@ -107,6 +107,7 @@ function isWithin(candidate: string, parent: string): boolean {
 
 function containsTrackedFiles(outputDir: string, workspaceRoot: string): boolean {
   const relativeOutputDir = path.relative(workspaceRoot, outputDir);
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git file listing whose length is its own read of this repository: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const result = spawnSync('git', ['ls-files', '--', relativeOutputDir], {
     cwd: workspaceRoot,
     encoding: 'utf8',

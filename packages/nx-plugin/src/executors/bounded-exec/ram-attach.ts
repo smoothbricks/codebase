@@ -43,6 +43,7 @@ export async function attachRamDisk(
   sectors: number,
   deadlineMs: number,
 ): Promise<Result<RamDiskLease, string | RamUnavailable>> {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a unix-socket connect completes or fails at once, and every answer on it is awaited by next(deadlineMs), whose timer ends the wait
   const connection = connect(socket);
   const next = answers(connection);
   connection.on('connect', () => connection.write(`${JSON.stringify({ op: RAM_LEASE_OP, sectors })}\n`));

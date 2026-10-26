@@ -360,6 +360,7 @@ function childSettled(
   child: ChildProcess,
   event: 'close' | 'exit',
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the cargo metadata read (--frozen --no-deps, no package-cache lock) and the nextest archive extraction it settles last as long as their work; the operator's interrupt or the enclosing runner's bound ends a hung one
   return new Promise((resolve, reject) => {
     function onError(error: Error) {
       if (event === 'close') child.removeListener('close', onSettled);

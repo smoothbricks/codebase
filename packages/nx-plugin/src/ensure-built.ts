@@ -551,6 +551,7 @@ function bindWorkspaceSocketDirectory(
       null,
     );
   const script = join(managedAssetsRoot, 'raw/tooling/direnv/nx-socket-dir.sh');
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: sh sources a repository script that only computes and prints a path; it waits on no other process
   const result = spawnSync('/bin/sh', ['-c', '. "$1" && printf %s "$NX_SOCKET_DIR"', 'sh', script], {
     cwd: workspaceRoot,
     env: { ...environment, PWD: workspaceRoot },
@@ -1629,6 +1630,7 @@ async function runViaCli(
   });
   // `Promise.withResolvers` would read better but needs lib es2024; this
   // package inherits lib es2022 from tsconfig.base.json.
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the nx build of the selector this run needs, with stdio inherited, lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
   const exit = await new Promise<ChildExit>((settle, reject) => {
     child.once('error', reject);
     child.once('exit', (code, signal) => settle({ code, signal }));

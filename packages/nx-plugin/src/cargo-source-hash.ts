@@ -258,6 +258,7 @@ function disownCargoChildren(): void {
 function runCargo(args: readonly string[], cwd: string, boundMs: number = CARGO_RESOLVE_BOUND_MS): Promise<string> {
   // spawn forwards detached groups; execFile does not. The public ES2022
   // library API requires the constructor form, not Promise.withResolvers.
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: settled by the CARGO_RESOLVE_BOUND_MS timer armed inside it, which ends a cargo held behind another's lock as CargoResolveLockError
   return new Promise((settle, reject) => {
     // Hooks first: a signal caught from here on runs its listener after this
     // synchronous body, by which time the child is in `cargoChildren`.
@@ -770,6 +771,7 @@ export function acquireCargoResolveLock(
     "process.stdin.on('end', () => { lock.unlock(); process.exit(0); });",
   ].join('\n');
   // The public ES2022 library API requires the constructor form, not Promise.withResolvers.
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: settled by the boundMs timer armed inside it, which ends the lock waiter as CargoResolveLockError
   return new Promise((settle, reject) => {
     const started = performance.now();
     const child = spawn(process.execPath, ['--eval', program], {
@@ -789,6 +791,7 @@ export function acquireCargoResolveLock(
       () => fail(new CargoResolveLockError(lockFile, boundMs, Math.ceil(performance.now() - started), child.pid)),
       boundMs,
     );
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the waiter's close after the boundMs timer above settled or killed it; a killed child's close follows its SIGKILL
     const closed = new Promise<void>((finish) => {
       child.on('close', (code, signal) => {
         clearTimeout(timer);
@@ -1123,6 +1126,7 @@ function gitIgnoredBeneath(directories: readonly string[]): (path: string) => bo
     const sourceRoots = relativeMembers.filter((member) => !ignoredRoots.has(member));
     if (sourceRoots.length === 0) continue;
     const installed = [...ignoredRoots].map((member) => join(repository, member));
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git file listing whose length is its own read of this repository: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
     const listing = execFileSync(
       'git',
       [
@@ -1157,6 +1161,7 @@ function gitIgnoredBeneath(directories: readonly string[]): (path: string) => bo
 
 /** The members of `paths` (relative to `repository`) that git ignores, own patterns or an ancestor's. */
 function gitCheckIgnore(repository: string, paths: readonly string[]): string[] {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git ignore check of the paths on its stdin: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const result = spawnSync('git', [...ISOLATED_GIT_ARGS, '-C', repository, 'check-ignore', '-z', '--stdin'], {
     input: `${paths.join('\0')}\0`,
     encoding: 'utf8',
@@ -1176,6 +1181,7 @@ function gitRepository(directory: string): string | undefined {
   try {
     // The walk compares realpaths, so git's answer is canonicalized the same way.
     return realpathSync(
+      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git work-tree lookup: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
       execFileSync('git', [...ISOLATED_GIT_ARGS, '-C', directory, 'rev-parse', '--show-toplevel'], {
         encoding: 'utf8',
         stdio: CHILD_STDIO,

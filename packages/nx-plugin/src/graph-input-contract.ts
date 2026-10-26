@@ -204,6 +204,7 @@ function gitEnvironment(): NodeJS.ProcessEnv {
   return { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
 }
 function gitQuery(path: string, query: Pick<GitQueryWitness, 'cwd' | 'args' | 'stdin'>): string {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git query: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   return execFileSync(path, ['-c', 'core.excludesFile=/dev/null', ...query.args], {
     cwd: query.cwd,
     env: gitEnvironment(),
@@ -447,6 +448,7 @@ export class GraphInputReadCollector {
       this.gitQueries.push({ ...splitIndex, sha256: digest(sharedIndex) });
       if (sharedIndex.trim() !== '') this.observe(resolve(scope, sharedIndex.trim()));
       for (const name of ['index', 'info/exclude', 'info/attributes']) {
+        // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git path lookup: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
         const path = execFileSync(tool, ['-c', 'core.excludesFile=/dev/null', 'rev-parse', '--git-path', name], {
           cwd: scope,
           env: gitEnvironment(),
@@ -635,6 +637,7 @@ export function graphInputContractIdentity(
           if (bun === undefined) return null;
           const recipe =
             "console.log(JSON.stringify(JSON.parse(require('node:fs').readFileSync(0,'utf8')).map(({from,specifier})=>{try{return require('node:fs').realpathSync(Bun.resolveSync(specifier,from))}catch{return null}})))";
+          // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: bun resolves the specifiers on its stdin from the filesystem and exits; it waits on no other process
           const actual = execFileSync(bun.path, ['--eval', recipe], {
             input: JSON.stringify(bunResolutions),
             cwd: root,

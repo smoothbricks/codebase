@@ -66,6 +66,7 @@ export function receiptGit(root: string, args: string[]): ReceiptEvidence<string
     'GIT_NAMESPACE',
   ])
     delete env[key];
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git query: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const child = spawnSync('git', ['-C', root, ...args], { env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   return child.status === 0 && child.error === undefined
     ? { ok: true, value: child.stdout }

@@ -24,6 +24,7 @@ function failure(context: string, error: unknown): Error {
 
 // This executable inherits lib es2022; Promise.withResolvers requires es2024.
 function write(stream: Writable, bytes: Buffer | string): Promise<Error | null> {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the parent executor drains these pipes for as long as the command runs; the operator's interrupt or the enclosing runner's bound ends a parent that stopped reading
   return new Promise((resolve) => {
     stream.write(bytes, (error) => resolve(error ?? null));
   });
@@ -129,6 +130,7 @@ function lifecycle(id: number, failed: (error: Error) => void): Lifecycle {
     async close(): Promise<void> {
       closing = true;
       if (socket.destroyed) return;
+      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: socket.destroy() below closes this end locally; 'close' follows without the peer
       await new Promise<void>((resolve) => {
         socket.once('close', resolve);
         // The shell retains this endpoint for later commands: shutdown/end would poison
@@ -248,6 +250,7 @@ async function main([idText, runner, executable, ...args]: readonly string[]): P
       // Descriptor 3 belongs only to this supervisor, never the tool or its descendants.
       const running = spawn(executable, args, { stdio: ['inherit', 'pipe', 'pipe'] });
       child = running;
+      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the go or cargo build this supervisor runs lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
       const closed = new Promise<void>((resolve) => {
         running.once('close', (status, reason) => {
           code = status;

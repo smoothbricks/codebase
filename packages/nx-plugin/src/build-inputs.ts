@@ -41,6 +41,7 @@ export interface BuildInputRecord {
  * takes the same list the same way.
  */
 export function pathspecFiles(workspaceRoot: string, pathspecs: readonly string[]): string[] {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git file listing whose length is its own read of this repository: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const run = spawnSync(
     'git',
     ['-C', workspaceRoot, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...pathspecs],
@@ -130,6 +131,7 @@ export function workspacePath(workspaceRoot: string, path: string): string {
 
 /** The Git work tree `directory` is in, physically resolved, or null outside one: a build there records nothing. */
 export function gitWorkspaceRoot(directory: string): string | null {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git work-tree lookup: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const run = spawnSync('git', ['-C', directory, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
   return run.status === 0 && run.error === undefined ? realpathSync(run.stdout.trim()) : null;
 }

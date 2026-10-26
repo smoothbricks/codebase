@@ -130,6 +130,7 @@ export default async function cargoZigbuildExecutor(
     env: zigbuildEnv(process.env, options.target),
     stdio: ['ignore', 'pipe', 'inherit'],
   });
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a cargo-zigbuild build lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once('error', reject);
     child.once('close', (code, signal) => resolve({ code, signal }));

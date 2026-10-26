@@ -239,6 +239,7 @@ async function holdLock(path: string): Promise<() => Promise<void>> {
   let stdout = '';
   let stderr = '';
   // The library compiles against ES2022, which has no Promise.withResolvers.
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a flock wait whose length is the current holder's take of the kept copy; the kernel releases the lock however that holder ends, and the operator's interrupt or the enclosing runner's bound ends a hung one
   const held = new Promise<'held'>((hold) => {
     child.stdout.setEncoding('utf8').on('data', (text: string) => {
       stdout += text;
@@ -248,6 +249,7 @@ async function holdLock(path: string): Promise<() => Promise<void>> {
   child.stderr.setEncoding('utf8').on('data', (text: string) => {
     stderr += text;
   });
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: perl ends on its stdin's EOF, which release() sends, or on its lock wait's end above; it waits on no other process but the lock's holder
   const ended = new Promise<string>((end) => {
     child.once('error', (error) => end(`perl could not start: ${error.message}`));
     child.once('close', (code, signal) => end(`perl exited with ${code ?? signal}: ${stderr.trim()}`));

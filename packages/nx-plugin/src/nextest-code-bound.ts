@@ -165,6 +165,7 @@ async function main(argv: readonly string[]): Promise<never> {
     process.on(signal, handler);
     return { signal, handler };
   });
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a nextest run, its signals forwarded, lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
   const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((settle) => {
     child.once('error', (error) => {
       process.stderr.write(`nextest-code-bound: could not start ${binary}: ${error.message}\n`);

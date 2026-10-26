@@ -139,6 +139,7 @@ let missingBiomeReported = false;
 export function formatJsonWithBiome(path: string, text: string): string {
   const absolute = resolve(path);
   const cwd = nearestExistingDirectory(dirname(absolute));
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: biome formats the text on its stdin and exits; it waits on no other process
   const child = spawnSync(biomeBinary(cwd), biomeHookArguments(absolute), { cwd, input: text, encoding: 'utf8' });
   if (child.error) {
     if ('code' in child.error && child.error.code === 'ENOENT') {

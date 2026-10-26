@@ -638,6 +638,7 @@ function git(
   root: string,
   args: readonly string[],
 ): { readonly status: number; readonly stdout: string; readonly stderr: string } {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git query whose length is its own read of this repository: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const result = spawnSync('git', args, {
     cwd: root,
     encoding: 'utf8',

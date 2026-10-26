@@ -103,6 +103,7 @@ export function holdLease(
   const promise = new Promise<HeldLease>((settled) => {
     resolve = settled;
   });
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a unix-socket connect completes or fails at once; the request's ack is bounded by bounds.ackMs and then bounds.afterCloseMs, and a queued lease's grant by bounds.grantMs, or by nothing for CPU tokens, which have no admission deadline (05_gateway.md, "Host CPU budget")
   const connection = connect(socket);
   // `closed` is made when a consumer reads it, so a lease nobody watches allocates no promise. The
   // flag, not `connection.destroyed`, says the socket really closed: `destroy()` sets that flag before
@@ -196,7 +197,8 @@ export function holdLease(
         get closed() {
           closed ??= socketClosed
             ? Promise.resolve()
-            : new Promise<void>((done) => connection.once('close', () => done()));
+            : // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a held lease's connection lasts as long as its holder keeps it; release() destroys it on this side, and the gateway's own end closes it too
+              new Promise<void>((done) => connection.once('close', () => done()));
           return closed;
         },
       });

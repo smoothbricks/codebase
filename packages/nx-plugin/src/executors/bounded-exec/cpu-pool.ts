@@ -607,6 +607,7 @@ export async function createCpuPool(
         socket.destroy();
       }
       if (listening) {
+        // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: every accepted socket was destroyed just above, so the server closes without waiting on a peer
         await new Promise<void>((done) => {
           server.close((error) => {
             if (error) {

@@ -164,6 +164,7 @@ async function runCompiler(invocation: CompilerInvocation): Promise<boolean> {
     windowsHide: true,
   });
   try {
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a TypeScript emit lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
     await once(child, 'exit');
     return child.exitCode === 0 && child.signalCode === null;
   } catch (error) {

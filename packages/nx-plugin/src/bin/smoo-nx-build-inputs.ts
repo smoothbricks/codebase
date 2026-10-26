@@ -40,6 +40,7 @@ function flag(name: string): string {
 }
 
 function run(command: string, args: readonly string[]): string {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: cargo metadata --offline --no-deps reads the workspace's manifests and resolves nothing, so it takes no package-cache lock and waits on no other process; the enclosing build's runner bound or the operator's interrupt ends a hung one
   const result = spawnSync(command, args, { encoding: 'utf8' });
   if (result.error !== undefined || result.status !== 0) {
     fail(`${command} ${args.join(' ')} in ${process.cwd()}: ${result.error?.message ?? result.stderr.trim()}`);

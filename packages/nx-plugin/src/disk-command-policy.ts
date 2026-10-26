@@ -57,6 +57,7 @@ export function directDiskCommands(source: string, path = ''): number[] {
 
 /** Scan tracked code, tests and scripts, never build output, prose or recorded benchmark data. */
 export function checkDiskCommandBoundary(root: string): string[] {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git file listing whose length is its own read of this repository: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], {
     cwd: root,
     encoding: 'utf8',
