@@ -164,7 +164,6 @@ fn refused(workspace: &str, wanted: Holding, holder: Option<&Holder>) -> Cowshed
 mod tests {
     use super::*;
     use crate::temp_root::TempRoot;
-    #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::ChildBackstop as _;
     use std::fs;
 
@@ -197,78 +196,97 @@ mod tests {
             .expect("the lease is free once its holder drops it");
     }
 
-    /// BSD `lockf(1)` takes the same `flock(2)`; Linux ships no such command.
-    #[cfg(target_os = "macos")]
+    /// Names the sessions directory this test binary holds a lease in when it runs as
+    /// [`lease_holder_helper`].
+    const HELD_LEASE_ENV: &str = "COWSHED_TEST_HELD_LAND_LEASE_SESSIONS";
+
+    /// Not a test of its own: the other process of
+    /// [`a_killed_holder_releases_the_lease`]. Run as this binary with [`HELD_LEASE_ENV`]
+    /// set, it takes that lease through [`take`] as a land takes it, says `held` on
+    /// stderr, and holds it until its stdin closes. Run any other way it does nothing.
+    #[test]
+    fn lease_holder_helper() {
+        use std::io::Write as _;
+        let Some(sessions) = std::env::var_os(HELD_LEASE_ENV) else {
+            return;
+        };
+        let _held = take(Path::new(&sessions), "topic", Holding::Land).expect("take the lease");
+        // On stderr, which libtest neither captures nor frames: the lease is held from here.
+        std::io::stderr()
+            .write_all(b"held\n")
+            .expect("say the lease is held");
+        // Held in the parent's custody: its stdin closing -- the parent letting go, or the
+        // parent's own death closing the pipe -- ends this helper and releases the lease.
+        std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("wait for the release");
+    }
+
     #[test]
     fn a_killed_holder_releases_the_lease() {
         use cowshed_os::fork_lock::Spawn as _;
-        use std::os::unix::process::CommandExt as _;
+        use std::io::BufRead as _;
         use std::process::{Command, Stdio};
-        use std::thread;
-        use std::time::Duration;
         let (_root, sessions) = sessions();
         let lease = lease_path(&sessions, "topic");
-        // `lockf -k` takes flock(2) on the lease and runs `cat` as its child; the child inherits
-        // the locked descriptor and reads lockf's stdin, a pipe `holder` holds, so it runs until
-        // the kill. Killing the whole process group ends both, as a killed land's tree.
-        let mut holder = Command::new("/usr/bin/lockf")
-            .arg("-k")
-            .arg(&lease)
-            .arg("/bin/cat")
+
+        // A lease flocked with no record in it refuses a taker, naming no holder.
+        {
+            let bare = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lease)
+                .expect("the lease file");
+            bare.lock().expect("flock the lease with no record");
+            let refusal = take(&sessions, "topic", Holding::Remove)
+                .expect_err("a flocked lease admitted a taker");
+            assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+            assert!(
+                !refusal.message.contains("pid "),
+                "a lease with no record named a holder: {refusal}"
+            );
+        }
+
+        let mut holder = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "runtime::land_lease::tests::lease_holder_helper",
+                "--nocapture",
+            ])
+            .env(HELD_LEASE_ENV, &sessions)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
+            .stderr(Stdio::piped())
             .spawn_locked()
-            .expect("spawn lockf");
-
-        // Until lockf locks, a taker can win; a win writes its own record, so empty the file again
-        // and release, and retry. Once the child holds the lock, a taker is refused with no record.
+            .expect("spawn the lease holder");
+        let pid = holder.id();
+        let mut said = std::io::BufReader::new(holder.stderr.take().expect("the holder's stderr"));
+        let mut transcript = String::new();
         loop {
-            if let Some(status) = holder.try_wait().expect("poll lockf") {
-                panic!("lockf exited ({status}) before it held the lease");
-            }
-            match take(&sessions, "topic", Holding::Remove) {
-                Ok(won) => {
-                    fs::write(&lease, b"").expect("empty the record this taker wrote");
-                    drop(won);
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(refusal) => {
-                    assert!(
-                        refusal.message.contains("its record cannot be read"),
-                        "the held lease was refused without a record: {refusal}"
-                    );
-                    break;
-                }
+            let start = transcript.len();
+            let read = said
+                .read_line(&mut transcript)
+                .expect("the holder's stderr");
+            assert_ne!(
+                read, 0,
+                "the lease holder ended before it held the lease; it said: {transcript}"
+            );
+            if transcript[start..].trim_end() == "held" {
+                break;
             }
         }
 
-        let group = libc::pid_t::try_from(holder.id()).expect("a pid fits pid_t");
-        // SAFETY: `holder` leads its own process group (`process_group(0)`), so its pid names the
-        // group; SIGKILL to that group ends lockf and the `cat` child that holds the descriptor.
-        let killed = unsafe { libc::killpg(group, libc::SIGKILL) };
-        assert_eq!(killed, 0, "kill the lockf process group");
-        // `cat` reads this pipe: reaping lockf must not end it, only the kill may.
-        let held = holder.stdin.take();
-        holder.wait_bounded().expect("reap lockf");
+        // Held through the production record: the refusal names the holder process.
+        let refusal = take(&sessions, "topic", Holding::Remove)
+            .expect_err("a held lease admitted a second taker");
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+        assert!(
+            refusal.message.contains(&format!("pid {pid}")),
+            "the refusal did not name the holder: {refusal}"
+        );
 
-        // The lock drops when the `cat` child's descriptor closes, a moment after the kill.
-        loop {
-            match take(&sessions, "topic", Holding::Remove) {
-                Ok(released) => {
-                    drop(released);
-                    drop(held);
-                    break;
-                }
-                Err(refusal) => {
-                    assert!(
-                        refusal.message.contains("its record cannot be read"),
-                        "the killed holder's lease was refused with a record: {refusal}"
-                    );
-                    thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
+        holder.kill().expect("kill the holder");
+        holder.wait_bounded().expect("reap the holder");
+        take(&sessions, "topic", Holding::Remove)
+            .expect("a killed holder's lease is free to the next taker");
     }
 }
