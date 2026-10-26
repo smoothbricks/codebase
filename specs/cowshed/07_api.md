@@ -1364,11 +1364,16 @@ sessions, including after the parent exits, does not change membership.
 Terminal retirement signals the cgroup's observed members through pidfds, grants TERM one grace deadline, then writes
 `cgroup.kill` if membership remains. The job seals only after `cgroup.events` reads `populated 0`; `poll(POLLPRI)` wakes
 that wait, never a periodic timer. Retained member pidfds are then joined with `poll(POLLIN)` too: Linux's `cgroup_exit`
-precedes `exit_notify`, so the empty-cgroup notification can precede pidfd readability. The terminal receipt reports
-kernel containment only after those proofs. `cgroup.kill` requires Linux 5.14; the supervisor's peer-pidfd protocol sets
-the overall floor at Linux 6.5 (11_shell.md). Below the relevant capability floor, missing interfaces or failed
-peer-pidfd acquisition are operational refusals, never a downgrade to process groups. Linux acceptance must run in a
-delegated scope on a real Linux kernel; compilation or a Darwin run is not evidence of Linux exit behavior.
+precedes `exit_notify`, so the empty-cgroup notification can precede pidfd readability. Both waits after the kill share
+one reap-class deadline (05_gateway.md, "Deadlines", 5 s), and finalization's pidfd join takes the same bound. Past it
+retirement fails `TIMEOUT` (`CgroupError::Unreaped`) naming the cgroup and each member still alive with its pid, image
+and kernel state: a member in an uninterruptible kernel wait (`D`), which SIGKILL ends only once its call returns, is
+named as such and left as it is. The job then keeps its claims and stays nonterminal, and an explicit retry retires it
+once that member has exited. The terminal receipt reports kernel containment only after those proofs. `cgroup.kill`
+requires Linux 5.14; the supervisor's peer-pidfd protocol sets the overall floor at Linux 6.5 (11_shell.md). Below the
+relevant capability floor, missing interfaces or failed peer-pidfd acquisition are operational refusals, never a
+downgrade to process groups. Linux acceptance must run in a delegated scope on a real Linux kernel; compilation or a
+Darwin run is not evidence of Linux exit behavior.
 
 The actor retains the admitted cgroup even before spawn. After terminal sampling it reads final counters, checks the
 directory identity, and removes the empty hierarchy before releasing the claim. This does not depend on the last exec

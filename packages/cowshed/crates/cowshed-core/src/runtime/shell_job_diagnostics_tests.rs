@@ -306,7 +306,9 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
             .expect("stdout closes without a launch");
         assert!(stdout_bytes.is_empty());
         #[cfg(target_os = "linux")]
-        cgroup.finish().expect("remove the refused empty admission");
+        cgroup
+            .finish(cowshed_os::deadline::REAP)
+            .expect("remove the refused empty admission");
     });
     println!("COWSHED_DIAGNOSTICS_VERIFIED");
 }

@@ -2620,11 +2620,20 @@ impl SpawnSink for SystemSpawnSink {
 
 #[cfg(target_os = "linux")]
 pub(super) fn cgroup_error(error: super::job_cgroup::CgroupError) -> CowshedError {
-    CowshedError::environment_missing(
-        format!("job cgroup containment: {error}"),
-        "run the supervisor in a delegated cgroup v2 scope (Delegate=yes), with writable \
-         cgroup.procs, cgroup.subtree_control and cgroup.kill; Linux 6.5+ is required",
-    )
+    let hint = match &error {
+        // Retirement's own wait expired: the delegation is fine, a member outlived its kill.
+        super::job_cgroup::CgroupError::Unreaped(_) => {
+            "a member that outlives SIGKILL is in an uninterruptible kernel wait, which ends only \\
+             when that call returns: read its kernel stack (/proc/<pid>/stack, as root) for what \\
+             it waits on; the job keeps its claims, and killing it again retires it once the \\
+             member has exited"
+        }
+        _ => {
+            "run the supervisor in a delegated cgroup v2 scope (Delegate=yes), with writable \\
+             cgroup.procs, cgroup.subtree_control and cgroup.kill; Linux 6.5+ is required"
+        }
+    };
+    CowshedError::environment_missing(format!("job cgroup containment: {error}"), hint)
 }
 
 #[cfg(target_os = "linux")]
@@ -2633,7 +2642,7 @@ fn refused_cgroup(
     cgroup: Option<&super::job_cgroup::JobCgroup>,
 ) -> CowshedError {
     if let Some(cgroup) = cgroup
-        && let Err(cleanup) = cgroup.finish()
+        && let Err(cleanup) = cgroup.finish(cowshed_os::deadline::REAP)
     {
         refusal.message.push_str(&format!(
             "; removing the unstarted job's cgroup also failed: {cleanup}"
@@ -4831,7 +4840,9 @@ fn retire_dropped_jobs(
         }
         #[cfg(target_os = "linux")]
         if let Some(cgroup) = &job.cgroup {
-            let retired = cgroup.retire(grace).and_then(|_| cgroup.finish());
+            let retired = cgroup
+                .retire(grace, cowshed_os::deadline::REAP)
+                .and_then(|_| cgroup.finish(cowshed_os::deadline::REAP));
             match retired {
                 Ok(_) => {
                     jobs.remove(&id);
@@ -7683,7 +7694,9 @@ impl SupervisorActor {
             }
             tokio::spawn(async move {
                 let retirement = tokio::task::spawn_blocking(move || {
-                    let members = cgroup.retire(grace).map_err(cgroup_error)?;
+                    let members = cgroup
+                        .retire(grace, cowshed_os::deadline::REAP)
+                        .map_err(cgroup_error)?;
                     Ok(JobProcessRetirement {
                         containment: crate::api::process::JobContainment::Kernel,
                         outlived: members
@@ -7929,7 +7942,7 @@ impl SupervisorActor {
         if let Some(cgroup) = &job.cgroup {
             // Final accounting precedes removing the hierarchy. A refused finish retains all
             // claims and remains nonterminal; only an explicit request retries retirement.
-            if let Err(error) = cgroup.finish() {
+            if let Err(error) = cgroup.finish(cowshed_os::deadline::REAP) {
                 self.refuse_membership(job_id, cgroup_error(error), RetirementRun::Requested);
                 return;
             }

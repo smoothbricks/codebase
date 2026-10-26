@@ -33,7 +33,7 @@
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::chown;
-use std::os::unix::process::ExitStatusExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
@@ -50,7 +50,9 @@ use cowshed_core::runtime::job_cgroup::{
 use cowshed_core::runtime::supervisor::{
     SpawnSink as _, SystemSpawnSink, WorkspaceAuthoritySnapshot,
 };
+use cowshed_os::deadline::{Bound, LatencyClass, REAP};
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::process::RunState;
 use serde::{Deserialize, Serialize};
 
 const ROLE: &str = "COWSHED_JOB_CGROUP_ROLE";
@@ -572,6 +574,7 @@ fn control() {
     retirement_waits_for_the_last_process(&jobs);
     restart_lookup_keeps_the_identity_under_its_incarnation(&authority, &jobs);
     escapees_die_with_their_job(&authority);
+    an_unending_member_is_named_past_the_reap_bound(&authority);
     admission_refuses_what_it_cannot_contain(&authority);
 
     // Leave the scope as admission found it.
@@ -1265,7 +1268,7 @@ fn kill_reaches_the_escapee(
         "{scenario}: the job holds live processes before the kill"
     );
 
-    job.kill_and_wait()
+    job.kill_and_wait(REAP)
         .unwrap_or_else(|error| panic!("{scenario}: kill and wait: {error}"));
     // The wait joined the exit of every process the kill ended, so both pidfds are readable now:
     // the kernel's exit event, which an empty `cgroup.events` alone can precede.
@@ -1288,8 +1291,8 @@ fn kill_reaches_the_escapee(
         "{scenario}: no process is left in cgroup.procs after the kill"
     );
     let (receipt, concurrent) = std::thread::scope(|scope| {
-        let first = scope.spawn(|| job.retire(Duration::ZERO).expect("retire"));
-        let second = scope.spawn(|| job.retire(Duration::ZERO).expect("concurrent retire"));
+        let first = scope.spawn(|| job.retire(Duration::ZERO, REAP).expect("retire"));
+        let second = scope.spawn(|| job.retire(Duration::ZERO, REAP).expect("concurrent retire"));
         (
             first.join().expect("first retire"),
             second.join().expect("second retire"),
@@ -1311,7 +1314,7 @@ fn kill_reaches_the_escapee(
             .permissions();
         std::fs::set_permissions(job.path(), std::fs::Permissions::from_mode(0o0))
             .expect("deny final counter reads");
-        let refused = job.finish();
+        let refused = job.finish(REAP);
         std::fs::set_permissions(job.path(), permissions).expect("restore job permissions");
         assert!(
             refused.is_err(),
@@ -1319,7 +1322,7 @@ fn kill_reaches_the_escapee(
         );
     }
     let retried = job
-        .retire(Duration::ZERO)
+        .retire(Duration::ZERO, REAP)
         .expect("retry after refused finalization");
     assert!(
         Arc::ptr_eq(&receipt, &retried),
@@ -1554,8 +1557,7 @@ fn a_vanished_cgroup_refuses_kill_and_wait() {
     std::fs::remove_dir(job.path()).expect("remove the empty cgroup");
     let refused = [
         ("kill", job.kill()),
-        ("wait_empty", job.wait_empty()),
-        ("kill_and_wait", job.kill_and_wait()),
+        ("kill_and_wait", job.kill_and_wait(REAP)),
     ];
     let path = job.path().display().to_string();
     for (call, result) in refused {
@@ -1565,6 +1567,95 @@ fn a_vanished_cgroup_refuses_kill_and_wait() {
             "{call} names the cgroup that vanished: {error}"
         );
     }
+}
+
+/// A member the kill never ends holds `kill_and_wait` for at most its reap bound, and the failure
+/// names it with its pid, image and kernel state (05_gateway.md "Deadlines"; 07_api.md
+/// "Complete job accounting and observation reconciliation"). The case it stands for is a member
+/// in an uninterruptible kernel call, which SIGKILL reaches only once that call returns; no
+/// unprivileged fixture can hold a process there. So the fixture holds the other half of the
+/// same bounded wait: a member retirement pinned, whose exit never comes. It ignores SIGTERM, so
+/// `terminate` pins it without ending it, and is then moved out of the job: the cgroup reads
+/// empty, and the pinned pidfd stays unreadable.
+fn an_unending_member_is_named_past_the_reap_bound(authority: &CgroupAuthority) {
+    let jobs = authority
+        .incarnation(&incarnation(11))
+        .expect("incarnation");
+    let job = jobs.admit(job_id(1)).expect("admit");
+    let mut command = workload_command(&Workload {
+        pause: true,
+        ..Workload::default()
+    });
+    job.placement().expect("placement").on_exec(&mut command);
+    // SAFETY: signal(2) is async-signal-safe; an ignored disposition survives exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut member = Spawned::spawn(command);
+    member.await_pause();
+    let pid = member.child.id();
+    job.terminate()
+        .expect("pin the member with a TERM it ignores");
+    let leaf = own_cgroup_path().join("cgroup.procs");
+    std::fs::write(&leaf, pid.to_string())
+        .unwrap_or_else(|error| panic!("move {pid} into {}: {error}", leaf.display()));
+    assert!(
+        !job.populated().expect("populated"),
+        "the job holds no process once its member moved out"
+    );
+
+    let bound = Bound::new(LatencyClass::Reap, Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let refused = job
+        .kill_and_wait(bound)
+        .expect_err("a member whose exit never comes is never reported reaped");
+    let waited = started.elapsed();
+    let CgroupError::Unreaped(expired) = &refused else {
+        panic!("an expiry naming the member, not {refused:?}");
+    };
+    assert!(
+        waited >= bound.within,
+        "the member had its whole bound: {waited:?}"
+    );
+    assert_eq!(expired.bound, bound.within);
+    assert_eq!(expired.peer.cgroup, job.path());
+    let members = expired
+        .peer
+        .members
+        .as_ref()
+        .expect("the members were read");
+    assert_eq!(
+        members.iter().map(|live| live.peer.pid).collect::<Vec<_>>(),
+        [pid],
+        "the expiry names the member whose exit never came"
+    );
+    assert_eq!(
+        members[0].peer.state,
+        RunState::Sleeping,
+        "it waits on its stdin"
+    );
+    assert_eq!(
+        members[0].image.as_deref(),
+        test_binary().to_str(),
+        "the expiry names the member's image"
+    );
+    let message = refused.to_string();
+    assert!(
+        message.starts_with("TIMEOUT: job cgroup kill on job cgroup ")
+            && message.contains(&format!("pid {pid} (sleeping)")),
+        "{message}"
+    );
+
+    member.resume();
+    member.finish();
+    job.retire(Duration::ZERO, REAP)
+        .expect("retire once the member has exited");
+    job.finish(REAP).expect("finish the empty job");
 }
 
 /// The actor can finalize while a late host release still holds an Arc and a placement fd.
@@ -1579,11 +1670,11 @@ fn shared_finalization_removes_only_the_admitted_hierarchy(authority: &CgroupAut
     let placement = job.placement().expect("placement retained by a late host");
     let original = job.identity().clone();
     std::fs::create_dir(job.path().join("empty-child")).expect("an empty owned child cgroup");
-    let proof = job.retire(Duration::ZERO).expect("empty retirement");
+    let proof = job.retire(Duration::ZERO, REAP).expect("empty retirement");
     assert!(proof.members.is_empty());
     assert!(!proof.metadata_gap, "no kill ran for an empty admission");
     let totals = job
-        .finish()
+        .finish(REAP)
         .expect("finalize with shared descriptors still held");
     assert!(
         !job.path().exists(),
@@ -1594,11 +1685,13 @@ fn shared_finalization_removes_only_the_admitted_hierarchy(authority: &CgroupAut
     let replacement = jobs.admit(job_id(1)).expect("a new cgroup at the old path");
     assert_ne!(replacement.identity(), &original);
     assert_eq!(
-        late_host.finish().expect("cached final counters"),
+        late_host.finish(REAP).expect("cached final counters"),
         totals,
         "late finalization returns its own counters, never removes the replacement"
     );
-    let late_proof = late_host.retire(Duration::ZERO).expect("cached exit proof");
+    let late_proof = late_host
+        .retire(Duration::ZERO, REAP)
+        .expect("cached exit proof");
     assert!(
         Arc::ptr_eq(&proof, &late_proof),
         "late retirement never re-signals"

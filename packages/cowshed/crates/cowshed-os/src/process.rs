@@ -433,6 +433,7 @@ pub fn run_state(pid: libc::pid_t) -> RunState {
 /// held is detached from its socket file by NOTE_EXIT; Linux makes a pidfd readable in
 /// `exit_notify`, after `exit_files` and the deferred closes it queued). On Darwin it is a kqueue
 /// with the process's `NOTE_EXIT` registered once; on Linux, the process's pidfd.
+#[derive(Debug)]
 pub struct ExitWatch(std::os::fd::OwnedFd);
 
 impl ExitWatch {

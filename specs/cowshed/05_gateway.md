@@ -912,7 +912,10 @@ the handshake bound.
     (`OutputPumps`): a pipe still open then is held by a process the child started, and the run fails `TIMEOUT` naming
     the child and the stream. A failed read of either stream is a typed failure, never empty output. In both cases the
     child, and whatever holds its pipe, is left as it is. Every disk child's run takes both waits
-    (`SystemCommandRunner`).
+    (`SystemCommandRunner`). A Linux job's retirement after `cgroup.kill` is the same wait over its cgroup: the
+    empty-membership notification and each signalled member's pidfd within one reap bound, past which it fails `TIMEOUT`
+    naming every member still alive with its pid, image and kernel state (07_api.md, "Complete job accounting and
+    observation reconciliation").
 - **A short lock is a request.** A lock taken for one short critical section is waited for within its class's bound. The
   job records lock (11_shell.md, "Job control") is held for an open's recovery of the records and its scan of the job
   directories that stay, a refresh, one record-sequence allocation and its append, and a checkpoint's hash of the

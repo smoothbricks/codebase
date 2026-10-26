@@ -44,7 +44,10 @@
 //! The supervisor requires Linux 6.5 for its peer pidfd. Membership termination additionally
 //! requires `cgroup.kill` (Linux 5.14): admission opens it before a command can run, and refuses
 //! a missing or unwritable interface rather than falling back to process groups. Empty membership
-//! is proved by `cgroup.events`, read on the same descriptor watched with `poll(POLLPRI)`.
+//! is proved by `cgroup.events`, read on the same descriptor watched with `poll(POLLPRI)`. After a
+//! kill, that proof and the join of each signalled member's pidfd share one reap-class deadline
+//! (`cowshed_os::deadline::REAP`): a member still alive past it fails the wait as
+//! [`CgroupError::Unreaped`], named with its pid, image and kernel state, and is left as it is.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -58,12 +61,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use cowshed_os::deadline::{self, Bound, Deadline, Expired, Progress};
+use cowshed_os::process::ExitWatch;
+
 use crate::api::dto::JobId;
 use crate::api::resources::{
     ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, ResourceUnitError, StorageIoBytes,
     StorageIoTotals,
 };
 use crate::metadata::WorkspaceIncarnation;
+use crate::runtime::live_membership::{LiveMember, LiveMembership};
 
 /// Where the unified cgroup hierarchy is mounted.
 pub const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
@@ -174,6 +181,10 @@ pub enum CgroupError {
     },
     #[error("job cgroup {path} still holds processes: its counters are not final")]
     Populated { path: PathBuf },
+    /// The membership did not end within its reap bound: code TIMEOUT, terminal. The holder
+    /// names every member still alive with its pid, image and kernel state.
+    #[error("{0}")]
+    Unreaped(Box<Expired<LiveMembership>>),
     #[error("{path}: {detail}")]
     Malformed { path: PathBuf, detail: String },
     #[error("{path} does not exist: this kernel or this cgroup's controllers do not provide it")]
@@ -613,41 +624,15 @@ pub struct CgroupRetirement {
 #[derive(Debug)]
 struct Member {
     pid: u32,
-    handle: OwnedFd,
+    watch: ExitWatch,
     image: Option<String>,
     signal: Option<i32>,
 }
 
 impl Member {
-    fn wait_exited(&self) -> io::Result<()> {
-        let mut event = libc::pollfd {
-            fd: self.handle.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        loop {
-            // SAFETY: one retained pidfd; an indefinite event wait, never a sampling clock.
-            let ready = unsafe { libc::poll(&raw mut event, 1, -1) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if event.revents & libc::POLLIN != 0 {
-                return Ok(());
-            }
-            return Err(io::Error::other(format!(
-                "pidfd exit watch returned {}",
-                event.revents
-            )));
-        }
-    }
-
     fn exited(&self) -> io::Result<bool> {
         let mut event = libc::pollfd {
-            fd: self.handle.as_raw_fd(),
+            fd: self.watch.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -669,7 +654,7 @@ impl Member {
         if unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                self.handle.as_raw_fd(),
+                self.watch.as_raw_fd(),
                 libc::SIGTERM,
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
@@ -833,7 +818,7 @@ impl JobCgroup {
     /// Kill the complete membership atomically with respect to forks and migrations. A process
     /// in a different session or a descendant cgroup is still a member. This is not an exit proof.
     pub fn kill(&self) -> Result<()> {
-        self.issue_kill()?
+        self.issue_kill()?.1
     }
 
     /// Freeze or thaw the complete membership through `cgroup.freeze`: a job whose probation
@@ -850,10 +835,10 @@ impl JobCgroup {
     }
 
     /// [`Self::kill`] with its refusal kept apart from what failed beside it: `Err` when
-    /// cgroup.kill was not written, so nothing is known to have ended; `Ok(Err(_))` when the kill
-    /// was issued, or membership was already empty, but a membership snapshot or population read
-    /// failed around it.
-    fn issue_kill(&self) -> Result<Result<()>> {
+    /// cgroup.kill was not written, so nothing is known to have ended. Otherwise what this did to
+    /// the membership (SIGKILL, or nothing when it was already empty), with `Err` beside it when
+    /// a membership snapshot or population read failed around it.
+    fn issue_kill(&self) -> Result<(Progress, Result<()>)> {
         let members = self.members();
         let mut signalled = self
             .signalled
@@ -876,7 +861,7 @@ impl JobCgroup {
         let populated = self.populated();
         if matches!(populated, Ok(false)) {
             // Empty membership cannot fork: do not issue a kill that would need a receipt.
-            return Ok(recording.map(|_| ()));
+            return Ok((Progress::Nothing, recording.map(|_| ())));
         }
         // Diagnostic snapshot failures do not revoke the controller's authority to end the
         // complete membership. Report them after attempting the atomic kernel operation.
@@ -890,7 +875,14 @@ impl JobCgroup {
         signalled.metadata_gap = true;
         let recording = match recording {
             Ok(recording) => recording,
-            Err(error) => return Ok(Err(error)),
+            Err(error) => {
+                return Ok((
+                    Progress::Signalled {
+                        signal: libc::SIGKILL,
+                    },
+                    Err(error),
+                ));
+            }
         };
         for pid in recording {
             signalled
@@ -899,7 +891,12 @@ impl JobCgroup {
                 .expect("the pinned member remains held")
                 .signal = Some(libc::SIGKILL);
         }
-        Ok(populated.map(|_| ()))
+        Ok((
+            Progress::Signalled {
+                signal: libc::SIGKILL,
+            },
+            populated.map(|_| ()),
+        ))
     }
 
     /// Ask every currently live member to end, addressing each through a pidfd. KILL later
@@ -924,10 +921,13 @@ impl JobCgroup {
     }
 
     /// TERM the current members, grant one grace deadline, then atomically KILL any remaining
-    /// membership and join the kernel's empty notification. Successful proof is cached and shared
-    /// across explicit retries and late Drop; only one retirement runs at a time. This method does
-    /// not reap a leader, remove the hierarchy, or publish a terminal record.
-    pub fn retire(&self, grace: Duration) -> Result<Arc<CgroupRetirement>> {
+    /// membership and join the kernel's empty notification and each signalled member's exit,
+    /// both within `reap` (production: `cowshed_os::deadline::REAP`). Successful proof is cached
+    /// and shared across explicit retries and late Drop; only one retirement runs at a time. A
+    /// member that outlives `reap` fails it as [`CgroupError::Unreaped`] and is left as it is;
+    /// a retry runs the whole retirement again. This method does not reap a leader, remove the
+    /// hierarchy, or publish a terminal record.
+    pub fn retire(&self, grace: Duration, reap: Bound) -> Result<Arc<CgroupRetirement>> {
         let mut retirement = self
             .retirement
             .lock()
@@ -936,22 +936,32 @@ impl JobCgroup {
             return Ok(Arc::clone(proof));
         }
         if let Err(term) = self.terminate() {
-            let ended = self.kill_and_wait();
+            let ended = self.kill_and_wait(reap);
             return Err(CgroupError::Malformed {
                 path: self.path.clone(),
                 detail: format!("TERM refused: {term}; KILL and empty-membership join: {ended:?}"),
             });
         }
-        let deadline = Instant::now()
-            .checked_add(grace)
-            .ok_or_else(|| CgroupError::Malformed {
-                path: self.path.clone(),
-                detail: "TERM grace exceeds the monotonic clock's range".to_owned(),
-            })?;
-        if self.wait_empty_until(Some(deadline))? {
-            self.join_signalled()?;
+        let grace_ends =
+            Instant::now()
+                .checked_add(grace)
+                .ok_or_else(|| CgroupError::Malformed {
+                    path: self.path.clone(),
+                    detail: "TERM grace exceeds the monotonic clock's range".to_owned(),
+                })?;
+        let graced = self.wait_empty_within(|| {
+            Some(grace_ends.saturating_duration_since(Instant::now()))
+                .filter(|left| !left.is_zero())
+        })?;
+        if graced {
+            self.join_signalled(
+                &deadline::start("job cgroup retire", reap),
+                Progress::Signalled {
+                    signal: libc::SIGTERM,
+                },
+            )?;
         } else {
-            self.kill_and_wait()?;
+            self.kill_and_wait(reap)?;
         }
         let mut signalled = self
             .signalled
@@ -967,18 +977,9 @@ impl JobCgroup {
         collect_members(&self.directory, &self.path, &mut pids)?;
         let mut members = Vec::with_capacity(pids.len());
         for pid in pids {
-            // SAFETY: plain pid and flags; a successful syscall returns a fresh owned fd.
-            let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-            if opened < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    continue;
-                }
-                return Err(failed("pidfd_open", &self.path)(error));
-            }
-            let fd = libc::c_int::try_from(opened).expect("a kernel descriptor fits c_int");
-            // SAFETY: pidfd_open just returned this descriptor and nothing else owns it.
-            let handle = unsafe { OwnedFd::from_raw_fd(fd) };
+            let Some(watch) = ExitWatch::of(pid).map_err(failed("pidfd_open", &self.path))? else {
+                continue;
+            };
             let process = PathBuf::from(format!("/proc/{pid}"));
             let membership = match fs::read_to_string(process.join("cgroup")) {
                 Ok(membership) => membership,
@@ -1004,7 +1005,7 @@ impl JobCgroup {
             };
             let member = Member {
                 pid,
-                handle,
+                watch,
                 image,
                 signal: None,
             };
@@ -1015,34 +1016,48 @@ impl JobCgroup {
         Ok(members)
     }
 
-    /// Block until the kernel reports no live member. No clock drives this wait: cgroup.events
-    /// changes wake poll(POLLPRI), and each wake is followed by a fresh read on that descriptor.
-    pub fn wait_empty(&self) -> Result<()> {
-        self.wait_empty_until(None)?;
-        self.join_signalled()
-    }
-
     /// cgroup_exit precedes exit_notify in Linux do_exit. After populated 0, join the retained
     /// pidfds too: membership is empty, but the final pidfd notification may still be pending.
-    fn join_signalled(&self) -> Result<()> {
+    /// The join ends with `deadline`: a member whose exit has not come by then is named in
+    /// [`CgroupError::Unreaped`], with `last` the last thing this wait did to the membership.
+    fn join_signalled(&self, deadline: &Deadline, last: Progress) -> Result<()> {
         let signalled = self
             .signalled
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         for member in signalled.pinned.values() {
-            member
-                .wait_exited()
-                .map_err(failed("poll(pidfd exit)", &self.path))?;
+            loop {
+                let Some(remaining) = deadline.remaining(deadline::clock()) else {
+                    let live = signalled
+                        .pinned
+                        .values()
+                        .filter(|pinned| !matches!(pinned.exited(), Ok(true)))
+                        .map(|pinned| LiveMember::observed(pinned.pid, pinned.image.clone()))
+                        .collect();
+                    return Err(self.unreaped(deadline, Ok(live), last));
+                };
+                match member.watch.within(remaining) {
+                    Ok(true) => break,
+                    // A wake short of the exit, or a sub-millisecond rest the watch rounds to
+                    // zero, asks the deadline again.
+                    Ok(false) => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(failed("poll(pidfd exit)", &self.path)(error)),
+                }
+            }
         }
         Ok(())
     }
 
-    /// End every member and retain the cgroup until the kernel reports that every one exited. A
-    /// refused cgroup.kill write ended nothing, so it is answered at once: joining would wait on
-    /// members still running, and the caller keeps its claim for an explicit retry.
-    pub fn kill_and_wait(&self) -> Result<()> {
-        let killed = self.issue_kill()?;
-        let waited = self.wait_empty();
+    /// End every member and retain the cgroup until the kernel reports that every one exited,
+    /// within `reap` (production: `cowshed_os::deadline::REAP`). A refused cgroup.kill write
+    /// ended nothing, so it is answered at once: joining would wait on members still running,
+    /// and the caller keeps its claim for an explicit retry. A member the kill has not ended by
+    /// then, such as one in an uninterruptible kernel wait, fails the wait as
+    /// [`CgroupError::Unreaped`] naming it; it is left as it is.
+    pub fn kill_and_wait(&self, reap: Bound) -> Result<()> {
+        let (last, killed) = self.issue_kill()?;
+        let waited = self.reap_membership(&deadline::start("job cgroup kill", reap), last);
         match (killed, waited) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -1053,7 +1068,46 @@ impl JobCgroup {
         }
     }
 
-    fn wait_empty_until(&self, deadline: Option<Instant>) -> Result<bool> {
+    /// Wait for empty membership, then join every signalled member's exit, both by `deadline`.
+    fn reap_membership(&self, deadline: &Deadline, last: Progress) -> Result<()> {
+        if !self.wait_empty_within(|| deadline.remaining(deadline::clock()))? {
+            let live = self
+                .members()
+                .map(|members| {
+                    members
+                        .into_iter()
+                        .map(|member| LiveMember::observed(member.pid, member.image))
+                        .collect()
+                })
+                .map_err(|census| census.to_string());
+            return Err(self.unreaped(deadline, live, last));
+        }
+        self.join_signalled(deadline, last)
+    }
+
+    /// The expiry of `deadline` on this cgroup, holding `live`: the members still alive, or
+    /// why they could not be read.
+    fn unreaped(
+        &self,
+        deadline: &Deadline,
+        live: Result<Vec<LiveMember>, String>,
+        last: Progress,
+    ) -> CgroupError {
+        CgroupError::Unreaped(Box::new(deadline.expired(
+            LiveMembership {
+                cgroup: self.path.clone(),
+                members: live,
+            },
+            last,
+            deadline::clock(),
+        )))
+    }
+
+    /// Wait until the kernel reports no live member, for as long as `remaining` grants (`None`
+    /// once the wait's deadline has passed); whether membership emptied. No clock samples the
+    /// membership: cgroup.events changes wake ppoll(POLLPRI), clipped to what is left, and each
+    /// wake rereads that descriptor.
+    fn wait_empty_within(&self, remaining: impl Fn() -> Option<Duration>) -> Result<bool> {
         let fd = open_at(self.directory.as_raw_fd(), c"cgroup.events", libc::O_RDONLY)
             .map_err(failed_in("open", &self.path, "cgroup.events"))?;
         let mut file = fs::File::from(fd);
@@ -1070,32 +1124,22 @@ impl JobCgroup {
             if !populated(&self.path, &text)? {
                 return Ok(true);
             }
-            let remaining =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-            if remaining == Some(Duration::ZERO) {
+            let Some(remaining) = remaining() else {
                 return Ok(false);
-            }
-            let timeout = remaining.map(|remaining| libc::timespec {
+            };
+            let timeout = libc::timespec {
                 tv_sec: libc::time_t::try_from(remaining.as_secs()).unwrap_or(libc::time_t::MAX),
                 tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
-            });
+            };
             let mut event = libc::pollfd {
                 fd: file.as_raw_fd(),
                 events: libc::POLLPRI,
                 revents: 0,
             };
-            // SAFETY: one live descriptor, optional valid timeout, and no signal-mask change.
-            // The optional timeout is the single TERM grace deadline, never a sampling period.
-            let answer = unsafe {
-                libc::ppoll(
-                    &raw mut event,
-                    1,
-                    timeout
-                        .as_ref()
-                        .map_or(std::ptr::null(), std::ptr::from_ref),
-                    std::ptr::null(),
-                )
-            };
+            // SAFETY: one live descriptor, a valid timeout, and no signal-mask change. The timeout
+            // is what is left of the wait's one deadline, never a sampling period.
+            let answer =
+                unsafe { libc::ppoll(&raw mut event, 1, &raw const timeout, std::ptr::null()) };
             if answer < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -1111,7 +1155,7 @@ impl JobCgroup {
                     detail: format!("membership watch closed (poll revents {})", event.revents),
                 });
             }
-            // A timeout also rereads the kernel's state before it decides the grace expired.
+            // A timeout also rereads the kernel's state before it decides the deadline passed.
             // POLLERR accompanies POLLPRI on cgroup.events and is not a failed observation.
         }
     }
@@ -1119,8 +1163,9 @@ impl JobCgroup {
     /// Collect final counters and remove an empty job's hierarchy without requiring the exec
     /// host's last Arc to have dropped. The actor calls this after its terminal sample, before
     /// releasing the claim. Descriptors retained by a late host release then name a removed
-    /// cgroup, never a newly admitted job that happens to reuse the path.
-    pub fn finish(&self) -> Result<JobCgroupTotals> {
+    /// cgroup, never a newly admitted job that happens to reuse the path. The join of signalled
+    /// members' exits ends within `reap` (production: `cowshed_os::deadline::REAP`).
+    pub fn finish(&self, reap: Bound) -> Result<JobCgroupTotals> {
         let mut retirement = self
             .retirement
             .lock()
@@ -1133,7 +1178,10 @@ impl JobCgroup {
                 path: self.path.clone(),
             });
         }
-        self.join_signalled()?;
+        self.join_signalled(
+            &deadline::start("job cgroup finish", reap),
+            Progress::Nothing,
+        )?;
         if retirement.proof.is_none() {
             let proof = self
                 .signalled

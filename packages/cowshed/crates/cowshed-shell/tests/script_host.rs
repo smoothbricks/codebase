@@ -324,7 +324,8 @@ impl Host {
     #[cfg(target_os = "linux")]
     fn retire_jobs(&mut self) -> std::io::Result<()> {
         for job in self.jobs.get_mut().drain(..) {
-            job.kill_and_wait().map_err(std::io::Error::other)?;
+            job.kill_and_wait(cowshed_os::deadline::REAP)
+                .map_err(std::io::Error::other)?;
             job.terminal()
                 .map_err(|refused| std::io::Error::other(refused.error))?
                 .retire()
@@ -1384,7 +1385,8 @@ fn linux_argv_and_scripts_enter_the_job_cgroup_without_leaking_placement() {
             signaled(Some(&read_exit(host.control()))),
             Some(libc::SIGKILL)
         );
-        job.wait_empty().expect("kernel confirms the job is empty");
+        job.kill_and_wait(cowshed_os::deadline::REAP)
+            .expect("kernel confirms the job is empty");
         let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
         assert_eq!(
             stdout, membership,
