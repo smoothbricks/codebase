@@ -494,6 +494,7 @@
       "dependencies": {
         "@smoothbricks/cli": "workspace:*",
         "@smoothbricks/failure-summary": "workspace:*",
+        "@smoothbricks/validation": "workspace:*",
         "typia": "15.2.1",
       },
     },
