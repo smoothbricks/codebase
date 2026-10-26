@@ -909,6 +909,12 @@ the handshake bound.
     empty-membership notification and each signalled member's pidfd within one reap bound, past which it fails `TIMEOUT`
     naming every member still alive with its pid, image and kernel state (07_api.md, "Complete job accounting and
     observation reconciliation").
+    - **A child whose output is its progress has a silence bound, not a total.** A long-running command whose stdout and
+      stderr show its work runs under `cowshed-os::deadline::run_to_log`: both streams are appended to its log as they
+      come, and each chunk restarts its silence bound, which its caller names. A child that writes nothing for that
+      silence fails `SILENT`, naming its pid, the state the kernel shows it in and the bytes it wrote; it is sent
+      `SIGTERM` and reaped within the reap bound, and collected later past it. A child that ends its streams is reaped
+      within the reap bound and its status answers.
   - **The gateway's drain reaps its Nx backends within one reap bound.** Once nothing is in flight, the drain sends
     `SIGTERM` to every Nx cache backend it started and waits for all of them within one reap bound
     (`cowshed-os::deadline::reap_async`). The actor is therefore parked at most that long, and the drain ends inside

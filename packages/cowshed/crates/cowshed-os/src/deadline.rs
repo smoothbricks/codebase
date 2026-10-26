@@ -288,6 +288,8 @@ impl From<RunError> for io::Error {
             RunError::Spawn { source, .. } => source,
             RunError::Reap(failure) => failure.into(),
             RunError::Output(failure) => failure.into(),
+            silent @ RunError::Silent(_) => io::Error::new(io::ErrorKind::TimedOut, silent),
+            RunError::Log { source, .. } => source,
         }
     }
 }
@@ -770,6 +772,19 @@ pub enum RunError {
     Reap(#[from] ReapError),
     #[error(transparent)]
     Output(#[from] OutputError),
+    /// A run whose output is its heartbeat ([`run_to_log`]) wrote nothing for its silence
+    /// (code `SILENT`, terminal).
+    #[error("{0}")]
+    Silent(Box<Silent<ChildPeer>>),
+    /// The run's output could not be written to its log (code `IO`).
+    #[error("{op}: writing the output of {role} pid {pid} to its log failed: {source}")]
+    Log {
+        op: &'static str,
+        role: &'static str,
+        pid: u32,
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl RunError {
@@ -779,6 +794,8 @@ impl RunError {
             Self::Spawn { .. } => "IO",
             Self::Reap(failure) => failure.code(),
             Self::Output(failure) => failure.code(),
+            Self::Silent(_) => "SILENT",
+            Self::Log { .. } => "IO",
         }
     }
 }
@@ -817,6 +834,105 @@ pub fn output_within(
         status,
         stdout,
         stderr,
+    })
+}
+
+/// Run `command`, `role` to this process, with its stdout and stderr appended to `log` as they
+/// come, for as long as it keeps writing: each chunk restarts `silence` ([`idle`]). A long run has
+/// no total ceiling; its output is its heartbeat (specs/cowshed/05_gateway.md, "Deadlines"). A
+/// child that writes nothing for `silence` fails `SILENT`, naming it, its pid, its kernel state
+/// and the bytes it wrote; it is sent SIGTERM and reaped within [`REAP`], and collected later past
+/// that. Otherwise its status, once both streams have ended and it is reaped within [`REAP`]. Its
+/// stdin is null.
+pub fn run_to_log(
+    role: &'static str,
+    command: &mut std::process::Command,
+    mut log: std::fs::File,
+    silence: Duration,
+) -> Result<ExitStatus, RunError> {
+    use crate::fork_lock::Spawn as _;
+    use std::io::Write as _;
+    const OP: &str = "run to log";
+
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .map_err(|source| RunError::Spawn {
+            op: OP,
+            role,
+            source,
+        })?;
+    let pid = child.id();
+    let pumps = OutputPumps::start(&mut child);
+    let mut open = pumps.started.len();
+    let mut heard = idle(OP, silence);
+    let mut written = 0_u64;
+    let failure = loop {
+        if open == 0 {
+            break None;
+        }
+        let wait = heard.remaining(clock()).unwrap_or_default();
+        match pumps.pumped.recv_timeout(wait) {
+            Ok(Pumped::Chunk(_, bytes)) => {
+                if let Err(source) = log.write_all(&bytes) {
+                    break Some(RunError::Log {
+                        op: OP,
+                        role,
+                        pid,
+                        source,
+                    });
+                }
+                written += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                heard.observe(Progress::Received { bytes: written }, clock());
+            }
+            Ok(Pumped::End(_)) => open -= 1,
+            Ok(Pumped::Failed(stream, source)) => {
+                break Some(RunError::Output(OutputError::Read {
+                    op: OP,
+                    role,
+                    pid,
+                    stream,
+                    source,
+                }));
+            }
+            // The timer's tick can wake the wait a hair early; only a spent silence is silent.
+            Err(mpsc::RecvTimeoutError::Timeout) if heard.remaining(clock()).is_some() => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                break Some(RunError::Silent(Box::new(
+                    heard.silent(ChildPeer::observed(role, pid), clock()),
+                )));
+            }
+            // Every pump has ended and said so.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+        }
+    };
+    let reap_budget = start(OP, REAP);
+    let reaped = match failure {
+        None => reap(
+            role,
+            &mut child,
+            &reap_budget,
+            Progress::State("output ended"),
+        ),
+        Some(failure) => {
+            if let Ok(target) = libc::pid_t::try_from(pid) {
+                // SAFETY: `target` is this process's own unreaped child.
+                unsafe { libc::kill(target, libc::SIGTERM) };
+            }
+            let signalled = Progress::Signalled {
+                signal: libc::SIGTERM,
+            };
+            if reap(role, &mut child, &reap_budget, signalled).is_err() {
+                collect_later(role, child);
+            }
+            return Err(failure);
+        }
+    };
+    reaped.map_err(|failure| {
+        collect_later(role, child);
+        RunError::Reap(failure)
     })
 }
 
@@ -1629,7 +1745,9 @@ mod tests {
             RunError::Reap(ReapError::Expired(expired))
             | RunError::Output(OutputError::Held { expired, .. }) => Some(expired.peer.pid),
             RunError::Reap(ReapError::Wait { pid, .. })
-            | RunError::Output(OutputError::Read { pid, .. }) => Some(*pid),
+            | RunError::Output(OutputError::Read { pid, .. })
+            | RunError::Log { pid, .. } => Some(*pid),
+            RunError::Silent(silent) => Some(silent.holder.pid),
         }
     }
 
@@ -1831,6 +1949,77 @@ mod tests {
         )
         .expect("the third look collects");
         assert_eq!(collected, 7);
+    }
+
+    /// A log file of this test's own, removed on every exit path.
+    struct LogFile(std::path::PathBuf);
+
+    impl LogFile {
+        fn new(label: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "cowshed-run-log-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_nanos())
+            )))
+        }
+
+        fn create(&self) -> std::fs::File {
+            std::fs::File::create(&self.0).expect("create the log")
+        }
+    }
+
+    impl Drop for LogFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_run_to_log_appends_both_streams_and_answers_the_exit() {
+        let log = LogFile::new("exit");
+        let status = run_to_log(
+            "probe command",
+            std::process::Command::new("/bin/sh").args(["-c", "echo out; echo err >&2; exit 3"]),
+            log.create(),
+            REAP.within,
+        )
+        .expect("sh writes and exits");
+        assert_eq!(status.code(), Some(3));
+        let written = std::fs::read_to_string(&log.0).expect("read the log");
+        assert!(
+            written.contains("out\n") && written.contains("err\n"),
+            "{written:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_to_log_that_goes_silent_fails_naming_the_child_and_is_ended() {
+        let log = LogFile::new("silent");
+        let failure = run_to_log(
+            "probe command",
+            std::process::Command::new("/bin/sh").args(["-c", "echo started; exec sleep 600"]),
+            log.create(),
+            Duration::from_millis(50),
+        )
+        .expect_err("sleep 600 writes nothing more within 50 ms");
+        let RunError::Silent(silent) = &failure else {
+            panic!("expected SILENT, got {failure}");
+        };
+        assert_eq!(failure.code(), "SILENT");
+        assert_eq!(silent.op, "run to log");
+        assert_eq!(silent.holder.role, "probe command");
+        assert_eq!(silent.last, Progress::Received { bytes: 8 });
+        assert_eq!(
+            crate::process::run_state(libc::pid_t::try_from(silent.holder.pid).expect("a pid")),
+            RunState::Gone,
+            "the silent child was ended and reaped"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log.0).expect("read the log"),
+            "started\n"
+        );
     }
 
     #[tokio::test]
