@@ -1130,18 +1130,21 @@ Concrete targets come from concrete files:
 - Canonical `napi` package metadata provides a host `cargo-napi` target (only when no configured triple is the host's
   own platform) and named release targets for each configured triple. macOS triples run `napi build` with the host's
   toolchain, because a macOS addon needs Apple's SDK, which zig does not carry; the napi CLI also writes the platform
-  `.d.ts`.
+  `.d.ts`. `package.json`'s `napi.targets` is the single owner of the shipped triples: when the package also ships a
+  `<binaryName>-cli` crate, each triple additionally generates a `cli-<arch>-<os>` target building that crate's
+  `<binaryName>` bin into `dist/bin/`, so no manifest restates the CLI triples or directories in per-arch entries, and
+  the package's runtime loader derives its platform rows from the same list.
 - Linux artifacts reference no build-host path. N-API addons link glibc 2.17 symbol versions and carry no RUNPATH;
   binaries a package builds for Linux, such as a CLI, build the same way. Both are built by devenv's zig through
   cargo-zigbuild, with the same command on every host. Each Linux triple's `napi-<arch>-linux` target runs the
   `@smoothbricks/nx-plugin:cargo-zigbuild` executor with `--target <triple>.2.17`, and the executor copies the cdylib to
   `dist/native/linux-<arch>-gnu/<binaryName>.linux-<arch>-gnu.node` itself: the napi CLI cannot carry the glibc suffix,
-  since it looks for the artifact under `target/<triple>.2.17/`. A package-local `cli-<arch>-linux` uses the same
-  executor with `bin` set; a static CLI targets `<arch>-unknown-linux-musl`. The executor runs `cargo-zigbuild`
-  directly, removes any compiler or linker the shell names for its triple (a Linux shell pins its host compiler for
-  `x86_64-unknown-linux-gnu`), and reads the artifact path from cargo's JSON messages. zig and cargo-zigbuild come from
-  the managed devenv module: a Linux shell carries them, a macOS shell only inside the `linux-cross` profile
-  (`tooling/devenv -P linux-cross shell -- …`).
+  since it looks for the artifact under `target/<triple>.2.17/`. A generated `cli-<arch>-linux` uses the same executor
+  with `bin` set; a static CLI targets `<arch>-unknown-linux-musl`, the musl twin of the addon's gnu triple. The
+  executor runs `cargo-zigbuild` directly, removes any compiler or linker the shell names for its triple (a Linux shell
+  pins its host compiler for `x86_64-unknown-linux-gnu`), and reads the artifact path from cargo's JSON messages. zig
+  and cargo-zigbuild come from the managed devenv module: a Linux shell carries them, a macOS shell only inside the
+  `linux-cross` profile (`tooling/devenv -P linux-cross shell -- …`).
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.

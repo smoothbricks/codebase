@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use cowshed_core::CowshedError;
 use cowshed_core::land_turn::{RepoTurns, Ticket};
+use cowshed_gateway_types::GATEWAY_EXIT_TIMEOUT;
 
 /// A loaded agent as `launchctl print` reports it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,9 +121,23 @@ pub enum Bootout {
 
 /// The latest a bootout of `agent` can finish: launchd SIGKILLs its process at the exit timeout,
 /// and its unload trails that kill by at most [`UNLOAD_GRACE`].
-pub fn bootout_deadline(agent: LoadedAgent) -> Duration {
+pub const fn bootout_deadline(agent: LoadedAgent) -> Duration {
     agent.exit_timeout.saturating_add(UNLOAD_GRACE)
 }
+
+// launchd SIGKILLs the gateway at its exit timeout and its unload trails that kill, so the
+// install's wait outlasts the kill: the equal 5 s bounds this replaced raced each other. The
+// drain's own deadline sits before that kill, which cowshed-gateway-types asserts beside the two
+// constants.
+const _: () = assert!(
+    GATEWAY_EXIT_TIMEOUT.as_nanos()
+        < bootout_deadline(LoadedAgent {
+            pid: None,
+            exit_timeout: GATEWAY_EXIT_TIMEOUT,
+        })
+        .as_nanos(),
+    "the install's wait for a bootout outlasts launchd's kill of the gateway"
+);
 
 /// Where a bootout of `agent` stands `elapsed` after it was asked, with `running` the pid of its
 /// process while that has not exited (the kernel's word: an exit has closed every descriptor the
@@ -234,7 +249,6 @@ pub fn refusal(busy: &[Busy]) -> Option<CowshedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowshed_gateway_types::{GATEWAY_DRAIN_WITHIN, GATEWAY_EXIT_TIMEOUT};
     use proptest::prelude::*;
 
     /// A `launchctl print` answer as launchd writes it: the service's properties one tab deep,
@@ -374,17 +388,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// The drain finishes before launchd's kill, and the install's wait outlasts that kill: the
-    /// equal 5 s bounds this replaces raced each other.
-    #[test]
-    fn the_drain_fits_launchd_s_kill_and_the_wait_outlasts_it() {
-        let gateway = LoadedAgent {
-            pid: Some(1),
-            exit_timeout: GATEWAY_EXIT_TIMEOUT,
-        };
-        assert!(GATEWAY_DRAIN_WITHIN < GATEWAY_EXIT_TIMEOUT);
-        assert!(GATEWAY_EXIT_TIMEOUT < bootout_deadline(gateway));
     }
 }

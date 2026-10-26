@@ -24,16 +24,8 @@ pub struct ScratchRoot {
 
 impl ScratchRoot {
     pub fn new(label: &str) -> std::io::Result<Self> {
-        static SWEPT: Mutex<bool> = Mutex::new(false);
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let mut swept = SWEPT.lock().map_err(|error| {
-            std::io::Error::other(format!("directory fixture sweep lock: {error}"))
-        })?;
-        if !*swept {
-            sweep_dead_roots()?;
-            *swept = true;
-        }
-        drop(swept);
+        sweep_dead_roots_once()?;
         let path = PathBuf::from(format!(
             "/private/tmp/{ROOT_PREFIX}{}-{}",
             std::process::id(),
@@ -66,6 +58,21 @@ fn reclaim(path: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Reclaim the dead runs' roots once per process, before this process makes or reads anything
+/// beneath `/private/tmp` under [`ROOT_PREFIX`]: a directory root, or a run's shared tree such as
+/// the CLI's checkout templates, whichever comes first. Every caller waits for the one sweep.
+pub(crate) fn sweep_dead_roots_once() -> std::io::Result<()> {
+    static SWEPT: Mutex<bool> = Mutex::new(false);
+    let mut swept = SWEPT
+        .lock()
+        .map_err(|error| std::io::Error::other(format!("directory fixture sweep lock: {error}")))?;
+    if !*swept {
+        sweep_dead_roots()?;
+        *swept = true;
+    }
+    Ok(())
 }
 
 fn sweep_dead_roots() -> std::io::Result<()> {

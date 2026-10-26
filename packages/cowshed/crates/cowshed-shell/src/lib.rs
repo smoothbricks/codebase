@@ -1347,7 +1347,6 @@ fn utf8(bytes: &[u8]) -> io::Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn only_the_exact_allowed_rc_counts_as_approved() {
@@ -1359,48 +1358,89 @@ mod tests {
         assert!(!approved(br#"{"state":{}}"#, Path::new("/w/.envrc")));
     }
 
-    /// The activated shell's PATH reaches the command unchanged (04_sandbox.md, direnv): only
-    /// the package-manager wrapper route leads it, so the toolchain the repository's shell
-    /// declares wins over the bootstrap link of the same name.
+    /// The PATH a command receives (04_sandbox.md, direnv): only the package-manager wrapper
+    /// route leads the activated PATH, so the toolchain the repository's shell declares wins over
+    /// the bootstrap link of the same name, and every other entry reaches the command as
+    /// activation left it. The returned sequence is a value: this table pins it row by row, and
+    /// tests/script_host.rs launches one real command to observe that it received this value.
+    /// Which program an entry selects is the operating system's behavior, not this table's.
     #[test]
-    fn only_the_wrapper_route_leads_the_activated_path() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn only_the_wrapper_route_leads_the_returned_path() {
+        const ROUTE: &str = "/tools/manager-bin";
 
-        let root = std::env::temp_dir().join(format!("cowshed-shell-path-{}", std::process::id()));
-        let devenv = root.join("devenv/bin");
-        let tools = root.join("tools/bin");
-        let wrappers = root.join("tools/manager-bin");
-        for (directory, program) in [(&devenv, "cargo"), (&tools, "cargo"), (&wrappers, "bun")] {
-            fs::create_dir_all(directory).unwrap();
-            let file = directory.join(program);
-            fs::write(&file, "#!/bin/sh\n").unwrap();
-            fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        struct Row {
+            /// The PATH activation left, or none when it left none.
+            activated: Option<&'static [&'static str]>,
+            /// The wrapper route the sandbox declared, or none when it declared none.
+            route: Option<&'static str>,
+            /// The PATH the command receives.
+            returned: Option<&'static [&'static str]>,
         }
-        // direnv puts the shell's additions ahead of the inherited bootstrap PATH.
-        let activated =
-            std::env::join_paths([&devenv, &wrappers, &tools, &PathBuf::from("/usr/bin")]).unwrap();
-        let host = Host {
-            environment: BTreeMap::from([
-                ("PATH".into(), activated),
-                (
-                    cowshed_core::developer_links::MANAGER_BIN_ENV.into(),
-                    wrappers.clone().into_os_string(),
-                ),
-            ]),
-        };
-        let environment = host.command_environment(&root, &[]).unwrap();
-        let path: Vec<PathBuf> = std::env::split_paths(&environment[OsStr::new("PATH")]).collect();
-        let found = |program: &str| {
-            path.iter()
-                .map(|directory| directory.join(program))
-                .find(|file| file.is_file())
-        };
-        let resolved = (found("cargo"), found("bun"));
-        fs::remove_dir_all(&root).unwrap();
-        assert_eq!(
-            resolved,
-            (Some(devenv.join("cargo")), Some(wrappers.join("bun"))),
-            "{path:?}"
-        );
+        let rows = [
+            // The route moves ahead of the toolchain, which stays ahead of the bootstrap link.
+            Row {
+                activated: Some(&["/devenv/bin", ROUTE, "/tools/bin", "/usr/bin"]),
+                route: Some(ROUTE),
+                returned: Some(&[ROUTE, "/devenv/bin", "/tools/bin", "/usr/bin"]),
+            },
+            // Already leading: nothing moves.
+            Row {
+                activated: Some(&[ROUTE, "/devenv/bin"]),
+                route: Some(ROUTE),
+                returned: Some(&[ROUTE, "/devenv/bin"]),
+            },
+            // Listed twice: it leads once.
+            Row {
+                activated: Some(&["/devenv/bin", ROUTE, "/tools/bin", ROUTE]),
+                route: Some(ROUTE),
+                returned: Some(&[ROUTE, "/devenv/bin", "/tools/bin"]),
+            },
+            // No route declared: the activated order stands, a directory named like one included.
+            Row {
+                activated: Some(&["/devenv/bin", "/tools/manager-bin", "/tools/bin"]),
+                route: None,
+                returned: Some(&["/devenv/bin", "/tools/manager-bin", "/tools/bin"]),
+            },
+            // A route and no activated PATH: the route is the PATH.
+            Row {
+                activated: None,
+                route: Some(ROUTE),
+                returned: Some(&[ROUTE]),
+            },
+            // Neither: the command has no PATH to lead.
+            Row {
+                activated: None,
+                route: None,
+                returned: None,
+            },
+        ];
+        for Row {
+            activated,
+            route,
+            returned,
+        } in rows
+        {
+            let mut environment = BTreeMap::new();
+            if let Some(entries) = activated {
+                environment.insert(
+                    OsString::from("PATH"),
+                    std::env::join_paths(entries).unwrap(),
+                );
+            }
+            if let Some(route) = route {
+                environment.insert(
+                    OsString::from(cowshed_core::developer_links::MANAGER_BIN_ENV),
+                    OsString::from(route),
+                );
+            }
+            let host = Host { environment };
+            let environment = host.command_environment(Path::new("/work"), &[]).unwrap();
+            let path: Option<Vec<PathBuf>> = environment
+                .get(OsStr::new("PATH"))
+                .map(|path| std::env::split_paths(path).collect());
+            let expected: Option<Vec<PathBuf>> =
+                returned.map(|entries| entries.iter().map(|entry| PathBuf::from(*entry)).collect());
+            assert_eq!(path, expected, "activated {activated:?}, route {route:?}");
+        }
     }
 }

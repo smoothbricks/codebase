@@ -25,9 +25,6 @@ fn cowshed() -> PathBuf {
 
 fn wrapper(mut command: Command) -> (u32, Vec<u8>, Output) {
     let (mut reader, writer) = fork_lock::create(UnixStream::pair).unwrap();
-    reader
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
     let writer_fd = writer.as_raw_fd();
     command
         .current_dir("/")
@@ -319,10 +316,12 @@ fn retirement_transport_and_input_failures_are_loud_nonzero() {
 }
 
 #[test]
+#[ignore = "owned subprocess fixture selected by the hosted entrypoint proof"]
 fn hosted_entrypoint_helper() {
-    if std::env::var_os("COWSHED_TEST_HOSTED_SUBTREE").is_none() {
-        return;
-    }
+    assert!(
+        std::env::var_os("COWSHED_TEST_HOSTED_SUBTREE").is_some(),
+        "the owned hosted-entrypoint helper requires its parent fixture"
+    );
     // Prepared before the runtime exists, as the binary prepares its own argv: preparation owns
     // the invocation's inherited descriptors.
     let invocation = cowshed_cli::run::prepare(
@@ -352,7 +351,12 @@ fn hosted_entrypoint_helper() {
 fn library_hosted_entrypoint_execs_instead_of_spawning() {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", "hosted_entrypoint_helper", "--nocapture"])
+        .args([
+            "--exact",
+            "hosted_entrypoint_helper",
+            "--ignored",
+            "--nocapture",
+        ])
         .env("COWSHED_TEST_HOSTED_SUBTREE", "1")
         .env_remove("COWSHED_SUPERVISOR_SOCKET");
     let (pid, admission, output) = wrapper(command);

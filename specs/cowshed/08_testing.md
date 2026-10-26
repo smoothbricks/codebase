@@ -172,7 +172,8 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Built-addon scripted Node peers**: `cowshed:napi-test` keeps exact stdout, exit-code and empty-stderr oracles for
   binary delivery, typed refusals, attachment detach and job progress. Scripted Node fixtures retain `NO_COLOR` and the
   rest of their inherited environment but omit `FORCE_COLOR`, so contradictory outer Nx color settings cannot inject
-  Node warnings. Nested Node peers inherit that coherent input; warnings are never filtered or suppressed.
+  Node warnings. Nested Node peers inherit that coherent input; warnings are never filtered or suppressed. The stream
+  iterator closes once; a close failure is terminal and later returns replay the same rejection without I/O.
 - **Shell AST redirect eligibility**: use the production parser against a matrix proving only a simple literal
   in-workspace `>`/`2>` can classify as `Redirect`, and then only when a trusted supervisor-controlled actual writable
   descriptor interposes with exact combined-quota accounting. Append, fd duplication, pipelines, lists, subshells,
@@ -209,6 +210,17 @@ root, start the prebuilt helper, wait for its socket readiness, detach only iden
 close the helper. `disk-command --gateway-socket` routes native tools to the same fixture admission, with registry-bound
 detach revalidation inside it. Size and UID distinguish fixture inventories but never authorize teardown.
 
+RAM fixture roots use the shared detach-aware scratch-root owner and next-run sweep, not a directory-only Drop guard.
+Before an attach answers, the fixture retains its exact registry entry and whole disk as an owner receipt under that
+root; keeping the gateway lease never removes that receipt. Dead-root reclamation settles these receipts and the
+gateway's interrupted lease records before removing the root, preserving it on an unreadable identity, an intent lacking
+an exact identity, or failed detach. A dead namespace's sweep never selects a disk by size: unlike a gateway's
+before-serve startup scan, it can overlap a live sibling's attach, and a reused pid can ask for the same fixture size. A
+killed-owner witness starts another fixture run and proves that it removes the dead root and its kept disk while a live
+sibling root and disk remain. Tests observe the real disk runner's detach completion, then inspect registry once;
+registry polling is not completion evidence. The same scratch-root reclaim unloads only an enrolled namespace's derived
+gateway LaunchAgent label before deleting its reserved plist, on normal teardown and next-start recovery.
+
 A fixture's child directory is a real, non-symlink directory owned by the test process UID with mode 0700. Drop cleans
 every path the fixture created. No fixture adds a grant, a host cache path, a script wrapper, or a sandbox disable. FIFO
 readiness reads are nonblocking asynchronous reads: dropping a failed or cancelled wait closes its descriptor, never
@@ -216,6 +228,27 @@ leaves a blocking open behind during runtime shutdown. A fixture awaiting a help
 helper's exit, so startup failure reports the exited helper instead of waiting for a writer that no longer exists. PID
 and release readiness frames are newline-terminated messages; their completion does not depend on every inherited writer
 descriptor reaching EOF. Independent readiness publishers are read concurrently.
+
+A fixture that makes a signing keychain owns it before its first `security` call (`code_signing/keychain_fixture.rs`). A
+keychain can reach the user's search list, through `security list-keychains -d user -s` as `code_signing::prepare` runs
+it, and `security` documents `create-keychain` as listing it too. Retiring the fixture has `security delete-keychain`
+take that one keychain off the list as it stands, never a snapshot restored over later additions, and delete its file;
+the fixture then reads the list and the disk again and returns an `Err` naming what remains, whatever the command's
+status was: an entry still listed, a listing line that is not one quoted path, a stat that fails other than by absence,
+or the keychain file or its `-db` twin still present. Dropping the fixture retires it and panics on that `Err`, except
+while the test is already unwinding, where a second panic would abort and the failure is logged only. The scratch root
+goes last, when its `TempRoot` drops, and a root that cannot be removed fails the test the same way. A run killed
+outright leaves a root named for its pid, with no owner record, and possibly its entry. The next fixture start,
+`ThrowawayKeychain::new`, takes the listed entries whose run is over. An entry's root is its ancestor whose whole name
+is a named scratch root of the fixture's own prefix (`cowshed_os::scratch::named_owner_for`), so another prefix, a
+longer one and a name that does not parse are never theirs. An existing root is over only when the production scratch
+sweep, its `Reaper` run as a dry run, judges it dead, never by a pid read from its name; a missing root, which a sweep
+archived, only when the pid its name records is observed dead by `process::running`. A symlink, a failed stat and a
+failed liveness check are neither absence nor death. The start removes those entries through `security delete-keychain`,
+then the dead roots, and fails naming the entry, line or root it could not settle; a live sibling's root and entry and
+every unrelated entry stay. The host proof starts a helper run of the test binary that makes its own fixture and lists
+its keychain, kills it with `SIGKILL` once the entry is observed listed, starts another fixture, and requires the dead
+entry and root gone and the live sibling's present.
 
 Process fixtures resolve real portable tools through the selected shell's PATH, not fixed FHS executable paths. A
 version-probe fixture prepends its selected executable directory without discarding that toolchain PATH. Host API proofs
@@ -610,7 +643,17 @@ also drops B's returned handle before cleanup to prove exact-image recovery. A n
 backing-file lock: unlink refuses and preserves its bytes until an exclusive no-follow open proves it unlocked, then
 cleanup accepts both that file and an already-absent file without spending an image attach.
 
-The killed-caller attach fixture captures helper PIDs from the existing I/O Registry creator walker, joined to its exact
+The killed-caller attach fixture arms the caller's process events before it lets the caller attach. While the caller
+blocks on its held stdin, the fixture reads the caller's life (pid and kernel unique id), registers its fork, exec and
+exit on cowshed-os's process watch, rereads the life to fence the registration, then releases it. On the caller's fork
+it reads the caller's children once and watches each child whose parent unique id is the caller's; on a watched child's
+exec whose arguments are `hdiutil attach`, it ends the caller as a tree-killer does: SIGTERM to every process working in
+the root, then SIGKILL to the caller. After release, no stop, hook or timer holds either process, so the kernel decides
+whether the kill lands before hdiutil exits or after. The oracle is the invariant in either case: the dead caller's
+attach leaves no orphaned attachment. The next invocation finds the image attached and releases it through the
+production owner, leaving no whole device, attachment or process in the root. The fixture records whether the attach
+exit was already observed before the kill and both exit delivery indices as observed order, never actual chronology or a
+pass condition. The same fixture captures helper PIDs from the existing I/O Registry creator walker, joined to its exact
 backing image before release. After its own attach/release operations finish, two reads must find no orphan among those
 captured PIDs; unrelated helpers and disk tools do not decide this owned verdict. Pure controls prove both that a
 foreign orphan is excluded and that an owned helper whose user client disappeared still fails. The host-wide helper

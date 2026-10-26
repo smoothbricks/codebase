@@ -285,32 +285,115 @@ fn open_ticket(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/// Whether `file`'s owner still holds it. A ticket whose lock is free is dead, and is removed
-/// while this caller holds that lock shared, so no live ticket is ever removed.
-fn live(file: &File, path: &Path) -> io::Result<bool> {
-    match file.try_lock_shared() {
-        Ok(()) => {
-            // Only explicit end appends the completion marker. A dropped turn or a process
-            // killed before ending remains unmarked until its last inherited holder closes.
-            if let (Some(directory), Ok((ticket, false))) = (path.parent(), read_ticket(file, path))
-            {
-                record(
-                    directory,
-                    &ticket,
-                    TurnEventKind::Abandoned,
-                    Some("its land ended without recording an outcome".to_owned()),
-                );
-            }
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            Ok(false)
-        }
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(error),
+/// What a reader's shared `try_lock` on a ticket answers: its land, or a process the land handed
+/// its descriptor to, still holds it, or nobody does and the ticket is dead. The kernel's lock is
+/// the only evidence of a ticket's death: no pid a ticket records is ever consulted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TicketLock {
+    Held,
+    Free,
+}
+
+/// One ticket file as a reader found it: the kernel's answer for its lock, and its record with
+/// whether its land ended it (the completion marker), or why the record could not be read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Found {
+    lock: TicketLock,
+    record: Result<(Ticket, bool), String>,
+}
+
+/// What a reader does with one ticket it found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Verdict {
+    /// Its lock is held: the ticket is in line, in its number's place.
+    Live(Ticket),
+    /// Its lock is free and no completion marker was written: its land ended without recording an
+    /// outcome. Recorded abandoned, then removed.
+    Abandoned(Ticket),
+    /// Its lock is free and its land ended it, or its record cannot be read: removed.
+    Removed,
+}
+
+/// The verdict on one found ticket. A held ticket whose record cannot be read is an error: its
+/// land is alive and its place unknowable. Pure.
+fn judge(found: Found) -> Result<Verdict, String> {
+    match (found.lock, found.record) {
+        (TicketLock::Held, Ok((ticket, _))) => Ok(Verdict::Live(ticket)),
+        (TicketLock::Held, Err(reason)) => Err(reason),
+        (TicketLock::Free, Ok((ticket, false))) => Ok(Verdict::Abandoned(ticket)),
+        (TicketLock::Free, Ok((_, true)) | Err(_)) => Ok(Verdict::Removed),
     }
+}
+
+/// A land's place behind the live tickets numbered below its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Place {
+    /// The lowest live ticket: it holds the turn.
+    holder: Ticket,
+    /// How many live tickets are ahead.
+    ahead: usize,
+    /// The live ticket just ahead, whose end is the only one this land waits for.
+    nearest: u64,
+}
+
+/// Where the land holding ticket `number` stands in `live`, the live tickets in any order, or
+/// `None` at the head. Pure.
+fn place(live: &[Ticket], number: u64) -> Option<Place> {
+    let mut ahead: Vec<&Ticket> = live.iter().filter(|other| other.number < number).collect();
+    ahead.sort_unstable_by_key(|other| other.number);
+    Some(Place {
+        holder: (*ahead.first()?).clone(),
+        ahead: ahead.len(),
+        nearest: ahead.last()?.number,
+    })
+}
+
+/// What the kernel and the file say of the ticket `file` opened at `path`. A free lock is taken
+/// shared and stays taken while `file` is open, so a dead ticket is removed under it and no live
+/// one ever is.
+fn found(file: &File, path: &Path) -> io::Result<Found> {
+    let lock = match file.try_lock_shared() {
+        Ok(()) => TicketLock::Free,
+        Err(TryLockError::WouldBlock) => TicketLock::Held,
+        Err(TryLockError::Error(error)) => return Err(error),
+    };
+    Ok(Found {
+        lock,
+        record: read_ticket(file, path).map_err(|error| error.to_string()),
+    })
+}
+
+/// Carry out `verdict` on the ticket at `path` in `directory`, still holding its file open; the
+/// live ticket, if it is one.
+fn settle(directory: &Path, path: &Path, verdict: Verdict) -> io::Result<Option<Ticket>> {
+    let removed = match verdict {
+        Verdict::Live(ticket) => return Ok(Some(ticket)),
+        Verdict::Abandoned(ticket) => {
+            record(
+                directory,
+                &ticket,
+                TurnEventKind::Abandoned,
+                Some("its land ended without recording an outcome".to_owned()),
+            );
+            fs::remove_file(path)
+        }
+        Verdict::Removed => fs::remove_file(path),
+    };
+    match removed {
+        Ok(()) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The live ticket at `path` in `directory`, judging and settling it; `None` once it is gone.
+fn read_live(directory: &Path, path: &Path) -> io::Result<Option<(Ticket, File)>> {
+    let Some(file) = open_ticket(path)? else {
+        return Ok(None);
+    };
+    let verdict = judge(found(&file, path)?)
+        .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
+    Ok(settle(directory, path, verdict)?.map(|ticket| (ticket, file)))
 }
 
 fn read_ticket(mut file: &File, path: &Path) -> io::Result<(Ticket, bool)> {
@@ -337,11 +420,8 @@ pub fn observe(directory: &Path) -> io::Result<Vec<Ticket>> {
     };
     let mut queue = Vec::new();
     for (_, path) in tickets {
-        let Some(file) = open_ticket(&path)? else {
-            continue;
-        };
-        if live(&file, &path)? {
-            queue.push(read_ticket(&file, &path)?.0);
+        if let Some((ticket, _)) = read_live(directory, &path)? {
+            queue.push(ticket);
         }
     }
     Ok(queue)
@@ -448,28 +528,50 @@ fn take_ticket(directory: &Path, workspace: &str, command: &str) -> io::Result<(
     Ok((ticket, file))
 }
 
-/// The live ticket just ahead of `number` and the live tickets before it, or `None` at the head.
-fn ahead_of(directory: &Path, number: u64) -> io::Result<Option<(File, Vec<Ticket>)>> {
-    let mut ahead = Vec::new();
-    let mut nearest = None;
+/// The live ticket just ahead of `number`, held open, and this land's place, or `None` at the head.
+fn ahead_of(directory: &Path, number: u64) -> io::Result<Option<(File, Place)>> {
+    let mut live = Vec::new();
     for (_, path) in ticket_files(directory)?
         .into_iter()
         .filter(|(other, _)| *other < number)
     {
-        let Some(file) = open_ticket(&path)? else {
-            continue;
-        };
-        if live(&file, &path)? {
-            ahead.push(read_ticket(&file, &path)?.0);
-            nearest = Some(file);
+        if let Some(found) = read_live(directory, &path)? {
+            live.push(found);
         }
     }
-    Ok(nearest.map(|file| (file, ahead)))
+    let tickets: Vec<Ticket> = live.iter().map(|(ticket, _)| ticket.clone()).collect();
+    let Some(place) = place(&tickets, number) else {
+        return Ok(None);
+    };
+    let nearest = live
+        .into_iter()
+        .find(|(ticket, _)| ticket.number == place.nearest)
+        .map(|(_, file)| file)
+        .expect("the nearest live ticket is one this read found");
+    Ok(Some((nearest, place)))
+}
+
+/// What a waiting land does next: say where it stands now, or keep waiting up to the time left
+/// before its next report is due.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Report {
+    Now,
+    After(Duration),
+}
+
+/// When a waiting land reports, given how long ago it last did (`None`: it has not yet) and its
+/// cadence `every`: at once when it starts to wait, and again each time `every` has passed.
+/// Pure: the caller's clock is the only input of time.
+fn report(since_told: Option<Duration>, every: Duration) -> Report {
+    match since_told {
+        Some(since) if since < every => Report::After(every - since),
+        None | Some(_) => Report::Now,
+    }
 }
 
 /// Run `blocking` on a thread of its own and answer what it answers, calling `tell` once it has
-/// started and every `every` until then: a lock wait that keeps saying what it waits for. The wait
-/// starts first, so however long a `tell` takes, it never delays taking the lock.
+/// started and every `every` until then ([`report`]): a lock wait that keeps saying what it waits
+/// for. The wait starts first, so however long a `tell` takes, it never delays taking the lock.
 fn wait_telling<T: Send + 'static>(
     blocking: impl FnOnce() -> io::Result<T> + Send + 'static,
     every: Duration,
@@ -479,11 +581,19 @@ fn wait_telling<T: Send + 'static>(
     std::thread::spawn(move || {
         let _ = ended.send(blocking());
     });
-    tell()?;
+    let mut told: Option<std::time::Instant> = None;
     loop {
-        match end.recv_timeout(every) {
+        if report(told.map(|at| at.elapsed()), every) == Report::Now {
+            tell()?;
+            told = Some(std::time::Instant::now());
+        }
+        let left = match report(told.map(|at| at.elapsed()), every) {
+            Report::After(left) => left,
+            Report::Now => Duration::ZERO,
+        };
+        match end.recv_timeout(left) {
             Ok(result) => return result,
-            Err(mpsc::RecvTimeoutError::Timeout) => tell()?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other(
                     "the land turn wait thread ended unanswered",
@@ -519,14 +629,10 @@ pub fn take(
 ) -> io::Result<Turn> {
     fs::create_dir_all(directory)?;
     let (ticket, file) = take_ticket(directory, workspace, command)?;
-    while let Some((nearest, ahead)) = ahead_of(directory, ticket.number)? {
-        let holder = ahead
-            .first()
-            .cloned()
-            .expect("a nearest live ticket is one of those ahead");
+    while let Some((nearest, standing)) = ahead_of(directory, ticket.number)? {
         let mut told = Wait::Queued {
-            holder,
-            ahead: ahead.len(),
+            holder: standing.holder,
+            ahead: standing.ahead,
         };
         // The wait on the ticket just ahead runs on its own thread, so this one can repeat what
         // it was told at its cadence; the lock is released at once, since only its end matters.
@@ -542,11 +648,10 @@ pub fn take(
             || {
                 if !first {
                     let now = observe(directory)?;
-                    let mine = now.iter().position(|live| live.number == ticket.number);
-                    if let (Some(holder), Some(ahead)) = (now.first(), mine) {
+                    if let Some(place) = place(&now, ticket.number) {
                         told = Wait::Queued {
-                            holder: holder.clone(),
-                            ahead,
+                            holder: place.holder,
+                            ahead: place.ahead,
                         };
                     }
                 }
@@ -598,6 +703,199 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("a turn event"))
             .collect()
+    }
+
+    fn ticket(number: u64, workspace: &str) -> Ticket {
+        Ticket {
+            number,
+            pid: 4000 + u32::try_from(number).expect("a small ticket number"),
+            workspace: workspace.to_owned(),
+            asked_unix_ms: 1_793_000_000_000 + number,
+            command: "land".to_owned(),
+        }
+    }
+
+    /// Every lock answer against every record: only a held lock keeps a ticket in line, whatever
+    /// its record says (a dead land's pid is never asked); a free one ended without its marker is
+    /// abandoned, a free one its land ended or whose record cannot be read is only removed, and a
+    /// held one whose record cannot be read is an error, never a guess at its place.
+    #[test]
+    fn only_a_held_lock_keeps_a_ticket_in_line_and_an_unmarked_dead_one_is_abandoned() {
+        let unread = || Err("land turn ticket: EOF while parsing".to_owned());
+        let cases = [
+            (
+                TicketLock::Held,
+                Ok((ticket(1, "H"), false)),
+                Ok(Verdict::Live(ticket(1, "H"))),
+            ),
+            (
+                TicketLock::Held,
+                Ok((ticket(1, "H"), true)),
+                Ok(Verdict::Live(ticket(1, "H"))),
+            ),
+            (
+                TicketLock::Held,
+                unread(),
+                Err("land turn ticket: EOF while parsing".to_owned()),
+            ),
+            (
+                TicketLock::Free,
+                Ok((ticket(2, "W1"), false)),
+                Ok(Verdict::Abandoned(ticket(2, "W1"))),
+            ),
+            (
+                TicketLock::Free,
+                Ok((ticket(2, "W1"), true)),
+                Ok(Verdict::Removed),
+            ),
+            (TicketLock::Free, unread(), Ok(Verdict::Removed)),
+        ];
+        for (lock, record, expected) in cases {
+            assert_eq!(
+                judge(Found {
+                    lock,
+                    record: record.clone()
+                }),
+                expected,
+                "{lock:?} {record:?}"
+            );
+        }
+    }
+
+    /// The lowest live ticket holds the turn; a land waits only on the live ticket just below its
+    /// own, behind every live one below it, and is at the head when none is below. Tickets above,
+    /// its own, and the gaps dead tickets left decide nothing; the order the reader found them in
+    /// decides nothing either.
+    #[test]
+    fn a_land_waits_on_the_nearest_live_ticket_behind_the_lowest() {
+        let live = [
+            ticket(3, "W2"),
+            ticket(1, "H"),
+            ticket(7, "W3"),
+            ticket(2, "W1"),
+        ];
+        let at = |number| place(&live, number);
+        assert_eq!(at(1), None, "the lowest ticket is the head");
+        assert_eq!(
+            at(0),
+            None,
+            "nothing is below a ticket lower than every live one"
+        );
+        for (number, ahead, nearest) in [(2, 1, 1), (3, 2, 2), (5, 3, 3), (7, 3, 3), (9, 4, 7)] {
+            assert_eq!(
+                at(number),
+                Some(Place {
+                    holder: ticket(1, "H"),
+                    ahead,
+                    nearest,
+                }),
+                "ticket {number}"
+            );
+        }
+        assert_eq!(place(&[], 4), None, "an empty line has no holder");
+    }
+
+    /// A waiting land reports when it starts to wait and each time its cadence has passed since its
+    /// last report, and otherwise waits exactly the time left; no other time decides it.
+    #[test]
+    fn a_waiting_land_reports_at_once_then_once_per_cadence() {
+        let every = Duration::from_secs(90);
+        for (since, expected) in [
+            (None, Report::Now),
+            (Some(Duration::ZERO), Report::After(every)),
+            (
+                Some(Duration::from_millis(89_999)),
+                Report::After(Duration::from_millis(1)),
+            ),
+            (Some(every), Report::Now),
+            (Some(Duration::from_secs(400)), Report::Now),
+        ] {
+            assert_eq!(report(since, every), expected, "{since:?}");
+        }
+    }
+
+    /// The head releases while earlier waiters still hold their tickets and a late land arrives:
+    /// the late land waits behind every earlier held ticket, on the nearest of them, never passing
+    /// them however soon the head released; a waiter killed in line is abandoned and the late land
+    /// then waits on the one left. Each step is one reader's observations of the line.
+    #[test]
+    fn a_late_arrival_waits_behind_every_earlier_held_ticket_after_the_head_releases() {
+        let found = |number, workspace, lock, ended| Found {
+            lock,
+            record: Ok((ticket(number, workspace), ended)),
+        };
+        let read = |sightings: Vec<Found>| -> Vec<Ticket> {
+            sightings
+                .into_iter()
+                .filter_map(
+                    |sighting| match judge(sighting).expect("a readable ticket") {
+                        Verdict::Live(ticket) => Some(ticket),
+                        Verdict::Abandoned(_) | Verdict::Removed => None,
+                    },
+                )
+                .collect()
+        };
+        let (held, free) = (TicketLock::Held, TicketLock::Free);
+
+        // H holds the turn; W1 and W2 wait behind it.
+        let line = read(vec![
+            found(1, "H", held, false),
+            found(2, "W1", held, false),
+            found(3, "W2", held, false),
+        ]);
+        assert_eq!(
+            place(&line, 2),
+            Some(Place {
+                holder: ticket(1, "H"),
+                ahead: 1,
+                nearest: 1,
+            })
+        );
+        assert_eq!(
+            place(&line, 3),
+            Some(Place {
+                holder: ticket(1, "H"),
+                ahead: 2,
+                nearest: 2,
+            })
+        );
+
+        // H ended its turn; W3 asks while W1 and W2 still hold theirs.
+        let line = read(vec![
+            found(1, "H", free, true),
+            found(2, "W1", held, false),
+            found(3, "W2", held, false),
+            found(4, "W3", held, false),
+        ]);
+        assert_eq!(place(&line, 2), None, "W1 is the head once H has ended");
+        assert_eq!(
+            place(&line, 4),
+            Some(Place {
+                holder: ticket(2, "W1"),
+                ahead: 2,
+                nearest: 3,
+            }),
+            "the late land waits behind both earlier tickets, on the nearest"
+        );
+
+        // W1 is killed in line: its lock dies unmarked, so it is abandoned, and W3 waits on W2.
+        assert_eq!(
+            judge(found(2, "W1", free, false)),
+            Ok(Verdict::Abandoned(ticket(2, "W1")))
+        );
+        let line = read(vec![
+            found(2, "W1", free, false),
+            found(3, "W2", held, false),
+            found(4, "W3", held, false),
+        ]);
+        assert_eq!(
+            place(&line, 4),
+            Some(Place {
+                holder: ticket(3, "W2"),
+                ahead: 1,
+                nearest: 3,
+            })
+        );
     }
 
     /// The direct child exits, but its descendant retains the ticket until the parent releases a

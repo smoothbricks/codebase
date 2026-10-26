@@ -1,13 +1,13 @@
 use super::*;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_os::process_events::{self, Delivered, Life, ProcessWatch};
 use cowshed_os::test_backstop::ChildBackstop as _;
 use scratch_apfs::ScratchRoot;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 /// The runner of a fixture's disk tools: they lease as the fixture's test namespace, never as
 /// production.
@@ -799,43 +799,99 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
         assert!(!root.exists(), "{ending}: {} remains", root.display());
     }
 }
-/// Block until `pid`, which is not this process's child, exits, on the kernel's exit event. A
-/// process already gone, or already exiting, has exited. The device tests reach no cowshed-core
-/// internals, so this is the test's own copy of the supervisor manager's waiter.
+
+/// Whether `life` runs `hdiutil attach` now, as its own arguments say: `None` once the pid no
+/// longer holds `life` after the read, so a later process given the pid is never read as it.
 #[cfg(target_os = "macos")]
-fn wait_for_exit(pid: libc::pid_t) -> io::Result<()> {
-    let ident = usize::try_from(pid).map_err(io::Error::other)?;
-    // SAFETY: kqueue returns a new descriptor this function owns and closes.
-    let queue = unsafe { libc::kqueue() };
-    if queue < 0 {
-        return Err(io::Error::last_os_error());
+fn runs_attach(life: Life) -> io::Result<Option<bool>> {
+    let arguments = cowshed_os::process::process_arguments(
+        libc::pid_t::try_from(life.pid).map_err(io::Error::other)?,
+    )?;
+    if process_events::identity(life.pid)?.is_none_or(|now| now.life != life) {
+        return Ok(None);
     }
-    // SAFETY: the kevent structs are plain data that outlive the call; `queue` is live until
-    // the close below.
-    let result = unsafe {
-        let change = libc::kevent {
-            ident,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ONESHOT,
-            fflags: libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
+    Ok(Some(
+        arguments.executable == cowshed_apfs::HDIUTIL.as_bytes()
+            && arguments
+                .argv
+                .get(1)
+                .is_some_and(|verb| verb.as_slice() == b"attach"),
+    ))
+}
+
+/// The `hdiutil attach` life `caller` runs, observed on `watch`, which is armed for `caller`. On
+/// each fork of `caller` its children are read once, and each child whose parent is `caller`'s
+/// life is armed in turn; its arguments are read once it is armed and again at its exec, so an
+/// exec after that first read is seen at its event. A child that exited before it was armed, or
+/// whose exec and exit came together, runs no attach to strike. A first read that fails waits
+/// for the child's exec; a read that fails at the exec, a refused event, a wait past the run's
+/// backstop or a caller that ends first is an error naming what was unread. Every event read
+/// stays in `delivered`, in the order the kernel delivered it.
+#[cfg(target_os = "macos")]
+fn attaching_hdiutil(
+    watch: &ProcessWatch,
+    caller: Life,
+    delivered: &mut Vec<Delivered>,
+) -> io::Result<Life> {
+    let mut armed = std::collections::HashSet::new();
+    let mut unread = std::collections::BTreeMap::new();
+    let mut read = 0;
+    loop {
+        if read == delivered.len()
+            && watch.events(Some(cowshed_os::test_backstop::NO_PROGRESS), delivered)? == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no process event within the backstop; unread children: {unread:?}"),
+            ));
+        }
+        let event = match &delivered[read] {
+            Delivered::Event(event) => *event,
+            Delivered::Refused { ident, error } => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("the watch refused process {ident}: {error}"),
+                ));
+            }
         };
-        let mut event = std::mem::zeroed::<libc::kevent>();
-        let returned = libc::kevent(queue, &change, 1, &mut event, 1, std::ptr::null());
-        let outcome = match returned {
-            ..0 => Err(io::Error::last_os_error()),
-            // A registration that failed comes back as an event carrying the error.
-            _ if event.flags & libc::EV_ERROR != 0 => Err(i32::try_from(event.data)
-                .map_or_else(io::Error::other, io::Error::from_raw_os_error)),
-            _ => Ok(()),
-        };
-        libc::close(queue);
-        outcome
-    };
-    match result {
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-        other => other,
+        read += 1;
+        if event.life == caller {
+            if event.forked {
+                let Some(children) = process_events::children(caller)? else {
+                    return Err(io::Error::other(format!(
+                        "the caller ended before hdiutil attach could be observed; unread children: {unread:?}"
+                    )));
+                };
+                for pid in children {
+                    let Some(child) = process_events::identity(pid)? else {
+                        continue;
+                    };
+                    if child.parent_birth != caller.birth
+                        || !armed.insert(child.life)
+                        || watch.register(child.life)?.is_none()
+                    {
+                        continue;
+                    }
+                    match runs_attach(child.life) {
+                        Ok(Some(true)) => return Ok(child.life),
+                        Ok(Some(false) | None) => {}
+                        Err(error) => {
+                            unread.insert(pid, error);
+                        }
+                    }
+                }
+            }
+            if event.exited {
+                return Err(io::Error::other(format!(
+                    "the caller ended before hdiutil attach could be observed; unread children: {unread:?}"
+                )));
+            }
+        } else if armed.contains(&event.life) {
+            unread.remove(&event.life.pid);
+            if event.execed && !event.exited && runs_attach(event.life)? == Some(true) {
+                return Ok(event.life);
+            }
+        }
     }
 }
 
@@ -845,17 +901,18 @@ const FIXTURE_KILL_ROOT: &str = "COWSHED_TEST_FIXTURE_KILL_ROOT";
 
 /// An in-kernel attach outlives its caller: the caller is ended the way an agent tool kills a
 /// tree — SIGTERM to every process working in its root, the attaching `hdiutil` among them,
-/// then SIGKILL to the caller itself — mid-attach. The protected disk-image child (`hdiutil`
-/// starts with those signals ignored and blocked) finishes regardless, so the next invocation
-/// (this parent, after the kill) finds the image attached and releases it cleanly: no whole
-/// device of the image remains, no attachment still backs the file, nothing keeps running in
-/// its root, and no diskimagesiod ever served the image. The host's departed-drive
-/// count is the lane's check (specs/cowshed/08_testing.md, "Host limit"), not one test's on a
-/// shared host.
+/// then SIGKILL to the caller itself — at the attach's exec, observed on the kernel's process
+/// events armed before the caller is let attach. The protected disk-image child (`hdiutil` starts with
+/// those signals ignored and blocked, before its exec) finishes regardless, and the next
+/// invocation (this parent, after the kill) finds the
+/// image attached and releases it cleanly: no whole device of the image remains, no attachment
+/// still backs the file, nothing keeps running in its root, and no diskimagesiod ever served the
+/// image. The host's departed-drive count is the lane's check (specs/cowshed/08_testing.md,
+/// "Host limit"), not one test's on a shared host.
 #[cfg(target_os = "macos")]
 #[test]
 fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let root = ScratchRoot::new_owned("fixture-kill").expect("owned scratch root");
@@ -879,60 +936,98 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         .stderr(Stdio::inherit())
         .spawn_locked()
         .expect("spawn the attaching caller");
-    let caller = libc::pid_t::try_from(child.id()).expect("caller pid");
+    let caller = child.id();
     let in_root = |cwd: &Path| cwd.starts_with(root.path());
+    let mut release = child.stdin.take().expect("caller stdin");
     let mut lines = BufReader::new(child.stdout.take().expect("caller stdout")).lines();
-    // Each attach's hdiutil is announced once it runs. Stop the caller there, so it cannot
-    // move past the attach, and strike only while that hdiutil still runs: an announcement
-    // read after its attach had already finished is passed over for the next one.
-    let attach = loop {
-        let line = lines
-            .next()
-            .expect("the caller's attach never came in flight")
-            .expect("caller line");
-        let Some(announced) = line.strip_prefix("inflight ") else {
-            continue;
-        };
-        let announced: libc::pid_t = announced.parse().expect("announced hdiutil pid");
-        // SAFETY: kill only names the caller, this test's unreaped child.
-        assert_eq!(
-            unsafe { libc::kill(caller, libc::SIGSTOP) },
-            0,
-            "stop the caller"
-        );
-        // WUNTRACED returns once the stop has taken effect.
-        let (stopped, status) = cowshed_os::test_backstop::waitpid(caller, libc::WUNTRACED)
-            .expect("wait for the caller's stop");
-        assert_eq!(stopped, caller);
-        assert!(libc::WIFSTOPPED(status), "the caller ended before its stop");
-        let tree =
-            crate::scratch_apfs::processes::processes_in(in_root).expect("list the caller's tree");
-        if tree.iter().any(|&(pid, _)| pid == announced) {
-            break announced;
-        }
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::kill(caller, libc::SIGCONT) }, 0, "resume");
-    };
-    // The tree-killer's two strokes: SIGTERM to every process working in the root
-    // (the disk-image child among them, which holds it blocked), SIGKILL to the caller.
+    // The caller has made its image and waits to attach it.
+    while lines
+        .next()
+        .expect("the caller ended before its attach")
+        .expect("caller line")
+        != "attaching"
+    {}
+    let caller = process_events::identity(caller)
+        .expect("read the caller's identity")
+        .expect("the caller waits on its held stdin")
+        .life;
+    let watch = ProcessWatch::new().expect("a process watch");
+    assert!(
+        watch
+            .register(caller)
+            .expect("arm the caller's process events")
+            .is_some(),
+        "the caller ended before its attach"
+    );
+    writeln!(release, "attach").expect("let the caller attach");
+    let mut delivered = Vec::new();
+    let attach = attaching_hdiutil(&watch, caller, &mut delivered)
+        .expect("observe the caller's hdiutil attach");
+    watch
+        .events(Some(Duration::ZERO), &mut delivered)
+        .expect("capture process events observed before the kill");
+    let attach_exit_observed_before_kill = delivered.iter().any(|delivered| {
+        matches!(delivered, Delivered::Event(event) if event.life == attach && event.exited)
+    });
+    // The tree-killer's two strokes, at the attach's exec: SIGTERM to every process working in
+    // the root (the disk-image child among them, which holds it blocked), SIGKILL to the caller.
     for (pid, _) in
         crate::scratch_apfs::processes::processes_in(in_root).expect("list the caller's tree")
     {
         // SAFETY: kill only names a process; a pid gone since the listing reports ESRCH.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            let error = io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "SIGTERM to fixture process {pid} failed: {error}"
+            );
+        }
     }
-    child.kill().expect("kill the caller mid-attach");
-    let _ = child.wait_bounded();
+    child.kill().expect("kill the observed attaching caller");
+    child.wait_bounded().expect("reap the killed caller");
+    drop(release);
     lines.for_each(drop);
-    // The detached attach, and anything else still working in the root, ends on its own:
-    // wait for each one's exit event, then reconcile as the next invocation does.
+    // Delivery indices are observed order only: coalesced events are not an
+    // actual exit chronology or a condition of the invariant below.
+    let exit_of = |delivered: &[Delivered], life: Life| {
+        delivered.iter().position(|delivered| {
+            matches!(delivered, Delivered::Event(event) if event.life == life && event.exited)
+        })
+    };
+    let (caller_exit, attach_exit) = loop {
+        if let (Some(caller_exit), Some(attach_exit)) =
+            (exit_of(&delivered, caller), exit_of(&delivered, attach))
+        {
+            break (caller_exit, attach_exit);
+        }
+        let got = watch
+            .events(Some(cowshed_os::test_backstop::NO_PROGRESS), &mut delivered)
+            .expect("read the exits of the caller and its attach");
+        assert!(
+            got > 0,
+            "no exit of the caller or its attach within the backstop: {delivered:?}"
+        );
+    };
+    cowshed_os::eprintln!(
+        "killed-caller attach observed order: attach exit already observed before kill={attach_exit_observed_before_kill}; caller exit delivery={caller_exit}; hdiutil {} exit delivery={attach_exit}",
+        attach.pid
+    );
+    // Anything else still working in the root ends on its own: wait for each one's exit event,
+    // then reconcile as the next invocation does.
     loop {
         let left = crate::scratch_apfs::processes::processes_in(in_root).expect("list the root");
         if left.is_empty() {
             break;
         }
         for (pid, _) in left {
-            wait_for_exit(pid).expect("watch a detached disk child's exit");
+            let pid = u32::try_from(pid).expect("a listed pid");
+            // No watch is a process that has already exited.
+            if let Some(exit) =
+                cowshed_os::process::ExitWatch::of(pid).expect("watch a detached disk child's exit")
+            {
+                exit.wait().expect("a detached disk child's exit");
+            }
         }
     }
     assert!(
@@ -940,7 +1035,8 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             .attached_whole_devices(&image)
             .expect("attachment inventory")
             .is_empty(),
-        "the killed caller's attach (hdiutil {attach}) did not complete"
+        "the killed caller's attach (hdiutil {}) did not complete",
+        attach.pid
     );
     let image_helpers = crate::disk_image_helpers::image_helper_pids(&image)
         .expect("join this image to its helper PIDs");
@@ -975,8 +1071,8 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     );
 }
 
-/// The caller [`real_apfs_a_disk_image_attach_survives_its_callers_kill`] kills: it
-/// attaches its image, detaches it, and begins again, so the kill lands mid-attach.
+/// The caller [`real_apfs_a_disk_image_attach_survives_its_callers_kill`] kills: it makes its
+/// image, says so, and attaches it once the parent, now watching its forks, lets it.
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "spawned by real_apfs_a_disk_image_attach_survives_its_callers_kill"]
@@ -990,47 +1086,17 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
     let backend = MacOsApfsBackend::new(runner(namespace));
     let image = root.join("attach.dmg");
     crate::blank_image::blank_image(namespace, &image);
-    // Announce only the attaching hdiutil while attach is in flight, so the parent kills
-    // mid-attach rather than during inventory reads or the exact-device release afterward.
-    // Release starts only after attach returned and the attaching flag has been cleared.
-    let watched = root.clone();
-    let attaching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watching = std::sync::Arc::clone(&attaching);
-    std::thread::spawn(move || {
-        let mut announced = std::collections::BTreeSet::new();
-        loop {
-            let found =
-                crate::scratch_apfs::processes::processes_in(|cwd| cwd.starts_with(&watched))
-                    .unwrap_or_default();
-            for (pid, _) in found {
-                let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-                // SAFETY: `path` is writable for its whole length, the size passed.
-                let length =
-                    unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-                let hdiutil = usize::try_from(length).is_ok_and(|length| {
-                    length > 0 && String::from_utf8_lossy(&path[..length]).ends_with("/hdiutil")
-                });
-                if hdiutil
-                    && watching.load(std::sync::atomic::Ordering::SeqCst)
-                    && announced.insert(pid)
-                {
-                    println!("inflight {pid}");
-                }
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    });
-    loop {
-        println!("attaching");
-        attaching.store(true, std::sync::atomic::Ordering::SeqCst);
-        let attachment = backend
-            .attach_verified(&image)
-            .expect("attach a fixture image");
-        attaching.store(false, std::sync::atomic::Ordering::SeqCst);
-        backend
-            .detach(&attachment, DetachIntent::Release)
-            .expect("detach a fixture image");
-    }
+    println!("attaching");
+    io::stdin()
+        .read_line(&mut String::new())
+        .expect("the parent's go-ahead");
+    let attachment = backend
+        .attach_verified(&image)
+        .expect("attach a fixture image");
+    // Reached only when the parent's kill missed the attach, which its oracle names.
+    backend
+        .detach(&attachment, DetachIntent::Release)
+        .expect("detach a fixture image");
 }
 
 /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it fails or waits to be

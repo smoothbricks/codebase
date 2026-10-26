@@ -38,21 +38,8 @@ use std::{
     task::{Context, Poll},
     time::Instant,
 };
-use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
-#[derive(Debug)]
-struct FailingCredentials;
-
-#[async_trait]
-impl CredentialProvider for FailingCredentials {
-    async fn lookup(
-        &self,
-        _query: &CredentialQuery,
-    ) -> Result<Option<CredentialRecord>, CredentialError> {
-        Err(CredentialError::Unavailable("injected failure".to_owned()))
-    }
-}
 #[derive(Debug)]
 struct FailingAudit;
 
@@ -98,12 +85,8 @@ impl UpstreamConnector for VerifiedTlsConnector {
             .map_err(|error| ConnectError::Tls(error.to_string()))?;
         let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         let _ = self.negotiated.send(alpn.clone()).await;
-        let transport = match alpn.as_deref() {
-            Some(b"h2") => NegotiatedTransport::Http2,
-            Some(b"http/1.1") => NegotiatedTransport::Http1,
-            Some(_) => return Err(ConnectError::UnsupportedAlpn),
-            None => return Err(ConnectError::MissingAlpn),
-        };
+        // The production mapping, so a refused session is dropped here before any request byte.
+        let transport = NegotiatedTransport::from_upstream_alpn(alpn.as_deref())?;
         Ok(UpstreamConnection {
             io: Box::new(tls),
             transport,
@@ -482,7 +465,7 @@ async fn h2_tls_fixture(
     Arc<ClientConfig>,
     Arc<Notify>,
     mpsc::Receiver<String>,
-    JoinHandle<TcpListener>,
+    JoinHandle<Served>,
 ) {
     let (server, client) = fixture_tls_configs(host, vec![b"h2".to_vec()]);
     let listener = fixture_ports::bind_fixture_listener().await;
@@ -540,13 +523,45 @@ async fn h2_tls_fixture(
             .max_concurrent_streams(8)
             .max_header_list_size(64 * 1024)
             .max_send_buf_size(64 * 1024);
-        let _ = builder.serve_connection(TokioIo::new(tls), service).await;
-        listener
+        let served = builder.serve_connection(TokioIo::new(tls), service).await;
+        (listener, served)
     });
     (port, client, gate, receiver, task)
 }
 
-async fn h1_tls_fixture(host: &str) -> (u16, Arc<ClientConfig>, JoinHandle<TcpListener>) {
+/// An upstream fixture's listener, which keeps its port, and how its one connection ended.
+type Served = (TcpListener, Result<(), hyper::Error>);
+
+/// An upstream connection the gateway let go: closed cleanly, or cut at its transport, as a
+/// drained gateway or a cancelled session cuts it. Any other end is the upstream protocol's own
+/// failure and fails the test.
+fn assert_upstream_ended(served: Served) {
+    let (_listener, ended) = served;
+    let Err(error) = ended else {
+        return;
+    };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = cause {
+        if let Some(io) = current.downcast_ref::<io::Error>()
+            && matches!(
+                io.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            )
+        {
+            return;
+        }
+        cause = current.source();
+    }
+    assert!(
+        error.is_incomplete_message(),
+        "the upstream connection failed: {error}"
+    );
+}
+
+async fn h1_tls_fixture(host: &str) -> (u16, Arc<ClientConfig>, JoinHandle<Served>) {
     let (server, client) = fixture_tls_configs(host, vec![b"http/1.1".to_vec()]);
     let listener = fixture_ports::bind_fixture_listener().await;
     let port = listener.local_addr().expect("h1 fixture address").port();
@@ -568,20 +583,23 @@ async fn h1_tls_fixture(host: &str) -> (u16, Arc<ClientConfig>, JoinHandle<TcpLi
                     .expect("h1 fixture response"),
             )
         });
-        let _ = server_http1::Builder::new()
+        let served = server_http1::Builder::new()
             .serve_connection(TokioIo::new(tls), service)
             .await;
-        listener
+        (listener, served)
     });
     (port, client, task)
 }
 
+/// An upstream that negotiates no ALPN and reports how many application bytes reached it before
+/// its connection ended: the first byte, or the end of the connection the gateway drops, ends the
+/// observation, never a timer.
 async fn no_alpn_tls_fixture(
     host: &str,
 ) -> (
     u16,
     Arc<ClientConfig>,
-    mpsc::Receiver<bool>,
+    mpsc::Receiver<usize>,
     JoinHandle<TcpListener>,
 ) {
     let (server, client) = fixture_tls_configs(host, Vec::new());
@@ -599,14 +617,21 @@ async fn no_alpn_tls_fixture(
             .expect("no-ALPN TLS handshake");
         assert_eq!(tls.get_ref().1.alpn_protocol(), None);
         let mut byte = [0_u8; 1];
-        let received_http = matches!(
-            timeout(Duration::from_secs(1), tls.read(&mut byte)).await,
-            Ok(Ok(count)) if count > 0
-        );
-        observed
-            .send(received_http)
-            .await
-            .expect("report no-ALPN bytes");
+        let received = match tls.read(&mut byte).await {
+            Ok(count) => count,
+            // The gateway drops the refused session without a close_notify, or with this
+            // server's session tickets unread: either way the connection's end.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                0
+            }
+            Err(error) => panic!("read the no-ALPN session to its end: {error}"),
+        };
+        observed.send(received).await.expect("report no-ALPN bytes");
         listener
     });
     (port, client, receiver, task)
@@ -697,14 +722,24 @@ async fn assert_stops_with_audit_failure(gateway: &mut Gateway) {
     );
 }
 
-async fn await_reclaimed(gateway: &Gateway) {
-    loop {
-        let status = gateway.handle().status().await.expect("gateway status");
-        if status.active == 0 && status.queued == 0 {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
+/// The next audit event, then the gateway's pools, read once: the actor records a request's
+/// terminal event and gives its permit back in the same turn, before it answers a status asked
+/// after the event arrived.
+async fn assert_reclaimed_after(
+    audit: &mut mpsc::Receiver<AuditEvent>,
+    gateway: &Gateway,
+) -> AuditEvent {
+    let event = audit
+        .recv()
+        .await
+        .expect("the request's terminal audit event");
+    let status = gateway.handle().status().await.expect("gateway status");
+    assert_eq!(
+        (status.active, status.queued),
+        (0, 0),
+        "nothing holds a permit after {event:?}"
+    );
+    event
 }
 
 async fn opaque_payload(
@@ -1736,6 +1771,7 @@ async fn opaque_connect_preserves_bytes_exactly() {
     });
     let endpoint = free_endpoint();
     let (observed_tx, mut observed_rx) = mpsc::channel(1);
+    let (audit_tx, mut audit_rx) = mpsc::channel(4);
     let (config, _cache) = test_config();
     let gateway = gateway(
         config,
@@ -1744,7 +1780,7 @@ async fn opaque_connect_preserves_bytes_exactly() {
             health: UpstreamHealth::Healthy,
             observed: Some(observed_tx),
         }),
-        Arc::new(DiscardAudit),
+        Arc::new(ChannelAudit(audit_tx)),
     )
     .await;
     let policy = WorkspacePolicy {
@@ -1784,12 +1820,8 @@ async fn opaque_connect_preserves_bytes_exactly() {
     assert_eq!(observed.purpose, UpstreamPurpose::OpaqueTcp);
     drop(stream);
     echo.await.expect("echo task");
-    loop {
-        if gateway.handle().status().await.expect("status").active == 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    let closed = assert_reclaimed_after(&mut audit_rx, &gateway).await;
+    assert_eq!(closed.kind, AuditKind::Opaque);
     gateway.drain().await.expect("drain gateway");
 }
 
@@ -2042,10 +2074,13 @@ async fn dead_upstream_is_refused_without_connecting() {
     gateway.drain().await.expect("drain gateway");
 }
 
+/// The HTTP shell of admission, whose policy is `admission::Pool`'s table: a request that reached
+/// its upstream holds the one permit, and its response's completion audits it and gives the
+/// permit back.
 #[tokio::test]
-async fn active_queue_and_overflow_limits_are_enforced() {
+async fn an_admitted_request_holds_its_permit_until_its_response_completes() {
     let gate = Arc::new(Notify::new());
-    let (upstream_port, mut captured, _upstream) = http_fixture(2, Some(Arc::clone(&gate))).await;
+    let (upstream_port, mut captured, _upstream) = http_fixture(1, Some(Arc::clone(&gate))).await;
     let endpoint = free_endpoint();
     let (mut config, _cache) = test_config();
     config.limits = GatewayLimits {
@@ -2058,6 +2093,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
         leaf_cache_workspace: 2,
         leaf_cache_global: 2,
     };
+    let (audit_tx, mut audit_rx) = mpsc::channel(4);
     let gateway = gateway(
         config,
         Arc::new(NoCredentials),
@@ -2065,7 +2101,7 @@ async fn active_queue_and_overflow_limits_are_enforced() {
             health: UpstreamHealth::Healthy,
             observed: None,
         }),
-        Arc::new(DiscardAudit),
+        Arc::new(ChannelAudit(audit_tx)),
     )
     .await;
     let (session, token, _) = session(
@@ -2081,41 +2117,31 @@ async fn active_queue_and_overflow_limits_are_enforced() {
     );
     let endpoint = install_in_free_block(&gateway.handle(), session).await;
 
-    let first_request = absolute_request("queue.test", upstream_port, &token, "/allowed/one");
-    let first = tokio::spawn(proxy_request(endpoint, first_request));
-    captured.recv().await.expect("first reached upstream");
-
-    let second_request = absolute_request("queue.test", upstream_port, &token, "/allowed/two");
-    let second = tokio::spawn(proxy_request(endpoint, second_request));
-    loop {
-        let status = gateway.handle().status().await.expect("gateway status");
-        if status.queued == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-
-    let overflow = proxy_request(
+    let request = tokio::spawn(proxy_request(
         endpoint,
-        absolute_request("queue.test", upstream_port, &token, "/allowed/three"),
-    )
-    .await;
-    assert!(overflow.starts_with("HTTP/1.1 429"), "{overflow}");
-
-    gate.notify_one();
-    assert!(first.await.expect("first task").starts_with("HTTP/1.1 200"));
-    captured.recv().await.expect("queued request promoted");
-    gate.notify_one();
-    assert!(
-        second
-            .await
-            .expect("second task")
-            .starts_with("HTTP/1.1 200")
+        absolute_request("queue.test", upstream_port, &token, "/allowed/one"),
+    ));
+    // Reaching its upstream is the request's admission acknowledgment.
+    captured.recv().await.expect("the request reached upstream");
+    let held = gateway.handle().status().await.expect("gateway status");
+    assert_eq!(
+        (held.active, held.queued),
+        (1, 0),
+        "the request holds the permit"
     );
+    gate.notify_one();
+    let response = request.await.expect("request task");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let completed = assert_reclaimed_after(&mut audit_rx, &gateway).await;
+    assert_eq!(completed.status, AuditStatus::Completed);
     gateway.drain().await.expect("drain gateway");
 }
 
-#[tokio::test]
+/// The timer shell of a queued wait, whose policy is `admission::Pool::expire`'s table: the
+/// actor's one queue timer ends the wait at its deadline, the client hears 504, and the place
+/// is free. Virtual time: the clock reaches the deadline once every task waits on the held
+/// tunnel, so no stopwatch judges the expiry.
+#[tokio::test(start_paused = true)]
 async fn queued_request_timeout_cancels_without_leaking_a_slot() {
     let tunnel_listener = fixture_ports::bind_fixture_listener().await;
     let tunnel_port = tunnel_listener.local_addr().expect("tunnel address").port();
@@ -2139,9 +2165,9 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
         leaf_cache_workspace: 2,
         leaf_cache_global: 2,
     };
-    config.timeouts.response_headers = Duration::from_millis(100);
-    config.timeouts.request_total = Duration::from_millis(200);
-    config.timeouts.tunnel_total = Duration::from_secs(2);
+    // Shorter than every bound on the held tunnel, so the queue's deadline is the first to come.
+    config.timeouts.request_total = Duration::from_secs(1);
+    let (audit_tx, mut audit_rx) = mpsc::channel(4);
     let gateway = gateway(
         config,
         Arc::new(NoCredentials),
@@ -2149,7 +2175,7 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
             health: UpstreamHealth::Healthy,
             observed: None,
         }),
-        Arc::new(DiscardAudit),
+        Arc::new(ChannelAudit(audit_tx)),
     )
     .await;
     let (session, token, _) = session(
@@ -2186,23 +2212,27 @@ async fn queued_request_timeout_cancels_without_leaking_a_slot() {
         .write_all(&tls_client_hello("held.test"))
         .await
         .expect("write held ClientHello");
-    let started = Instant::now();
     let response = proxy_request(
         endpoint,
         absolute_request("queued.test", 443, &token, "/allowed"),
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 504"), "{response}");
-    assert!(started.elapsed() >= Duration::from_millis(150));
-    assert_eq!(gateway.handle().status().await.expect("status").queued, 0);
+    let expired = audit_rx.recv().await.expect("the expiry's audit");
+    assert_eq!(
+        (expired.status, expired.classification.as_deref()),
+        (AuditStatus::TimedOut, Some("queue-timeout"))
+    );
+    let status = gateway.handle().status().await.expect("status");
+    assert_eq!(
+        (status.active, status.queued),
+        (1, 0),
+        "the tunnel alone holds a permit"
+    );
     drop(tunnel);
     held.await.expect("held tunnel task");
-    loop {
-        if gateway.handle().status().await.expect("status").active == 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    let closed = assert_reclaimed_after(&mut audit_rx, &gateway).await;
+    assert_eq!(closed.kind, AuditKind::Opaque);
     gateway.drain().await.expect("drain gateway");
 }
 #[tokio::test]
@@ -2671,6 +2701,7 @@ async fn audit_failure_is_fail_closed_drains_and_stops_the_gateway() {
 async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_calls() {
     let endpoint = free_endpoint();
     let calls = Arc::new(AtomicUsize::new(0));
+    let (audit_tx, mut audit_rx) = mpsc::channel(4);
     let (config, _cache) = test_config();
     let gateway = gateway(
         config,
@@ -2678,7 +2709,7 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
         Arc::new(CountingFailConnector {
             calls: Arc::clone(&calls),
         }),
-        Arc::new(DiscardAudit),
+        Arc::new(ChannelAudit(audit_tx)),
     )
     .await;
     let (installed, token, _) = session(
@@ -2697,8 +2728,16 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
     );
     let endpoint = install_in_free_block(&gateway.handle(), installed).await;
 
+    // Each tunnel is refused, or fails at its connector, and audited: its terminal event.
+    let denied = |event: AuditEvent| {
+        assert_eq!(
+            (event.kind, event.status),
+            (AuditKind::Opaque, AuditStatus::Denied),
+            "{event:?}"
+        );
+    };
     opaque_payload(endpoint, &token, "expected.test", 443, b"not tls").await;
-    await_reclaimed(&gateway).await;
+    denied(assert_reclaimed_after(&mut audit_rx, &gateway).await);
     opaque_payload(
         endpoint,
         &token,
@@ -2707,7 +2746,7 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
         &tls_client_hello("other.test"),
     )
     .await;
-    await_reclaimed(&gateway).await;
+    denied(assert_reclaimed_after(&mut audit_rx, &gateway).await);
     opaque_payload(
         endpoint,
         &token,
@@ -2716,7 +2755,7 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
         &tls_client_hello("127.0.0.1"),
     )
     .await;
-    await_reclaimed(&gateway).await;
+    denied(assert_reclaimed_after(&mut audit_rx, &gateway).await);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     opaque_payload(
         endpoint,
@@ -2726,7 +2765,11 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
         &tls_client_hello("127.0.0.1"),
     )
     .await;
-    await_reclaimed(&gateway).await;
+    let failed = assert_reclaimed_after(&mut audit_rx, &gateway).await;
+    assert_eq!(
+        (failed.kind, failed.status),
+        (AuditKind::Opaque, AuditStatus::Failed)
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     opaque_payload(
         endpoint,
@@ -2736,223 +2779,19 @@ async fn opaque_rejects_non_tls_missing_and_mismatched_sni_without_connector_cal
         &tls_client_hello("conflict.test"),
     )
     .await;
-    await_reclaimed(&gateway).await;
+    denied(assert_reclaimed_after(&mut audit_rx, &gateway).await);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     gateway.drain().await.expect("drain gateway");
 }
 
+/// The transport shell of release, whose policy is `admission::Pool::complete`'s table: a client
+/// that goes away mid-request ends its admission, whose completion audits it and gives the one
+/// permit back. Every other ending reaches the pool through the same completion.
 #[tokio::test]
-async fn active_error_and_disconnect_paths_reclaim_single_permit() {
-    let single_permit_config = || {
-        let (mut config, cache) = test_config();
-        config.limits = GatewayLimits {
-            max_sessions: 2,
-            workspace_active: 1,
-            workspace_queued: 1,
-            global_active: 1,
-            global_queued: 1,
-            origin_active: 1,
-            leaf_cache_workspace: 2,
-            leaf_cache_global: 2,
-        };
-        (config, cache)
-    };
-
-    {
-        let endpoint = free_endpoint();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (config, _cache) = single_permit_config();
-        let gateway = gateway(
-            config,
-            Arc::new(NoCredentials),
-            Arc::new(CountingFailConnector {
-                calls: Arc::clone(&calls),
-            }),
-            Arc::new(DiscardAudit),
-        )
-        .await;
-        let (installed, token, _) = session(
-            "connect-failure",
-            "owner/repo-connect-failure",
-            block_endpoint(endpoint),
-            24,
-            1,
-            WorkspacePolicy {
-                grants: vec![grant("connect-failure.test", 443)],
-                mirrors: Vec::new(),
-            },
-        );
-        let endpoint = install_in_free_block(&gateway.handle(), installed).await;
-        for _ in 0..2 {
-            let response = proxy_request(
-                endpoint,
-                absolute_request("connect-failure.test", 443, &token, "/allowed"),
-            )
-            .await;
-            assert!(response.starts_with("HTTP/1.1 502"), "{response}");
-            await_reclaimed(&gateway).await;
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
-        gateway
-            .drain()
-            .await
-            .expect("drain connect-failure gateway");
-        // Each scenario's gateway is gone once drained; its block goes back before the next.
-        release_claim(endpoint);
-    }
-
-    {
-        let upstream = fixture_ports::bind_fixture_listener().await;
-        let upstream_port = upstream.local_addr().expect("upstream address").port();
-        let accepts = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (stream, _) = upstream
-                    .accept()
-                    .await
-                    .expect("accept credential connection");
-                drop(stream);
-            }
-        });
-        let endpoint = free_endpoint();
-        let (config, _cache) = single_permit_config();
-        let gateway = gateway(
-            config,
-            Arc::new(FailingCredentials),
-            Arc::new(LocalConnector {
-                health: UpstreamHealth::Healthy,
-                observed: None,
-            }),
-            Arc::new(DiscardAudit),
-        )
-        .await;
-        let (installed, token, _) = session(
-            "credential-failure",
-            "owner/repo-credential-failure",
-            block_endpoint(endpoint),
-            25,
-            1,
-            WorkspacePolicy {
-                grants: vec![grant("credential-failure.test", upstream_port)],
-                mirrors: Vec::new(),
-            },
-        );
-        let endpoint = install_in_free_block(&gateway.handle(), installed).await;
-        for _ in 0..2 {
-            let response = proxy_request(
-                endpoint,
-                absolute_request("credential-failure.test", upstream_port, &token, "/allowed"),
-            )
-            .await;
-            assert!(response.starts_with("HTTP/1.1 502"), "{response}");
-            await_reclaimed(&gateway).await;
-        }
-        accepts.await.expect("credential accepts task");
-        gateway.drain().await.expect("drain credential gateway");
-        release_claim(endpoint);
-    }
-
-    {
-        let upstream = fixture_ports::bind_fixture_listener().await;
-        let upstream_port = upstream.local_addr().expect("upstream address").port();
-        let accepts = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut stream, _) = upstream.accept().await.expect("accept header connection");
-                let _ = read_headers(&mut stream).await;
-            }
-        });
-        let endpoint = free_endpoint();
-        let (config, _cache) = single_permit_config();
-        let gateway = gateway(
-            config,
-            Arc::new(NoCredentials),
-            Arc::new(LocalConnector {
-                health: UpstreamHealth::Healthy,
-                observed: None,
-            }),
-            Arc::new(DiscardAudit),
-        )
-        .await;
-        let (installed, token, _) = session(
-            "header-failure",
-            "owner/repo-header-failure",
-            block_endpoint(endpoint),
-            26,
-            1,
-            WorkspacePolicy {
-                grants: vec![grant("header-failure.test", upstream_port)],
-                mirrors: Vec::new(),
-            },
-        );
-        let endpoint = install_in_free_block(&gateway.handle(), installed).await;
-        for _ in 0..2 {
-            let response = proxy_request(
-                endpoint,
-                absolute_request("header-failure.test", upstream_port, &token, "/allowed"),
-            )
-            .await;
-            assert!(response.starts_with("HTTP/1.1 502"), "{response}");
-            await_reclaimed(&gateway).await;
-        }
-        accepts.await.expect("header accepts task");
-        gateway.drain().await.expect("drain header gateway");
-        release_claim(endpoint);
-    }
-
-    {
-        let gate = Arc::new(Notify::new());
-        let (upstream_port, mut captured, _upstream) =
-            http_fixture(1, Some(Arc::clone(&gate))).await;
-        let endpoint = free_endpoint();
-        let (config, _cache) = single_permit_config();
-        let gateway = gateway(
-            config,
-            Arc::new(NoCredentials),
-            Arc::new(LocalConnector {
-                health: UpstreamHealth::Healthy,
-                observed: None,
-            }),
-            Arc::new(DiscardAudit),
-        )
-        .await;
-        let (installed, token, _) = session(
-            "disconnect",
-            "owner/repo-disconnect",
-            block_endpoint(endpoint),
-            27,
-            1,
-            WorkspacePolicy {
-                grants: vec![grant("disconnect.test", upstream_port)],
-                mirrors: Vec::new(),
-            },
-        );
-        let endpoint = install_in_free_block(&gateway.handle(), installed).await;
-        let mut client = TcpStream::connect(endpoint).await.expect("connect client");
-        client
-            .write_all(
-                absolute_request("disconnect.test", upstream_port, &token, "/allowed").as_bytes(),
-            )
-            .await
-            .expect("write request");
-        captured.recv().await.expect("upstream capture");
-        drop(client);
-        gate.notify_one();
-        await_reclaimed(&gateway).await;
-        gateway.drain().await.expect("drain disconnect gateway");
-    }
-}
-
-#[tokio::test]
-async fn queued_disconnect_and_drain_reclaim_all_capacity() {
-    let upstream = fixture_ports::bind_fixture_listener().await;
-    let upstream_port = upstream.local_addr().expect("upstream address").port();
-    let held = tokio::spawn(async move {
-        let (mut stream, _) = upstream.accept().await.expect("accept held tunnel");
-        let mut discarded = Vec::new();
-        stream
-            .read_to_end(&mut discarded)
-            .await
-            .expect("held tunnel closes");
-    });
+async fn a_client_that_disconnects_mid_request_gives_its_permit_back() {
+    let gate = Arc::new(Notify::new());
+    let (upstream_port, mut captured, upstream) = http_fixture(1, Some(Arc::clone(&gate))).await;
+    let endpoint = free_endpoint();
     let (mut config, _cache) = test_config();
     config.limits = GatewayLimits {
         max_sessions: 2,
@@ -2964,7 +2803,7 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
         leaf_cache_workspace: 2,
         leaf_cache_global: 2,
     };
-    let endpoint = free_endpoint();
+    let (audit_tx, mut audit_rx) = mpsc::channel(4);
     let gateway = gateway(
         config,
         Arc::new(NoCredentials),
@@ -2972,72 +2811,51 @@ async fn queued_disconnect_and_drain_reclaim_all_capacity() {
             health: UpstreamHealth::Healthy,
             observed: None,
         }),
-        Arc::new(DiscardAudit),
+        Arc::new(ChannelAudit(audit_tx)),
     )
     .await;
     let (installed, token, _) = session(
-        "queue-cancel",
-        "owner/repo-queue-cancel",
+        "disconnect",
+        "owner/repo-disconnect",
         block_endpoint(endpoint),
-        28,
+        27,
         1,
         WorkspacePolicy {
-            grants: vec![
-                EgressGrant::opaque("held-cancel.test", upstream_port).expect("opaque grant"),
-                grant("queued-cancel.test", 443),
-            ],
+            grants: vec![grant("disconnect.test", upstream_port)],
             mirrors: Vec::new(),
         },
     );
     let endpoint = install_in_free_block(&gateway.handle(), installed).await;
-
-    let mut tunnel = TcpStream::connect(endpoint).await.expect("connect tunnel");
-    let connect = format!(
-        "CONNECT held-cancel.test:{upstream_port} HTTP/1.1\r\nHost: held-cancel.test:{upstream_port}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+    let mut client = TcpStream::connect(endpoint).await.expect("connect client");
+    client
+        .write_all(
+            absolute_request("disconnect.test", upstream_port, &token, "/allowed").as_bytes(),
+        )
+        .await
+        .expect("write request");
+    captured.recv().await.expect("upstream capture");
+    // The upstream holds its response: only the client's going away can end the request now.
+    drop(client);
+    let ended = assert_reclaimed_after(&mut audit_rx, &gateway).await;
+    assert_eq!(
+        (
+            ended.status,
+            ended.classification.as_deref(),
+            ended.path.as_deref()
+        ),
+        (
+            AuditStatus::Cancelled,
+            Some("request-dropped"),
+            Some("/allowed")
+        ),
+        "{ended:?}"
     );
-    tunnel
-        .write_all(connect.as_bytes())
+    gate.notify_one();
+    upstream
         .await
-        .expect("write CONNECT");
-    assert!(
-        read_response_head(&mut tunnel)
-            .await
-            .starts_with("HTTP/1.1 200")
-    );
-    tunnel
-        .write_all(&tls_client_hello("held-cancel.test"))
-        .await
-        .expect("write ClientHello");
-
-    let mut queued = TcpStream::connect(endpoint).await.expect("connect queued");
-    queued
-        .write_all(absolute_request("queued-cancel.test", 443, &token, "/allowed").as_bytes())
-        .await
-        .expect("write queued request");
-    loop {
-        if gateway.handle().status().await.expect("status").queued == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    drop(queued);
-    loop {
-        let status = gateway.handle().status().await.expect("status");
-        if status.active == 1 && status.queued == 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-
-    gateway.drain().await.expect("drain gateway");
-    let mut discarded = Vec::new();
-    tunnel
-        .read_to_end(&mut discarded)
-        .await
-        .expect("read tunnel close");
-    held.await.expect("held upstream task");
+        .expect("the upstream fixture accepted its one request");
+    gateway.drain().await.expect("drain disconnect gateway");
 }
-
 #[tokio::test]
 async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audited() {
     let (mut config, _cache) = test_config();
@@ -3112,7 +2930,11 @@ async fn client_tls_failures_reclaim_permits_and_pre_admission_denials_are_audit
             .read_to_end(&mut discarded)
             .await
             .expect("read TLS rejection");
-        await_reclaimed(&gateway).await;
+        let refused = assert_reclaimed_after(&mut audit_rx, &gateway).await;
+        assert_eq!(
+            (refused.status, refused.classification.as_deref()),
+            (AuditStatus::Denied, Some("client-tls"))
+        );
     }
     gateway.drain().await.expect("drain gateway");
 }
@@ -3219,10 +3041,14 @@ async fn h2_intercept_and_upstream_preserve_streaming_trailers_and_authority() {
         .expect("authority mismatch response");
     assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
 
+    // Its only request handle gone, the downstream h2 connection closes cleanly.
     drop(sender);
+    downstream_connection
+        .await
+        .expect("the downstream h2 connection task joins")
+        .expect("the downstream h2 connection closes cleanly");
     gateway.drain().await.expect("drain h2 gateway");
-    let _ = timeout(Duration::from_secs(1), downstream_connection).await;
-    upstream_task.await.expect("h2 upstream task");
+    assert_upstream_ended(upstream_task.await.expect("h2 upstream task"));
 }
 
 #[tokio::test]
@@ -3286,9 +3112,12 @@ async fn upstream_tls_alpn_selects_h1_fallback_without_downgrading_h2() {
         Bytes::from_static(b"h1-fallback")
     );
     drop(sender);
+    downstream_connection
+        .await
+        .expect("the downstream h2 connection task joins")
+        .expect("the downstream h2 connection closes cleanly");
     gateway.drain().await.expect("drain fallback gateway");
-    let _ = timeout(Duration::from_secs(1), downstream_connection).await;
-    upstream_task.await.expect("h1 upstream task");
+    assert_upstream_ended(upstream_task.await.expect("h1 upstream task"));
 }
 
 #[tokio::test]
@@ -3340,13 +3169,17 @@ async fn missing_upstream_alpn_fails_without_sending_http1_bytes() {
         .expect("no-ALPN gateway response");
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(negotiated_rx.recv().await.expect("no-ALPN result"), None);
-    assert!(
-        !received_http.recv().await.expect("no-ALPN byte report"),
-        "gateway sent HTTP/1.1 after TLS selected no ALPN"
+    assert_eq!(
+        received_http.recv().await.expect("no-ALPN byte report"),
+        0,
+        "the gateway sent application bytes after TLS selected no ALPN"
     );
     drop(sender);
+    downstream_connection
+        .await
+        .expect("the downstream h2 connection task joins")
+        .expect("the downstream h2 connection closes cleanly");
     gateway.drain().await.expect("drain no-ALPN gateway");
-    let _ = timeout(Duration::from_secs(1), downstream_connection).await;
     upstream_task.await.expect("no-ALPN upstream task");
 }
 
@@ -3508,9 +3341,19 @@ async fn h2_session_cancellation_closes_stream_and_is_audited() {
     assert!(saw_cancelled_connect, "missing cancelled h2 CONNECT audit");
     gate.notify_waiters();
     drop(sender);
+    // The gateway cut this session's tunnel: the client connection ends with that cut, or
+    // cleanly once its only request handle is gone. It ends, and only the cut may be its error.
+    if let Err(error) = downstream_connection
+        .await
+        .expect("the downstream h2 connection task joins")
+    {
+        assert!(
+            !error.is_user() && !error.is_parse(),
+            "the downstream h2 connection failed on its own side: {error}"
+        );
+    }
     gateway.drain().await.expect("drain cancelled h2 gateway");
-    let _ = timeout(Duration::from_secs(1), downstream_connection).await;
-    let _ = timeout(Duration::from_secs(1), upstream_task).await;
+    assert_upstream_ended(upstream_task.await.expect("h2 upstream task"));
 }
 
 #[tokio::test]
@@ -3615,7 +3458,7 @@ async fn direct_https_proxy_uses_negotiated_upstream_h2() {
         format!("https://direct-h2.test:{upstream_port}/allowed")
     );
     gateway.drain().await.expect("drain direct h2 gateway");
-    upstream_task.await.expect("direct h2 upstream task");
+    assert_upstream_ended(upstream_task.await.expect("direct h2 upstream task"));
 }
 
 #[derive(Debug, Default)]

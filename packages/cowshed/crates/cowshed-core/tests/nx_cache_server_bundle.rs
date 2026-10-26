@@ -77,13 +77,13 @@ fn read_manifest(path: &Path) -> Value {
 }
 
 /// The server ships as one platform-independent bundle that Bun runs from `PATH` (the owner's
-/// ruling, 2026-10-18): the nx-cache-server package publishes `dist/server` and no `dist/bin`, and
-/// no cowshed CLI build depends on, hashes, or copies an nx-cache-server artifact. All four
-/// platforms are checked; a single target is not enough.
+/// ruling, 2026-10-18): the nx-cache-server package publishes `dist/server` and no `dist/bin`.
+/// That no cowshed CLI build depends on, hashes, or copies an nx-cache-server artifact is
+/// proven where the `cli-*` targets are now generated from `napi.targets`, in the Nx plugin's
+/// inference tests; the targets no longer exist in this manifest to inventory here.
 #[test]
-fn cli_targets_carry_no_nx_cache_server_and_the_server_ships_its_bundle() {
+fn the_server_ships_its_bundle_and_no_platform_binaries() {
     let root = repository_root();
-    let cowshed = read_manifest(&root.join("packages/cowshed/package.json"));
     let server = read_manifest(&root.join("packages/nx-cache-server/package.json"));
     let files = server["files"]
         .as_array()
@@ -94,18 +94,4 @@ fn cli_targets_carry_no_nx_cache_server_and_the_server_ships_its_bundle() {
         server["nx"]["targets"]["bundle"]["outputs"],
         json!(["{projectRoot}/dist/server/nx-cache-server.js"])
     );
-    for cli in [
-        "cli-arm64-macos",
-        "cli-x64-macos",
-        "cli-arm64-linux",
-        "cli-x64-linux",
-    ] {
-        let target = &cowshed["nx"]["targets"][cli];
-        assert!(target.is_object(), "{cli} is a cowshed target");
-        let declared = serde_json::to_string(target).expect("serialize the target");
-        assert!(
-            !declared.contains("nx-cache-server"),
-            "{cli} must not depend on, hash, or copy an nx-cache-server artifact: {declared}"
-        );
-    }
 }

@@ -2,10 +2,11 @@
 /// <reference types="node" />
 
 import { describe, expect, it } from 'bun:test';
-import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { ownedFixtureRoot } from '@smoothbricks/nx-plugin/testing';
 import typia from 'typia';
 import type {
   JobProcessRetirement,
@@ -649,12 +650,12 @@ const project = fileURLToPath(new URL('..', import.meta.url));
  * package because the compiler preload finds Typia's transform through the nearest `package.json`
  * and resolves `typia` through the nearest `node_modules`.
  */
-const scratchPrefix = join(project, '.cache', 'api-generation-');
+const generationScratch = () => ownedFixtureRoot(join(project, '.cache'), 'api-generation', 'project-');
 
 describe('canonical DTO generation', () => {
   it('a declared field changes the generated type and the executed validator', async () => {
     const sourceDirectory = dirname(fileURLToPath(import.meta.url));
-    const scratch = mkdtempSync(scratchPrefix);
+    const scratch = await generationScratch();
     try {
       const core = join(scratch, 'crates/cowshed-core/src');
       const gateway = join(scratch, 'crates/cowshed-gateway-types/src');
@@ -722,8 +723,8 @@ describe('canonical DTO generation', () => {
     }
   });
 
-  it('keeps its scratch project out of the Biome pass that lints this package', () => {
-    const scratch = mkdtempSync(scratchPrefix);
+  it('keeps its scratch project out of the Biome pass that lints this package', async () => {
+    const scratch = await generationScratch();
     try {
       // The file that failed the gate: compact JSON, which Biome's formatter rejects wherever it can see it.
       writeFileSync(join(scratch, 'tsconfig.test.json'), JSON.stringify({ include: ['./*.ts'] }));
@@ -738,6 +739,102 @@ describe('canonical DTO generation', () => {
       expect(report).not.toContain(basename(scratch));
     } finally {
       rmSync(scratch, { recursive: true });
+    }
+  });
+});
+
+describe('owned generation scratch', () => {
+  it("a new process's setup reclaims a dead run and keeps a live run and foreign entries", async () => {
+    const cache = realpathSync(join(project, '.cache'));
+    const suite = join(cache, 'smoothbricks-fixtures', 'api-generation');
+    const script = [
+      "const { ownedFixtureRoot } = await import('@smoothbricks/nx-plugin/testing');",
+      "const root = await ownedFixtureRoot(process.env.FIXTURE_CACHE, 'api-generation', 'project-');",
+      "console.log('ROOT ' + root);",
+      "if (process.env.FIXTURE_HOLD === '1') {",
+      '  process.stdin.resume();',
+      "  await new Promise((resolve) => process.stdin.once('end', resolve));",
+      '}',
+    ].join('\n');
+    type Child = ReturnType<typeof spawn>;
+    type Owned = { child: Child; done: Promise<void> };
+    const start = (hold: boolean): Owned => {
+      const child = spawn(process.execPath, ['-e', script], {
+        cwd: project,
+        env: { ...process.env, FIXTURE_CACHE: cache, FIXTURE_HOLD: hold ? '1' : '0' },
+        stdio: ['pipe', 'pipe', 'inherit'],
+      });
+      const done = new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        child.once('exit', () => resolve());
+        child.once('error', () => resolve());
+      });
+      return { child, done };
+    };
+    const rootOf = ({ child }: Owned): Promise<string> =>
+      new Promise((resolve, reject) => {
+        let printed = '';
+        child.stdout?.on('data', (chunk: Buffer) => {
+          printed += chunk.toString();
+          const end = printed.indexOf('\n');
+          if (end === -1) {
+            return;
+          }
+          const frame = /^ROOT (.+)$/.exec(printed.slice(0, end));
+          if (frame?.[1]) {
+            resolve(frame[1]);
+          } else {
+            reject(new Error(`unframed fixture root: ${printed.slice(0, end)}`));
+          }
+        });
+        child.on('exit', (code) => reject(new Error(`fixture child exited ${String(code)} before naming its root`)));
+        child.on('error', reject);
+      });
+    const runOf = ({ child }: Owned): string => join(suite, `run-${String(child.pid)}`);
+
+    const dead = start(false);
+    let live: Owned | undefined;
+    let next: Owned | undefined;
+    const planted: string[] = [runOf(dead)];
+    try {
+      const deadRoot = await rootOf(dead);
+      await dead.done;
+      expect(dirname(deadRoot)).toBe(runOf(dead));
+      expect(existsSync(deadRoot)).toBe(true);
+
+      live = start(true);
+      planted.push(runOf(live));
+      const liveRoot = await rootOf(live);
+      expect(dirname(liveRoot)).toBe(runOf(live));
+
+      // Entries the sweep must not claim: a same-suite name with no owner pid, and a
+      // foreign suite's run of the dead pid.
+      const malformed = join(suite, 'run-unknown');
+      const foreign = join(cache, 'smoothbricks-fixtures', 'other-suite', `run-${String(dead.child.pid)}`);
+      mkdirSync(malformed, { recursive: true });
+      mkdirSync(foreign, { recursive: true });
+      planted.push(malformed, join(cache, 'smoothbricks-fixtures', 'other-suite'));
+
+      // The next setup is a new process: this process cached its own run at its first root.
+      next = start(false);
+      planted.push(runOf(next));
+      const nextRoot = await rootOf(next);
+      await next.done;
+
+      expect(existsSync(nextRoot)).toBe(true);
+      expect(existsSync(deadRoot)).toBe(false);
+      expect(existsSync(liveRoot)).toBe(true);
+      expect(existsSync(malformed)).toBe(true);
+      expect(existsSync(foreign)).toBe(true);
+    } finally {
+      live?.child.stdin?.end();
+      await Promise.all([dead.done, live?.done, next?.done]);
+      for (const path of planted) {
+        rmSync(path, { recursive: true, force: true });
+      }
     }
   });
 });

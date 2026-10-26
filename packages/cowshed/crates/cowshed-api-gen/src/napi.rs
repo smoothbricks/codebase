@@ -815,7 +815,8 @@ fn typescript(
          export interface NativeAdopted {{\n  readonly workspace: NativeWorkspaceRefHandle;\n  readonly reAdoption: string | null;\n}}\n\n\
          /**\n * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,\n\
          \x20* as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes, even\n\
-         \x20* while a `next` waits, which then resolves to `null`.\n */\n\
+         \x20* while a `next` waits, which then resolves to `null`.\n\
+         \x20* Its iterator adapter closes once; a close failure is terminal and later returns replay the same rejection without I/O.\n */\n\
          export interface NativeEvents {{\n  next(): Promise<string | null>;\n  close(): Promise<void>;\n}}\n"
     );
     for (class, methods) in classes.iter().filter(|(_, methods)| !methods.is_empty()) {

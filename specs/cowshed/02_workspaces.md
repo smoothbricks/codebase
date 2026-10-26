@@ -262,7 +262,8 @@ own config travels with every clone, so a file it includes by a relative path in
 (`include.path = ../tooling/workspace.gitconfig`, which Git lists as `.git/../tooling/workspace.gitconfig`) resolves in
 each clone and is never reported; a relative include that climbs out of the repository lands elsewhere for a mount and
 is. The answer depends only on the host's git configuration and the fixed mount root, never on a workspace, so `fork`
-does not repeat it.
+does not repeat it. Resolving an include-origin spelling treats NotFound or NotADirectory as absent; any other I/O
+failure refuses the probe with environment-missing naming the path and cause, never as an absent or different file.
 
 Linked Git worktrees share their primary checkout's config. Managed shell setup retains that primary checkout's
 repo-relative `tooling/workspace.gitconfig` include; it never retargets the shared config to the linked caller's foreign

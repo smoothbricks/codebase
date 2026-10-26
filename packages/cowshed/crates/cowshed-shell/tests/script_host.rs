@@ -405,15 +405,84 @@ fn read_exit(control: &std::os::unix::net::UnixStream) -> ExitStatus {
     }
 }
 
-/// A script whose leader starts a descendant that records its pid in `marker` and outlives the
-/// leader, which exits with `code` once the descendant runs: a leader that exited first could end
-/// before the interpreter started its background command at all.
-fn outliving_descendant(marker: &Path, code: i32) -> RenderedScript {
-    text(&format!(
-        "sh -c 'printf \"%s\" \"$$\" > {marker}; exec sleep 300' & \
-         while [ ! -s {marker} ]; do sleep 0.01; done; exit {code}",
-        marker = marker.display()
-    ))
+/// A FIFO at path: its reader and its writer each wait for the other, so a process blocked on one
+/// is held exactly until the test opens the other end.
+fn fifo(path: &Path) {
+    let raw = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("FIFO path");
+    // SAFETY: a NUL-terminated path in this fixture's own directory.
+    assert_eq!(
+        unsafe { libc::mkfifo(raw.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+/// The pid a process published as one newline-terminated frame on the FIFO at path, from its own
+/// body: the read returns with the frame, whatever other descriptor of that FIFO is still open
+/// (08_testing.md, "Fixtures"), and no elapsed delay supplies the readiness.
+fn read_published_pid(path: &Path) -> i32 {
+    use std::io::BufRead as _;
+
+    let mut frame = String::new();
+    std::io::BufReader::new(std::fs::File::open(path).expect("open the actual process's FIFO"))
+        .read_line(&mut frame)
+        .expect("read the actual process's FIFO frame");
+    frame.trim().parse().unwrap_or_else(|error| {
+        panic!(
+            "FIFO {} held {frame:?}, not a published pid: {error}",
+            path.display()
+        )
+    })
+}
+
+/// The exit watch of the process pid names, registered while a FIFO gate holds it. A process
+/// held there cannot have exited, so the watch names it and no later holder of the pid.
+fn watch_held(pid: i32) -> cowshed_os::process::ExitWatch {
+    cowshed_os::process::ExitWatch::of(u32::try_from(pid).expect("a published pid"))
+        .expect("watch an exit")
+        .expect("the held process runs")
+}
+
+/// A command whose leader has exited while its one descendant outlives it, held on a FIFO.
+struct Outliving {
+    /// The readers of the job's streams, which the descendant holds open.
+    readers: [std::thread::JoinHandle<String>; 2],
+    /// The descendant's pid, which its FIFO gate holds until the test ends it or its host does.
+    pid: i32,
+    /// The descendant's exit, watched since before its leader could exit.
+    descendant: cowshed_os::process::ExitWatch,
+}
+
+/// Run a script whose leader exits with code while a descendant outlives it. The descendant
+/// publishes its pid from its own body and holds on a FIFO nothing opens; only once the test has
+/// registered its exit watch does the test open the leader's gate FIFO, so the leader cannot exit
+/// before the watch exists. Returns once the host reported the leader's exit.
+fn outliving(host: &Host, code: i32) -> Outliving {
+    let [published, hold, go] = ["published", "hold", "go"].map(|name| host.directory.join(name));
+    for path in [&published, &hold, &go] {
+        fifo(path);
+    }
+    let rendered = text(&format!(
+        "sh -c 'printf \"%s\\n\" \"$$\" > {published}; read -r _ < {hold}' & \
+         sh -c 'read -r _ < {go}'; exit {code}",
+        published = published.display(),
+        hold = hold.display(),
+        go = go.display(),
+    ));
+    let Submitted { reply, readers } = submit(host, &rendered);
+    let (tag, _) = FrameReader::new(&reply).unwrap();
+    assert_eq!(tag, REPLY_STARTED);
+    let pid = read_published_pid(&published);
+    let descendant = watch_held(pid);
+    std::fs::write(&go, "go\n").expect("let the leader exit");
+    assert_eq!(read_exit(host.control()), ExitStatus::Exited { code });
+    Outliving {
+        readers,
+        pid,
+        descendant,
+    }
 }
 
 /// Release the held command, as a supervisor does once the job concluded, and see it reaped.
@@ -795,7 +864,8 @@ fn the_host_reports_the_leader_it_observed_before_reaping_it() {
 /// A job's signal reaches its command's group through the host, the command's parent, which holds
 /// the leader unreaped until the job is released -- after the leader exited too, so descendants
 /// that outlive it and hold the job's output open are still reached. The released host serves
-/// the next command.
+/// the next command. The descendant's exit watch is registered while a FIFO holds it, so its exit
+/// is the event the watch reports; no null signal stands in for it.
 #[test]
 fn the_host_signals_its_command_s_group_until_it_is_released() {
     #[cfg(target_os = "linux")]
@@ -806,22 +876,17 @@ fn the_host_signals_its_command_s_group_until_it_is_released() {
     let ran = host.run_signalled(&text("sleep 30"), libc::SIGKILL);
     assert_eq!(signaled(ran.status.as_ref()), Some(libc::SIGKILL));
 
-    let marker = host.directory.join("descendant");
-    let Submitted { reply, readers } = submit(&host, &outliving_descendant(&marker, 3));
-    let (tag, _) = FrameReader::new(&reply).unwrap();
-    assert_eq!(tag, REPLY_STARTED);
-    assert_eq!(read_exit(host.control()), ExitStatus::Exited { code: 3 });
-    let descendant = loop {
-        if let Some(pid) = std::fs::read_to_string(&marker)
-            .ok()
-            .and_then(|pid| pid.trim().parse::<i32>().ok())
-        {
-            break pid;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(alive(descendant), "the descendant outlives the leader");
+    let Outliving {
+        readers,
+        descendant,
+        ..
+    } = outliving(&host, 3);
+    assert!(
+        !descendant
+            .within(Duration::ZERO)
+            .expect("current exit readiness"),
+        "the descendant outlives the leader"
+    );
     assert!(
         readers.iter().all(|reader| !reader.is_finished()),
         "the descendant holds the job's output open"
@@ -830,7 +895,12 @@ fn the_host_signals_its_command_s_group_until_it_is_released() {
     send_signal(host.control(), libc::SIGKILL);
     let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
     assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
-    assert!(gone(descendant), "the signal reached the descendant");
+    assert!(
+        descendant
+            .within(cowshed_os::test_backstop::NO_PROGRESS)
+            .expect("native exit notification"),
+        "the signal reached the descendant"
+    );
     release(host.control());
 
     let ran = host.run(&text("printf after"));
@@ -842,7 +912,9 @@ fn the_host_signals_its_command_s_group_until_it_is_released() {
 
 /// A supervisor that goes away while its command's leader has exited and descendants run on
 /// leaves nothing to signal them: the host ends the command's group itself, reaps the leader and
-/// exits.
+/// exits. The descendant's exit watch is registered while a FIFO holds it, and the host's own
+/// exit is awaited directly: the host ends only once its teardown is over, so that exit orders
+/// the check that the descendant has exited.
 #[test]
 fn a_host_whose_supervisor_goes_away_ends_the_command_it_holds() {
     #[cfg(target_os = "linux")]
@@ -850,44 +922,27 @@ fn a_host_whose_supervisor_goes_away_ends_the_command_it_holds() {
         return;
     }
     let mut host = Host::start("orphan");
-    let marker = host.directory.join("descendant");
-    let Submitted { reply, readers } = submit(&host, &outliving_descendant(&marker, 0));
-    let (tag, _) = FrameReader::new(&reply).unwrap();
-    assert_eq!(tag, REPLY_STARTED);
-    assert_eq!(read_exit(host.control()), ExitStatus::Exited { code: 0 });
-    let descendant = loop {
-        if let Some(pid) = std::fs::read_to_string(&marker)
-            .ok()
-            .and_then(|pid| pid.trim().parse::<i32>().ok())
-        {
-            break pid;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let Outliving {
+        readers,
+        pid,
+        descendant,
+    } = outliving(&host, 0);
     host.close_control();
+    let host_status = host
+        .child
+        .wait_bounded()
+        .expect("the host exits once it ended the command it held");
+    assert_eq!(host_status.code(), Some(0));
+    let ended = descendant
+        .within(Duration::ZERO)
+        .expect("read the descendant's exit");
+    if !ended {
+        // SAFETY: a plain kill of this test's own fixture process, which still runs.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(ended, "the host ended the descendant {pid}");
     let [stdout, _] = readers.map(|reader| reader.join().expect("stream reader"));
     assert_eq!(stdout, "");
-    let host_status = loop {
-        if let Some(status) = host.child.try_wait().expect("host status") {
-            break status;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert_eq!(host_status.code(), Some(0));
-    assert!(gone(descendant), "the host ended the descendant");
-}
-
-/// Whether `pid` stops existing within a bound: a killed descendant whose parent already exited
-/// is collected by init, not by this test.
-fn gone(pid: i32) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while alive(pid) {
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    true
 }
 
 #[test]
@@ -924,14 +979,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     let descendant = host.directory.join("descendant");
     let hold = host.directory.join("hold");
     for path in [&leader, &descendant, &hold] {
-        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("FIFO path");
-        // SAFETY: a NUL-terminated path in this fixture's own directory.
-        assert_eq!(
-            unsafe { libc::mkfifo(path.as_ptr(), 0o600) },
-            0,
-            "{}",
-            std::io::Error::last_os_error()
-        );
+        fifo(path);
     }
     let rendered = text(&format!(
         "sh -c 'printf \"%s\\n\" \"$$\" > {}; read -r _ < {}' & printf '%s\\n' \"$$\" > {}; wait",
@@ -952,8 +1000,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     // Each FIFO reports only after that exact process runs. No elapsed delay supplies readiness.
     let pids = [&leader, &descendant].map(|path| {
         cowshed_os::eprintln!("script-group phase=reading-pid fifo={}", path.display());
-        let value = std::fs::read_to_string(path).expect("read the actual process's FIFO");
-        let pid = value.trim().parse::<i32>().expect("published process PID");
+        let pid = read_published_pid(path);
         cowshed_os::eprintln!(
             "script-group phase=pid-read fifo={} pid={pid}",
             path.display()
@@ -1192,74 +1239,356 @@ fn values_reach_the_script_as_data_in_every_quoting_context() {
     assert_eq!(spread.stdout, "[a b][*]");
 }
 
+const CORPUS_SCHEMA: &str = "cowshed.shell-script-corpus/v1";
+
+/// Declares Verdict, what a corpus row pins, and Verdict::ALL, every class of it, from this one
+/// list, as cowshed-core declares its dictionary enums with trace_enum!. A corpus must hold a row
+/// of each declared class, so a class added to the list is required of the corpus at admission
+/// with no second list to extend, and each match over a verdict below has no default arm, so it
+/// does not compile until it says what the new class does.
+macro_rules! verdicts {
+    ($($(#[$meta:meta])* $class:ident,)+) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Verdict {
+            $($(#[$meta])* $class,)+
+        }
+
+        impl Verdict {
+            /// Every class of row, in declaration order.
+            const ALL: &'static [Self] = &[$(Self::$class,)+];
+        }
+    };
+}
+
+verdicts! {
+    /// The script runs and prints what bash does.
+    #[serde(rename = "ok")]
+    Accepted,
+    /// The host's parser refuses it.
+    Syntax,
+    /// The client refuses its placement before it reaches cowshed.
+    Placement,
+}
+
+impl Verdict {
+    /// Whether this check runs the class's rows on the host: an accepted script runs and prints,
+    /// and a script that does not parse is refused by the host's parser. A placement is refused by
+    /// the client before a script reaches cowshed, so the host never sees one.
+    const fn reaches_the_host(self) -> bool {
+        match self {
+            Self::Accepted | Self::Syntax => true,
+            Self::Placement => false,
+        }
+    }
+}
+
+/// Where one value of an accepted row lands, as the corpus records it: a row that printed
+/// otherwise names where its values stood.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Slot {
+    kind: String,
+    stmt: usize,
+    word: usize,
+}
+
+impl std::fmt::Display for Slot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} at statement {}, word {}",
+            self.kind, self.stmt, self.word
+        )
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Row {
+    name: String,
+    parts: Vec<String>,
+    values: Vec<ScriptValue>,
+    verdict: Verdict,
+    #[serde(default)]
+    slots: Vec<Slot>,
+    #[serde(default)]
+    stdout: Option<String>,
+}
+
+impl Row {
+    /// Where this row's values land, for the report of a row that printed otherwise.
+    fn landing(&self) -> String {
+        self.slots
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Corpus {
     schema: String,
     rows: Vec<Row>,
 }
 
-#[derive(serde::Deserialize)]
-struct Row {
-    name: String,
-    parts: Vec<String>,
-    values: Vec<ScriptValue>,
-    verdict: String,
-    #[serde(default)]
-    stdout: Option<String>,
+/// Why bytes are no corpus this check can stand on.
+#[derive(Debug)]
+enum Refusal {
+    /// Not the shared schema: a missing, unknown or mistyped field, or an unknown verdict.
+    Unreadable(serde_json::Error),
+    /// Another schema's file.
+    Schema(String),
+    /// No row at all.
+    Empty,
+    /// No row of a declared class: with no accepted row nothing would run, and with no syntax row
+    /// nothing would be refused.
+    Missing(Verdict),
+    /// An accepted row, named, that carries no stdout to compare or not one slot per value.
+    Incomplete(String),
 }
 
-fn corpus() -> Corpus {
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(error) => write!(formatter, "is not the shared schema: {error}"),
+            Self::Schema(found) => write!(formatter, "is schema {found:?}, not {CORPUS_SCHEMA:?}"),
+            Self::Empty => formatter.write_str("holds no row, so it exercises nothing"),
+            Self::Missing(class) => write!(formatter, "holds no {class:?} row"),
+            Self::Incomplete(row) => write!(
+                formatter,
+                "holds the accepted row {row:?} without its stdout and a slot per value"
+            ),
+        }
+    }
+}
+
+/// The corpus these bytes hold, or why this check cannot stand on them. An empty corpus, or one
+/// with no row of a declared class, passes every assertion over its rows for want of rows; an
+/// unknown field or verdict is a reader that no longer reads the whole file.
+fn admit(bytes: &[u8]) -> Result<Corpus, Refusal> {
+    let corpus: Corpus = serde_json::from_slice(bytes).map_err(Refusal::Unreadable)?;
+    if corpus.schema != CORPUS_SCHEMA {
+        return Err(Refusal::Schema(corpus.schema));
+    }
+    if corpus.rows.is_empty() {
+        return Err(Refusal::Empty);
+    }
+    if let Some(class) = Verdict::ALL
+        .iter()
+        .copied()
+        .find(|class| corpus.rows.iter().all(|row| row.verdict != *class))
+    {
+        return Err(Refusal::Missing(class));
+    }
+    if let Some(row) = corpus.rows.iter().find(|row| {
+        row.verdict == Verdict::Accepted
+            && (row.stdout.is_none() || row.slots.len() != row.values.len())
+    }) {
+        return Err(Refusal::Incomplete(row.name.clone()));
+    }
+    Ok(corpus)
+}
+
+fn corpus_bytes() -> Vec<u8> {
     let path = std::path::PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR")
             .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs"),
     )
     .join("testdata/shell-script-corpus.json");
-    serde_json::from_slice(&std::fs::read(path).expect("the shared corpus")).expect("corpus JSON")
+    std::fs::read(path).expect("the shared corpus")
+}
+
+/// The rows of a corpus document.
+fn rows(document: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+    document["rows"].as_array_mut().expect("the corpus rows")
+}
+
+/// How the corpus writes a verdict, from the enum that reads it.
+fn written(verdict: Verdict) -> serde_json::Value {
+    serde_json::to_value(verdict).expect("a verdict serializes")
+}
+
+/// Why the real corpus is refused once one change is planted in its JSON. Every control that
+/// uses it differs from the corpus that admits by that change alone, so the refusal is its own.
+fn refused(change: impl FnOnce(&mut serde_json::Value)) -> Refusal {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&corpus_bytes()).expect("the shared corpus is JSON");
+    change(&mut document);
+    match admit(&serde_json::to_vec(&document).expect("the planted corpus")) {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("the planted corpus was admitted"),
+    }
+}
+
+/// A corpus that exercises nothing is refused instead of passed, and a file holding a field the
+/// reader does not name is refused instead of half read.
+#[test]
+fn a_corpus_that_exercises_nothing_or_holds_an_unknown_field_is_refused() {
+    admit(&corpus_bytes()).unwrap_or_else(|refusal| panic!("the shared corpus {refusal}"));
+
+    // No row at all.
+    assert!(matches!(
+        refused(|document| rows(document).clear()),
+        Refusal::Empty
+    ));
+    // Rows, but none the host would run or refuse: only placements are left.
+    assert!(matches!(
+        refused(|document| rows(document)
+            .retain(|row| row["verdict"] == written(Verdict::Placement))),
+        Refusal::Missing(class) if class.reaches_the_host()
+    ));
+    // Each class absent in turn, named.
+    for class in Verdict::ALL.iter().copied() {
+        assert!(matches!(
+            refused(|document| rows(document).retain(|row| row["verdict"] != written(class))),
+            Refusal::Missing(missing) if missing == class
+        ));
+    }
+    // A field nothing reads: in the file, in a row, in a slot.
+    let plants: [fn(&mut serde_json::Value); 3] = [
+        |document| document["unknown"] = serde_json::json!(true),
+        |document| rows(document)[0]["unknown"] = serde_json::json!(true),
+        |document| {
+            let row = rows(document)
+                .iter_mut()
+                .find(|row| {
+                    row["slots"]
+                        .as_array()
+                        .is_some_and(|slots| !slots.is_empty())
+                })
+                .expect("a row with a slot");
+            row["slots"][0]["unknown"] = serde_json::json!(true);
+        },
+    ];
+    for plant in plants {
+        assert!(matches!(
+            refused(plant),
+            Refusal::Unreadable(error) if error.is_data()
+        ));
+    }
+    // A verdict nothing reads.
+    assert!(matches!(
+        refused(|document| rows(document)[0]["verdict"] = serde_json::json!("bogus")),
+        Refusal::Unreadable(error) if error.is_data()
+    ));
+    // An accepted row with no stdout to compare.
+    assert!(matches!(
+        refused(|document| {
+            let row = rows(document)
+                .iter_mut()
+                .find(|row| row["verdict"] == written(Verdict::Accepted))
+                .expect("an accepted row");
+            row.as_object_mut().expect("a row").remove("stdout");
+        }),
+        Refusal::Incomplete(_)
+    ));
+    // Another schema's file.
+    assert!(matches!(
+        refused(|document| document["schema"] = serde_json::json!("another/v1")),
+        Refusal::Schema(_)
+    ));
 }
 
 /// The corpus is shared byte for byte with the compile-time checker on the other side of the
-/// script interface: both must agree which scripts parse, and what an accepted one prints.
+/// script interface: both must agree which scripts parse, and what an accepted one prints. Every
+/// row of a class that reaches the host runs on it.
 #[test]
 fn the_shared_corpus_parses_and_prints_what_bash_does() {
     #[cfg(target_os = "linux")]
     if delegated_case("the_shared_corpus_parses_and_prints_what_bash_does") {
         return;
     }
-    let corpus = corpus();
-    assert_eq!(corpus.schema, "cowshed.shell-script-corpus/v1");
+    let corpus =
+        admit(&corpus_bytes()).unwrap_or_else(|refusal| panic!("the shared corpus {refusal}"));
     let mut host = Host::start("corpus");
     let mut mismatches = Vec::new();
+    let mut exercised = 0;
     for row in &corpus.rows {
         let command = ScriptCommand::new(row.parts.clone(), row.values.clone())
             .unwrap_or_else(|error| panic!("{}: {error}", row.name));
         let rendered = render(&command);
-        match row.verdict.as_str() {
-            "ok" => {
+        match row.verdict {
+            Verdict::Accepted => {
                 let rendered = rendered.unwrap_or_else(|error| panic!("{}: {error}", row.name));
                 let ran = host.run(&rendered);
-                let expected = row.stdout.as_deref().unwrap_or_default();
+                exercised += 1;
+                let expected = row
+                    .stdout
+                    .as_deref()
+                    .expect("admission requires an accepted row's stdout");
                 if ran.status.is_none() || ran.stdout != expected {
                     mismatches.push(format!(
-                        "{}: stdout {:?} (want {expected:?}), status {:?}, stderr {:?}",
-                        row.name, ran.stdout, ran.status, ran.stderr
+                        "{}: stdout {:?} (want {expected:?}), status {:?}, stderr {:?}; its values land in {}",
+                        row.name,
+                        ran.stdout,
+                        ran.status,
+                        ran.stderr,
+                        row.landing()
                     ));
                 }
             }
-            "syntax" => {
-                if let Ok(rendered) = rendered {
+            Verdict::Syntax => match rendered {
+                Ok(rendered) => {
                     let ran = host.run(&rendered);
+                    exercised += 1;
                     if ran.status.is_some() {
                         mismatches.push(format!("{}: parsed, but bash refuses it", row.name));
                     }
                 }
-            }
+                Err(error) => mismatches.push(format!(
+                    "{}: refused before the host ({error}), which pins no parser verdict",
+                    row.name
+                )),
+            },
             // Placement is refused before a script reaches cowshed; brush only has to keep the
             // value out of the shell text, which rendering guarantees for every row that renders.
-            "placement" => {}
-            other => panic!("{}: unknown verdict {other}", row.name),
+            Verdict::Placement => {}
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    assert_eq!(
+        exercised,
+        corpus
+            .rows
+            .iter()
+            .filter(|row| row.verdict.reaches_the_host())
+            .count(),
+        "every row of a class that reaches the host ran on it"
+    );
+}
+
+/// The PATH a command receives is the sequence its host built from the activation's PATH and the
+/// wrapper route: only the route leads, and the activated order stands behind it (04_sandbox.md,
+/// direnv). The cowshed-shell crate's own table owns that sequence for every case
+/// (only_the_wrapper_route_leads_the_returned_path); this is one row of it shown through the real
+/// host. A real command prints the PATH it received, so the check is that the host hands its
+/// command the PATH it built and not the activation's own. No program is planted and no lookup is
+/// asserted: which program a PATH selects is the OS's to decide.
+#[test]
+fn a_launched_command_receives_the_path_its_host_built() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("a_launched_command_receives_the_path_its_host_built") {
+        return;
+    }
+    const ROUTE: &str = "/route/manager-bin";
+    // direnv puts the shell's additions ahead of the inherited bootstrap PATH.
+    let activated =
+        std::env::join_paths(["/declared/bin", ROUTE, "/bootstrap/bin"]).expect("a PATH");
+    let mut host = Host::start_with(
+        "path",
+        &activated,
+        &[(cowshed_core::developer_links::MANAGER_BIN_ENV, ROUTE)],
+    );
+    let ran = host.run(&text("printf '%s' \"$PATH\""));
+    assert_eq!(
+        (exited(ran.status.as_ref()), ran.stdout.as_str()),
+        (Some(0), "/route/manager-bin:/declared/bin:/bootstrap/bin"),
+        "stderr: {:?}",
+        ran.stderr
+    );
 }
 
 /// A host that cannot serve a request says why before it exits, instead of leaving the

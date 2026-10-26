@@ -1,33 +1,30 @@
 //! `cowshed lock` and `cowshed lock-holders`, run as the binary a caller runs (02_workspaces.md
-//! "Held locks"). The readiness proofs of the held lock:
+//! "Held locks"). Which descriptor is the proven owner and whom a waiter may signal (record ×
+//! kernel view × captured life × queued inode) is decided by cowshed-core's `held_lock::judge` and
+//! `held_lock::owned_target`, table-tested there over every cell. These tests keep the real-OS
+//! mappings around that decision:
 //!
 //! - killing the `lock` process alone never releases the lock while its command runs: the command
-//!   inherited the descriptor, and only its end lets the next holder in;
-//! - a holder record naming a pid that is not the proven holder proves no owner, and a waiter's
-//!   captured authority never reaches it;
-//! - a holder outside cowshed that takes the same `flock(2)` with no record (lockf(1), flock(1))
-//!   still serializes with `lock`, is named with the custody the kernel shows of it, and is never
-//!   signalled;
-//! - a waiter signals only the proven owner whose life it captured at its start, through that
-//!   captured identity, and only of the inode it is queued on; a captured life that has ended or a
-//!   file that replaced its lock at the path is never signalled, and the owner forwards the signal
-//!   to its command, so the lock goes only with the command;
-//! - a waiter that signalled refuses its step: it never says ACQUIRED nor runs its command, while
-//!   a waiter that did not signal keeps its place in the queue.
+//!   inherited the descriptor, the kernel shows it without a record, and only its end lets the
+//!   next holder in;
+//! - a proven owner is signalled through the identity its waiter captured, and the owner forwards
+//!   the signal to its command, so the lock goes only with the command;
+//! - a waiter queued on an inode a file replaced at the path refuses its step and never runs its
+//!   command;
+//! - a holder outside cowshed that takes the same `flock(2)` (lockf(1)) serializes with `lock`.
 #![cfg(unix)]
 
 use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _, FileBackstop as _};
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::Duration;
 
 use cowshed_core::api::dto::ExitStatus;
 use cowshed_core::api::held_lock::LockWaiterEvent;
@@ -37,7 +34,9 @@ use cowshed_core::storage::directory::DirectoryExecutionHost;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use serde_json::Value;
 
-const POLL: Duration = Duration::from_millis(20);
+#[path = "support/release_gate.rs"]
+mod release_gate;
+use release_gate::Gate;
 
 /// The `cowshed` binary under test, read when the test runs (see `disk_command.rs`).
 fn cowshed() -> PathBuf {
@@ -77,6 +76,11 @@ impl Dir {
         assert_eq!(rc, 0, "mkfifo: {}", io::Error::last_os_error());
         fifo
     }
+
+    /// A release gate named `name` in this directory.
+    fn gate(&self, name: &str) -> Gate {
+        Gate::new(self.path.join(name))
+    }
 }
 
 impl Drop for Dir {
@@ -84,24 +88,6 @@ impl Drop for Dir {
         let removed = fs::remove_dir_all(&self.path);
         if !thread::panicking() {
             removed.expect("remove the test directory");
-        }
-    }
-}
-
-/// Writes one line to a fifo a command reads, once the command has opened it.
-fn release(fifo: &Path) {
-    loop {
-        match OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(fifo)
-        {
-            Ok(mut writer) => {
-                writer.write_all(b"\n").expect("write the release line");
-                return;
-            }
-            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => thread::sleep(POLL),
-            Err(error) => panic!("open {}: {error}", fifo.display()),
         }
     }
 }
@@ -294,11 +280,6 @@ fn unrecorded(lock: &Path) -> TestProcess {
     let child = TestProcess::spawn(&mut command);
     drop(file);
     child
-}
-
-/// A `sleep` with no descriptor on any lock.
-fn bystander() -> TestProcess {
-    TestProcess::spawn(Command::new("sleep").arg("600"))
 }
 
 /// The leader stays unreaped until cleanup, so its process-group id cannot be reused.
@@ -622,11 +603,11 @@ fn lock_preserves_non_utf8_child_arguments() {
 fn acquired_keeps_the_state_channel_until_the_command_ends() {
     let dir = Dir::new("state-cloexec");
     let state = dir.fifo("state");
-    let release_fifo = dir.fifo("release");
+    let release_fifo = dir.gate("release");
     let child = TestProcess::spawn(
         state_command(&dir)
             .args(["--", "sh", "-c", r#"read x < "$1"; exit 7"#, "step"])
-            .arg(&release_fifo),
+            .arg(release_fifo.path()),
     );
     let mut state = BufReader::new(File::open(&state).expect("open state reader"));
     let mut events = String::new();
@@ -641,7 +622,7 @@ fn acquired_keeps_the_state_channel_until_the_command_ends() {
         !at_end(state.get_ref()),
         "post-spawn diagnostics remain owned"
     );
-    release(&release_fifo);
+    release_fifo.release();
     assert_eq!(
         child.wait().expect("observe nonzero child exit"),
         ExitStatus::Exited { code: 7 }
@@ -693,7 +674,7 @@ fn a_stateful_lock_relinquishes_all_command_streams_before_its_command_ends() {
     let dir = Dir::new("stdio-handoff");
     let state_path = dir.fifo("state");
     let closed = dir.fifo("closed");
-    let release_fifo = dir.fifo("release");
+    let release_fifo = dir.gate("release");
     let mut child = TestProcess::spawn(
         state_command(&dir)
             .args([
@@ -704,7 +685,7 @@ fn a_stateful_lock_relinquishes_all_command_streams_before_its_command_ends() {
                 "step",
             ])
             .arg(&closed)
-            .arg(&release_fifo)
+            .arg(release_fifo.path())
             .stdin(Stdio::piped()),
     );
     let mut state = BufReader::new(File::open(state_path).expect("open state"));
@@ -741,7 +722,7 @@ fn a_stateful_lock_relinquishes_all_command_streams_before_its_command_ends() {
         child.is_running(),
         "the controller still waits for the live command"
     );
-    release(&release_fifo);
+    release_fifo.release();
     assert_eq!(
         child.wait().expect("command status"),
         ExitStatus::Exited { code: 7 }
@@ -758,11 +739,11 @@ fn a_stateful_lock_relinquishes_all_command_streams_before_its_command_ends() {
 fn the_running_command_does_not_inherit_the_state_channel() {
     let dir = Dir::new("state-custody");
     let state_path = dir.fifo("state");
-    let release_fifo = dir.fifo("release");
+    let release_fifo = dir.gate("release");
     let child = TestProcess::spawn(
         state_command(&dir)
             .args(["--", "sh", "-c", r#"read -r line < "$1""#, "step"])
-            .arg(&release_fifo),
+            .arg(release_fifo.path()),
     );
     let mut state = BufReader::new(File::open(state_path).expect("open state"));
     let mut event = String::new();
@@ -785,13 +766,13 @@ fn the_running_command_does_not_inherit_the_state_channel() {
         .expect("the live command owns no state writer");
     assert_eq!(rest, "");
     assert!(held(&dir.lock()), "the live command still holds the lock");
-    release(&release_fifo);
+    release_fifo.release();
 }
 
 #[test]
 fn a_closed_state_reader_does_not_abandon_the_started_command() {
     let dir = Dir::new("closed-state-reader");
-    let fifo = dir.fifo("release");
+    let fifo = dir.gate("release");
     let (state, reader) = std::os::unix::net::UnixStream::pair().expect("create state channel");
     drop(reader);
     let descriptor = state.as_raw_fd();
@@ -807,7 +788,7 @@ fn a_closed_state_reader_does_not_abandon_the_started_command() {
             r#"echo started; read x < "$1"; echo ended"#,
             "step",
         ])
-        .arg(&fifo)
+        .arg(fifo.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // SAFETY: the child inherits this open socket; only the async-signal-safe fcntl runs here.
@@ -832,7 +813,7 @@ fn a_closed_state_reader_does_not_abandon_the_started_command() {
         "the wrapper exited instead of waiting for its started command"
     );
     assert!(held(&dir.lock()), "state reporting lost lock custody");
-    release(&fifo);
+    fifo.release();
     assert_eq!(line(&mut stdout), "ended");
     assert_eq!(
         child
@@ -855,11 +836,11 @@ fn a_closed_state_reader_does_not_abandon_the_started_command() {
 fn killing_the_lock_process_alone_leaves_the_lock_with_its_running_command() {
     let dir = Dir::new("helper-death");
     let lock = dir.lock();
-    let fifo = dir.fifo("release");
+    let fifo = dir.gate("release");
     let mut helper = lock_command(
         &lock,
         r#"echo started; read x < "$1"; echo ended"#,
-        &[&fifo],
+        &[fifo.path()],
     );
     let mut stdout = BufReader::new(helper.stdout.take().expect("stdout"));
     assert_eq!(line(&mut stdout), "started");
@@ -895,104 +876,13 @@ fn killing_the_lock_process_alone_leaves_the_lock_with_its_running_command() {
         .unwrap_or_else(|| panic!("the running command is not named: {observation}"));
     assert_eq!(command["custody"], unrecorded_holder(), "{observation}");
 
-    release(&fifo);
+    fifo.release();
     assert_eq!(line(&mut stdout), "ended");
-    while held(&lock) {
-        thread::sleep(POLL);
-    }
-}
-
-#[test]
-fn a_record_naming_a_pid_that_does_not_hold_the_lock_proves_no_owner_and_is_never_signalled() {
-    let dir = Dir::new("foreign-record");
-    let lock = dir.lock();
-    let holder = unrecorded(&lock);
-    let named = bystander();
-    // A record naming a live process that holds no descriptor on the inode, with a unique id that
-    // is not its life's. The waiter's caller even owns that process: nothing proves it the owner.
-    let forged = serde_json::json!({
-        "pid": named.id(),
-        "uniqueId": "1",
-        "since": "2026-10-21T00:00:00Z",
-        "command": "a holder that has exited",
-    });
-    fs::write(&lock, forged.to_string()).expect("write the record");
-    let observation = lock_holders(&lock);
-    assert!(observation["owner"].is_null(), "{observation}");
-    assert_eq!(observation["locked"], true, "{observation}");
-    let mut waiter = OwnedWaiter::start(&dir, "state", &lock, &[named.id(), holder.id()]);
-    waiter.refused_request();
-    assert!(named.is_running(), "the named process was signalled");
-    assert!(holder.is_running(), "the unrecorded holder was signalled");
-    drop(holder);
-    waiter.finish();
-    drop(named);
-}
-
-/// The owner whose life the waiter captured has ended while its command still holds the lock
-/// (the command inherited it): the record names a life that is gone, the kernel proves no owner,
-/// and the request reaches nothing; the command, still holding the lock, is untouched.
-#[test]
-fn a_waiter_never_signals_once_the_life_it_captured_has_ended() {
-    let dir = Dir::new("captured-ended");
-    let lock = dir.lock();
-    let fifo = dir.fifo("release");
-    let mut owner = lock_command(
-        &lock,
-        r#"echo started; read x < "$1"; echo ended"#,
-        &[&fifo],
-    );
-    let mut stdout = BufReader::new(owner.stdout.take().expect("stdout"));
-    assert_eq!(line(&mut stdout), "started");
-    let mut waiter = OwnedWaiter::start(&dir, "state", &lock, &[owner.id()]);
-    send(owner.id(), libc::SIGKILL);
-    owner.wait().expect("observe the owner exit");
-    assert!(held(&lock), "the command holds the lock its owner left");
-    waiter.refused_request();
-    release(&fifo);
-    assert_eq!(line(&mut stdout), "ended", "the command was signalled");
-    waiter.finish();
-}
-
-#[test]
-fn a_holder_outside_cowshed_serializes_with_lock_is_named_and_is_never_signalled() {
-    let dir = Dir::new("outside-holder");
-    let lock = dir.lock();
-    let holder = unrecorded(&lock);
-    let mut waiter = lock_command(&lock, "echo ran", &[]);
-    let mut stderr = BufReader::new(waiter.stderr.take().expect("stderr"));
-    let mut said = String::new();
-    stderr.read_line(&mut said).expect("read the wait line");
-    assert!(said.contains("held by another holder; waiting"), "{said}");
-
-    let observation = &lock_holders(&lock);
-    assert_eq!(observation["locked"], true, "{observation}");
-    assert!(observation["owner"].is_null(), "{observation}");
-    assert_eq!(
-        observation["record"],
-        serde_json::json!({"encoding": "utf8", "data": ""}),
-        "{observation}"
-    );
-    assert_eq!(custody_of(observation, holder.id()), unrecorded_holder());
-    let waiting = if cfg!(target_os = "linux") {
-        "open"
-    } else {
-        "unexposed"
-    };
-    assert_eq!(custody_of(observation, waiter.id()), waiting);
-    assert!(holder.is_running(), "an unrecorded holder was signalled");
-    let mut owned = OwnedWaiter::start(&dir, "state", &lock, &[holder.id()]);
-    owned.refused_request();
-    assert!(holder.is_running(), "an unrecorded holder was signalled");
-
-    let mut stdout = BufReader::new(waiter.stdout.take().expect("stdout"));
-    drop(holder);
-    assert_eq!(line(&mut stdout), "ran");
-    assert_eq!(
-        waiter.wait().expect("observe lock exit"),
-        ExitStatus::Exited { code: 0 }
-    );
-    owned.finish();
+    // The kernel grants the lock exactly when the command's descriptor closes with it.
+    File::open(&lock)
+        .expect("open the lock")
+        .lock_bounded()
+        .expect("the lock is granted once its command has ended");
 }
 
 #[test]
@@ -1074,48 +964,6 @@ fn a_file_that_replaced_the_lock_at_its_path_is_never_the_waiters_owner() {
     replacing.stop().expect("stop the replacing holder");
 }
 
-/// Darwin exposes no lock state per descriptor. The command that inherited the lock holds it, but
-/// the kernel cannot say so: it is named `unexposed`, never counted the owner, and a signal asked
-/// of it is never sent, while the owner the record names is proven and signalled.
-#[cfg(target_os = "macos")]
-#[test]
-fn darwin_names_an_inherited_descriptor_unexposed_and_never_signals_it() {
-    let dir = Dir::new("unexposed");
-    let lock = dir.lock();
-    let mut helper = lock_command(&lock, "echo started; exec sleep 600", &[]);
-    let mut stdout = BufReader::new(helper.stdout.take().expect("stdout"));
-    assert_eq!(line(&mut stdout), "started");
-    let observation = lock_holders(&lock);
-    assert_eq!(observation["owner"]["pid"], helper.id(), "{observation}");
-    let inherited = observation["descriptors"]
-        .as_array()
-        .expect("descriptors")
-        .iter()
-        .find(|descriptor| {
-            descriptor["command"]
-                .as_str()
-                .is_some_and(|command| command.contains("sleep 600"))
-        })
-        .unwrap_or_else(|| panic!("the inherited command is not named: {observation}"));
-    assert_eq!(inherited["custody"], "unexposed", "{observation}");
-    let inherited = u32::try_from(inherited["pid"].as_u64().expect("a pid")).expect("a pid fits");
-
-    let mut waiter = OwnedWaiter::start(&dir, "state", &lock, &[inherited]);
-    waiter.refused_request();
-    // This is the helper's child, not ours: the helper reaps it. The NotSignalled
-    // event above proves refusal; signal 0 only checks that this inherited process still exists.
-    let inherited_pid = i32::try_from(inherited).expect("a pid fits in pid_t");
-    // SAFETY: signal 0 only checks existence and sends no signal.
-    assert_eq!(
-        unsafe { libc::kill(inherited_pid, 0) },
-        0,
-        "the inherited process disappeared: {}",
-        io::Error::last_os_error()
-    );
-    helper.stop().expect("stop the holder");
-    waiter.finish();
-}
-
 /// Git under `lock` resolves automatic gc, maintenance and fsmonitor off even when the repository
 /// enables them. The caller's unrelated config survives, and the managed Nx no-start policy is
 /// present. This finite command leaves no process holding the lock.
@@ -1179,13 +1027,13 @@ fn a_command_holding_the_lock_receives_the_git_and_managed_nx_policies() {
 fn bsd_lockf_and_cowshed_lock_exclude_each_other_on_the_same_file() {
     let dir = Dir::new("lockf");
     let lock = dir.lock();
-    let fifo = dir.fifo("release");
+    let fifo = dir.gate("release");
     let mut lockf = TestProcess::spawn(
         Command::new("lockf")
             .arg("-k")
             .arg(&lock)
             .args(["sh", "-c", r#"echo held; read x < "$1""#, "sh"])
-            .arg(&fifo)
+            .arg(fifo.path())
             .stdout(Stdio::piped()),
     );
     let mut said = BufReader::new(lockf.stdout.take().expect("stdout"));
@@ -1208,7 +1056,7 @@ fn bsd_lockf_and_cowshed_lock_exclude_each_other_on_the_same_file() {
     owned.refused_request();
     assert!(lockf.is_running(), "lockf was signalled");
 
-    release(&fifo);
+    fifo.release();
     assert_eq!(
         lockf.wait().expect("observe lockf exit"),
         ExitStatus::Exited { code: 0 }
@@ -1222,7 +1070,7 @@ fn bsd_lockf_and_cowshed_lock_exclude_each_other_on_the_same_file() {
     owned.finish();
 
     // And the other order: lockf waits for a lock `cowshed lock` holds.
-    let mut holder = lock_command(&lock, r#"echo started; read x < "$1""#, &[&fifo]);
+    let mut holder = lock_command(&lock, r#"echo started; read x < "$1""#, &[fifo.path()]);
     let mut started = BufReader::new(holder.stdout.take().expect("stdout"));
     assert_eq!(line(&mut started), "started");
     let refused = Command::new("lockf")
@@ -1232,7 +1080,7 @@ fn bsd_lockf_and_cowshed_lock_exclude_each_other_on_the_same_file() {
         .status_bounded()
         .expect("run lockf");
     assert!(!refused.success(), "lockf took a lock cowshed lock holds");
-    release(&fifo);
+    fifo.release();
     assert_eq!(
         holder.wait().expect("observe lock exit"),
         ExitStatus::Exited { code: 0 }

@@ -56,26 +56,17 @@ fn requester(socket: &Path, line: &str) -> Command {
     command
 }
 
-/// Wait until the registry no longer lists `disk`'s entry. Nothing tells the test when a detach no
-/// one waits for has ended, so the registry, which lists every attached disk, is read until it
-/// does; a detach that never ends is the test runner's hang to report.
-fn await_detached(disk: &OwnedDisk) {
-    while registered(disk.entry).is_some() {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ram_detach_outlives_the_requester_that_asked_for_it() {
     // The test holds a namespace phase for as long as the requester lives; the gateway must not
     // evict it to the waiting detach meanwhile.
-    let (gateway, root, socket) = gateway(DiskLeaseLimits {
+    let (mut gateway, root, socket) = gateway(DiskLeaseLimits {
         phase_bound: Duration::from_secs(600),
         ..DiskLeaseLimits::default()
     })
     .await;
     let namespace = root.namespace();
-    tokio::task::spawn_blocking(move || {
+    let (disk, mut disks) = tokio::task::spawn_blocking(move || {
         let mut disks = FixtureDisks::new(namespace);
         let disk = disks.attach(fixture_sectors(0));
         let line = detach_line(&disk, disk.entry);
@@ -117,12 +108,17 @@ async fn a_ram_detach_outlives_the_requester_that_asked_for_it() {
             }),
             "the requester's job held no disk-image process to retire: {retired:?}"
         );
-        // The phase drained with the requester gone: the gateway's detach runs to its end.
-        await_detached(&disk);
-        disks.forget(&disk);
+        (disk, disks)
     })
     .await
     .expect("the requester proof");
+    gateway.detached(disk.entry).await;
+    assert!(
+        registered(disk.entry).is_none(),
+        "the completed detach removed {disk:?}"
+    );
+    disks.forget(&disk);
+    drop(disks);
     gateway.drain().await.expect("drain");
 }
 

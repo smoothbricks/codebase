@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt,
     path::Path,
     sync::Arc,
@@ -23,15 +23,20 @@ use cowshed_gateway_types::{
 };
 
 use crate::{
+    admission::{
+        Admitted, PermitClass, PermitId, Pool, QueueId, Queued, Refusal, Unadmitted,
+        active_permit_capacity,
+    },
     cache::{Cache, CacheError},
-    config::{ControlTcpConfig, GatewayConfig, GatewayLimits},
+    config::{ControlTcpConfig, GatewayConfig},
     control::ControlError,
     interfaces::{
         AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, ConnectError, CredentialError,
         CredentialProvider, SystemConnector, UpstreamConnector,
     },
     mirror::{MirrorCacheStatus, MirrorService},
-    nx_cache::{NxCacheBackend, NxCacheClearRefusal, NxCacheUse},
+    nx_cache::{NxCacheBackend, NxCacheClearRefusal},
+    nx_lifecycle::{Handle, Installed, NxAdmission, NxBackendState, NxBackends, Released},
     proxy,
     repo_mirror::{Git2RepoTransport, RepoMirrorError, RepoMirrorHandle, RepoTransport},
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRunner, XcrunSimRunner},
@@ -518,9 +523,6 @@ pub(crate) enum Command {
         event: BrokerAuditEvent,
         reply: oneshot::Sender<Result<(), AuditError>>,
     },
-    QueueExpired {
-        queue_id: u64,
-    },
     MintLeaf {
         workspace_id: String,
         generation: u64,
@@ -836,26 +838,18 @@ pub(crate) struct AdmissionError {
     pub audit_status: AuditStatus,
 }
 
+/// A request waiting for a permit: its seed and its reply.
 struct Pending {
-    queue_id: u64,
     seed: AdmissionSeed,
     reply: oneshot::Sender<Result<Admission, AdmissionError>>,
-    timer: Option<JoinHandle<()>>,
-    cancellation: Option<JoinHandle<()>>,
 }
 
 /// A request waiting for its project's standalone Nx backend to start. It keeps the original
 /// request rather than an admission seed, since the backend that seed needs does not exist yet.
-/// It is charged to the same session and global queued counters as any queued request.
 struct NxPending {
-    queue_id: u64,
     workspace_id: String,
-    repo_id: String,
-    generation: u64,
     intent: RequestIntent,
     reply: oneshot::Sender<Result<Admission, AdmissionError>>,
-    timer: Option<JoinHandle<()>>,
-    cancellation: Option<JoinHandle<()>>,
 }
 
 /// The reporting supervisor owns this worker even before its first poll.
@@ -884,162 +878,42 @@ fn supervise_nx_start(
     })
 }
 
-/// A project's standalone Nx cache backend, owned by the actor. `Starting` holds the one task
-/// that reports its start; every removal aborts that task explicitly, because dropping a
-/// `JoinHandle` does not abort it.
-enum NxBackendState {
-    Starting {
-        task: JoinHandle<()>,
-    },
-    Ready {
-        backend: NxCacheBackend,
-        /// `None` only for a backend the host configured directly. A started server's child keeps
-        /// its stdin lease, and its death closes that lease.
-        process: Option<Box<tokio::process::Child>>,
-    },
-    Failed {
-        reason: String,
-        retry_after: std::time::Instant,
-    },
-    /// The project's store is being cleared: its backend has stopped and no new one starts until
-    /// the clear reports, so every request meanwhile is the method's miss or refusal.
-    Clearing,
-}
+/// A project's backend start task, the one that reports it ([`supervise_nx_start`]), or a child
+/// the gateway started for a project: what the Nx lifecycle holds for the actor and hands back.
+type NxHandle = Handle<JoinHandle<()>, Box<tokio::process::Child>>;
 
-/// One request's Nx backend admission: serve now, wait for the start, or refuse as an outage.
-enum NxAdmission {
-    Ready,
-    Starting,
-    Unavailable(NxRefusal),
-}
-
-/// Why an Nx request is refused before it is admitted: the audit status and classification, the
-/// optional diagnostic, and the reply's message.
-struct NxRefusal {
-    status: AuditStatus,
-    classification: &'static str,
-    detail: Option<String>,
-    message: &'static str,
-}
-
-impl NxRefusal {
-    /// The refusal of a project backend that is down, cooling down, or failed to start.
-    fn outage(reason: String) -> Self {
-        Self {
-            status: AuditStatus::Failed,
-            classification: "nx-backend-unavailable",
-            detail: Some(reason),
-            message: "project Nx cache backend is unavailable",
-        }
-    }
-
-    /// A full queue, whether the project's backend is starting or Ready. Stock Nx 23.2.1 retries
-    /// no `GET` and reads any status but 200/404 as a fatal misconfiguration, so a busy gateway
-    /// answers the method's miss or refusal (05_gateway.md "Busy gateway"), never 429.
-    fn queue_limited() -> Self {
-        Self {
-            status: AuditStatus::Limited,
-            classification: "nx-queue-limited",
-            detail: None,
-            message: "gateway queue is full",
-        }
-    }
-
-    /// A startup-queue wait that reached its deadline: like a full queue, the method's miss or
-    /// refusal, never 504.
-    fn queue_timeout() -> Self {
-        Self {
-            status: AuditStatus::TimedOut,
-            classification: "queue-timeout",
-            detail: None,
-            message: "gateway queue wait timed out",
-        }
+/// Ends what the Nx lifecycle handed back. A start's task is aborted, its worker with it, because
+/// dropping a `JoinHandle` does not abort it; a started child is dropped, which kills it
+/// (`kill_on_drop`).
+fn retire_nx(handle: NxHandle) {
+    match handle {
+        Handle::Start(task) => task.abort(),
+        Handle::Child(process) => drop(process),
     }
 }
 
-/// Which bounded active pool a permit is charged to.
-///
-/// An intercepted CONNECT is a downstream TLS transport: every HTTP request it carries is
-/// admitted separately as a [`PermitClass::Request`]. Charging the tunnel to the origin pool its
-/// own inner requests need would let `origin_active` live tunnels starve every inner request
-/// until the client gives up. Tunnels therefore draw from their own pool, bounded by the same
-/// workspace and global limits, and never hold an origin slot; only requests carry one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum PermitClass {
-    InterceptTunnel,
-    Request { origin: String },
+/// The clock the actor's admission decisions read: tokio's, which its queue timer sleeps on.
+fn now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
 }
 
-/// Active permits per pool. Each pool is bounded independently by `workspace_active` and
-/// `global_active`, so the active total is at most twice either limit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ActiveCounts {
-    tunnels: usize,
-    requests: usize,
-}
-
-impl ActiveCounts {
-    fn of(self, class: &PermitClass) -> usize {
-        match class {
-            PermitClass::InterceptTunnel => self.tunnels,
-            PermitClass::Request { .. } => self.requests,
-        }
-    }
-
-    fn slot(&mut self, class: &PermitClass) -> &mut usize {
-        match class {
-            PermitClass::InterceptTunnel => &mut self.tunnels,
-            PermitClass::Request { .. } => &mut self.requests,
-        }
-    }
-
-    fn charge(&mut self, class: &PermitClass) {
-        *self.slot(class) += 1;
-    }
-
-    fn release(&mut self, class: &PermitClass) {
-        let slot = self.slot(class);
-        *slot = slot.saturating_sub(1);
-    }
-
-    fn total(self) -> usize {
-        self.tunnels + self.requests
-    }
-}
-
-/// Every active permit owns one reserved completion slot until the actor receives its
-/// completion, so the channel holds both pools' global bounds.
-/// [`GatewayLimits::validate`] keeps this product within the channel's permit range.
-fn active_permit_capacity(limits: &GatewayLimits) -> usize {
-    limits.global_active * 2
-}
-
-/// Whether one more permit of `class` fits its pool. `origin_active` is consulted only for
-/// requests, the sole class holding an upstream origin slot.
-fn pool_admits(
-    limits: &GatewayLimits,
-    session: ActiveCounts,
-    global: ActiveCounts,
-    class: &PermitClass,
-    origin_active: impl FnOnce(&str) -> usize,
-) -> bool {
-    session.of(class) < limits.workspace_active
-        && global.of(class) < limits.global_active
-        && match class {
-            PermitClass::InterceptTunnel => true,
-            PermitClass::Request { origin } => origin_active(origin) < limits.origin_active,
-        }
-}
-
-struct PermitState {
-    workspace_id: String,
-    class: PermitClass,
+/// Whether `authentication` proves a request is the session's whose `token` and `generation` it
+/// presents. The selected listener or socket already named the workspace, and with it the
+/// project, so the Nx cache route takes no credential (05_gateway.md "`/nx/v1/cache/{hash}`");
+/// a tunnel's generation never admits that route.
+fn authenticated(
+    authentication: &Authentication,
+    token: &WorkspaceToken,
     generation: u64,
-    /// The project whose Nx backend this permit's request is served by; `None` for every other
-    /// request.
-    nx_repo: Option<String>,
+    nx: bool,
+) -> bool {
+    match authentication {
+        Authentication::Bearer(_) if nx => true,
+        Authentication::Bearer(Some(presented)) => token.matches_encoded(presented),
+        Authentication::Bearer(None) => false,
+        Authentication::Generation(presented) => *presented == generation && !nx,
+    }
 }
-
 struct SessionState {
     repo_id: String,
     revision: u64,
@@ -1049,8 +923,6 @@ struct SessionState {
     policy: WorkspacePolicy,
     signer: CaSigner,
     generation: u64,
-    active: ActiveCounts,
-    queued: usize,
     accept_stop: watch::Sender<bool>,
     connection_stop: watch::Sender<bool>,
     audit_stop: watch::Sender<bool>,
@@ -1104,17 +976,12 @@ struct Actor {
     repo_mirror: RepoMirrorHandle,
     sim_broker: SimBrokerHandle,
     sessions: HashMap<String, SessionState>,
-    nx_backends: HashMap<String, NxBackendState>,
-    nx_queue: VecDeque<NxPending>,
+    /// Every request's admission: permits, waiters and their deadlines.
+    pool: Pool<Pending, NxPending>,
+    /// Every project's Nx cache backend.
+    nx: NxBackends<JoinHandle<()>, Box<tokio::process::Child>>,
     revisions: HashMap<String, u64>,
-    permits: HashMap<u64, PermitState>,
-    origins: HashMap<(String, String), usize>,
-    queue: VecDeque<Pending>,
-    global_active: ActiveCounts,
-    global_queued: usize,
     next_generation: u64,
-    next_permit: u64,
-    next_queue: u64,
     next_audit: u64,
     leaf_cache: LeafCache,
     draining: bool,
@@ -1153,6 +1020,8 @@ impl Actor {
         } = brokers;
         Self {
             leaf_cache: LeafCache::new(config.limits, config.timeouts),
+            pool: Pool::new(config.limits, config.timeouts.request_total),
+            nx: NxBackends::new(config.timeouts.connect),
             commands,
             completions,
             completion_receiver,
@@ -1167,17 +1036,8 @@ impl Actor {
             repo_mirror,
             sim_broker,
             sessions: HashMap::new(),
-            nx_backends: HashMap::new(),
-            nx_queue: VecDeque::new(),
             revisions: HashMap::new(),
-            permits: HashMap::new(),
-            origins: HashMap::new(),
-            queue: VecDeque::new(),
-            global_active: ActiveCounts::default(),
-            global_queued: 0,
             next_generation: 1,
-            next_permit: 1,
-            next_queue: 1,
             next_audit: 1,
             draining: false,
             nx_backend_reap: cowshed_os::deadline::REAP,
@@ -1189,14 +1049,26 @@ impl Actor {
 
     async fn run(mut self) -> Result<(), GatewayError> {
         loop {
+            // The one queue timer: it wakes the actor at the earliest wait's end, read afresh
+            // each turn, and the pool decides which waits ended.
+            let deadline = self.pool.deadline();
+            let expiry = async move {
+                match deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 Some(completion) = self.completion_receiver.recv() => {
                     self.record(completion.draft).await;
                     self.complete(completion.permit_id);
                 }
                 Some(queue_id) = self.cancellation_receiver.recv() => {
-                    self.cancel_queued_request(queue_id).await;
+                    self.cancel_queued(queue_id).await;
                 }
+                () = expiry => self.expire_queued().await,
                 command = self.receiver.recv() => {
                     let Some(command) = command else {
                         self.force_stop().await?;
@@ -1248,9 +1120,6 @@ impl Actor {
                         Command::BrokerAudit { event, reply } => {
                             let result = self.broker_audit(event).await;
                             let _ = reply.send(result);
-                        }
-                        Command::QueueExpired { queue_id } => {
-                            self.expire_queued(queue_id).await;
                         }
                         Command::MintLeaf {
                             workspace_id,
@@ -1367,7 +1236,7 @@ impl Actor {
                 current.quiesce().await;
             }
             self.leaf_cache.drop_workspace(&workspace_id);
-            self.cancel_queued(&workspace_id).await;
+            self.refuse_rotated(&workspace_id).await;
         }
         if self.draining {
             drop(listener);
@@ -1411,8 +1280,6 @@ impl Actor {
                 policy: session.policy,
                 signer,
                 generation,
-                active: ActiveCounts::default(),
-                queued: 0,
                 accept_stop,
                 connection_stop,
                 audit_stop,
@@ -1420,6 +1287,7 @@ impl Actor {
                 handoff,
             },
         );
+        self.pool.install(&workspace_id, generation);
         self.revisions.insert(workspace_id, revision);
         Ok(())
     }
@@ -1452,8 +1320,8 @@ impl Actor {
             .unbind_session(workspace_id.to_owned())
             .await?;
         self.leaf_cache.drop_workspace(workspace_id);
-        self.cancel_queued(workspace_id).await;
-        self.release_nx_backend(&repo_id).await;
+        self.refuse_rotated(workspace_id).await;
+        self.release_nx_backend(&repo_id);
         Ok(())
     }
 
@@ -1463,7 +1331,7 @@ impl Actor {
     /// running one's child is killed as it drops. A backend the gateway was handed, not started,
     /// owns no process and stays. Measured 2026-10-19: every scratch project a test adopted and
     /// discarded left its server running until the gateway restarted, seven of nine at once.
-    async fn release_nx_backend(&mut self, repo_id: &str) {
+    fn release_nx_backend(&mut self, repo_id: &str) {
         if self
             .sessions
             .values()
@@ -1471,22 +1339,17 @@ impl Actor {
         {
             return;
         }
-        match self.nx_backends.get(repo_id) {
-            Some(NxBackendState::Starting { task }) => task.abort(),
-            Some(
-                NxBackendState::Ready {
-                    process: Some(_), ..
+        match self.nx.release(repo_id) {
+            Released::Kept => {}
+            Released::Forgot(handle) => {
+                cowshed_os::eprintln!(
+                    "cowshed: Nx cache backend for {repo_id} stopped: its project has no session left"
+                );
+                if let Some(handle) = handle {
+                    retire_nx(handle);
                 }
-                | NxBackendState::Failed { .. },
-            ) => {}
-            Some(NxBackendState::Ready { process: None, .. } | NxBackendState::Clearing) | None => {
-                return;
             }
         }
-        cowshed_os::eprintln!(
-            "cowshed: Nx cache backend for {repo_id} stopped: its project has no session left"
-        );
-        self.drop_nx_backend(repo_id);
     }
 
     /// Serve `listener` for `workspace_id`; the task, and for a TCP listener a duplicate a
@@ -1638,40 +1501,14 @@ impl Actor {
     }
 
     fn configure_nx_cache(&mut self, backend: NxCacheBackend) -> Result<(), GatewayError> {
-        if matches!(
-            self.nx_backends.get(&backend.repo_id),
-            Some(
-                NxBackendState::Starting { .. }
-                    | NxBackendState::Clearing
-                    | NxBackendState::Ready {
-                        process: Some(_),
-                        ..
-                    }
-            )
-        ) {
-            return Err(GatewayError::NxBackend(
-                "the project's Nx cache backend is managed by the gateway".to_owned(),
-            ));
-        }
-        backend
-            .validate()
+        let displaced = self
+            .nx
+            .configure(backend)
             .map_err(|reason| GatewayError::NxBackend(reason.to_owned()))?;
-        self.nx_backends.insert(
-            backend.repo_id.clone(),
-            NxBackendState::Ready {
-                backend,
-                process: None,
-            },
-        );
-        Ok(())
-    }
-
-    /// The project's Ready backend: the only backend state a request may use.
-    fn nx_backend(&self, repo_id: &str) -> Option<&NxCacheBackend> {
-        match self.nx_backends.get(repo_id) {
-            Some(NxBackendState::Ready { backend, .. }) => Some(backend),
-            _ => None,
+        if let Some(handle) = displaced {
+            retire_nx(handle);
         }
+        Ok(())
     }
 
     /// Starts the project's backend in its own task. The task owns a copy of the config and the
@@ -1689,90 +1526,33 @@ impl Actor {
                 async move { crate::nx_cache::start_backend(&config, &worker_repo).await },
             );
         let task = supervise_nx_start(repo, self.commands.clone(), worker);
-        self.nx_backends
-            .insert(repo_id.to_owned(), NxBackendState::Starting { task });
+        if let Some(displaced) = self.nx.starting(repo_id, task) {
+            retire_nx(displaced);
+        }
         Ok(())
     }
 
-    /// The project backend's state for one request. A started child that has exited is replaced
-    /// by a fresh start in this same call, and its writers are revoked. A failed start is an
-    /// outage until its cooldown ends, after which one new start is attempted.
-    async fn nx_admission(&mut self, repo_id: &str) -> NxAdmission {
-        let exited = match self.nx_backends.get_mut(repo_id) {
-            Some(NxBackendState::Ready {
-                process: Some(process),
-                ..
-            }) => match process.try_wait() {
-                Ok(None) => false,
-                Ok(Some(status)) => {
-                    cowshed_os::eprintln!(
-                        "cowshed: Nx cache backend for {repo_id} exited {status}; starting a replacement"
-                    );
-                    true
-                }
-                Err(error) => {
-                    cowshed_os::eprintln!(
-                        "cowshed: cannot inspect the Nx cache backend for {repo_id}: {error}; starting a replacement"
-                    );
-                    true
-                }
-            },
-            _ => false,
+    /// Whether the child the gateway started for `repo_id` has exited, as the kernel reports it
+    /// now. A status that cannot be read counts as exited, so the request starts a replacement.
+    fn nx_child_exited(&mut self, repo_id: &str) -> bool {
+        let Some(process) = self.nx.managed_child(repo_id) else {
+            return false;
         };
-        if exited {
-            self.drop_nx_backend(repo_id);
-        }
-        match self.nx_backends.get(repo_id) {
-            Some(NxBackendState::Ready { .. }) => return NxAdmission::Ready,
-            Some(NxBackendState::Starting { .. }) => return NxAdmission::Starting,
-            Some(NxBackendState::Clearing) => {
-                return NxAdmission::Unavailable(NxRefusal::outage(
-                    "the project's Nx cache store is being cleared".to_owned(),
-                ));
+        match process.try_wait() {
+            Ok(None) => false,
+            Ok(Some(status)) => {
+                cowshed_os::eprintln!(
+                    "cowshed: Nx cache backend for {repo_id} exited {status}; starting a replacement"
+                );
+                true
             }
-            Some(NxBackendState::Failed {
-                reason,
-                retry_after,
-            }) if std::time::Instant::now() < *retry_after => {
-                return NxAdmission::Unavailable(NxRefusal::outage(reason.clone()));
-            }
-            Some(NxBackendState::Failed { .. }) | None => {}
-        }
-        match self.start_nx_backend(repo_id) {
-            Ok(()) => NxAdmission::Starting,
-            Err(reason) => NxAdmission::Unavailable(NxRefusal::outage(reason)),
-        }
-    }
-
-    /// The Nx work of `repo_id` this gateway serves now, by workspace: admitted and queued
-    /// requests. Clearing the store under any of it would cut it off.
-    fn nx_cache_use(&self, repo_id: &str) -> NxCacheUse {
-        let mut usage = NxCacheUse::default();
-        for permit in self.permits.values() {
-            if permit.nx_repo.as_deref() == Some(repo_id) {
-                *usage
-                    .in_flight
-                    .entry(permit.workspace_id.clone())
-                    .or_default() += 1;
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot inspect the Nx cache backend for {repo_id}: {error}; starting a replacement"
+                );
+                true
             }
         }
-        for pending in &self.queue {
-            if pending.seed.nx && pending.seed.repo_id == repo_id {
-                *usage
-                    .queued
-                    .entry(pending.seed.workspace_id.clone())
-                    .or_default() += 1;
-            }
-        }
-        for pending in &self.nx_queue {
-            if pending.repo_id == repo_id {
-                *usage
-                    .queued
-                    .entry(pending.workspace_id.clone())
-                    .or_default() += 1;
-            }
-        }
-        usage
     }
 
     /// Clear `repo_id`'s accepted-task store (03_caches.md, "Nx accepted-task artifact service").
@@ -1799,37 +1579,13 @@ impl Actor {
             let _ = reply.send(Err(NxCacheClearRefusal::Unconfigured.into()));
             return;
         };
-        let usage = self.nx_cache_use(&repo_id);
-        let refusal = if usage.is_idle() {
-            match self.nx_backends.get(&repo_id) {
-                Some(NxBackendState::Starting { .. }) => Some(NxCacheClearRefusal::Starting),
-                Some(NxBackendState::Clearing) => Some(NxCacheClearRefusal::Clearing),
-                Some(NxBackendState::Ready { process: None, .. }) => {
-                    Some(NxCacheClearRefusal::HostConfigured)
-                }
-                Some(
-                    NxBackendState::Ready {
-                        process: Some(_), ..
-                    }
-                    | NxBackendState::Failed { .. },
-                )
-                | None => None,
+        let process = match self.nx.clear(&repo_id, self.pool.nx_use(&repo_id)) {
+            Ok(process) => process,
+            Err(refusal) => {
+                let _ = reply.send(Err(refusal.into()));
+                return;
             }
-        } else {
-            Some(NxCacheClearRefusal::Busy(usage))
         };
-        if let Some(refusal) = refusal {
-            let _ = reply.send(Err(refusal.into()));
-            return;
-        }
-        // Only a backend the gateway started, a failed start or none is left: the states above
-        // were refused.
-        let process = match self.nx_backends.remove(&repo_id) {
-            Some(NxBackendState::Ready { process, .. }) => process,
-            _ => None,
-        };
-        self.nx_backends
-            .insert(repo_id.clone(), NxBackendState::Clearing);
         let store = crate::nx_cache::project_store(&directory, &repo_id);
         let commands = self.commands.clone();
         tokio::spawn(async move {
@@ -1863,12 +1619,7 @@ impl Actor {
         result: Result<u64, NxCacheClearRefusal>,
         reply: oneshot::Sender<Result<u64, GatewayError>>,
     ) {
-        if matches!(
-            self.nx_backends.get(repo_id),
-            Some(NxBackendState::Clearing)
-        ) {
-            self.nx_backends.remove(repo_id);
-        }
+        self.nx.cleared(repo_id);
         match &result {
             Ok(entries) => {
                 cowshed_os::eprintln!(
@@ -1884,112 +1635,275 @@ impl Actor {
         let _ = reply.send(result.map_err(GatewayError::from));
     }
 
-    /// Removes a backend -- its child gone, or its project's last session. A child it still owns
-    /// is killed as it drops.
-    fn drop_nx_backend(&mut self, repo_id: &str) {
-        self.nx_backends.remove(repo_id);
-    }
-
     /// Installs the outcome of a start. Ready resumes this repo's queued requests; a failure
-    /// becomes a cooldown, and its queued requests are refused as an outage.
+    /// becomes a cooldown, and its queued requests are refused as an outage. A start that
+    /// finishes while the gateway drains or fails closed installs nothing: its child is killed
+    /// as it drops.
     async fn nx_backend_started(
         &mut self,
         repo_id: String,
         result: Result<(NxCacheBackend, tokio::process::Child), String>,
     ) {
         if self.draining || self.audit_failure.is_some() {
-            // A start that finishes while the gateway fails closed installs nothing: its child is
-            // killed on drop, and its Starting state is removed and aborted if it still matches.
-            if matches!(
-                self.nx_backends.get(&repo_id),
-                Some(NxBackendState::Starting { .. })
-            ) && let Some(NxBackendState::Starting { task }) = self.nx_backends.remove(&repo_id)
-            {
-                task.abort();
+            if let Some(task) = self.nx.abandon(&repo_id) {
+                retire_nx(Handle::Start(task));
             }
-            return;
-        }
-        if !matches!(
-            self.nx_backends.get(&repo_id),
-            Some(NxBackendState::Starting { .. })
-        ) {
+            // A started child is killed as it drops (`kill_on_drop`).
+            drop(result);
             return;
         }
         match result {
             Ok((backend, process)) => {
+                let (address, reclaimed) = (backend.address, backend.reclaimed_staging_files);
+                match self.nx.ready(&repo_id, backend, Box::new(process)) {
+                    // The start's task is the one reporting: it ends once its report is sent.
+                    Installed::Ready { start } => drop(start),
+                    Installed::Stale(process) => {
+                        retire_nx(Handle::Child(process));
+                        return;
+                    }
+                }
                 cowshed_os::eprintln!(
-                    "cowshed: Nx cache backend ready repo={} address={} reclaimed_staging_files={}",
-                    backend.repo_id,
-                    backend.address,
-                    backend.reclaimed_staging_files,
+                    "cowshed: Nx cache backend ready repo={repo_id} address={address} reclaimed_staging_files={reclaimed}"
                 );
-                self.nx_backends.insert(
-                    repo_id.clone(),
-                    NxBackendState::Ready {
-                        backend,
-                        process: Some(Box::new(process)),
-                    },
-                );
-                self.resume_nx_pending(&repo_id).await;
+                self.resume_nx_waiters(&repo_id).await;
             }
             Err(reason) => {
+                // The start's task is the one reporting: it ends once its report is sent.
+                let Some(start) = self.nx.start_failed(&repo_id, reason.clone(), now()) else {
+                    return;
+                };
+                drop(start);
                 cowshed_os::eprintln!(
                     "cowshed: Nx cache backend for {repo_id} did not start: {reason}"
                 );
-                let retry_after = std::time::Instant::now() + self.config.timeouts.connect;
-                self.nx_backends.insert(
-                    repo_id.clone(),
-                    NxBackendState::Failed {
-                        reason: reason.clone(),
-                        retry_after,
-                    },
-                );
-                self.fail_nx_pending(&repo_id, &reason).await;
+                for waiting in self.pool.backend_failed(&repo_id) {
+                    self.refuse_queued(
+                        Queued::Backend(waiting),
+                        Refusal::BackendOutage(reason.clone()),
+                    )
+                    .await;
+                }
             }
         }
     }
 
-    /// Refuses one Nx request with the status its method owns: GET is 404, every non-GET is 403. The audit
-    /// names the classification; the reply names the outcome.
-    async fn refuse_nx(
+    /// Resumes `repo_id`'s waiting Nx requests once its backend is Ready: each is seeded against
+    /// it, then holds a permit or waits for one in the ordinary queue; one whose seed is refused
+    /// is refused as the startup queue refuses.
+    async fn resume_nx_waiters(&mut self, repo_id: &str) {
+        let Some(backend) = self.nx.backend(repo_id) else {
+            return;
+        };
+        // Every Nx seed is an intercepted request to its backend: `AdmissionSeed::class`.
+        let class = PermitClass::Request {
+            origin: backend.target().origin(),
+        };
+        let mut seeded = Vec::new();
+        let mut refused = Vec::new();
+        for resuming in self.pool.take_backend_waiters(repo_id) {
+            let (place, waiting) = resuming.into_parts();
+            let Some(session) = self.sessions.get(&waiting.workspace_id) else {
+                refused.push((Refusal::SessionRotated, waiting));
+                continue;
+            };
+            match build_seed(
+                &waiting.workspace_id,
+                session,
+                &waiting.intent,
+                Some(backend),
+            ) {
+                Ok(seed) => seeded.push(place.hold(Pending {
+                    seed,
+                    reply: waiting.reply,
+                })),
+                Err((message, hint)) => {
+                    refused.push((Refusal::NxDenied { message, hint }, waiting))
+                }
+            }
+        }
+        for (permit, pending) in self.pool.resume(&class, seeded) {
+            self.grant(permit, pending);
+        }
+        for (refusal, waiting) in refused {
+            self.refuse_queued(Queued::Backend(waiting), refusal).await;
+        }
+    }
+
+    /// Refuses one request before it is admitted, fresh or waiting for its backend: its audit
+    /// records `refusal`, and its client hears the answer its route owns, or that the audit is
+    /// unavailable. An Nx request is audited as any Nx refusal is ([`Self::audit_denial`]).
+    async fn refuse_intent(
         &mut self,
         workspace_id: &str,
         intent: &RequestIntent,
-        refusal: NxRefusal,
+        refusal: Refusal,
         reply: oneshot::Sender<Result<Admission, AdmissionError>>,
     ) {
-        let NxRefusal {
-            status,
-            classification,
-            detail,
-            message,
-        } = refusal;
-        let http_status = crate::nx_cache::unavailable_status(&intent.method);
-        if let Some(detail) = &detail {
-            cowshed_os::eprintln!(
-                "cowshed: Nx cache {} for workspace {workspace_id} refused ({classification}): {detail}",
-                intent.method
-            );
+        let hint = refusal.hint();
+        if matches!(intent.target, RequestTarget::LocalNx) {
+            let answer = refusal.nx_answer(&intent.method);
+            if let Some(detail) = &hint {
+                cowshed_os::eprintln!(
+                    "cowshed: Nx cache {} for workspace {workspace_id} refused ({}): {detail}",
+                    intent.method,
+                    answer.classification
+                );
+            }
+            let recorded = self
+                .audit_denial(
+                    workspace_id,
+                    AuditAttempt {
+                        kind: intent.audit_kind,
+                        host: None,
+                        method: intent.method.to_string(),
+                        path: intent.path.clone(),
+                        status: answer.audit,
+                        http_status: answer.status,
+                        classification: answer.classification,
+                    },
+                )
+                .await;
+            let _ = reply.send(Err(if recorded {
+                admission_error(answer.status, answer.message, answer.audit, hint)
+            } else {
+                audit_unavailable(answer.status)
+            }));
+            return;
         }
-        let recorded = self
-            .audit_denial(
-                workspace_id,
-                AuditAttempt {
-                    kind: intent.audit_kind,
-                    host: None,
-                    method: intent.method.to_string(),
-                    path: intent.path.clone(),
-                    status,
-                    http_status,
-                    classification,
-                },
-            )
-            .await;
+        let answer = refusal.proxy_answer();
+        let Some(status) = answer.status else {
+            return;
+        };
+        let recorded = match self.sessions.get(workspace_id) {
+            Some(session) => {
+                let draft = denial_draft(workspace_id, session, intent, answer.audit, status, None);
+                self.record(draft).await
+            }
+            None => false,
+        };
         let _ = reply.send(Err(if recorded {
-            admission_error(http_status, message, status, detail)
+            admission_error(status, answer.message, answer.audit, hint)
         } else {
-            audit_unavailable(http_status)
+            audit_unavailable(StatusCode::SERVICE_UNAVAILABLE)
         }));
+    }
+    /// Refuses one request that left the queue unadmitted, as [`Self::refuse_intent`] does.
+    async fn refuse_queued(&mut self, waiter: Queued<Pending, NxPending>, refusal: Refusal) {
+        match waiter {
+            Queued::Permit(Pending { seed, reply }) => {
+                let answer = refusal.queued_answer(seed.nx.then_some(&seed.method));
+                let draft =
+                    pending_audit_draft(&seed, answer.audit, answer.status, answer.classification);
+                let recorded = self.record(draft).await;
+                let Some(status) = answer.status else {
+                    return;
+                };
+                let _ = reply.send(Err(if recorded {
+                    admission_error(status, answer.message, answer.audit, None)
+                } else {
+                    audit_unavailable(status)
+                }));
+            }
+            Queued::Backend(NxPending {
+                workspace_id,
+                intent,
+                reply,
+            }) => {
+                self.refuse_intent(&workspace_id, &intent, refusal, reply)
+                    .await;
+            }
+        }
+    }
+
+    /// Every waiter of `workspace_id` leaves: its session was replaced or removed.
+    async fn refuse_rotated(&mut self, workspace_id: &str) {
+        for waiter in self.pool.remove(workspace_id) {
+            self.refuse_queued(waiter, Refusal::SessionRotated).await;
+        }
+    }
+
+    /// The client of queued request `queue_id` went away.
+    async fn cancel_queued(&mut self, queue_id: QueueId) {
+        if let Some(waiter) = self.pool.cancel(queue_id) {
+            self.refuse_queued(waiter, Refusal::QueueCancelled).await;
+        }
+    }
+
+    /// Every wait that ended by now is refused.
+    async fn expire_queued(&mut self) {
+        for waiter in self.pool.expire(now()) {
+            self.refuse_queued(waiter, Refusal::QueueTimeout).await;
+        }
+    }
+
+    /// Maps the client of queued request `queue_id` going away into a cancellation. The client's
+    /// side drops its sender once it has its answer too, and a cancellation of a request that
+    /// already left the queue changes nothing, so the watch ends with the request.
+    fn watch_cancellation(&self, queue_id: QueueId, cancelled: oneshot::Receiver<()>) {
+        let cancellations = self.cancellations.clone();
+        tokio::spawn(async move {
+            let _ = cancelled.await;
+            let _ = cancellations.send(queue_id).await;
+        });
+    }
+
+    /// Queues one Nx request while its project's backend starts, under the queue bounds every
+    /// queued request shares.
+    async fn wait_for_backend(
+        &mut self,
+        now: std::time::Instant,
+        workspace_id: String,
+        repo_id: &str,
+        intent: RequestIntent,
+        reply: oneshot::Sender<Result<Admission, AdmissionError>>,
+        cancelled: oneshot::Receiver<()>,
+    ) {
+        let waiting = NxPending {
+            workspace_id,
+            intent,
+            reply,
+        };
+        let workspace_id = waiting.workspace_id.clone();
+        match self
+            .pool
+            .wait_for_backend(now, &workspace_id, repo_id, waiting)
+        {
+            Ok(queue_id) => self.watch_cancellation(queue_id, cancelled),
+            Err((Unadmitted::Full, waiting)) => {
+                self.refuse_queued(Queued::Backend(waiting), Refusal::QueueFull)
+                    .await;
+            }
+            Err((Unadmitted::NoSession, waiting)) => {
+                let _ = waiting.reply.send(Err(audit_unavailable(
+                    waiting
+                        .intent
+                        .refusal_status(StatusCode::SERVICE_UNAVAILABLE),
+                )));
+            }
+        }
+    }
+
+    /// Hands `pending` the permit the pool granted it. A client gone by now drops the admission,
+    /// whose completion lease completes it at once.
+    fn grant(&self, permit: PermitId, pending: Pending) {
+        let Pending { seed, reply } = pending;
+        let cancelled =
+            pending_audit_draft(&seed, AuditStatus::Cancelled, None, Some("request-dropped"));
+        let completion = self
+            .completions
+            .clone()
+            .try_reserve_owned()
+            .expect("completion capacity covers both active pools' global bounds");
+        let admission = seed.activate(permit, CompletionLease::new(completion, permit, cancelled));
+        let _ = reply.send(Ok(admission));
+    }
+
+    /// `permit`'s request ended: its places go back and the waiters that now fit are admitted.
+    fn complete(&mut self, permit: PermitId) {
+        for (permit, pending) in self.pool.complete(permit) {
+            self.grant(permit, pending);
+        }
     }
 
     async fn admit(
@@ -2000,6 +1914,7 @@ impl Actor {
         reply: oneshot::Sender<Result<Admission, AdmissionError>>,
         cancelled: oneshot::Receiver<()>,
     ) {
+        let is_nx = matches!(intent.target, RequestTarget::LocalNx);
         if self.draining {
             let _ = reply.send(Err(admission_error(
                 intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
@@ -2015,16 +1930,7 @@ impl Actor {
             )));
             return;
         };
-        let is_nx = matches!(intent.target, RequestTarget::LocalNx);
-        // The selected listener or socket already named this workspace, and with it the project.
-        // The Nx cache route takes no credential (05_gateway.md "`/nx/v1/cache/{hash}`").
-        let authenticated = match &authentication {
-            Authentication::Bearer(_) if is_nx => true,
-            Authentication::Bearer(Some(token)) => session.token.matches_encoded(token),
-            Authentication::Bearer(None) => false,
-            Authentication::Generation(generation) => *generation == session.generation && !is_nx,
-        };
-        if !authenticated {
+        if !authenticated(&authentication, &session.token, session.generation, is_nx) {
             let status = intent.refusal_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
             let draft = denial_draft(
                 &workspace_id,
@@ -2048,33 +1954,41 @@ impl Actor {
             return;
         }
         let repo_id = session.repo_id.clone();
-        if is_nx && intent.method != Method::GET && intent.method != Method::PUT {
-            self.refuse_nx(
-                &workspace_id,
-                &intent,
-                NxRefusal {
-                    status: AuditStatus::Denied,
-                    classification: "nx-method-denied",
-                    detail: None,
-                    message: "Nx cache accepts only GET and PUT",
-                },
-                reply,
-            )
-            .await;
-            return;
-        }
+        let now = now();
         if is_nx {
-            match self.nx_admission(&repo_id).await {
-                NxAdmission::Ready => {}
+            let exited = self.nx_child_exited(&repo_id);
+            let decision = self.nx.admit(&repo_id, &intent.method, now, exited);
+            if let Some(process) = decision.exited {
+                retire_nx(Handle::Child(process));
+            }
+            let refusal = match decision.admission {
+                NxAdmission::Ready => None,
                 NxAdmission::Starting => {
-                    self.enqueue_nx(workspace_id, repo_id, intent, reply, cancelled)
+                    self.wait_for_backend(now, workspace_id, &repo_id, intent, reply, cancelled)
                         .await;
                     return;
                 }
-                NxAdmission::Unavailable(refusal) => {
-                    self.refuse_nx(&workspace_id, &intent, refusal, reply).await;
-                    return;
-                }
+                NxAdmission::Start => match self.start_nx_backend(&repo_id) {
+                    Ok(()) => {
+                        self.wait_for_backend(
+                            now,
+                            workspace_id,
+                            &repo_id,
+                            intent,
+                            reply,
+                            cancelled,
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(reason) => Some(Refusal::BackendOutage(reason)),
+                },
+                NxAdmission::Refuse(refusal) => Some(refusal),
+            };
+            if let Some(refusal) = refusal {
+                self.refuse_intent(&workspace_id, &intent, refusal, reply)
+                    .await;
+                return;
             }
         }
         let Some(session) = self.sessions.get(&workspace_id) else {
@@ -2088,7 +2002,7 @@ impl Actor {
             session,
             &intent,
             if is_nx {
-                self.nx_backend(&repo_id)
+                self.nx.backend(&repo_id)
             } else {
                 None
             },
@@ -2113,528 +2027,23 @@ impl Actor {
             }
         };
         let class = seed.class();
-        if self.can_activate(&workspace_id, &class) {
-            let admission = self.activate(seed, class);
-            let _ = reply.send(Ok(admission));
-            return;
-        }
-        if session.queued >= self.config.limits.workspace_queued
-            || self.global_queued >= self.config.limits.global_queued
+        let nx_repo = seed.nx.then(|| seed.repo_id.clone());
+        match self
+            .pool
+            .admit(now, &workspace_id, class, nx_repo, Pending { seed, reply })
         {
-            if is_nx {
-                self.refuse_nx(&workspace_id, &intent, NxRefusal::queue_limited(), reply)
+            Admitted::Active(permit, pending) => self.grant(permit, pending),
+            Admitted::Queued(queue_id) => self.watch_cancellation(queue_id, cancelled),
+            Admitted::Refused(Unadmitted::Full, Pending { reply, .. }) => {
+                self.refuse_intent(&workspace_id, &intent, Refusal::QueueFull, reply)
                     .await;
-                return;
             }
-            let draft = denial_draft(
-                &workspace_id,
-                session,
-                &intent,
-                AuditStatus::Limited,
-                StatusCode::TOO_MANY_REQUESTS,
-                None,
-            );
-            let recorded = self.record(draft).await;
-            let _ = reply.send(Err(if recorded {
-                admission_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "gateway queue is full",
-                    AuditStatus::Limited,
-                    None,
-                )
-            } else {
-                audit_unavailable(StatusCode::SERVICE_UNAVAILABLE)
-            }));
-            return;
-        }
-        if let Some(session) = self.sessions.get_mut(&workspace_id) {
-            session.queued += 1;
-        }
-        self.global_queued += 1;
-        let queue_id = self.next_queue;
-        self.next_queue = self.next_queue.wrapping_add(1).max(1);
-        let (timer, cancellation) = self.spawn_queue_handles(queue_id, cancelled);
-        self.queue.push_back(Pending {
-            queue_id,
-            seed,
-            reply,
-            timer: Some(timer),
-            cancellation: Some(cancellation),
-        });
-    }
-
-    fn can_activate(&self, workspace_id: &str, class: &PermitClass) -> bool {
-        let Some(session) = self.sessions.get(workspace_id) else {
-            return false;
-        };
-        pool_admits(
-            &self.config.limits,
-            session.active,
-            self.global_active,
-            class,
-            |origin| {
-                self.origins
-                    .get(&(workspace_id.to_owned(), origin.to_owned()))
-                    .copied()
-                    .unwrap_or(0)
-            },
-        )
-    }
-
-    fn activate(&mut self, seed: AdmissionSeed, class: PermitClass) -> Admission {
-        let permit_id = self.next_permit;
-        self.next_permit = self.next_permit.wrapping_add(1).max(1);
-        let workspace_id = seed.workspace_id.clone();
-        let cancelled =
-            pending_audit_draft(&seed, AuditStatus::Cancelled, None, Some("request-dropped"));
-        let completion = self
-            .completions
-            .clone()
-            .try_reserve_owned()
-            .expect("completion capacity covers both active pools' global bounds");
-        self.global_active.charge(&class);
-        if let Some(session) = self.sessions.get_mut(&workspace_id) {
-            session.active.charge(&class);
-        }
-        if let PermitClass::Request { origin } = &class {
-            *self
-                .origins
-                .entry((workspace_id.clone(), origin.clone()))
-                .or_default() += 1;
-        }
-        self.permits.insert(
-            permit_id,
-            PermitState {
-                workspace_id,
-                class,
-                generation: seed.generation,
-                nx_repo: seed.nx.then(|| seed.repo_id.clone()),
-            },
-        );
-        seed.activate(
-            permit_id,
-            CompletionLease::new(completion, permit_id, cancelled),
-        )
-    }
-
-    fn complete(&mut self, permit_id: u64) {
-        let Some(permit) = self.permits.remove(&permit_id) else {
-            return;
-        };
-        self.global_active.release(&permit.class);
-        if let Some(session) = self.sessions.get_mut(&permit.workspace_id)
-            && session.generation == permit.generation
-        {
-            session.active.release(&permit.class);
-        }
-        if let PermitClass::Request { origin } = permit.class {
-            let origin_key = (permit.workspace_id, origin);
-            if let Some(active) = self.origins.get_mut(&origin_key) {
-                *active = active.saturating_sub(1);
-                if *active == 0 {
-                    self.origins.remove(&origin_key);
-                }
+            Admitted::Refused(Unadmitted::NoSession, Pending { reply, .. }) => {
+                let _ = reply.send(Err(audit_unavailable(
+                    intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
+                )));
             }
         }
-        self.promote();
-    }
-
-    fn promote(&mut self) {
-        let mut inspected = 0;
-        while inspected < self.queue.len() {
-            let Some(mut pending) = self.queue.pop_front() else {
-                break;
-            };
-            let workspace_id = pending.seed.workspace_id.clone();
-            if let Some(session) = self.sessions.get_mut(&workspace_id) {
-                session.queued = session.queued.saturating_sub(1);
-            }
-            self.global_queued = self.global_queued.saturating_sub(1);
-            if !self.sessions.contains_key(&workspace_id) {
-                if let Some(timer) = pending.timer.take() {
-                    timer.abort();
-                }
-                if let Some(cancellation) = pending.cancellation.take() {
-                    cancellation.abort();
-                }
-                continue;
-            }
-            let class = pending.seed.class();
-            if self.can_activate(&workspace_id, &class) {
-                if let Some(timer) = pending.timer.take() {
-                    timer.abort();
-                }
-                if let Some(cancellation) = pending.cancellation.take() {
-                    cancellation.abort();
-                }
-                let admission = self.activate(pending.seed, class);
-                let _ = pending.reply.send(Ok(admission));
-                inspected = 0;
-            } else {
-                if let Some(session) = self.sessions.get_mut(&workspace_id) {
-                    session.queued += 1;
-                }
-                self.global_queued += 1;
-                self.queue.push_back(pending);
-                inspected += 1;
-            }
-        }
-    }
-
-    /// Shares the timer and cancellation watch between ordinary and Nx-startup queues.
-    /// Both report back through the actor's own channels.
-    fn spawn_queue_handles(
-        &self,
-        queue_id: u64,
-        cancelled: oneshot::Receiver<()>,
-    ) -> (JoinHandle<()>, JoinHandle<()>) {
-        let commands = self.commands.clone();
-        let queue_timeout = self.config.timeouts.request_total;
-        let timer = tokio::spawn(async move {
-            tokio::time::sleep(queue_timeout).await;
-            let _ = commands.send(Command::QueueExpired { queue_id }).await;
-        });
-        let cancellations = self.cancellations.clone();
-        let cancellation = tokio::spawn(async move {
-            let _ = cancelled.await;
-            let _ = cancellations.send(queue_id).await;
-        });
-        (timer, cancellation)
-    }
-
-    /// Queues one request while its project backend starts. It is charged to the same session and
-    /// global counters, and bounded by the same limits, as any queued request.
-    async fn enqueue_nx(
-        &mut self,
-        workspace_id: String,
-        repo_id: String,
-        intent: RequestIntent,
-        reply: oneshot::Sender<Result<Admission, AdmissionError>>,
-        cancelled: oneshot::Receiver<()>,
-    ) {
-        let Some(session) = self.sessions.get(&workspace_id) else {
-            let _ = reply.send(Err(audit_unavailable(
-                intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
-            )));
-            return;
-        };
-        let generation = session.generation;
-        if session.queued >= self.config.limits.workspace_queued
-            || self.global_queued >= self.config.limits.global_queued
-        {
-            self.refuse_nx(&workspace_id, &intent, NxRefusal::queue_limited(), reply)
-                .await;
-            return;
-        }
-        if let Some(session) = self.sessions.get_mut(&workspace_id) {
-            session.queued += 1;
-        }
-        self.global_queued += 1;
-        let queue_id = self.next_queue;
-        self.next_queue = self.next_queue.wrapping_add(1).max(1);
-        let (timer, cancellation) = self.spawn_queue_handles(queue_id, cancelled);
-        self.nx_queue.push_back(NxPending {
-            queue_id,
-            workspace_id,
-            repo_id,
-            generation,
-            intent,
-            reply,
-            timer: Some(timer),
-            cancellation: Some(cancellation),
-        });
-    }
-
-    /// Releases one queued Nx request's handles and its charge to the shared queued counters.
-    fn take_nx_pending(&mut self, mut pending: NxPending) -> NxPending {
-        if let Some(timer) = pending.timer.take() {
-            timer.abort();
-        }
-        if let Some(cancellation) = pending.cancellation.take() {
-            cancellation.abort();
-        }
-        if let Some(session) = self.sessions.get_mut(&pending.workspace_id) {
-            session.queued = session.queued.saturating_sub(1);
-        }
-        self.global_queued = self.global_queued.saturating_sub(1);
-        pending
-    }
-
-    /// Releases one queued Nx request and refuses it with the outcome its method owns.
-    async fn refuse_nx_pending(&mut self, pending: NxPending, refusal: NxRefusal) {
-        let pending = self.take_nx_pending(pending);
-        self.refuse_nx(
-            &pending.workspace_id,
-            &pending.intent,
-            refusal,
-            pending.reply,
-        )
-        .await;
-    }
-
-    /// Resumes this repo's queued Nx requests once its backend is Ready. Each is revalidated, then
-    /// seeded against the Ready backend, then either activated or moved to the ordinary queue.
-    async fn resume_nx_pending(&mut self, repo_id: &str) {
-        let mut waiting = VecDeque::new();
-        let mut resumed = Vec::new();
-        while let Some(pending) = self.nx_queue.pop_front() {
-            if pending.repo_id == repo_id {
-                resumed.push(pending);
-            } else {
-                waiting.push_back(pending);
-            }
-        }
-        self.nx_queue = waiting;
-        for pending in resumed {
-            self.resume_one(pending).await;
-        }
-        self.promote();
-    }
-
-    /// Revalidates one resumed Nx request against its session, then seeds it. A request whose
-    /// session rotated while it waited is refused.
-    async fn resume_one(&mut self, pending: NxPending) {
-        let Some(session) = self.sessions.get(&pending.workspace_id) else {
-            self.refuse_nx_pending(
-                pending,
-                NxRefusal {
-                    status: AuditStatus::Cancelled,
-                    classification: "session-rotated",
-                    detail: None,
-                    message: "workspace session rotated",
-                },
-            )
-            .await;
-            return;
-        };
-        if session.generation != pending.generation || session.repo_id != pending.repo_id {
-            self.refuse_nx_pending(
-                pending,
-                NxRefusal {
-                    status: AuditStatus::Cancelled,
-                    classification: "session-rotated",
-                    detail: None,
-                    message: "workspace session rotated",
-                },
-            )
-            .await;
-            return;
-        }
-        let seed = match build_seed(
-            &pending.workspace_id,
-            session,
-            &pending.intent,
-            self.nx_backend(&pending.repo_id),
-        ) {
-            Ok(seed) => seed,
-            Err((denial, hint)) => {
-                self.refuse_nx_pending(
-                    pending,
-                    NxRefusal {
-                        status: AuditStatus::Denied,
-                        classification: "nx-denied",
-                        detail: hint,
-                        message: denial,
-                    },
-                )
-                .await;
-                return;
-            }
-        };
-        let class = seed.class();
-        let NxPending {
-            queue_id,
-            workspace_id,
-            reply,
-            timer,
-            cancellation,
-            ..
-        } = pending;
-        let converted = Pending {
-            queue_id,
-            seed,
-            reply,
-            timer,
-            cancellation,
-        };
-        if self.can_activate(&workspace_id, &class) {
-            let converted = self.take_pending(converted);
-            let admission = self.activate(converted.seed, class);
-            let _ = converted.reply.send(Ok(admission));
-        } else {
-            // The charge stays with the request: it moves to the ordinary queue, counters unchanged.
-            self.queue.push_back(converted);
-        }
-    }
-
-    /// A failed start refuses every queued request for its project as an outage, releasing each.
-    async fn fail_nx_pending(&mut self, repo_id: &str, reason: &str) {
-        let mut waiting = VecDeque::new();
-        let mut failed = Vec::new();
-        while let Some(pending) = self.nx_queue.pop_front() {
-            if pending.repo_id == repo_id {
-                failed.push(pending);
-            } else {
-                waiting.push_back(pending);
-            }
-        }
-        self.nx_queue = waiting;
-        for pending in failed {
-            self.refuse_nx_pending(pending, NxRefusal::outage(reason.to_owned()))
-                .await;
-        }
-    }
-
-    async fn cancel_queued(&mut self, workspace_id: &str) {
-        let mut waiting = VecDeque::new();
-        let mut rotated = Vec::new();
-        while let Some(pending) = self.nx_queue.pop_front() {
-            if pending.workspace_id == workspace_id {
-                rotated.push(pending);
-            } else {
-                waiting.push_back(pending);
-            }
-        }
-        self.nx_queue = waiting;
-        for pending in rotated {
-            self.refuse_nx_pending(
-                pending,
-                NxRefusal {
-                    status: AuditStatus::Cancelled,
-                    classification: "session-rotated",
-                    detail: None,
-                    message: "workspace session rotated",
-                },
-            )
-            .await;
-        }
-        let mut retained = VecDeque::new();
-        while let Some(pending) = self.queue.pop_front() {
-            if pending.seed.workspace_id == workspace_id {
-                let pending = self.take_pending(pending);
-                let http_status = pending.seed.refusal_status(StatusCode::SERVICE_UNAVAILABLE);
-                let draft = pending_audit_draft(
-                    &pending.seed,
-                    AuditStatus::Cancelled,
-                    Some(http_status),
-                    Some("session-rotated"),
-                );
-                let recorded = self.record(draft).await;
-                let _ = pending.reply.send(Err(if recorded {
-                    admission_error(
-                        http_status,
-                        "workspace session rotated",
-                        AuditStatus::Cancelled,
-                        None,
-                    )
-                } else {
-                    audit_unavailable(http_status)
-                }));
-            } else {
-                retained.push_back(pending);
-            }
-        }
-        self.queue = retained;
-    }
-
-    async fn cancel_queued_request(&mut self, queue_id: u64) {
-        if let Some(position) = self
-            .nx_queue
-            .iter()
-            .position(|pending| pending.queue_id == queue_id)
-        {
-            let pending = self
-                .nx_queue
-                .remove(position)
-                .expect("queued position exists");
-            self.refuse_nx_pending(
-                pending,
-                NxRefusal {
-                    status: AuditStatus::Cancelled,
-                    classification: "queue-cancelled",
-                    detail: None,
-                    message: "queued request was cancelled",
-                },
-            )
-            .await;
-            return;
-        }
-        let Some(position) = self
-            .queue
-            .iter()
-            .position(|pending| pending.queue_id == queue_id)
-        else {
-            return;
-        };
-        let pending = self.queue.remove(position).expect("queued position exists");
-        let pending = self.take_pending(pending);
-        let draft = pending_audit_draft(
-            &pending.seed,
-            AuditStatus::Cancelled,
-            None,
-            Some("queue-cancelled"),
-        );
-        self.record(draft).await;
-        self.promote();
-    }
-
-    async fn expire_queued(&mut self, queue_id: u64) {
-        if let Some(position) = self
-            .nx_queue
-            .iter()
-            .position(|pending| pending.queue_id == queue_id)
-        {
-            let pending = self
-                .nx_queue
-                .remove(position)
-                .expect("queued position exists");
-            self.refuse_nx_pending(pending, NxRefusal::queue_timeout())
-                .await;
-            return;
-        }
-        let Some(position) = self
-            .queue
-            .iter()
-            .position(|pending| pending.queue_id == queue_id)
-        else {
-            return;
-        };
-        let pending = self.queue.remove(position).expect("queued position exists");
-        let pending = self.take_pending(pending);
-        // Its deadline is an Nx seed's method miss or refusal, as in the startup queue
-        // (`NxRefusal::queue_timeout`); every other request's is 504.
-        let http_status = pending.seed.refusal_status(StatusCode::GATEWAY_TIMEOUT);
-        let draft = pending_audit_draft(
-            &pending.seed,
-            AuditStatus::TimedOut,
-            Some(http_status),
-            Some("queue-timeout"),
-        );
-        let recorded = self.record(draft).await;
-        let _ = pending.reply.send(Err(if recorded {
-            admission_error(
-                http_status,
-                "gateway queue wait timed out",
-                AuditStatus::TimedOut,
-                None,
-            )
-        } else {
-            audit_unavailable(http_status)
-        }));
-    }
-
-    fn take_pending(&mut self, mut pending: Pending) -> Pending {
-        if let Some(timer) = pending.timer.take() {
-            timer.abort();
-        }
-        if let Some(cancellation) = pending.cancellation.take() {
-            cancellation.abort();
-        }
-        if let Some(session) = self.sessions.get_mut(&pending.seed.workspace_id) {
-            session.queued = session.queued.saturating_sub(1);
-        }
-        self.global_queued = self.global_queued.saturating_sub(1);
-        pending
     }
 
     async fn audit_denial(&mut self, workspace_id: &str, attempt: AuditAttempt) -> bool {
@@ -2749,28 +2158,22 @@ impl Actor {
             let _ = session.accept_stop.send(true);
             let _ = session.audit_stop.send(true);
         }
-        while let Some(pending) = self.queue.pop_front() {
-            let pending = self.take_pending(pending);
-            let status = pending.seed.refusal_status(StatusCode::SERVICE_UNAVAILABLE);
-            let _ = pending.reply.send(Err(audit_unavailable(status)));
+        // Nothing is admitted unaudited: every waiter hears that the audit is unavailable, an Nx
+        // request as its method's miss or refusal.
+        for waiter in self.pool.withdraw_all() {
+            let (reply, status) = match waiter {
+                Queued::Permit(Pending { seed, reply }) => {
+                    (reply, seed.refusal_status(StatusCode::SERVICE_UNAVAILABLE))
+                }
+                Queued::Backend(NxPending { intent, reply, .. }) => (
+                    reply,
+                    intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
+                ),
+            };
+            let _ = reply.send(Err(audit_unavailable(status)));
         }
-        while let Some(pending) = self.nx_queue.pop_front() {
-            let pending = self.take_nx_pending(pending);
-            let status = pending
-                .intent
-                .refusal_status(StatusCode::SERVICE_UNAVAILABLE);
-            let _ = pending.reply.send(Err(audit_unavailable(status)));
-        }
-        let starting: Vec<String> = self
-            .nx_backends
-            .iter()
-            .filter(|(_, state)| matches!(state, NxBackendState::Starting { .. }))
-            .map(|(repo_id, _)| repo_id.clone())
-            .collect();
-        for repo_id in starting {
-            if let Some(NxBackendState::Starting { task }) = self.nx_backends.remove(&repo_id) {
-                task.abort();
-            }
+        for task in self.nx.abandon_starts() {
+            retire_nx(Handle::Start(task));
         }
     }
 
@@ -2778,12 +2181,15 @@ impl Actor {
         let mut sessions: Vec<_> = self
             .sessions
             .iter()
-            .map(|(workspace_id, session)| SessionStatus {
-                workspace_id: workspace_id.clone(),
-                revision: session.revision,
-                endpoint: session.endpoint_label.clone(),
-                active: session.active.total(),
-                queued: session.queued,
+            .map(|(workspace_id, session)| {
+                let (active, queued) = self.pool.load(workspace_id);
+                SessionStatus {
+                    workspace_id: workspace_id.clone(),
+                    revision: session.revision,
+                    endpoint: session.endpoint_label.clone(),
+                    active,
+                    queued,
+                }
             })
             .collect();
         sessions.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
@@ -2806,8 +2212,8 @@ impl Actor {
                 .as_ref()
                 .and_then(|probe| probe.recovering()),
             sessions,
-            active: self.global_active.total(),
-            queued: self.global_queued,
+            active: self.pool.active(),
+            queued: self.pool.queued(),
         }
     }
 
@@ -2820,38 +2226,8 @@ impl Actor {
             let _ = session.accept_stop.send(true);
             let _ = session.connection_stop.send(true);
         }
-        while let Some(pending) = self.queue.pop_front() {
-            let pending = self.take_pending(pending);
-            let http_status = pending.seed.refusal_status(StatusCode::SERVICE_UNAVAILABLE);
-            let draft = pending_audit_draft(
-                &pending.seed,
-                AuditStatus::Cancelled,
-                Some(http_status),
-                Some("gateway-draining"),
-            );
-            let recorded = self.record(draft).await;
-            let _ = pending.reply.send(Err(if recorded {
-                admission_error(
-                    http_status,
-                    "gateway is draining",
-                    AuditStatus::Cancelled,
-                    None,
-                )
-            } else {
-                audit_unavailable(http_status)
-            }));
-        }
-        while let Some(pending) = self.nx_queue.pop_front() {
-            self.refuse_nx_pending(
-                pending,
-                NxRefusal {
-                    status: AuditStatus::Cancelled,
-                    classification: "gateway-draining",
-                    detail: None,
-                    message: "gateway is draining",
-                },
-            )
-            .await;
+        for waiter in self.pool.withdraw_all() {
+            self.refuse_queued(waiter, Refusal::Draining).await;
         }
     }
 
@@ -2860,13 +2236,13 @@ impl Actor {
     /// backend still running past the bound fails the drain naming its pid and state, and is
     /// left running: its stdin closes, which asks it to drain and exit, and a task collects it.
     async fn finish_drain(&mut self) -> Result<bool, GatewayError> {
-        if !self.draining || self.global_active.total() != 0 {
+        if !self.draining || self.pool.active() != 0 {
             return Ok(false);
         }
         let mut signalled = Vec::new();
-        for (_, state) in self.nx_backends.drain() {
+        for state in self.nx.take_all() {
             match state {
-                NxBackendState::Starting { task } => task.abort(),
+                NxBackendState::Starting { task } => retire_nx(Handle::Start(task)),
                 NxBackendState::Ready {
                     process: Some(process),
                     ..
@@ -2908,7 +2284,13 @@ impl Actor {
                 // Expiry ends the wait, never the backend: dropped, its `kill_on_drop` would kill it.
                 // Its stdin closes, which asks it to drain and exit (`--exit-on-stdin-eof`).
                 drop(process.stdin.take());
-                cowshed_os::deadline::collect_later_async("nx cache backend", *process);
+                // The collecting task is the backend's custodian from here (05_gateway.md,
+                // "Deadlines"): nobody waits for it, and the runtime that ends with the gateway
+                // drops it, whose `kill_on_drop` then ends the backend.
+                drop(cowshed_os::deadline::collect_later_async(
+                    "nx cache backend",
+                    *process,
+                ));
             }
         }
         let sessions = std::mem::take(&mut self.sessions);
@@ -2929,30 +2311,23 @@ impl Actor {
     }
 
     async fn force_stop(&mut self) -> Result<(), GatewayError> {
-        for (_, state) in self.nx_backends.drain() {
-            if let NxBackendState::Starting { task } = state {
-                task.abort();
+        for state in self.nx.take_all() {
+            match state {
+                NxBackendState::Starting { task } => retire_nx(Handle::Start(task)),
+                NxBackendState::Ready {
+                    process: Some(process),
+                    ..
+                } => retire_nx(Handle::Child(process)),
+                NxBackendState::Ready { process: None, .. }
+                | NxBackendState::Failed { .. }
+                | NxBackendState::Clearing => {}
             }
-        }
-        while let Some(pending) = self.nx_queue.pop_front() {
-            self.take_nx_pending(pending);
         }
         let sessions = std::mem::take(&mut self.sessions);
         for (_, session) in sessions {
             session.stop().await;
         }
-        while let Some(mut pending) = self.queue.pop_front() {
-            if let Some(timer) = pending.timer.take() {
-                timer.abort();
-            }
-            if let Some(cancellation) = pending.cancellation.take() {
-                cancellation.abort();
-            }
-        }
-        self.permits.clear();
-        self.origins.clear();
-        self.global_active = ActiveCounts::default();
-        self.global_queued = 0;
+        self.pool.clear();
         self.audit.flush().await?;
         if let Some(error) = self.audit_failure.take() {
             return Err(GatewayError::Audit(error));
@@ -3001,9 +2376,6 @@ fn build_seed(
                     .ok_or(("Nx cache path is invalid", None))?;
                 let backend =
                     nx_backend.ok_or(("project Nx cache backend is unavailable", None))?;
-                if intent.method != Method::GET && intent.method != Method::PUT {
-                    return Err(("Nx cache accepts only GET and PUT", None));
-                }
                 (
                     backend.target(),
                     EgressMode::Intercept,
@@ -3564,25 +2936,6 @@ mod tests {
         }
     }
 
-    /// Charges `class` the way `Actor::activate` does, after checking it fits.
-    fn admit(
-        limits: &GatewayLimits,
-        session: &mut ActiveCounts,
-        global: &mut ActiveCounts,
-        origin_active: &mut usize,
-        class: &PermitClass,
-    ) -> bool {
-        if !pool_admits(limits, *session, *global, class, |_| *origin_active) {
-            return false;
-        }
-        session.charge(class);
-        global.charge(class);
-        if let PermitClass::Request { .. } = class {
-            *origin_active += 1;
-        }
-        true
-    }
-
     #[test]
     fn only_intercepted_connect_is_a_tunnel() {
         let origin = seed(Method::GET, EgressMode::Intercept).target.origin();
@@ -3602,84 +2955,31 @@ mod tests {
         );
     }
 
+    /// The listener names the workspace, so the Nx route needs no credential; every other route
+    /// needs the session's token, and a tunnel's generation admits only its own session's inner
+    /// requests, never the Nx route.
     #[test]
-    fn origin_limit_of_intercept_tunnels_leaves_inner_requests_admissible() {
-        let limits = GatewayLimits::default();
-        let tunnel = seed(Method::CONNECT, EgressMode::Intercept).class();
-        let request = seed(Method::GET, EgressMode::Intercept).class();
-        let (mut session, mut global, mut origin_active) =
-            (ActiveCounts::default(), ActiveCounts::default(), 0_usize);
-        for _ in 0..limits.origin_active {
-            assert!(admit(
-                &limits,
-                &mut session,
-                &mut global,
-                &mut origin_active,
-                &tunnel
-            ));
+    fn only_the_sessions_credential_admits_a_request_and_the_nx_route_needs_none() {
+        let token = WorkspaceToken::from_bytes([7; 32]);
+        let encoded = token.encode();
+        let other = WorkspaceToken::from_bytes([8; 32]).encode();
+        let rows = [
+            (Authentication::Bearer(Some(encoded.clone())), false, true),
+            (Authentication::Bearer(Some(other.clone())), false, false),
+            (Authentication::Bearer(None), false, false),
+            (Authentication::Generation(3), false, true),
+            (Authentication::Generation(2), false, false),
+            (Authentication::Bearer(None), true, true),
+            (Authentication::Bearer(Some(other)), true, true),
+            (Authentication::Generation(3), true, false),
+        ];
+        for (authentication, nx, admitted) in rows {
+            assert_eq!(
+                authenticated(&authentication, &token, 3, nx),
+                admitted,
+                "{authentication:?} nx={nx}"
+            );
         }
-        assert_eq!(origin_active, 0, "tunnels never hold an origin slot");
-        for _ in 0..limits.origin_active {
-            assert!(admit(
-                &limits,
-                &mut session,
-                &mut global,
-                &mut origin_active,
-                &request
-            ));
-        }
-        assert!(
-            !admit(
-                &limits,
-                &mut session,
-                &mut global,
-                &mut origin_active,
-                &request
-            ),
-            "requests stay origin-limited"
-        );
-        assert_eq!(session.total(), limits.origin_active * 2);
-    }
-
-    #[test]
-    fn single_active_limit_admits_one_tunnel_and_its_inner_request() {
-        let limits = GatewayLimits {
-            workspace_active: 1,
-            global_active: 1,
-            origin_active: 1,
-            ..GatewayLimits::default()
-        };
-        let tunnel = seed(Method::CONNECT, EgressMode::Intercept).class();
-        let request = seed(Method::GET, EgressMode::Intercept).class();
-        let opaque = seed(Method::CONNECT, EgressMode::Opaque).class();
-        let (mut session, mut global, mut origin_active) =
-            (ActiveCounts::default(), ActiveCounts::default(), 0_usize);
-        assert!(admit(
-            &limits,
-            &mut session,
-            &mut global,
-            &mut origin_active,
-            &tunnel
-        ));
-        assert!(!pool_admits(&limits, session, global, &tunnel, |_| 0));
-        assert!(admit(
-            &limits,
-            &mut session,
-            &mut global,
-            &mut origin_active,
-            &request
-        ));
-        assert!(!pool_admits(&limits, session, global, &request, |_| 0));
-        assert!(!pool_admits(&limits, session, global, &opaque, |_| {
-            origin_active
-        }));
-        session.release(&request);
-        global.release(&request);
-        origin_active -= 1;
-        assert!(pool_admits(&limits, session, global, &request, |_| {
-            origin_active
-        }));
-        assert!(!pool_admits(&limits, session, global, &tunnel, |_| 0));
     }
 
     /// A private directory under the system temporary root, removed when the guard drops.
@@ -3716,21 +3016,17 @@ mod tests {
         }
     }
 
-    /// Records the actual actor audit events without changing its admission decisions.
+    /// The audit sink of the shell witnesses: they judge the drain and the clear, not the trail.
     #[cfg(target_os = "macos")]
-    #[derive(Default)]
-    struct UnitAudit {
-        events: std::sync::Mutex<Vec<crate::interfaces::AuditEvent>>,
-    }
+    struct UnitAudit;
 
     #[cfg(target_os = "macos")]
     #[async_trait::async_trait]
     impl crate::interfaces::AuditSink for UnitAudit {
         async fn record(
             &self,
-            event: crate::interfaces::AuditEvent,
+            _event: crate::interfaces::AuditEvent,
         ) -> Result<(), crate::interfaces::AuditError> {
-            self.events.lock().expect("unit audit").push(event);
             Ok(())
         }
 
@@ -3755,29 +3051,13 @@ mod tests {
         }
     }
 
-    /// A self-signed CA for one fixture session, as the gateway's own tests make theirs.
-    #[cfg(target_os = "macos")]
-    fn fixture_ca() -> cowshed_gateway_types::WorkspaceCa {
-        let key = rcgen::KeyPair::generate().expect("fixture CA key");
-        let mut params = rcgen::CertificateParams::default();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "cowshed actor fixture CA");
-        let certificate = params.self_signed(&key).expect("fixture CA certificate");
-        cowshed_gateway_types::WorkspaceCa::new(certificate.pem(), key.serialize_pem())
-            .expect("valid fixture CA")
-    }
-
     /// The actor built the way `start_runtime` builds it, plus the brokers' tasks, which `finish`
-    /// stops. The claimed loopback listeners are held until then, so no other claimant takes them.
+    /// stops: the shell its drain and store-clear witnesses run.
     #[cfg(target_os = "macos")]
     struct TestActor {
         actor: Actor,
-        audit: Arc<UnitAudit>,
         repo_task: JoinHandle<()>,
         sim_task: JoinHandle<()>,
-        claims: Vec<Fenced<std::net::TcpListener>>,
     }
 
     #[cfg(target_os = "macos")]
@@ -3802,7 +3082,7 @@ mod tests {
                 )
                 .expect("test connector"),
             );
-            let audit = Arc::new(UnitAudit::default());
+            let audit: Arc<dyn crate::interfaces::AuditSink> = Arc::new(UnitAudit);
             let mirror_service = MirrorService::new(
                 Cache::open(config.mirror_cache.cache_config())
                     .await
@@ -3851,7 +3131,7 @@ mod tests {
                 },
                 credentials,
                 connector,
-                audit.clone(),
+                audit,
                 mirror_service,
                 BrokerHandles {
                     repo_mirror,
@@ -3860,108 +3140,18 @@ mod tests {
             );
             Self {
                 actor,
-                audit,
                 repo_task,
                 sim_task,
-                claims: Vec::new(),
             }
         }
 
-        /// Claims the adjacent service port first, then the session port in the same fork-lock
-        /// creation step. The service claim reserves this candidate across installer processes,
-        /// including the session port's release/rebind handoff, until its listener is quiesced.
-        fn claim_ports(
-            base: u16,
-        ) -> std::io::Result<(Fenced<std::net::TcpListener>, Fenced<std::net::TcpListener>)>
-        {
-            fork_lock::create(|| {
-                let loopback = std::net::Ipv4Addr::LOCALHOST;
-                let service = std::net::TcpListener::bind((loopback, base + 1))?;
-                let session = std::net::TcpListener::bind((loopback, base))?;
-                Ok((session, service))
-            })
-            .map(|(session, service)| (Fenced::new(session), Fenced::new(service)))
-        }
-
-        /// Claims a two-port subblock for one installed session: inside the port block the workspace
-        /// running the tests exported, or, outside a workspace, inside the fixture partition, which is a
-        /// port block of its own, so a test never claims a port the host partition lends production's
-        /// workspaces (specs/cowshed/08_testing.md, "Fixtures").
-        fn claim_endpoint(&mut self) -> (Fenced<std::net::TcpListener>, u16) {
-            use cowshed_gateway_types::{
-                MACOS_FIXTURE_PORT_MIN, MACOS_FIXTURE_PORTS as FIXTURE_PORTS,
-            };
-            let (base, size) = match (
-                std::env::var("COWSHED_PORT_BASE").ok(),
-                std::env::var("COWSHED_PORT_BLOCK_SIZE").ok(),
-            ) {
-                (Some(base), Some(size)) => (
-                    base.parse::<u16>().expect("COWSHED_PORT_BASE is a port"),
-                    size.parse::<u16>()
-                        .expect("COWSHED_PORT_BLOCK_SIZE is a size"),
-                ),
-                _ => (MACOS_FIXTURE_PORT_MIN, FIXTURE_PORTS),
-            };
-            assert!(size >= 4, "a port block needs room for a 2-port session");
-            for offset in (2..size - 1).step_by(2) {
-                let subblock = base + offset;
-                match Self::claim_ports(subblock) {
-                    Ok((session, service)) => {
-                        self.claims.push(service);
-                        return (session, 2);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
-                    Err(error) => {
-                        panic!("claim subblock {subblock}+2 of port block {base}+{size}: {error}")
-                    }
-                }
-            }
-            panic!("port block {base}+{size} has no free two-port subblock");
-        }
-
-        /// Installs one session through the actor's own install path, and returns its encoded token.
-        async fn install(
-            &mut self,
-            workspace_id: &str,
-            repo_id: &str,
-            token_byte: u8,
-            revision: u64,
-        ) -> String {
-            let (endpoint_claim, block_size) = self.claim_endpoint();
-            let address = endpoint_claim
-                .local_addr()
-                .expect("claimed session address");
-            let token = cowshed_gateway_types::WorkspaceToken::from_bytes([token_byte; 32]);
-            let encoded = token.encode();
-            let session = cowshed_gateway_types::WorkspaceSession {
-                workspace_id: workspace_id.to_owned(),
-                repo_id: repo_id.to_owned(),
-                revision,
-                endpoint: cowshed_gateway_types::WorkspaceEndpoint::Tcp {
-                    address,
-                    block_size,
-                },
-                token,
-                ca: fixture_ca(),
-                policy: cowshed_gateway_types::WorkspacePolicy::default(),
-            };
-            drop(endpoint_claim);
-            self.actor.install(session).await.unwrap_or_else(|error| {
-                panic!(
-                    "install fixture {workspace_id} at {address}: {error:?}; installed={:?}",
-                    self.actor.status().sessions
-                )
-            });
-            encoded
-        }
-
-        /// Stops both brokers, waits for their tasks, and releases the claimed endpoints.
+        /// Kills the fixture children still running, stops both brokers and waits for their tasks.
         async fn finish(mut self) {
-            for state in self.actor.nx_backends.values_mut() {
+            for state in self.actor.nx.take_all() {
                 match state {
                     NxBackendState::Starting { task } => task.abort(),
                     NxBackendState::Ready {
-                        process: Some(process),
+                        process: Some(mut process),
                         ..
                     } => {
                         if process.try_wait().expect("fixture child status").is_none() {
@@ -3979,22 +3169,25 @@ mod tests {
             }
             self.actor.repo_mirror.shutdown().await;
             self.actor.sim_broker.shutdown().await;
-            let _ = self.repo_task.await;
-            let _ = self.sim_task.await;
-            self.claims.clear();
+            self.repo_task.await.expect("the repo mirror task ends");
+            self.sim_task.await.expect("the simulator broker task ends");
         }
-    }
 
-    /// An Nx request intent for one hash.
-    #[cfg(target_os = "macos")]
-    fn nx_intent(method: Method, path: &str) -> RequestIntent {
-        RequestIntent {
-            target: RequestTarget::LocalNx,
-            method,
-            path: path.to_owned(),
-            audit_kind: AuditKind::Http,
-            trace_id: None,
-            npm_mirror: false,
+        /// `repo` served by `process`, a backend this actor started.
+        fn serving(&mut self, repo: &str, process: tokio::process::Child) {
+            let start = tokio::spawn(std::future::ready(()));
+            assert!(
+                self.actor.nx.starting(repo, start).is_none(),
+                "nothing was displaced"
+            );
+            match self
+                .actor
+                .nx
+                .ready(repo, unit_backend(repo), Box::new(process))
+            {
+                Installed::Ready { start } => start.abort(),
+                Installed::Stale(_) => panic!("the start installs its backend"),
+            }
         }
     }
 
@@ -4008,16 +3201,6 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn unit_starting(actor: &mut Actor, repo_id: &str) {
-        actor.nx_backends.insert(
-            repo_id.to_owned(),
-            NxBackendState::Starting {
-                task: tokio::spawn(async {}),
-            },
-        );
-    }
-
-    #[cfg(target_os = "macos")]
     async fn unit_child() -> tokio::process::Child {
         use cowshed_os::fork_lock::Spawn as _;
         tokio::process::Command::new("/bin/cat")
@@ -4026,165 +3209,6 @@ mod tests {
             .kill_on_drop(true)
             .spawn_locked()
             .expect("start the fixture child")
-    }
-
-    #[cfg(target_os = "macos")]
-    async fn unit_queued_get(
-        fixture: &mut TestActor,
-        workspace: &str,
-        token: String,
-    ) -> (
-        oneshot::Receiver<Result<Admission, AdmissionError>>,
-        oneshot::Sender<()>,
-    ) {
-        let (reply, receive) = oneshot::channel();
-        let (cancel, cancelled) = oneshot::channel();
-        fixture
-            .actor
-            .admit(
-                workspace.to_owned(),
-                Authentication::Bearer(Some(token)),
-                nx_intent(Method::GET, "/nx/v1/cache/42"),
-                reply,
-                cancelled,
-            )
-            .await;
-        (receive, cancel)
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_ready_resumes_a_queued_authenticated_get() {
-        let root = TestRoot::new("ready-resume");
-        let mut fixture = TestActor::new(&root).await;
-        let token = fixture.install("nx-ready", "owner/nx-ready", 91, 1).await;
-        unit_starting(&mut fixture.actor, "owner/nx-ready");
-        let (mut receive, _cancel) = unit_queued_get(&mut fixture, "nx-ready", token).await;
-        assert!(matches!(
-            receive.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        fixture
-            .actor
-            .nx_backend_started(
-                "owner/nx-ready".to_owned(),
-                Ok((unit_backend("owner/nx-ready"), unit_child().await)),
-            )
-            .await;
-        let admission = receive
-            .try_recv()
-            .expect("Ready answers immediately")
-            .expect("the authenticated GET activates");
-        assert_eq!(admission.upstream_path, "/v1/cache/42");
-        assert!(admission.nx);
-        assert_eq!(fixture.actor.nx_queue.len(), 0);
-        assert_eq!(fixture.actor.global_queued, 0);
-        assert_eq!(fixture.actor.sessions["nx-ready"].queued, 0);
-        assert_eq!(fixture.actor.global_active.requests, 1);
-        fixture.actor.complete(admission.permit_id);
-        drop(admission);
-        fixture.finish().await;
-    }
-
-    /// The Nx route takes no credential (05_gateway.md "`/nx/v1/cache/{hash}`"): the selected
-    /// endpoint names the workspace, so a PUT that presents nothing reaches its project's backend.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_put_without_a_credential_reaches_the_backend() {
-        let root = TestRoot::new("put-open");
-        let mut fixture = TestActor::new(&root).await;
-        fixture.install("nx-put", "owner/nx-put", 92, 1).await;
-        unit_ready(&mut fixture.actor, "owner/nx-put");
-        let (reply, mut receive) = oneshot::channel();
-        let (_cancel, cancelled) = oneshot::channel();
-        fixture
-            .actor
-            .admit(
-                "nx-put".to_owned(),
-                Authentication::Bearer(None),
-                nx_intent(Method::PUT, "/nx/v1/cache/42"),
-                reply,
-                cancelled,
-            )
-            .await;
-        let admission = receive
-            .try_recv()
-            .expect("a Ready backend answers at once")
-            .expect("an uncredentialed PUT activates");
-        assert_eq!(admission.method, Method::PUT);
-        assert_eq!(admission.upstream_path, "/v1/cache/42");
-        assert!(admission.nx);
-        fixture.actor.complete(admission.permit_id);
-        drop(admission);
-        fixture.finish().await;
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_exited_child_restarts_and_queues_in_the_same_admission() {
-        let root = TestRoot::new("exit-restart");
-        let mut fixture = TestActor::new(&root).await;
-        let token = fixture.install("nx-exit", "owner/nx-exit", 94, 1).await;
-        let mut child = unit_child().await;
-        child.start_kill().expect("kill fixture child");
-        child.wait_bounded().await.expect("reap fixture child");
-        fixture.actor.nx_backends.insert(
-            "owner/nx-exit".to_owned(),
-            NxBackendState::Ready {
-                backend: unit_backend("owner/nx-exit"),
-                process: Some(Box::new(child)),
-            },
-        );
-        fixture.actor.config.nx_cache = Some(crate::nx_cache::NxCacheServiceConfig {
-            script: root.0.join("unavailable-server"),
-            path: std::ffi::OsString::new(),
-            directory: root.0.join("nx"),
-            max_bytes: 1024,
-            cap_bytes: 4096,
-        });
-        let (mut receive, _cancel) = unit_queued_get(&mut fixture, "nx-exit", token).await;
-        assert!(matches!(
-            fixture.actor.nx_backends.get("owner/nx-exit"),
-            Some(NxBackendState::Starting { .. })
-        ));
-        assert_eq!(fixture.actor.nx_queue.len(), 1);
-        assert_eq!(fixture.actor.global_queued, 1);
-        assert!(
-            matches!(receive.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-            "the exiting child's request must wait for its replacement, not be refused"
-        );
-        fixture.finish().await;
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_failed_start_enforces_the_configured_cooldown() {
-        let root = TestRoot::new("cooldown");
-        let mut fixture = TestActor::new(&root).await;
-        unit_starting(&mut fixture.actor, "owner/nx-cooldown");
-        let before = std::time::Instant::now();
-        fixture
-            .actor
-            .nx_backend_started(
-                "owner/nx-cooldown".to_owned(),
-                Err("failed start".to_owned()),
-            )
-            .await;
-        let Some(NxBackendState::Failed { retry_after, .. }) =
-            fixture.actor.nx_backends.get("owner/nx-cooldown")
-        else {
-            panic!("failure must be retained")
-        };
-        assert!(*retry_after >= before + fixture.actor.config.timeouts.connect);
-        assert!(matches!(
-            fixture.actor.nx_admission("owner/nx-cooldown").await,
-            NxAdmission::Unavailable(_)
-        ));
-        assert!(matches!(
-            fixture.actor.nx_backends.get("owner/nx-cooldown"),
-            Some(NxBackendState::Failed { .. })
-        ));
-        fixture.finish().await;
     }
 
     #[tokio::test]
@@ -4209,42 +3233,20 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    /// A start whose worker panics reports a failed start, the transition that starts its
+    /// cooldown (`NxBackends::start_failed`); it never leaves an unreported `Starting` state.
     #[tokio::test]
-    async fn nx_start_worker_panic_is_reported_and_enters_cooldown() {
-        let root = TestRoot::new("start-panic");
-        let mut fixture = TestActor::new(&root).await;
+    async fn nx_start_worker_panic_is_reported_as_a_failed_start() {
         let worker = tokio::spawn(async { panic!("planted startup panic") });
-        let task = supervise_nx_start(
-            "owner/nx-panic".to_owned(),
-            fixture.actor.commands.clone(),
-            worker,
-        );
-        fixture.actor.nx_backends.insert(
-            "owner/nx-panic".to_owned(),
-            NxBackendState::Starting { task },
-        );
-        let command = fixture
-            .actor
-            .receiver
-            .recv()
-            .await
-            .expect("completion command");
-        let Command::NxBackendStarted { repo_id, result } = command else {
-            panic!("expected startup completion")
+        let (commands, mut receive) = mpsc::channel(1);
+        let task = supervise_nx_start("owner/nx-panic".to_owned(), commands, worker);
+        let Some(Command::NxBackendStarted { repo_id, result }) = receive.recv().await else {
+            panic!("expected the start's report")
         };
-        assert!(
-            result
-                .as_ref()
-                .expect_err("panic is a failure")
-                .contains("planted startup panic")
-        );
-        fixture.actor.nx_backend_started(repo_id, result).await;
-        assert!(matches!(
-            fixture.actor.nx_admission("owner/nx-panic").await,
-            NxAdmission::Unavailable(_)
-        ));
-        fixture.finish().await;
+        assert_eq!(repo_id, "owner/nx-panic");
+        let reason = result.err().expect("a panic is a failed start");
+        assert!(reason.contains("planted startup panic"), "{reason}");
+        task.await.expect("the supervisor ends once it reported");
     }
 
     /// 05_gateway.md "Deadlines": the drain waits for an Nx backend it signalled within the reap
@@ -4280,13 +3282,7 @@ mod tests {
             .expect("read the stand-in's trap line");
         assert_eq!(trapped, "trapped\n");
         let pid = process.id().expect("the stand-in's pid");
-        fixture.actor.nx_backends.insert(
-            "owner/nx-stuck".to_owned(),
-            NxBackendState::Ready {
-                backend: unit_backend("owner/nx-stuck"),
-                process: Some(Box::new(process)),
-            },
-        );
+        fixture.serving("owner/nx-stuck", process);
         let bound = Duration::from_millis(500);
         fixture.actor.nx_backend_reap = Bound::new(LatencyClass::Reap, bound);
         fixture.actor.draining = true;
@@ -4312,7 +3308,7 @@ mod tests {
         );
         let said = drained.expect_err("matched above").to_string();
         assert!(said.contains(&format!("pid {pid}")), "{said}");
-        assert!(fixture.actor.nx_backends.is_empty());
+        assert!(fixture.actor.nx.take_all().is_empty());
         let pid = libc::pid_t::try_from(pid).expect("a pid_t");
         let state = cowshed_os::process::run_state(pid);
         assert!(
@@ -4333,513 +3329,15 @@ mod tests {
         fixture.finish().await;
     }
 
+    /// The clear's shell: an idle project's started backend stops, the store is emptied under its
+    /// lease in the clear's own task, and its report forgets the backend, so the next request
+    /// starts one. Which clears are refused is `NxBackends::clear`'s table.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn nx_managed_child_cannot_be_replaced_by_configuration() {
-        let root = TestRoot::new("managed-config");
-        let mut fixture = TestActor::new(&root).await;
-        fixture.actor.nx_backends.insert(
-            "owner/nx-managed".to_owned(),
-            NxBackendState::Ready {
-                backend: unit_backend("owner/nx-managed"),
-                process: Some(Box::new(unit_child().await)),
-            },
-        );
-        let mut replacement = unit_backend("owner/nx-managed");
-        replacement.address.set_port(10);
-        assert!(fixture.actor.configure_nx_cache(replacement).is_err());
-        assert_eq!(
-            fixture
-                .actor
-                .nx_backend("owner/nx-managed")
-                .expect("managed backend")
-                .address
-                .port(),
-            9
-        );
-        fixture.finish().await;
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_unsupported_methods_never_start_a_backend() {
-        let root = TestRoot::new("method-order");
-        let mut fixture = TestActor::new(&root).await;
-        let token = fixture.install("nx-method", "owner/nx-method", 95, 1).await;
-        for method in [Method::HEAD, Method::POST, Method::DELETE] {
-            let (reply, mut receive) = oneshot::channel();
-            let (_cancel, cancelled) = oneshot::channel();
-            fixture
-                .actor
-                .admit(
-                    "nx-method".to_owned(),
-                    Authentication::Bearer(Some(token.clone())),
-                    nx_intent(method, "/nx/v1/cache/42"),
-                    reply,
-                    cancelled,
-                )
-                .await;
-            let error = receive
-                .try_recv()
-                .expect("method refusal is immediate")
-                .err()
-                .expect("unsupported method");
-            assert_eq!(error.status, StatusCode::FORBIDDEN);
-            assert_eq!(error.audit_status, AuditStatus::Denied);
-            assert!(fixture.actor.nx_backends.is_empty());
-            assert!(fixture.actor.nx_queue.is_empty());
-        }
-        fixture.finish().await;
-    }
-
-    /// Stock Nx 23.2.1 reads every GET status but 200/404 as a fatal misconfiguration and retries
-    /// no GET, so a full queue answers its method's miss/refusal whether the backend is starting
-    /// or Ready: a 429 here ends the caller's whole run.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_queue_capacity_is_a_cache_miss_not_429() {
-        let root = TestRoot::new("queue-capacity");
-        let mut fixture = TestActor::new(&root).await;
-        for (index, ready) in [false, true].into_iter().enumerate() {
-            let workspace = format!("nx-limited-{index}");
-            let repo = format!("owner/nx-limited-{index}");
-            let token = fixture
-                .install(&workspace, &repo, 96 + index as u8, 1)
-                .await;
-            if ready {
-                unit_ready(&mut fixture.actor, &repo);
-            } else {
-                unit_starting(&mut fixture.actor, &repo);
-            }
-            // The backend's origin pool and the global queue are both full: a Ready request can
-            // neither activate nor wait.
-            let origin = (workspace.clone(), unit_backend(&repo).target().origin());
-            let origin_active = fixture.actor.config.limits.origin_active;
-            fixture.actor.origins.insert(origin.clone(), origin_active);
-            fixture.actor.global_queued = fixture.actor.config.limits.global_queued;
-            let (mut receive, _cancel) = unit_queued_get(&mut fixture, &workspace, token).await;
-            let error = receive
-                .try_recv()
-                .expect("capacity refusal is immediate")
-                .err()
-                .expect("queue capacity");
-            assert_eq!(error.status, StatusCode::NOT_FOUND, "ready={ready}");
-            assert_eq!(error.audit_status, AuditStatus::Limited);
-            assert!(fixture.actor.nx_queue.is_empty());
-            assert!(fixture.actor.queue.is_empty());
-            assert!(unit_audited(
-                &fixture,
-                &workspace,
-                404,
-                AuditStatus::Limited,
-                "nx-queue-limited"
-            ));
-            let (reply, mut receive) = oneshot::channel();
-            let (_cancel, cancelled) = oneshot::channel();
-            fixture
-                .actor
-                .admit(
-                    workspace.clone(),
-                    Authentication::Bearer(None),
-                    nx_intent(Method::PUT, "/nx/v1/cache/42"),
-                    reply,
-                    cancelled,
-                )
-                .await;
-            let error = receive
-                .try_recv()
-                .expect("PUT capacity refusal")
-                .err()
-                .expect("capacity is bounded");
-            assert_eq!(error.status, StatusCode::FORBIDDEN, "ready={ready}");
-            assert_eq!(error.audit_status, AuditStatus::Limited);
-            assert!(unit_audited(
-                &fixture,
-                &workspace,
-                403,
-                AuditStatus::Limited,
-                "nx-queue-limited"
-            ));
-            fixture.actor.global_queued = 0;
-            fixture.actor.origins.remove(&origin);
-        }
-        fixture.finish().await;
-    }
-
-    /// A Ready backend's request that waits out its queue deadline is a miss, not a 504 the
-    /// stock client cannot survive; the startup queue already answers its deadline this way.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_ready_queue_deadline_is_a_cache_miss_not_504() {
-        let root = TestRoot::new("ready-deadline");
-        let mut fixture = TestActor::new(&root).await;
-        let token = fixture
-            .install("nx-deadline", "owner/nx-deadline", 98, 1)
-            .await;
-        unit_ready(&mut fixture.actor, "owner/nx-deadline");
-        let origin = unit_backend("owner/nx-deadline").target().origin();
-        let origin_active = fixture.actor.config.limits.origin_active;
-        fixture
-            .actor
-            .origins
-            .insert(("nx-deadline".to_owned(), origin.clone()), origin_active);
-        let (mut receive, _cancel) = unit_queued_get(&mut fixture, "nx-deadline", token).await;
-        assert!(matches!(
-            receive.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        let queue_id = fixture.actor.queue.front().expect("queued Nx GET").queue_id;
-        fixture.actor.expire_queued(queue_id).await;
-        let error = receive
-            .try_recv()
-            .expect("deadline refusal")
-            .err()
-            .expect("queue deadline");
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
-        assert_eq!(error.audit_status, AuditStatus::TimedOut);
-        assert!(unit_audited(
-            &fixture,
-            "nx-deadline",
-            404,
-            AuditStatus::TimedOut,
-            "queue-timeout"
-        ));
-        assert!(fixture.actor.queue.is_empty());
-        assert_eq!(fixture.actor.global_queued, 0);
-        assert_eq!(fixture.actor.sessions["nx-deadline"].queued, 0);
-        fixture
-            .actor
-            .origins
-            .remove(&("nx-deadline".to_owned(), origin));
-        fixture.finish().await;
-    }
-
-    /// The Nx cache never blocks a build (05_gateway.md): a draining gateway answers a queued or
-    /// fresh Nx request with its method's miss or not-stored answer, never a 503 the stock client
-    /// would turn into a failed task.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_refusals_while_draining_are_a_miss_or_not_stored() {
-        let root = TestRoot::new("nx-draining");
-        let mut fixture = TestActor::new(&root).await;
-        let token = fixture
-            .install("nx-draining", "owner/nx-draining", 99, 1)
-            .await;
-        unit_ready(&mut fixture.actor, "owner/nx-draining");
-        let origin = (
-            "nx-draining".to_owned(),
-            unit_backend("owner/nx-draining").target().origin(),
-        );
-        let origin_active = fixture.actor.config.limits.origin_active;
-        fixture.actor.origins.insert(origin.clone(), origin_active);
-        let (mut queued, _cancel) =
-            unit_queued_get(&mut fixture, "nx-draining", token.clone()).await;
-        let (drained, _drained) = oneshot::channel();
-        fixture.actor.begin_drain(drained).await;
-        let error = queued
-            .try_recv()
-            .expect("drain refuses the queued GET")
-            .err()
-            .expect("a draining gateway admits nothing");
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
-        assert!(unit_audited(
-            &fixture,
-            "nx-draining",
-            404,
-            AuditStatus::Cancelled,
-            "gateway-draining"
-        ));
-        for (method, status) in [
-            (Method::GET, StatusCode::NOT_FOUND),
-            (Method::PUT, StatusCode::FORBIDDEN),
-        ] {
-            let (reply, mut receive) = oneshot::channel();
-            let (_cancel, cancelled) = oneshot::channel();
-            fixture
-                .actor
-                .admit(
-                    "nx-draining".to_owned(),
-                    Authentication::Bearer(Some(token.clone())),
-                    nx_intent(method.clone(), "/nx/v1/cache/42"),
-                    reply,
-                    cancelled,
-                )
-                .await;
-            let error = receive
-                .try_recv()
-                .expect("draining refusal is immediate")
-                .err()
-                .expect("a draining gateway admits nothing");
-            assert_eq!(error.status, status, "{method}");
-        }
-        fixture.actor.origins.remove(&origin);
-        fixture.finish().await;
-    }
-
-    /// A failed audit sink closes the gateway, and a queued Nx request still hears its method's
-    /// miss rather than a 503.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_requests_refused_by_a_failed_audit_are_a_miss() {
-        let root = TestRoot::new("nx-audit-failed");
-        let mut fixture = TestActor::new(&root).await;
-        let ready_token = fixture
-            .install("nx-audit-ready", "owner/nx-audit-ready", 100, 1)
-            .await;
-        let starting_token = fixture
-            .install("nx-audit-starting", "owner/nx-audit-starting", 101, 1)
-            .await;
-        unit_ready(&mut fixture.actor, "owner/nx-audit-ready");
-        unit_starting(&mut fixture.actor, "owner/nx-audit-starting");
-        let origin = (
-            "nx-audit-ready".to_owned(),
-            unit_backend("owner/nx-audit-ready").target().origin(),
-        );
-        let origin_active = fixture.actor.config.limits.origin_active;
-        fixture.actor.origins.insert(origin.clone(), origin_active);
-        let (mut ready, _ready_cancel) =
-            unit_queued_get(&mut fixture, "nx-audit-ready", ready_token).await;
-        let (mut starting, _starting_cancel) =
-            unit_queued_get(&mut fixture, "nx-audit-starting", starting_token).await;
-        fixture
-            .actor
-            .fail_closed(AuditError("unit audit sink failed".to_owned()));
-        for receive in [&mut ready, &mut starting] {
-            let error = receive
-                .try_recv()
-                .expect("a failed audit refuses every queued request")
-                .err()
-                .expect("nothing is admitted unaudited");
-            assert_eq!(error.status, StatusCode::NOT_FOUND);
-            assert_eq!(error.audit_status, AuditStatus::Failed);
-        }
-        fixture.actor.origins.remove(&origin);
-        fixture.finish().await;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn unit_ready(actor: &mut Actor, repo_id: &str) {
-        actor.nx_backends.insert(
-            repo_id.to_owned(),
-            NxBackendState::Ready {
-                backend: unit_backend(repo_id),
-                process: None,
-            },
-        );
-    }
-
-    /// Whether the audit trail holds one refusal of this workspace with exactly this outcome.
-    #[cfg(target_os = "macos")]
-    fn unit_audited(
-        fixture: &TestActor,
-        workspace: &str,
-        http_status: u16,
-        status: AuditStatus,
-        classification: &str,
-    ) -> bool {
-        fixture
-            .audit
-            .events
-            .lock()
-            .expect("unit audit")
-            .iter()
-            .any(|event| {
-                event.workspace_id == workspace
-                    && event.http_status == Some(http_status)
-                    && event.status == status
-                    && event.classification.as_deref() == Some(classification)
-            })
-    }
-
-    /// A failed single-flight start refuses only its own waiters. Another project's authenticated
-    /// GET stays queued through that failure, then activates when its own backend becomes Ready.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_single_flight_shares_one_start_and_leaves_other_repos_responsive() {
-        let root = TestRoot::new("single-flight");
-        let mut fixture = TestActor::new(&root).await;
-        let encoded = fixture.install("nx-unit-a", "owner/nx-unit", 91, 1).await;
-        let other_encoded = fixture
-            .install("nx-unit-other", "owner/nx-other", 92, 1)
-            .await;
-        let actor = &mut fixture.actor;
-
-        // The one start in flight, held by a task that finishes only when released.
-        let (release, gate) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            let _ = gate.await;
-        });
-        actor.nx_backends.insert(
-            "owner/nx-unit".to_owned(),
-            NxBackendState::Starting { task },
-        );
-
-        unit_starting(actor, "owner/nx-other");
-        let (other_reply, mut other_receive) = oneshot::channel();
-        let (_other_cancel, other_cancelled) = oneshot::channel();
-        actor
-            .admit(
-                "nx-unit-other".to_owned(),
-                Authentication::Bearer(Some(other_encoded)),
-                nx_intent(Method::GET, "/nx/v1/cache/44"),
-                other_reply,
-                other_cancelled,
-            )
-            .await;
-
-        let mut receivers = Vec::new();
-        let mut cancels = Vec::new();
-        for hash in ["42", "43"] {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .admit(
-                    "nx-unit-a".to_owned(),
-                    Authentication::Bearer(Some(encoded.clone())),
-                    nx_intent(Method::GET, &format!("/nx/v1/cache/{hash}")),
-                    reply,
-                    cancelled,
-                )
-                .await;
-            receivers.push(receive);
-            cancels.push(cancel);
-        }
-        // Two same-repo requests share one start; the other project's start and charge are separate.
-        assert_eq!(actor.nx_queue.len(), 3);
-        assert_eq!(actor.global_queued, 3);
-        assert_eq!(actor.sessions["nx-unit-a"].queued, 2);
-        assert!(matches!(
-            actor.nx_backends.get("owner/nx-unit"),
-            Some(NxBackendState::Starting { .. })
-        ));
-
-        // Release the start's completion: it fails, and every waiter is refused once as an outage.
-        let _ = release.send(());
-        actor
-            .nx_backend_started(
-                "owner/nx-unit".to_owned(),
-                Err("unit start failure".to_owned()),
-            )
-            .await;
-        for receive in receivers {
-            let refused = receive.await.expect("each waiter is answered");
-            let error = refused.err().expect("a failed start refuses the waiter");
-            assert_eq!(error.status, StatusCode::NOT_FOUND);
-            assert_eq!(error.audit_status, AuditStatus::Failed);
-        }
-        assert!(matches!(
-            other_receive.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert_eq!(actor.nx_queue.len(), 1);
-        assert_eq!(actor.global_queued, 1);
-        assert_eq!(actor.sessions["nx-unit-a"].queued, 0);
-        assert_eq!(actor.sessions["nx-unit-other"].queued, 1);
-        actor
-            .nx_backend_started(
-                "owner/nx-other".to_owned(),
-                Ok((unit_backend("owner/nx-other"), unit_child().await)),
-            )
-            .await;
-        let other = other_receive
-            .try_recv()
-            .expect("the other project's Ready transition answers its waiter")
-            .expect("the other project's authenticated GET activates");
-        assert_eq!(other.upstream_path, "/v1/cache/44");
-        assert!(other.nx);
-        assert_eq!(actor.nx_queue.len(), 0);
-        assert_eq!(actor.global_queued, 0);
-        assert_eq!(actor.sessions["nx-unit-other"].queued, 0);
-        actor.complete(other.permit_id);
-        drop(other);
-        drop(cancels);
-        fixture.finish().await;
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_ready_resumes_only_its_project_waiters() {
-        let root = TestRoot::new("ready-isolation");
-        let mut fixture = TestActor::new(&root).await;
-        let first_token = fixture.install("nx-first", "owner/nx-first", 91, 1).await;
-        let other_token = fixture.install("nx-other", "owner/nx-other", 92, 1).await;
-        unit_starting(&mut fixture.actor, "owner/nx-first");
-        unit_starting(&mut fixture.actor, "owner/nx-other");
-        let (mut first_receive, _first_cancel) =
-            unit_queued_get(&mut fixture, "nx-first", first_token).await;
-        let (mut other_receive, _other_cancel) =
-            unit_queued_get(&mut fixture, "nx-other", other_token).await;
-        fixture
-            .actor
-            .nx_backend_started(
-                "owner/nx-first".to_owned(),
-                Ok((unit_backend("owner/nx-first"), unit_child().await)),
-            )
-            .await;
-        let first = first_receive
-            .try_recv()
-            .expect("Ready answers its own project")
-            .expect("the first project's authenticated GET activates");
-        assert!(matches!(
-            other_receive.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert_eq!(fixture.actor.nx_queue.len(), 1);
-        assert_eq!(fixture.actor.global_queued, 1);
-        assert_eq!(fixture.actor.sessions["nx-first"].queued, 0);
-        assert_eq!(fixture.actor.sessions["nx-other"].queued, 1);
-        fixture.actor.complete(first.permit_id);
-        drop(first);
-        fixture
-            .actor
-            .nx_backend_started(
-                "owner/nx-other".to_owned(),
-                Err("other start failed".to_owned()),
-            )
-            .await;
-        assert!(
-            other_receive
-                .try_recv()
-                .expect("the other failure is answered")
-                .is_err()
-        );
-        assert_eq!(fixture.actor.nx_queue.len(), 0);
-        assert_eq!(fixture.actor.global_queued, 0);
-        assert_eq!(fixture.actor.sessions["nx-other"].queued, 0);
-        fixture.finish().await;
-    }
-
-    /// One authenticated Nx GET from `workspace`, answered as the actor answers it at once.
-    #[cfg(target_os = "macos")]
-    async fn unit_admitted_get(
-        fixture: &mut TestActor,
-        workspace: &str,
-        token: &str,
-    ) -> Result<Admission, AdmissionError> {
-        let (reply, receive) = oneshot::channel();
-        let (cancel, cancelled) = oneshot::channel();
-        fixture
-            .actor
-            .admit(
-                workspace.to_owned(),
-                Authentication::Bearer(Some(token.to_owned())),
-                nx_intent(Method::GET, "/nx/v1/cache/101"),
-                reply,
-                cancelled,
-            )
-            .await;
-        let answer = receive.await.expect("answered");
-        drop(cancel);
-        answer
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn nx_cache_clear_refuses_in_flight_work_and_then_clears_the_store() {
+    async fn nx_cache_clear_stops_the_started_backend_and_empties_its_store() {
         let root = TestRoot::new("nx-clear");
         let mut fixture = TestActor::new(&root).await;
         let repo = "owner/nx-clear";
-        let token = fixture.install("nx-clear", repo, 95, 1).await;
         fixture.actor.config.nx_cache = Some(crate::nx_cache::NxCacheServiceConfig {
             script: root.0.join("unavailable-server"),
             path: std::ffi::OsString::new(),
@@ -4855,58 +3353,10 @@ mod tests {
         }
         std::fs::write(entries.join(".owner.lock"), b"").expect("lease fixture");
         std::fs::write(project.join("sieve.hand"), b"1\n").expect("cursor fixture");
-        fixture.actor.nx_backends.insert(
-            repo.to_owned(),
-            NxBackendState::Ready {
-                backend: unit_backend(repo),
-                process: Some(Box::new(unit_child().await)),
-            },
-        );
+        fixture.serving(repo, unit_child().await);
 
-        // An admitted Nx request is in flight: refused, naming its workspace; nothing changes.
-        let admission = unit_admitted_get(&mut fixture, "nx-clear", &token)
-            .await
-            .expect("the GET activates");
-        let (reply, refused) = oneshot::channel();
-        fixture.actor.clear_nx_cache(repo.to_owned(), reply);
-        let error = refused
-            .await
-            .expect("answered")
-            .expect_err("in-flight work refuses");
-        assert!(
-            matches!(
-                &error,
-                GatewayError::NxCacheClear(NxCacheClearRefusal::Busy(usage))
-                    if usage.in_flight.get("nx-clear") == Some(&1)
-            ),
-            "{error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("1 Nx request(s) in flight from workspace nx-clear"),
-            "{error}"
-        );
-        assert!(matches!(
-            fixture.actor.nx_backends.get(repo),
-            Some(NxBackendState::Ready { .. })
-        ));
-        assert!(entries.join("101").exists());
-        fixture.actor.complete(admission.permit_id);
-        drop(admission);
-
-        // Idle: the backend stops and the store is cleared; a request meanwhile is a miss.
         let (reply, cleared) = oneshot::channel();
         fixture.actor.clear_nx_cache(repo.to_owned(), reply);
-        assert!(matches!(
-            fixture.actor.nx_backends.get(repo),
-            Some(NxBackendState::Clearing)
-        ));
-        let miss = unit_admitted_get(&mut fixture, "nx-clear", &token)
-            .await
-            .err()
-            .expect("a request while the store clears is refused");
-        assert_eq!(miss.status, StatusCode::NOT_FOUND);
         let (repo_id, result, reply) = loop {
             match fixture.actor.receiver.recv().await {
                 Some(Command::NxCacheCleared {
@@ -4929,22 +3379,15 @@ mod tests {
         );
         assert!(entries.join(".staging").exists());
         assert!(!project.join("sieve.hand").exists());
-        assert!(!fixture.actor.nx_backends.contains_key(repo));
+        assert_eq!(
+            fixture
+                .actor
+                .nx
+                .admit(repo, &Method::GET, now(), false)
+                .admission,
+            NxAdmission::Start,
+            "the cleared project's next request starts a backend"
+        );
         fixture.finish().await;
-    }
-
-    #[test]
-    fn completion_capacity_covers_both_full_pools() {
-        let limits = GatewayLimits::default();
-        let full = ActiveCounts {
-            tunnels: limits.global_active,
-            requests: limits.global_active,
-        };
-        assert_eq!(active_permit_capacity(&limits), full.total());
-        let oversized = GatewayLimits {
-            global_active: tokio::sync::Semaphore::MAX_PERMITS / 2 + 1,
-            ..limits
-        };
-        assert!(oversized.validate().is_err());
     }
 }

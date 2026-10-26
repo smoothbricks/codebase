@@ -809,6 +809,19 @@ struct RepoDeadlines {
     total: Duration,
 }
 
+impl RepoDeadlines {
+    /// The instant a request that starts at `now` must end by.
+    fn total_deadline(self, now: Instant) -> Instant {
+        now + self.total
+    }
+
+    /// When the credential stage that starts at `now` ends: its own bound, or the request's total
+    /// deadline if that comes first.
+    fn credential_deadline(self, now: Instant, total_deadline: Instant) -> Instant {
+        total_deadline.min(now + self.credential)
+    }
+}
+
 async fn run(
     mut receiver: mpsc::Receiver<Message>,
     mut shutdown: watch::Receiver<bool>,
@@ -915,52 +928,24 @@ async fn mirror(
         deadlines,
         cancellation,
     } = context;
-    let deadline = Instant::now() + deadlines.total;
-    crate::validate_repo_id(&request.repo_id).map_err(|_| RepoMirrorError::InvalidRepoId)?;
-    let binding = bindings
-        .get(&request.workspace_id)
-        .ok_or(RepoMirrorError::UnknownWorkspace)?;
-    if binding.repo_id != request.repo_id {
-        let mut scoped = request.clone();
-        scoped.repo_id.clone_from(&binding.repo_id);
-        audit(
-            auditor,
-            &scoped,
-            None,
-            AuditStatus::Denied,
-            Some("repo-scope-mismatch"),
-            0,
-        )
-        .await?;
-        return Err(RepoMirrorError::ScopeMismatch);
-    }
-    let original = match canonical_remote(&request.remote) {
-        Ok(remote) => remote,
-        Err(error) => {
-            audit(
-                auditor,
-                &request,
-                None,
-                AuditStatus::Denied,
-                Some(error.classification()),
-                0,
-            )
-            .await?;
-            return Err(error);
+    let deadline = deadlines.total_deadline(Instant::now());
+    let (binding, original) = match admit(&request, bindings.get(&request.workspace_id)) {
+        Ok(admitted) => admitted,
+        Err(refusal) => {
+            if let Some(denial) = &refusal.denial {
+                audit(
+                    auditor,
+                    &request,
+                    denial.remote.as_deref(),
+                    AuditStatus::Denied,
+                    Some(denial.classification),
+                    0,
+                )
+                .await?;
+            }
+            return Err(refusal.error);
         }
     };
-    if let Err(error) = admit_remote(binding, &original) {
-        audit(
-            auditor,
-            &request,
-            Some(&original.canonical),
-            AuditStatus::Denied,
-            Some(error.classification()),
-            0,
-        )
-        .await?;
-        return Err(error);
-    }
     audit(
         auditor,
         &request,
@@ -1094,6 +1079,61 @@ fn admit_remote(binding: &Binding, remote: &CanonicalRemote) -> Result<(), RepoM
     Ok(())
 }
 
+/// A request refused before any effect: the error it answers, and the denial it audits, if any. A
+/// malformed repository id or an unknown workspace is answered without an audit line; every later
+/// refusal names its workspace, status and safe path.
+struct Refusal {
+    error: RepoMirrorError,
+    denial: Option<Denial>,
+}
+
+/// The audit record of a denial: the remote it names, once the request got far enough to have a
+/// canonical one, and the classification of its error.
+struct Denial {
+    remote: Option<String>,
+    classification: &'static str,
+}
+
+impl Refusal {
+    fn unaudited(error: RepoMirrorError) -> Self {
+        Self {
+            error,
+            denial: None,
+        }
+    }
+
+    fn denied(error: RepoMirrorError, remote: Option<String>) -> Self {
+        let classification = error.classification();
+        Self {
+            error,
+            denial: Some(Denial {
+                remote,
+                classification,
+            }),
+        }
+    }
+}
+
+/// The scope and admission decisions on a request, from what was observed of it and of its
+/// workspace's binding: the request's repository must be the workspace's, its remote canonical
+/// HTTPS, and its exact repository path admitted by the workspace's trusted policy.
+fn admit<'a>(
+    request: &RepoMirrorRequest,
+    binding: Option<&'a Binding>,
+) -> Result<(&'a Binding, CanonicalRemote), Refusal> {
+    crate::validate_repo_id(&request.repo_id)
+        .map_err(|_| Refusal::unaudited(RepoMirrorError::InvalidRepoId))?;
+    let binding = binding.ok_or_else(|| Refusal::unaudited(RepoMirrorError::UnknownWorkspace))?;
+    if binding.repo_id != request.repo_id {
+        return Err(Refusal::denied(RepoMirrorError::ScopeMismatch, None));
+    }
+    let original =
+        canonical_remote(&request.remote).map_err(|error| Refusal::denied(error, None))?;
+    admit_remote(binding, &original)
+        .map_err(|error| Refusal::denied(error, Some(original.canonical.clone())))?;
+    Ok((binding, original))
+}
+
 struct FetchContext<'a> {
     request: &'a RepoMirrorRequest,
     binding: &'a Binding,
@@ -1132,23 +1172,15 @@ async fn fetch_redirects(
             method: Method::GET,
             path: remote.path.clone(),
         };
-        let credential_deadline = deadline.min(Instant::now() + deadlines.credential);
-        let credential = tokio::select! {
-            result = timeout_at(credential_deadline, credentials.lookup(&query)) => {
-                result
-                    .map_err(|_| RepoMirrorError::CredentialTimeout)?
-                    .map_err(|_| RepoMirrorError::CredentialUnavailable)?
-            }
-            _ = cancellation.cancelled() => return Err(RepoMirrorError::Cancelled),
+        let credential_deadline = deadlines.credential_deadline(Instant::now(), deadline);
+        let lookup = tokio::select! {
+            result = timeout_at(credential_deadline, credentials.lookup(&query)) => match result {
+                Ok(answer) => Lookup::Answered(answer),
+                Err(_) => Lookup::Expired,
+            },
+            _ = cancellation.cancelled() => Lookup::Cancelled,
         };
-        let credential = match credential {
-            Some(record) if record.validate_for(&query) => Some(RepoCredential {
-                header_name: record.header_name.as_str().to_owned(),
-                header_value: record.header_value,
-            }),
-            Some(_) => return Err(RepoMirrorError::CredentialScopeMismatch),
-            None => None,
-        };
+        let credential = credential_verdict(lookup, &query)?;
         let operation = transport.fetch(RepoFetchPlan::new(
             remote.canonical.clone(),
             destination.clone(),
@@ -1172,13 +1204,12 @@ async fn fetch_redirects(
         };
         match outcome {
             RepoFetchOutcome::Fetched { head } => return Ok((remote, head)),
-            RepoFetchOutcome::Redirect { location } if redirect_count < MAX_REDIRECTS => {
+            RepoFetchOutcome::Redirect { location } => {
+                remote = next_hop(&remote, &location, redirect_count)?;
                 remove_tree(&destination);
                 std::fs::create_dir(&destination)
                     .map_err(|_| RepoMirrorError::PublicationFailed)?;
-                remote = resolve_redirect(&remote, &location)?;
             }
-            RepoFetchOutcome::Redirect { .. } => return Err(RepoMirrorError::TooManyRedirects),
         }
     }
     Err(RepoMirrorError::TooManyRedirects)
@@ -1193,6 +1224,59 @@ fn resolve_redirect(
         .join(location)
         .map_err(|_| RepoMirrorError::InvalidRedirect)?;
     canonical_remote(resolved.as_str()).map_err(|_| RepoMirrorError::InvalidRedirect)
+}
+
+/// The remote a redirect answer names, once `followed` redirects were already taken: at most
+/// `MAX_REDIRECTS`, each resolved against the remote that answered it and each on that remote's
+/// own origin. A hop to another origin (another scheme, host or port) fails closed whatever the
+/// policy would admit there: 05_gateway.md, "Credential and redirect boundary", follows only
+/// same-origin redirects. Whether the hop stays inside the admitted prefix is for the next loop's
+/// admission to judge.
+fn next_hop(
+    remote: &CanonicalRemote,
+    location: &str,
+    followed: usize,
+) -> Result<CanonicalRemote, RepoMirrorError> {
+    if followed >= MAX_REDIRECTS {
+        return Err(RepoMirrorError::TooManyRedirects);
+    }
+    let next = resolve_redirect(remote, location)?;
+    if next.target != remote.target {
+        return Err(RepoMirrorError::InvalidRedirect);
+    }
+    Ok(next)
+}
+
+/// What the credential stage observed of its lookup.
+enum Lookup {
+    /// The store answered.
+    Answered(Result<Option<crate::CredentialRecord>, crate::CredentialError>),
+    /// The stage's deadline passed with no answer.
+    Expired,
+    /// The request was cancelled while the store was still thinking.
+    Cancelled,
+}
+
+/// What the credential stage decides from what it observed: the credential to send, none, or why
+/// the request must not go on. A record that does not match the query exactly is refused, never
+/// sent.
+fn credential_verdict(
+    lookup: Lookup,
+    query: &CredentialQuery,
+) -> Result<Option<RepoCredential>, RepoMirrorError> {
+    match lookup {
+        Lookup::Cancelled => Err(RepoMirrorError::Cancelled),
+        Lookup::Expired => Err(RepoMirrorError::CredentialTimeout),
+        Lookup::Answered(Err(_)) => Err(RepoMirrorError::CredentialUnavailable),
+        Lookup::Answered(Ok(None)) => Ok(None),
+        Lookup::Answered(Ok(Some(record))) if record.validate_for(query) => {
+            Ok(Some(RepoCredential {
+                header_name: record.header_name.as_str().to_owned(),
+                header_value: record.header_value,
+            }))
+        }
+        Lookup::Answered(Ok(Some(_))) => Err(RepoMirrorError::CredentialScopeMismatch),
+    }
 }
 
 async fn audit(
@@ -1418,7 +1502,9 @@ mod tests {
             Ok(None)
         }
     }
-    struct NeverCredentials;
+    struct NeverCredentials {
+        started: Arc<Notify>,
+    }
 
     #[async_trait]
     impl CredentialProvider for NeverCredentials {
@@ -1426,6 +1512,7 @@ mod tests {
             &self,
             _query: &CredentialQuery,
         ) -> Result<Option<crate::CredentialRecord>, crate::CredentialError> {
+            self.started.notify_one();
             std::future::pending().await
         }
     }
@@ -1535,18 +1622,319 @@ mod tests {
     }
 
     fn policy(prefix: &str) -> WorkspacePolicy {
+        policy_on(prefix, &[("git.example.test", 443)])
+    }
+
+    /// A policy with one exact intercept grant per origin, each admitting `prefix`.
+    fn policy_on(prefix: &str, origins: &[(&str, u16)]) -> WorkspacePolicy {
         let policy = WorkspacePolicy {
-            grants: vec![crate::EgressGrant {
-                host: HostPattern::parse("git.example.test").expect("host"),
-                port: 443,
-                mode: EgressMode::Intercept,
-                methods: BTreeSet::from(["GET".to_owned(), "HEAD".to_owned()]),
-                path_prefixes: vec![prefix.to_owned()],
-            }],
+            grants: origins
+                .iter()
+                .map(|&(host, port)| crate::EgressGrant {
+                    host: HostPattern::parse(host).expect("host"),
+                    port,
+                    mode: EgressMode::Intercept,
+                    methods: BTreeSet::from(["GET".to_owned(), "HEAD".to_owned()]),
+                    path_prefixes: vec![prefix.to_owned()],
+                })
+                .collect(),
             mirrors: Vec::new(),
         };
         policy.validate().expect("policy");
         policy
+    }
+
+    #[test]
+    fn a_request_is_refused_before_any_effect_with_the_audit_each_refusal_names() {
+        let binding = Binding {
+            repo_id: "owner/repo-a".to_owned(),
+            policy: policy("/org"),
+        };
+        let answer = |repo_id: &str, remote: &str, bound: bool| {
+            let request = RepoMirrorRequest {
+                workspace_id: "ws-a".to_owned(),
+                repo_id: repo_id.to_owned(),
+                remote: remote.to_owned(),
+            };
+            match admit(&request, bound.then_some(&binding)) {
+                Ok((_, original)) => format!("admitted {}", original.canonical),
+                Err(Refusal {
+                    error,
+                    denial: None,
+                }) => format!("{error:?}, unaudited"),
+                Err(Refusal {
+                    error,
+                    denial: Some(denial),
+                }) => format!(
+                    "{error:?}, denied as {} naming {:?}",
+                    denial.classification, denial.remote
+                ),
+            }
+        };
+        let repo = "https://git.example.test/org/repo.git";
+        // (label, repository id, remote, the workspace is bound, what the request comes to)
+        for (label, repo_id, remote, bound, expected) in [
+            (
+                "an admitted repository",
+                "owner/repo-a",
+                repo,
+                true,
+                "admitted https://git.example.test/org/repo.git",
+            ),
+            (
+                "a malformed repository id",
+                "not-a-repo-id",
+                repo,
+                true,
+                "InvalidRepoId, unaudited",
+            ),
+            (
+                "an unknown workspace",
+                "owner/repo-a",
+                repo,
+                false,
+                "UnknownWorkspace, unaudited",
+            ),
+            (
+                "another project's repository",
+                "owner/repo-b",
+                repo,
+                true,
+                "ScopeMismatch, denied as repo-scope-mismatch naming None",
+            ),
+            (
+                "plain http",
+                "owner/repo-a",
+                "http://git.example.test/org/repo.git",
+                true,
+                "InvalidRemote, denied as repo-invalid-remote naming None",
+            ),
+            (
+                "credentials in the URL",
+                "owner/repo-a",
+                "https://user:pw@git.example.test/org/repo.git",
+                true,
+                "InvalidRemote, denied as repo-invalid-remote naming None",
+            ),
+            (
+                "a query in the URL",
+                "owner/repo-a",
+                "https://git.example.test/org/repo.git?x=1",
+                true,
+                "InvalidRemote, denied as repo-invalid-remote naming None",
+            ),
+            (
+                "a spelling that is not the canonical one",
+                "owner/repo-a",
+                "https://git.example.test:443/org/repo.git",
+                true,
+                "NonCanonicalRemote, denied as repo-invalid-remote naming None",
+            ),
+            (
+                "a path outside the admitted prefix",
+                "owner/repo-a",
+                "https://git.example.test/outside/repo.git",
+                true,
+                "NotAdmitted, denied as repo-not-admitted naming \
+                 Some(\"https://git.example.test/outside/repo.git\")",
+            ),
+            (
+                "another host",
+                "owner/repo-a",
+                "https://other.example.test/org/repo.git",
+                true,
+                "NotAdmitted, denied as repo-not-admitted naming \
+                 Some(\"https://other.example.test/org/repo.git\")",
+            ),
+        ] {
+            assert_eq!(answer(repo_id, remote, bound), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_redirect_chain_takes_five_same_origin_hops_and_admits_each_one_again() {
+        // The policy also grants another host and another port. Only the redirect's own origin
+        // check keeps a hop from reaching them.
+        let binding = Binding {
+            repo_id: "owner/repo-a".to_owned(),
+            policy: policy_on(
+                "/org",
+                &[
+                    ("git.example.test", 443),
+                    ("git.example.test", 8443),
+                    ("evil.example", 443),
+                ],
+            ),
+        };
+        let base =
+            canonical_remote("https://git.example.test/org/repo.git").expect("canonical base");
+        for elsewhere in [
+            "https://evil.example/org/final.git",
+            "https://git.example.test:8443/org/final.git",
+        ] {
+            let remote = canonical_remote(elsewhere).expect("canonical remote");
+            assert!(admit_remote(&binding, &remote).is_ok(), "{elsewhere}");
+        }
+        // (label, redirects already taken, location, where the hop ends up)
+        for (label, followed, location, expected) in [
+            (
+                "an absolute location",
+                0,
+                "https://git.example.test/org/final.git",
+                "admitted https://git.example.test/org/final.git",
+            ),
+            (
+                "a relative location",
+                0,
+                "/org/final.git",
+                "admitted https://git.example.test/org/final.git",
+            ),
+            (
+                "the fifth hop",
+                4,
+                "/org/final.git",
+                "admitted https://git.example.test/org/final.git",
+            ),
+            (
+                "a sixth hop",
+                5,
+                "/org/final.git",
+                "refused TooManyRedirects",
+            ),
+            (
+                "a downgrade to http",
+                0,
+                "http://git.example.test/org/final.git",
+                "refused InvalidRedirect",
+            ),
+            (
+                "credentials in the location",
+                0,
+                "https://user:pw@git.example.test/org/final.git",
+                "refused InvalidRedirect",
+            ),
+            (
+                "a query in the location",
+                0,
+                "https://git.example.test/org/final.git?x=1",
+                "refused InvalidRedirect",
+            ),
+            (
+                "a location outside the admitted prefix",
+                0,
+                "https://git.example.test/outside/final.git",
+                "refused NotAdmitted",
+            ),
+            (
+                "another host the policy does not grant",
+                0,
+                "https://other.example.test/org/final.git",
+                "refused InvalidRedirect",
+            ),
+            (
+                "another host the policy grants",
+                0,
+                "https://evil.example/org/final.git",
+                "refused InvalidRedirect",
+            ),
+            (
+                "another port of the same host, which the policy grants",
+                0,
+                "https://git.example.test:8443/org/final.git",
+                "refused InvalidRedirect",
+            ),
+        ] {
+            let ended = next_hop(&base, location, followed)
+                .and_then(|remote| admit_remote(&binding, &remote).map(|()| remote));
+            let outcome = match ended {
+                Ok(remote) => format!("admitted {}", remote.canonical),
+                Err(error) => format!("refused {error:?}"),
+            };
+            assert_eq!(outcome, expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn the_credential_stage_ends_by_its_own_bound_or_the_total_deadline_and_maps_what_it_saw() {
+        let deadlines = RepoDeadlines {
+            credential: Duration::from_secs(10),
+            total: Duration::from_secs(60),
+        };
+        let origin = Instant::now();
+        let at = |seconds: u64| origin + Duration::from_secs(seconds);
+        assert_eq!(deadlines.total_deadline(at(5)), at(65));
+        for (label, now, total, expected) in [
+            ("the stage's own bound comes first", at(0), at(60), at(10)),
+            ("the total deadline comes first", at(55), at(60), at(60)),
+            (
+                "the stage starts at the total deadline",
+                at(60),
+                at(60),
+                at(60),
+            ),
+        ] {
+            assert_eq!(
+                deadlines.credential_deadline(now, total),
+                expected,
+                "{label}"
+            );
+        }
+
+        let remote =
+            canonical_remote("https://git.example.test/org/repo.git").expect("canonical remote");
+        let query = CredentialQuery {
+            workspace_id: "ws-a".to_owned(),
+            repo_id: "owner/repo-a".to_owned(),
+            protocol: CredentialProtocol::Generic,
+            origin: remote.target.origin(),
+            method: Method::GET,
+            path: remote.path.clone(),
+        };
+        let record = |repo_id: &str| crate::CredentialRecord {
+            repo_id: repo_id.to_owned(),
+            protocol: CredentialProtocol::Generic,
+            origin: remote.target.origin(),
+            methods: BTreeSet::from(["GET".to_owned()]),
+            path_prefixes: vec!["/org".to_owned()],
+            header_name: header::AUTHORIZATION,
+            header_value: Zeroizing::new("Bearer scoped-secret".to_owned()),
+        };
+        // (label, what the stage observed, its verdict)
+        for (label, lookup, expected) in [
+            (
+                "a record for this very query",
+                Lookup::Answered(Ok(Some(record("owner/repo-a")))),
+                "credential in authorization",
+            ),
+            ("no record", Lookup::Answered(Ok(None)), "no credential"),
+            (
+                "a record bound to another project",
+                Lookup::Answered(Ok(Some(record("owner/repo-b")))),
+                "refused CredentialScopeMismatch",
+            ),
+            (
+                "a store that cannot answer",
+                Lookup::Answered(Err(crate::CredentialError::Unavailable("store".to_owned()))),
+                "refused CredentialUnavailable",
+            ),
+            (
+                "no answer by the stage's deadline",
+                Lookup::Expired,
+                "refused CredentialTimeout",
+            ),
+            (
+                "the request cancelled while the store thought",
+                Lookup::Cancelled,
+                "refused Cancelled",
+            ),
+        ] {
+            let verdict = match credential_verdict(lookup, &query) {
+                Ok(Some(credential)) => format!("credential in {}", credential.header_name),
+                Ok(None) => "no credential".to_owned(),
+                Err(error) => format!("refused {error:?}"),
+            };
+            assert_eq!(verdict, expected, "{label}");
+        }
     }
 
     #[tokio::test]
@@ -1591,14 +1979,16 @@ mod tests {
         task.await.expect("actor joined");
         assert!(matches!(
             request.await.expect("request joined"),
-            Err(RepoMirrorError::Cancelled | RepoMirrorError::Stopped)
+            Err(RepoMirrorError::Cancelled)
         ));
         remove_tree_read_only(&root);
     }
 
-    #[tokio::test]
-    async fn credential_lookup_obeys_stage_deadline() {
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_never_answers_ends_at_its_stage_deadline_or_at_a_shutdown_before_any_fetch()
+     {
         let root = fixture_root("credential-timeout");
+        let started = Arc::new(Notify::new());
         let transport = Arc::new(FixtureTransport {
             calls: Mutex::new(Vec::new()),
             outcomes: Mutex::new(VecDeque::new()),
@@ -1607,10 +1997,12 @@ mod tests {
         let (handle, task) = RepoMirrorHandle::start(
             root.clone(),
             4,
-            Arc::new(NeverCredentials),
-            transport,
-            auditor,
-            Duration::from_millis(10),
+            Arc::new(NeverCredentials {
+                started: Arc::clone(&started),
+            }),
+            transport.clone(),
+            auditor.clone(),
+            Duration::from_secs(30),
             cowshed_os::test_backstop::NO_PROGRESS,
         )
         .expect("start");
@@ -1618,18 +2010,51 @@ mod tests {
             .bind_session("ws".to_owned(), "owner/repo".to_owned(), policy("/org"))
             .await
             .expect("bind");
+        let request = RepoMirrorRequest {
+            workspace_id: "ws".to_owned(),
+            repo_id: "owner/repo".to_owned(),
+            remote: "https://git.example.test/org/repo.git".to_owned(),
+        };
+
+        // The stage's deadline ends a lookup nobody answers: a failed request, audited under its
+        // classification.
         assert!(matches!(
-            handle
-                .mirror(RepoMirrorRequest {
-                    workspace_id: "ws".to_owned(),
-                    repo_id: "owner/repo".to_owned(),
-                    remote: "https://git.example.test/org/repo.git".to_owned(),
-                })
-                .await,
+            handle.mirror(request.clone()).await,
             Err(RepoMirrorError::CredentialTimeout)
         ));
+        {
+            let events = auditor.events.lock().expect("events");
+            let decisions = events
+                .iter()
+                .map(|event| (event.status, event.classification.as_deref()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                decisions,
+                [
+                    (AuditStatus::Allowed, None),
+                    (AuditStatus::Failed, Some("repo-credential-denied")),
+                ]
+            );
+        }
+
+        // A shutdown cancels a lookup that is still waiting. The first notice is the lookup that
+        // just expired.
+        started.notified().await;
+        let pending = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.mirror(request).await }
+        });
+        started.notified().await;
         handle.shutdown().await;
-        task.await.expect("join");
+        task.await.expect("actor joined");
+        assert!(matches!(
+            pending.await.expect("request joined"),
+            Err(RepoMirrorError::Cancelled)
+        ));
+        assert!(
+            transport.calls.lock().expect("calls").is_empty(),
+            "no fetch starts without a credential verdict"
+        );
         remove_tree_read_only(&root);
     }
 
@@ -1678,7 +2103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scope_redirect_credentials_and_publication_are_fenced() {
+    async fn a_redirected_fetch_is_published_read_only_under_its_own_project_and_audited() {
         let root = fixture_root("flow");
         let credentials = Arc::new(CountingCredentials {
             calls: AtomicUsize::new(0),
@@ -1694,9 +2119,6 @@ mod tests {
                 },
                 RepoFetchOutcome::Fetched {
                     head: Some("b".repeat(40)),
-                },
-                RepoFetchOutcome::Redirect {
-                    location: "https://git.example.test/outside/final.git".to_owned(),
                 },
             ])),
         });
@@ -1720,17 +2142,6 @@ mod tests {
             .await
             .expect("bind b");
 
-        let outside = handle
-            .mirror(RepoMirrorRequest {
-                workspace_id: "ws-a".to_owned(),
-                repo_id: "owner/repo-a".to_owned(),
-                remote: "https://git.example.test/outside/repo.git".to_owned(),
-            })
-            .await;
-        assert!(matches!(outside, Err(RepoMirrorError::NotAdmitted)));
-        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
-        assert!(transport.calls.lock().expect("calls").is_empty());
-
         let first = handle
             .mirror(RepoMirrorRequest {
                 workspace_id: "ws-a".to_owned(),
@@ -1743,14 +2154,6 @@ mod tests {
             first.canonical_remote,
             "https://git.example.test/org/final.git"
         );
-        assert_ne!(
-            std::fs::metadata(&first.path)
-                .expect("published")
-                .permissions()
-                .mode()
-                & 0o222,
-            0o222
-        );
         assert_eq!(
             std::fs::metadata(&first.path)
                 .expect("published")
@@ -1759,7 +2162,11 @@ mod tests {
                 & 0o222,
             0
         );
-        assert_eq!(credentials.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            credentials.calls.load(Ordering::SeqCst),
+            2,
+            "one lookup per hop"
+        );
 
         let second = handle
             .mirror(RepoMirrorRequest {
@@ -1775,32 +2182,6 @@ mod tests {
                 .path
                 .starts_with(second.path.parent().expect("parent"))
         );
-
-        let before = transport.calls.lock().expect("calls").len();
-        assert!(matches!(
-            handle
-                .mirror(RepoMirrorRequest {
-                    workspace_id: "ws-a".to_owned(),
-                    repo_id: "owner/repo-b".to_owned(),
-                    remote: "https://git.example.test/org/repo.git".to_owned(),
-                })
-                .await,
-            Err(RepoMirrorError::ScopeMismatch)
-        ));
-        assert_eq!(transport.calls.lock().expect("calls").len(), before);
-
-        let redirect_denied = handle
-            .mirror(RepoMirrorRequest {
-                workspace_id: "ws-a".to_owned(),
-                repo_id: "owner/repo-a".to_owned(),
-                remote: "https://git.example.test/org/redirect.git".to_owned(),
-            })
-            .await;
-        assert!(matches!(
-            redirect_denied,
-            Err(RepoMirrorError::InvalidRedirect | RepoMirrorError::NotAdmitted)
-        ));
-        assert_eq!(credentials.calls.load(Ordering::SeqCst), 4);
         {
             let events = auditor.events.lock().expect("events");
             let decisions = events.iter().map(|event| {
@@ -1813,12 +2194,6 @@ mod tests {
             });
             assert!(
                 decisions.eq([
-                    (
-                        "ws-a",
-                        AuditKind::RepoMirror,
-                        AuditStatus::Denied,
-                        Some("https://git.example.test/outside/repo.git")
-                    ),
                     (
                         "ws-a",
                         AuditKind::RepoMirror,
@@ -1843,14 +2218,6 @@ mod tests {
                         AuditStatus::Completed,
                         Some("https://git.example.test/org/repo.git")
                     ),
-                    ("ws-a", AuditKind::RepoMirror, AuditStatus::Denied, None),
-                    (
-                        "ws-a",
-                        AuditKind::RepoMirror,
-                        AuditStatus::Allowed,
-                        Some("https://git.example.test/org/redirect.git")
-                    ),
-                    ("ws-a", AuditKind::RepoMirror, AuditStatus::Failed, None),
                 ]),
                 "every mirror decision must retain its workspace, status and safe path: {events:?}"
             );

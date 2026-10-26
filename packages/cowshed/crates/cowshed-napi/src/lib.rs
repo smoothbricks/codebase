@@ -897,6 +897,73 @@ mod stdin_failure_tests {
 #[cfg(test)]
 mod wire_contract;
 
+/// Coverage quantified over the declaration IR `cowshed-api-gen` collects from the owning
+/// declarations, never over a variant list a test retypes: a variant added to its owning enum
+/// enters the IR with it, and until a value naming it is constructed here the join is red.
+#[cfg(test)]
+pub(crate) mod declaration_coverage {
+    use std::{collections::BTreeSet, fmt::Debug, path::PathBuf, sync::OnceLock};
+
+    use cowshed_api_gen::ir::{Api, Shape};
+
+    fn api() -> &'static Api {
+        static API: OnceLock<Api> = OnceLock::new();
+        API.get_or_init(|| {
+            // Read at run time, never `env!`: cargo does not fingerprint the checkout path, so a
+            // baked one would read another checkout's declarations.
+            let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("cargo sets CARGO_MANIFEST_DIR for every test");
+            let project = PathBuf::from(manifest).join("../..");
+            cowshed_api_gen::collect_api(&project)
+                .expect("the declaration IR collects from the owning declarations")
+        })
+    }
+
+    /// The variants the declaration IR declares for enum `record`, in declaration order.
+    pub(crate) fn variants(record: &str) -> Vec<String> {
+        let declaration = api()
+            .records
+            .get(record)
+            .unwrap_or_else(|| panic!("the declaration IR declares {record}"));
+        let Shape::Enum(variants) = &declaration.shape else {
+            panic!("{record} is an enum in the declaration IR");
+        };
+        assert!(
+            !variants.is_empty(),
+            "{record} declares no variants in the declaration IR: coverage over it proves nothing"
+        );
+        variants
+            .iter()
+            .map(|variant| variant.name.clone())
+            .collect()
+    }
+
+    /// Assert `values` construct every variant the IR declares for `record` and nothing else,
+    /// so quantifier spellings taken from the values cover the owner's whole universe.
+    pub(crate) fn assert_exact<T: Debug>(record: &str, values: &[T]) {
+        let declared: BTreeSet<String> = variants(record).into_iter().collect();
+        let constructed: BTreeSet<String> = values.iter().map(variant_name).collect();
+        assert_eq!(
+            constructed.len(),
+            values.len(),
+            "{record}: a variant is constructed twice"
+        );
+        assert_eq!(
+            declared, constructed,
+            "{record}: constructed values must name exactly the variants its declaration owns"
+        );
+    }
+
+    fn variant_name<T: Debug>(value: &T) -> String {
+        let debug = format!("{value:?}");
+        debug
+            .split([' ', '(', '{'])
+            .next()
+            .expect("a Debug rendering starts with the variant name")
+            .to_owned()
+    }
+}
+
 #[cfg(test)]
 mod parity_tests {
     //! Option-level CLI/N-API parity is api-check's (`cowshed_api_gen::cli_parity`, 07_api.md
@@ -966,29 +1033,66 @@ mod parity_tests {
 }
 
 #[cfg(test)]
+#[path = "../../cowshed-core/tests/support/temp_root.rs"]
+mod test_temp_root;
+#[cfg(test)]
 mod host_stable_path_tests {
-    use std::path::Path;
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+    use crate::test_temp_root::TempRoot;
+    use cowshed_os::test_backstop::CommandBackstop;
+
+    fn script(path: &std::path::Path, body: &str) {
+        fs::create_dir_all(path.parent().expect("a fixture script has a parent"))
+            .expect("fixture directories are creatable");
+        fs::write(path, body).expect("a fixture script is writable");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("a fixture script is executable");
+    }
 
     /// The launcher is a shell script and cannot ask where launchd installed the binary, so
-    /// `bin/cowshed` restates the path under `$HOME`. This test is the check that it still names
-    /// `HostStableExecutable`'s path: changing either side without the other is red.
+    /// `bin/cowshed` restates the path under `$HOME`. Planting a script only at the path
+    /// `HostStableExecutable` derives for a fixture home, and a decoy at the workspace
+    /// fallback, proves by execution which binary the launcher execs for `sccache`: a literal
+    /// in a comment or a dead branch cannot answer. Changing either side's spelling without
+    /// the other leaves the stable script unrun and is red.
     #[test]
-    fn launcher_host_stable_path_matches_launchd() {
-        let launcher = include_str!("../../../bin/cowshed");
-        assert!(
-            launcher.contains(r"${HOME:-}/Library/Application\ Support/dev.cowshed/bin/cowshed"),
-            "bin/cowshed must name the launchd host-stable binary"
+    fn launcher_runs_sccache_from_the_host_stable_path() {
+        let root = TempRoot::new_in(&std::env::temp_dir(), "cowshed-napi-launcher");
+        let home = root.join("home");
+        let launcher = root.join("packages/cowshed/bin/cowshed");
+        script(&launcher, include_str!("../../../bin/cowshed"));
+        script(
+            &root.join("target/release/cowshed"),
+            "#!/bin/sh\nprintf '%s' workspace\n",
         );
 
         let executable = cowshed_cli::launchd::HostStableExecutable::new(
-            Path::new("/Users/test"),
+            &home,
             cowshed_cli::launchd::COWSHED_BINARY_NAME,
         )
-        .expect("a lexical home path is accepted");
-        assert_eq!(
+        .expect("the fixture home is a canonical absolute path");
+        script(
             executable.path(),
-            Path::new("/Users/test/Library/Application Support/dev.cowshed/bin/cowshed")
+            "#!/bin/sh\nprintf '%s' stable; for argument in \"$@\"; do printf ' [%s]' \"$argument\"; done; exit 17\n",
         );
+
+        let output = Command::new(&launcher)
+            .args(["--json", "sccache", "start"])
+            .env("HOME", &home)
+            .output_bounded()
+            .expect("the fixture launcher runs");
+        assert_eq!(
+            output.status.code(),
+            Some(17),
+            "the stable script ran: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("the stable script prints UTF-8"),
+            "stable [--json] [sccache] [start]"
+        );
+        assert_eq!(output.stderr, b"", "nothing else spoke");
+        drop(root);
     }
 }
 
@@ -996,13 +1100,15 @@ mod host_stable_path_tests {
 mod error_code_ssot {
     use cowshed_core::ErrorCode;
 
+    use crate::declaration_coverage;
+
     const TYPES_TS: &str = include_str!("../../../src/api.generated.ts");
 
-    /// Core's kebab-case spellings, in enum-declaration order. Adding a variant breaks
-    /// `ErrorCode::as_str`; adding it there without this list leaves the TypeScript union
-    /// unverified, so keep the two lists in this test the same length as the enum.
-    fn rust_spellings() -> Vec<&'static str> {
-        [
+    /// One value per variant the declaration IR declares for `ErrorCode`: the join is red
+    /// until a new variant's value stands here, so its TypeScript spelling cannot go
+    /// unverified by omission.
+    fn codes() -> Vec<ErrorCode> {
+        let codes = vec![
             ErrorCode::Internal,
             ErrorCode::Usage,
             ErrorCode::NotFound,
@@ -1010,10 +1116,21 @@ mod error_code_ssot {
             ErrorCode::EnvironmentMissing,
             ErrorCode::SandboxDenied,
             ErrorCode::Integrity,
-        ]
-        .into_iter()
-        .map(ErrorCode::as_str)
-        .collect()
+        ];
+        declaration_coverage::assert_exact("ErrorCode", &codes);
+        codes
+    }
+
+    /// Core's kebab-case spellings, in the declaration IR's variant order.
+    fn rust_spellings() -> Vec<&'static str> {
+        let by_name: std::collections::BTreeMap<String, ErrorCode> = codes()
+            .into_iter()
+            .map(|code| (format!("{code:?}"), code))
+            .collect();
+        declaration_coverage::variants("ErrorCode")
+            .iter()
+            .map(|name| by_name[name].as_str())
+            .collect()
     }
 
     fn ts_spellings() -> Vec<&'static str> {

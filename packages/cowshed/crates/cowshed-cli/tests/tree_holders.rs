@@ -14,6 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
+use cowshed_core::api::tree_holder::TreeHolder;
 use cowshed_core::runtime::job_groups::signal_unreaped_group;
 use serde_json::Value;
 
@@ -105,8 +106,11 @@ impl Drop for Resident {
     }
 }
 
-/// Every line `cowshed tree-holders <dir>` writes, each checked whole against the `TreeHolder`
-/// shape: exactly `pid`, `hold`, `path` and `command`, the path tagged bytes, in that order.
+/// Every line cowshed tree-holders <dir> writes, read whole by the TreeHolder the command prints:
+/// its reader refuses a stray field, a missing one and a path that is not tagged bytes, so no key
+/// or kind list is retyped here. Each line also leads with the {"pid":<n>,"hold":"<kind>", prefix
+/// a shell reader may match (02_workspaces.md, "Holders cowshed does not run"). The lines stay
+/// JSON values for the cases that name what a line holds.
 fn holders(dir: &Path) -> Vec<Value> {
     let output = Command::new(cowshed())
         .arg("tree-holders")
@@ -126,42 +130,16 @@ fn holders(dir: &Path) -> Vec<Value> {
     stdout
         .lines()
         .map(|line| {
-            let holder: Value = serde_json::from_str(line).expect("one JSON object per line");
-            let pid = holder["pid"].as_i64().expect("a numeric pid");
-            let hold = holder["hold"].as_str().expect("a hold kind");
+            let holder: TreeHolder = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("not one whole TreeHolder ({error}): {line}"));
+            let hold = serde_json::to_string(&holder.hold).expect("a hold kind encodes");
             assert!(
-                [
-                    "working-directory",
-                    "root-directory",
-                    "executable",
-                    "open-file",
-                    "mapped-file"
-                ]
-                .contains(&hold),
+                line.starts_with(&format!(r#"{{"pid":{},"hold":{hold},"#, holder.pid)),
                 "{line}"
             );
-            assert!(
-                line.starts_with(&format!(r#"{{"pid":{pid},"hold":"{hold}","path":{{"#)),
-                "{line}"
-            );
-            assert_eq!(keys(&holder), ["command", "hold", "path", "pid"], "{line}");
-            assert_eq!(keys(&holder["path"]), ["data", "encoding"], "{line}");
-            assert!(holder["command"].is_string(), "{line}");
-            holder
+            serde_json::from_str(line).expect("one JSON object per line")
         })
         .collect()
-}
-
-/// The keys of the JSON object `value`, sorted.
-fn keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .unwrap_or_else(|| panic!("not an object: {value}"))
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
 }
 
 /// The holder line naming `resident`, which must be among `named`.

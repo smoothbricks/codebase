@@ -256,7 +256,16 @@ fn report<W: Write, E: Write>(
     repo: &str,
     wait: &Wait,
 ) -> Result<(), CowshedError> {
-    let line = match wait {
+    output
+        .guidance(&wait_line(repo, wait))
+        .map_err(write_failed)
+}
+
+/// What a waiting land of `repo` says of `wait`: who holds the turn, by workspace, pid and the
+/// local time it asked, and how many live tickets are ahead; or, at the head, the outside lock and
+/// the processes one census found with it open. Pure.
+fn wait_line(repo: &str, wait: &Wait) -> String {
+    match wait {
         Wait::Queued { holder, ahead } => format!(
             "land turn {repo}: {ahead} ahead; {} holds it (pid {}, asked {})",
             holder.workspace,
@@ -284,8 +293,7 @@ fn report<W: Write, E: Write>(
                 lock.display(),
             )
         }
-    };
-    output.guidance(&line).map_err(write_failed)
+    }
 }
 
 /// Send one termination signal to the child. The child may have ended as the signal arrived;
@@ -355,4 +363,69 @@ pub fn local_clock(unix_ms: u64) -> String {
         "{:02}:{:02}:{:02}",
         parts.tm_hour, parts.tm_min, parts.tm_sec
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cowshed_core::land_turn::Ticket;
+    use cowshed_os::process::Holder;
+    use std::path::PathBuf;
+
+    /// The queued report names the holder's workspace, pid and asking time and the live tickets
+    /// ahead, for the head's holder and a deeper place alike.
+    #[test]
+    fn a_queued_land_names_the_holder_and_its_place() {
+        for ahead in [1, 3] {
+            let holder = Ticket {
+                number: 7,
+                pid: 4242,
+                workspace: "H".to_owned(),
+                asked_unix_ms: 1_793_000_000_000,
+                command: "nx run-many".to_owned(),
+            };
+            let asked = local_clock(holder.asked_unix_ms);
+            assert_eq!(
+                wait_line("repo", &Wait::Queued { holder, ahead }),
+                format!("land turn repo: {ahead} ahead; H holds it (pid 4242, asked {asked})")
+            );
+        }
+    }
+
+    /// At the head, the report names the outside lock and each process one census found with it
+    /// open, by pid and command, or says the census found none or could not be taken.
+    #[test]
+    fn a_head_names_what_the_outside_census_found() {
+        let lock = PathBuf::from("/locks/land.lock");
+        let line = |holders| {
+            wait_line(
+                "repo",
+                &Wait::Outside {
+                    lock: lock.clone(),
+                    holders,
+                },
+            )
+        };
+        let head = "land turn repo: next, waiting for /locks/land.lock, held outside the queue; ";
+        let open = vec![
+            Holder {
+                pid: 11,
+                command: "cowshed land-turn other".to_owned(),
+            },
+            Holder {
+                pid: 12,
+                command: "lockf".to_owned(),
+            },
+        ];
+        assert_eq!(
+            line(OutsideHolders::Open(open)),
+            format!("{head}open in pid 11 (cowshed land-turn other), pid 12 (lockf)")
+        );
+        let none = line(OutsideHolders::NoneOpen);
+        assert!(none.starts_with(head) && !none.contains("pid"), "{none}");
+        assert_eq!(
+            line(OutsideHolders::Unknown("lsof refused".to_owned())),
+            format!("{head}the processes with it open could not be listed: lsof refused")
+        );
+    }
 }

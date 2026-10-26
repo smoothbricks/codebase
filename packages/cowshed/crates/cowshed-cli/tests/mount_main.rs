@@ -23,38 +23,30 @@ use cowshed_core::repository::{BoundIdentity, RepoId, RepositoryBinding};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::lifecycle::MountIntent;
 use cowshed_core::{ErrorCode, Result};
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+#[path = "../../cowshed-core/tests/support/temp_root.rs"]
+mod temp_root;
 
 fn repo() -> RepoId {
     RepoId::parse("acme/widget").expect("fixture repo")
 }
 
-fn scratch_root(label: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "cowshed-cli-mount-main-{label}-{}-{nonce}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).expect("scratch root");
-    root
-}
-
 struct Fixture {
-    root: PathBuf,
+    root: temp_root::TempRoot,
     store: PathBuf,
 }
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let root = scratch_root(label);
+        Self::new_in(&std::env::temp_dir(), label)
+    }
+
+    fn new_in(parent: &Path, label: &str) -> Self {
+        let root = temp_root::TempRoot::new_in(parent, &format!("cowshed-cli-mount-main-{label}"));
         let store = root.join("store");
         fs::create_dir_all(&store).expect("fixture store");
         Self { root, store }
@@ -135,19 +127,6 @@ impl Fixture {
         }])
         .expect("binding");
         write_json(&paths.repository_binding, &binding).expect("binding file");
-    }
-}
-
-/// The scratch root goes with the fixture, so a failed assertion unwinds through the same
-/// cleanup a passing test runs.
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.root) {
-            cowshed_os::eprintln!(
-                "mount-main fixture {} was not removed: {error}",
-                self.root.display()
-            );
-        }
     }
 }
 
@@ -436,4 +415,63 @@ async fn dispatch_json_reports_mount_result() {
         envelope["result"]["mount"],
         stub.display().to_string().as_str()
     );
+}
+
+/// The parent directory the killed-fixture child makes its root in, handed over by
+/// environment because the child is this same test binary run a second time.
+const KILLED_FIXTURE_PARENT: &str = "COWSHED_MOUNT_MAIN_KILLED_FIXTURE_PARENT";
+
+/// The next start: the shared scratch sweep reclaims the killed child's fixture root by
+/// the owner pid its name publishes, and leaves a live run's root beside it standing. The
+/// child is this test run a second time: with the parent handed over by environment it
+/// makes its root, names it, and dies without unwinding, so no Drop cleanup runs — the
+/// state a SIGKILL leaves behind.
+#[test]
+fn a_killed_runs_fixture_root_is_reclaimed_at_the_next_start_and_a_live_one_is_kept() {
+    if let Ok(parent) = std::env::var(KILLED_FIXTURE_PARENT) {
+        let parent = Path::new(&parent);
+        let fixture = Fixture::new_in(parent, "killed");
+        fs::write(
+            parent.join("killed-root"),
+            fixture.root.display().to_string(),
+        )
+        .expect("name the killed fixture root");
+        std::process::abort();
+    }
+    let parent = temp_root::TempRoot::new_in(&std::env::temp_dir(), "cowshed-cli-mount-main-sweep");
+    let status = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "a_killed_runs_fixture_root_is_reclaimed_at_the_next_start_and_a_live_one_is_kept",
+            "--nocapture",
+        ])
+        .env(KILLED_FIXTURE_PARENT, &*parent)
+        .status_bounded()
+        .expect("spawn killed fixture child");
+    assert!(!status.success(), "the child dies holding its fixture root");
+    let killed = PathBuf::from(
+        fs::read_to_string(parent.join("killed-root")).expect("the child named its root"),
+    );
+    assert!(killed.is_dir(), "the killed run left its root behind");
+    let live = Fixture::new_in(&parent, "live");
+
+    let mut reaper =
+        cowshed_os::scratch::Reaper::new([parent.to_path_buf()]).expect("scratch reaper");
+    let report = reaper.sweep(&parent.join("sweep-store"), false);
+
+    assert!(
+        !killed.exists(),
+        "the next start reclaims the killed run's root: {report:?}"
+    );
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.path.file_name() == killed.file_name()
+                && !matches!(
+                    finding.disposition,
+                    cowshed_os::scratch::Disposition::Kept(_)
+                )
+        }),
+        "the sweep names the killed root as reclaimed: {report:?}"
+    );
+    assert!(live.root.is_dir(), "a live run's root is kept");
 }

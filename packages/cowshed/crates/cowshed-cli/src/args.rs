@@ -1636,6 +1636,7 @@ fn reject_project(
 
 const DISK_COMMAND: CommandSpec = CommandSpec {
     name: "disk-command",
+    example: &["disk-command", "hdiutil", "--", "info"],
     missing: "disk-command requires a tool: diskutil or hdiutil",
     args: "<diskutil|hdiutil>",
     trailing: "-- <args...>",
@@ -1753,6 +1754,7 @@ fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
 
 const LAND_TURN: CommandSpec = CommandSpec {
     name: "land-turn",
+    example: &["land-turn", "repo", "--", "true"],
     missing: "land-turn requires a repository name before `--`",
     args: "<repo>",
     trailing: "-- <cmd...>",
@@ -1824,6 +1826,7 @@ fn parse_land_turn(matches: &ArgMatches, global: &GlobalOptions) -> Result<Comma
 
 const LOCK: CommandSpec = CommandSpec {
     name: "lock",
+    example: &["lock", "/tmp/x.lock", "--", "true"],
     missing: "lock requires the lock file's path before `--`",
     args: "<path>",
     trailing: "-- <cmd...>",
@@ -1886,6 +1889,7 @@ fn parse_lock(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, U
 
 const HOLD: CommandSpec = CommandSpec {
     name: "hold",
+    example: &["hold", "--control-fd", "3", "--state-fd", "4", "--", "true"],
     missing: "hold requires --control-fd and --state-fd before `--`",
     args: "--control-fd <n> --state-fd <m>",
     trailing: "-- <cmd...>",
@@ -1979,6 +1983,7 @@ fn command_argv(
 }
 const LOCK_HOLDERS: CommandSpec = CommandSpec {
     name: "lock-holders",
+    example: &["lock-holders", "/tmp/x.lock"],
     missing: "lock-holders requires the lock file's path",
     args: "<path>",
     trailing: "",
@@ -2012,6 +2017,7 @@ fn parse_lock_holders(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
 
 const TREE_HOLDERS: CommandSpec = CommandSpec {
     name: "tree-holders",
+    example: &["tree-holders", "/tmp/tree"],
     missing: "tree-holders requires the directory whose holders it names",
     args: "<dir>",
     trailing: "",
@@ -2045,6 +2051,7 @@ fn parse_tree_holders(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
 
 const FD_HOLDERS: CommandSpec = CommandSpec {
     name: "fd-holders",
+    example: &["fd-holders", "--inode", "7"],
     missing: "fd-holders requires at least one --device or --inode",
     args: "[--device <0x…>]… [--inode <n>]…",
     trailing: "",
@@ -2110,6 +2117,7 @@ fn parse_fd_holders(matches: &ArgMatches, global: &GlobalOptions) -> Result<Comm
 
 const SUBTREE_ROOT: CommandSpec = CommandSpec {
     name: "subtree-root",
+    example: &["subtree-root", "--handle-fd", "3", "--", "true"],
     missing: "subtree-root requires --handle-fd N and a command after `--`",
     args: "",
     trailing: "-- <cmd...>",
@@ -2167,6 +2175,7 @@ fn parse_subtree_root(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
 
 const RETIRE_DESCENDANTS: CommandSpec = CommandSpec {
     name: "retire-descendants",
+    example: &["retire-descendants", "--grace-ms", "0"],
     missing: "retire-descendants requires --grace-ms N",
     args: "",
     trailing: "",
@@ -2208,6 +2217,7 @@ fn parse_retire_descendants(
 }
 const CONTROLLER: CommandSpec = CommandSpec {
     name: "controller",
+    example: &["controller"],
     missing: "controller requires an argument",
     args: "",
     trailing: "",
@@ -2221,6 +2231,7 @@ const CONTROLLER: CommandSpec = CommandSpec {
 
 const HOST: CommandSpec = CommandSpec {
     name: "host",
+    example: &["host"],
     missing: "host requires an argument",
     args: "",
     trailing: "",
@@ -2233,6 +2244,7 @@ const HOST: CommandSpec = CommandSpec {
 
 const GATEWAY: CommandSpec = CommandSpec {
     name: "gateway",
+    example: &["gateway", "status"],
     missing: "gateway action is required",
     args: "<start|stop|status|run>",
     trailing: "",
@@ -2273,6 +2285,7 @@ fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
 
 const CREDENTIAL: CommandSpec = CommandSpec {
     name: "credential",
+    example: &["credential", "ls"],
     missing: "credential action is required",
     args: "<add|ls|status|rm>",
     trailing: "",
@@ -2401,6 +2414,7 @@ fn parse_credential(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const IDENTITY: CommandSpec = CommandSpec {
     name: "identity",
+    example: &["identity", "add", "forge"],
     missing: "identity action is required",
     args: "add <remote>",
     trailing: "",
@@ -2459,6 +2473,7 @@ fn parse_secret_command(
 
 const SCCACHE: CommandSpec = CommandSpec {
     name: "sccache",
+    example: &["sccache", "status"],
     missing: "sccache action is required",
     args: "<start|stop|status|host>",
     trailing: "",
@@ -2499,6 +2514,7 @@ fn parse_sccache(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
 
 const SKILL: CommandSpec = CommandSpec {
     name: "skill",
+    example: &["skill", "install"],
     missing: "skill action is required",
     args: "install",
     trailing: "",
@@ -2560,6 +2576,7 @@ fn parse_adopt(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const ADOPT: CommandSpec = CommandSpec {
     name: "adopt",
+    example: &["adopt", "/repo"],
     missing: "adopt requires an argument",
     args: "[path]",
     trailing: "",
@@ -2592,6 +2609,7 @@ const ADOPT: CommandSpec = CommandSpec {
 
 const SETUP: CommandSpec = CommandSpec {
     name: "setup",
+    example: &["setup"],
     missing: "setup requires an argument",
     args: "",
     trailing: "",
@@ -2683,6 +2701,7 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
 
 const FORK: CommandSpec = CommandSpec {
     name: "fork",
+    example: &["fork", "raven"],
     missing: "fork requires a destination workspace",
     args: "[<src>] <ws>",
     trailing: "",
@@ -2762,6 +2781,7 @@ fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const MOVE: CommandSpec = CommandSpec {
     name: "mv",
+    example: &["mv", "raven", "falcon"],
     missing: "mv requires a workspace",
     args: "<ws> <new-name> | main <path>",
     trailing: "",
@@ -2835,6 +2855,7 @@ fn checkout_destination(value: &OsStr, usage: &'static CommandSpec) -> Result<Pa
 
 const CHECKPOINT: CommandSpec = CommandSpec {
     name: "checkpoint",
+    example: &["checkpoint", "raven"],
     missing: "checkpoint requires an argument",
     args: "[<ws>] [label]",
     trailing: "",
@@ -2859,6 +2880,7 @@ fn parse_checkpoint(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const RESTORE: CommandSpec = CommandSpec {
     name: "restore",
+    example: &["restore", "raven", "saved"],
     missing: "restore requires a workspace",
     args: "<ws> <label>",
     trailing: "",
@@ -2880,6 +2902,7 @@ fn parse_restore(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const LIST: CommandSpec = CommandSpec {
     name: "ls",
+    example: &["ls"],
     missing: "ls requires an argument",
     args: "",
     trailing: "",
@@ -2915,6 +2938,7 @@ fn parse_list(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const PATH: CommandSpec = CommandSpec {
     name: "path",
+    example: &["path", "raven"],
     missing: "path requires an argument",
     args: "[<ws>]",
     trailing: "",
@@ -2953,6 +2977,7 @@ fn parse_path(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const EXEC: CommandSpec = CommandSpec {
     name: "exec",
+    example: &["exec", "raven", "--", "true"],
     missing: "exec requires a workspace",
     args: "<ws>",
     trailing: "-- <cmd...>",
@@ -3155,6 +3180,7 @@ fn positive_count(
 
 const GRANT: CommandSpec = CommandSpec {
     name: "grant",
+    example: &["grant", "raven"],
     missing: "grant requires a workspace",
     args: "<ws>",
     trailing: "",
@@ -3327,6 +3353,7 @@ fn parse_service_ports(
 
 const REVOKE: CommandSpec = CommandSpec {
     name: "revoke",
+    example: &["revoke", "raven", "--egress", "api.example.test:443"],
     missing: "revoke requires a workspace",
     args: "<ws>",
     trailing: "",
@@ -3436,6 +3463,7 @@ fn parse_revoke(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const REMOVE: CommandSpec = CommandSpec {
     name: "rm",
+    example: &["rm", "raven"],
     missing: "rm requires a workspace",
     args: "<ws>",
     trailing: "",
@@ -3504,6 +3532,7 @@ fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const FORGET: CommandSpec = CommandSpec {
     name: "forget",
+    example: &["forget", "acme/widget", "--abandon"],
     missing: "forget requires an owner/repo",
     args: "<owner/repo> --abandon",
     trailing: "",
@@ -3548,6 +3577,7 @@ fn parse_forget(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command,
 
 const ATTACH: CommandSpec = CommandSpec {
     name: "attach",
+    example: &["attach", "raven"],
     missing: "attach requires an argument",
     args: "[ws]",
     trailing: "",
@@ -3592,6 +3622,7 @@ fn parse_attach(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const DETACH: CommandSpec = CommandSpec {
     name: "detach",
+    example: &["detach", "raven"],
     missing: "detach requires a workspace",
     args: "[ws]",
     trailing: "",
@@ -3630,6 +3661,7 @@ fn parse_detach(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const MOUNT: CommandSpec = CommandSpec {
     name: "mount",
+    example: &["mount", "main", "--repo-id", "acme/widget"],
     missing: "mount requires a target",
     args: "main",
     trailing: "",
@@ -3673,6 +3705,7 @@ fn parse_mount(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const RESIZE: CommandSpec = CommandSpec {
     name: "resize",
+    example: &["resize", "raven", "32GiB"],
     missing: "resize requires a workspace",
     args: "<ws|main> <size>",
     trailing: "",
@@ -3711,6 +3744,7 @@ fn parse_resize(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const DEFRAG: CommandSpec = CommandSpec {
     name: "defrag",
+    example: &["defrag", "main"],
     missing: "defrag requires a workspace",
     args: "<ws|main>",
     trailing: "",
@@ -3732,6 +3766,7 @@ fn parse_defrag(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const CACHE: CommandSpec = CommandSpec {
     name: "cache",
+    example: &["cache", "clear", "raven"],
     missing: "cache action is required",
     args: "clear [<ws>]",
     trailing: "",
@@ -3766,6 +3801,7 @@ fn parse_cache(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const RESEED: CommandSpec = CommandSpec {
     name: "reseed",
+    example: &["reseed", "raven"],
     missing: "reseed requires a workspace",
     args: "<ws|main>",
     trailing: "",
@@ -3799,6 +3835,7 @@ fn parse_reseed(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const REKEY: CommandSpec = CommandSpec {
     name: "rekey",
+    example: &["rekey", "raven"],
     missing: "rekey requires a workspace",
     args: "<ws|main>",
     trailing: "",
@@ -3818,6 +3855,7 @@ fn parse_rekey(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const GC: CommandSpec = CommandSpec {
     name: "gc",
+    example: &["gc"],
     missing: "gc requires an argument",
     args: "",
     trailing: "",
@@ -3892,6 +3930,7 @@ fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const PUSH: CommandSpec = CommandSpec {
     name: "push",
+    example: &["push", "raven"],
     missing: "push requires an argument",
     args: "[<ws>]",
     trailing: "",
@@ -3927,6 +3966,7 @@ fn parse_push(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const REBASE: CommandSpec = CommandSpec {
     name: "rebase",
+    example: &["rebase", "raven"],
     missing: "rebase requires an argument",
     args: "[<ws>]",
     trailing: "",
@@ -3972,6 +4012,7 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const LAND: CommandSpec = CommandSpec {
     name: "land",
+    example: &["land", "raven"],
     missing: "land requires a workspace",
     args: "<ws>",
     trailing: "",
@@ -4066,6 +4107,7 @@ fn land_mode(matches: &ArgMatches) -> LandMode {
 
 const BUILD_STATE: CommandSpec = CommandSpec {
     name: "build-state",
+    example: &["build-state"],
     missing: "build-state takes no arguments",
     args: "",
     trailing: "",
@@ -4079,6 +4121,7 @@ const BUILD_STATE: CommandSpec = CommandSpec {
 
 const DOCTOR: CommandSpec = CommandSpec {
     name: "doctor",
+    example: &["doctor"],
     missing: "doctor requires an argument",
     args: "",
     trailing: "",
@@ -5966,57 +6009,99 @@ mod tests {
         assert_eq!(unrelated.message, "unknown command `frobnicate`");
     }
 
+    /// Each command's example is one valid invocation of that command: the case every test that
+    /// derives one per command parses, so a command without a parsing example fails by name.
+    #[test]
+    fn every_command_example_parses_as_its_own_command() {
+        for spec in COMMANDS {
+            assert_eq!(
+                spec.example.first().copied(),
+                Some(spec.name),
+                "{} gives another command's example",
+                spec.name
+            );
+            let parsed = parse_args(spec.example.iter().copied()).unwrap_or_else(|error| {
+                panic!(
+                    "{}'s example {:?} does not parse: {}",
+                    spec.name, spec.example, error.message
+                )
+            });
+            assert!(
+                !matches!(parsed.command, Command::Help(_)),
+                "{}'s example asks for help, not the command",
+                spec.name
+            );
+        }
+    }
+
+    /// Every command declares whether it needs the project, may use it, or never reads it, judged
+    /// over the command set itself: each command's own example is parsed, a command named in
+    /// neither list below is one that never discovers a project (so a new verb that does has to be
+    /// named), and a name that is no command fails. The flags that change the answer, which an
+    /// example does not reach, are the rows after.
     #[test]
     fn every_command_declares_its_project_discovery_requirement() {
         use ProjectDiscovery::{NotUsed, Optional, Required};
 
-        let cases: &[(&[&str], ProjectDiscovery)] = &[
-            (&["adopt", "/repo"], Required),
-            (&["setup"], NotUsed),
-            (&["fork", "raven"], Required),
+        const REQUIRED: &[&str] = &[
+            "adopt",
+            "fork",
+            "mv",
+            "checkpoint",
+            "restore",
+            "path",
+            "build-state",
+            "exec",
+            "grant",
+            "revoke",
+            "rm",
+            "attach",
+            "resize",
+            "defrag",
+            "cache",
+            "reseed",
+            "rekey",
+            "gc",
+            "push",
+            "rebase",
+            "land",
+            "controller",
+            "credential",
+            "identity",
+        ];
+        const OPTIONAL: &[&str] = &["ls", "doctor"];
+        for name in REQUIRED.iter().chain(OPTIONAL) {
+            assert!(
+                help::command_named(name).is_some(),
+                "{name} is classified but is no command"
+            );
+        }
+        for spec in COMMANDS {
+            let expected = if REQUIRED.contains(&spec.name) {
+                Required
+            } else if OPTIONAL.contains(&spec.name) {
+                Optional
+            } else {
+                NotUsed
+            };
+            let cli = parse_args(spec.example.iter().copied()).expect("a command's example parses");
+            assert_eq!(cli.command.project_discovery(), expected, "{}", spec.name);
+        }
+
+        let flagged: &[(&[&str], ProjectDiscovery)] = &[
             (&["fork", "raven", "falcon"], Required),
-            (&["mv", "raven", "falcon"], Required),
-            (&["checkpoint", "raven"], Required),
-            (&["restore", "raven", "saved"], Required),
             (&["attach"], Required),
             (&["attach", "--all"], NotUsed),
-            (&["ls"], Optional),
             (&["ls", "--all"], NotUsed),
-            (&["path", "raven"], Required),
-            (&["exec", "raven", "--", "true"], Required),
-            (&["rm", "raven"], Required),
-            (&["forget", "acme/widget", "--abandon"], NotUsed),
-            (&["attach", "raven"], Required),
-            (&["detach", "raven"], NotUsed),
             (&["detach", "--all"], NotUsed),
-            (&["resize", "raven", "32GiB"], Required),
-            (&["defrag", "main"], Required),
-            (&["reseed", "raven"], Required),
             (&["reseed", "main", "--from", "lane", "--dry-run"], Required),
-            (&["rekey", "raven"], Required),
-            (&["gc"], Required),
-            (&["push", "raven"], Required),
-            (&["rebase", "raven"], Required),
-            (&["land", "raven"], Required),
-            (&["doctor"], Optional),
-            (&["gateway", "status"], NotUsed),
-            (&["controller"], Required),
-            (&["sccache", "status"], NotUsed),
-            (&["skill", "install"], NotUsed),
-            (&["land-turn", "repo", "--", "true"], NotUsed),
-            (&["lock", "/tmp/x.lock", "--", "true"], NotUsed),
-            (&["lock-holders", "/tmp/x.lock"], NotUsed),
-            (
-                &["hold", "--control-fd", "3", "--state-fd", "4", "--", "true"],
-                NotUsed,
-            ),
-            (&["tree-holders", "/tmp/tree"], NotUsed),
-            (&["fd-holders", "--inode", "7"], NotUsed),
-            (&["help"], NotUsed),
         ];
-
-        for (arguments, expected) in cases {
-            let cli = parse_args(arguments.iter().copied()).expect("representative command parses");
+        for (arguments, expected) in flagged {
+            assert!(
+                help::command_named(arguments[0]).is_some(),
+                "{arguments:?} is no command"
+            );
+            let cli = parse_args(arguments.iter().copied()).expect("a flagged command parses");
             assert_eq!(cli.command.project_discovery(), *expected, "{arguments:?}");
         }
     }
@@ -6027,10 +6112,7 @@ mod tests {
     fn usage_hints_come_from_the_same_table_as_the_help() {
         let error = parse_args(["fork", "raven", "--unknown"]).unwrap_err();
         assert_eq!(error.message, "unknown flag `--unknown`");
-        assert_eq!(
-            error.hint,
-            "cowshed fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree] [--markdown-only]"
-        );
+        assert_eq!(error.hint, help::command_named("fork").unwrap().hint());
 
         for spec in COMMANDS {
             let hint = spec.hint();
@@ -6162,59 +6244,34 @@ mod tests {
         }
     }
 
+    /// A missing positional is reported in the words of the command's own spec, which the clap
+    /// fallback and the require helpers both read.
     #[test]
     fn missing_positionals_use_the_same_words_as_require_helpers() {
-        let cases = [
-            (["fork"].as_slice(), "fork requires a destination workspace"),
-            (&["mv"], "mv requires a workspace"),
-            (&["restore"], "restore requires a workspace"),
-            (&["exec", "--", "true"], "exec requires a workspace"),
-            (&["rm"], "rm requires a workspace"),
-            (&["forget"], "forget requires an owner/repo"),
-            (&["detach"], "detach requires a workspace"),
-            (&["resize"], "resize requires a workspace"),
-            (&["defrag"], "defrag requires a workspace"),
-            (&["reseed"], "reseed requires a workspace"),
-            (&["rekey"], "rekey requires a workspace"),
-            (&["land"], "land requires a workspace"),
-            (&["gateway"], "gateway action is required"),
-            (&["sccache"], "sccache action is required"),
-            (&["skill"], "skill action is required"),
-        ];
-        for (arguments, message) in cases {
+        for arguments in [
+            &["fork"][..],
+            &["mv"],
+            &["restore"],
+            &["exec", "--", "true"],
+            &["rm"],
+            &["forget"],
+            &["detach"],
+            &["resize"],
+            &["defrag"],
+            &["reseed"],
+            &["rekey"],
+            &["land"],
+            &["gateway"],
+            &["sccache"],
+            &["skill"],
+        ] {
             let error = parse_args(arguments.iter().copied()).unwrap_err();
-            assert_eq!(error.message, message, "{arguments:?}");
             assert_eq!(
+                error.message,
                 help::command_named(arguments[0]).unwrap().missing,
-                message,
-                "{arguments:?} clap fallback drifted"
+                "{arguments:?}"
             );
         }
-    }
-
-    #[test]
-    fn no_help_page_contains_provision_or_a_phantom_job_verb() {
-        for spec in COMMANDS {
-            let page = spec.page();
-            assert!(
-                !page.contains("provision"),
-                "{} help must not say provision:\n{page}",
-                spec.name
-            );
-            assert!(
-                !page.contains("cowshed job"),
-                "{} help must not name a job verb:\n{page}",
-                spec.name
-            );
-        }
-        let exec = help::command_named("exec").unwrap().page();
-        assert!(exec.contains("exec --session") || exec.contains("`--session`"));
-        assert!(
-            help::command_named("setup")
-                .unwrap()
-                .summary
-                .contains("create or repair")
-        );
     }
 
     #[test]

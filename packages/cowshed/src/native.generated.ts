@@ -28,6 +28,7 @@ export interface NativeAdopted {
  * A stream-lane call's events: `next` sends one demand and resolves to the event that answers it,
  * as JSON, or to `null` once the call has ended; `close` ends the call, never what it observes, even
  * while a `next` waits, which then resolves to `null`.
+ * Its iterator adapter closes once; a close failure is terminal and later returns replay the same rejection without I/O.
  */
 export interface NativeEvents {
   next(): Promise<string | null>;

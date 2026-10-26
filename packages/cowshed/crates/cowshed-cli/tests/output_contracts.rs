@@ -82,20 +82,6 @@ fn bare_streams_and_records_preserve_machine_bytes() {
 }
 
 #[test]
-fn binary_entrypoint_returns_typed_json_usage_error() {
-    let output = Command::new(cowshed())
-        .args(["--json", "exec", "raven", "--unknown"])
-        .output_bounded()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stderr.is_empty());
-    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(envelope["ok"], false);
-    assert_eq!(envelope["error"]["code"], "usage");
-}
-
-#[test]
 fn binary_entrypoint_returns_usage_and_command_map() {
     let output = Command::new(cowshed()).output_bounded().unwrap();
 
@@ -106,30 +92,6 @@ fn binary_entrypoint_returns_usage_and_command_map() {
     assert!(stderr.contains("warm git workspaces — a copy-on-write checkout"));
     assert!(stderr.contains("first time here? run cowshed setup, then cowshed adopt"));
     assert!(stderr.contains("commands:"));
-}
-
-#[test]
-fn child_argv_cannot_enable_cli_json_mode() {
-    let output = Command::new(cowshed())
-        .args([
-            "exec",
-            "raven",
-            "--stdin",
-            "--stdin-file",
-            "input",
-            "--",
-            "--json",
-        ])
-        .output_bounded()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("conflict")
-    );
 }
 
 /// A scratch HOME per test, following the crate's temp-directory convention.

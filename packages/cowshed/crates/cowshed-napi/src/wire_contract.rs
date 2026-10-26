@@ -43,6 +43,8 @@ use serde_json::Value;
 
 use super::canonical_json;
 
+use crate::declaration_coverage;
+
 /// `include_str!` makes the corpus a compile input of this crate, so editing the file alone
 /// cannot leave this assertion unrun behind an up-to-date build.
 const GOLDEN: &str = include_str!("../../../src/wire-fixtures.json");
@@ -593,6 +595,23 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ..exited.clone()
     };
 
+    // A job whose supervisor ended without seeing it end: recovery sealed its terminal record,
+    // so it names the process it held but no exit it observed.
+    let supervisor_lost = JobInfo {
+        job_id: JobId::new(31).expect("fixture job id"),
+        state: JobState::Failed,
+        exit: None,
+        pid: Some(4250),
+        resources: None,
+        stdout: inline_stream(""),
+        stderr: inline_stream("cowshed: the supervisor running this job ended\n"),
+        failure: Some(cowshed_core::api::JobFailure::SupervisorLost),
+        class: ExecClass::Background,
+        scope: ExecScope::Workspace,
+        nice: None,
+        ..exited.clone()
+    };
+
     // A job its requester waits on: it ran at the supervisor's own nice, above a gate
     // (05_gateway.md "Classes").
     let interactive = JobInfo {
@@ -720,6 +739,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ("priorityFailed", document("job status", &priority_failed)),
         ("memoryEnded", document("job status", &memory_ended)),
         ("unlaunched", document("job status", &unlaunched)),
+        ("supervisorLost", document("job status", &supervisor_lost)),
         ("interactive", document("job status", &interactive)),
         ("resident", document("job status", &resident)),
         (
@@ -1630,6 +1650,17 @@ fn the_committed_wire_corpus_is_what_core_serializes() {
     );
 }
 
+/// The wire spelling one constructed value serializes to: coverage below is quantified over
+/// values joined against the declaration IR (`declaration_coverage`), so the spellings are the
+/// owning serde declarations', never retyped string lists.
+fn wire_spelling<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .expect("a wire value is JSON")
+        .as_str()
+        .expect("a wire value serializes as a string")
+        .to_owned()
+}
+
 /// Every `JobState` must reach the corpus, because `JobInfo::validate` couples the state to the
 /// presence of `exit`, `durationMs`, and `outputLimit`: a state that never serializes here is a
 /// combination `types.ts` is unverified against.
@@ -1649,7 +1680,7 @@ fn every_job_state_appears_in_the_corpus() {
         })
         .collect();
 
-    for state in [
+    let declared = [
         JobState::Queued,
         JobState::Running,
         JobState::Draining,
@@ -1658,13 +1689,12 @@ fn every_job_state_appears_in_the_corpus() {
         JobState::Killed,
         JobState::OutputLimit,
         JobState::Failed,
-    ] {
-        let spelling = serde_json::to_value(state).expect("a job state is JSON");
-        let spelling = spelling
-            .as_str()
-            .expect("a job state serializes as a string");
+    ];
+    declaration_coverage::assert_exact("JobState", &declared);
+    for state in declared {
+        let spelling = wire_spelling(&state);
         assert!(
-            states.iter().any(|seen| seen == spelling),
+            states.iter().any(|seen| seen == &spelling),
             "job state {spelling:?} has no corpus case, so types.ts is unverified for it"
         );
     }
@@ -1719,16 +1749,44 @@ fn every_volume_usage_appears_in_the_corpus() {
             usage["reason"]["kind"].as_str().map(str::to_owned),
         )
     };
-    for (kind, reason) in [
-        ("read", None),
-        ("unavailable", Some("unconfigured")),
-        ("unavailable", Some("unsupportedPlatform")),
-        ("unavailable", Some("failed")),
-    ] {
-        let wanted = (Some(kind.to_owned()), reason.map(str::to_owned));
+
+    let reasons = vec![
+        VolumeUnavailable::Unconfigured,
+        VolumeUnavailable::UnsupportedPlatform,
+        VolumeUnavailable::Failed {
+            message: "fixture stat failure".to_owned(),
+        },
+    ];
+    declaration_coverage::assert_exact("VolumeUnavailable", &reasons);
+    let read = VolumeUsage::Read {
+        delta_bytes: VolumeUsedBytesDelta::new(0).expect("a zero delta is exact"),
+    };
+    declaration_coverage::assert_exact(
+        "VolumeUsage",
+        &[
+            read.clone(),
+            VolumeUsage::Unavailable {
+                reason: VolumeUnavailable::Unconfigured,
+            },
+        ],
+    );
+    // Every combination the two declarations admit, spelled by their own serde shapes.
+    let mut combinations = vec![read];
+    combinations.extend(
+        reasons
+            .into_iter()
+            .map(|reason| VolumeUsage::Unavailable { reason }),
+    );
+    for usage in &combinations {
+        let serialized = serde_json::to_value(usage).expect("a volume usage is JSON");
+        let wanted = kinds(&serialized);
         assert!(
-            volumes.iter().any(|usage| kinds(usage) == wanted),
-            "no volume in the corpus is {kind} {reason:?}"
+            wanted.0.is_some(),
+            "a volume usage serializes with a kind: {serialized}"
+        );
+        assert!(
+            volumes.iter().any(|seen| kinds(seen) == wanted),
+            "no volume in the corpus is {wanted:?}"
         );
     }
     assert!(
@@ -1782,25 +1840,42 @@ fn every_scheduling_fact_appears_in_the_corpus() {
             single => vec![single.clone()],
         })
         .collect();
+
+    let classes = [
+        ExecClass::Background,
+        ExecClass::Interactive,
+        ExecClass::Gate,
+        ExecClass::Resident,
+        ExecClass::InteractiveResident,
+    ];
+    declaration_coverage::assert_exact("ExecClass", &classes);
+    let scopes = [ExecScope::Workspace, ExecScope::HostGate];
+    declaration_coverage::assert_exact("ExecScope", &scopes);
+    let failures = [
+        cowshed_core::api::JobFailure::ScriptSyntax,
+        cowshed_core::api::JobFailure::SupervisorLost,
+        cowshed_core::api::JobFailure::CpuAdmission,
+        cowshed_core::api::JobFailure::Priority,
+        cowshed_core::api::JobFailure::Memory,
+        cowshed_core::api::JobFailure::Unlaunched,
+    ];
+    declaration_coverage::assert_exact("JobFailure", &failures);
+
     for (field, spellings) in [
         (
             "class",
-            [
-                "background",
-                "interactive",
-                "gate",
-                "resident",
-                "interactive-resident",
-            ]
-            .as_slice(),
+            classes.iter().map(wire_spelling).collect::<Vec<_>>(),
         ),
-        ("scope", ["workspace", "hostGate"].as_slice()),
+        (
+            "scope",
+            scopes.iter().map(wire_spelling).collect::<Vec<_>>(),
+        ),
         (
             "failure",
-            ["scriptSyntax", "cpuAdmission", "priority", "memory"].as_slice(),
+            failures.iter().map(wire_spelling).collect::<Vec<_>>(),
         ),
     ] {
-        for spelling in spellings {
+        for spelling in &spellings {
             assert!(
                 documents
                     .iter()
@@ -1839,7 +1914,17 @@ fn every_retirement_fact_appears_in_the_corpus() {
             single => vec![single.clone()],
         })
         .collect();
-    for kind in ["kernel", "observed"] {
+
+    let containments = [
+        cowshed_core::api::JobContainment::Kernel,
+        cowshed_core::api::JobContainment::Observed { lost: Vec::new() },
+    ];
+    declaration_coverage::assert_exact("JobContainment", &containments);
+    for containment in &containments {
+        let serialized = serde_json::to_value(containment).expect("a containment is JSON");
+        let kind = serialized["kind"]
+            .as_str()
+            .expect("a containment serializes with a kind");
         assert!(
             documents
                 .iter()

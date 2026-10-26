@@ -2092,6 +2092,77 @@
       },
       "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
     },
+    "supervisorLost": {
+      "argv": [
+        {
+          "data": "sh",
+          "encoding": "utf8"
+        },
+        {
+          "data": "-c",
+          "encoding": "utf8"
+        }
+      ],
+      "class": "background",
+      "cwd": null,
+      "durationMs": 1234,
+      "failure": "supervisorLost",
+      "grantRevision": 7,
+      "jobId": 31,
+      "pid": 4250,
+      "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "failed",
+      "stderr": {
+        "bytes": 47,
+        "sha256": "f3001d85a7b9d5fe7a300bd3dfbbcbde571f9b9d54a6054e57017b9c88e81644",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "cowshed: the supervisor running this job ended\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "cowshed: the supervisor running this job ended\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 5,
+        "complete": true,
+        "kind": "inline"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
     "unlaunched": {
       "argv": [
         {

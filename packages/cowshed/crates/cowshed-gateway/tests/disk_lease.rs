@@ -7,12 +7,10 @@ mod fixture_dir;
 #[path = "support/namespace_root.rs"]
 mod namespace_root;
 
-use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -27,8 +25,9 @@ use cowshed_gateway::{
     CredentialProvider, CredentialQuery, CredentialRecord, DiskLeaseLimits, Gateway, GatewayConfig,
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
-use cowshed_gateway_types::DiskClass;
+use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
 
 struct NoCredentials;
 
@@ -97,114 +96,59 @@ async fn gateway(limits: DiskLeaseLimits) -> (Gateway, namespace_root::Namespace
     (gateway, root, socket)
 }
 
-/// A client thread that takes a `class` lease on `socket`, says when its command starts, and
-/// holds the lease until told to finish.
-fn holder(socket: &Path, class: DiskClass, label: &'static str) -> (Receiver<()>, Sender<()>) {
-    let (entered, entered_rx) = channel();
-    let (finish, finish_rx) = channel::<()>();
-    let socket = socket.to_path_buf();
-    std::thread::spawn(move || {
-        leased_at(&socket, class, label, None, || {
-            let _ = entered.send(());
-            let _ = finish_rx.recv();
-            Ok::<(), String>(())
-        })
-    });
-    (entered_rx, finish)
+/// Read one protocol publication, never a timed negative observation.
+async fn lease_state(
+    stream: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+    expected: LeaseState,
+) {
+    use tokio::io::AsyncBufReadExt as _;
+    let mut line = String::new();
+    assert_ne!(
+        stream.read_line(&mut line).await.expect("lease answer"),
+        0,
+        "lease closed before {expected:?}"
+    );
+    let answer: DiskLeaseAnswer = serde_json::from_str(&line).expect("typed lease answer");
+    assert!(answer.ok, "lease refused: {answer:?}");
+    assert_eq!(answer.lease, Some(expected));
 }
 
-/// Wait for `signal`, off the runtime the gateway serves on: the grant is the event, and a grant
-/// that never comes meets the run's no-progress bound, never a clock of the test's own.
-async fn enters(signal: Receiver<()>) -> Receiver<()> {
-    tokio::task::spawn_blocking(move || {
-        signal
-            .recv()
-            .expect("the holder's thread signals its entry");
-        signal
-    })
-    .await
-    .expect("wait")
-}
-
-/// Absence check: whether `signal` fires within `within`, waited off the runtime the gateway
-/// serves on. Load only makes `false` pass vacuously, never fail.
-async fn fires(signal: Receiver<()>, within: Duration) -> (Receiver<()>, bool) {
-    tokio::task::spawn_blocking(move || {
-        let fired = signal.recv_timeout(within).is_ok();
-        (signal, fired)
-    })
-    .await
-    .expect("wait")
+async fn ask_lease(
+    socket: &Path,
+    class: DiskClass,
+) -> tokio::io::BufReader<tokio::net::UnixStream> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut stream = tokio::net::UnixStream::connect_bounded(socket)
+        .await
+        .expect("connect lease");
+    let request = DiskLeaseRequest::new(class, PhaseShare::Shared, "wire lifecycle witness");
+    let line = format!(
+        "{}\n",
+        serde_json::to_string(&request).expect("lease request")
+    );
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .expect("write lease");
+    let mut stream = tokio::io::BufReader::new(stream);
+    lease_state(&mut stream, LeaseState::Queued).await;
+    stream
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_class_shares_its_phase_and_the_other_runs_only_once_it_drains() {
-    let (gateway, _root, socket) = gateway(DiskLeaseLimits {
-        per_class: NonZeroUsize::new(2).unwrap(),
-        // Not the subject: no holder here is stuck, so the bound sits at the run's backstop.
-        phase_bound: cowshed_os::test_backstop::NO_PROGRESS,
-    })
-    .await;
-
-    // An idle lease grants at once; a second storage command shares the phase.
-    let (first, finish_first) = holder(&socket, DiskClass::Storage, "/usr/sbin/diskutil a");
-    enters(first).await;
-    let (second, finish_second) = holder(&socket, DiskClass::Storage, "/usr/sbin/diskutil b");
-    enters(second).await;
-
-    let (mount, finish_mount) = holder(&socket, DiskClass::Namespace, "/sbin/mount_apfs x");
-    let (mount, entered) = fires(mount, Duration::from_millis(500)).await;
-    assert!(!entered, "a mount never runs beside storage commands");
-    let (third, finish_third) = holder(&socket, DiskClass::Storage, "/usr/sbin/diskutil c");
-    let (third, entered) = fires(third, Duration::from_millis(500)).await;
-    assert!(
-        !entered,
-        "room in the phase, but namespace waits: storage admits nobody new"
-    );
-
-    finish_first.send(()).unwrap();
-    let (mount, entered) = fires(mount, Duration::from_millis(500)).await;
-    assert!(!entered, "storage has not drained");
-    finish_second.send(()).unwrap();
-    // The drained phase goes to namespace.
-    enters(mount).await;
-    let (third, entered) = fires(third, Duration::from_millis(300)).await;
-    assert!(!entered, "storage waits for the namespace phase");
-    finish_mount.send(()).unwrap();
-    // And storage gets the phase back.
-    enters(third).await;
-    finish_third.send(()).unwrap();
-
-    gateway.drain().await.expect("drain");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_holder_stuck_past_the_bound_stops_holding_the_other_class_back() {
-    let bound = Duration::from_millis(300);
-    let (gateway, _root, socket) = gateway(DiskLeaseLimits {
-        per_class: NonZeroUsize::new(8).unwrap(),
-        phase_bound: bound,
-    })
-    .await;
-
-    // The bound runs from the stuck holder's grant, which comes after its ask: entry beside it
-    // is at least `bound` after this instant, however late the host runs either thread.
-    let stuck_asked = Instant::now();
-    let (stuck, _never_finished) = holder(&socket, DiskClass::Namespace, "/sbin/umount /hung");
-    enters(stuck).await;
-    let (attach, finish_attach) = holder(
-        &socket,
-        DiskClass::Storage,
-        "/usr/sbin/diskutil image attach",
-    );
-    enters(attach).await;
-    assert!(
-        stuck_asked.elapsed() >= bound,
-        "the stuck unmount was evicted before the bound: {:?}",
-        stuck_asked.elapsed()
-    );
-    finish_attach.send(()).unwrap();
-
+async fn a_queued_wire_request_is_granted_after_the_held_connection_closes() {
+    let (gateway, _root, socket) = gateway(DiskLeaseLimits::default()).await;
+    let mut first = ask_lease(&socket, DiskClass::Storage).await;
+    lease_state(&mut first, LeaseState::Granted).await;
+    let mut next = ask_lease(&socket, DiskClass::Namespace).await;
+    // The queued acknowledgment proves admission ran. Policy/exclusion is covered by
+    // Ledger's explicit Ask/Leave tables, not by a contender failing to get scheduled.
+    drop(first);
+    lease_state(&mut next, LeaseState::Granted).await;
+    drop(next);
+    let mut final_request = ask_lease(&socket, DiskClass::Storage).await;
+    lease_state(&mut final_request, LeaseState::Granted).await;
+    drop(final_request);
     gateway.drain().await.expect("drain");
 }
 

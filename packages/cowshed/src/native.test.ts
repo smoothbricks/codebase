@@ -15,6 +15,8 @@ import {
   openProject,
 } from '../dist/ts/index.js';
 
+import { EventIteratorCore, type EventIteratorEffect, type EventIteratorInput } from '../dist/ts/native.js';
+
 /**
  * The oracle is the `ErrorCode` plus a non-empty hint, not the rendered English. `code` is core's
  * taxonomy and `hint` is a real property the addon sets, so both are contract; message copy is
@@ -872,4 +874,196 @@ describe('Node fixture environment', () => {
       nodeFixtureEnvironment({ FORCE_COLOR: 'true', NO_COLOR: '1', PATH: '/usr/bin', CARGO_HOME: '/cargo' }),
     ).toEqual({ NO_COLOR: '1', PATH: '/usr/bin', CARGO_HOME: '/cargo' });
   });
+});
+
+/**
+ * The iterator's decision matrix, table-driven over the pure core: each row is a sequence of
+ * observations and the exact effects each one causes, with no native call, no Node peer and no
+ * timers. The scripted built-addon oracles above stay as the shell checks that those effects
+ * reach a real call (job progress demand-for-demand, close-on-break, return-while-waiting).
+ */
+describe('event iterator core', () => {
+  const done = { done: true, value: undefined } as const;
+  const value = (text: string) => ({ done: false, value: text }) as const;
+  type Step = readonly [EventIteratorInput<string>, readonly EventIteratorEffect<string>[]];
+  const cases: readonly (readonly [string, readonly Step[]])[] = [
+    [
+      'opens lazily on the first next, demands once per next, and closes only on return, settling at its result',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'event', event: '{"n":1}' }, [{ kind: 'parse', event: '{"n":1}' }]],
+        [{ kind: 'parsed', value: 'one' }, [{ kind: 'resolve-next', result: value('one') }]],
+        [{ kind: 'next' }, [{ kind: 'demand' }]],
+        [{ kind: 'event', event: null }, [{ kind: 'resolve-next', result: done }]],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+        [{ kind: 'return' }, [{ kind: 'close' }]],
+        [{ kind: 'close-ok' }, [{ kind: 'resolve-return' }]],
+        [{ kind: 'return' }, [{ kind: 'resolve-return' }]],
+      ],
+    ],
+    [
+      'return before any next opens nothing and settles every later call done',
+      [
+        [{ kind: 'return' }, [{ kind: 'resolve-return' }]],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+        [{ kind: 'return' }, [{ kind: 'resolve-return' }]],
+      ],
+    ],
+    [
+      'return while a demand waits closes at once exactly once; the ended demand and the close result settle next and return',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'return' }, [{ kind: 'close' }]],
+        [{ kind: 'return' }, []],
+        [{ kind: 'event', event: null }, [{ kind: 'resolve-next', result: done }]],
+        [{ kind: 'close-ok' }, [{ kind: 'resolve-return' }]],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+      ],
+    ],
+    [
+      'a close failure rejects the pending return, settles its next done, and later returns hear the stored failure',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'return' }, [{ kind: 'close' }]],
+        [
+          { kind: 'close-error', error: 'close failed' },
+          [
+            { kind: 'resolve-next', result: done },
+            { kind: 'reject-return', error: 'close failed' },
+          ],
+        ],
+        [{ kind: 'return' }, [{ kind: 'reject-return', error: 'close failed' }]],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+      ],
+    ],
+    [
+      'return while opening closes the call the open then delivers, settling at the close result',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'return' }, []],
+        [{ kind: 'open-ok' }, [{ kind: 'close' }]],
+        [{ kind: 'close-ok' }, [{ kind: 'resolve-next', result: done }, { kind: 'resolve-return' }]],
+      ],
+    ],
+    [
+      'an open failure rejects the opening and every later next; return sends no close',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-error', error: 'open failed' }, [{ kind: 'reject-next', error: 'open failed' }]],
+        [{ kind: 'next' }, [{ kind: 'reject-next', error: 'open failed' }]],
+        [{ kind: 'return' }, [{ kind: 'resolve-return' }]],
+      ],
+    ],
+    [
+      'an open failure after return rejects its next, settles the return, and later nexts are done',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'return' }, []],
+        [
+          { kind: 'open-error', error: 'open failed' },
+          [{ kind: 'reject-next', error: 'open failed' }, { kind: 'resolve-return' }],
+        ],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+      ],
+    ],
+    [
+      'a parse failure closes the call before its next rejects, and no second close follows',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'event', event: 'not json' }, [{ kind: 'parse', event: 'not json' }]],
+        [{ kind: 'parse-error', error: 'bad event' }, [{ kind: 'close' }]],
+        [{ kind: 'close-ok' }, [{ kind: 'reject-next', error: 'bad event' }]],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+        [{ kind: 'return' }, [{ kind: 'resolve-return' }]],
+      ],
+    ],
+    [
+      'a close failure is what a parse-rejecting next hears, replacing the parse failure',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'event', event: 'not json' }, [{ kind: 'parse', event: 'not json' }]],
+        [{ kind: 'parse-error', error: 'bad event' }, [{ kind: 'close' }]],
+        [{ kind: 'close-error', error: 'close failed' }, [{ kind: 'reject-next', error: 'close failed' }]],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+      ],
+    ],
+    [
+      'return during parsing discards the value, closes, and settles both calls at the close result',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'event', event: 'a' }, [{ kind: 'parse', event: 'a' }]],
+        [{ kind: 'return' }, []],
+        [{ kind: 'parsed', value: 'one' }, [{ kind: 'close' }]],
+        [{ kind: 'close-ok' }, [{ kind: 'resolve-next', result: done }, { kind: 'resolve-return' }]],
+      ],
+    ],
+    [
+      'a demand failure rejects only its own next; a later explicit next demands again and is answered',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'event-error', error: 'call failed' }, [{ kind: 'reject-next', error: 'call failed' }]],
+        [{ kind: 'next' }, [{ kind: 'demand' }]],
+        [{ kind: 'event', event: 'a' }, [{ kind: 'parse', event: 'a' }]],
+        [{ kind: 'parsed', value: 'one' }, [{ kind: 'resolve-next', result: value('one') }]],
+      ],
+    ],
+    [
+      'a queued next sends its own demand after a demand failure, and return still closes exactly once',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'next' }, []],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [
+          { kind: 'event-error', error: 'call failed' },
+          [{ kind: 'reject-next', error: 'call failed' }, { kind: 'demand' }],
+        ],
+        [{ kind: 'event', event: null }, [{ kind: 'resolve-next', result: done }]],
+        [{ kind: 'return' }, [{ kind: 'close' }]],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+        [{ kind: 'close-ok' }, [{ kind: 'resolve-return' }]],
+      ],
+    ],
+    [
+      'nexts queued behind work in flight are served one demand each, in order',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'next' }, []],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'event', event: 'a' }, [{ kind: 'parse', event: 'a' }]],
+        [{ kind: 'parsed', value: 'one' }, [{ kind: 'resolve-next', result: value('one') }, { kind: 'demand' }]],
+        [{ kind: 'event', event: 'b' }, [{ kind: 'parse', event: 'b' }]],
+        [{ kind: 'parsed', value: 'two' }, [{ kind: 'resolve-next', result: value('two') }]],
+      ],
+    ],
+    [
+      'return while idle-open closes exactly once; repeat returns only settle',
+      [
+        [{ kind: 'next' }, [{ kind: 'open' }]],
+        [{ kind: 'open-ok' }, [{ kind: 'demand' }]],
+        [{ kind: 'event', event: 'a' }, [{ kind: 'parse', event: 'a' }]],
+        [{ kind: 'parsed', value: 'one' }, [{ kind: 'resolve-next', result: value('one') }]],
+        [{ kind: 'return' }, [{ kind: 'close' }]],
+        [{ kind: 'return' }, []],
+        [{ kind: 'close-ok' }, [{ kind: 'resolve-return' }]],
+        [{ kind: 'return' }, [{ kind: 'resolve-return' }]],
+        [{ kind: 'next' }, [{ kind: 'resolve-next', result: done }]],
+      ],
+    ],
+  ];
+
+  for (const [name, steps] of cases) {
+    it(name, () => {
+      const core = new EventIteratorCore<string>();
+      for (const [input, expected] of steps) {
+        expect(core.step(input)).toEqual(expected);
+      }
+    });
+  }
 });

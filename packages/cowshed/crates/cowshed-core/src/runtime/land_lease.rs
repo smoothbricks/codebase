@@ -42,6 +42,12 @@ pub enum Holding {
 }
 
 impl Holding {
+    /// The lease a land call takes for its workspace: a land holds it as
+    /// Holding::Land; a preflight takes no lease at all (02_workspaces.md,
+    /// cowshed land --preflight), whoever currently holds that lease.
+    pub(crate) const fn for_land(preflight: bool) -> Option<Self> {
+        if preflight { None } else { Some(Self::Land) }
+    }
     const fn verb(self) -> &'static str {
         match self {
             Self::Land => "landed",
@@ -174,6 +180,70 @@ mod tests {
         let sessions = root.join("sessions");
         fs::create_dir(&sessions).expect("create the sessions directory");
         (root, sessions)
+    }
+
+    #[test]
+    fn a_preflight_takes_no_lease_and_a_land_holds_as_land() {
+        assert_eq!(Holding::for_land(true), None);
+        assert_eq!(Holding::for_land(false), Some(Holding::Land));
+    }
+    /// The lease decision's whole matrix (02_workspaces.md, "A land and an rm of one workspace
+    /// exclude each other"): every taker against every recorded holder, and against a holder whose
+    /// record cannot be read. Each refusal is the exact conflict the taker gets: what it would do,
+    /// the holder's operation, pid, start and command, and that operation's own hint; an
+    /// unreadable record names nobody. Free leases are the kernel's grant and take no decision.
+    #[test]
+    fn every_taker_is_refused_naming_whoever_holds_the_lease() {
+        const LAND: &str = "a land retires its workspace itself when it ends; wait for it, then \
+                            remove the workspace if the land kept it";
+        const REMOVE: &str = "wait for the removal to end";
+        const MAKE_ROOM: &str = "wait for that detach to end; it detaches only a workspace nothing \
+                                 uses, which attaches again on its next use";
+        let holder = |holding| Holder {
+            holding,
+            pid: 4242,
+            unique_id: None,
+            since: "2026-10-26T00:00:00Z".to_owned(),
+            command: "cowshed run topic".to_owned(),
+        };
+        for (wanted, doing) in [
+            (Holding::Land, "land"),
+            (Holding::Remove, "remove"),
+            (Holding::MakeRoom, "detach"),
+        ] {
+            for (holding, being, hint) in [
+                (Holding::Land, "landed", LAND),
+                (Holding::Remove, "removed", REMOVE),
+                (
+                    Holding::MakeRoom,
+                    "detached to make room for an attach",
+                    MAKE_ROOM,
+                ),
+            ] {
+                assert_eq!(
+                    refused("topic", wanted, Some(&holder(holding))),
+                    CowshedError::conflict(
+                        format!(
+                            "cannot {doing} workspace topic: it is being {being} by pid 4242 since \
+                             2026-10-26T00:00:00Z (`cowshed run topic`)"
+                        ),
+                        hint,
+                    ),
+                    "{wanted:?} against {holding:?}"
+                );
+            }
+            assert_eq!(
+                refused("topic", wanted, None),
+                CowshedError::conflict(
+                    format!(
+                        "cannot {doing} workspace topic: another land or removal of it holds its \
+                         land lease, and its record cannot be read"
+                    ),
+                    "wait for that operation to end",
+                ),
+                "{wanted:?} against an unreadable record"
+            );
+        }
     }
 
     #[test]

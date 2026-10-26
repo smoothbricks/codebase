@@ -135,6 +135,7 @@
       "devDependencies": {
         "@napi-rs/cli": "3.7.3",
         "@smoothbricks/lmao": "workspace:*",
+        "@smoothbricks/nx-plugin": "workspace:*",
         "@smoothbricks/validation": "workspace:*",
         "@types/node": "^26.6.5",
         "typescript": "^6.0.3",
@@ -309,6 +310,7 @@
         "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
         "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
         "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
+        "smoo-nx-forbidden-spellings": "./dist/bin/smoo-nx-forbidden-spellings.js",
       },
       "dependencies": {
         "@nx/js": "23.2.1",

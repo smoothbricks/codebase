@@ -17,19 +17,10 @@ use cowshed_core::sandbox::{
     RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
 };
 
-struct Scratch(PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.0) {
-            if std::thread::panicking() {
-                cowshed_os::eprintln!("remove build-state fixture {}: {error}", self.0.display());
-            } else {
-                panic!("remove build-state fixture {}: {error}", self.0.display());
-            }
-        }
-    }
-}
+#[path = "../../cowshed-core/tests/support/temp_parent.rs"]
+mod temp_parent;
+#[path = "../../cowshed-core/tests/support/temp_root.rs"]
+mod temp_root;
 
 /// Launch `argv` as every launcher does (04_sandbox.md, "Exec pipeline" step 4): the profile
 /// from its file in the fixture's own store, its build volume bound with `-D`. The text names
@@ -53,17 +44,12 @@ fn job(config: &SandboxConfig, tools: &Path, argv: &[&str]) -> Output {
 /// and the executed-child sandbox of a read-write job in it, with the support directory the
 /// install lives in. The root is outside the protected cowshed store, independently of the
 /// runner's TMPDIR.
-fn installed_cli_fixture(label: &str) -> (Scratch, SandboxConfig, PathBuf) {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let scratch = PathBuf::from(format!(
-        "/private/tmp/cowshed-{label}-cli-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir(&scratch).unwrap();
-    let root = Scratch(scratch.clone());
+fn installed_cli_fixture(label: &str) -> (temp_root::TempRoot, SandboxConfig, PathBuf) {
+    let root = temp_root::TempRoot::new_in(
+        &temp_parent::canonical_parent(),
+        &format!("cowshed-{label}-cli"),
+    );
+    let scratch = root.to_path_buf();
     let checkout = scratch.join("mounts/workspace");
     let home = scratch.join("home");
     let temporary = scratch.join("tmp");

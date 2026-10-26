@@ -13,7 +13,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
-use cowshed_os::test_backstop::FileBackstop as _;
+use cowshed_os::test_backstop::{CommandBackstop as _, FileBackstop as _};
 
 use super::{
     CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
@@ -22,6 +22,9 @@ use super::{
 
 #[path = "scratch_reclaim.rs"]
 mod reclaim;
+
+#[path = "scratch_ram.rs"]
+pub(crate) mod ram;
 
 #[path = "../../../cowshed-os/tests/support/scratch_processes.rs"]
 pub(crate) mod processes;
@@ -92,6 +95,8 @@ pub struct ScratchRoot {
     sweep: Option<JoinHandle<()>>,
 }
 
+/// The reserved plist path enrolls a root for its namespace-derived gateway label.
+pub(crate) const LAUNCH_AGENT_PLIST: &str = "launch-agent.plist";
 impl ScratchRoot {
     pub fn new(label: &str) -> std::io::Result<Self> {
         static SWEEP: Once = Once::new();
@@ -139,6 +144,9 @@ impl ScratchRoot {
         Ok(root)
     }
 
+    pub(crate) fn launch_agent_plist(&self) -> PathBuf {
+        self.path.join(LAUNCH_AGENT_PLIST)
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -211,11 +219,46 @@ pub fn reclaim_dead_root(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Unload only the gateway label derived from an enrolled fixture namespace.
+/// An absent job is already settled; any other failure retains the owner root.
+fn boot_out_enrolled_agent(namespace: TestNamespace, root: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(root.join(LAUNCH_AGENT_PLIST)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let target = format!(
+        "gui/{}/{}",
+        euid(),
+        HostNamespace::Test(namespace).launchd_label("gateway")
+    );
+    let output = std::process::Command::new("/bin/launchctl")
+        .args(["bootout", &target])
+        .output_bounded()?;
+    // bootout may return before teardown finishes, and an already-removed job
+    // has no successful bootout to repeat. The recorded job, not that exit code,
+    // decides whether it is safe to remove the enrolled plist. The caller has
+    // already ended and watched every process working in the fixture root.
+    let printed = std::process::Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output_bounded()?;
+    match printed.status.code() {
+        Some(113) => Ok(()),
+        _ => Err(std::io::Error::other(format!(
+            "fixture agent {target} is not proved unloaded: launchctl print {}: {}; bootout {}: {}",
+            printed.status,
+            String::from_utf8_lossy(&printed.stderr).trim(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
 fn tear_down_root(namespace: TestNamespace, path: &Path) -> std::io::Result<()> {
     // End the root's workers before releasing any image they may hold.
-    if let Err(error) = end_processes_in(|cwd| cwd.starts_with(path)) {
-        cowshed_os::eprintln!("scratch root {}: {error}", path.display());
-    }
+    end_processes_in(|cwd| cwd.starts_with(path))?;
+    boot_out_enrolled_agent(namespace, path)?;
+    ram::release(namespace, path)?;
     let unreleased = detach_images(namespace, |image| {
         image.starts_with(path).then_some(namespace)
     })?;
@@ -300,6 +343,7 @@ fn sweep_dead_runs(namespace: TestNamespace) {
     let started = Instant::now();
     if let Err(error) = end_processes_in(|path| dead_owner(path).is_some()) {
         cowshed_os::eprintln!("abandoned scratch roots: {error}");
+        return;
     }
     let unreleased = match detach_images(namespace, dead_owner) {
         Ok(unreleased) => unreleased,
@@ -326,7 +370,17 @@ fn sweep_dead_runs(namespace: TestNamespace) {
             .map(|entry| entry.path())
             .filter(|path| dead_owner(path).is_some()),
         &unreleased,
-        |path| fs::remove_dir_all(path),
+        |path| {
+            let namespace = dead_owner(path).ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "scratch owner is no longer proved dead: {}",
+                    path.display()
+                ))
+            })?;
+            boot_out_enrolled_agent(namespace, path)?;
+            ram::release(namespace, path)?;
+            fs::remove_dir_all(path)
+        },
         |path, error| {
             cowshed_os::eprintln!(
                 "abandoned scratch root {} was not removed: {error}",

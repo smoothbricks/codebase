@@ -415,6 +415,14 @@ const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the wait says that it is still waiting, and on what.
 const START_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
+// The deadline has to outlast a real heal: mounting several multi-gigabyte mains takes minutes,
+// and a deadline shorter than that fails a start that was working.
+const _: () = assert!(
+    START_DEADLINE.as_nanos() >= Duration::from_secs(120).as_nanos()
+        && START_DEADLINE.as_nanos() > START_PROGRESS_INTERVAL.as_nanos() * 4,
+    "the start deadline outlasts a multi-project heal"
+);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayPaths {
     pub home: PathBuf,
@@ -959,65 +967,53 @@ where
     let mut started = tokio::time::Instant::now();
     let mut restarted = false;
     loop {
-        let waiting = match client.status().await {
-            Err(_) => StartWait::ControlSocket,
-            Ok(status) => {
-                let reported = cli_status(
-                    true,
-                    control_socket.to_path_buf(),
-                    Some(&status),
-                    cli_sha256,
-                );
-                match (
-                    &reported.drain_cause,
-                    &reported.stale_daemon,
-                    reported.healing,
-                ) {
-                    (None, None, None) => return Ok(reported),
-                    // It answers, and tells how far its startup pass has got; nothing that
-                    // needs a workspace is served until that pass is over.
-                    (None, None, Some(heal)) => StartWait::Startup(heal),
-                    // launchd kept the process it already had: the plist did not change, so
-                    // activation did not restart it onto the bytes just installed. Restart it
-                    // once.
-                    (None, Some(_), _) if !restarted => {
-                        // The land turns were judged under this slot before the install
-                        // changed anything, and every land step since waits for the slot, so this
-                        // restart cuts nothing off. The start deadline is the new daemon's to
-                        // meet, not the old one's drain.
-                        started = tokio::time::Instant::now();
-                        activate_launch_agent(executor, uid, target, InstallOutcome::Changed)?;
-                        restarted = true;
-                        StartWait::ControlSocket
-                    }
-                    (None, Some(stale), _) => {
-                        return Err(CowshedError::conflict(
-                            format!(
-                                "the gateway still runs a different cowshed binary after a restart (daemon sha256 {}, cli sha256 {})",
-                                stale.daemon_sha256.as_deref().unwrap_or("unreported"),
-                                stale.cli_sha256
-                            ),
-                            STALE_DAEMON_REMEDY,
-                        ));
-                    }
-                    // A draining daemon exits once its in-flight work ends and launchd restarts
-                    // it; it is not healthy until then.
-                    (Some(_), _, _) => StartWait::Drain,
-                }
-            }
+        let reported = match client.status().await {
+            Err(_) => None,
+            Ok(status) => Some(cli_status(
+                true,
+                control_socket.to_path_buf(),
+                Some(&status),
+                cli_sha256,
+            )),
         };
         let waited = started.elapsed();
-        if waited >= START_DEADLINE {
-            return Err(CowshedError::environment_missing(
-                format!(
-                    "gateway did not become healthy within {}s of starting",
-                    START_DEADLINE.as_secs()
-                ),
-                kickstart_hint(uid, target.label()),
-            ));
-        }
-        if let Some(line) = progress.line(waited, waiting) {
-            output.guidance(&line).map_err(output_error)?;
+        match start_step(reported.as_ref(), waited, restarted) {
+            StartStep::Served(status) => return Ok(status.clone()),
+            StartStep::Wait(waiting) => {
+                if let Some(line) = progress.line(waited, waiting) {
+                    output.guidance(&line).map_err(output_error)?;
+                }
+            }
+            // launchd kept the process it already had: the plist did not change, so activation
+            // did not restart it onto the bytes just installed. Restart it once.
+            StartStep::Restart => {
+                // The land turns were judged under this slot before the install changed
+                // anything, and every land step since waits for the slot, so this restart cuts
+                // nothing off. The start deadline is the new daemon's to meet, not the old one's
+                // drain.
+                started = tokio::time::Instant::now();
+                activate_launch_agent(executor, uid, target, InstallOutcome::Changed)?;
+                restarted = true;
+            }
+            StartStep::Stale(stale) => {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "the gateway still runs a different cowshed binary after a restart (daemon sha256 {}, cli sha256 {})",
+                        stale.daemon_sha256.as_deref().unwrap_or("unreported"),
+                        stale.cli_sha256
+                    ),
+                    STALE_DAEMON_REMEDY,
+                ));
+            }
+            StartStep::Overdue => {
+                return Err(CowshedError::environment_missing(
+                    format!(
+                        "gateway did not become healthy within {}s of starting",
+                        START_DEADLINE.as_secs()
+                    ),
+                    kickstart_hint(uid, target.label()),
+                ));
+            }
         }
         tokio::time::sleep(START_POLL_INTERVAL).await;
     }
@@ -1032,6 +1028,56 @@ enum StartWait {
     Startup(StartupHeal),
     /// The daemon answers while it drains; launchd restarts it once it exits.
     Drain,
+}
+
+/// What the wait does after one probe of the starting gateway.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartStep<'a> {
+    /// The gateway answers from this build, its startup pass is over and it is not draining.
+    Served(&'a CliGatewayStatus),
+    /// Not yet: poll again, saying what it is waiting for.
+    Wait(StartWait),
+    /// launchd kept the process it had: restart it once, and give the new daemon its own deadline.
+    Restart,
+    /// The daemon still runs other bytes than this CLI after that one restart.
+    Stale(&'a StaleDaemonBinary),
+    /// The deadline passed with the gateway still not serving.
+    Overdue,
+}
+
+/// The wait's one decision, pure over what a probe found (None when nothing answered), how long
+/// the wait has run and whether the one restart has happened, so it is a table and no sleep is
+/// needed to know a wait still holds (05_gateway.md "Deadlines": the ceiling is the start's own,
+/// never a probe's). Serving, and an old daemon's restart or refusal, outrank the clock: a gateway
+/// that serves at the deadline is served. Everything else holds until the deadline has passed.
+fn start_step(
+    probe: Option<&CliGatewayStatus>,
+    waited: Duration,
+    restarted: bool,
+) -> StartStep<'_> {
+    let waiting = match probe {
+        None => StartWait::ControlSocket,
+        Some(reported) => match (
+            &reported.drain_cause,
+            &reported.stale_daemon,
+            reported.healing,
+        ) {
+            (None, None, None) => return StartStep::Served(reported),
+            // It answers, and tells how far its startup pass has got; nothing that needs a
+            // workspace is served until that pass is over.
+            (None, None, Some(heal)) => StartWait::Startup(heal),
+            (None, Some(_), _) if !restarted => return StartStep::Restart,
+            (None, Some(stale), _) => return StartStep::Stale(stale),
+            // A draining daemon exits once its in-flight work ends and launchd restarts it; it
+            // is not healthy until then.
+            (Some(_), _, _) => StartWait::Drain,
+        },
+    };
+    if waited >= START_DEADLINE {
+        StartStep::Overdue
+    } else {
+        StartStep::Wait(waiting)
+    }
 }
 
 /// The wait's own reporting, at most one line per [`START_PROGRESS_INTERVAL`].
@@ -3587,6 +3633,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::CommandBackstop as _;
 
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::ChildBackstop as _;
+
+    #[cfg(target_os = "macos")]
+    use crate::code_signing::keychain_fixture::{self, ThrowawayKeychain};
+
     type RecordingExecutor = LaunchdExecutor<NativeFilesystem, RecordingGatewayLaunchctl>;
 
     /// A gateway that is not running answers a status read `Absent`: its socket is missing,
@@ -4783,41 +4835,34 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    /// The proof with a throwaway keychain: its home is a scratch directory, and its search-list
-    /// entry and keychain are removed afterwards. Run first, before the user's own:
-    /// `cargo test -p cowshed-cli --lib host_proof -- --ignored --nocapture`.
+    /// The proof with a throwaway keychain, the fixture the signing tests share: its scratch root
+    /// and keychain are owned before the first call that puts the keychain on this user's search
+    /// list, so a panic still has security take exactly that entry off the list as it stands and
+    /// delete the keychain, and a run killed outright leaves its entry for the next start's
+    /// reclaim. That reclaim is proven here too, after this one, because two host proofs
+    /// rewriting the one search list at once could lose each other's entry. Run first, before the
+    /// user's own:
+    /// cargo test -p cowshed-cli --lib host_proof -- --ignored --nocapture
     #[cfg(target_os = "macos")]
-    #[ignore = "host proof: adds a throwaway keychain to this user's search list for its run"]
+    #[ignore = "host proof: adds throwaway keychains to this user's search list for its run"]
     #[tokio::test]
     async fn host_proof_a_throwaway_keychain_signs_without_a_dialog() {
-        let keychain_home = scratch_root("host-proof-keychain");
-        let keychain = Keychain::cowshed(&keychain_home);
-        prove_one_requirement_across_two_setups(&keychain_home).await;
-        let listed = std::process::Command::new(code_signing::SECURITY)
-            .args(["list-keychains", "-d", "user"])
-            .output_bounded()
-            .unwrap();
-        let kept: Vec<String> = String::from_utf8_lossy(&listed.stdout)
-            .lines()
-            .filter_map(|line| {
-                line.trim()
-                    .strip_prefix('"')?
-                    .strip_suffix('"')
-                    .map(str::to_owned)
-            })
-            .filter(|entry| Path::new(entry) != keychain.path())
-            .collect();
-        let restored = std::process::Command::new(code_signing::SECURITY)
-            .args(["list-keychains", "-d", "user", "-s"])
-            .args(&kept)
-            .status_bounded()
-            .unwrap();
-        assert!(restored.success());
-        let _ = std::process::Command::new(code_signing::SECURITY)
-            .arg("delete-keychain")
-            .arg(keychain.path())
-            .status_bounded();
-        fs::remove_dir_all(keychain_home).unwrap();
+        let mut throwaway = ThrowawayKeychain::new(KEYCHAIN_PROOF, Keychain::cowshed);
+        let before = search_list_now();
+        prove_one_requirement_across_two_setups(throwaway.home()).await;
+        throwaway.retire().expect("retire the throwaway keychain");
+        let after = search_list_now();
+        assert!(
+            !after
+                .iter()
+                .any(|entry| keychain_fixture::names(entry, throwaway.keychain().path())),
+            "the throwaway keychain is still on the search list: {after:?}"
+        );
+        assert!(
+            before.iter().all(|entry| after.contains(entry)),
+            "an entry the proof never added left the search list: {before:?} became {after:?}"
+        );
+        prove_the_next_start_reclaims_a_killed_runs_keychain();
     }
 
     /// The same proof with this user's own cowshed keychain, the one setup uses.
@@ -4877,6 +4922,167 @@ mod tests {
         assert_eq!(seen[0].0, seen[1].0, "one requirement across both setups");
         assert_ne!(seen[0].1, seen[1].1, "two setups installed two builds");
         fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The prefix of the scratch roots the keychain proofs make: the sweep knows cowshed- roots.
+    #[cfg(target_os = "macos")]
+    const KEYCHAIN_PROOF: &str = "cowshed-host-proof-keychain";
+
+    /// The keychains on this user's search list now.
+    #[cfg(target_os = "macos")]
+    fn search_list_now() -> Vec<PathBuf> {
+        let listing = keychain_fixture::search_list().expect("read the search list");
+        keychain_fixture::listed(&listing).expect("read every line of the search list")
+    }
+
+    /// The environment variable the witness sets for the helper run below. The helper fails
+    /// without it, so selecting the helper by itself is red, never a green test that did nothing.
+    #[cfg(target_os = "macos")]
+    const KEYCHAIN_HELPER: &str = "COWSHED_KEYCHAIN_PROOF_HELPER";
+
+    /// The helper test's name, as this test binary selects it with --exact.
+    #[cfg(target_os = "macos")]
+    const KEYCHAIN_HELPER_TEST: &str = "a_run_that_lists_a_keychain_and_waits_to_be_killed";
+
+    /// What the helper prints before the scratch root its fixture made, once the keychain is on
+    /// the search list.
+    #[cfg(target_os = "macos")]
+    const KEYCHAIN_LISTED: &str = "keychain-proof-listed ";
+
+    /// The run the witness kills: a run of this test binary that makes its fixture, so its scratch
+    /// root is named for its pid and records no owner, puts the keychain on the search list,
+    /// reports the root and holds until it is killed. Only the witness starts it, with the
+    /// environment variable set; anywhere else it fails.
+    #[cfg(target_os = "macos")]
+    #[ignore = "helper of host_proof_a_throwaway_keychain_signs_without_a_dialog, which kills it"]
+    #[test]
+    fn a_run_that_lists_a_keychain_and_waits_to_be_killed() {
+        assert!(
+            std::env::var_os(KEYCHAIN_HELPER).is_some(),
+            "the helper run is started by its host proof; select that test instead"
+        );
+        let run = ThrowawayKeychain::new(KEYCHAIN_PROOF, Keychain::cowshed);
+        code_signing::prepare(run.keychain()).expect("put the keychain on the search list");
+        println!("{KEYCHAIN_LISTED}{}", run.home().display());
+        // Held until the witness kills this process; stdin ends only if the witness is gone.
+        std::io::Read::read_exact(&mut io::stdin(), &mut [0u8; 1]).ok();
+    }
+
+    /// A helper run of this test binary, from the moment it reports its keychain listed until it
+    /// is killed.
+    #[cfg(target_os = "macos")]
+    struct ListingRun {
+        child: std::process::Child,
+        /// Held open so that the helper never prints into a closed pipe.
+        _report: io::BufReader<std::process::ChildStdout>,
+        /// The scratch root its fixture made, as it reported it.
+        home: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ListingRun {
+        /// Start the helper and read its report. A helper that ends without one fails the proof
+        /// with everything it printed.
+        fn start() -> Self {
+            use std::io::BufRead as _;
+            let test = format!(
+                "{}::{KEYCHAIN_HELPER_TEST}",
+                module_path!()
+                    .split_once("::")
+                    .expect("a path inside the crate")
+                    .1
+            );
+            let binary = std::env::current_exe().expect("this test binary");
+            let mut child = std::process::Command::new(binary)
+                .args(["--exact", test.as_str(), "--ignored", "--nocapture"])
+                .env(KEYCHAIN_HELPER, "1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("start the helper run");
+            let mut report = io::BufReader::new(child.stdout.take().expect("the helper's stdout"));
+            let mut printed = String::new();
+            loop {
+                let mut line = String::new();
+                let read = report
+                    .read_line(&mut line)
+                    .expect("read the helper's report");
+                printed.push_str(&line);
+                if let Some(home) = line.strip_prefix(KEYCHAIN_LISTED) {
+                    return Self {
+                        child,
+                        _report: report,
+                        home: PathBuf::from(home.trim_end()),
+                    };
+                }
+                if read == 0 {
+                    let status = child.wait_bounded().expect("reap the helper run");
+                    panic!(
+                        "the helper run ended ({status}) without listing a keychain: {printed:?}"
+                    );
+                }
+            }
+        }
+
+        /// Kill the helper with SIGKILL and reap it: nothing of its drop ran, so its entry and its
+        /// scratch root, named for its pid, are still here, and that pid now names no process.
+        fn kill(&mut self) {
+            self.child.kill().expect("kill the helper run");
+            self.child.wait_bounded().expect("reap the helper run");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ListingRun {
+        fn drop(&mut self) {
+            // Killed and reaped already, or still held by a panic: either way it ends here.
+            let _ = self.child.kill();
+            let _ = self.child.wait_bounded();
+        }
+    }
+
+    /// A run killed while its keychain is listed leaves the entry and its scratch root behind. The
+    /// next start removes a dead run's and leaves a live sibling's. The dead run is a real
+    /// process, a helper run of this test binary that makes its own fixture, lists its keychain
+    /// and reports it; it is killed here once the entry is observed on the search list, so its
+    /// root is named for its dead pid and records no owner. The sibling is this process's own.
+    #[cfg(target_os = "macos")]
+    fn prove_the_next_start_reclaims_a_killed_runs_keychain() {
+        let mut sibling = ThrowawayKeychain::new(KEYCHAIN_PROOF, Keychain::cowshed);
+        code_signing::prepare(sibling.keychain())
+            .expect("put the sibling's keychain on the search list");
+        let mut run = ListingRun::start();
+        let killed = Keychain::cowshed(&run.home);
+        let listed = search_list_now();
+        assert!(
+            listed
+                .iter()
+                .any(|entry| keychain_fixture::names(entry, killed.path())),
+            "the helper run's keychain is not on the search list: {listed:?}"
+        );
+        run.kill();
+
+        // The next start: making a fixture is what reclaims the killed run's leftovers.
+        let _next_start = ThrowawayKeychain::new(KEYCHAIN_PROOF, Keychain::cowshed);
+
+        let current = search_list_now();
+        assert!(
+            !current
+                .iter()
+                .any(|entry| keychain_fixture::names(entry, killed.path())),
+            "a dead run's entry is still listed: {current:?}"
+        );
+        assert!(!run.home.exists(), "a dead run's root is still there");
+        assert!(
+            current
+                .iter()
+                .any(|entry| keychain_fixture::names(entry, sibling.keychain().path())),
+            "a live sibling's entry left the list: {current:?}"
+        );
+        assert!(sibling.home().exists(), "a live sibling's root was removed");
+        sibling
+            .retire()
+            .expect("retire the live sibling's keychain");
     }
 
     /// A build whose package has no Nx cache server dependency cannot be installed: the refresh
@@ -5556,10 +5762,12 @@ mod tests {
             );
         }
 
-        /// The measured failure: `setup` restarted the gateway and released the install slot at
+        /// The measured failure: setup restarted the gateway and released the install slot at
         /// once, and a land step that had waited on the slot found the daemon's socket refusing
         /// the connection, failing the land. An install now holds the slot until the gateway it
-        /// started serves: before its control socket answers, and through its startup pass.
+        /// started serves, so the land step that waited on it reaches a gateway whose startup pass
+        /// is over. What the wait holds through before then is the start_step table's, never a
+        /// clock's.
         #[tokio::test]
         async fn an_install_holds_the_slot_until_the_gateway_it_started_serves() {
             let support = gateway_root("csinstserve");
@@ -5600,18 +5808,9 @@ mod tests {
                     client.status().await
                 }
             });
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            assert!(!install.is_finished(), "no gateway answers yet");
-            assert!(!land.is_finished(), "the land step waits for the install");
 
             let heal = Arc::new(StartupHealState::mounting(0));
             let daemon = daemon(root, &[], Arc::clone(&heal)).await;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            assert!(
-                !install.is_finished(),
-                "the gateway answers but still heals"
-            );
-            assert!(!land.is_finished(), "the land step still waits");
 
             heal.restored();
             let served = install
@@ -5740,33 +5939,131 @@ mod tests {
         }
     }
 
-    /// "heal" is cowshed's word for what it does to itself, not the user's word for what they are
-    /// waiting on. A person watching `gateway start` is waiting for their workspaces to be
-    /// mounted, and the line has to say that.
-    #[test]
-    fn the_start_wait_never_speaks_of_healing() {
-        for waiting in [
-            StartWait::ControlSocket,
-            mounting(1),
-            mounting(4),
-            StartWait::Startup(StartupHeal::RestoringSessions),
-            StartWait::Drain,
-        ] {
-            let line = StartProgress::new()
-                .line(START_PROGRESS_INTERVAL, waiting)
-                .expect("a line once the interval has passed");
-            for jargon in ["heal", "unhealable", "reclaim", "provision", "incarnation"] {
-                assert!(!line.contains(jargon), "{line} leaks {jargon}");
-            }
+    /// A status the daemon answered with, as the start wait reads it: draining, running other
+    /// bytes than this CLI, and how far its startup pass has got.
+    fn answered(draining: bool, old: bool, healing: Option<StartupHeal>) -> CliGatewayStatus {
+        CliGatewayStatus {
+            installed: true,
+            running: true,
+            socket: PathBuf::from("/tmp/gateway.sock"),
+            cli_version: String::from("1.0.0"),
+            daemon_version: None,
+            active_workspaces: 0,
+            drain_cause: draining.then(|| String::from("an install restarts it")),
+            healing,
+            recovering: None,
+            stale_daemon: old.then(|| StaleDaemonBinary {
+                daemon_sha256: Some(String::from("old")),
+                cli_sha256: String::from("new"),
+            }),
+            scheduling: None,
+            pending_install: false,
+            land_turns: Vec::new(),
+            land_turns_error: None,
         }
     }
 
-    /// The deadline has to outlast a real heal: mounting several multi-gigabyte mains takes
-    /// minutes, and a deadline shorter than that fails a start that was working.
+    /// The start wait holds while nothing answers, while the daemon mounts projects or restores
+    /// sessions, and while it drains; no sleep is needed to know it has not finished, because the
+    /// verdict is a function of what the probe found and how long the wait has run. It serves the
+    /// moment a daemon of this build reports its startup pass over, at any elapsed time; it
+    /// restarts a daemon of another build once and then refuses it; and it gives up only once the
+    /// deadline has passed, never a nanosecond before.
     #[test]
-    fn the_start_deadline_outlasts_a_multi_project_heal() {
-        assert!(START_DEADLINE >= Duration::from_secs(120));
-        assert!(START_DEADLINE > START_PROGRESS_INTERVAL * 4);
+    fn the_start_wait_holds_until_the_gateway_serves_and_gives_up_only_at_its_deadline() {
+        let three = StartupHeal::Mounting {
+            projects: std::num::NonZeroUsize::new(3).expect("non-zero"),
+        };
+        let serving = answered(false, false, None);
+        let mounts = answered(false, false, Some(three));
+        let restores = answered(false, false, Some(StartupHeal::RestoringSessions));
+        let draining = answered(true, false, None);
+        let draining_old = answered(true, true, Some(three));
+        let old = answered(false, true, None);
+        let old_mounting = answered(false, true, Some(three));
+        let old_binary = old.stale_daemon.as_ref().expect("an old daemon");
+        let before_deadline = START_DEADLINE - Duration::from_nanos(1);
+        let late = START_DEADLINE * 2;
+
+        for (probe, waited, restarted, expected) in [
+            // Nothing answers: hold, and fail only at the deadline.
+            (
+                None,
+                Duration::ZERO,
+                false,
+                StartStep::Wait(StartWait::ControlSocket),
+            ),
+            (
+                None,
+                before_deadline,
+                false,
+                StartStep::Wait(StartWait::ControlSocket),
+            ),
+            (None, START_DEADLINE, false, StartStep::Overdue),
+            // It answers and heals: hold through the whole startup pass.
+            (
+                Some(&mounts),
+                Duration::ZERO,
+                false,
+                StartStep::Wait(StartWait::Startup(three)),
+            ),
+            (
+                Some(&mounts),
+                before_deadline,
+                false,
+                StartStep::Wait(StartWait::Startup(three)),
+            ),
+            (
+                Some(&restores),
+                before_deadline,
+                false,
+                StartStep::Wait(StartWait::Startup(StartupHeal::RestoringSessions)),
+            ),
+            (Some(&restores), START_DEADLINE, false, StartStep::Overdue),
+            // It drains: hold until launchd restarts it, a daemon that is also old included.
+            (
+                Some(&draining),
+                Duration::ZERO,
+                false,
+                StartStep::Wait(StartWait::Drain),
+            ),
+            (
+                Some(&draining_old),
+                Duration::ZERO,
+                true,
+                StartStep::Wait(StartWait::Drain),
+            ),
+            (Some(&draining), START_DEADLINE, false, StartStep::Overdue),
+            // It serves: served at any elapsed time.
+            (
+                Some(&serving),
+                Duration::ZERO,
+                false,
+                StartStep::Served(&serving),
+            ),
+            (Some(&serving), late, true, StartStep::Served(&serving)),
+            // Another build: restart it once whatever the clock says, then refuse it by name.
+            (Some(&old), Duration::ZERO, false, StartStep::Restart),
+            (Some(&old_mounting), late, false, StartStep::Restart),
+            (
+                Some(&old),
+                Duration::ZERO,
+                true,
+                StartStep::Stale(old_binary),
+            ),
+            (
+                Some(&old_mounting),
+                late,
+                true,
+                StartStep::Stale(old_binary),
+            ),
+        ] {
+            assert_eq!(
+                start_step(probe, waited, restarted),
+                expected,
+                "{probe:?} after {waited:?}, restarted {restarted}"
+            );
+        }
     }
 
     /// A retirement that cannot finish is a line and its hint for that project and nothing more:

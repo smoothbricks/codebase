@@ -25,7 +25,6 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 #[test]
 fn gateway_parser_is_strict_and_accepts_status_json_after_action() {
@@ -50,8 +49,6 @@ fn gateway_parser_is_strict_and_accepts_status_json_after_action() {
 struct RecordingLaunchctl {
     outputs: VecDeque<std::result::Result<LaunchctlOutput, RunError>>,
     argv: Vec<Vec<OsString>>,
-    /// The bound each call ran within.
-    bounds: Vec<Duration>,
 }
 
 impl RecordingLaunchctl {
@@ -70,11 +67,10 @@ impl LaunchctlCommand for RecordingLaunchctl {
         &mut self,
         executable: &Path,
         arguments: &[OsString],
-        deadline: &Deadline,
+        _deadline: &Deadline,
     ) -> std::result::Result<LaunchctlOutput, RunError> {
         assert_eq!(executable, Path::new("/bin/launchctl"));
         self.argv.push(arguments.to_vec());
-        self.bounds.push(deadline.bound().within);
         self.outputs
             .pop_front()
             .expect("one fake output per launchctl call")
@@ -96,77 +92,6 @@ fn launch_spec() -> LaunchAgentSpec {
         &bun(),
     )
     .expect("valid spec")
-}
-
-#[test]
-fn launch_agent_activation_bootstraps_only_when_not_loaded() {
-    let command = RecordingLaunchctl::new([
-        Ok(LaunchctlOutput {
-            status: CommandStatus::ExitCode(3),
-            stdout: Vec::new(),
-            stderr: b"not loaded".to_vec(),
-        }),
-        Ok(LaunchctlOutput::success()),
-    ]);
-    let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(
-        &mut executor,
-        501,
-        launch_spec().target(),
-        InstallOutcome::NoChange,
-    )
-    .expect("activation succeeds");
-    let (_, command) = executor.into_parts();
-    assert_eq!(command.argv.len(), 2);
-    assert_eq!(command.argv[0][0], "print");
-    assert_eq!(command.argv[1][0], "bootstrap");
-}
-
-/// A loaded agent is kickstarted within its exit timeout, as `launchctl print` read it, the unload
-/// grace and one launchctl call: `kickstart -k` waits for the old process to go.
-#[test]
-fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
-    let command = RecordingLaunchctl::new([
-        Ok(LaunchctlOutput {
-            status: CommandStatus::Success,
-            stdout: b"gui/501/dev.cowshed.gateway = {\n\tstate = running\n\tpid = 812\n\texit timeout = 30\n}\n"
-                .to_vec(),
-            stderr: Vec::new(),
-        }),
-        Ok(LaunchctlOutput::success()),
-    ]);
-    let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(
-        &mut executor,
-        501,
-        launch_spec().target(),
-        InstallOutcome::NoChange,
-    )
-    .expect("activation succeeds");
-    let (_, command) = executor.into_parts();
-    assert_eq!(command.argv.len(), 2);
-    assert_eq!(command.argv[0][0], "print");
-    assert_eq!(command.argv[1][0], "kickstart");
-    assert_eq!(
-        command.bounds,
-        [Duration::from_secs(10), Duration::from_secs(30 + 1 + 10)]
-    );
-
-    let command = RecordingLaunchctl::new([Err(RunError::Spawn {
-        op: "launchctl print",
-        role: "launchctl",
-        source: io::Error::new(io::ErrorKind::NotFound, "launchctl missing"),
-    })]);
-    let mut executor = LaunchdExecutor::new((), command);
-    assert!(
-        activate_launch_agent(
-            &mut executor,
-            501,
-            launch_spec().target(),
-            InstallOutcome::NoChange
-        )
-        .is_err()
-    );
 }
 
 /// A rewritten plist is only a file: launchd runs the definition it bootstrapped, so the agent
@@ -646,39 +571,9 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
     assert!(error.hint.contains("--release"), "{}", error.hint);
     // The remedy must name a build that this guard accepts. `nx run cowshed:build` builds the
     // platform `cli-*` target in its default configuration, which is a debug build: a hint
-    // naming it sent the operator straight back here.
-    // Resolved at run time: `env!` would compile the building checkout's path into the binary,
-    // and an archive replayed from the cache into another checkout reads a path that is gone.
-    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
-        .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
-    let package: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(Path::new(&manifest).join("../../package.json"))
-            .expect("cowshed package.json"),
-    )
-    .expect("package.json is JSON");
-    let target = &package["nx"]["targets"][RELEASE_CLI_TARGET];
-    // Each platform's CLI target says "release" in its executor's own terms: the macOS targets
-    // run `napi build` through `nx:run-commands`, whose command carries `--release`; the Linux
-    // targets use the plugin's `cargo-zigbuild` executor, whose `release` option is the flag.
-    let executor = target["executor"].as_str().unwrap_or_default();
-    let release = |configuration: &serde_json::Value| match executor {
-        "nx:run-commands" => configuration["command"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{RELEASE_CLI_TARGET} names its command: {target}"))
-            .contains("--release"),
-        "@smoothbricks/nx-plugin:cargo-zigbuild" => configuration["release"] == true,
-        other => panic!(
-            "{RELEASE_CLI_TARGET} uses executor {other:?}, which this test cannot read: {target}"
-        ),
-    };
-    assert!(
-        release(&target["configurations"]["production"]),
-        "{RELEASE_CLI_TARGET}:production must be a release build: {target}"
-    );
-    assert!(
-        !release(&target["options"]),
-        "{RELEASE_CLI_TARGET}'s default configuration is a debug build, as the hint says: {target}"
-    );
+    // naming it sent the operator straight back here. That the generated target's `production`
+    // configuration is the release build and its default is debug is proven where the target is
+    // generated, in the Nx plugin's inference tests; the hint names that same target here.
     assert!(
         error
             .hint

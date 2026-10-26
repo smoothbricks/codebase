@@ -5699,74 +5699,101 @@ mod tests {
     /// they begin; the ones that diagnose or repair must keep working under the disagreement.
     #[test]
     fn only_verbs_that_change_state_or_run_jobs_ask_the_daemon_for_its_build() {
+        // The verbs that change state or run a job. Every other command, one that diagnoses,
+        // repairs, reads, or serves a caller that is not cowshed, has to work under the
+        // disagreement, and a command named nowhere here is judged as one of those.
+        const ASKS: &[&str] = &[
+            "adopt",
+            "fork",
+            "mv",
+            "checkpoint",
+            "restore",
+            "path",
+            "exec",
+            "grant",
+            "revoke",
+            "rm",
+            "forget",
+            "attach",
+            "detach",
+            "resize",
+            "defrag",
+            "reseed",
+            "cache",
+            "rekey",
+            "gc",
+            "push",
+            "rebase",
+            "land",
+        ];
         let needs = |argv: &[&str]| {
             let cli = crate::args::parse_args(argv.iter().copied()).expect("a valid command line");
             needs_daemon_of_this_build(&cli.command)
         };
-        for argv in [
-            &["rm", "raven"][..],
-            &["rm", "raven", "--force"],
-            &["forget", "acme/widget", "--abandon"],
-            &["exec", "raven", "--", "true"],
-            &["fork", "raven"],
-            &["fork", "raven", "crow"],
-            &["mv", "raven", "crow"],
-            &["checkpoint", "raven", "before"],
-            &["restore", "raven", "before"],
-            &["path", "raven"],
-            &["attach", "raven"],
-            &["detach", "raven"],
-            &["resize", "raven", "200g"],
-            &["reseed", "raven"],
-            &["reseed", "raven", "--dry-run"],
-            &["land", "raven", "--target", "main"],
-            &["rebase", "raven"],
-            &["push", "raven", "--branch", "review"],
-            &["gc"],
-            &["revoke", "raven", "--egress", "api.example.test:443"],
-            &[
-                "revoke",
-                "--project-wide",
-                "--egress",
-                "api.example.test:443",
-            ],
-            &["revoke", "raven", "--all"],
-            &["revoke", "--project-wide", "--all"],
-        ] {
-            assert!(needs(argv), "{argv:?} changes state through the daemon");
+        for name in ASKS {
+            assert!(
+                crate::help::command_named(name).is_some(),
+                "{name} is named here but is no command"
+            );
         }
-        for argv in [
-            &["doctor"][..],
-            &["land", "raven", "--preflight"],
-            &[
-                "land",
-                "raven",
-                "--preflight",
-                "--into",
-                "lane",
-                "--ungated",
-            ],
-            &[
-                "--json",
-                "land",
-                "raven",
-                "--preflight",
-                "--target",
-                "main",
-                "--push-only",
-            ],
-            &["doctor", "--repair"],
-            &["ls"],
-            &["ls", "--all"],
-            &["setup"],
-            &["setup", "--downgrade"],
-            &["gateway", "status"],
-            &["gateway", "start"],
-            &["build-state"],
-            &["sccache", "status"],
-            &["skill", "install"],
-        ] {
-            assert!(!needs(argv), "{argv:?} must work while the builds disagree");
+        for spec in crate::args::COMMANDS {
+            let asks = ASKS.contains(&spec.name);
+            assert_eq!(
+                needs(spec.example),
+                asks,
+                "{}: expected to ask: {asks}",
+                spec.name
+            );
+        }
+
+        // The flags that change the answer, which an example does not reach.
+        let flagged: &[(&[&str], bool)] = &[
+            (&["rm", "raven", "--force"], true),
+            (&["fork", "raven", "crow"], true),
+            (&["reseed", "raven", "--dry-run"], true),
+            (
+                &[
+                    "revoke",
+                    "--project-wide",
+                    "--egress",
+                    "api.example.test:443",
+                ],
+                true,
+            ),
+            (&["revoke", "raven", "--all"], true),
+            (&["revoke", "--project-wide", "--all"], true),
+            (&["land", "raven", "--target", "main"], true),
+            (&["land", "raven", "--preflight"], false),
+            (
+                &[
+                    "land",
+                    "raven",
+                    "--preflight",
+                    "--into",
+                    "lane",
+                    "--ungated",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "--json",
+                    "land",
+                    "raven",
+                    "--preflight",
+                    "--target",
+                    "main",
+                    "--push-only",
+                ],
+                false,
+            ),
+            (&["doctor", "--repair"], false),
+            (&["ls", "--all"], false),
+            (&["setup", "--downgrade"], false),
+            (&["gateway", "start"], false),
+        ];
+        for &(argv, asks) in flagged {
+            assert_eq!(needs(argv), asks, "{argv:?}");
         }
     }
 
@@ -6154,18 +6181,36 @@ mod tests {
                 .expect("exec")
         }
 
-        #[derive(Clone, Default)]
-        struct Terminal(Arc<Mutex<Vec<u8>>>);
+        /// What a job's output has written to the terminal, announced to whoever waits for it.
+        #[derive(Clone)]
+        struct Terminal(Arc<tokio::sync::watch::Sender<Vec<u8>>>);
+
+        impl Default for Terminal {
+            fn default() -> Self {
+                Self(Arc::new(tokio::sync::watch::channel(Vec::new()).0))
+            }
+        }
 
         impl Terminal {
             fn contents(&self) -> Vec<u8> {
-                self.0.lock().expect("terminal").clone()
+                self.0.borrow().clone()
+            }
+
+            /// Resolves once the terminal holds exactly these bytes. The contents are judged
+            /// first and again on every write, so no write falls between a read and the wait.
+            async fn holds(&self, bytes: &[u8]) {
+                self.0
+                    .subscribe()
+                    .wait_for(|contents| contents.as_slice() == bytes)
+                    .await
+                    .expect("the terminal outlives its wait");
             }
         }
 
         impl Write for Terminal {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().expect("terminal").extend_from_slice(bytes);
+                self.0
+                    .send_modify(|contents| contents.extend_from_slice(bytes));
                 Ok(bytes.len())
             }
 
@@ -6261,14 +6306,9 @@ mod tests {
                 &mut stderr,
             );
             tokio::pin!(relay);
-            let first_line = async {
-                while terminal.contents() != FIRST {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            };
             tokio::select! {
                 _ = &mut relay => panic!("the relay returned while the job still ran"),
-                () = first_line => {}
+                () = terminal.holds(FIRST) => {}
             }
             job.end();
             let result = relay.await.expect("relay");
@@ -6322,7 +6362,7 @@ mod tests {
 
         /// The soft timeout fires, and by the time its status read is answered the job has
         /// ended: there is nothing to background. Its output and exit code are the command's.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn a_job_that_ends_as_the_soft_timeout_fires_keeps_its_output_and_exit_code() {
             let job = ScriptedJob::new(true, 3);
             let handle = connect(&job).await;
@@ -6390,7 +6430,7 @@ mod tests {
         /// A job still running when the caller's `--timeout` passes keeps running, and the exec
         /// fails: it has no output or status of the command's to give, so it exits with the
         /// conflict wrapper code and names the job and how to reach it.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn a_job_still_running_at_the_callers_timeout_fails_the_exec_and_names_the_job() {
             for json in [false, true] {
                 let job = ScriptedJob::new(false, 0);
@@ -7577,48 +7617,43 @@ mod tests {
 
     #[test]
     fn only_adopt_receives_provisioning_authority() {
-        let cases = [
-            (vec!["adopt", "/repo"], RuntimeOpenMode::Provision),
-            (vec!["mv", "raven", "falcon"], RuntimeOpenMode::ExistingOnly),
+        assert!(
+            crate::help::command_named("adopt").is_some(),
+            "adopt is the one command that provisions"
+        );
+        for spec in crate::args::COMMANDS {
+            let parsed = crate::args::parse_args(spec.example.iter().copied())
+                .expect("a command's example parses");
+            let expected = if spec.name == "adopt" {
+                RuntimeOpenMode::Provision
+            } else {
+                RuntimeOpenMode::ExistingOnly
+            };
+            assert_eq!(
+                runtime_open_mode(&parsed.command),
+                expected,
+                "{}",
+                spec.name
+            );
+        }
+
+        // The flags that change the answer, which an example does not reach.
+        let flagged: &[(&[&str], RuntimeOpenMode)] = &[
+            // The rebind verb must open even when the remote already names the new identity.
             (
-                // The rebind verb must open even when the remote already names the new identity.
-                vec!["mv", "main", "--repo-id", "other/widget"],
+                &["mv", "main", "--repo-id", "other/widget"],
                 RuntimeOpenMode::IdentityChange,
             ),
-            (vec!["fork", "raven"], RuntimeOpenMode::ExistingOnly),
-            (
-                vec!["fork", "raven", "falcon"],
-                RuntimeOpenMode::ExistingOnly,
-            ),
-            (vec!["checkpoint", "raven"], RuntimeOpenMode::ExistingOnly),
-            (
-                vec!["restore", "raven", "stable"],
-                RuntimeOpenMode::ExistingOnly,
-            ),
-            (vec!["attach", "--all"], RuntimeOpenMode::ExistingOnly),
-            (vec!["ls"], RuntimeOpenMode::ExistingOnly),
-            (vec!["path", "raven"], RuntimeOpenMode::ExistingOnly),
-            (
-                vec!["exec", "raven", "--", "true"],
-                RuntimeOpenMode::ExistingOnly,
-            ),
-            (vec!["rm", "raven"], RuntimeOpenMode::ExistingOnly),
-            (
-                vec!["forget", "acme/widget", "--abandon"],
-                RuntimeOpenMode::ExistingOnly,
-            ),
-            (vec!["attach", "raven"], RuntimeOpenMode::ExistingOnly),
-            (vec!["detach", "raven"], RuntimeOpenMode::ExistingOnly),
-            (vec!["gc"], RuntimeOpenMode::ExistingOnly),
-            (vec!["push", "raven"], RuntimeOpenMode::ExistingOnly),
-            (vec!["rebase", "raven"], RuntimeOpenMode::ExistingOnly),
-            (vec!["land", "raven"], RuntimeOpenMode::ExistingOnly),
-            (vec!["doctor"], RuntimeOpenMode::ExistingOnly),
+            (&["fork", "raven", "falcon"], RuntimeOpenMode::ExistingOnly),
+            (&["attach", "--all"], RuntimeOpenMode::ExistingOnly),
         ];
-
-        for (arguments, expected) in cases {
-            let parsed = crate::args::parse_args(arguments).unwrap();
-            assert_eq!(runtime_open_mode(&parsed.command), expected);
+        for &(arguments, expected) in flagged {
+            let parsed = crate::args::parse_args(arguments.iter().copied()).unwrap();
+            assert_eq!(
+                runtime_open_mode(&parsed.command),
+                expected,
+                "{arguments:?}"
+            );
         }
     }
 

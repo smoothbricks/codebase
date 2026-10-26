@@ -310,14 +310,14 @@ mod tests {
         )
         .await;
         let reported = String::from_utf8_lossy(&refused.stderr);
-        assert!(
-            !refused.status.success(),
+        assert_eq!(
+            refused.status.code(),
+            Some(3),
             "strict client accepted an AKI-less leaf: {reported}"
         );
-        assert!(
-            reported.contains("Missing Authority Key Identifier"),
-            "{reported}"
-        );
+        // 85 is OpenSSL's X509_V_ERR_MISSING_AUTHORITY_KEY_IDENTIFIER: the typed
+        // verification failure, not its English message.
+        assert!(reported.contains("verify_code=85"), "{reported}");
     }
 
     async fn strict_handshake(config: Arc<ServerConfig>, ca_pem: &str) -> std::process::Output {
@@ -325,9 +325,13 @@ mod tests {
 print(ssl.OPENSSL_VERSION, file=sys.stderr)
 context = ssl.create_default_context(cadata=sys.stdin.read())
 context.verify_flags |= ssl.VERIFY_X509_STRICT
-with socket.create_connection(('127.0.0.1', int(sys.argv[1]))) as raw:
-    with context.wrap_socket(raw, server_hostname=sys.argv[2]) as tls:
-        print(tls.version())
+try:
+    with socket.create_connection(('127.0.0.1', int(sys.argv[1]))) as raw:
+        with context.wrap_socket(raw, server_hostname=sys.argv[2]) as tls:
+            print(tls.version())
+except ssl.SSLCertVerificationError as error:
+    print(f'verify_code={error.verify_code}', file=sys.stderr)
+    sys.exit(3)
 ";
         // A sandboxed client may connect only to its workspace's block ports (04_sandbox.md).
         let listener = super::test_fixture_ports::bind_fixture_listener().await;

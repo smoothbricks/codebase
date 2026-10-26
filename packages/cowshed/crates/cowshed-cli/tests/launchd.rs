@@ -80,7 +80,7 @@ fn sccache_program() -> StoreBackedProgram {
 }
 
 #[test]
-fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
+fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_entries() {
     let spec = gateway();
 
     assert_eq!(spec.label(), "dev.cowshed.gateway");
@@ -107,51 +107,60 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         vec![GATEWAY_HOST, "__gateway-host", EXECUTABLE, "gateway", "run"]
     );
 
-    let expected = concat!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
-        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
-        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
-        "<plist version=\"1.0\">\n",
-        "<dict>\n",
-        "  <key>Label</key>\n",
-        "  <string>dev.cowshed.gateway</string>\n",
-        "  <key>ProgramArguments</key>\n",
-        "  <array>\n",
-        "    <string>/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed-gateway-host</string>\n",
-        "    <string>__gateway-host</string>\n",
-        "    <string>/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed</string>\n",
-        "    <string>gateway</string>\n",
-        "    <string>run</string>\n",
-        "  </array>\n",
-        "  <key>RunAtLoad</key>\n",
-        "  <true/>\n",
-        "  <key>KeepAlive</key>\n",
-        "  <true/>\n",
-        "  <key>ProcessType</key>\n",
-        "  <string>Interactive</string>\n",
-        "  <key>StandardErrorPath</key>\n",
-        "  <string>/Users/cowshed-test/Library/Logs/cowshed/daemon-stderr.log</string>\n",
-        "  <key>EnvironmentVariables</key>\n",
-        "  <dict>\n",
-        "    <key>PATH</key>\n",
-        "    <string>/Users/cowshed-test/Dev/project/tooling/direnv/.devenv/profile/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n",
-        "  </dict>\n",
-        "  <key>SoftResourceLimits</key>\n",
-        "  <dict>\n",
-        "    <key>NumberOfFiles</key>\n",
-        "    <integer>245760</integer>\n",
-        "  </dict>\n",
-        "  <key>HardResourceLimits</key>\n",
-        "  <dict>\n",
-        "    <key>NumberOfFiles</key>\n",
-        "    <integer>9223372036854775807</integer>\n",
-        "  </dict>\n",
-        "  <key>ExitTimeOut</key>\n",
-        "  <integer>30</integer>\n",
-        "</dict>\n",
-        "</plist>\n",
+    assert_eq!(
+        spec.environment(),
+        [(
+            "PATH".to_owned(),
+            format!("{BUN_DIRECTORY}:/usr/bin:/bin:/usr/sbin:/sbin")
+        )]
     );
-    assert_eq!(spec.plist_bytes(), expected.as_bytes());
+
+    // launchd reads the plist's keys and values; layout and key order are not its contract.
+    let read = plist::Value::from_reader_xml(spec.plist_bytes().as_slice())
+        .expect("the generated definition is an XML property list");
+    let dictionary = |entries: Vec<(&str, plist::Value)>| {
+        plist::Value::Dictionary(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+        )
+    };
+    let number_of_files =
+        |limit: i64| dictionary(vec![("NumberOfFiles", plist::Value::Integer(limit.into()))]);
+    let expected = dictionary(vec![
+        ("Label", spec.label().into()),
+        (
+            "ProgramArguments",
+            plist::Value::Array(spec.program_arguments().map(Into::into).collect()),
+        ),
+        ("RunAtLoad", true.into()),
+        // KeepAlive is the definition's lifecycle, asserted above.
+        ("KeepAlive", true.into()),
+        ("ProcessType", "Interactive".into()),
+        (
+            "StandardErrorPath",
+            spec.standard_error_path()
+                .to_str()
+                .expect("UTF-8 log path")
+                .into(),
+        ),
+        (
+            "EnvironmentVariables",
+            dictionary(
+                spec.environment()
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str().into()))
+                    .collect(),
+            ),
+        ),
+        // The gateway's descriptor budget: launchd's soft limit, and no hard cap (i64::MAX is
+        // launchd's RLIM_INFINITY).
+        ("SoftResourceLimits", number_of_files(245_760)),
+        ("HardResourceLimits", number_of_files(i64::MAX)),
+        ("ExitTimeOut", plist::Value::Integer(30_i64.into())),
+    ]);
+    assert_eq!(read, expected);
 }
 
 /// A plist outlives the shell that wrote it and nothing roots a store path for it, so no gateway
@@ -1921,40 +1930,36 @@ mod descriptor_inheritance {
         )
     }
 
-    #[tokio::test]
-    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-    async fn host_controller_generated_gateway_plist_gives_a_real_child_10000_descriptors() {
-        // The host harness deliberately has a long TMPDIR. Use the same short owned root as
-        // native CLI socket fixtures rather than deriving a Unix-socket path from that directory.
-        let scratch = scratch_apfs::ScratchRoot::new("cli-fd").expect("short descriptor fixture");
+    /// `scratch`'s namespace's generated gateway definition, loaded one-shot with a shell running
+    /// `body` standing in for the gateway host. The shell first enters the scratch root, so the
+    /// root's teardown ends the agent's life by its working directory before it boots the label
+    /// out. The plist lies at the root's enrolled path
+    /// ([`scratch_apfs::ScratchRoot::launch_agent_plist`]), so the root's teardown, and the next
+    /// run's reclaim of a killed run's root, boot out exactly this namespace's label.
+    fn load_one_shot_gateway(scratch: scratch_apfs::ScratchRoot, body: &str) -> Agent {
         // The probe is isolated by its scratch root's namespace: the generated gateway definition
         // carries that namespace's label, never production's.
         let namespace = HostNamespace::Test(scratch.namespace());
         let label = namespace.launchd_label("gateway");
         // SAFETY: geteuid has no preconditions.
         let domain = format!("gui/{}", unsafe { libc::geteuid() });
+        let plist_path = scratch.launch_agent_plist();
+        let scratch_root = scratch.path().to_path_buf();
+        let executable =
+            HostStableExecutable::new(scratch.path(), COWSHED_BINARY_NAME).expect("probe program");
         let mut agent = Agent {
             _scratch: scratch,
             target: format!("{domain}/{label}"),
             loaded: false,
         };
-        let root = agent._scratch.path();
-        let executable =
-            HostStableExecutable::new(root, COWSHED_BINARY_NAME).expect("probe program");
         let spec = LaunchAgentSpec::gateway(namespace, &executable, &bun())
             .expect("generated gateway definition");
         fs::create_dir_all(executable.path().parent().expect("binary directory"))
             .expect("binary directory");
         fs::create_dir_all(spec.standard_error_path().parent().expect("log directory"))
             .expect("log directory");
-        let socket = root.join("s");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("descriptor report socket");
-        let program = format!(
-            "#!/bin/sh\nexport {SOCKET_ENV}={}\nexec {} --exact {CHILD_TEST} --ignored --nocapture\n",
-            quote(&socket),
-            quote(&std::env::current_exe().expect("probe test binary"))
-        );
         // The plist names the gateway host; the probe stands in for it and ignores its arguments.
+        let program = format!("#!/bin/sh\ncd {} || exit 1\n{body}", quote(&scratch_root));
         fs::write(executable.gateway_host(), program).expect("launchd probe executable");
         fs::set_permissions(
             executable.gateway_host(),
@@ -1970,7 +1975,6 @@ mod descriptor_inheritance {
                 "<key>KeepAlive</key>\n  <true/>",
                 "<key>KeepAlive</key>\n  <false/>",
             );
-        let plist_path = root.join("probe.plist");
         fs::write(&plist_path, plist).expect("generated probe plist");
         fs::set_permissions(&plist_path, fs::Permissions::from_mode(PRIVATE_PLIST_MODE))
             .expect("plist mode");
@@ -1986,6 +1990,41 @@ mod descriptor_inheritance {
             String::from_utf8_lossy(&launched.stderr)
         );
         agent.loaded = true;
+        agent
+    }
+
+    /// Whether launchd holds `target` loaded: `print` answers a loaded service and refuses an
+    /// unloaded one with 113 ("Could not find service"). Any other answer fails the test.
+    fn loaded(target: &str) -> bool {
+        let printed = std::process::Command::new(LAUNCHCTL_EXECUTABLE)
+            .args(["print", target])
+            .output_bounded()
+            .expect("launchctl print");
+        match printed.status.code() {
+            Some(0) => true,
+            Some(113) => false,
+            _ => panic!(
+                "launchctl print {target}: {} {}",
+                printed.status,
+                String::from_utf8_lossy(&printed.stderr)
+            ),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    async fn host_controller_generated_gateway_plist_gives_a_real_child_10000_descriptors() {
+        // The host harness deliberately has a long TMPDIR. Use the same short owned root as
+        // native CLI socket fixtures rather than deriving a Unix-socket path from that directory.
+        let scratch = scratch_apfs::ScratchRoot::new("cli-fd").expect("short descriptor fixture");
+        let socket = scratch.path().join("s");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("descriptor report socket");
+        let body = format!(
+            "export {SOCKET_ENV}={}\nexec {} --exact {CHILD_TEST} --ignored --nocapture\n",
+            quote(&socket),
+            quote(&std::env::current_exe().expect("probe test binary"))
+        );
+        let _agent = load_one_shot_gateway(scratch, &body);
         let report = async {
             use tokio::io::AsyncReadExt as _;
             let (mut child, _) = listener.accept().await.expect("launchd child connects");
@@ -2007,5 +2046,139 @@ mod descriptor_inheritance {
         assert_eq!(result["soft"].as_u64(), Some(245_760));
         assert_eq!(result["hard"].as_u64(), Some(libc::RLIM_INFINITY));
         assert_eq!(result["open_max"].as_u64(), Some(245_760));
+    }
+
+    const KILLED_RUN_ENV: &str = "COWSHED_LAUNCHD_KILLED_RUN";
+    const KILLED_RUN_TEST: &str = "descriptor_inheritance::host_controller_a_killed_runs_gateway_agent_is_booted_out_by_the_next_reclaim_and_a_live_ones_stays";
+
+    /// A run SIGKILLed with its one-shot gateway agent loaded runs no Drop: launchd keeps its
+    /// namespace's label, and the agent's life, after the root's owner is gone. The next run's
+    /// reclaim of that dead root ends the agent working in it, boots out exactly that label and
+    /// removes the root, and a live run's agent stays loaded (08_testing.md, "Host-controller
+    /// authority": the probe unloads its agent on every exit path). The killed run is a real child
+    /// test process whose agent says its pid once it runs in the root; the label is proved loaded
+    /// and the agent's exit watched before the reclaim, so neither oracle passes on an agent that
+    /// never ran.
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_a_killed_runs_gateway_agent_is_booted_out_by_the_next_reclaim_and_a_live_ones_stays()
+     {
+        use cowshed_os::test_backstop::ChildBackstop as _;
+        use std::io::BufRead as _;
+        if std::env::var_os(KILLED_RUN_ENV).is_some() {
+            // The run to be killed: its parent owns its recovery, so it starts no sweep.
+            let scratch =
+                scratch_apfs::ScratchRoot::new_owned("cli-killed-agent").expect("killed run root");
+            let fifo = |path: &Path| {
+                let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                    .expect("a fifo path has no NUL");
+                // SAFETY: mkfifo(3) reads the NUL-terminated path, which outlives the call.
+                let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+                assert_eq!(
+                    made,
+                    0,
+                    "mkfifo {}: {}",
+                    path.display(),
+                    io::Error::last_os_error()
+                );
+            };
+            let ready = scratch.path().join("ready");
+            fifo(&ready);
+            // The agent's hold: a gate in its root no process ever opens for writing, so the agent
+            // waits in its open until a signal ends it. Nothing times its life.
+            fifo(&scratch.path().join("hold"));
+            // Held read-write: the agent's open never waits for a reader, and its line waits here.
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&ready)
+                .expect("hold the readiness fifo");
+            let agent = load_one_shot_gateway(scratch, "echo $$ > ready\nexec /bin/cat hold\n");
+            let mut life = String::new();
+            io::BufReader::new(&held)
+                .read_line(&mut life)
+                .expect("the agent's readiness");
+            println!("agent={}", life.trim_end());
+            println!("root={}", agent._scratch.path().display());
+            // Held until killed: a closed stdin ends it through its ordinary Drop instead.
+            let mut kept = String::new();
+            std::io::stdin()
+                .read_line(&mut kept)
+                .expect("hold on stdin");
+            return;
+        }
+        let live = load_one_shot_gateway(
+            scratch_apfs::ScratchRoot::new_owned("cli-live-agent").expect("live run root"),
+            "exit 0\n",
+        );
+        let mut killed = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                KILLED_RUN_TEST,
+                "--ignored",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env(KILLED_RUN_ENV, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the run to be killed");
+        let mut said = io::BufReader::new(killed.stdout.take().expect("piped stdout"));
+        let mut life = None;
+        let root = loop {
+            let mut line = String::new();
+            assert!(
+                said.read_line(&mut line)
+                    .expect("read the killed run's root")
+                    > 0,
+                "the run to be killed ended before naming its root"
+            );
+            if let Some(pid) = line.trim_end().strip_prefix("agent=") {
+                life = Some(pid.parse::<i32>().expect("the agent's pid"));
+            }
+            if let Some(root) = line.trim_end().strip_prefix("root=") {
+                break PathBuf::from(root);
+            }
+        };
+        let agent = cowshed_core::runtime::job_groups::Process::observe(
+            life.expect("the killed run named its agent before its root"),
+        )
+        .expect("observe the killed run's agent")
+        .expect("the killed run's agent runs");
+        let agent_exit = agent.watch_exit().expect("watch the agent's exit");
+        killed.kill().expect("SIGKILL the run");
+        killed.wait_bounded().expect("reap the killed run");
+        let namespace = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(TestNamespace::parse)
+            .expect("the killed run's root is its test namespace's directory");
+        // SAFETY: geteuid has no preconditions.
+        let dead = format!(
+            "gui/{}/{}",
+            unsafe { libc::geteuid() },
+            HostNamespace::Test(namespace).launchd_label("gateway")
+        );
+        assert!(
+            loaded(&dead),
+            "the killed run's agent was never loaded: {dead}"
+        );
+
+        scratch_apfs::reclaim_dead_root(&root).expect("reclaim the killed run's root");
+
+        agent_exit
+            .wait()
+            .expect("the reclaim ends the killed run's agent working in its root");
+
+        assert!(
+            !loaded(&dead),
+            "the reclaim left the killed run's agent loaded: {dead}"
+        );
+        assert!(!root.exists(), "the reclaim left {}", root.display());
+        assert!(
+            loaded(&live.target),
+            "the reclaim unloaded a live run's agent"
+        );
     }
 }

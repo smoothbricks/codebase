@@ -2,14 +2,14 @@
 //!
 //! Every fixture `.envrc` appends one line to `$TMPDIR/activations` each time direnv evaluates
 //! it, so that file's line count is the number of shell activations the workspace paid for.
-//! `$TMPDIR` is the exec temp dir, writable in both sandbox modes. Unless a test is about the
-//! prewarmed spare, pools run without one, so every activation counted is one a command waited
-//! on. Kernel-profile probes run in the host-controller lane: an enclosing workspace sandbox
+//! `$TMPDIR` is the exec temp dir, writable in both sandbox modes. Pools run without a prewarmed
+//! spare, which cowshed-core's pool tests cover, so every activation counted is one a command
+//! waited on. Kernel-profile probes run in the host-controller lane: an enclosing workspace sandbox
 //! cannot grant the fixture supervisor its independently declared authority.
 
 #![cfg(target_os = "macos")]
 
-use cowshed_os::test_backstop::{AsyncChildBackstop as _, CommandBackstop as _};
+use cowshed_os::test_backstop::AsyncChildBackstop as _;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,7 +18,8 @@ use async_trait::async_trait;
 use cowshed_core::api::ExecClass;
 use cowshed_core::api::{
     CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus, JobAccounting, JobFailure, JobId,
-    JobInfo, JobState, RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
+    JobInfo, JobState, RunSandboxMode, SampleInterval, ScriptCommand, ScriptValue, StdinSource,
+    WorkspacePath,
 };
 use cowshed_core::build_volume::nx::tree_holders;
 use cowshed_core::error::Result;
@@ -39,6 +40,9 @@ use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::host_load::HostLoad;
 use cowshed_os::process::ExitWatch;
+
+#[path = "../../cowshed-core/tests/support/scratch_directory.rs"]
+mod scratch_directory;
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
 
@@ -80,6 +84,11 @@ impl CommitmentSink for DiscardedCommitments {
 struct Workspace {
     root: PathBuf,
     sandbox: SandboxConfig,
+    /// The owner-marked scratch root this workspace's tree lives in: reclaimed, with the
+    /// processes working in it, when this workspace drops, and by the next start's sweep once the
+    /// process that made it is gone. None for the helper process of a test, whose root that test
+    /// owns.
+    _scratch: Option<scratch_directory::ScratchRoot>,
 }
 
 impl Workspace {
@@ -89,6 +98,7 @@ impl Workspace {
         Self {
             sandbox: Self::sandbox_at(&root, port_base),
             root,
+            _scratch: None,
         }
     }
 
@@ -124,15 +134,12 @@ impl Workspace {
     }
 
     fn new(label: &str, port_base: u16) -> Self {
-        let parent = std::fs::canonicalize("/tmp").expect("canonical controller fixture parent");
-        let alias = parent.join(format!(
-            "cowshed-{label}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&alias).expect("scratch root");
-        // Seatbelt matches resolved paths; `/var/folders` is a symlink into `/private/var`.
-        let root = std::fs::canonicalize(&alias).expect("canonical scratch root");
+        // The root is an owner-marked scratch directory in the canonical spelling Seatbelt matches,
+        // whose dead runs the next start reclaims, processes working in it first
+        // (scratch_directory): a killed run leaves no root that sweep cannot name.
+        let scratch =
+            scratch_directory::ScratchRoot::new(label).expect("an owner-marked scratch root");
+        let root = scratch.path().to_path_buf();
         let mount = root.join("mounts/workspace");
         std::fs::create_dir_all(mount.join(".cowshed/bin")).expect("private bin");
         std::fs::write(
@@ -154,7 +161,11 @@ impl Workspace {
         )
         .expect("make direnv reachable in the sandbox");
         let sandbox = Self::sandbox_at(&root, port_base);
-        Self { root, sandbox }
+        Self {
+            root,
+            sandbox,
+            _scratch: Some(scratch),
+        }
     }
 
     /// A workspace mounted beside `beside`, under the same mount root, as sibling workspaces of
@@ -251,12 +262,6 @@ impl Workspace {
     }
 }
 
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
 fn authority(grant_revision: u64) -> WorkspaceAuthoritySnapshot {
     WorkspaceAuthoritySnapshot {
         repo_id: RepoId::parse("acme/widget").expect("repo id"),
@@ -345,10 +350,7 @@ async fn run_in(
 
 /// `job` once it ended, with what it wrote.
 async fn ran(handle: &WorkspaceSupervisorHandle, job: JobId) -> Ran {
-    let info = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
-        .await
-        .expect("job terminates")
-        .expect("job outcome");
+    let info = handle.wait(job).await.expect("job outcome");
     let stdout = read_stream(handle, &info, StreamKind::Stdout).await;
     let stderr = read_stream(handle, &info, StreamKind::Stderr).await;
     Ran {
@@ -362,9 +364,26 @@ async fn run(handle: &WorkspaceSupervisorHandle, request: ExecRequest) -> Ran {
     run_in(handle, None, request).await
 }
 
-fn process_alive(pid: i32) -> bool {
-    // SAFETY: signal 0 performs only the existence and permission check.
-    unsafe { libc::kill(pid, 0) == 0 }
+/// The kernel's exit watch on the process pid names, registered while the fixture holds that
+/// process on a FIFO gate. A process held there cannot have exited, so the watch names it and no
+/// later holder of the pid (cowshed-os ExitWatch::of; 08_testing.md, "Host-controller
+/// authority").
+fn watch(pid: i32) -> ExitWatch {
+    ExitWatch::of(u32::try_from(pid).expect("a pid"))
+        .expect("watch an exit")
+        .expect("the held process runs")
+}
+
+/// Whether the watched process exited, waiting for its exit event on a blocking thread. No
+/// deadline of this test's own ends the wait: the target's no-progress bound does, and false
+/// names a process that outlived it. A null signal never stands in for the event, because an
+/// exited process its parent has not reaped still answers one (11_shell.md, "Shell activation
+/// and process reuse").
+async fn exited(exit: ExitWatch) -> bool {
+    tokio::task::spawn_blocking(move || exit.within(cowshed_os::test_backstop::NO_PROGRESS))
+        .await
+        .expect("exit watch task")
+        .expect("wait for the exit event")
 }
 
 #[tokio::test]
@@ -712,6 +731,10 @@ async fn host_controller_a_failed_activation_fails_only_the_job_that_triggered_i
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_killing_a_job_ends_its_whole_group_and_keeps_the_warm_shell() {
     let workspace = Workspace::new("shell-pool-kill", 41_168);
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in ["pids", "hold"] {
+        fifo(&tmp.join(name));
+    }
     workspace.envrc("");
     let handle = workspace.supervisor(false);
     run(&handle, sh("true")).await.ok();
@@ -719,35 +742,26 @@ async fn host_controller_killing_a_job_ends_its_whole_group_and_keeps_the_warm_s
         .exec(
             None,
             None,
-            sh("sleep 300 & printf '%s %s\\n' $$ $! > pids; wait"),
+            sh("(read _ < \"$TMPDIR/hold\") & printf '%s %s\\n' $$ $! > \"$TMPDIR/pids\"; wait"),
             AdmissionSource::Worker,
         )
         .await
         .expect("admit");
-    let pids = workspace.mount().join("pids");
-    let recorded = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&pids)
-                && text.ends_with('\n')
-            {
-                return text;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the job records its pids");
-    let pids: Vec<i32> = recorded
-        .split_whitespace()
-        .map(|pid| pid.parse().expect("pid"))
+    // The leader and its child publish their pids from their own bodies, and the child holds on
+    // a FIFO nothing opens: both run, and cannot have exited, while their exit watches are
+    // registered. The frame names exactly those two lives, so the loop after the kill has both
+    // to assert; an empty or any other set is refused where it is read.
+    let exits: Vec<(i32, ExitWatch)> = read_pids::<2>(&tmp.join("pids"))
+        .await
+        .into_iter()
+        .map(|pid| (pid, watch(pid)))
         .collect();
     handle.kill(job).await.expect("kill");
     let info = handle.wait(job).await.expect("killed job");
     assert_eq!(info.state, JobState::Killed);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    for pid in pids {
+    for (pid, exit) in exits {
         assert!(
-            !process_alive(pid),
+            exited(exit).await,
             "process {pid} of the killed job survived"
         );
     }
@@ -761,13 +775,19 @@ async fn host_controller_killing_a_job_ends_its_whole_group_and_keeps_the_warm_s
 
 /// A warm command whose leader exits while a descendant holds the job's output open does not
 /// outlive its job (11_shell.md, "Process identity and signal ownership"): leader exit begins
-/// `draining`, retirement ends the descendant through the group the host still holds, and the job
+/// draining, retirement ends the descendant through the group the host still holds, and the job
 /// ends with the leader's own exit and a receipt naming the descendant. The warm shell serves the
-/// next command once the host released the command.
+/// next command once the host released the command. The descendant publishes its pid from its
+/// own body and holds on a FIFO nothing opens, and the leader exits only once the test has
+/// registered the descendant's exit watch.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_an_exited_leaders_descendants_are_retired_before_the_job_ends() {
     let workspace = Workspace::new("shell-pool-exited-leader", 41_344);
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in ["descendant", "hold", "go"] {
+        fifo(&tmp.join(name));
+    }
     workspace.envrc("");
     let handle = workspace.supervisor(false);
     run(&handle, sh("true")).await.ok();
@@ -775,25 +795,14 @@ async fn host_controller_an_exited_leaders_descendants_are_retired_before_the_jo
         .exec(
             None,
             None,
-            sh("sleep 300 & printf '%s\\n' $! > pid; exit 3"),
+            sh("(read _ < \"$TMPDIR/hold\") & printf '%s\\n' $! > \"$TMPDIR/descendant\"; read _ < \"$TMPDIR/go\"; exit 3"),
             AdmissionSource::Worker,
         )
         .await
         .expect("admit");
-    let pid = workspace.mount().join("pid");
-    // The job records its backgrounded descendant's pid in the file.
-    let recorded = async {
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&pid)
-                && text.ends_with('\n')
-            {
-                return text;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-    .await;
-    let descendant: i32 = recorded.trim().parse().expect("pid");
+    let descendant = read_pid(&tmp.join("descendant")).await;
+    let exit = watch(descendant);
+    release(&tmp.join("go")).await;
     let info = handle.wait(job).await.expect("drained job");
     assert_eq!(
         (info.state, info.exit.as_ref()),
@@ -805,9 +814,8 @@ async fn host_controller_an_exited_leaders_descendants_are_retired_before_the_jo
             .any(|row| i32::try_from(row.pid).ok() == Some(descendant)),
         "the receipt names the descendant retirement ended: {info:?}"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        !process_alive(descendant),
+        exited(exit).await,
         "retirement reached the exited leader's descendant"
     );
     assert_eq!(run(&handle, sh("printf again")).await.ok().stdout, "again");
@@ -862,11 +870,7 @@ async fn host_controller_a_grant_revision_retires_every_older_shell() {
         "same grants, same inputs: adopted"
     );
     // Other grants are another baseline: what the evaluation could read differs, so it runs.
-    let granted = workspace
-        .root
-        .parent()
-        .expect("scratch parent")
-        .join(format!("cowshed-granted-{}", uuid::Uuid::new_v4().simple()));
+    let granted = workspace.root.join("granted");
     std::fs::create_dir_all(&granted).expect("granted directory");
     let mut widened = workspace.sandbox.clone();
     widened.grants.read.push(granted.clone());
@@ -886,7 +890,6 @@ async fn host_controller_a_grant_revision_retires_every_older_shell() {
         2,
         "no shell evaluated under other grants serves these"
     );
-    std::fs::remove_dir_all(&granted).ok();
 }
 
 #[tokio::test]
@@ -1005,76 +1008,73 @@ async fn host_controller_each_command_has_its_own_cwd_env_streams_status_and_std
     );
 }
 
-const ORPHAN_HELPER: &str = "COWSHED_SHELL_POOL_ORPHAN_HELPER";
-
-/// The controller half of the test below: a process that starts an activation and exits
-/// without running a destructor, exactly as a finished `cowshed exec` does.
-#[tokio::test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-async fn host_controller_orphan_helper_exits_while_an_activation_runs() {
-    let Some(root) = std::env::var_os(ORPHAN_HELPER) else {
-        return;
-    };
-    let workspace = Workspace::from_root(PathBuf::from(root));
-    let handle = workspace.supervisor(false);
-    let _job = handle
-        .exec(None, None, sh("true"), AdmissionSource::Worker)
-        .await
-        .expect("admit");
-    let pid_file = workspace.sandbox.exec_temp_dir.join("activation-pid");
-    while !pid_file.exists() {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    std::process::exit(0);
+/// Start the helper of the supervisor-helper test below for the workspace: its own process, which
+/// exits without running a destructor once its release FIFO is written. It is run by exact name,
+/// ignored tests included, with the workspace root in its environment.
+fn supervisor_helper(workspace: &Workspace) -> tokio::process::Child {
+    tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "supervisor_helper_exits_while_an_activation_runs",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(SUPERVISOR_HELPER, &workspace.root)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the controller helper")
 }
 
+/// An activation whose supervisor's process exits without running a destructor, as a finished
+/// cowshed exec's does, ends with it (11_shell.md, "Activation belongs to the job that waited on
+/// it"). The activation publishes its pid from its own body and holds on a FIFO gate, so its exit
+/// watch is registered while it cannot have exited; only then does the test release the helper,
+/// and the activation's exit is the event the watch reports.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_an_activation_ends_when_its_supervisor_process_does() {
     let workspace = Workspace::new("shell-pool-orphan", 41_248);
-    workspace.envrc("printf '%s\\n' $$ > \"$TMPDIR/activation-pid\"\nsleep 60\n");
-    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "--exact",
-            "host_controller_orphan_helper_exits_while_an_activation_runs",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(ORPHAN_HELPER, &workspace.root)
-        .status_bounded()
-        .expect("run the controller helper");
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in ["activation-pid", "activation-hold", "helper-exit"] {
+        fifo(&tmp.join(name));
+    }
+    workspace.envrc(
+        "printf '%s\\n' $$ > \"$TMPDIR/activation-pid\"\nread _ < \"$TMPDIR/activation-hold\"\n",
+    );
+    let mut helper = supervisor_helper(&workspace);
+    let pid_frame = tmp.join("activation-pid");
+    let activation = tokio::select! {
+        pid = read_pid(&pid_frame) => pid,
+        status = helper.wait_bounded() => panic!("activation helper exited before its activation held: {status:?}"),
+    };
+    let exit = watch(activation);
+    release(&tmp.join("helper-exit")).await;
+    let status = helper.wait_bounded().await.expect("wait for the helper");
     assert!(status.success(), "helper: {status}");
-    let pid: i32 = std::fs::read_to_string(workspace.sandbox.exec_temp_dir.join("activation-pid"))
-        .expect("the activation recorded its pid")
-        .trim()
-        .parse()
-        .expect("pid");
-    let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        while process_alive(pid) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await;
     assert!(
-        ended.is_ok(),
-        "the activation of a supervisor that exited kept running as pid {pid}"
+        exited(exit).await,
+        "the activation of a supervisor that exited kept running as pid {activation}"
     );
 }
 
-const ESCAPE_HELPER: &str = "COWSHED_SHELL_POOL_ESCAPE_HELPER";
+const SUPERVISOR_HELPER: &str = "COWSHED_SHELL_POOL_SUPERVISOR_HELPER";
 
-/// The controller half of the test below: a supervisor whose job's activation runs held, with a
-/// descendant that left the host's session, and that exits without running a destructor once
-/// the test watches both, exactly as a stopped supervisor's process does.
+/// The controller half of the two tests that start it, never a test of its own: a supervisor
+/// whose job's activation runs held, which exits without running a destructor once the test
+/// releases it, exactly as a finished cowshed exec or a stopped supervisor's process does. Its
+/// name carries no host_controller_ prefix, so the counted host-controller selection (every
+/// ignored host_controller_ test, an empty selection failing) never picks it up, and it is
+/// ignored so no ordinary run does. Its starters run it by exact name with the workspace root in
+/// its environment; without one it fails, since a helper with nothing to serve would pass for
+/// nothing.
 #[tokio::test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-async fn host_controller_escape_helper_exits_while_an_activation_runs() {
+#[ignore = "a helper process of the host_controller_ tests that start it, with its role in the environment"]
+async fn supervisor_helper_exits_while_an_activation_runs() {
     use std::io::Write as _;
     use tokio::io::AsyncBufReadExt as _;
 
-    let Some(root) = std::env::var_os(ESCAPE_HELPER) else {
-        return;
-    };
+    let root = std::env::var_os(SUPERVISOR_HELPER)
+        .expect("a test starts this helper with its workspace root in the environment");
     let workspace = Workspace::from_root(PathBuf::from(root));
     let handle = workspace.supervisor(false);
     let job = handle
@@ -1160,17 +1160,7 @@ printf '%s\n' "$PPID" > "$TMPDIR/direnv-pid"
 read _ < "$TMPDIR/activation-hold"
 "#,
     );
-    let mut helper = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "--exact",
-            "host_controller_escape_helper_exits_while_an_activation_runs",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(ESCAPE_HELPER, &workspace.root)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("start the controller helper");
+    let mut helper = supervisor_helper(&workspace);
     let ready = async {
         let escaped = tmp.join("escaped-pid");
         let parent = tmp.join("escape-parent");
@@ -1188,21 +1178,10 @@ read _ < "$TMPDIR/activation-hold"
         escaped_group, host_group,
         "the fixture's descendant {escaped} never left the host's group"
     );
-    let watch = |pid: i32| {
-        ExitWatch::of(u32::try_from(pid).expect("a pid"))
-            .expect("watch an exit")
-            .expect("the process runs")
-    };
     let (escaped_exit, host_exit) = (watch(escaped), watch(host));
     let parent_exit = watch(parent);
     release(&tmp.join("escape-release")).await;
-    assert!(
-        tokio::task::spawn_blocking(move || parent_exit.within(Duration::from_secs(60)))
-            .await
-            .expect("parent watch task")
-            .expect("watch parent"),
-        "the fixture parent must exit"
-    );
+    assert!(exited(parent_exit).await, "the fixture parent must exit");
     assert_eq!(
         parent_of(escaped),
         1,
@@ -1211,12 +1190,8 @@ read _ < "$TMPDIR/activation-hold"
     release(&tmp.join("helper-exit")).await;
     let status = helper.wait_bounded().await.expect("wait for the helper");
     assert!(status.success(), "helper: {status}");
-    let host_ended = tokio::task::spawn_blocking(move || host_exit.within(Duration::from_secs(60)))
-        .await
-        .expect("host watch task")
-        .expect("watch the host");
     assert!(
-        host_ended,
+        exited(host_exit).await,
         "the host {host} of a supervisor that exited kept running"
     );
     let escaped_ended = escaped_exit
@@ -1234,6 +1209,199 @@ read _ < "$TMPDIR/activation-hold"
     assert!(
         holders.is_empty(),
         "processes hold the workspace after its host ended: {holders:?}"
+    );
+}
+
+const RUN_HELPER: &str = "COWSHED_SHELL_POOL_RUN_HELPER";
+
+/// A process of its own working in directory: it publishes its pid on the FIFO report from its
+/// own body, then holds on the FIFO gate until the gate's opener releases it or it is ended. It
+/// holds no standard stream, so it never keeps the runner's output pipes open.
+fn held_command(directory: &Path, report: &Path, gate: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("printf '%s\\n' \"$$\" > \"$0\"; read _ < \"$1\"")
+        .arg(report)
+        .arg(gate)
+        .current_dir(directory)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+
+/// Start a helper process of the killed-run witness below in role, with the parent-owned
+/// directory of FIFOs it reports and holds on. It is run by exact name, ignored tests included.
+fn run_helper(role: &str, directory: &Path) -> tokio::process::Child {
+    tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "killed_run_helper_makes_or_sweeps_a_workspace",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(RUN_HELPER, format!("{role}:{}", directory.display()))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start a run's helper process")
+}
+
+/// The helper processes of the killed-run witness below, never a test of their own, each in the
+/// role and the parent-owned directory its environment names. Each makes an actual Workspace, so
+/// the first Workspace of the process sweeps the roots of dead runs; it then reports its own root
+/// and holds on a FIFO of the test's. The owner's tree also holds a process that outlives it, held
+/// on a gate the test owns. Like the supervisor helper it carries no host_controller_ prefix and
+/// is ignored, and without its environment it fails instead of passing for nothing.
+#[tokio::test]
+#[ignore = "a helper process of the host_controller_ tests that start it, with its role in the environment"]
+async fn killed_run_helper_makes_or_sweeps_a_workspace() {
+    use std::io::BufRead as _;
+
+    let selected = std::env::var_os(RUN_HELPER)
+        .expect("a test starts this helper with its role and directory in the environment");
+    let selected = selected.into_string().expect("a UTF-8 helper selection");
+    let (role, directory) = selected.split_once(':').expect("a role and a directory");
+    let directory = PathBuf::from(directory);
+    let workspace = Workspace::new(role, 41_632);
+    let _held = (role == "owner").then(|| {
+        held_command(
+            workspace.mount(),
+            &directory.join("descendant-report"),
+            &directory.join("descendant-gate"),
+        )
+        .spawn()
+        .expect("start the run's own process")
+    });
+    std::fs::write(
+        directory.join(format!("{role}-report")),
+        format!("{}\n", workspace.root.display()),
+    )
+    .expect("report this run's root");
+    // One newline-terminated release frame, as the supervisor helper reads its own: the hold does
+    // not wait for every writer of the FIFO to close.
+    let mut release = String::new();
+    std::io::BufReader::new(
+        std::fs::File::open(directory.join(format!("{role}-hold"))).expect("open the hold FIFO"),
+    )
+    .read_line(&mut release)
+    .expect("hold until the test ends or releases this run");
+}
+
+/// A run killed before any destructor leaves its Workspace root, and a process still working in
+/// it, for the next start to reclaim (08_testing.md, "Integration tests (real substrate)"): the
+/// first Workspace a new process makes sweeps the dead run's root and ends the process working
+/// in it, and a live sibling's root and process are never touched. The owner is a helper that
+/// makes an actual Workspace and reports its root and the pid of the process held in it; the
+/// test arms that process's exit watch, ends the helper and reaps it, and only then starts the
+/// next helper, whose report follows its completed start.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_killed_runs_workspace_is_reclaimed_by_the_next_start_and_a_live_ones_is_not()
+ {
+    let live = Workspace::new("killed-run-live", 41_616);
+    let directory = live.sandbox.exec_temp_dir.clone();
+    for name in [
+        "owner-report",
+        "owner-hold",
+        "next-report",
+        "next-hold",
+        "descendant-report",
+        "descendant-gate",
+        "sibling-report",
+        "sibling-gate",
+    ] {
+        fifo(&directory.join(name));
+    }
+    // A live sibling: a process working in its own workspace, held on a gate this test owns.
+    let mut sibling = held_command(
+        live.mount(),
+        &directory.join("sibling-report"),
+        &directory.join("sibling-gate"),
+    )
+    .kill_on_drop(true)
+    .spawn()
+    .expect("start the live sibling's process");
+    let sibling_report = directory.join("sibling-report");
+    let sibling_pid = tokio::select! {
+        pid = read_pid(&sibling_report) => pid,
+        status = sibling.wait_bounded() => panic!("the live sibling's process exited before it held: {status:?}"),
+    };
+    let sibling_exit = watch(sibling_pid);
+
+    let mut owner = run_helper("owner", &directory);
+    let ready = async {
+        let (root, descendant) = (
+            directory.join("owner-report"),
+            directory.join("descendant-report"),
+        );
+        tokio::join!(read_line(&root), read_pid(&descendant))
+    };
+    let (owner_root, descendant) = tokio::select! {
+        ready = ready => ready,
+        status = owner.wait_bounded() => panic!("the run to be killed exited before it held: {status:?}"),
+    };
+    let dead_root = PathBuf::from(owner_root.trim());
+    let descendant_exit = watch(descendant);
+    owner
+        .kill_bounded()
+        .await
+        .expect("end the run without a destructor");
+    assert!(
+        dead_root.is_dir(),
+        "the killed run left its root: no destructor ran"
+    );
+    assert!(
+        !descendant_exit
+            .within(Duration::ZERO)
+            .expect("read the held process's exit"),
+        "the killed run's own process outlives it, held on the test's gate"
+    );
+
+    let mut next = run_helper("next", &directory);
+    let next_report = directory.join("next-report");
+    let next_root = tokio::select! {
+        root = read_line(&next_report) => root,
+        status = next.wait_bounded() => panic!("the next run exited before its start finished: {status:?}"),
+    };
+    // The next run reports once its first Workspace, which swept, was made: judged from here.
+    let reclaimed = !dead_root.exists();
+    let ended = descendant_exit
+        .within(Duration::ZERO)
+        .expect("read the held process's exit");
+    let sibling_alive = !sibling_exit
+        .within(Duration::ZERO)
+        .expect("read the live sibling's exit");
+    let live_kept = live.root.is_dir();
+    // Tear down what this test owns before judging: a gate only opens for a process still held.
+    if !ended {
+        release(&directory.join("descendant-gate")).await;
+    }
+    if sibling_alive {
+        release(&directory.join("sibling-gate")).await;
+    }
+    release(&directory.join("next-hold")).await;
+    let status = next.wait_bounded().await.expect("wait for the next run");
+    sibling
+        .wait_bounded()
+        .await
+        .expect("reap the live sibling's process");
+    assert!(status.success(), "next run: {status}");
+    assert!(
+        reclaimed,
+        "the next start reclaims the killed run's root {}",
+        dead_root.display()
+    );
+    assert!(
+        ended,
+        "the next start ends the process still working in the dead root"
+    );
+    assert!(sibling_alive, "a live sibling's process is never ended");
+    assert!(live_kept, "a live sibling's root is never reclaimed");
+    assert_ne!(
+        PathBuf::from(next_root.trim()),
+        dead_root,
+        "the next run works in a root of its own"
     );
 }
 
@@ -1304,37 +1472,41 @@ async fn host_controller_a_script_that_does_not_parse_is_a_typed_failure() {
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_killing_a_script_job_ends_every_process_it_started() {
     let workspace = Workspace::new("shell-pool-script-kill", 41_296);
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in ["leader", "first", "first-hold", "second", "second-hold"] {
+        fifo(&tmp.join(name));
+    }
     workspace.envrc("");
     let handle = workspace.supervisor(false);
     run(&handle, sh("true")).await.ok();
+    // Two grandchildren of the host, each an external process the script's interpreter started,
+    // publish their pids from their own bodies and hold on a FIFO nothing opens; the script
+    // publishes its own pid too. Every life runs, and cannot have exited, while its exit watch
+    // is registered.
+    let grandchild = |name: &str| {
+        format!(
+            "sh -c 'printf \"%s\\n\" \"$$\" > \"$TMPDIR/{name}\"; read _ < \"$TMPDIR/{name}-hold\"' & "
+        )
+    };
+    let source = format!(
+        "{}{}printf '%s\\n' \"$$\" > \"$TMPDIR/leader\"; wait",
+        grandchild("first"),
+        grandchild("second"),
+    );
     let job = handle
         .exec(
             None,
             None,
-            script(
-                &["sleep 300 & (sleep 301; true) & printf '%s %s\\n' $$ $! > pids; wait"],
-                Vec::new(),
-            ),
+            script(&[source.as_str()], Vec::new()),
             AdmissionSource::Worker,
         )
         .await
         .expect("admit");
-    let pids = workspace.mount().join("pids");
-    let recorded = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&pids)
-                && text.ends_with('\n')
-            {
-                return text;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the script records its pids");
-    let pids: Vec<i32> = recorded
-        .split_whitespace()
-        .map(|pid| pid.parse().expect("pid"))
+    let (leader, first, second) = (tmp.join("leader"), tmp.join("first"), tmp.join("second"));
+    let published = tokio::join!(read_pid(&leader), read_pid(&first), read_pid(&second));
+    let exits: Vec<(i32, ExitWatch)> = [published.0, published.1, published.2]
+        .into_iter()
+        .map(|pid| (pid, watch(pid)))
         .collect();
     handle.kill(job).await.expect("kill");
     let info = handle.wait(job).await.expect("killed job");
@@ -1346,10 +1518,9 @@ async fn host_controller_killing_a_script_job_ends_every_process_it_started() {
             core_dumped: false,
         })
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    for pid in pids {
+    for (pid, exit) in exits {
         assert!(
-            !process_alive(pid),
+            exited(exit).await,
             "process {pid} of the killed script survived"
         );
     }
@@ -1361,47 +1532,42 @@ async fn host_controller_killing_a_script_job_ends_every_process_it_started() {
     );
 }
 
+/// A revoke binds every later command and no running one: the first command admitted after it is
+/// refused the revoked path by the real sandbox, and the job admitted before it, still running,
+/// finishes under the revision-1 profile it started with. Which hosts, a spare included, a
+/// revision may be served by is the pool key's decision, owned by cowshed-core's tables; this
+/// keeps the two facts only a real sandbox shows.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one() {
     let mut workspace = Workspace::new("shell-pool-revoke", 41_312);
+    let tmp = workspace.sandbox.exec_temp_dir.clone();
+    for name in ["running", "gate"] {
+        fifo(&tmp.join(name));
+    }
     workspace.envrc("");
-    let granted = workspace
-        .root
-        .parent()
-        .expect("scratch parent")
-        .join(format!("cowshed-granted-{}", uuid::Uuid::new_v4().simple()));
+    let granted = workspace.root.join("granted");
     std::fs::create_dir_all(&granted).expect("granted directory");
     let granted_path = granted.display().to_string();
     workspace.sandbox.grants.write = vec![granted.clone()];
-    let handle = workspace.supervisor(true);
+    let handle = workspace.supervisor(false);
     run(&handle, sh(&format!("printf n > {granted_path}/before")))
         .await
         .ok();
-    // Admitted under revision 1; it writes only once the revoke is installed.
-    let gate = workspace.mount().join("gate");
+    // Admitted under revision 1; it announces that it runs, and writes only once the revoke is
+    // installed and the test opens its gate.
     let running = handle
         .exec(
             None,
             None,
             sh(&format!(
-                "while [ ! -e {} ]; do sleep 0.05; done; printf n > {granted_path}/during",
-                gate.display()
+                "printf 'running\\n' > \"$TMPDIR/running\"; read _ < \"$TMPDIR/gate\"; printf n > {granted_path}/during"
             )),
             AdmissionSource::Worker,
         )
         .await
         .expect("admit the running job");
-    // The spare built ahead of demand under revision 1 exists before the revoke (it adopts the
-    // export the first command's evaluation left, so its activation is what shows it).
-    let spare = tokio::time::timeout(Duration::from_secs(60), async {
-        while workspace.activations() < 2 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await;
-    assert!(spare.is_ok(), "a spare activates under revision 1");
-    let before = workspace.activations();
+    assert_eq!(read_line(&tmp.join("running")).await, "running\n");
 
     let mut revoked = workspace.sandbox.clone();
     revoked.grants.write.clear();
@@ -1417,12 +1583,8 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
         "the first command after the revoke is refused the revoked path"
     );
     assert!(!granted.join("after").exists());
-    assert!(
-        workspace.activations() > before,
-        "no host built under revision 1, the spare included, serves revision 2"
-    );
 
-    std::fs::write(&gate, b"go").expect("release the running job");
+    release(&tmp.join("gate")).await;
     let finished = advanced.wait(running).await.expect("its outcome");
     assert_eq!(finished.exit, Some(ExitStatus::Exited { code: 0 }));
     assert_eq!(finished.grant_revision, 1);
@@ -1430,7 +1592,6 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
         granted.join("during").exists(),
         "a job admitted under revision 1 finishes under the profile it started with"
     );
-    std::fs::remove_dir_all(&granted).ok();
 }
 
 #[tokio::test]
@@ -1505,31 +1666,44 @@ fn fifo(path: &Path) {
     );
 }
 
-/// The newline-terminated pid a job's process wrote into the FIFO at `path`, without a
-/// blocking thread left behind if readiness fails or the controlling helper exits.
-async fn read_pid(path: &Path) -> i32 {
+/// The newline-terminated line a job's process wrote into the FIFO at path, without a blocking
+/// thread left behind if readiness fails or the controlling helper exits. A line that never
+/// comes is a hang the target's no-progress bound names; no deadline of this test's own ends
+/// the wait.
+async fn read_line(path: &Path) -> String {
     use tokio::io::AsyncBufReadExt as _;
 
     let receiver = tokio::net::unix::pipe::OpenOptions::new()
         .open_receiver(path)
-        .unwrap_or_else(|error| panic!("open pid FIFO {}: {error}", path.display()));
+        .unwrap_or_else(|error| panic!("open FIFO {}: {error}", path.display()));
     let mut receiver = tokio::io::BufReader::new(receiver);
     let mut text = String::new();
-    let read = tokio::time::timeout(Duration::from_secs(60), receiver.read_line(&mut text)).await;
-    match read {
-        Ok(Ok(_)) => text
-            .trim()
-            .parse()
-            .unwrap_or_else(|error| panic!("pid FIFO {} held {text:?}: {error}", path.display())),
-        Ok(Err(error)) => panic!(
-            "read pid FIFO {}: {error}; received {text:?}",
-            path.display()
-        ),
-        Err(error) => panic!(
-            "wait for pid FIFO {}: {error}; received {text:?}",
-            path.display()
-        ),
+    match receiver.read_line(&mut text).await {
+        Ok(_) => text,
+        Err(error) => panic!("read FIFO {}: {error}; received {text:?}", path.display()),
     }
+}
+
+/// The N pids the one line a job's process wrote into the FIFO at path names. A blank line, or
+/// any other count, is refused here, so no loop over the pids can pass on an empty set.
+async fn read_pids<const N: usize>(path: &Path) -> [i32; N] {
+    let text = read_line(path).await;
+    let pids: Vec<i32> = text
+        .split_whitespace()
+        .map(|pid| {
+            pid.parse().unwrap_or_else(|error| {
+                panic!("pid FIFO {} held {text:?}: {error}", path.display())
+            })
+        })
+        .collect();
+    <[i32; N]>::try_from(pids)
+        .unwrap_or_else(|other| panic!("pid FIFO {} held {other:?}, not {N} pids", path.display()))
+}
+
+/// The one pid a job's process wrote into the FIFO at path.
+async fn read_pid(path: &Path) -> i32 {
+    let [pid] = read_pids::<1>(path).await;
+    pid
 }
 
 /// Dropping a pending FIFO wait must not leave spawn_blocking(open) behind for Runtime::drop
@@ -1553,17 +1727,13 @@ async fn a_cancelled_pid_fifo_wait_leaves_no_blocking_reader() {
     }
 }
 
-/// Release the job's process blocked reading the FIFO at `path`.
+/// Release the job's process blocked reading the FIFO at path.
 async fn release(path: &Path) {
     let path = path.to_path_buf();
-    tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::task::spawn_blocking(move || std::fs::write(path, "go\n")),
-    )
-    .await
-    .expect("the job reads its release")
-    .expect("writer task")
-    .expect("write the release");
+    tokio::task::spawn_blocking(move || std::fs::write(path, "go\n"))
+        .await
+        .expect("writer task")
+        .expect("write the release");
 }
 
 /// Wall microseconds from `earlier` to `later`.
@@ -1685,25 +1855,36 @@ async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts(
         "status carries the latest sample"
     );
 
+    // The supervisor publishes the command's group as the job's leader at its own sample
+    // boundary, which is neither JobState::Running nor the command's own pid frame: the job's
+    // progress subscription delivers it.
+    let mut progress = handle
+        .progress(job, SampleInterval::new(20).expect("a sampling interval"))
+        .await
+        .expect("subscribe to the job's progress");
     release(&tmp.join("activation-hold")).await;
     let command_pid = u32::try_from(read_pid(&tmp.join("command-pid")).await).expect("pid");
-    let before = std::time::Instant::now();
-    // A new leader is the supervisor's own sample boundary, not JobState::Running
-    // and not this read. The read leaves the open window open.
-    let running = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let sample = handle
-                .resources(job)
-                .await
-                .expect("a running job is sampled");
-            if sample.leader_pid == command_pid {
-                break sample;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    loop {
+        let sample = progress
+            .next()
+            .await
+            .expect("the job's progress outlives its command")
+            .expect("a running job is sampled");
+        if sample.leader_pid == command_pid {
+            break;
         }
-    })
-    .await
-    .expect("the new-leader sample names the command");
+    }
+    // The one read after that boundary is the sample judged below. It leaves the open window
+    // open.
+    let before = std::time::Instant::now();
+    let running = handle
+        .resources(job)
+        .await
+        .expect("a running job is sampled");
+    assert_eq!(
+        running.leader_pid, command_pid,
+        "the command leads the job once its group is sampled as the leader"
+    );
     assert_eq!(
         running.host_start, activating.host_start,
         "the command keeps the activation's spawn host baseline"
@@ -1715,10 +1896,7 @@ async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts(
     assert!(running.wall_us > activating.wall_us);
 
     release(&tmp.join("command-hold")).await;
-    let ended = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
-        .await
-        .expect("the job ends")
-        .expect("job outcome");
+    let ended = handle.wait(job).await.expect("job outcome");
     assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
     let terminal = ended.resources.expect("a terminal sample");
     assert_eq!(
@@ -1764,45 +1942,35 @@ async fn host_controller_a_job_s_sample_names_its_whole_group_and_none_after_a_k
         .await
         .expect("admit");
 
-    // Both children were born before the shell wrote their pids.
-    let pids = tmp.join("pids");
-    let text = tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::task::spawn_blocking(move || std::fs::read_to_string(pids)),
-    )
-    .await
-    .expect("the job writes its pids")
-    .expect("reader task")
-    .expect("read the pids");
-    let mut group: Vec<u32> = text
-        .split_whitespace()
-        .map(|pid| pid.parse().expect("a pid"))
-        .collect();
-    let leader = group[0];
+    let mut progress = handle
+        .progress(job, SampleInterval::new(20).expect("a sampling interval"))
+        .await
+        .expect("subscribe to the job's progress");
+    // Both children were born before the shell wrote their pids: the frame names exactly the
+    // leader and its two children.
+    let published = read_pids::<3>(&tmp.join("pids"))
+        .await
+        .map(|pid| u32::try_from(pid).expect("a pid"));
+    let leader = published[0];
+    let mut group = published.to_vec();
     group.sort_unstable();
-    // The pid file proves the command started. The sample that names its
-    // leader and held members is the supervisor's own boundary, not that write.
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let mut sample = handle
-                .resources(job)
-                .await
-                .expect("a running job is sampled");
-            sample.members.sort_unstable();
-            if sample.leader_pid == leader && sample.members == group {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    // The pid frame proves the command started. The sample that names its leader and held
+    // members is the supervisor's own boundary, not that write: the job's progress subscription
+    // delivers it.
+    loop {
+        let mut sample = progress
+            .next()
+            .await
+            .expect("the job's progress outlives its command")
+            .expect("a running job is sampled");
+        sample.members.sort_unstable();
+        if sample.leader_pid == leader && sample.members == group {
+            break;
         }
-    })
-    .await
-    .expect("the command's own sample names its leader and both held children");
+    }
 
     handle.kill(job).await.expect("kill");
-    let ended = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
-        .await
-        .expect("the killed job ends")
-        .expect("job outcome");
+    let ended = handle.wait(job).await.expect("job outcome");
     assert_eq!(ended.state, JobState::Killed);
     let terminal = ended.resources.expect("a terminal sample");
     assert_eq!(

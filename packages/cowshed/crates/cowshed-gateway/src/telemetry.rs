@@ -789,8 +789,7 @@ mod tests {
 
     use arrow_array::{Array as _, DictionaryArray, StringArray, UInt64Array, types::UInt8Type};
     use arrow_ipc::reader::StreamReader;
-    use arrow_schema::TimeUnit;
-    use cowshed_core::storage::trace_segment::dict_type;
+    use cowshed_core::storage::trace_segment::system_fields;
 
     use super::*;
     use crate::{interfaces::AuditKind, mirror::MirrorCacheStatus};
@@ -911,37 +910,20 @@ mod tests {
             12,
             "request and upstream span lifecycle rows"
         );
+        // The system columns are the shared trace-segment writer's, whose byte golden pins them
+        // (13_telemetry.md, "Why lmao, not text logs"): the gateway's segment leads with exactly
+        // the columns that owner declares.
         let schema = batch.schema();
-        let fields = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().as_str())
-            .collect::<Vec<_>>();
+        let system = system_fields();
         assert_eq!(
-            &fields[..12],
-            [
-                "timestamp",
-                "trace_id",
-                "thread_id",
-                "span_id",
-                "parent_thread_id",
-                "parent_span_id",
-                "entry_type",
-                "message",
-                "package_name",
-                "package_file",
-                "git_sha",
-                "line",
-            ]
+            schema
+                .fields()
+                .iter()
+                .take(system.len())
+                .map(|field| &**field)
+                .collect::<Vec<_>>(),
+            system.iter().collect::<Vec<_>>()
         );
-        assert_eq!(
-            schema.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
-        );
-        assert_eq!(schema.field(1).data_type(), &dict_type(DataType::UInt32));
-        assert_eq!(schema.field(3).data_type(), &DataType::UInt32);
-        assert_eq!(schema.field(6).data_type(), &dict_type(DataType::UInt8));
-        assert_eq!(schema.field(7).data_type(), &dict_type(DataType::UInt32));
         let sequences = batch
             .column_by_name("sequence")
             .expect("sequence column")
@@ -960,20 +942,23 @@ mod tests {
             .as_any()
             .downcast_ref::<DictionaryArray<UInt8Type>>()
             .expect("dictionary entry type");
-        assert_eq!(
-            (0..4)
-                .map(|row| entries.keys().value(row))
-                .collect::<Vec<_>>(),
-            [1, 1, 2, 2]
-        );
         let entry_names = entries
             .values()
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("entry type values");
-        assert_eq!(entry_names.value(0), "");
-        assert_eq!(entry_names.value(1), "span-start");
-        assert_eq!(entry_names.value(2), "span-ok");
+        // Each completed request is its span's start and its upstream span's, then both ends.
+        assert_eq!(
+            (0..4)
+                .map(|row| entry_names.value(usize::from(entries.keys().value(row))))
+                .collect::<Vec<_>>(),
+            [
+                EntryType::SpanStart.name(),
+                EntryType::SpanStart.name(),
+                EntryType::SpanOk.name(),
+                EntryType::SpanOk.name(),
+            ]
+        );
 
         let first_tail = subscription
             .recv()

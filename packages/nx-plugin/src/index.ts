@@ -2470,6 +2470,8 @@ interface ResolvedNapiConfig {
   cargoPackage: string;
   manifestPath: string;
   targets: string[];
+  /** The '<binaryName>-cli' crate beside the addon crate, when this package ships a CLI. */
+  cli: { cargoPackage: string; manifestPath: string } | null;
 }
 
 function inferTypescriptOutputs(tsconfigPath: string, packageJsonPath: string): string[] {
@@ -2519,11 +2521,11 @@ function resolveNapiConfig(
   if (
     !Array.isArray(rawTargets) ||
     rawTargets.length === 0 ||
-    !rawTargets.every((target) => typeof target === 'string')
+    !rawTargets.every((target): target is string => typeof target === 'string')
   ) {
     throw new Error(`${packageJsonPath}: napi.targets must be a non-empty array of target triples`);
   }
-  const targets = [...new Set(rawTargets as string[])];
+  const targets = [...new Set(rawTargets)];
   for (const target of targets) {
     if (!NAPI_TARGET_CONVENTIONS[target]) {
       throw new Error(`${packageJsonPath}: unsupported inferred napi target ${target}`);
@@ -2539,7 +2541,19 @@ function resolveNapiConfig(
   if (!existsSync(absoluteManifestPath)) {
     throw new Error(`${packageJsonPath}: inferred N-API crate is missing at ${manifestPath}`);
   }
-  return { binaryName, cargoPackage, manifestPath, targets };
+  // The CLI crate beside the addon crate, when this package ships one: its per-triple build
+  // targets are generated from the same `napi.targets` list below, so no manifest restates
+  // the CLI triples or directories per target.
+  const cliPackage = `${binaryName}-cli`;
+  const cliRootMember = repoRootPackages.find((pkg) => pkg.name === cliPackage);
+  const cliManifestPath = cliRootMember
+    ? posix.join(cliRootMember.dir, 'Cargo.toml')
+    : `crates/${cliPackage}/Cargo.toml`;
+  const absoluteCliManifestPath = cliRootMember
+    ? join(absoluteProjectRoot, relative(dirname(packageJsonPath), cliManifestPath))
+    : join(absoluteProjectRoot, cliManifestPath);
+  const cli = existsSync(absoluteCliManifestPath) ? { cargoPackage: cliPackage, manifestPath: cliManifestPath } : null;
+  return { binaryName, cargoPackage, manifestPath, targets, cli };
 }
 
 function createNapiTargets(
@@ -2563,18 +2577,25 @@ function createNapiTargets(
   const napiCommand = repoRooted ? posix.join(projectRoot, 'node_modules/.bin/napi') : 'napi';
   const outputPath = (projectOutput: string) => (repoRooted ? posix.join(projectRoot, projectOutput) : projectOutput);
   // After a build, the step that writes its input record (build-inputs.ts) into the output directory from the dep-info
-  // rustc wrote for the addon (`target/[<triple>/]<profile>/lib<crate>.d`). The record is inside the target's
-  // outputs, so Nx restores it with the addon it describes. Relative to the runner's cwd, so the hashed command is
+  // rustc wrote for the artifact (`target/[<triple>/]<profile>/<artifact>.d`). The record is inside the target's
+  // outputs, so Nx restores it with the artifact it describes. Relative to the runner's cwd, so the hashed command is
   // the same in every checkout.
-  const recordInputs = (triple: string | null, profile: CargoProfile, outputDirectory: string): string => {
+  const recordInputs = (
+    manifestPath: string,
+    depInfoArtifact: string,
+    triple: string | null,
+    profile: CargoProfile,
+    outputDirectory: string,
+  ): string => {
     const depInfo = posix.join(
       ...(triple === null ? [] : [triple]),
       CARGO_PROFILE_OUTPUT_DIR[profile],
-      `lib${config.cargoPackage.replaceAll('-', '_')}.d`,
+      depInfoArtifact,
     );
     const bin = nativeToolCommand(nativeTools, cargoCwd, 'build-inputs', 'smoo-nx-build-inputs');
-    return ` && ${bin} --manifest-path ${config.manifestPath} --dep-info ${depInfo} --output ${outputDirectory}`;
+    return ` && ${bin} --manifest-path ${manifestPath} --dep-info ${depInfo} --output ${outputDirectory}`;
   };
+  const addonDepInfo = `lib${config.cargoPackage.replaceAll('-', '_')}.d`;
   // The task that builds the executable recordInputs runs, when this workspace builds it.
   const buildInputsTool = nativeToolDependsOn(nativeTools, 'build-inputs');
   const hasHostPlatformTarget = config.targets.some((triple) => {
@@ -2612,7 +2633,7 @@ function createNapiTargets(
     // platform-suffixed filename from dist/native/<platform-dir> after
     // dist/native/host.
     const hostBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}${recordInputs(null, profile, outputPath('dist/native/host'))}`;
+      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}${recordInputs(config.manifestPath, addonDepInfo, null, profile, outputPath('dist/native/host'))}`;
     targets['cargo-napi'] = {
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
@@ -2654,25 +2675,69 @@ function createNapiTargets(
         },
         configurations: { [RELEASE_CONFIGURATION]: { release: true } },
       };
-      continue;
+    } else {
+      // macOS addons need Apple's SDK, which zig does not carry: the napi CLI
+      // drives the host's own toolchain and writes the platform `.d.ts`.
+      const platformBuild = (profile: CargoProfile): string =>
+        `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${outputPath(outputDirectory)}${recordInputs(config.manifestPath, addonDepInfo, triple, profile, outputPath(outputDirectory))}`;
+      targets[targetName] = {
+        executor: 'nx:run-commands',
+        metadata: CARGO_PRODUCER_METADATA,
+        cache: true,
+        ...(buildInputsTool.length > 0 ? { dependsOn: buildInputsTool } : {}),
+        inputs: cargoInputs,
+        outputs: [`{projectRoot}/${outputDirectory}/`],
+        options: {
+          cwd: cargoCwd,
+          command: platformBuild('dev'),
+        },
+        configurations: { [RELEASE_CONFIGURATION]: { command: platformBuild('release') } },
+      };
     }
-    // macOS addons need Apple's SDK, which zig does not carry: the napi CLI
-    // drives the host's own toolchain and writes the platform `.d.ts`.
-    const platformBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${outputPath(outputDirectory)}${recordInputs(triple, profile, outputPath(outputDirectory))}`;
-    targets[targetName] = {
-      executor: 'nx:run-commands',
-      metadata: CARGO_PRODUCER_METADATA,
-      cache: true,
-      ...(buildInputsTool.length > 0 ? { dependsOn: buildInputsTool } : {}),
-      inputs: cargoInputs,
-      outputs: [`{projectRoot}/${outputDirectory}/`],
-      options: {
-        cwd: cargoCwd,
-        command: platformBuild('dev'),
-      },
-      configurations: { [RELEASE_CONFIGURATION]: { command: platformBuild('release') } },
-    };
+    const cli = config.cli;
+    if (cli !== null) {
+      // The CLI this package ships beside its addon, generated from the same `napi.targets`
+      // list: `package.json` never restates these triples or directories in per-arch target
+      // entries. The Linux CLI is a static musl executable (no loader, no libraries), so its
+      // triple is the musl twin of the addon's gnu triple and its directory carries no libc
+      // suffix; the runtime loader's table derives the same rows from the same list.
+      const cliTargetName = `cli-${convention.architecture}-${convention.targetFamily}`;
+      const cliOutputName = convention.outputName.replace(/-gnu$/, '');
+      const cliOutputDirectory = `dist/bin/${cliOutputName}`;
+      if (convention.targetFamily === 'linux') {
+        targets[cliTargetName] = {
+          executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
+          metadata: CARGO_PRODUCER_METADATA,
+          cache: true,
+          inputs: napiInputs(projectRoot, repoRooted, []),
+          outputs: [`{projectRoot}/${cliOutputDirectory}/`],
+          options: {
+            target: triple.replace(/-gnu$/, '-musl'),
+            manifestPath: posix.join(cargoCwd, cli.manifestPath),
+            package: cli.cargoPackage,
+            bin: config.binaryName,
+            output: `{projectRoot}/${cliOutputDirectory}/${config.binaryName}`,
+          },
+          configurations: { [RELEASE_CONFIGURATION]: { release: true } },
+        };
+      } else {
+        const cliBuild = (profile: CargoProfile): string =>
+          `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --bin ${config.binaryName} --target ${triple} --manifest-path ${cli.manifestPath} --package ${cli.cargoPackage} --output-dir ${outputPath(cliOutputDirectory)}${recordInputs(cli.manifestPath, `${config.binaryName}.d`, triple, profile, outputPath(cliOutputDirectory))}`;
+        targets[cliTargetName] = {
+          executor: 'nx:run-commands',
+          metadata: CARGO_PRODUCER_METADATA,
+          cache: true,
+          ...(buildInputsTool.length > 0 ? { dependsOn: buildInputsTool } : {}),
+          inputs: cargoInputs,
+          outputs: [`{projectRoot}/${cliOutputDirectory}/`],
+          options: {
+            cwd: cargoCwd,
+            command: cliBuild('dev'),
+          },
+          configurations: { [RELEASE_CONFIGURATION]: { command: cliBuild('release') } },
+        };
+      }
+    }
   }
   return targets;
 }

@@ -299,166 +299,6 @@
           "command": "bun scripts/refresh-harnesses.ts"
         }
       },
-      "cli-arm64-macos": {
-        "executor": "nx:run-commands",
-        "cache": true,
-        "inputs": [
-          "{projectRoot}/**/*.rs",
-          "{projectRoot}/skills/cowshed/SKILL.md",
-          "{projectRoot}/crates/**/*.js",
-          "{projectRoot}/**/Cargo.toml",
-          "{workspaceRoot}/Cargo.toml",
-          {
-            "externalDependencies": [
-              "cargo-lock:packages/cowshed"
-            ]
-          },
-          "{workspaceRoot}/.cargo/config.toml",
-          "{projectRoot}/.cargo/config.toml",
-          "{projectRoot}/scripts/*.sh",
-          "!{projectRoot}/**/target/**",
-          "{projectRoot}/package.json",
-          {
-            "externalDependencies": [
-              "bun-lock:packages/cowshed"
-            ]
-          },
-          "cargoToolchain"
-        ],
-        "outputs": [
-          "{projectRoot}/dist/bin/darwin-arm64/"
-        ],
-        "options": {
-          "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-arm64"
-        },
-        "configurations": {
-          "production": {
-            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/release/cowshed.d --output dist/bin/darwin-arm64"
-          }
-        }
-      },
-      "cli-x64-macos": {
-        "executor": "nx:run-commands",
-        "cache": true,
-        "inputs": [
-          "{projectRoot}/**/*.rs",
-          "{projectRoot}/skills/cowshed/SKILL.md",
-          "{projectRoot}/crates/**/*.js",
-          "{projectRoot}/**/Cargo.toml",
-          "{workspaceRoot}/Cargo.toml",
-          {
-            "externalDependencies": [
-              "cargo-lock:packages/cowshed"
-            ]
-          },
-          "{workspaceRoot}/.cargo/config.toml",
-          "{projectRoot}/.cargo/config.toml",
-          "{projectRoot}/scripts/*.sh",
-          "!{projectRoot}/**/target/**",
-          "{projectRoot}/package.json",
-          {
-            "externalDependencies": [
-              "bun-lock:packages/cowshed"
-            ]
-          },
-          "cargoToolchain"
-        ],
-        "outputs": [
-          "{projectRoot}/dist/bin/darwin-x64/"
-        ],
-        "options": {
-          "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-x64"
-        },
-        "configurations": {
-          "production": {
-            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/release/cowshed.d --output dist/bin/darwin-x64"
-          }
-        }
-      },
-      "cli-arm64-linux": {
-        "executor": "@smoothbricks/nx-plugin:cargo-zigbuild",
-        "cache": true,
-        "inputs": [
-          "{projectRoot}/**/*.rs",
-          "{projectRoot}/skills/cowshed/SKILL.md",
-          "{projectRoot}/crates/**/*.js",
-          "{projectRoot}/**/Cargo.toml",
-          "{workspaceRoot}/Cargo.toml",
-          {
-            "externalDependencies": [
-              "cargo-lock:packages/cowshed"
-            ]
-          },
-          "{workspaceRoot}/.cargo/config.toml",
-          "{projectRoot}/.cargo/config.toml",
-          "!{projectRoot}/**/target/**",
-          "{projectRoot}/package.json",
-          {
-            "externalDependencies": [
-              "bun-lock:packages/cowshed"
-            ]
-          },
-          "cargoToolchain"
-        ],
-        "outputs": [
-          "{projectRoot}/dist/bin/linux-arm64/"
-        ],
-        "options": {
-          "target": "aarch64-unknown-linux-musl",
-          "manifestPath": "{projectRoot}/crates/cowshed-cli/Cargo.toml",
-          "package": "cowshed-cli",
-          "bin": "cowshed",
-          "output": "{projectRoot}/dist/bin/linux-arm64/cowshed"
-        },
-        "configurations": {
-          "production": {
-            "release": true
-          }
-        }
-      },
-      "cli-x64-linux": {
-        "executor": "@smoothbricks/nx-plugin:cargo-zigbuild",
-        "cache": true,
-        "inputs": [
-          "{projectRoot}/**/*.rs",
-          "{projectRoot}/skills/cowshed/SKILL.md",
-          "{projectRoot}/crates/**/*.js",
-          "{projectRoot}/**/Cargo.toml",
-          "{workspaceRoot}/Cargo.toml",
-          {
-            "externalDependencies": [
-              "cargo-lock:packages/cowshed"
-            ]
-          },
-          "{workspaceRoot}/.cargo/config.toml",
-          "{projectRoot}/.cargo/config.toml",
-          "!{projectRoot}/**/target/**",
-          "{projectRoot}/package.json",
-          {
-            "externalDependencies": [
-              "bun-lock:packages/cowshed"
-            ]
-          },
-          "cargoToolchain"
-        ],
-        "outputs": [
-          "{projectRoot}/dist/bin/linux-x64/"
-        ],
-        "options": {
-          "target": "x86_64-unknown-linux-musl",
-          "manifestPath": "{projectRoot}/crates/cowshed-cli/Cargo.toml",
-          "package": "cowshed-cli",
-          "bin": "cowshed",
-          "output": "{projectRoot}/dist/bin/linux-x64/cowshed"
-        },
-        "configurations": {
-          "production": {
-            "release": true
-          }
-        }
-      },
       "host-napi-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
@@ -528,13 +368,14 @@
           "default",
           "^dependencyDefault"
         ],
-        "//": "dependsOn ^build so lmao/dist exists: bunfig.napi-test.toml preloads ../../lmao/dist/ts/bun/trace-preload.js, and without the edge a cold cache runs this target before lmao:build.",
+        "//": "Runs from source under the compiler preload, because platform.ts admits its manifest through Typia-generated code. wire-warmup pays the cold typia-plugin compile ahead of this target, as it does for wire-test; dependsOn ^build so lmao/dist exists for bunfig.toml preloads.",
         "dependsOn": [
           "^build",
-          "typecheck-tests"
+          "typecheck-tests",
+          "wire-warmup"
         ],
         "options": {
-          "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 launcher.test.ts platform.test.ts",
+          "command": "bun test --config=../bunfig.toml --timeout=0 launcher.test.ts platform.test.ts",
           "cwd": "{projectRoot}/src",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -823,6 +664,7 @@
   "devDependencies": {
     "@napi-rs/cli": "3.7.3",
     "@smoothbricks/lmao": "workspace:*",
+    "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "@types/node": "^26.6.5",
     "typescript": "^6.0.3"

@@ -38,6 +38,9 @@ use zeroize::Zeroizing;
 
 use crate::launchd::CommandStatus;
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod keychain_fixture;
+
 pub const SECURITY: &str = "/usr/bin/security";
 pub const CODESIGN: &str = "/usr/bin/codesign";
 
@@ -739,32 +742,16 @@ mod tests {
 
     /// The real boundary: `security` takes the minted key and certificate into a scratch
     /// keychain as one code-signing identity, found again by name, and a second ensure makes no
-    /// second one. The scratch keychain is never on the user's search list and is deleted on
-    /// every exit path.
+    /// second one. create-keychain is documented to list the keychain; the fixture's drop
+    /// deletes it and takes it off the current list if it is there, on every exit the process
+    /// lives to take, and the next fixture reclaims a killed run's entry.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     fn host_controller_a_minted_identity_is_one_code_signing_identity_in_its_keychain() {
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = Command::new(SECURITY)
-                    .arg("delete-keychain")
-                    .arg(&self.0)
-                    .output_bounded();
-                let _ = std::fs::remove_dir_all(self.0.parent().expect("keychain directory"));
-            }
-        }
-        let directory = std::env::temp_dir().join(format!(
-            "cowshed-signing-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let scratch = Scratch(directory.join("signing.keychain"));
+        let fixture = super::keychain_fixture::ThrowawayKeychain::new("cowshed-signing", |home| {
+            Keychain::at(home.join("signing.keychain"), "scratch")
+        });
         for arguments in [
             ["create-keychain", "-p", "scratch"],
             ["unlock-keychain", "-p", "scratch"],
@@ -774,17 +761,17 @@ mod tests {
                     OsStr::new(arguments[0]),
                     OsStr::new(arguments[1]),
                     OsStr::new(arguments[2]),
-                    scratch.0.as_os_str(),
+                    fixture.keychain().path().as_os_str(),
                 ],
                 None,
             )
             .unwrap();
         }
-        let keychain = Keychain::at(scratch.0.clone(), "scratch");
-        assert!(find_identities(&keychain).unwrap().is_empty());
-        let made = ensure_identity(&keychain).unwrap();
-        assert_eq!(find_identities(&keychain).unwrap(), [made.certificate]);
-        assert_eq!(ensure_identity(&keychain).unwrap(), made);
-        assert_eq!(find_identities(&keychain).unwrap(), [made.certificate]);
+        let keychain = fixture.keychain();
+        assert!(find_identities(keychain).unwrap().is_empty());
+        let made = ensure_identity(keychain).unwrap();
+        assert_eq!(find_identities(keychain).unwrap(), [made.certificate]);
+        assert_eq!(ensure_identity(keychain).unwrap(), made);
+        assert_eq!(find_identities(keychain).unwrap(), [made.certificate]);
     }
 }

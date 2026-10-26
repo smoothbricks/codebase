@@ -2557,6 +2557,115 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('generates cli targets from napi.targets only when the package ships a cli crate', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write(
+        'packages/cowshed/package.json',
+        JSON.stringify({
+          name: 'cowshed',
+          napi: {
+            binaryName: 'cowshed',
+            targets: [
+              'aarch64-apple-darwin',
+              'x86_64-apple-darwin',
+              'aarch64-unknown-linux-gnu',
+              'x86_64-unknown-linux-gnu',
+            ],
+          },
+        }),
+      );
+      await workspace.write('packages/cowshed/Cargo.toml', '[workspace]\nmembers = ["crates/cowshed-napi"]\n');
+      await workspace.write(
+        'packages/cowshed/crates/cowshed-napi/Cargo.toml',
+        '[package]\nname = "cowshed-napi"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+      );
+      await workspace.write(
+        'packages/cowshed/tsconfig.lib.json',
+        '{"compilerOptions":{"outDir":"dist/ts","tsBuildInfoFile":"dist/ts/tsconfig.lib.tsbuildinfo"}}\n',
+      );
+      await workspace.write('packages/cowshed/src/native.test.ts', 'export {};\n');
+
+      const addonOnly = await inferProjectTargets(
+        workspace,
+        'packages/cowshed/package.json',
+        createNodesV2ForPlatform('darwin', 'arm64'),
+      );
+      // No `<binaryName>-cli` crate, no cli targets: the list alone never invents a binary
+      // the package does not ship.
+      expect(Object.keys(addonOnly).filter((name) => name.startsWith('cli-'))).toEqual([]);
+
+      await workspace.write(
+        'packages/cowshed/Cargo.toml',
+        '[workspace]\nmembers = ["crates/cowshed-napi", "crates/cowshed-cli"]\n',
+      );
+      await workspace.write(
+        'packages/cowshed/crates/cowshed-cli/Cargo.toml',
+        '[package]\nname = "cowshed-cli"\n\n[[bin]]\nname = "cowshed"\npath = "src/main.rs"\n',
+      );
+      const targets = await inferProjectTargets(
+        workspace,
+        'packages/cowshed/package.json',
+        createNodesV2ForPlatform('darwin', 'arm64'),
+      );
+
+      // One cli target per `napi.targets` triple, from that list alone. macOS builds the bin
+      // through the napi CLI like the addon; every local build compiles dev and only the
+      // release configuration ships.
+      // The inferring host is forced to darwin-arm64 above, so the tool directory is that
+      // host's, never the runner's own `HOST_TOOLS`.
+      const buildInputs =
+        '../../node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/darwin-arm64/smoo-nx-build-inputs';
+      const darwinArm64Cli = (release: string): string =>
+        `napi build${release} --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && ${buildInputs} --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/cowshed.d --output dist/bin/darwin-arm64`;
+      expect(targets['cli-arm64-macos']).toMatchObject({
+        executor: 'nx:run-commands',
+        cache: true,
+        outputs: ['{projectRoot}/dist/bin/darwin-arm64/'],
+        options: { cwd: 'packages/cowshed', command: darwinArm64Cli('') },
+        configurations: { [RELEASE_CONFIGURATION]: { command: darwinArm64Cli(' --release') } },
+      });
+      expect(targets['cli-x64-macos']?.options?.command).toContain('--target x86_64-apple-darwin');
+      expect(targets['cli-x64-macos']?.outputs).toEqual(['{projectRoot}/dist/bin/darwin-x64/']);
+      // The Linux CLI is the static musl twin of the addon's gnu triple, in the directory
+      // without the libc suffix, through the same cargo-zigbuild executor as the addon.
+      expect(targets['cli-x64-linux']).toMatchObject({
+        executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
+        cache: true,
+        outputs: ['{projectRoot}/dist/bin/linux-x64/'],
+        options: {
+          target: 'x86_64-unknown-linux-musl',
+          manifestPath: 'packages/cowshed/crates/cowshed-cli/Cargo.toml',
+          package: 'cowshed-cli',
+          bin: 'cowshed',
+          output: '{projectRoot}/dist/bin/linux-x64/cowshed',
+        },
+        configurations: { [RELEASE_CONFIGURATION]: { release: true } },
+      });
+      expect(targets['cli-arm64-linux']?.options).toMatchObject({
+        target: 'aarch64-unknown-linux-musl',
+        output: '{projectRoot}/dist/bin/linux-arm64/cowshed',
+      });
+      // The proof the CLI's debug-build refusal names: the default configuration is a debug
+      // build in each executor's own terms, and only `production` is the release build an
+      // operator may install as the supervised binary.
+      expect(targets['cli-arm64-macos']?.options?.command).not.toContain('--release');
+      expect(JSON.stringify(targets['cli-x64-linux']?.options)).not.toContain('release');
+      // No generated cli target depends on, hashes, or copies an nx-cache-server artifact:
+      // the server ships as its own Bun bundle, never inside a CLI build.
+      for (const cliTarget of ['cli-arm64-macos', 'cli-x64-macos', 'cli-arm64-linux', 'cli-x64-linux']) {
+        expect(JSON.stringify(targets[cliTarget])).not.toContain('nx-cache-server');
+      }
+      // The aggregate build reaches the inferring host's cli target, and no foreign one.
+      expect(targets.build?.dependsOn).toContain('cli-arm64-macos');
+      expect(targets.build?.dependsOn).not.toContain('cli-x64-linux');
+      expect(targets.build?.dependsOn).not.toContain('cli-arm64-linux');
+      expect(targets.build?.dependsOn).not.toContain('cli-x64-macos');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('keeps an explicit package-local cargo-wasm target singular and feeding the aggregate build', async () => {
     const workspace = await createWorkspace();
     try {

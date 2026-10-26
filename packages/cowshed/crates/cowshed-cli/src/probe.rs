@@ -9,12 +9,16 @@
 //! include by a relative path that stays inside the repository, travel with every clone and are
 //! never a gap.
 //!
+//! Two spellings of one file are told by the real path each resolves to. The decision is pure over
+//! the two listings and over those paths, which the shell reads for the few spellings that need it.
+//!
 //! The answer depends on the host's git configuration and the mount root, never on a workspace,
 //! so `setup` and `doctor` run it and `fork` does not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -81,31 +85,45 @@ fn probe_git_identity_with_env(
     let probe = ProbeRepo::create(candidate)?;
     let checkout_list = git_config_list(checkout, extra_env)?;
     let probe_list = git_config_list(&probe.path, extra_env)?;
-    Ok(diff_identity(
-        checkout,
-        &probe.path,
-        &checkout_list,
-        &probe_list,
-    ))
+    let found = Found::between(checkout, &probe.path, &checkout_list, &probe_list);
+    let observed = observe(&found.spellings_to_resolve())?;
+    Ok(found.gaps(&observed))
 }
 
-fn diff_identity(
-    checkout: &Path,
-    probe: &Path,
-    checkout_list: &str,
-    probe_list: &str,
-) -> Vec<GitIdentityGap> {
-    let checkout_cfg = parse_show_origin(checkout_list, checkout);
-    let probe_cfg = parse_show_origin(probe_list, probe);
-    let checkout_origins = origins_outside(checkout, &checkout_cfg.origins);
-    let probe_origins = origins_outside(probe, &probe_cfg.origins);
-    checkout_origins
-        .difference(&probe_origins)
-        .map(|file| GitIdentityGap {
-            include_if_condition: checkout_cfg.condition_for(file),
-            config_file: file.clone(),
-        })
-        .collect()
+/// What the two listings say before the disk is asked anything: the files only the checkout loads
+/// from outside its repository, and the checkout's own parse, which names their conditions.
+struct Found {
+    files: BTreeSet<PathBuf>,
+    config: ParsedConfig,
+}
+
+impl Found {
+    fn between(checkout: &Path, probe: &Path, checkout_list: &str, probe_list: &str) -> Self {
+        let config = parse_show_origin(checkout_list, checkout);
+        let probe_config = parse_show_origin(probe_list, probe);
+        let probe_origins = origins_outside(probe, &probe_config.origins);
+        let files = origins_outside(checkout, &config.origins)
+            .difference(&probe_origins)
+            .cloned()
+            .collect();
+        Self { files, config }
+    }
+
+    /// The spellings whose real files the disk has to show before a condition can be named.
+    fn spellings_to_resolve(&self) -> BTreeSet<PathBuf> {
+        self.config.spellings_to_resolve(&self.files)
+    }
+
+    /// The gaps, each with the condition that named its file, given what the disk showed.
+    fn gaps(self, observed: &Observed) -> Vec<GitIdentityGap> {
+        self.files
+            .into_iter()
+            .map(|file| GitIdentityGap {
+                include_if_condition: self.config.condition_for(&file, observed),
+                config_file: file,
+            })
+            .collect()
+    }
 }
 
 struct ParsedConfig {
@@ -115,12 +133,31 @@ struct ParsedConfig {
 }
 
 impl ParsedConfig {
-    fn condition_for(&self, file: &Path) -> Option<String> {
+    /// The condition whose included path is this file: that path as Git listed it, else a spelling
+    /// the disk showed resolving to the same real file.
+    fn condition_for(&self, file: &Path, observed: &Observed) -> Option<String> {
         self.include_if.get(file).cloned().or_else(|| {
             self.include_if.iter().find_map(|(included, condition)| {
-                same_config_file(included, file).then(|| condition.clone())
+                same_config_file(included, file, observed).then(|| condition.clone())
             })
         })
+    }
+
+    /// The spellings condition_for compares by their real files for these files: none when every
+    /// file is named by its own spelling, else each file that is not, and every included path.
+    fn spellings_to_resolve(&self, files: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+        let unnamed: Vec<&PathBuf> = files
+            .iter()
+            .filter(|file| !self.include_if.contains_key(*file))
+            .collect();
+        if unnamed.is_empty() {
+            return BTreeSet::new();
+        }
+        unnamed
+            .into_iter()
+            .chain(self.include_if.keys())
+            .cloned()
+            .collect()
     }
 }
 
@@ -224,14 +261,58 @@ fn origins_outside(repo: &Path, origins: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf
         .collect()
 }
 
-fn same_config_file(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
+/// What the disk says of one spelling of a config file's path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Canonical {
+    /// The file the spelling resolves to once every symlink is followed.
+    Real(PathBuf),
+    /// Nothing is there: an include Git skips as missing, or a spelling that names no file.
+    Absent,
+}
+
+/// What the disk showed of each spelling the decision asked about.
+type Observed = BTreeMap<PathBuf, Canonical>;
+
+/// Whether two spellings are one file: the same spelling, or two the disk showed resolving to the
+/// same real file. A spelling with nothing at it is no file, and so no other spelling's alias.
+fn same_config_file(left: &Path, right: &Path, observed: &Observed) -> bool {
+    let shown = |spelling: &Path| {
+        observed
+            .get(spelling)
+            .expect("the disk was asked about every spelling the decision compares")
+    };
+    left == right
+        || matches!(
+            (shown(left), shown(right)),
+            (Canonical::Real(real_left), Canonical::Real(real_right)) if real_left == real_right
+        )
+}
+
+/// The disk's answer for each spelling, the one place this probe follows symlinks. A spelling with
+/// nothing at it is absent; a read that fails any other way cannot tell absent from different, so
+/// it fails the probe naming the path, and is never taken for an answer.
+fn observe(spellings: &BTreeSet<PathBuf>) -> Result<Observed> {
+    spellings
+        .iter()
+        .map(|spelling| match fs::canonicalize(spelling) {
+            Ok(real) => Ok((spelling.clone(), Canonical::Real(real))),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok((spelling.clone(), Canonical::Absent))
+            }
+            Err(error) => Err(CowshedError::environment_missing(
+                format!(
+                    "could not resolve git config path {}: {error}",
+                    spelling.display()
+                ),
+                "cowshed doctor",
+            )),
+        })
+        .collect()
 }
 
 fn git_config_list(root: &Path, extra_env: &[(&str, &OsStr)]) -> Result<String> {
@@ -394,86 +475,243 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn matching_anchor_is_not_a_gap() {
-        let root = fs::canonicalize(temp_dir("git-identity-shared-anchor")).unwrap();
-        let checkout = root.join("Dev/widget");
-        let candidate = root.join("Dev/.cowshed/acme/widget/raven");
-        let extra = root.join("dev.gitconfig");
-        let global = root.join("global.gitconfig");
-        fs::create_dir_all(&checkout).unwrap();
-        fs::write(&extra, "[user]\n    name = Shared\n").unwrap();
-        fs::write(
-            &global,
-            format!(
-                "[includeIf \"gitdir:{}/\"]\n    path = {}\n",
-                root.join("Dev").display(),
-                extra.display()
-            ),
-        )
-        .unwrap();
-        git_at(&checkout, &[], ["init", "--quiet"]).unwrap();
+    /// One setting as git config --list --show-origin prints it: its origin, then the setting.
+    type Line = (&'static str, &'static str);
 
-        let env = [
-            ("GIT_CONFIG_GLOBAL", global.as_os_str()),
-            ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
-            ("GIT_CONFIG_SYSTEM", OsStr::new("/dev/null")),
-        ];
-        let gaps = probe_git_identity_with_env(&checkout, &candidate, &env).unwrap();
-        assert!(gaps.is_empty(), "{gaps:?}");
-        assert!(!candidate.exists());
-        let _ = fs::remove_dir_all(root);
+    /// Git names a repository's own config relative to the repository.
+    const LOCAL: Line = ("file:.git/config", "core.repositoryformatversion=0");
+
+    fn listing(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|(origin, setting)| format!("{origin}\t{setting}\n"))
+            .collect()
     }
 
-    /// A repository's own config is copied with every clone, so an include it names by a relative
-    /// path resolves inside each clone: no identity gap, however Git spells its origin
-    /// (`.git/../tooling/workspace.gitconfig`). A relative include that climbs out of the
-    /// repository lands somewhere else for a clone mounted elsewhere, and still is one.
+    /// Which origins are gaps is a decision over two listings, the checkout's and the candidate
+    /// mount's, so it is a table over their lines and never a Git run: only what the checkout
+    /// loads from outside its repository and the candidate does not is a gap, and it carries the
+    /// includeIf condition that named it. A repository's own files travel with every clone,
+    /// however Git spells their origin. The real-Git run above establishes that the listings are
+    /// what these rows say, and that its include loading is the fixture's adversary. These rows
+    /// plant nothing of the disk: what it shows of a spelling is a fact the next test plants.
     #[test]
-    fn a_relative_include_inside_the_repository_is_not_a_gap_and_one_outside_it_is() {
-        let root = fs::canonicalize(temp_dir("git-identity-relative-include")).unwrap();
-        let checkout = root.join("checkout");
-        let candidate = root.join("mnt/acme/widget/raven");
-        let global = root.join("global.gitconfig");
-        let shared = root.join("shared.gitconfig");
-        fs::create_dir_all(checkout.join("tooling")).unwrap();
-        fs::write(
-            checkout.join("tooling/workspace.gitconfig"),
-            "[merge \"newer-pins\"]\n    name = keep the newer pins\n",
-        )
-        .unwrap();
-        fs::write(&shared, "[user]\n    name = Shared\n").unwrap();
-        fs::write(&global, "").unwrap();
-        git_at(&checkout, &[], ["init", "--quiet"]).unwrap();
-        let env = [
-            ("GIT_CONFIG_GLOBAL", global.as_os_str()),
-            ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
-            ("GIT_CONFIG_SYSTEM", OsStr::new("/dev/null")),
+    fn a_gap_is_an_origin_only_the_checkout_loads_from_outside_its_repository() {
+        let gap = |file: &str, condition: Option<&str>| GitIdentityGap {
+            config_file: PathBuf::from(file),
+            include_if_condition: condition.map(str::to_owned),
+        };
+        let inside: [Line; 2] = [
+            (
+                "file:.git/config",
+                "include.path=../tooling/workspace.gitconfig",
+            ),
+            (
+                "file:.git/../tooling/workspace.gitconfig",
+                "merge.newer-pins.name=keep the newer pins",
+            ),
         ];
-        git_at(
-            &checkout,
-            &env,
-            ["config", "include.path", "../tooling/workspace.gitconfig"],
-        )
-        .unwrap();
-        let gaps = probe_git_identity_with_env(&checkout, &candidate, &env).unwrap();
-        assert!(gaps.is_empty(), "{gaps:?}");
+        let outside: [Line; 2] = [
+            ("file:.git/config", "include.path=../../shared.gitconfig"),
+            ("file:.git/../../shared.gitconfig", "user.name=Shared"),
+        ];
+        let under_dev: [Line; 3] = [
+            (
+                "file:/r/global.gitconfig",
+                "includeif.gitdir:/r/Dev/.path=/r/dev.gitconfig",
+            ),
+            ("file:/r/dev.gitconfig", "user.name=Shared"),
+            LOCAL,
+        ];
+        let at_checkout: [Line; 3] = [
+            (
+                "file:/r/global.gitconfig",
+                "includeif.gitdir:/r/checkout/.path=/r/dev.gitconfig",
+            ),
+            (
+                "file:/r/dev.gitconfig",
+                "user.email=cowshed-probe@example.com",
+            ),
+            LOCAL,
+        ];
+        let cases = [
+            (
+                "an anchor above both the checkout and the candidate covers both",
+                "/r/Dev/widget",
+                "/r/Dev/.cowshed/acme/widget/raven",
+                under_dev.to_vec(),
+                under_dev.to_vec(),
+                vec![],
+            ),
+            (
+                "an include anchored at the checkout only is the one gap, naming its condition",
+                "/r/checkout",
+                "/r/mnt/acme/widget/raven",
+                at_checkout.to_vec(),
+                vec![at_checkout[0], LOCAL],
+                vec![gap("/r/dev.gitconfig", Some("gitdir:/r/checkout/"))],
+            ),
+            (
+                "a relative include inside the repository travels with every clone",
+                "/r/checkout",
+                "/r/mnt/acme/widget/raven",
+                [vec![LOCAL], inside.to_vec()].concat(),
+                vec![LOCAL],
+                vec![],
+            ),
+            (
+                "a relative include that climbs out of the repository is a gap with no condition",
+                "/r/checkout",
+                "/r/mnt/acme/widget/raven",
+                [vec![LOCAL], inside.to_vec(), outside.to_vec()].concat(),
+                vec![LOCAL],
+                vec![gap("/r/shared.gitconfig", None)],
+            ),
+            (
+                "a setting that came from no file names no file",
+                "/r/checkout",
+                "/r/mnt/acme/widget/raven",
+                vec![("command line:", "user.name=Arg"), LOCAL],
+                vec![LOCAL],
+                vec![],
+            ),
+            (
+                "nothing included anywhere",
+                "/r/checkout",
+                "/r/mnt/acme/widget/raven",
+                vec![LOCAL],
+                vec![LOCAL],
+                vec![],
+            ),
+        ];
+        for (label, checkout, candidate, checkout_lines, probe_lines, expected) in cases {
+            assert_eq!(
+                gaps_of(checkout, candidate, &checkout_lines, &probe_lines, &[]),
+                expected,
+                "{label}"
+            );
+        }
+    }
 
-        git_at(
-            &checkout,
-            &env,
-            ["config", "--add", "include.path", "../../shared.gitconfig"],
-        )
-        .unwrap();
-        let gaps = probe_git_identity_with_env(&checkout, &candidate, &env).unwrap();
-        assert_eq!(
-            gaps,
-            vec![GitIdentityGap {
-                config_file: shared,
-                include_if_condition: None,
-            }]
+    /// What the disk shows, planted: each spelling the decision asks about resolves where the row
+    /// says, else nothing is there.
+    fn shown(asked: BTreeSet<PathBuf>, shows: &[(&str, &str)]) -> Observed {
+        asked
+            .into_iter()
+            .map(|spelling| {
+                let form = shows
+                    .iter()
+                    .find(|(from, _)| Path::new(from) == spelling)
+                    .map_or(Canonical::Absent, |(_, real)| {
+                        Canonical::Real(PathBuf::from(real))
+                    });
+                (spelling, form)
+            })
+            .collect()
+    }
+
+    fn gaps_of(
+        checkout: &str,
+        candidate: &str,
+        checkout_lines: &[Line],
+        probe_lines: &[Line],
+        shows: &[(&str, &str)],
+    ) -> Vec<GitIdentityGap> {
+        let found = Found::between(
+            Path::new(checkout),
+            Path::new(candidate),
+            &listing(checkout_lines),
+            &listing(probe_lines),
         );
-        assert!(!candidate.exists());
+        let observed = shown(found.spellings_to_resolve(), shows);
+        found.gaps(&observed)
+    }
+
+    /// An include can name a file by another spelling than the one Git listed it under. What the
+    /// disk shows of each spelling is a fact handed to the decision, so the table plants it: two
+    /// spellings are one file only when both resolve to the same real file, and a spelling with
+    /// nothing at it, or resolving elsewhere, is no alias.
+    #[test]
+    fn a_condition_follows_an_include_to_the_real_file_its_spelling_resolves_to() {
+        let global: Line = (
+            "file:/r/global.gitconfig",
+            "includeif.gitdir:/r/checkout/.path=/r/link/dev.gitconfig",
+        );
+        let included: Line = (
+            "file:/r/real/dev.gitconfig",
+            "user.email=cowshed-probe@example.com",
+        );
+        let gap = |condition: Option<&str>| {
+            vec![GitIdentityGap {
+                config_file: PathBuf::from("/r/real/dev.gitconfig"),
+                include_if_condition: condition.map(str::to_owned),
+            }]
+        };
+        let real = ("/r/real/dev.gitconfig", "/r/real/dev.gitconfig");
+        for (label, shows, expected) in [
+            (
+                "two spellings of one real file are one file",
+                vec![("/r/link/dev.gitconfig", "/r/real/dev.gitconfig"), real],
+                gap(Some("gitdir:/r/checkout/")),
+            ),
+            (
+                "spellings that resolve to different files are two files",
+                vec![("/r/link/dev.gitconfig", "/r/other/dev.gitconfig"), real],
+                gap(None),
+            ),
+            (
+                "a spelling with nothing at it is no alias, however absent both are",
+                vec![],
+                gap(None),
+            ),
+        ] {
+            assert_eq!(
+                gaps_of(
+                    "/r/checkout",
+                    "/r/mnt/acme/widget/raven",
+                    &[global, included, LOCAL],
+                    &[global, LOCAL],
+                    &shows
+                ),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// The shell's answers: a spelling through a symlink resolves to the real file; a spelling with
+    /// nothing at it, or under a file, is absent; a read that fails any other way (a symlink loop)
+    /// fails the probe naming the path, never an answer.
+    #[test]
+    fn the_disk_is_asked_per_spelling_and_a_failure_to_tell_fails_the_probe() {
+        let root = fs::canonicalize(temp_dir("git-identity-observe")).unwrap();
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("dev.gitconfig"), "").unwrap();
+        std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+        let through_link = root.join("link/dev.gitconfig");
+        let direct = real.join("dev.gitconfig");
+        let under_a_file = direct.join("inside");
+        let absent = root.join("absent.gitconfig");
+
+        let observed = observe(&BTreeSet::from([
+            through_link.clone(),
+            direct.clone(),
+            under_a_file.clone(),
+            absent.clone(),
+        ]))
+        .expect("every spelling answers");
+        assert_eq!(observed[&through_link], Canonical::Real(direct.clone()));
+        assert_eq!(observed[&direct], Canonical::Real(direct.clone()));
+        assert_eq!(observed[&under_a_file], Canonical::Absent);
+        assert_eq!(observed[&absent], Canonical::Absent);
+
+        std::os::unix::fs::symlink(root.join("loop_b"), root.join("loop_a")).unwrap();
+        std::os::unix::fs::symlink(root.join("loop_a"), root.join("loop_b")).unwrap();
+        let error = observe(&BTreeSet::from([root.join("loop_a")]))
+            .expect_err("a symlink loop cannot be told from absence");
+        assert!(error.to_string().contains("loop_a"), "{error}");
+
         let _ = fs::remove_dir_all(root);
     }
 

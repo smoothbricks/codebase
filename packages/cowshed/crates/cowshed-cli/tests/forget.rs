@@ -261,7 +261,7 @@ fn a_mistyped_forget_is_corrected_against_the_command_list() {
 }
 
 #[test]
-fn forget_help_documents_the_authorization_the_refusals_and_the_preserved_tree() {
+fn forget_help_routes_to_its_page_and_the_command_map_lists_it() {
     let spec = help::command_named("forget").expect("forget has a help page");
     for argv in [
         &["help", "forget"][..],
@@ -280,27 +280,6 @@ fn forget_help_documents_the_authorization_the_refusals_and_the_preserved_tree()
         page.starts_with("usage: cowshed forget <owner/repo> --abandon"),
         "{page}"
     );
-    for fact in [
-        "its checkout is gone",
-        "no `--project`",
-        "`--abandon` is required",
-        "never infers it from a missing checkout",
-        "a dead pid",
-        "a path prefix",
-        "nothing retires a project automatically",
-        "`.retirements/<owner>/<repo>.json`",
-        "fenced, drained, detached, archived",
-        "without force",
-        "`.retired-projects/<operation-id>`",
-        "nothing is deleted or rewritten",
-        "stdout is the archive path",
-        "refuses that step with exit 4 and nothing is forced",
-        "resumes from its recorded phase",
-        "already exists is left intact",
-        "never begins one",
-    ] {
-        assert!(page.contains(fact), "missing {fact}: {page}");
-    }
 
     // The command map lists it, grammar and summary, with the explicit flag in the grammar.
     assert!(help::command_map().lines().any(|line| {

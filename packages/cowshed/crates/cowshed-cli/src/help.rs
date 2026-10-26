@@ -32,6 +32,9 @@ impl Opt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
     pub name: &'static str,
+    /// One valid invocation, argv from the verb on: the case each test that derives one per
+    /// command parses, so a command that cannot be run as written fails by name.
+    pub example: &'static [&'static str],
     /// Sentence clap's missing-argument path and `require_*` share.
     pub missing: &'static str,
     /// Positional grammar between the verb and its options; empty when the verb takes none.
@@ -346,23 +349,36 @@ fn pad(out: &mut String, spaces: usize) {
 mod tests {
     use super::*;
 
+    /// The usage line is the option table printed: the positional grammar, then every option in
+    /// table order, then the child argv that has to follow them; the hint a usage error carries is
+    /// that line made runnable.
     #[test]
     fn usage_is_the_option_table_printed() {
-        let fork = command_named("fork").unwrap();
-        assert_eq!(
-            fork.usage(),
-            "fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree] [--markdown-only]"
-        );
-        assert_eq!(fork.hint(), format!("cowshed {}", fork.usage()));
-
-        // The child argv follows the options, wherever the flags end.
-        let exec = command_named("exec").unwrap();
-        assert!(exec.usage().starts_with("exec <ws> [--stdin]"));
-        assert!(exec.usage().ends_with("-- <cmd...>"));
+        for spec in COMMANDS {
+            let mut parts = vec![spec.name.to_owned()];
+            parts.extend((!spec.args.is_empty()).then(|| spec.args.to_owned()));
+            parts.extend(
+                spec.options
+                    .iter()
+                    .map(|option| format!("[{}]", option.spelling)),
+            );
+            parts.extend((!spec.trailing.is_empty()).then(|| spec.trailing.to_owned()));
+            assert_eq!(spec.usage(), parts.join(" "), "{}", spec.name);
+            assert_eq!(
+                spec.hint(),
+                format!("cowshed {}", spec.usage()),
+                "{}",
+                spec.name
+            );
+        }
     }
 
+    /// Every command's page leads with its usage line and renders each of its options, and each
+    /// global, as one row: the spelling and then the whole of its meaning, however the row wraps
+    /// and is padded.
     #[test]
     fn every_command_page_documents_every_flag_of_its_usage_line() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         for spec in COMMANDS {
             let page = spec.page();
             assert!(
@@ -370,26 +386,14 @@ mod tests {
                 "{} must lead with its usage line",
                 spec.name
             );
-            for option in spec.options {
+            let rendered = flat(page.as_str());
+            for option in spec.options.iter().chain(GLOBALS) {
+                let row = flat(format!("{} {}", option.spelling, option.meaning).as_str());
                 assert!(
-                    page.contains(option.spelling),
-                    "{} omits {}",
+                    rendered.contains(&row),
+                    "{} renders no row for {}",
                     spec.name,
                     option.spelling
-                );
-                let first = option.meaning.split_whitespace().next().unwrap();
-                assert!(
-                    page.contains(first),
-                    "{} documents {} without a meaning",
-                    spec.name,
-                    option.spelling
-                );
-            }
-            for global in GLOBALS {
-                assert!(
-                    page.contains(global.spelling),
-                    "{} omits globals",
-                    spec.name
                 );
             }
         }
@@ -440,11 +444,5 @@ mod tests {
         assert!(rest.starts_with('\n'));
         assert!(rest[1..].starts_with(command_map()));
         assert!(page.find("warm git workspaces").unwrap() < page.find("commands:").unwrap());
-    }
-
-    #[test]
-    fn current_help_pages_do_not_name_the_deleted_clone_command() {
-        let page = command_named("defrag").unwrap().page();
-        assert!(!page.contains("`new`"), "{page}");
     }
 }

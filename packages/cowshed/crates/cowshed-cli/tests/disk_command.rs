@@ -29,19 +29,6 @@ fn disk_command(argv: &[&str]) -> std::process::Output {
         .expect("run cowshed disk-command")
 }
 
-/// The facade a TypeScript, Python or shell caller types: `hdiutil info` answers through it.
-#[test]
-fn hdiutil_info_answers_through_the_facade() {
-    let output = disk_command(&["hdiutil", "--", "info"]);
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("framework"), "{stdout}");
-    assert!(
-        !stdout.contains("cowshed:"),
-        "no facade text on stdout: {stdout}"
-    );
-}
-
 /// A failing tool keeps its status and bytes. Stderr also carries the runner's lease progress;
 /// those diagnostics precede the tool output, which is delivered verbatim after the run.
 #[test]

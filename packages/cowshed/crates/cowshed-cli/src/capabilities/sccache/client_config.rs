@@ -177,19 +177,34 @@ impl fmt::Display for ConfigConflict {
 /// Mirrors `directories::ProjectDirs::from("", "Mozilla", "sccache")` per platform, which is what
 /// sccache builds its own paths from. The legacy `preference_dir` candidate is macOS-only: the
 /// `directories` split that created it exists nowhere else, and on XDG platforms `preference_dir`
-/// and `config_dir` are the same directory.
+/// and `config_dir` are the same directory. This is the one probe of the disk: it asks whether each
+/// candidate exists and hands those facts to `config_path`, which chooses.
 pub fn client_config_path(home: &Path) -> PathBuf {
-    let candidates = config_directories(home);
-    candidates
-        .iter()
-        .map(|directory| directory.join(CONFIG_LEAF))
-        .find(|candidate| candidate.exists())
-        .unwrap_or_else(|| {
-            candidates
-                .first()
-                .expect("every platform has at least one sccache config directory")
-                .join(CONFIG_LEAF)
+    let observed = config_directories(home)
+        .into_iter()
+        .map(|directory| {
+            let file = directory.join(CONFIG_LEAF);
+            let exists = file.exists();
+            (file, exists)
         })
+        .collect();
+    config_path(observed)
+}
+
+/// The config file sccache reads, given the candidates it consults, in its order, each with whether
+/// it exists: the first that does, else the first candidate, where sccache would make one. The
+/// choice is pure over those facts, so a table states every combination.
+fn config_path(candidates: Vec<(PathBuf, bool)>) -> PathBuf {
+    let mut candidates = candidates.into_iter();
+    let (first, first_exists) = candidates
+        .next()
+        .expect("every platform has at least one sccache config directory");
+    if first_exists {
+        return first;
+    }
+    candidates
+        .find_map(|(file, exists)| exists.then_some(file))
+        .unwrap_or(first)
 }
 
 /// Read the file sccache would load, decide, and act — the only function here that touches disk.
@@ -789,28 +804,36 @@ mod tests {
 
     /// The path cowshed writes is the path sccache reads, including the legacy location sccache
     /// still prefers when a config already lives there. Writing the new path over an existing old
-    /// one would shadow it rather than replace it, and silently move that user's cache.
+    /// one would shadow it rather than replace it, and silently move that user's cache. Judged
+    /// over which of the two candidates exist, in every combination, as facts handed to the choice;
+    /// the on-disk check is the apply test above.
     #[cfg(target_os = "macos")]
     #[test]
     fn resolution_follows_sccache_and_prefers_an_existing_legacy_config() {
-        let home = std::env::temp_dir().join(format!(
-            "cowshed-sccache-config-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let modern = home.join("Library/Application Support/Mozilla.sccache");
-        let legacy = home.join("Library/Preferences/Mozilla.sccache");
-        std::fs::create_dir_all(&legacy).expect("legacy directory");
-
-        assert_eq!(client_config_path(&home), modern.join(CONFIG_LEAF));
-
-        std::fs::write(legacy.join(CONFIG_LEAF), b"").expect("legacy config");
-        assert_eq!(client_config_path(&home), legacy.join(CONFIG_LEAF));
-
-        std::fs::create_dir_all(&modern).expect("modern directory");
-        std::fs::write(modern.join(CONFIG_LEAF), b"").expect("modern config");
-        assert_eq!(client_config_path(&home), modern.join(CONFIG_LEAF));
-
-        std::fs::remove_dir_all(&home).expect("clean up");
+        let home = Path::new("/home/dev");
+        let modern = home
+            .join("Library/Application Support/Mozilla.sccache")
+            .join(CONFIG_LEAF);
+        let legacy = home
+            .join("Library/Preferences/Mozilla.sccache")
+            .join(CONFIG_LEAF);
+        for (modern_exists, legacy_exists, chosen) in [
+            (false, false, &modern),
+            (false, true, &legacy),
+            (true, false, &modern),
+            (true, true, &modern),
+        ] {
+            // The platform's own candidates, in the order it lists them, each with its fact.
+            let observed = config_directories(home)
+                .into_iter()
+                .map(|directory| directory.join(CONFIG_LEAF))
+                .zip([modern_exists, legacy_exists])
+                .collect();
+            assert_eq!(
+                config_path(observed),
+                *chosen,
+                "modern exists {modern_exists}, legacy exists {legacy_exists}"
+            );
+        }
     }
 }

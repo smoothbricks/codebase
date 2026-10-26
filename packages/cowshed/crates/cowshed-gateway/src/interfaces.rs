@@ -31,6 +31,21 @@ pub enum NegotiatedTransport {
     Raw,
 }
 
+impl NegotiatedTransport {
+    /// The transport an upstream TLS session's negotiated ALPN selects (05_gateway.md,
+    /// "Interception engine": h1 and h2 on both legs). A session that negotiated no protocol, or
+    /// one the gateway does not speak, is refused before any request byte is written: the gateway
+    /// never assumes HTTP/1.1 over an upstream that did not agree to it, and never downgrades h2.
+    pub fn from_upstream_alpn(alpn: Option<&[u8]>) -> Result<Self, ConnectError> {
+        match alpn {
+            Some(ALPN_H2) => Ok(Self::Http2),
+            Some(ALPN_HTTP_1_1) => Ok(Self::Http1),
+            Some(_) => Err(ConnectError::UnsupportedAlpn),
+            None => Err(ConnectError::MissingAlpn),
+        }
+    }
+}
+
 pub(crate) const ALPN_H2: &[u8] = b"h2";
 pub(crate) const ALPN_HTTP_1_1: &[u8] = b"http/1.1";
 
@@ -158,12 +173,7 @@ impl UpstreamConnector for SystemConnector {
         .await
         .map_err(|_| ConnectError::TlsTimeout)?
         .map_err(|error| ConnectError::Tls(error.to_string()))?;
-        let transport = match tls.get_ref().1.alpn_protocol() {
-            Some(ALPN_H2) => NegotiatedTransport::Http2,
-            Some(ALPN_HTTP_1_1) => NegotiatedTransport::Http1,
-            Some(_) => return Err(ConnectError::UnsupportedAlpn),
-            None => return Err(ConnectError::MissingAlpn),
-        };
+        let transport = NegotiatedTransport::from_upstream_alpn(tls.get_ref().1.alpn_protocol())?;
         Ok(UpstreamConnection {
             io: Box::new(tls),
             transport,
@@ -369,3 +379,32 @@ pub trait AuditSink: Send + Sync + 'static {
 pub struct AuditError(pub String);
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_upstream_session_speaks_only_the_protocol_its_alpn_selected() {
+        let rows: [(Option<&[u8]>, Option<NegotiatedTransport>); 5] = [
+            (Some(b"h2".as_slice()), Some(NegotiatedTransport::Http2)),
+            (
+                Some(b"http/1.1".as_slice()),
+                Some(NegotiatedTransport::Http1),
+            ),
+            (Some(b"http/1.0".as_slice()), None),
+            (Some(b"h3".as_slice()), None),
+            (None, None),
+        ];
+        for (alpn, selected) in rows {
+            let decided = NegotiatedTransport::from_upstream_alpn(alpn);
+            assert_eq!(decided.as_ref().ok().copied(), selected, "{alpn:?}");
+            match (alpn, decided) {
+                (_, Ok(_)) => {}
+                (None, Err(ConnectError::MissingAlpn)) => {}
+                (Some(_), Err(ConnectError::UnsupportedAlpn)) => {}
+                (alpn, Err(error)) => panic!("{alpn:?} refused as {error}"),
+            }
+        }
+    }
+}

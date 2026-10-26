@@ -13,7 +13,7 @@ use cowshed_gateway_types::{CanonicalTarget, MirrorProtocol, decode_percent};
 use crate::{
     cache::{
         Cache, CacheAcquire, CacheBodyError, CacheError, CacheKey, CacheNamespace, CachedResponse,
-        NpmExpectationLookup, ObjectExpectation, unix_ms,
+        NpmExpectationLookup, ObjectExpectation,
     },
     interfaces::UpstreamHealth,
 };
@@ -308,9 +308,7 @@ impl MirrorService {
                     .await?,
             );
         }
-        let outcome = self
-            .execute_expected(&mut request, health, upstream)
-            .await?;
+        let outcome = self.execute_expected(&request, health, upstream).await?;
         answer_validators(&request.headers, outcome).await
     }
 
@@ -345,7 +343,7 @@ impl MirrorService {
                     header::ACCEPT,
                     HeaderValue::from_static(PackumentRepresentation::InstallV1.upstream_accept()),
                 );
-                let mut packument = MirrorRequest::new(
+                let packument = MirrorRequest::new(
                     MirrorProtocol::Npm,
                     tarball.target.clone(),
                     Method::GET,
@@ -355,9 +353,8 @@ impl MirrorService {
                     tarball.credentialed,
                     None,
                 )?;
-                let MirrorOutcome::Response(response) = self
-                    .execute_expected(&mut packument, health, upstream)
-                    .await?
+                let MirrorOutcome::Response(response) =
+                    self.execute_expected(&packument, health, upstream).await?
                 else {
                     return Err(MirrorError::MissingIntegrity);
                 };
@@ -428,7 +425,7 @@ impl MirrorService {
 
     async fn execute_expected<U>(
         &self,
-        request: &mut MirrorRequest,
+        request: &MirrorRequest,
         health: UpstreamHealth,
         upstream: &U,
     ) -> Result<MirrorOutcome, MirrorError>
@@ -456,7 +453,7 @@ impl MirrorService {
                     Err(CacheError::DigestMismatch | CacheError::InvalidMetadata) => continue,
                     Err(error) => return Err(error.into()),
                 },
-                CacheAcquire::Wait(wait) => match self.cache.retry_after_wait(wait).await {
+                CacheAcquire::Wait(wait) => match wait.ended().await {
                     Ok(())
                     | Err(
                         CacheError::FillAborted
@@ -486,76 +483,72 @@ impl MirrorService {
                     let response = self
                         .fetch_observed(&request.target, fetch, upstream)
                         .await?;
-                    if response.status() == StatusCode::NOT_MODIFIED {
-                        if previous.is_none() {
+                    let plan = match plan_fill(
+                        request,
+                        previous.is_some(),
+                        response.status(),
+                        response.headers(),
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => {
                             permit.bypass().await?;
-                            return Err(MirrorError::UnexpectedNotModified);
+                            return Err(error);
                         }
-                        let candidate = permit.not_modified().await?;
-                        let hit = self.cache.open_candidate(candidate).await?;
-                        return Ok(MirrorOutcome::Response(MirrorResponse {
-                            response: response_from_hit(hit, false)?,
-                            cache_status: MirrorCacheStatus::Revalidated,
-                        }));
-                    }
-                    if response.status().is_redirection() {
-                        permit.bypass().await?;
-                        return redirect_outcome(request, &response);
-                    }
-                    validate_representation(&response)?;
-                    if response.status() != StatusCode::OK || !cacheable(request, &response) {
-                        permit.bypass().await?;
-                        return Ok(MirrorOutcome::Response(MirrorResponse {
-                            response: sanitize_response(response),
-                            cache_status: MirrorCacheStatus::Bypassed,
-                        }));
-                    }
-                    if request.metadata.kind == MirrorResourceKind::Immutable
-                        && request.metadata.expected.is_none()
-                    {
-                        permit.bypass().await?;
-                        return Err(MirrorError::MissingIntegrity);
-                    }
-                    if let Some(expected) = &mut request.metadata.expected
-                        && expected.length == 0
-                    {
-                        expected.length = response_content_length(&response)?;
-                    }
-                    let max_bytes = response_limit(request, &response)?;
-                    let (mut parts, body) = response.into_parts();
-                    strip_response_secrets(&mut parts.headers);
-                    let cached = CachedResponse {
-                        status: parts.status,
-                        headers: parts.headers.clone(),
-                        content_length: 0,
-                        content_sha256: [0; 32],
-                        expected: request.metadata.expected,
-                        stored_unix_ms: unix_ms(SystemTime::now())
-                            .map_err(|_| MirrorError::Clock)?,
-                        npm_tarballs: None,
-                        npm_index_bytes: 0,
                     };
-                    let mut body = self
-                        .cache
-                        .start_fill(permit, cached, max_bytes, body)
-                        .await?;
-                    if request.representation.is_some()
-                        && parts
-                            .headers
-                            .get(header::CONTENT_TYPE)
-                            .and_then(|value| value.to_str().ok())
-                            .is_some_and(|value| {
-                                value.starts_with("application/json")
-                                    || value.starts_with("application/vnd.npm.install-v1+json")
-                            })
-                    {
-                        body = body.with_npm_index(request.target.clone());
+                    match plan {
+                        FillPlan::Revalidated => {
+                            let candidate = permit.not_modified().await?;
+                            let hit = self.cache.open_candidate(candidate).await?;
+                            return Ok(MirrorOutcome::Response(MirrorResponse {
+                                response: response_from_hit(hit, false)?,
+                                cache_status: MirrorCacheStatus::Revalidated,
+                            }));
+                        }
+                        FillPlan::Redirect(hop) => {
+                            permit.bypass().await?;
+                            return Ok(MirrorOutcome::Redirect(MirrorRedirect { request: hop }));
+                        }
+                        FillPlan::Bypass => {
+                            permit.bypass().await?;
+                            return Ok(MirrorOutcome::Response(MirrorResponse {
+                                response: sanitize_response(response),
+                                cache_status: MirrorCacheStatus::Bypassed,
+                            }));
+                        }
+                        FillPlan::Publish {
+                            expected,
+                            max_bytes,
+                            index_packument,
+                        } => {
+                            let (mut parts, body) = response.into_parts();
+                            strip_response_secrets(&mut parts.headers);
+                            let cached = CachedResponse {
+                                status: parts.status,
+                                headers: parts.headers.clone(),
+                                content_length: 0,
+                                content_sha256: [0; 32],
+                                expected,
+                                stored_unix_ms: self
+                                    .cache
+                                    .now_unix_ms()
+                                    .map_err(|_| MirrorError::Clock)?,
+                                npm_tarballs: None,
+                                npm_index_bytes: 0,
+                            };
+                            let mut body = self
+                                .cache
+                                .start_fill(permit, cached, max_bytes, body)
+                                .await?;
+                            if index_packument {
+                                body = body.with_npm_index(request.target.clone());
+                            }
+                            let body = body.boxed();
+                            return Ok(MirrorOutcome::Response(MirrorResponse {
+                                response: Response::from_parts(parts, body),
+                                cache_status: MirrorCacheStatus::Filled,
+                            }));
+                        }
                     }
-                    let body = body.boxed();
-                    return Ok(MirrorOutcome::Response(MirrorResponse {
-                        response: Response::from_parts(parts, body),
-                        cache_status: MirrorCacheStatus::Filled,
-                    }));
                 }
             }
         }
@@ -573,7 +566,8 @@ impl MirrorService {
             .fetch_observed(&request.target, request.to_fetch(), upstream)
             .await?;
         if response.status().is_redirection() {
-            redirect_outcome(request, &response)
+            redirect_plan(request, response.status(), response.headers())
+                .map(|hop| MirrorOutcome::Redirect(MirrorRedirect { request: hop }))
         } else {
             Ok(MirrorOutcome::Response(MirrorResponse {
                 response: sanitize_response(response),
@@ -813,15 +807,8 @@ fn parse_quality(value: &str) -> Option<u16> {
     }
 }
 
-fn response_content_length(response: &Response<MirrorBody>) -> Result<u64, MirrorError> {
-    response_content_length_optional(response)?.ok_or(MirrorError::MissingContentLength)
-}
-
-fn response_content_length_optional(
-    response: &Response<MirrorBody>,
-) -> Result<Option<u64>, MirrorError> {
-    response
-        .headers()
+fn content_length(headers: &HeaderMap) -> Result<Option<u64>, MirrorError> {
+    headers
         .get(header::CONTENT_LENGTH)
         .map(|value| {
             value
@@ -833,9 +820,8 @@ fn response_content_length_optional(
         .transpose()
 }
 
-fn validate_representation(response: &Response<MirrorBody>) -> Result<(), MirrorError> {
-    if response
-        .headers()
+fn validate_representation(headers: &HeaderMap) -> Result<(), MirrorError> {
+    if headers
         .get(header::CONTENT_ENCODING)
         .is_some_and(|value| value.as_bytes() != b"identity")
     {
@@ -995,12 +981,81 @@ fn not_modified(representation: &HeaderMap) -> Response<MirrorBody> {
     response
 }
 
-fn response_limit(
+/// What a fill does with the upstream's answer, decided from the answer's head alone (status and
+/// headers, never the body) and from what was asked. Every refusal is an `Err` and starts no cache
+/// write; every acceptance names what the cache will store.
+enum FillPlan {
+    /// The registry answered the mirror's own conditional with 304: the cached entry is current.
+    Revalidated,
+    /// A redirect: the typed hop for the caller to re-admit, never followed here.
+    Redirect(MirrorFetchRequest),
+    /// An answer the cache does not store (an error status, an unsafe `Vary`, a cookie,
+    /// `no-store`): the client gets it as it came.
+    Bypass,
+    /// A 200 the cache stores while it streams it.
+    Publish {
+        /// The integrity the stored object is verified against, its length settled.
+        expected: Option<ObjectExpectation>,
+        /// The most bytes the fill may write.
+        max_bytes: u64,
+        /// Whether the same pass records the tarball index of a packument.
+        index_packument: bool,
+    },
+}
+
+/// The plan for the answer `status` and `headers` of the registry to a fill's request, `previous`
+/// saying whether the fill revalidates a cached entry.
+fn plan_fill(
     request: &MirrorRequest,
-    response: &Response<MirrorBody>,
+    previous: bool,
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<FillPlan, MirrorError> {
+    if status == StatusCode::NOT_MODIFIED {
+        return if previous {
+            Ok(FillPlan::Revalidated)
+        } else {
+            Err(MirrorError::UnexpectedNotModified)
+        };
+    }
+    if status.is_redirection() {
+        return redirect_plan(request, status, headers).map(FillPlan::Redirect);
+    }
+    validate_representation(headers)?;
+    if status != StatusCode::OK || !cacheable(request, headers) {
+        return Ok(FillPlan::Bypass);
+    }
+    let mut expected = request.metadata.expected;
+    if expected.is_none() && request.metadata.kind == MirrorResourceKind::Immutable {
+        return Err(MirrorError::MissingIntegrity);
+    }
+    if let Some(expected) = &mut expected
+        && expected.length == 0
+    {
+        expected.length = content_length(headers)?.ok_or(MirrorError::MissingContentLength)?;
+    }
+    let max_bytes = response_limit(expected, headers)?;
+    let index_packument = request.representation.is_some()
+        && headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.starts_with("application/json")
+                    || value.starts_with("application/vnd.npm.install-v1+json")
+            });
+    Ok(FillPlan::Publish {
+        expected,
+        max_bytes,
+        index_packument,
+    })
+}
+
+fn response_limit(
+    expected: Option<ObjectExpectation>,
+    headers: &HeaderMap,
 ) -> Result<u64, MirrorError> {
-    let header_length = response_content_length_optional(response)?;
-    if let Some(expected) = request.metadata.expected {
+    let header_length = content_length(headers)?;
+    if let Some(expected) = expected {
         let length = header_length.ok_or(MirrorError::MissingContentLength)?;
         if length != expected.length {
             return Err(MirrorError::LengthMismatch);
@@ -1010,13 +1065,12 @@ fn response_limit(
     Ok(header_length.unwrap_or(u64::MAX))
 }
 
-fn cacheable(request: &MirrorRequest, response: &Response<MirrorBody>) -> bool {
-    if response.headers().contains_key(header::SET_COOKIE) {
+fn cacheable(request: &MirrorRequest, headers: &HeaderMap) -> bool {
+    if headers.contains_key(header::SET_COOKIE) {
         return false;
     }
     // `Vary: accept` is safe only because each packument representation is its own cache entry.
-    let unsupported_vary = response
-        .headers()
+    let unsupported_vary = headers
         .get_all(header::VARY)
         .iter()
         .filter_map(|value| value.to_str().ok())
@@ -1029,8 +1083,7 @@ fn cacheable(request: &MirrorRequest, response: &Response<MirrorBody>) -> bool {
     if unsupported_vary {
         return false;
     }
-    let cache_control = response
-        .headers()
+    let cache_control = headers
         .get_all(header::CACHE_CONTROL)
         .iter()
         .filter_map(|value| value.to_str().ok())
@@ -1058,15 +1111,19 @@ fn sanitize_response(mut response: Response<MirrorBody>) -> Response<MirrorBody>
     response
 }
 
-fn redirect_outcome(
+/// The hop a redirect answer names, or why it is refused: a hop budget left, one of the four
+/// statuses that keep the method, and a location that stays on the request's own origin and
+/// package. The hop carries the request's headers less every secret.
+fn redirect_plan(
     request: &MirrorRequest,
-    response: &Response<MirrorBody>,
-) -> Result<MirrorOutcome, MirrorError> {
+    status: StatusCode,
+    response_headers: &HeaderMap,
+) -> Result<MirrorFetchRequest, MirrorError> {
     if request.redirects_remaining == 0 {
         return Err(MirrorError::TooManyRedirects);
     }
     if !matches!(
-        response.status(),
+        status,
         StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
             | StatusCode::TEMPORARY_REDIRECT
@@ -1074,8 +1131,7 @@ fn redirect_outcome(
     ) {
         return Err(MirrorError::UnsafeRedirect);
     }
-    let location = response
-        .headers()
+    let location = response_headers
         .get(header::LOCATION)
         .ok_or(MirrorError::InvalidRedirect)?
         .to_str()
@@ -1106,16 +1162,14 @@ fn redirect_outcome(
     }
     let mut headers = request.headers.clone();
     strip_request_secrets(&mut headers);
-    Ok(MirrorOutcome::Redirect(MirrorRedirect {
-        request: MirrorFetchRequest {
-            protocol: request.protocol,
-            target,
-            method: request.method.clone(),
-            path,
-            headers,
-            redirects_remaining: request.redirects_remaining - 1,
-        },
-    }))
+    Ok(MirrorFetchRequest {
+        protocol: request.protocol,
+        target,
+        method: request.method.clone(),
+        path,
+        headers,
+        redirects_remaining: request.redirects_remaining - 1,
+    })
 }
 
 fn classify(
@@ -1262,6 +1316,8 @@ impl fmt::Debug for dyn MirrorUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::ObjectDigest;
+    use cowshed_gateway_types::TargetScheme;
 
     #[test]
     fn mirror_and_generic_hops_apply_the_same_header_policy() {
@@ -1438,6 +1494,8 @@ mod tests {
             ("\"a\"", "\"b\" , , \tW/\"a\"", true),
             ("\"a,b\"", "\"a,b\"", true),
             ("\"a\"", "*", true),
+            ("\"a\"", "\"b\",W/\"a\" ,\"c\"", true),
+            ("\"a,b\"", "W/\"a,b\"", true),
             ("\"a\"", "\"b\"", false),
             ("\"a\"", "\"A\"", false),
             ("\"a\"", "\"ab\"", false),
@@ -1448,6 +1506,8 @@ mod tests {
             ("\"a\"", "w/\"a\"", false),
             ("\"a\"", "W/a", false),
             ("\"a\"", "\"a", false),
+            ("W/\"a\"", "\"b\"", false),
+            ("W/\"a\"", "W/\"b\"", false),
             // A malformed member ends the list: what follows it is never read.
             ("\"a\"", "a, \"a\"", false),
             // The registry's own ETag must be one entity-tag for anything but `*` to match it.
@@ -1510,6 +1570,19 @@ mod tests {
             !holds(&[(header::IF_NONE_MATCH, "\"b\""), since()], &modified),
             "If-None-Match rules out If-Modified-Since"
         );
+        assert!(
+            holds(
+                &[
+                    (header::IF_NONE_MATCH, "W/\"a\""),
+                    (header::IF_MODIFIED_SINCE, "Thu, 25 Dec 2025 00:00:00 GMT"),
+                ],
+                &[
+                    (header::ETAG, "\"a\""),
+                    (header::LAST_MODIFIED, "Fri, 26 Dec 2025 06:55:24 GMT"),
+                ]
+            ),
+            "a matching If-None-Match holds the representation whatever If-Modified-Since says"
+        );
     }
 
     #[test]
@@ -1539,5 +1612,579 @@ mod tests {
             ["cache-control", "date", "etag", "last-modified", "vary"]
         );
         assert_eq!(response.headers().get_all(header::VARY).iter().count(), 2);
+    }
+
+    fn header_map(fields: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in fields {
+            headers.append(
+                header::HeaderName::from_bytes(name.as_bytes()).expect("fixture header name"),
+                HeaderValue::from_str(value).expect("fixture header value"),
+            );
+        }
+        headers
+    }
+
+    fn npm_request(
+        path: &str,
+        scope: MirrorCacheScope,
+        expected: Option<ObjectExpectation>,
+        client: &[(&str, &str)],
+    ) -> MirrorRequest {
+        MirrorRequest::new(
+            MirrorProtocol::Npm,
+            CanonicalTarget::from_authority("registry.npmjs.org:443", TargetScheme::Https)
+                .expect("fixture target"),
+            Method::GET,
+            path.to_owned(),
+            header_map(client),
+            scope,
+            false,
+            expected,
+        )
+        .expect("valid fixture request")
+    }
+
+    fn cached(fields: &[(&str, &str)]) -> CachedResponse {
+        CachedResponse {
+            status: StatusCode::OK,
+            headers: header_map(fields),
+            content_length: 0,
+            content_sha256: [0; 32],
+            expected: None,
+            stored_unix_ms: 0,
+            npm_tarballs: None,
+            npm_index_bytes: 0,
+        }
+    }
+
+    /// A plan as one line, so a table row names what it expects.
+    fn verdict(plan: Result<FillPlan, MirrorError>) -> String {
+        match plan {
+            Ok(FillPlan::Revalidated) => "revalidate".to_owned(),
+            Ok(FillPlan::Redirect(hop)) => {
+                format!(
+                    "redirect {} with {} left",
+                    hop.path, hop.redirects_remaining
+                )
+            }
+            Ok(FillPlan::Bypass) => "bypass".to_owned(),
+            Ok(FillPlan::Publish {
+                expected,
+                max_bytes,
+                index_packument,
+            }) => {
+                let verified = expected.map_or_else(
+                    || "unverified".to_owned(),
+                    |expected| expected.length.to_string(),
+                );
+                format!("publish up to {max_bytes} bytes, {verified}, index {index_packument}")
+            }
+            Err(error) => format!("refuse {error:?}"),
+        }
+    }
+
+    #[test]
+    fn a_response_head_decides_what_a_fill_stores_streams_or_refuses() {
+        let packument = npm_request("/react", MirrorCacheScope::Anonymous, None, &[]);
+        let project = npm_request(
+            "/react",
+            MirrorCacheScope::Project("owner/repo".to_owned()),
+            None,
+            &[],
+        );
+        let exhausted = {
+            let mut request = npm_request("/react", MirrorCacheScope::Anonymous, None, &[]);
+            request.redirects_remaining = 0;
+            request
+        };
+        let published = |length: u64| {
+            Some(ObjectExpectation {
+                length,
+                digest: ObjectDigest::Sha256([0; 32]),
+            })
+        };
+        let tarball = |expected| {
+            npm_request(
+                "/@scope/pkg/-/pkg-1.0.0.tgz",
+                MirrorCacheScope::Anonymous,
+                expected,
+                &[],
+            )
+        };
+        let (unpublished, five, settled) =
+            (tarball(None), tarball(published(5)), tarball(published(0)));
+        // (label, request, the fill revalidates a cached entry, status, headers, the plan)
+        for (label, request, previous, status, headers, expected) in [
+            (
+                "a 304 to the mirror's own conditional",
+                &packument,
+                true,
+                304,
+                &[][..],
+                "revalidate",
+            ),
+            (
+                "a 304 nobody asked for",
+                &packument,
+                false,
+                304,
+                &[][..],
+                "refuse UnexpectedNotModified",
+            ),
+            (
+                "a same-origin redirect",
+                &packument,
+                false,
+                307,
+                &[("location", "/react?write=true")][..],
+                "redirect /react?write=true with 4 left",
+            ),
+            (
+                "a redirect with no hop left",
+                &exhausted,
+                false,
+                307,
+                &[("location", "/react")][..],
+                "refuse TooManyRedirects",
+            ),
+            (
+                "a redirect to another origin",
+                &packument,
+                false,
+                307,
+                &[("location", "https://evil.example/react")][..],
+                "refuse UnsafeRedirect",
+            ),
+            (
+                "a redirect that would rewrite the method",
+                &packument,
+                false,
+                303,
+                &[("location", "/react")][..],
+                "refuse UnsafeRedirect",
+            ),
+            (
+                "a packument",
+                &packument,
+                false,
+                200,
+                &[
+                    ("content-type", "application/json"),
+                    ("content-length", "9"),
+                ][..],
+                "publish up to 9 bytes, unverified, index true",
+            ),
+            (
+                "a packument of unknown length",
+                &packument,
+                false,
+                200,
+                &[("content-type", "application/vnd.npm.install-v1+json")][..],
+                "publish up to 18446744073709551615 bytes, unverified, index true",
+            ),
+            (
+                "a body that is no packument",
+                &packument,
+                false,
+                200,
+                &[("content-type", "text/plain"), ("content-length", "3")][..],
+                "publish up to 3 bytes, unverified, index false",
+            ),
+            (
+                "a Vary that names every header",
+                &packument,
+                false,
+                200,
+                &[("vary", "*")][..],
+                "bypass",
+            ),
+            (
+                "a Vary on encoding and accept, which a packument's entries carry",
+                &packument,
+                false,
+                200,
+                &[("vary", "accept-encoding, accept"), ("content-length", "2")][..],
+                "publish up to 2 bytes, unverified, index false",
+            ),
+            (
+                "a Vary on a header the cache key lacks",
+                &packument,
+                false,
+                200,
+                &[("vary", "cookie")][..],
+                "bypass",
+            ),
+            (
+                "a cookie",
+                &packument,
+                false,
+                200,
+                &[("set-cookie", "a=b")][..],
+                "bypass",
+            ),
+            (
+                "no-store",
+                &packument,
+                false,
+                200,
+                &[("cache-control", "public, no-store")][..],
+                "bypass",
+            ),
+            (
+                "private beside the anonymous scope",
+                &packument,
+                false,
+                200,
+                &[("cache-control", "private, max-age=60")][..],
+                "bypass",
+            ),
+            (
+                "private in a project's own scope",
+                &project,
+                false,
+                200,
+                &[("cache-control", "private"), ("content-length", "4")][..],
+                "publish up to 4 bytes, unverified, index false",
+            ),
+            ("an error status", &packument, false, 404, &[][..], "bypass"),
+            (
+                "an encoded body the identity request never asked for",
+                &packument,
+                false,
+                200,
+                &[("content-encoding", "gzip")][..],
+                "refuse UnsupportedEncoding",
+            ),
+            (
+                "an encoded error page",
+                &packument,
+                false,
+                404,
+                &[("content-encoding", "br")][..],
+                "refuse UnsupportedEncoding",
+            ),
+            (
+                "a tarball with no published integrity",
+                &unpublished,
+                false,
+                200,
+                &[("content-length", "5")][..],
+                "refuse MissingIntegrity",
+            ),
+            (
+                "a tarball of its published length",
+                &five,
+                false,
+                200,
+                &[("content-length", "5")][..],
+                "publish up to 5 bytes, 5, index false",
+            ),
+            (
+                "a tarball of another length",
+                &five,
+                false,
+                200,
+                &[("content-length", "6")][..],
+                "refuse LengthMismatch",
+            ),
+            (
+                "a tarball with no length",
+                &five,
+                false,
+                200,
+                &[][..],
+                "refuse MissingContentLength",
+            ),
+            (
+                "a tarball with an unreadable length",
+                &five,
+                false,
+                200,
+                &[("content-length", "five")][..],
+                "refuse InvalidContentLength",
+            ),
+            (
+                "a tarball whose length the response settles",
+                &settled,
+                false,
+                200,
+                &[("content-length", "7")][..],
+                "publish up to 7 bytes, 7, index false",
+            ),
+            (
+                "a tarball whose settling length never comes",
+                &settled,
+                false,
+                200,
+                &[][..],
+                "refuse MissingContentLength",
+            ),
+        ] {
+            let status = StatusCode::from_u16(status).expect("fixture status");
+            assert_eq!(
+                verdict(plan_fill(request, previous, status, &header_map(headers))),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirect_is_bounded_same_origin_typed_and_never_followed() {
+        let at = |remaining: u8| {
+            let mut request = npm_request("/react", MirrorCacheScope::Anonymous, None, &[]);
+            request.redirects_remaining = remaining;
+            request
+        };
+        let overlong = format!("/{}", "a".repeat(MAX_LOCATION_BYTES));
+        // (label, hops left, status, location, outcome)
+        for (label, remaining, status, location, expected) in [
+            (
+                "a relative location",
+                5,
+                307,
+                Some("/react?write=true"),
+                "hop /react?write=true, 4 left",
+            ),
+            ("the last hop", 1, 301, Some("/react"), "hop /react, 0 left"),
+            (
+                "a permanent redirect",
+                3,
+                308,
+                Some("/react"),
+                "hop /react, 2 left",
+            ),
+            (
+                "no hop left",
+                0,
+                307,
+                Some("/react"),
+                "refuse TooManyRedirects",
+            ),
+            (
+                "another origin",
+                5,
+                307,
+                Some("https://evil.example/react"),
+                "refuse UnsafeRedirect",
+            ),
+            (
+                "an HTTPS downgrade",
+                5,
+                307,
+                Some("http://registry.npmjs.org/react"),
+                "refuse UnsafeRedirect",
+            ),
+            (
+                "another package",
+                5,
+                307,
+                Some("/other"),
+                "refuse UnsafeRedirect",
+            ),
+            (
+                "a method rewrite",
+                5,
+                303,
+                Some("/react"),
+                "refuse UnsafeRedirect",
+            ),
+            (
+                "a choice of several",
+                5,
+                300,
+                Some("/react"),
+                "refuse UnsafeRedirect",
+            ),
+            ("no location", 5, 307, None, "refuse InvalidRedirect"),
+            (
+                "a location past its bound",
+                5,
+                307,
+                Some(overlong.as_str()),
+                "refuse InvalidRedirect",
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(location) = location {
+                headers.insert(
+                    header::LOCATION,
+                    HeaderValue::from_str(location).expect("fixture location"),
+                );
+            }
+            let status = StatusCode::from_u16(status).expect("fixture status");
+            let outcome = match redirect_plan(&at(remaining), status, &headers) {
+                Ok(hop) => format!("hop {}, {} left", hop.path, hop.redirects_remaining),
+                Err(error) => format!("refuse {error:?}"),
+            };
+            assert_eq!(outcome, expected, "{label}");
+        }
+        let mut opaque = HeaderMap::new();
+        opaque.insert(
+            header::LOCATION,
+            HeaderValue::from_bytes(b"/react\xff").expect("opaque bytes"),
+        );
+        assert!(
+            matches!(
+                redirect_plan(&at(5), StatusCode::FOUND, &opaque),
+                Err(MirrorError::InvalidRedirect)
+            ),
+            "a location that is no text is no location"
+        );
+        // The hop is the same request one redirect later: a HEAD stays a HEAD.
+        let mut head = at(5);
+        head.method = Method::HEAD;
+        let mut named = HeaderMap::new();
+        named.insert(header::LOCATION, HeaderValue::from_static("/react"));
+        let hop = redirect_plan(&head, StatusCode::TEMPORARY_REDIRECT, &named)
+            .expect("a same-origin redirect is a hop");
+        assert_eq!(
+            hop.method,
+            Method::HEAD,
+            "a hop keeps the method it came with"
+        );
+    }
+
+    #[test]
+    fn a_request_asks_the_registry_for_identity_bytes_and_only_its_cached_entrys_validator() {
+        let request = npm_request(
+            "/@msgpack%2fmsgpack",
+            MirrorCacheScope::Anonymous,
+            None,
+            &[
+                (
+                    "accept",
+                    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
+                ),
+                ("accept-encoding", "gzip, br"),
+                ("if-none-match", "W/\"v1\""),
+                ("if-modified-since", "Fri, 26 Dec 2025 06:55:24 GMT"),
+                ("authorization", "Bearer secret"),
+                ("cookie", "session=1"),
+            ],
+        );
+        let fetch = request.to_fetch();
+        let mut names = fetch
+            .headers
+            .keys()
+            .map(header::HeaderName::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["accept", "accept-encoding"],
+            "no client validator and no secret travels upstream"
+        );
+        assert_eq!(
+            fetch
+                .headers
+                .get(header::ACCEPT_ENCODING)
+                .map(HeaderValue::as_bytes),
+            Some(b"identity".as_slice()),
+            "the registry is asked for the canonical encoding whatever the client accepts"
+        );
+
+        // (label, the cached entry's headers, the validators the registry hears)
+        for (label, entry, expected) in [
+            (
+                "an ETag is preferred",
+                &[
+                    ("etag", "\"v1\""),
+                    ("last-modified", "Fri, 26 Dec 2025 06:55:24 GMT"),
+                ][..],
+                "if-none-match: \"v1\"",
+            ),
+            (
+                "a Last-Modified alone",
+                &[("last-modified", "Fri, 26 Dec 2025 06:55:24 GMT")][..],
+                "if-modified-since: Fri, 26 Dec 2025 06:55:24 GMT",
+            ),
+            ("no validator at all", &[][..], ""),
+        ] {
+            let mut headers = request.to_fetch().headers;
+            add_conditionals(&mut headers, &cached(entry));
+            let heard = [header::IF_NONE_MATCH, header::IF_MODIFIED_SINCE]
+                .iter()
+                .filter_map(|name| {
+                    headers.get(name).map(|value| {
+                        format!("{name}: {}", value.to_str().expect("visible validator"))
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(heard.join("; "), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_registry_change_is_answered_from_the_fill_that_publishes_it() {
+        let previous = cached(&[("etag", "\"v1\"")]);
+        let published = "publish up to 9 bytes, unverified, index false";
+        // (label, the registry's status, its new ETag, the client's If-None-Match, the plan, the
+        // client already holds what the fill resolves to)
+        for (label, status, etag, client, expected, holds) in [
+            (
+                "the registry changed and the client holds the old tag",
+                200,
+                Some("\"v2\""),
+                "W/\"v1\"",
+                published,
+                false,
+            ),
+            (
+                "the registry changed and the client already holds the new tag",
+                200,
+                Some("\"v2\""),
+                "W/\"v2\"",
+                published,
+                true,
+            ),
+            (
+                "the registry is unchanged and the client holds it",
+                304,
+                None,
+                "W/\"v1\"",
+                "revalidate",
+                true,
+            ),
+            (
+                "the registry is unchanged and the client holds another tag",
+                304,
+                None,
+                "\"v0\"",
+                "revalidate",
+                false,
+            ),
+        ] {
+            let request = npm_request(
+                "/@msgpack%2fmsgpack",
+                MirrorCacheScope::Anonymous,
+                None,
+                &[("if-none-match", client)],
+            );
+            let mut asked = request.to_fetch().headers;
+            add_conditionals(&mut asked, &previous);
+            assert_eq!(
+                asked
+                    .get(header::IF_NONE_MATCH)
+                    .and_then(|value| value.to_str().ok()),
+                Some("\"v1\""),
+                "{label}: the registry hears the cached validator, never the client's"
+            );
+
+            let mut answer = vec![("content-length", "9")];
+            if let Some(etag) = etag {
+                answer.push(("etag", etag));
+            }
+            let answer = header_map(&answer);
+            let status = StatusCode::from_u16(status).expect("fixture status");
+            let plan = plan_fill(&request, true, status, &answer);
+            let served = match &plan {
+                Ok(FillPlan::Revalidated) => &previous.headers,
+                _ => &answer,
+            };
+            assert_eq!(client_holds(&request.headers, served), holds, "{label}");
+            assert_eq!(verdict(plan), expected, "{label}");
+        }
     }
 }

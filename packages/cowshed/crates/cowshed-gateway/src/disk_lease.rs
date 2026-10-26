@@ -442,15 +442,15 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             message = messages.recv() => match message {
                 Some(Message::Ask { ticket, class, share, claim, granted }) => {
                     grants.insert(ticket, granted);
-                    ledger.ask(Instant::now(), ticket, class, share, claim, &mut effects);
+                    ledger.ask(tokio::time::Instant::now().into_std(), ticket, class, share, claim, &mut effects);
                 }
                 Some(Message::Leave { ticket }) => {
                     grants.remove(&ticket);
-                    ledger.leave(Instant::now(), ticket, &mut effects);
+                    ledger.leave(tokio::time::Instant::now().into_std(), ticket, &mut effects);
                 }
                 None => return,
             },
-            () = expiry => ledger.expire(Instant::now(), &mut effects),
+            () = expiry => ledger.expire(tokio::time::Instant::now().into_std(), &mut effects),
         }
         for effect in effects.drain(..) {
             match effect {
@@ -733,6 +733,20 @@ mod tests {
             "the evicted holder's late close changes nothing"
         );
         assert_eq!(clock.ask(501, 3, Storage), [3], "storage still runs");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timer_event_expires_the_core_holder_and_delivers_the_waiters_grant() {
+        let leases = DiskLeases::start(limits(1, 100));
+        let (held, granted) = leases.ask(Namespace, PhaseShare::Shared, claim("held"));
+        granted.await.expect("first grant");
+        let (waiting, granted) = leases.ask(Storage, PhaseShare::Shared, claim("waiting"));
+        // Paused runtime advances to the actor's own timer while the first tenure
+        // is still held. The pure table above owns every bound and eviction decision.
+        granted
+            .await
+            .expect("timer expiry mapped to the next grant");
+        drop((held, waiting));
     }
 
     #[test]

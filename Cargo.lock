@@ -845,8 +845,10 @@ name = "cowshed-apfs-tests"
 version = "0.1.0"
 dependencies = [
  "cowshed-apfs",
+ "cowshed-gateway-types",
  "cowshed-os",
  "libc",
+ "serde_json",
 ]
 
 [[package]]
@@ -877,6 +879,7 @@ dependencies = [
  "cowshed-os",
  "cowshed-shell",
  "libc",
+ "plist",
  "proptest",
  "rcgen",
  "serde",

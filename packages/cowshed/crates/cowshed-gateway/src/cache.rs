@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::npm_index::{NpmIndexScanner, NpmTarballIndex};
@@ -36,6 +36,11 @@ const FINAL_PREFIX: &str = "obj-";
 const TEMP_PREFIX: &str = ".tmp-";
 
 pub type CacheBodyError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The wall clock a cache stamps its entries by and ages them against. A stamp outlives the
+/// process, so no monotonic clock can serve; [`Cache::open_with_clock`] takes a clock a scenario
+/// moves itself.
+type WallClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
@@ -232,6 +237,7 @@ impl CachedResponse {
 pub struct Cache {
     commands: mpsc::Sender<Command>,
     config: Arc<CacheConfig>,
+    clock: WallClock,
 }
 
 impl fmt::Debug for Cache {
@@ -245,15 +251,36 @@ impl fmt::Debug for Cache {
 
 impl Cache {
     pub async fn open(config: CacheConfig) -> Result<Self, CacheError> {
+        Self::open_with_clock(config, SystemTime::now).await
+    }
+
+    /// Opens the cache with the wall clock that stamps its entries and ages them against the
+    /// metadata TTL. [`Cache::open`] reads the system clock; a scenario that must age an entry
+    /// moves its own clock, where a sleep would only wait for the host's.
+    pub async fn open_with_clock(
+        config: CacheConfig,
+        clock: impl Fn() -> SystemTime + Send + Sync + 'static,
+    ) -> Result<Self, CacheError> {
         config.validate()?;
         validate_root(&config.root).await?;
         cleanup_temps(&config.root).await?;
         let entries = load_entries(&config.root).await?;
         let config = Arc::new(config);
+        let clock: WallClock = Arc::new(clock);
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
-        let actor = CacheActor::new(Arc::clone(&config), entries, commands.downgrade(), receiver);
+        let actor = CacheActor::new(
+            Arc::clone(&config),
+            Arc::clone(&clock),
+            entries,
+            commands.downgrade(),
+            receiver,
+        );
         tokio::spawn(actor.run());
-        Ok(Self { commands, config })
+        Ok(Self {
+            commands,
+            config,
+            clock,
+        })
     }
 
     pub fn metadata_ttl(&self) -> Duration {
@@ -297,11 +324,9 @@ impl Cache {
         receiver.await.map_err(|_| CacheError::ActorStopped)?
     }
 
-    pub async fn retry_after_wait(&self, wait: CacheWait) -> Result<(), CacheError> {
-        tokio::time::timeout(self.config.fill_wait_timeout, wait.receiver)
-            .await
-            .map_err(|_| CacheError::FillWaitTimeout)?
-            .map_err(|_| CacheError::ActorStopped)?
+    /// The cache's clock reading as unix milliseconds: what a fill stamps its entry with.
+    pub fn now_unix_ms(&self) -> Result<u64, CacheError> {
+        unix_ms((self.clock)())
     }
 
     pub async fn open_candidate(&self, candidate: CacheCandidate) -> Result<CacheHit, CacheError> {
@@ -415,6 +440,14 @@ pub struct CacheWait {
     receiver: oneshot::Receiver<Result<(), CacheError>>,
 }
 
+impl CacheWait {
+    /// Waits for the fill this request joined to end, or for the waiter's own bound to pass. `Ok`
+    /// means the key may be asked for again.
+    pub async fn ended(self) -> Result<(), CacheError> {
+        self.receiver.await.map_err(|_| CacheError::ActorStopped)?
+    }
+}
+
 #[derive(Clone)]
 pub struct CacheCandidate {
     digest: [u8; 32],
@@ -447,7 +480,6 @@ impl FillPermit {
             .send(Command::NotModified {
                 digest: self.digest,
                 generation: self.generation,
-                refreshed_unix_ms: unix_ms(SystemTime::now())?,
                 reply,
             })
             .await
@@ -950,6 +982,171 @@ impl FillPermit {
     }
 }
 
+/// What a request for one cache key does, decided from the key's state and a clock reading alone
+/// (05_gateway.md, "Interception engine"): concurrent misses coalesce on one fill, a metadata
+/// entry older than its TTL is revalidated, and a digest-verified object never ages. `allow_stale`
+/// is the offline reader, who takes whatever the cache holds. Time is data: the caller reads its
+/// clock and hands the reading in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcquirePlan {
+    /// A fill for the key is in progress: wait for it, then ask again.
+    Wait,
+    /// Serve the cached entry.
+    Hit,
+    /// The entry is stale: take the fill and revalidate it with the entry's own validators.
+    Revalidate,
+    /// Nothing is cached: take the fill.
+    Fill,
+}
+
+/// What an entry's freshness depends on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EntryFacts {
+    pub(crate) stored_unix_ms: u64,
+    /// Whether a verified digest pins the object, so no age makes it stale.
+    pub(crate) immutable: bool,
+}
+
+impl EntryFacts {
+    /// Whether the entry answers a request at `now_unix_ms` without revalidation. An entry
+    /// stamped in the future (the clock stepped back) has age zero.
+    pub(crate) fn is_fresh(self, now_unix_ms: u64, ttl: Duration, allow_stale: bool) -> bool {
+        let age = Duration::from_millis(now_unix_ms.saturating_sub(self.stored_unix_ms));
+        age <= ttl || self.immutable || allow_stale
+    }
+}
+
+pub(crate) fn acquire_plan(
+    fill_in_progress: bool,
+    entry: Option<EntryFacts>,
+    now_unix_ms: u64,
+    ttl: Duration,
+    allow_stale: bool,
+) -> AcquirePlan {
+    match (fill_in_progress, entry) {
+        (true, _) => AcquirePlan::Wait,
+        (false, Some(entry)) if entry.is_fresh(now_unix_ms, ttl, allow_stale) => AcquirePlan::Hit,
+        (false, Some(_)) => AcquirePlan::Revalidate,
+        (false, None) => AcquirePlan::Fill,
+    }
+}
+
+/// A caller waiting for a fill to end, as the actor names it.
+pub(crate) type WaiterId = u64;
+
+/// The fills in progress and who waits on each: the part of the cache that decides when a waiter
+/// is released, by its fill ending or by its own bound. Time is data: every transition that
+/// depends on it takes the reading.
+#[derive(Debug)]
+pub(crate) struct Fills {
+    wait_bound: Duration,
+    active: HashMap<[u8; 32], Fill>,
+}
+
+#[derive(Debug)]
+struct Fill {
+    generation: u64,
+    /// In arrival order.
+    waiters: Vec<Waiter>,
+}
+
+#[derive(Debug)]
+struct Waiter {
+    id: WaiterId,
+    /// When its bound passes; `None` when the bound is too far out for the clock to hold, so the
+    /// waiter ends only with its fill.
+    deadline: Option<Instant>,
+}
+
+impl Fills {
+    pub(crate) fn new(wait_bound: Duration) -> Self {
+        Self {
+            wait_bound,
+            active: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn is_active(&self, digest: &[u8; 32]) -> bool {
+        self.active.contains_key(digest)
+    }
+
+    /// Whether `generation` is the fill now in progress for `digest`.
+    pub(crate) fn is_current(&self, digest: &[u8; 32], generation: u64) -> bool {
+        self.active
+            .get(digest)
+            .is_some_and(|fill| fill.generation == generation)
+    }
+
+    /// A fill for `digest` starts under `generation`.
+    pub(crate) fn start(&mut self, digest: [u8; 32], generation: u64) {
+        self.active.insert(
+            digest,
+            Fill {
+                generation,
+                waiters: Vec::new(),
+            },
+        );
+    }
+
+    /// `waiter` begins waiting at `now` for the fill in progress for `digest`. `false` when none
+    /// is in progress: there is nothing to wait for.
+    pub(crate) fn wait(&mut self, now: Instant, digest: &[u8; 32], waiter: WaiterId) -> bool {
+        let deadline = now.checked_add(self.wait_bound);
+        let Some(fill) = self.active.get_mut(digest) else {
+            return false;
+        };
+        fill.waiters.push(Waiter {
+            id: waiter,
+            deadline,
+        });
+        true
+    }
+
+    /// The fill under `generation` ended, published or not: its waiters are released in arrival
+    /// order. Any other generation is a fill that already ended and releases no one.
+    pub(crate) fn end(&mut self, digest: &[u8; 32], generation: u64) -> Vec<WaiterId> {
+        if !self.is_current(digest, generation) {
+            return Vec::new();
+        }
+        self.active.remove(digest).map_or_else(Vec::new, |fill| {
+            fill.waiters.into_iter().map(|waiter| waiter.id).collect()
+        })
+    }
+
+    /// Time reached `now`: every waiter whose bound has passed is released, oldest first. Its
+    /// fill goes on.
+    pub(crate) fn expire(&mut self, now: Instant) -> Vec<WaiterId> {
+        let mut expired = Vec::new();
+        for fill in self.active.values_mut() {
+            fill.waiters.retain(|waiter| {
+                let due = waiter.deadline.is_some_and(|deadline| deadline <= now);
+                if due {
+                    expired.push(waiter.id);
+                }
+                !due
+            });
+        }
+        expired.sort_unstable();
+        expired
+    }
+
+    /// When [`Self::expire`] next releases someone: the earliest bound among the waiters. `None`
+    /// while no waiter has one.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.active
+            .values()
+            .flat_map(|fill| fill.waiters.iter())
+            .filter_map(|waiter| waiter.deadline)
+            .min()
+    }
+}
+
+/// The moment fill waits are measured on: tokio's clock, so a test that pauses tokio's time
+/// measures them in that same virtual time.
+fn monotonic_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 #[derive(Clone)]
 struct Entry {
     generation: u64,
@@ -958,11 +1155,6 @@ struct Entry {
     stored_bytes: u64,
     active_readers: usize,
     last_access: u64,
-}
-
-struct FillStateEntry {
-    generation: u64,
-    waiters: Vec<oneshot::Sender<Result<(), CacheError>>>,
 }
 
 enum Command {
@@ -1001,7 +1193,6 @@ enum Command {
     NotModified {
         digest: [u8; 32],
         generation: u64,
-        refreshed_unix_ms: u64,
         reply: oneshot::Sender<Result<CacheCandidate, CacheError>>,
     },
     NpmExpectation {
@@ -1014,8 +1205,12 @@ enum Command {
 
 struct CacheActor {
     config: Arc<CacheConfig>,
+    clock: WallClock,
     entries: HashMap<[u8; 32], Entry>,
-    fills: HashMap<[u8; 32], FillStateEntry>,
+    fills: Fills,
+    /// The reply each waiter of `fills` is owed, by its name.
+    waiters: HashMap<WaiterId, oneshot::Sender<Result<(), CacheError>>>,
+    next_waiter: WaiterId,
     commands: mpsc::WeakSender<Command>,
     receiver: mpsc::Receiver<Command>,
     next_generation: u64,
@@ -1026,6 +1221,7 @@ struct CacheActor {
 impl CacheActor {
     fn new(
         config: Arc<CacheConfig>,
+        clock: WallClock,
         entries: HashMap<[u8; 32], Entry>,
         commands: mpsc::WeakSender<Command>,
         receiver: mpsc::Receiver<Command>,
@@ -1044,9 +1240,12 @@ impl CacheActor {
             .unwrap_or(0)
             .saturating_add(1);
         Self {
+            fills: Fills::new(config.fill_wait_timeout),
             config,
+            clock,
             entries,
-            fills: HashMap::new(),
+            waiters: HashMap::new(),
+            next_waiter: 0,
             commands,
             receiver,
             next_generation,
@@ -1059,7 +1258,26 @@ impl CacheActor {
         if self.evict_if_needed().await.is_err() {
             return;
         }
-        while let Some(command) = self.receiver.recv().await {
+        loop {
+            let deadline = self.fills.deadline();
+            let expiry = async {
+                match deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let command = tokio::select! {
+                command = self.receiver.recv() => match command {
+                    Some(command) => command,
+                    None => return,
+                },
+                () = expiry => {
+                    self.release_expired();
+                    continue;
+                }
+            };
             match command {
                 Command::Acquire {
                     digest,
@@ -1092,11 +1310,7 @@ impl CacheActor {
                     generation,
                     reply,
                 } => {
-                    let result = if self
-                        .fills
-                        .get(&digest)
-                        .is_some_and(|fill| fill.generation == generation)
-                    {
+                    let result = if self.fills.is_current(&digest, generation) {
                         if let Some(entry) = self.entries.remove(&digest) {
                             self.total_bytes = self.total_bytes.saturating_sub(entry.stored_bytes);
                             remove_generated_file(&entry.path).await
@@ -1139,10 +1353,10 @@ impl CacheActor {
                 Command::NotModified {
                     digest,
                     generation,
-                    refreshed_unix_ms,
                     reply,
                 } => {
-                    let result = self.not_modified(digest, generation, refreshed_unix_ms);
+                    let result = unix_ms((self.clock)())
+                        .and_then(|now| self.not_modified(digest, generation, now));
                     let notification = result
                         .as_ref()
                         .map(|_| ())
@@ -1156,14 +1370,15 @@ impl CacheActor {
                     allow_stale,
                     reply,
                 } => {
-                    let result = unix_ms(SystemTime::now()).map(|now| {
+                    let result = unix_ms((self.clock)()).map(|now| {
                         let Some(entry) = self.entries.get_mut(&digest) else {
                             return NpmExpectationLookup::MissingPackument;
                         };
-                        let age = Duration::from_millis(
-                            now.saturating_sub(entry.response.stored_unix_ms),
-                        );
-                        if !allow_stale && age > self.config.metadata_ttl {
+                        let facts = EntryFacts {
+                            stored_unix_ms: entry.response.stored_unix_ms,
+                            immutable: entry.response.expected.is_some(),
+                        };
+                        if !facts.is_fresh(now, self.config.metadata_ttl, allow_stale) {
                             return NpmExpectationLookup::MissingPackument;
                         }
                         let Some(index) = &entry.response.npm_tarballs else {
@@ -1181,62 +1396,84 @@ impl CacheActor {
     }
 
     fn acquire(&mut self, digest: [u8; 32], allow_stale: bool) -> Result<CacheAcquire, CacheError> {
-        if let Some(fill) = self.fills.get_mut(&digest) {
-            let (reply, receiver) = oneshot::channel();
-            fill.waiters.push(reply);
-            return Ok(CacheAcquire::Wait(CacheWait { receiver }));
-        }
-        let now = unix_ms(SystemTime::now())?;
-        if let Some(entry) = self.entries.get_mut(&digest) {
-            let age = Duration::from_millis(now.saturating_sub(entry.response.stored_unix_ms));
-            if age <= self.config.metadata_ttl || entry.response.expected.is_some() || allow_stale {
+        let now = unix_ms((self.clock)())?;
+        let entry = self.entries.get(&digest).map(|entry| EntryFacts {
+            stored_unix_ms: entry.response.stored_unix_ms,
+            immutable: entry.response.expected.is_some(),
+        });
+        match acquire_plan(
+            self.fills.is_active(&digest),
+            entry,
+            now,
+            self.config.metadata_ttl,
+            allow_stale,
+        ) {
+            AcquirePlan::Wait => {
+                let (reply, receiver) = oneshot::channel();
+                let waiter = self.next_waiter;
+                self.next_waiter = self.next_waiter.saturating_add(1);
+                self.waiters.insert(waiter, reply);
+                let joined = self.fills.wait(monotonic_now(), &digest, waiter);
+                debug_assert!(joined, "a wait plan names a fill in progress");
+                Ok(CacheAcquire::Wait(CacheWait { receiver }))
+            }
+            AcquirePlan::Hit => {
+                let entry = self
+                    .entries
+                    .get_mut(&digest)
+                    .expect("a hit names a cached entry");
                 entry.active_readers = entry.active_readers.saturating_add(1);
                 entry.last_access = self.next_access;
                 self.next_access = self.next_access.saturating_add(1);
-                return Ok(CacheAcquire::Hit(CacheCandidate {
+                Ok(CacheAcquire::Hit(CacheCandidate {
                     digest,
                     generation: entry.generation,
                     path: entry.path.clone(),
                     response: entry.response.clone(),
-                }));
+                }))
             }
-            let candidate = CacheCandidate {
-                digest,
-                generation: entry.generation,
-                path: entry.path.clone(),
-                response: entry.response.clone(),
-            };
-            let generation = self.allocate_generation();
-            self.fills.insert(
-                digest,
-                FillStateEntry {
-                    generation,
-                    waiters: Vec::new(),
-                },
-            );
-            return Ok(CacheAcquire::Fill(FillPermit {
-                commands: self.commands.upgrade().ok_or(CacheError::ActorStopped)?,
-                digest,
-                generation,
-                previous: Some(candidate),
-                completed: false,
-            }));
+            AcquirePlan::Revalidate => {
+                let entry = self
+                    .entries
+                    .get(&digest)
+                    .expect("a revalidation names a cached entry");
+                let previous = CacheCandidate {
+                    digest,
+                    generation: entry.generation,
+                    path: entry.path.clone(),
+                    response: entry.response.clone(),
+                };
+                self.begin_fill(digest, Some(previous))
+            }
+            AcquirePlan::Fill => self.begin_fill(digest, None),
         }
+    }
+
+    /// A fill for `digest` starts; `previous` is the stale entry it revalidates, if any.
+    fn begin_fill(
+        &mut self,
+        digest: [u8; 32],
+        previous: Option<CacheCandidate>,
+    ) -> Result<CacheAcquire, CacheError> {
+        let commands = self.commands.upgrade().ok_or(CacheError::ActorStopped)?;
         let generation = self.allocate_generation();
-        self.fills.insert(
-            digest,
-            FillStateEntry {
-                generation,
-                waiters: Vec::new(),
-            },
-        );
+        self.fills.start(digest, generation);
         Ok(CacheAcquire::Fill(FillPermit {
-            commands: self.commands.upgrade().ok_or(CacheError::ActorStopped)?,
+            commands,
             digest,
             generation,
-            previous: None,
+            previous,
             completed: false,
         }))
+    }
+
+    /// Time reached the earliest waiter's bound: the waiters whose bound has passed hear it.
+    fn release_expired(&mut self) {
+        for waiter in self.fills.expire(monotonic_now()) {
+            if let Some(reply) = self.waiters.remove(&waiter) {
+                let _ = reply.send(Err(CacheError::FillWaitTimeout));
+            }
+        }
     }
 
     fn allocate_generation(&mut self) -> u64 {
@@ -1268,11 +1505,7 @@ impl CacheActor {
         response: CachedResponse,
         stored_bytes: u64,
     ) -> Result<(), CacheError> {
-        if !self
-            .fills
-            .get(&digest)
-            .is_some_and(|fill| fill.generation == generation)
-        {
+        if !self.fills.is_current(&digest, generation) {
             return Err(CacheError::StalePermit);
         }
         if let Some(old) = self.entries.insert(
@@ -1299,11 +1532,7 @@ impl CacheActor {
         generation: u64,
         refreshed_unix_ms: u64,
     ) -> Result<CacheCandidate, CacheError> {
-        if !self
-            .fills
-            .get(&digest)
-            .is_some_and(|fill| fill.generation == generation)
-        {
+        if !self.fills.is_current(&digest, generation) {
             return Err(CacheError::StalePermit);
         }
         let entry = self.entries.get_mut(&digest).ok_or(CacheError::CacheMiss)?;
@@ -1320,20 +1549,13 @@ impl CacheActor {
     }
 
     fn finish_fill(&mut self, digest: [u8; 32], generation: u64, result: Result<(), CacheError>) {
-        if !self
-            .fills
-            .get(&digest)
-            .is_some_and(|fill| fill.generation == generation)
-        {
-            return;
-        }
-        if let Some(fill) = self.fills.remove(&digest) {
-            for waiter in fill.waiters {
+        for waiter in self.fills.end(&digest, generation) {
+            if let Some(reply) = self.waiters.remove(&waiter) {
                 let value = result
                     .as_ref()
                     .map(|_| ())
                     .map_err(|error| error.for_waiter());
-                let _ = waiter.send(value);
+                let _ = reply.send(value);
             }
         }
     }
@@ -1345,9 +1567,7 @@ impl CacheActor {
         let mut candidates = self
             .entries
             .iter()
-            .filter(|(digest, entry)| {
-                entry.active_readers == 0 && !self.fills.contains_key(*digest)
-            })
+            .filter(|(digest, entry)| entry.active_readers == 0 && !self.fills.is_active(*digest))
             .map(|(digest, entry)| (*digest, entry.last_access))
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|(_, access)| *access);
@@ -1907,6 +2127,7 @@ mod tests {
                 metadata_ttl: cowshed_os::test_backstop::NO_PROGRESS,
                 fill_wait_timeout: cowshed_os::test_backstop::NO_PROGRESS,
             }),
+            Arc::new(SystemTime::now),
             entries,
             commands.downgrade(),
             receiver,
@@ -1920,5 +2141,321 @@ mod tests {
         assert_eq!(actor.total_bytes, 2);
         drop(commands);
         fs::remove_dir_all(root).await.expect("remove fixture");
+    }
+
+    fn key(path: &str) -> CacheKey {
+        CacheKey::new(
+            CacheNamespace::Anonymous,
+            "npm",
+            "https://registry.npmjs.org:443".to_owned(),
+            path.to_owned(),
+            None,
+        )
+        .expect("fixture cache key")
+    }
+
+    fn sealed(stored_unix_ms: u64) -> CachedResponse {
+        CachedResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            content_length: 0,
+            content_sha256: Sha256::digest([]).into(),
+            expected: None,
+            stored_unix_ms,
+            npm_tarballs: None,
+            npm_index_bytes: 0,
+        }
+    }
+
+    /// A cache whose actor has no disk behind it: acquiring a key and ending or publishing its
+    /// fill are all in memory, and its clock stands at the epoch.
+    fn memory_cache(fill_wait_timeout: Duration) -> Cache {
+        let config = Arc::new(CacheConfig {
+            root: PathBuf::from("/nonexistent/cache"),
+            high_water_bytes: 1_000,
+            low_water_bytes: 500,
+            metadata_ttl: Duration::from_secs(300),
+            fill_wait_timeout,
+        });
+        let clock: WallClock = Arc::new(|| UNIX_EPOCH);
+        let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let actor = CacheActor::new(
+            Arc::clone(&config),
+            Arc::clone(&clock),
+            HashMap::new(),
+            commands.downgrade(),
+            receiver,
+        );
+        tokio::spawn(actor.run());
+        Cache {
+            commands,
+            config,
+            clock,
+        }
+    }
+
+    #[test]
+    fn a_request_waits_hits_revalidates_or_fills_by_the_clock_reading_it_is_handed() {
+        const TTL_MS: u64 = 300_000;
+        const STORED: u64 = 1_000_000;
+        let ttl = Duration::from_millis(TTL_MS);
+        let metadata = Some(EntryFacts {
+            stored_unix_ms: STORED,
+            immutable: false,
+        });
+        let immutable = Some(EntryFacts {
+            stored_unix_ms: STORED,
+            immutable: true,
+        });
+        // (label, a fill is in progress, the entry, the clock reading, an offline reader, the plan)
+        for (label, filling, entry, now, offline, expected) in [
+            (
+                "nothing cached",
+                false,
+                None,
+                STORED,
+                false,
+                AcquirePlan::Fill,
+            ),
+            (
+                "nothing cached, offline",
+                false,
+                None,
+                STORED,
+                true,
+                AcquirePlan::Fill,
+            ),
+            (
+                "a fill in progress",
+                true,
+                None,
+                STORED,
+                false,
+                AcquirePlan::Wait,
+            ),
+            (
+                "a fill in progress beside a stale entry",
+                true,
+                metadata,
+                STORED + TTL_MS + 1,
+                false,
+                AcquirePlan::Wait,
+            ),
+            (
+                "just stored",
+                false,
+                metadata,
+                STORED,
+                false,
+                AcquirePlan::Hit,
+            ),
+            (
+                "exactly at the TTL",
+                false,
+                metadata,
+                STORED + TTL_MS,
+                false,
+                AcquirePlan::Hit,
+            ),
+            (
+                "one millisecond past the TTL",
+                false,
+                metadata,
+                STORED + TTL_MS + 1,
+                false,
+                AcquirePlan::Revalidate,
+            ),
+            (
+                "past the TTL, offline",
+                false,
+                metadata,
+                STORED + TTL_MS + 1,
+                true,
+                AcquirePlan::Hit,
+            ),
+            (
+                "an immutable object never ages",
+                false,
+                immutable,
+                STORED + 1_000 * TTL_MS,
+                false,
+                AcquirePlan::Hit,
+            ),
+            (
+                "stamped in the future",
+                false,
+                metadata,
+                STORED - 1,
+                false,
+                AcquirePlan::Hit,
+            ),
+        ] {
+            assert_eq!(
+                acquire_plan(filling, entry, now, ttl, offline),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fills_waiters_leave_with_their_fill_or_at_their_own_bound() {
+        let origin = Instant::now();
+        let at = |millis: u64| origin + Duration::from_millis(millis);
+        let (first, second) = ([1_u8; 32], [2_u8; 32]);
+        let mut fills = Fills::new(Duration::from_millis(100));
+        assert_eq!(fills.deadline(), None, "no waiter, no bound is running");
+        assert!(
+            !fills.wait(at(0), &first, 1),
+            "nothing is being filled: nothing to wait for"
+        );
+
+        fills.start(first, 7);
+        fills.start(second, 8);
+        assert!(fills.is_active(&first) && fills.is_current(&first, 7));
+        assert!(
+            !fills.is_current(&first, 8),
+            "a generation is its own fill's"
+        );
+        assert!(fills.wait(at(10), &first, 1));
+        assert!(fills.wait(at(40), &first, 2));
+        assert!(fills.wait(at(50), &second, 3));
+        assert_eq!(
+            fills.deadline(),
+            Some(at(110)),
+            "the earliest bound among all waiters"
+        );
+
+        assert!(fills.expire(at(109)).is_empty(), "inside every bound");
+        assert_eq!(
+            fills.expire(at(110)),
+            [1],
+            "a waiter's bound runs from when it began to wait"
+        );
+        assert_eq!(fills.deadline(), Some(at(140)));
+        assert!(
+            fills.is_active(&first),
+            "an expired waiter does not end its fill"
+        );
+
+        assert!(
+            fills.end(&first, 6).is_empty(),
+            "a fill that already ended releases no one"
+        );
+        assert!(fills.is_active(&first));
+        assert_eq!(
+            fills.end(&first, 7),
+            [2],
+            "the ending fill releases the waiters it still has"
+        );
+        assert!(!fills.is_active(&first));
+        assert_eq!(
+            fills.deadline(),
+            Some(at(150)),
+            "a released waiter's bound is gone"
+        );
+
+        assert_eq!(
+            fills.expire(at(10_000)),
+            [3],
+            "another fill's waiter still expires by its own bound"
+        );
+        assert_eq!(fills.deadline(), None);
+        assert!(fills.end(&second, 8).is_empty(), "nobody is left waiting");
+
+        // A bound too far out for the clock to hold never expires: the waiter leaves with its fill.
+        let mut unbounded = Fills::new(Duration::MAX);
+        unbounded.start(first, 1);
+        assert!(unbounded.wait(at(0), &first, 1));
+        assert_eq!(unbounded.deadline(), None);
+        assert!(unbounded.expire(at(10_000)).is_empty());
+        assert_eq!(unbounded.end(&first, 1), [1]);
+    }
+
+    /// A request for a key nobody holds: it becomes the fill.
+    async fn lead_a_fill(cache: &Cache, path: &str) -> FillPermit {
+        let CacheAcquire::Fill(leader) = cache
+            .acquire(key(path), false)
+            .await
+            .expect("request for a key nobody holds")
+        else {
+            panic!("a key nobody holds is filled");
+        };
+        leader
+    }
+
+    /// A request for a key whose fill is running: it waits behind that fill.
+    async fn wait_for_a_fill(cache: &Cache, path: &str) -> CacheWait {
+        let CacheAcquire::Wait(waiter) = cache
+            .acquire(key(path), false)
+            .await
+            .expect("request for a key being filled")
+        else {
+            panic!("a key being filled is waited for");
+        };
+        waiter
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiters_follow_their_fill_and_their_own_bound_on_virtual_time() {
+        let bound = Duration::from_secs(900);
+        let cache = memory_cache(bound);
+
+        // A fill that publishes releases the waiter behind it, who then finds the entry.
+        let mut leader = lead_a_fill(&cache, "/published").await;
+        let waiter = tokio::spawn(wait_for_a_fill(&cache, "/published").await.ended());
+        let (reply, committed) = oneshot::channel();
+        cache
+            .commands
+            .send(Command::Commit {
+                digest: leader.digest,
+                generation: leader.generation,
+                path: PathBuf::from("published"),
+                response: Box::new(sealed(0)),
+                stored_bytes: 10,
+                reply,
+            })
+            .await
+            .expect("commit command");
+        committed
+            .await
+            .expect("commit reply")
+            .expect("the fill publishes");
+        leader.completed = true;
+        waiter
+            .await
+            .expect("waiter joined")
+            .expect("a published fill releases its waiter well");
+        assert!(matches!(
+            cache
+                .acquire(key("/published"), false)
+                .await
+                .expect("third request"),
+            CacheAcquire::Hit(_)
+        ));
+
+        // A leader that goes away aborts its fill, and its waiter hears it, though it has waited
+        // all but its bound.
+        let leader = lead_a_fill(&cache, "/abandoned").await;
+        let waiter = wait_for_a_fill(&cache, "/abandoned").await;
+        tokio::time::advance(bound - Duration::from_millis(1)).await;
+        drop(leader);
+        let ended = waiter.ended().await;
+        assert!(matches!(ended, Err(CacheError::FillAborted)), "{ended:?}");
+
+        // A waiter's bound ends its wait and never its fill: the next request still waits behind
+        // that fill, and the leader still ends it.
+        let leader = lead_a_fill(&cache, "/stalled").await;
+        let waiter = wait_for_a_fill(&cache, "/stalled").await;
+        tokio::time::advance(bound).await;
+        let ended = waiter.ended().await;
+        assert!(
+            matches!(ended, Err(CacheError::FillWaitTimeout)),
+            "{ended:?}"
+        );
+        let next = wait_for_a_fill(&cache, "/stalled").await;
+        leader.bypass().await.expect("the leader ends its own fill");
+        let ended = next.ended().await;
+        assert!(matches!(ended, Err(CacheError::FillAborted)), "{ended:?}");
     }
 }

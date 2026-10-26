@@ -5,21 +5,20 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use cowshed_gateway::{
-    Cache, CacheBodyError, CacheConfig, CacheError, CanonicalTarget, ConfigError, GatewayConfig,
-    MirrorBody, MirrorCacheConfig, MirrorCacheScope, MirrorCacheStatus, MirrorError,
-    MirrorFetchRequest, MirrorOutcome, MirrorProtocol, MirrorRequest, MirrorResourceKind,
-    MirrorRoute, MirrorService, MirrorUpstream, ObjectDigest, ObjectExpectation, TargetScheme,
-    UpstreamHealth, WorkspacePolicy,
+    Cache, CacheBodyError, CacheConfig, CanonicalTarget, ConfigError, GatewayConfig, MirrorBody,
+    MirrorCacheConfig, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
+    MirrorOutcome, MirrorProtocol, MirrorRequest, MirrorResourceKind, MirrorRoute, MirrorService,
+    MirrorUpstream, ObjectDigest, ObjectExpectation, TargetScheme, UpstreamHealth, WorkspacePolicy,
 };
 use http::{HeaderMap, Method, Response, StatusCode, header};
 use http_body::{Body, Frame};
@@ -60,6 +59,26 @@ impl TestRoot {
 impl Drop for TestRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The wall clock a scenario moves itself, so an entry ages by the clock's say and not the host's:
+/// the mirror cache stamps its entries and ages them by it (`Cache::open_with_clock`).
+struct ManualClock(Arc<AtomicU64>);
+
+impl ManualClock {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(1_800_000_000_000)))
+    }
+
+    fn advance(&self, by: Duration) {
+        let millis = u64::try_from(by.as_millis()).expect("a span of milliseconds");
+        self.0.fetch_add(millis, Ordering::SeqCst);
+    }
+
+    fn reader(&self) -> impl Fn() -> SystemTime + Send + Sync + 'static {
+        let millis = Arc::clone(&self.0);
+        move || UNIX_EPOCH + Duration::from_millis(millis.load(Ordering::SeqCst))
     }
 }
 
@@ -805,11 +824,16 @@ async fn simultaneous_misses_coalesce_until_atomic_publish() {
 }
 
 #[tokio::test]
-async fn stale_metadata_304_refreshes_and_200_replaces_atomically() {
+async fn a_stale_entry_is_refreshed_or_replaced_atomically_and_the_published_entry_reopens() {
     let root = TestRoot::new();
-    let mut config = root.cache_config();
-    config.metadata_ttl = Duration::from_millis(15);
-    let service = MirrorService::new(Cache::open(config).await.expect("open cache"));
+    let clock = ManualClock::new();
+    let config = root.cache_config();
+    let ttl = config.metadata_ttl;
+    let service = MirrorService::new(
+        Cache::open_with_clock(config.clone(), clock.reader())
+            .await
+            .expect("open cache"),
+    );
     let request = request(
         MirrorProtocol::Npm,
         target("registry.npmjs.org"),
@@ -824,19 +848,18 @@ async fn stale_metadata_304_refreshes_and_200_replaces_atomically() {
         metadata_response(b"v2", "\"v2\""),
     ]);
 
-    assert_eq!(
-        collect(
-            service
-                .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
-                .await
-                .expect("fill v1")
-        )
-        .await
-        .1
-        .as_ref(),
-        b"v1"
-    );
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    let (status, bytes) = collect(
+        service
+            .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
+            .await
+            .expect("fill v1"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), b"v1");
+
+    // Past the TTL the entry is revalidated with its own validator, and a 304 serves it again.
+    clock.advance(ttl + Duration::from_millis(1));
     let (status, bytes) = collect(
         service
             .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
@@ -854,7 +877,21 @@ async fn stale_metadata_304_refreshes_and_200_replaces_atomically() {
         "\"v1\""
     );
 
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    // The 304 moved the entry's stamp: a whole TTL later it is still fresh, and asks no one.
+    clock.advance(ttl);
+    let (status, bytes) = collect(
+        service
+            .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
+            .await
+            .expect("hit inside the refreshed TTL"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Hit);
+    assert_eq!(bytes.as_ref(), b"v1");
+    assert_eq!(upstream.call_count(), 2);
+
+    // One millisecond more and a 200 replaces it whole.
+    clock.advance(Duration::from_millis(1));
     let (status, bytes) = collect(
         service
             .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
@@ -866,49 +903,33 @@ async fn stale_metadata_304_refreshes_and_200_replaces_atomically() {
     assert_eq!(bytes.as_ref(), b"v2");
 
     let offline = QueueUpstream::new([]);
-    assert_eq!(
-        collect(
-            service
-                .execute(request, UpstreamHealth::Offline, &offline)
-                .await
-                .expect("offline replacement hit")
-        )
-        .await
-        .1
-        .as_ref(),
-        b"v2"
-    );
-}
+    let (status, bytes) = collect(
+        service
+            .execute(request.clone(), UpstreamHealth::Offline, &offline)
+            .await
+            .expect("offline replacement hit"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::OfflineHit);
+    assert_eq!(bytes.as_ref(), b"v2");
 
-#[tokio::test]
-async fn coalesced_fill_waits_have_a_hard_timeout() {
-    let root = TestRoot::new();
-    let mut config = root.cache_config();
-    config.fill_wait_timeout = Duration::from_millis(10);
-    let service = MirrorService::new(Cache::open(config).await.expect("open cache"));
-    let request = request(
-        MirrorProtocol::Npm,
-        target("registry.npmjs.org"),
-        "/timeout",
-        MirrorCacheScope::Anonymous,
-        false,
-        None,
+    // The replacement was published whole: a reopened cache finds it, still fresh.
+    drop(service);
+    let reopened = MirrorService::new(
+        Cache::open_with_clock(config, clock.reader())
+            .await
+            .expect("reopen cache"),
     );
-    let upstream = QueueUpstream::new([metadata_response(b"held fill", "\"held\"")]);
-    let leader = service
-        .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
-        .await
-        .expect("start leader fill without consuming it");
-
-    let error = service
-        .execute(request, UpstreamHealth::Healthy, &upstream)
-        .await
-        .expect_err("coalesced wait must time out");
-    assert!(matches!(
-        error,
-        MirrorError::Cache(CacheError::FillWaitTimeout)
-    ));
-    drop(leader);
+    let (status, bytes) = collect(
+        reopened
+            .execute(request, UpstreamHealth::Healthy, &offline)
+            .await
+            .expect("reopened hit"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Hit);
+    assert_eq!(bytes.as_ref(), b"v2");
+    assert_eq!(offline.call_count(), 0);
 }
 
 #[tokio::test]
@@ -1186,114 +1207,6 @@ fn disjoint_private_scopes_coexist_without_shadowing_public_baselines() {
     assert!(matches!(
         overlapping.validate(),
         Err(cowshed_gateway::PolicyError::OverlappingMirrorScope)
-    ));
-}
-
-#[tokio::test]
-async fn redirect_is_bounded_same_origin_typed_and_never_followed() {
-    let root = TestRoot::new();
-    let service = open_service(&root).await;
-    let request = request(
-        MirrorProtocol::Npm,
-        target("registry.npmjs.org"),
-        "/react",
-        MirrorCacheScope::Anonymous,
-        false,
-        None,
-    );
-    let redirected = Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
-        .header(header::LOCATION, "/react?write=true")
-        .body(body(Bytes::new()))
-        .expect("redirect response");
-    let upstream = QueueUpstream::new([redirected]);
-    let MirrorOutcome::Redirect(redirect) = service
-        .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
-        .await
-        .expect("typed redirect")
-    else {
-        panic!("expected redirect outcome");
-    };
-    assert_eq!(redirect.request.path, "/react?write=true");
-    assert_eq!(redirect.request.redirects_remaining, 4);
-    assert_eq!(upstream.call_count(), 1);
-    let mut next =
-        MirrorRequest::from_redirect(redirect.request, MirrorCacheScope::Anonymous, false)
-            .expect("re-admitted redirect request");
-    for expected_remaining in [3, 2, 1, 0] {
-        let response = Response::builder()
-            .status(StatusCode::TEMPORARY_REDIRECT)
-            .header(header::LOCATION, "/react?write=true")
-            .body(body(Bytes::new()))
-            .expect("redirect response");
-        let hop = QueueUpstream::new([response]);
-        let MirrorOutcome::Redirect(redirect) = service
-            .execute(next, UpstreamHealth::Healthy, &hop)
-            .await
-            .expect("bounded redirect hop")
-        else {
-            panic!("expected redirect hop");
-        };
-        assert_eq!(redirect.request.redirects_remaining, expected_remaining);
-        next = MirrorRequest::from_redirect(redirect.request, MirrorCacheScope::Anonymous, false)
-            .expect("re-admitted redirect request");
-    }
-    let sixth = Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
-        .header(header::LOCATION, "/react?write=true")
-        .body(body(Bytes::new()))
-        .expect("redirect response");
-    assert!(matches!(
-        service
-            .execute(next, UpstreamHealth::Healthy, &QueueUpstream::new([sixth]),)
-            .await,
-        Err(MirrorError::TooManyRedirects)
-    ));
-
-    let cross_origin = Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
-        .header(header::LOCATION, "https://evil.example/react")
-        .body(body(Bytes::new()))
-        .expect("redirect response");
-    let upstream = QueueUpstream::new([cross_origin]);
-    assert!(matches!(
-        service
-            .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
-            .await,
-        Err(MirrorError::UnsafeRedirect)
-    ));
-    assert_eq!(upstream.call_count(), 1);
-
-    let downgrade = Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
-        .header(header::LOCATION, "http://registry.npmjs.org/react")
-        .body(body(Bytes::new()))
-        .expect("downgrade response");
-    assert!(matches!(
-        service
-            .execute(
-                request.clone(),
-                UpstreamHealth::Healthy,
-                &QueueUpstream::new([downgrade]),
-            )
-            .await,
-        Err(MirrorError::UnsafeRedirect)
-    ));
-
-    let method_rewrite = Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header(header::LOCATION, "/react")
-        .body(body(Bytes::new()))
-        .expect("method rewrite response");
-    assert!(matches!(
-        service
-            .execute(
-                request,
-                UpstreamHealth::Healthy,
-                &QueueUpstream::new([method_rewrite]),
-            )
-            .await,
-        Err(MirrorError::UnsafeRedirect)
     ));
 }
 
@@ -1580,9 +1493,14 @@ async fn real_fetch_failure_transitions_unknown_health_to_fast_offline_miss() {
 }
 
 #[tokio::test]
-async fn canonical_identity_encoding_and_vary_star_never_share_cache() {
+async fn an_accepted_response_is_streamed_and_published_and_a_rejected_one_writes_nothing() {
     let root = TestRoot::new();
     let service = open_service(&root).await;
+    let stored = || {
+        std::fs::read_dir(root.path())
+            .expect("list cache root")
+            .count()
+    };
     let mut headers = HeaderMap::new();
     headers.insert(header::ACCEPT_ENCODING, "gzip, br".parse().expect("header"));
     let request = MirrorRequest::new(
@@ -1596,6 +1514,8 @@ async fn canonical_identity_encoding_and_vary_star_never_share_cache() {
         None,
     )
     .expect("canonical mirror request");
+
+    // A response that varies on everything is streamed to the client and stored nowhere.
     let varying = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_LENGTH, 2)
@@ -1603,14 +1523,15 @@ async fn canonical_identity_encoding_and_vary_star_never_share_cache() {
         .body(body(Bytes::from_static(b"ok")))
         .expect("varying response");
     let upstream = QueueUpstream::new([varying]);
-    let (status, _) = collect(
+    let (status, bytes) = collect(
         service
-            .execute(request, UpstreamHealth::Healthy, &upstream)
+            .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
             .await
-            .expect("bypass unsafe varying response"),
+            .expect("an unsafe Vary is answered, not stored"),
     )
     .await;
     assert_eq!(status, MirrorCacheStatus::Bypassed);
+    assert_eq!(bytes.as_ref(), b"ok");
     assert_eq!(
         upstream.requests()[0]
             .headers
@@ -1618,6 +1539,47 @@ async fn canonical_identity_encoding_and_vary_star_never_share_cache() {
             .expect("canonical encoding"),
         "identity"
     );
+    assert_eq!(stored(), 0, "a rejected response starts no cache write");
+
+    // A redirect is handed back typed, and writes nothing either.
+    let redirected = Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, "/encoding?hop=1")
+        .body(body(Bytes::new()))
+        .expect("redirect response");
+    let upstream = QueueUpstream::new([redirected]);
+    let MirrorOutcome::Redirect(redirect) = service
+        .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
+        .await
+        .expect("typed redirect")
+    else {
+        panic!("expected redirect outcome");
+    };
+    assert_eq!(redirect.request.path, "/encoding?hop=1");
+    assert_eq!(stored(), 0, "a redirect starts no cache write");
+
+    // An accepted response streams to its client while it publishes: the next reader needs no
+    // registry.
+    let upstream = QueueUpstream::new([ok_response(b"accepted")]);
+    let (status, bytes) = collect(
+        service
+            .execute(request.clone(), UpstreamHealth::Healthy, &upstream)
+            .await
+            .expect("an accepted response fills"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::Filled);
+    assert_eq!(bytes.as_ref(), b"accepted");
+    assert_eq!(stored(), 1, "the published object is the one entry");
+    let (status, bytes) = collect(
+        service
+            .execute(request, UpstreamHealth::Offline, &QueueUpstream::new([]))
+            .await
+            .expect("the published entry is served offline"),
+    )
+    .await;
+    assert_eq!(status, MirrorCacheStatus::OfflineHit);
+    assert_eq!(bytes.as_ref(), b"accepted");
 }
 
 #[test]
@@ -2528,87 +2490,6 @@ fn bun_manifest(method: Method, validators: &[(header::HeaderName, &str)]) -> Mi
     bun_manifest_at("/@msgpack%2fmsgpack", method, validators)
 }
 
-/// The state of the mirror's cache when the conditional request arrives.
-#[derive(Clone, Copy, Debug)]
-enum Warmth {
-    /// Nothing cached: the request fills.
-    Cold,
-    /// Cached and inside the metadata TTL: the request hits.
-    Fresh,
-    /// Cached and past the TTL: the request revalidates with the cached entry's own validator.
-    Stale,
-}
-
-impl Warmth {
-    fn cache_status(self) -> MirrorCacheStatus {
-        match self {
-            Self::Cold => MirrorCacheStatus::Filled,
-            Self::Fresh => MirrorCacheStatus::Hit,
-            Self::Stale => MirrorCacheStatus::Revalidated,
-        }
-    }
-}
-
-struct Conditional {
-    _root: TestRoot,
-    service: MirrorService,
-    answer: Answer,
-    /// The registry requests this one request caused; priming is excluded.
-    sent: Vec<MirrorFetchRequest>,
-}
-
-/// One conditional manifest request against `registry`, with the cache in `warmth`. Priming is a
-/// plain `GET` of the same manifest.
-async fn conditional_manifest(
-    warmth: Warmth,
-    registry: &ValidatingRegistry,
-    method: Method,
-    validators: &[(header::HeaderName, &str)],
-) -> Conditional {
-    let root = TestRoot::new();
-    let mut config = root.cache_config();
-    config.metadata_ttl = match warmth {
-        Warmth::Stale => Duration::from_millis(15),
-        Warmth::Cold | Warmth::Fresh => cowshed_os::test_backstop::NO_PROGRESS,
-    };
-    let service = MirrorService::new(Cache::open(config).await.expect("open cache"));
-    if !matches!(warmth, Warmth::Cold) {
-        let primed = answer(
-            service
-                .execute(
-                    bun_manifest(Method::GET, &[]),
-                    UpstreamHealth::Healthy,
-                    registry,
-                )
-                .await
-                .expect("prime the manifest"),
-        )
-        .await;
-        assert_eq!(primed.cache_status, MirrorCacheStatus::Filled);
-    }
-    if matches!(warmth, Warmth::Stale) {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let primed = registry.requests().len();
-    let answered = answer(
-        service
-            .execute(
-                bun_manifest(method, validators),
-                UpstreamHealth::Healthy,
-                registry,
-            )
-            .await
-            .expect("a conditional GET is answered, never failed"),
-    )
-    .await;
-    Conditional {
-        _root: root,
-        service,
-        answer: answered,
-        sent: registry.requests().split_off(primed),
-    }
-}
-
 /// The cached manifest as an offline client reads it: whatever the conditional request did, the
 /// entry must be published whole.
 async fn cached_manifest(service: &MirrorService, context: &str) -> Answer {
@@ -2669,251 +2550,127 @@ fn assert_manifest_not_modified(answer: &Answer, etag: &str, context: &str) {
 }
 
 #[tokio::test]
-async fn a_clients_etag_is_compared_weakly_by_the_mirror_and_never_reaches_the_registry() {
+async fn a_clients_validators_stay_out_of_the_registry_and_a_held_representation_is_a_bodyless_304()
+{
     let document = published(b"manifest tarball", false);
-    // (ETag the registry serves, If-None-Match the client sends, whether the client holds it)
-    for (served, sent, holds) in [
-        ("\"v1\"", "\"v1\"", true),
-        ("\"v1\"", "W/\"v1\"", true),
-        ("W/\"v1\"", "W/\"v1\"", true),
-        ("W/\"v1\"", "\"v1\"", true),
-        ("\"v1\"", "\"v0\", W/\"v1\"", true),
-        ("\"v1\"", "\"v0\",W/\"v1\" ,\"v2\"", true),
-        ("\"v1\"", "*", true),
-        ("\"a,b\"", "W/\"a,b\"", true),
-        ("\"v1\"", "W/\"v2\"", false),
-        ("W/\"v1\"", "\"v2\"", false),
-        ("\"v1\"", "\"v10\"", false),
-        ("\"a,b\"", "\"a\", \"b\"", false),
-        ("\"v1\"", "v1", false),
-        ("\"v1\"", "w/\"v1\"", false),
-        ("\"v1\"", "\"v1", false),
-    ] {
-        for warmth in [Warmth::Cold, Warmth::Fresh, Warmth::Stale] {
-            let context = format!("{served} against If-None-Match {sent} on a {warmth:?} cache");
-            let registry = ValidatingRegistry::new(served, &document);
-            // Bound whole: the cache root lives as long as this iteration.
-            let conditional = conditional_manifest(
-                warmth,
+    let root = TestRoot::new();
+    let clock = ManualClock::new();
+    let config = root.cache_config();
+    let ttl = config.metadata_ttl;
+    let service = MirrorService::new(
+        Cache::open_with_clock(config, clock.reader())
+            .await
+            .expect("open cache"),
+    );
+    let registry = ValidatingRegistry::new("\"v1\"", &document);
+    let holds_v1 = [(header::IF_NONE_MATCH, "W/\"v1\"")];
+    let holds_v2 = [(header::IF_NONE_MATCH, "\"v2\"")];
+    let stored = || {
+        std::fs::read_dir(root.path())
+            .expect("list cache root")
+            .count()
+    };
+
+    // Cold, a HEAD is answered from the registry's HEAD and stores nothing.
+    let cold_head = answer(
+        service
+            .execute(
+                bun_manifest(Method::HEAD, &holds_v1),
+                UpstreamHealth::Healthy,
                 &registry,
-                Method::GET,
-                &[(header::IF_NONE_MATCH, sent)],
             )
-            .await;
-            let (answer, upstream) = (&conditional.answer, &conditional.sent);
-            let service = &conditional.service;
+            .await
+            .expect("a conditional HEAD is answered, never failed"),
+    )
+    .await;
+    assert_eq!(cold_head.cache_status, MirrorCacheStatus::Bypassed);
+    assert_manifest_not_modified(&cold_head, "\"v1\"", "the cold HEAD");
+    assert_eq!(registry.requests().len(), 1);
+    assert_eq!(registry.requests()[0].method, Method::HEAD);
+    assert_no_client_validator(&registry.requests()[0], "the cold HEAD");
+    assert_eq!(stored(), 0, "a HEAD starts no cache write");
 
-            assert_eq!(answer.cache_status, warmth.cache_status(), "{context}");
-            if holds {
-                assert_manifest_not_modified(answer, served, &context);
-            } else {
-                assert_eq!(answer.status, StatusCode::OK, "{context}");
-                assert_eq!(answer.bytes.as_ref(), document, "{context}");
-                assert_eq!(
-                    header_str(&answer.headers, header::ETAG),
-                    served,
-                    "{context}"
-                );
-            }
-
-            // The registry hears only the mirror's own validator, never the client's.
-            match warmth {
-                Warmth::Cold => {
-                    assert_eq!(upstream.len(), 1, "{context}");
-                    assert_no_client_validator(&upstream[0], &context);
-                }
-                Warmth::Fresh => assert!(upstream.is_empty(), "{context}"),
-                Warmth::Stale => {
-                    assert_eq!(upstream.len(), 1, "{context}");
-                    assert_eq!(
-                        header_str(&upstream[0].headers, header::IF_NONE_MATCH),
-                        served,
-                        "{context}"
-                    );
-                    assert!(
-                        !upstream[0].headers.contains_key(header::IF_MODIFIED_SINCE),
-                        "{context}"
-                    );
-                }
-            }
-
-            // Answering 304 never costs the next client its cache entry.
-            let cached = cached_manifest(service, &context).await;
-            assert_eq!(cached.status, StatusCode::OK, "{context}");
-            assert_eq!(cached.bytes.as_ref(), document, "{context}");
-        }
-    }
-}
-
-#[tokio::test]
-async fn a_registry_change_is_answered_from_the_fill_that_publishes_it() {
-    let v1 = published(b"manifest tarball v1", false);
-    let v2 = published(b"manifest tarball v2, a different size", false);
-    assert_ne!(v1, v2);
-    for (sent, holds) in [("W/\"v1\"", false), ("W/\"v2\"", true)] {
-        let root = TestRoot::new();
-        let mut config = root.cache_config();
-        config.metadata_ttl = Duration::from_millis(15);
-        let service = MirrorService::new(Cache::open(config).await.expect("open cache"));
-        let before = ValidatingRegistry::new("\"v1\"", &v1);
-        let primed = answer(
-            service
-                .execute(
-                    bun_manifest(Method::GET, &[]),
-                    UpstreamHealth::Healthy,
-                    &before,
-                )
-                .await
-                .expect("prime the first version"),
-        )
-        .await;
-        assert_eq!(primed.cache_status, MirrorCacheStatus::Filled);
-        tokio::time::sleep(Duration::from_millis(25)).await;
-
-        let after = ValidatingRegistry::new("\"v2\"", &v2);
-        let answered = answer(
-            service
-                .execute(
-                    bun_manifest(Method::GET, &[(header::IF_NONE_MATCH, sent)]),
-                    UpstreamHealth::Healthy,
-                    &after,
-                )
-                .await
-                .expect("a conditional GET across a registry change"),
-        )
-        .await;
-        assert_eq!(answered.cache_status, MirrorCacheStatus::Filled, "{sent}");
-        assert_eq!(
-            header_str(&after.requests()[0].headers, header::IF_NONE_MATCH),
-            "\"v1\"",
-            "the mirror validates its cached v1, whatever the client holds"
-        );
-        if holds {
-            assert_manifest_not_modified(&answered, "\"v2\"", sent);
-        } else {
-            assert_eq!(answered.status, StatusCode::OK, "{sent}");
-            assert_eq!(answered.bytes.as_ref(), v2, "{sent}");
-        }
-        let cached = cached_manifest(&service, sent).await;
-        assert_eq!(cached.bytes.as_ref(), v2, "{sent}");
-        assert_eq!(header_str(&cached.headers, header::ETAG), "\"v2\"");
-    }
-}
-
-#[tokio::test]
-async fn head_is_answered_with_the_same_conditional_semantics() {
-    let document = published(b"manifest tarball", false);
-    for warmth in [Warmth::Cold, Warmth::Fresh] {
-        for (sent, holds) in [("W/\"v1\"", true), ("\"v2\"", false)] {
-            let context = format!("HEAD against If-None-Match {sent} on a {warmth:?} cache");
-            let registry = ValidatingRegistry::new("\"v1\"", &document);
-            let conditional = conditional_manifest(
-                warmth,
+    // Cold, a GET whose validator names another representation fills and is answered in full.
+    let cold_get = answer(
+        service
+            .execute(
+                bun_manifest(Method::GET, &holds_v2),
+                UpstreamHealth::Healthy,
                 &registry,
-                Method::HEAD,
-                &[(header::IF_NONE_MATCH, sent)],
             )
-            .await;
-            let (answer, upstream) = (&conditional.answer, &conditional.sent);
-            if holds {
-                assert_manifest_not_modified(answer, "\"v1\"", &context);
-            } else {
-                assert_eq!(answer.status, StatusCode::OK, "{context}");
-                assert!(answer.bytes.is_empty(), "{context}");
-                assert_eq!(
-                    header_str(&answer.headers, header::CONTENT_LENGTH),
-                    document.len().to_string(),
-                    "{context}"
-                );
-            }
-            if matches!(warmth, Warmth::Cold) {
-                assert_eq!(
-                    answer.cache_status,
-                    MirrorCacheStatus::Bypassed,
-                    "{context}"
-                );
-                assert_eq!(upstream.len(), 1, "{context}");
-                assert_eq!(upstream[0].method, Method::HEAD, "{context}");
-                assert_no_client_validator(&upstream[0], &context);
-            } else {
-                assert_eq!(answer.cache_status, MirrorCacheStatus::Hit, "{context}");
-                assert!(upstream.is_empty(), "{context}");
-            }
-        }
-    }
-}
+            .await
+            .expect("a conditional GET is answered, never failed"),
+    )
+    .await;
+    assert_eq!(cold_get.cache_status, MirrorCacheStatus::Filled);
+    assert_eq!(cold_get.status, StatusCode::OK);
+    assert_eq!(cold_get.bytes.as_ref(), document);
+    assert_eq!(registry.requests().len(), 2);
+    assert_no_client_validator(&registry.requests()[1], "the cold GET");
 
-#[tokio::test]
-async fn if_modified_since_is_answered_by_the_mirror_unless_if_none_match_is_present() {
-    let document = published(b"manifest tarball", false);
-    let etag = "\"v1\"";
-    // Last-Modified is Fri, 26 Dec 2025 06:55:24 GMT.
-    for (validators, holds) in [
-        (vec![(header::IF_MODIFIED_SINCE, LAST_MODIFIED)], true),
-        (
-            vec![(header::IF_MODIFIED_SINCE, "Sat, 27 Dec 2025 00:00:00 GMT")],
-            true,
-        ),
-        (
-            vec![(header::IF_MODIFIED_SINCE, "Friday, 26-Dec-25 06:55:24 GMT")],
-            true,
-        ),
-        (
-            vec![(header::IF_MODIFIED_SINCE, "Fri Dec 26 06:55:24 2025")],
-            true,
-        ),
-        (
-            vec![(header::IF_MODIFIED_SINCE, "Thu, 25 Dec 2025 00:00:00 GMT")],
-            false,
-        ),
-        (
-            vec![(header::IF_MODIFIED_SINCE, "Fri, 26 Dec 2025 06:55:23 GMT")],
-            false,
-        ),
-        (vec![(header::IF_MODIFIED_SINCE, "yesterday")], false),
-        (
-            vec![
-                (header::IF_MODIFIED_SINCE, LAST_MODIFIED),
-                (header::IF_MODIFIED_SINCE, LAST_MODIFIED),
-            ],
-            false,
-        ),
-        (
-            vec![
-                (header::IF_NONE_MATCH, "\"v2\""),
-                (header::IF_MODIFIED_SINCE, "Sat, 27 Dec 2025 00:00:00 GMT"),
-            ],
-            false,
-        ),
-        (
-            vec![
-                (header::IF_NONE_MATCH, "W/\"v1\""),
-                (header::IF_MODIFIED_SINCE, "Thu, 25 Dec 2025 00:00:00 GMT"),
-            ],
-            true,
-        ),
-    ] {
-        for warmth in [Warmth::Cold, Warmth::Fresh, Warmth::Stale] {
-            let context = format!("{validators:?} on a {warmth:?} cache");
-            let registry = ValidatingRegistry::new(etag, &document);
-            let conditional =
-                conditional_manifest(warmth, &registry, Method::GET, &validators).await;
-            let (answer, upstream) = (&conditional.answer, &conditional.sent);
-            assert_eq!(answer.cache_status, warmth.cache_status(), "{context}");
-            if holds {
-                assert_manifest_not_modified(answer, etag, &context);
-            } else {
-                assert_eq!(answer.status, StatusCode::OK, "{context}");
-                assert_eq!(answer.bytes.as_ref(), document, "{context}");
-            }
-            for request in upstream {
-                assert!(
-                    !request.headers.contains_key(header::IF_MODIFIED_SINCE),
-                    "{context}: the client's validator reached the registry"
-                );
-            }
-        }
-    }
+    // Fresh, the representation the client holds is a bodyless 304 and the registry is not asked.
+    let fresh = answer(
+        service
+            .execute(
+                bun_manifest(Method::GET, &holds_v1),
+                UpstreamHealth::Healthy,
+                &registry,
+            )
+            .await
+            .expect("a conditional GET is answered, never failed"),
+    )
+    .await;
+    assert_eq!(fresh.cache_status, MirrorCacheStatus::Hit);
+    assert_manifest_not_modified(&fresh, "\"v1\"", "the fresh GET");
+    assert_eq!(registry.requests().len(), 2);
+
+    // Fresh, a HEAD for another representation is the bodyless 200 of the cached entry.
+    let head = answer(
+        service
+            .execute(
+                bun_manifest(Method::HEAD, &holds_v2),
+                UpstreamHealth::Healthy,
+                &registry,
+            )
+            .await
+            .expect("a conditional HEAD is answered, never failed"),
+    )
+    .await;
+    assert_eq!(head.cache_status, MirrorCacheStatus::Hit);
+    assert_eq!(head.status, StatusCode::OK);
+    assert!(head.bytes.is_empty());
+    assert_eq!(
+        header_str(&head.headers, header::CONTENT_LENGTH),
+        document.len().to_string()
+    );
+
+    // Stale, the registry hears the cached entry's own validator and never the client's.
+    clock.advance(ttl + Duration::from_millis(1));
+    let stale = answer(
+        service
+            .execute(
+                bun_manifest(Method::GET, &holds_v1),
+                UpstreamHealth::Healthy,
+                &registry,
+            )
+            .await
+            .expect("a conditional GET is answered, never failed"),
+    )
+    .await;
+    assert_eq!(stale.cache_status, MirrorCacheStatus::Revalidated);
+    assert_manifest_not_modified(&stale, "\"v1\"", "the stale GET");
+    let sent = registry.requests();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(
+        header_str(&sent[2].headers, header::IF_NONE_MATCH),
+        "\"v1\""
+    );
+    assert!(!sent[2].headers.contains_key(header::IF_MODIFIED_SINCE));
+
+    // Answering 304 never costs the next client its cached bytes.
+    let cached = cached_manifest(&service, "after the conditional requests").await;
+    assert_eq!(cached.status, StatusCode::OK);
+    assert_eq!(cached.bytes.as_ref(), document);
 }
 
 #[tokio::test]

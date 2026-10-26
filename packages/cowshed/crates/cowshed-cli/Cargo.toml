@@ -48,6 +48,8 @@ toml.workspace = true
 # The expired-wait boundary test (src/run.rs) reads the Arrow segment it seals.
 arrow-array = "56"
 arrow-ipc = "56"
+# The launchd tests read a generated LaunchAgent definition as launchd does: its keys and values.
+plist = "1"
 # The install and restart decisions (src/agent_cycle.rs) are property-tested.
 proptest = "1"
 # Paused time: a test lets a day pass while a foreground exec still waits for its job.

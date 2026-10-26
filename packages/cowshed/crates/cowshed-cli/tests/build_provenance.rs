@@ -6,34 +6,14 @@ use cowshed_os::test_backstop::CommandBackstop as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+#[path = "../../cowshed-core/tests/support/temp_root.rs"]
+mod temp_root;
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-build-provenance-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).unwrap();
-        Self(root)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.0) {
-            cowshed_os::eprintln!(
-                "release provenance fixture cleanup {} failed: {error}",
-                self.0.display()
-            );
-        }
-    }
+/// The owner script itself, included so its directive decision is tested at the function
+/// that makes it; its `main` and git shell are exercised by the warm-clone build below.
+#[allow(dead_code)]
+mod build_script {
+    include!("../build.rs");
 }
 
 fn output(command: &mut Command) -> String {
@@ -65,8 +45,8 @@ fn stamp(root: &Path) -> String {
 
 #[test]
 fn release_provenance_follows_a_warm_clone_not_its_donor() {
-    let scratch = Scratch::new();
-    let donor = scratch.0.join("donor");
+    let scratch = temp_root::TempRoot::new_in(&std::env::temp_dir(), "cowshed-build-provenance");
+    let donor = scratch.join("donor");
     fs::create_dir_all(donor.join("src")).unwrap();
     fs::write(
         donor.join("Cargo.toml"),
@@ -95,62 +75,8 @@ fn release_provenance_follows_a_warm_clone_not_its_donor() {
     );
     assert_eq!(stamp(&donor), first);
 
-    // Execute the actual owner script to inspect its Cargo directives, not Cargo's private file layout.
-    let script = scratch.0.join("owner-build-script");
-    output(
-        Command::new("rustc")
-            .current_dir(&donor)
-            .arg("build.rs")
-            .arg("-o")
-            .arg(&script),
-    );
-    let metadata = output(
-        Command::new(&script)
-            .current_dir(&donor)
-            .env("PROFILE", "release")
-            .env("CARGO_MANIFEST_DIR", &donor),
-    );
-
-    let debug = output(
-        Command::new(&script)
-            .current_dir(&donor)
-            .env("PROFILE", "debug")
-            .env("CARGO_MANIFEST_DIR", &donor),
-    );
-    assert_eq!(
-        debug, "cargo:rerun-if-changed=build.rs\n",
-        "debug builds record no provenance"
-    );
-    let archive = scratch.0.join("archive");
-    fs::create_dir(&archive).unwrap();
-    let unversioned = output(
-        Command::new(&script)
-            .current_dir(&archive)
-            .env("PROFILE", "release")
-            .env("CARGO_MANIFEST_DIR", &archive),
-    );
-    assert_eq!(
-        unversioned, "cargo:rerun-if-changed=build.rs\n",
-        "an unversioned archive records no provenance"
-    );
-    let watched: Vec<_> = metadata
-        .lines()
-        .filter_map(|line| line.strip_prefix("cargo:rerun-if-changed="))
-        .collect();
-    assert_eq!(watched.len(), 3, "build.rs and both Git HEAD clocks");
-    for path in watched {
-        assert!(
-            Path::new(path).is_relative(),
-            "warm rerun metadata must be checkout-relative: {path}"
-        );
-        assert!(
-            donor.join(path).try_exists().unwrap(),
-            "the declared watch path exists: {path}"
-        );
-    }
-
     // Preserve Cargo's warm artifacts and file times, as a source-image clone does.
-    let clone = scratch.0.join("clone");
+    let clone = scratch.join("clone");
     output(
         Command::new("cp")
             .args(["-p", "-R"])
@@ -182,4 +108,34 @@ fn release_provenance_follows_a_warm_clone_not_its_donor() {
         "release provenance must follow the clone's own HEAD"
     );
     assert_eq!(stamp(&donor), first, "the donor artifact is untouched");
+}
+
+#[test]
+fn build_directives_name_the_watch_set_and_the_recorded_commit() {
+    let directives = |release: bool,
+                      git_directory: Option<&str>,
+                      commit: Option<&str>,
+                      commit_time: Option<&str>| {
+        build_script::directives(release, git_directory, commit, commit_time).join("\n")
+    };
+    assert_eq!(
+        directives(false, Some(".git"), Some("abc"), Some("123")),
+        "cargo:rerun-if-changed=build.rs",
+        "debug builds record no provenance"
+    );
+    assert_eq!(
+        directives(true, None, None, None),
+        "cargo:rerun-if-changed=build.rs",
+        "an unversioned archive records no provenance"
+    );
+    assert_eq!(
+        directives(true, Some(".git"), Some("abc"), Some("not-a-time")),
+        "cargo:rerun-if-changed=build.rs\ncargo:rerun-if-changed=.git/HEAD\ncargo:rerun-if-changed=.git/logs/HEAD",
+        "an unreadable commit time records no provenance, and the watch set is build.rs and both Git HEAD clocks"
+    );
+    assert_eq!(
+        directives(true, Some(".git"), Some("abc"), Some("123")),
+        "cargo:rerun-if-changed=build.rs\ncargo:rerun-if-changed=.git/HEAD\ncargo:rerun-if-changed=.git/logs/HEAD\ncargo:rustc-env=COWSHED_BUILD_COMMIT=abc\ncargo:rustc-env=COWSHED_BUILD_COMMIT_TIME=123",
+        "a release build records the commit git named"
+    );
 }

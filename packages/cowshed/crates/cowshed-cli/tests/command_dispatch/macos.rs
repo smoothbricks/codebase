@@ -36,7 +36,6 @@ use cowshed_os::test_backstop::{
     AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _, FileBackstop as _,
     UnixStreamBackstop as _,
 };
-use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
@@ -60,6 +59,9 @@ mod scratch_apfs;
 #[path = "../../../cowshed-core/tests/support/scratch_directory.rs"]
 mod scratch_directory;
 use nx_dependencies::nx_read_paths;
+#[path = "../support/release_gate.rs"]
+mod release_gate;
+use release_gate::Gate;
 
 use scratch_apfs::ScratchRoot;
 
@@ -350,11 +352,24 @@ fn checkout_template(project: Project<'_>) -> PathBuf {
     )
 }
 
+/// This runner's template directory, `/private/tmp/cowshed-dtest-<runner pid>-<runner start>-templates`.
+/// Its name parses as the runner's directory root, so the directory roots' sweep reclaims it once
+/// the runner is gone; this process enters that sweep before it reads or makes the directory,
+/// whatever substrate its own fixtures use. The runner's start joins its pid: a dead runner whose
+/// pid this one now holds named another directory, which this run never reads and the sweep
+/// reclaims once the pid is free.
 fn checkout_template_directory() -> PathBuf {
+    scratch_directory::sweep_dead_roots_once()
+        .unwrap_or_else(|error| panic!("reclaim dead runs' fixture roots: {error}"));
     // SAFETY: `getppid` has no preconditions and cannot fail.
     let run = unsafe { libc::getppid() };
+    let started = cowshed_core::runtime::job_groups::GroupLeader::observe(
+        u32::try_from(run).expect("a parent pid is positive"),
+    )
+    .unwrap_or_else(|error| panic!("the start of runner {run}: {error}"))
+    .start();
     let directory = PathBuf::from(format!(
-        "/private/tmp/{}{run}-templates",
+        "/private/tmp/{}{run}-{started}-templates",
         scratch_directory::ROOT_PREFIX
     ));
     fs::create_dir_all(&directory)
@@ -369,7 +384,17 @@ fn materialized_template(directory: &Path, key: &str, write: impl FnOnce(&Path))
     let _writing = scratch_apfs::lock_exclusive(&lock)
         .unwrap_or_else(|error| panic!("template lock {}: {error}", lock.display()));
     if !template.exists() {
+        // Writers write only under this lock, so an aside already here is a killed writer's that
+        // held this pid before: it is removed whole, never written over.
         let aside = directory.join(format!("{key}.{}", std::process::id()));
+        match fs::remove_dir_all(&aside) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!(
+                "remove a killed writer's template {}: {error}",
+                aside.display()
+            ),
+        }
         write(&aside);
         fs::rename(&aside, &template).unwrap_or_else(|error| {
             panic!("publish fixture template {}: {error}", template.display())
@@ -1318,9 +1343,10 @@ async fn directory_a_job_reads_its_own_start_environment_with_ps() {
             "--".into(),
             "/bin/sh".into(),
             "-c".into(),
-            r#"COWSHED_PS_PROBE=daemon "$1" -e 'require("fs").writeFileSync("started", ""); setInterval(() => {}, 1000)' &
+            r#"mkfifo started || exit 5
+COWSHED_PS_PROBE=daemon "$1" -e 'require("fs").writeFileSync("started", "\n"); setInterval(() => {}, 1000)' &
 daemon=$!
-while [ ! -e started ]; do kill -0 $daemon || exit 5; sleep 0.1; done
+read ready < started
 line=$(/bin/ps -E -ww -o command= -p $daemon)
 listed=$?
 kill $daemon
@@ -1364,8 +1390,8 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
     let mut excluded = fs::read(&exclude).expect("the workspace's own exclude file");
     excluded.extend_from_slice(b"/.nx/\n");
     fs::write(&exclude, excluded).expect("exclude Nx state");
-    let socket = std::env::temp_dir().join(format!("cs-nxd-{}.sock", std::process::id()));
-    let _ = fs::remove_file(&socket);
+    // In the fixture's own short root: spelled as bound, under sun_path, reclaimed with the root.
+    let socket = fixture._scratch.path().join("nxd.sock");
     let mut daemon = Command::new("/usr/bin/nc")
         .arg("-lkU")
         .arg(&socket)
@@ -1375,7 +1401,7 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
         .stderr(Stdio::null())
         .spawn()
         .expect("a listening stand-in daemon");
-    eventually(|| socket.exists()).await;
+    until_changed(&[Watched::Entry(&socket)], || socket.exists()).await;
     let record = topic.join(".nx/workspace-data/d/server-process.json");
     fs::create_dir_all(record.parent().expect("record directory")).expect("record directory");
     fs::write(
@@ -1397,19 +1423,16 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
         "{}",
         String::from_utf8_lossy(&stderr)
     );
-    let mut exited = None;
-    eventually(|| {
-        exited = daemon.try_wait().expect("poll the stand-in daemon");
-        exited.is_some()
-    })
-    .await;
+    let exited = tokio::task::spawn_blocking(move || daemon.wait_bounded())
+        .await
+        .expect("wait for the stand-in daemon")
+        .expect("the stand-in daemon exits");
     assert_eq!(
-        exited.and_then(|status| status.signal()),
+        exited.signal(),
         Some(libc::SIGTERM),
         "stopped as `nx daemon --stop` stops it; {}",
         String::from_utf8_lossy(&stderr)
     );
-    let _ = fs::remove_file(&socket);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
@@ -2216,6 +2239,10 @@ fn directory_nx_install_is_materialized_once_across_checkout_templates() {
     let scratch = scratch_directory::ScratchRoot::new("nx-install-template").expect("scratch root");
     let templates = scratch.path().join("templates");
     fs::create_dir(&templates).unwrap();
+    // A writer of this pid killed before its rename left its aside behind.
+    let killed_writer = templates.join(format!("nx-install.{}", std::process::id()));
+    fs::create_dir(&killed_writer).unwrap();
+    fs::write(killed_writer.join("partial"), b"a killed writer's bytes").unwrap();
     let source = scratch.path().join("installed");
     fs::create_dir_all(source.join("nx")).unwrap();
     fs::write(source.join("nx/product"), b"immutable installed bytes").unwrap();
@@ -2238,6 +2265,10 @@ fn directory_nx_install_is_materialized_once_across_checkout_templates() {
     let second = scratch.path().join("build-nx");
     clone_nx_namespace(&templates, &second, write);
     assert_eq!(copies.get(), 1);
+    assert!(
+        !killed_writer.exists(),
+        "the published install took the killed writer's aside, not its bytes"
+    );
     for checkout in [first, second] {
         assert_eq!(
             fs::read(checkout.join("entry")).unwrap(),
@@ -2248,6 +2279,86 @@ fn directory_nx_install_is_materialized_once_across_checkout_templates() {
             Path::new("nx/product")
         );
     }
+}
+
+/// F106 (08_testing.md, "Integration tests (real substrate)": every run first reclaims the runs
+/// whose owner is gone). A runner killed mid-run leaves its checkout templates; the next process
+/// that reads checkout templates reclaims them though it makes no directory root of its own, and
+/// keeps a live runner's. The dead runner and the live one are real processes: the dead one is
+/// reaped before the next process starts, the live one is held on its stdin.
+#[test]
+fn directory_a_dead_runners_checkout_templates_are_reclaimed_by_the_next_process_reading_templates()
+{
+    const CHILD: &str = "COWSHED_TEST_CHECKOUT_TEMPLATE_ENTRANT";
+    if std::env::var_os(CHILD).is_some() {
+        println!("templates={}", checkout_template_directory().display());
+        return;
+    }
+    let templates_of = |runner: &std::process::Child| {
+        let pid = runner.id();
+        let started = cowshed_core::runtime::job_groups::GroupLeader::observe(pid)
+            .expect("the runner's start")
+            .start();
+        let directory = PathBuf::from(format!(
+            "/private/tmp/{}{pid}-{started}-templates",
+            scratch_directory::ROOT_PREFIX
+        ));
+        fs::create_dir_all(directory.join("checkout-plain")).unwrap();
+        fs::write(directory.join("checkout-plain/tracked"), b"tracked\n").unwrap();
+        directory
+    };
+    let runner = || {
+        Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("a runner")
+    };
+    let mut dead = runner();
+    let dead_templates = templates_of(&dead);
+    drop(dead.stdin.take());
+    assert!(dead.wait_bounded().expect("reap the dead runner").success());
+    let live = Holder(runner());
+    let live_templates = templates_of(&live.0);
+
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "macos::directory_a_dead_runners_checkout_templates_are_reclaimed_by_the_next_process_reading_templates",
+            "--nocapture",
+            "--quiet",
+        ])
+        .env(CHILD, "1")
+        .output_bounded()
+        .expect("run the next process that reads checkout templates");
+    let stdout = String::from_utf8(output.stdout).expect("child stdout");
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The entrant's own templates are this live process's, named for it as their runner.
+    let entrant = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("templates="))
+        .map(PathBuf::from)
+        .expect("the entrant names its template directory");
+    let kept = live_templates.join("checkout-plain/tracked").exists();
+    let reclaimed = !dead_templates.exists();
+    for directory in [&live_templates, &entrant] {
+        fs::remove_dir_all(directory).unwrap();
+    }
+    assert!(
+        reclaimed,
+        "the dead runner's templates stayed: {}",
+        dead_templates.display()
+    );
+    assert!(
+        kept,
+        "the live runner's templates were reclaimed: {}",
+        live_templates.display()
+    );
 }
 
 fn write_repository_nx_install(installed: &Path, nx: &Path) {
@@ -3332,7 +3443,7 @@ async fn push_only_preserves_the_validated_head_without_landing_or_retiring(
     assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), source_head);
     assert!(landed.retired, "ordinary land still retires by default");
     // Logical retirement returns at step4; step5 reclaims the mountpoint in the background.
-    eventually(|| !topic.exists()).await;
+    until_changed(&[Watched::Entry(&topic)], || !topic.exists()).await;
     assert!(!topic.exists());
     assert_land_outcome(fixture.storage.telemetry(), &landed);
 }
@@ -3386,7 +3497,7 @@ async fn directory_a_land_fences_the_target_head_under_the_caller_ref_lock_subst
         ],
     );
     let doc_commit = async {
-        eventually(|| checked.exists()).await;
+        until_changed(&[Watched::Entry(&checked)], || checked.exists()).await;
         fs::write(main.join("doc.md"), b"doc\n").unwrap();
         git(&main, &["add", "doc.md"]);
         git(&main, &["commit", "-q", "-m", "doc"]);
@@ -3497,7 +3608,7 @@ async fn directory_a_land_fences_the_target_head_under_the_writers_ref_turn_subs
         ],
     );
     let doc_commit = async {
-        eventually(|| checked.exists()).await;
+        until_changed(&[Watched::Entry(&checked)], || checked.exists()).await;
         fs::write(main.join("doc.md"), b"doc\n").unwrap();
         git(&main, &["add", "doc.md"]);
         git(&main, &["commit", "-q", "-m", "doc"]);
@@ -3561,8 +3672,8 @@ async fn directory_an_rm_during_a_land_is_refused_naming_it_substrate_lifecycle(
     // The land parks in its check until the rm has been refused, so the rm runs while the land
     // holds the lease. The release is written even when the rm misbehaves, so the land ends.
     let mid_land = topic.join(".git/mid-land");
-    let release = topic.join(".git/release-land");
-    let finished = Cell::new(false);
+    let release = Gate::new(topic.join(".git/release-land"));
+    let finished = tokio::sync::Notify::new();
     let mut removal_service = fixture.reopen().await;
     let land = async {
         let outcome = run(
@@ -3573,17 +3684,22 @@ async fn directory_an_rm_during_a_land_is_refused_naming_it_substrate_lifecycle(
                 "topic",
                 "--no-retire",
                 "--check",
-                "/usr/bin/touch .git/mid-land; while [ ! -e .git/release-land ]; do /bin/sleep 0.05; done",
+                "/usr/bin/touch .git/mid-land; read released < .git/release-land",
             ],
         )
         .await;
-        finished.set(true);
+        finished.notify_one();
         outcome
     };
     let rm_during_land = async {
-        eventually(|| mid_land.exists() || finished.get()).await;
+        // Either the land parked in its check or it ended without parking: never a wait on a land
+        // that is gone.
+        tokio::select! {
+            () = until_changed(&[Watched::Entry(&mid_land)], || mid_land.exists()) => {}
+            () = finished.notified() => {}
+        }
         let outcome = run(&mut removal_service, ["rm", "topic"]).await;
-        fs::write(&release, b"").expect("release the parked land");
+        release.release();
         outcome
     };
     let ((landed, _, land_stderr), (removed, _, _)) = tokio::join!(land, rm_during_land);
@@ -3612,79 +3728,6 @@ async fn directory_an_rm_during_a_land_is_refused_naming_it_substrate_lifecycle(
         .shutdown()
         .await
         .expect("stop the second controller bridge");
-    service
-        .shutdown()
-        .await
-        .expect("stop the real directory project");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_an_rm_while_a_land_holds_the_lease_is_refused_substrate_lifecycle() {
-    let mut fixture = Fixture::directory();
-    let mut service = serve_project(&mut fixture, &[]).await;
-    let topic = new_workspace(&mut service, "topic").await;
-    let held = land_lease::take(&fixture_sessions(&fixture), "topic", Holding::Land)
-        .expect("a land takes the lease");
-
-    let (removed, _, stderr) = run(&mut service, ["rm", "topic"]).await;
-    let refusal = removed.expect_err("an rm was admitted while a land held the lease");
-    assert!(
-        refusal
-            .message
-            .contains(&format!("being landed by pid {}", std::process::id())),
-        "the rm did not name the land: {refusal}\n{}",
-        String::from_utf8_lossy(&stderr)
-    );
-    assert!(topic.exists(), "the refused rm left the workspace in place");
-
-    drop(held);
-    // Seconds old, so past the age floor only by force; the lease no longer refuses it.
-    succeed(&mut service, ["rm", "topic", "--force"]).await;
-    // The rm's logical retirement returns before its mountpoint is reclaimed in the background.
-    eventually(|| !topic.exists()).await;
-    service
-        .shutdown()
-        .await
-        .expect("stop the real directory project");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_a_land_while_an_rm_holds_the_lease_is_refused_substrate_lifecycle() {
-    let mut fixture = Fixture::directory();
-    let mut service = serve_project(&mut fixture, &[]).await;
-    let main = fixture.checkout.clone();
-    let topic = new_workspace(&mut service, "topic").await;
-    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
-    git(&topic, &["add", "topic.txt"]);
-    git(&topic, &["commit", "-q", "-m", "topic"]);
-    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
-    let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
-    let held = land_lease::take(&fixture_sessions(&fixture), "topic", Holding::Remove)
-        .expect("an rm takes the lease");
-
-    let (landed, _, stderr) = run(&mut service, ["--json", "land", "topic", "--no-retire"]).await;
-    let refusal = landed.expect_err("a land was admitted while an rm held the lease");
-    assert!(
-        refusal
-            .message
-            .contains(&format!("being removed by pid {}", std::process::id())),
-        "the land did not name the rm: {refusal}\n{}",
-        String::from_utf8_lossy(&stderr)
-    );
-    assert_eq!(
-        git_stdout(&main, &["rev-parse", "HEAD"]),
-        main_head,
-        "a refused land left main where it was"
-    );
-    assert!(topic.exists(), "a refused land left the workspace in place");
-
-    drop(held);
-    succeed(&mut service, ["--json", "land", "topic", "--no-retire"]).await;
-    assert_eq!(
-        git_stdout(&main, &["rev-parse", "HEAD"]),
-        topic_head,
-        "the released lease let the land move main"
-    );
     service
         .shutdown()
         .await
@@ -3746,12 +3789,12 @@ async fn directory_land_preflight_refuses_an_unheld_untracked_leaf_as_land_does_
         .expect("stop the real directory project");
 }
 
-/// A clean workspace passes its preflight while another process holds its land lease, which a
-/// land itself is refused for: the preflight takes no lease. Its report pins the land that runs
-/// once the lease is free.
+/// A clean workspace's preflight report pins the land that runs: its source head, target branch and
+/// head, and workspace incarnation, which a land given as expectations moves main to. Whether a
+/// preflight takes the land lease is cowshed-core's `Holding::for_land` decision, table-tested by
+/// `a_preflight_takes_no_lease_and_a_land_holds_as_land`.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_land_preflight_passes_while_another_process_holds_the_land_lease_substrate_lifecycle()
- {
+async fn directory_land_preflight_pins_the_land_that_runs_substrate_lifecycle() {
     let mut fixture = Fixture::directory();
     let mut service = serve_project(&mut fixture, &[]).await;
     let main = fixture.checkout.clone();
@@ -3761,10 +3804,6 @@ async fn directory_land_preflight_passes_while_another_process_holds_the_land_le
     git(&topic, &["commit", "-q", "-m", "topic"]);
     let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
     let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
-    let holder = OtherProcessLock::hold(&land_lease::lease_path(
-        &fixture_sessions(&fixture),
-        "topic",
-    ));
 
     let (stdout, stderr) = succeed(&mut service, ["--json", "land", "topic", "--preflight"]).await;
     let envelope: JsonEnvelope<LandReport> = serde_json::from_slice(&stdout)
@@ -3779,19 +3818,11 @@ async fn directory_land_preflight_passes_while_another_process_holds_the_land_le
         preflight.target_head,
         ExpectedRefHead::Oid(GitOid::new(&main_head).expect("main's head"))
     );
-    let (landed, _, stderr) = run(&mut service, ["--json", "land", "topic", "--no-retire"]).await;
-    let refusal = landed.expect_err("a land was admitted while another process held the lease");
-    assert!(
-        refusal.message.contains("holds its land lease"),
-        "the land did not name the held lease: {refusal}\n{}",
-        String::from_utf8_lossy(&stderr)
-    );
     assert_eq!(
         git_stdout(&main, &["rev-parse", "HEAD"]),
         main_head,
-        "the preflight and the refused land left main where it was"
+        "the preflight left main where it was"
     );
-    holder.release();
 
     let target_head = match &preflight.target_head {
         ExpectedRefHead::Oid(oid) => oid.as_str().to_owned(),
@@ -3824,50 +3855,116 @@ async fn directory_land_preflight_passes_while_another_process_holds_the_land_le
         .expect("stop the real directory project");
 }
 
-/// Another process holding `path` exclusively, as lockf(1) does with the flock(2) a land lease
-/// is: it says `held` once it has the lock, and lets go when its stdin closes.
-struct OtherProcessLock(std::process::Child);
-
-impl OtherProcessLock {
-    fn hold(path: &Path) -> Self {
-        let mut child = Command::new("/usr/bin/lockf")
-            .arg("-k")
-            .arg(path)
-            .args(["/bin/sh", "-c", "echo held; exec cat"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn lockf");
-        let mut word = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.take().expect("the holder's stdout")),
-            &mut word,
-        )
-        .expect("read the holder's word");
-        assert_eq!(word, "held\n", "lockf did not take {}", path.display());
-        Self(child)
-    }
-
-    fn release(mut self) {
-        drop(self.0.stdin.take());
-        let status = self.0.wait_bounded().expect("wait for the lock holder");
-        assert!(status.success(), "the lock holder failed: {status}");
-    }
+/// What a wait watches. An entry's appearance or removal writes its parent directory, so an
+/// entry is watched there and never opened itself: it may be a socket, a mounted volume's root or
+/// already gone. A regular file's bytes are watched on the file once it exists, and on its parent
+/// directory too, which a replacement renamed into place writes.
+#[derive(Clone, Copy, Debug)]
+enum Watched<'a> {
+    Entry(&'a Path),
+    Content(&'a Path),
 }
 
-/// The fixture project's session directory, where its workspaces' land leases live.
-fn fixture_sessions(fixture: &Fixture) -> PathBuf {
-    let storage = cowshed_core::storage::StorageLayout::new(
-        fixture.storage.store(),
-        &RepoId::parse("fixture/dispatch").expect("repository identity"),
-    )
-    .expect("fixture storage layout");
-    storage.project().sessions.clone()
+/// The vnodes a wait on `watched` arms now: each path's parent at its deepest existing ancestor,
+/// and a content path's file once it is a regular file.
+fn watch_targets(watched: &[Watched<'_>]) -> Vec<PathBuf> {
+    let directory = |path: &Path| -> PathBuf {
+        path.parent()
+            .unwrap_or(path)
+            .ancestors()
+            .find(|ancestor| fs::symlink_metadata(ancestor).is_ok_and(|entry| entry.is_dir()))
+            .expect("the root directory exists")
+            .to_path_buf()
+    };
+    let mut targets = Vec::new();
+    for watch in watched {
+        match *watch {
+            Watched::Entry(path) => targets.push(directory(path)),
+            Watched::Content(path) => {
+                targets.push(directory(path));
+                if fs::symlink_metadata(path).is_ok_and(|entry| entry.is_file()) {
+                    targets.push(path.to_path_buf());
+                }
+            }
+        }
+    }
+    targets
 }
 
-async fn eventually(mut ready: impl FnMut() -> bool) {
-    while !ready() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+/// Wait until `ready` holds, judging it only while the kernel watches what `watched` names, and
+/// again after each change the kernel reports there (08_testing.md, "Fixtures": a wait on a file
+/// or directory change waits on a kernel watch it armed itself). The watch is armed again after
+/// every change, deeper as directories appear and on a content file once it exists, and before
+/// every judgment, so no change falls between a look and the wait. Nothing is timed: the runner's
+/// no-progress bound names a change that never comes. Dropping the wait drops the watch.
+async fn until_changed(watched: &[Watched<'_>], mut ready: impl FnMut() -> bool) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    loop {
+        // SAFETY: kqueue takes no arguments; a negative answer is an error.
+        let queue = unsafe { libc::kqueue() };
+        assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
+        // SAFETY: `queue` is a new descriptor this wait alone owns.
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        let targets = watch_targets(watched);
+        let vnodes: Vec<fs::File> = targets
+            .iter()
+            .map(|target| {
+                // O_EVTONLY: a watch never keeps a volume from unmounting.
+                fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_EVTONLY)
+                    .open(target)
+                    .unwrap_or_else(|error| panic!("watch {}: {error}", target.display()))
+            })
+            .collect();
+        let changes: Vec<libc::kevent> = vnodes
+            .iter()
+            .map(|vnode| libc::kevent {
+                ident: vnode.as_raw_fd() as libc::uintptr_t,
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: libc::NOTE_WRITE
+                    | libc::NOTE_EXTEND
+                    | libc::NOTE_DELETE
+                    | libc::NOTE_RENAME
+                    | libc::NOTE_ATTRIB
+                    | libc::NOTE_LINK
+                    | libc::NOTE_REVOKE,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            })
+            .collect();
+        // SAFETY: valid changes, no events requested back, no timeout.
+        let registered = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                changes.as_ptr(),
+                libc::c_int::try_from(changes.len()).expect("a few watched paths"),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            registered,
+            0,
+            "watch {watched:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        if ready() {
+            return;
+        }
+        // What appeared since the watch was armed is watched before the wait.
+        if watch_targets(watched) != targets {
+            continue;
+        }
+        let queue = tokio::io::unix::AsyncFd::new(queue).expect("register the kernel watch");
+        queue
+            .readable()
+            .await
+            .expect("the kernel watch reports a change")
+            .clear_ready();
     }
 }
 
@@ -3888,6 +3985,37 @@ async fn job_holds_released(layout: &BuildVolumeLayout, id: &BuildVolumeId) {
 
 fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+/// A host process holding `file` open as `tail -f` holds it, and its pid. It opens the file before
+/// it says `ready` on its stdout, so a holder census taken once it has said so finds it; it then
+/// becomes `tail -f <file>` in the same process. Its stdout stays open with it, so tail never
+/// writes to a closed pipe.
+fn file_holder(file: &Path) -> (Holder, i32) {
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"exec 3<"$1"; echo ready; exec /usr/bin/tail -f "$1""#,
+            "sh",
+        ])
+        .arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn a file holder");
+    let mut said = std::io::BufReader::new(child.stdout.take().expect("the holder's stdout"));
+    let mut ready = String::new();
+    std::io::BufRead::read_line(&mut said, &mut ready).expect("read the holder's readiness");
+    child.stdout = Some(said.into_inner());
+    let pid = i32::try_from(child.id()).expect("a pid fits i32");
+    let holder = Holder(child);
+    assert_eq!(
+        ready,
+        "ready\n",
+        "the holder never opened {}",
+        file.display()
+    );
+    (holder, pid)
 }
 
 /// A host process (never the daemon) holding a file open, killed when dropped.
@@ -4397,7 +4525,10 @@ async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
 
     // A supervisor's own start is no use (04_sandbox.md, the kept daemon): w1's keeper starts its
     // daemon at the run's admission, alongside it, so the record may follow the run's end.
-    eventually(|| recorded_daemon(&w1).is_some()).await;
+    until_changed(&[Watched::Entry(&daemon_record(&w1))], || {
+        recorded_daemon(&w1).is_some()
+    })
+    .await;
     let source_daemon = recorded_daemon(&w1).expect("w1's keeper left its daemon recorded");
     assert!(
         cowshed_os::process::running(source_daemon).expect("observe w1's daemon"),
@@ -4425,7 +4556,10 @@ async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
     // daemon's plugin workers follow it out.
     // As for w1, w2's keeper starts its daemon at the run's admission, so the record may follow the
     // run's end.
-    eventually(|| recorded_daemon(&w2).is_some()).await;
+    until_changed(&[Watched::Entry(&daemon_record(&w2))], || {
+        recorded_daemon(&w2).is_some()
+    })
+    .await;
     let kept = recorded_daemon(&w2).expect("w2's run left its kept daemon recorded");
     assert!(
         cowshed_os::process::running(kept).expect("read the daemon's state"),
@@ -4457,8 +4591,14 @@ async fn a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed(
 }
 
 /// The pid the Nx daemon record in `checkout` names, if there is a record.
+/// Where the patched Nx daemon of `checkout` records itself. It publishes the record whole (written
+/// aside, then linked into place), so its appearance is its content.
+fn daemon_record(checkout: &Path) -> PathBuf {
+    checkout.join(".nx/workspace-data/d/server-process.json")
+}
+
 fn recorded_daemon(checkout: &Path) -> Option<libc::pid_t> {
-    let record = checkout.join(".nx/workspace-data/d/server-process.json");
+    let record = daemon_record(checkout);
     let bytes = match fs::read(&record) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
@@ -4697,9 +4837,10 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
         lane_build
     );
     // Logical retirement returns at step 4; step 5 reclaims the mountpoint in the background.
-    eventually(|| !unit.exists()).await;
+    until_changed(&[Watched::Entry(&unit)], || !unit.exists()).await;
     for id in &unit_owned {
-        eventually(|| !layout.image(id).exists()).await;
+        let image = layout.image(id);
+        until_changed(&[Watched::Entry(&image)], || !image.exists()).await;
         assert!(!layout.record(id).exists(), "{id} is released");
     }
     assert_eq!(
@@ -4808,22 +4949,14 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
         &topic,
         &["commit", "-q", "-am", "change a after the opener exits"],
     );
-    let holder = Holder(
-        Command::new("/usr/bin/tail")
-            .arg("-f")
-            .arg(database)
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn a database holder"),
-    );
-    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
-    eventually(|| {
+    let (holder, pid) = file_holder(database);
+    assert!(
         nx::holders(database)
             .expect("query the database's holders")
             .iter()
-            .any(|holder| holder.pid == pid)
-    })
-    .await;
+            .any(|holder| holder.pid == pid),
+        "the census names the holder that said it holds the database"
+    );
     let report = land(&mut service, "topic", true, &[&nx_check]).await;
     assert!(
         matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
@@ -4887,22 +5020,14 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
         .expect("topic links its build volume")
         .join("codegraph.db");
     fs::write(&index, b"an index nothing in the land knows\n").unwrap();
-    let holder = Holder(
-        Command::new("/usr/bin/tail")
-            .arg("-f")
-            .arg(&index)
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn an index holder"),
-    );
-    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
-    eventually(|| {
+    let (holder, pid) = file_holder(&index);
+    assert!(
         nx::holders(&index)
             .expect("query the index's holders")
             .iter()
-            .any(|holder| holder.pid == pid)
-    })
-    .await;
+            .any(|holder| holder.pid == pid),
+        "the census names the holder that said it holds the index"
+    );
 
     let report = land(&mut service, "topic", true, &[&nx_check]).await;
     assert!(
@@ -4999,7 +5124,7 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     )
     .await;
     let ticks = old_mount.join("target/ticking/ticks");
-    eventually(|| file_len(&ticks) > 0).await;
+    until_changed(&[Watched::Content(&ticks)], || file_len(&ticks) > 0).await;
 
     let workspace = new_workspace(&mut service, "w").await;
     fs::write(workspace.join("notes.txt"), b"notes\n").unwrap();
@@ -5016,7 +5141,7 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     let copied = new_mount.join("target/ticking/ticks");
     let copied_at_swap = file_len(&copied);
     let at_swap = file_len(&ticks);
-    eventually(|| file_len(&ticks) > at_swap).await;
+    until_changed(&[Watched::Content(&ticks)], || file_len(&ticks) > at_swap).await;
     assert_eq!(file_len(&copied), copied_at_swap);
     sh(&mut service, "main", "touch target/after").await;
     assert!(new_mount.join("target/after").is_file());
@@ -5067,7 +5192,11 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
         "the job ran to its end in the previous volume"
     );
     // The job's end releases it, inside the controller: no later collection is needed.
-    eventually(|| !layout.image(&old).exists() && !layout.record(&old).exists()).await;
+    let (image, record) = (layout.image(&old), layout.record(&old));
+    until_changed(&[Watched::Entry(&image), Watched::Entry(&record)], || {
+        !image.exists() && !record.exists()
+    })
+    .await;
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
@@ -5110,11 +5239,21 @@ async fn assert_build_label(
         &RepoId::parse("fixture/dispatch").expect("repository identity"),
         &WorkspaceName::new(name).expect("checkout name"),
     );
-    eventually(|| {
+    // The supervisor names a volume in the background and says so on its stderr once it has
+    // renamed it (a volume rename posts no kernel event); this scenario's stderr is a file its
+    // parent owns, so each line the supervisor writes wakes the probe of the volume's name.
+    let stderr = PathBuf::from(
+        std::env::var_os(SUPERVISOR_STDERR).expect("the scenario runs with its stderr in a file"),
+    );
+    until_changed(&[Watched::Content(&stderr)], || {
         cowshed_apfs::volume_name(&mount).expect("read build volume name") == expected.as_str()
     })
     .await;
 }
+
+/// The file the build-volume naming scenario's stderr goes to, named to its child test process by
+/// its parent: the supervisor's report that it named a volume is a write to it.
+const SUPERVISOR_STDERR: &str = "COWSHED_TEST_SUPERVISOR_STDERR";
 
 /// One declared project, one walk. Main's first touch links the declared path onto its build
 /// volume, and the author's reconstruct script writes through that link (16_build_volumes.md,
@@ -5130,7 +5269,11 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     const CHILD: &str = "COWSHED_TEST_BUILD_VOLUME_HOLDER_CHILD";
     if std::env::var_os(CHILD).is_none() {
         // Native release diagnostics use the process's stderr, not dispatch's Output writer.
-        // A separate test process captures them without redirecting descriptors shared by tests.
+        // A separate test process writes them to a file this one owns, without redirecting
+        // descriptors shared by tests; the scenario wakes on that file's writes.
+        let scratch = scratch_directory::ScratchRoot::new("supervisor-stderr")
+            .expect("a root for the scenario's stderr");
+        let log = scratch.path().join("stderr");
         let output = tokio::process::Command::new(
             std::env::current_exe().expect("test executable"),
         )
@@ -5142,11 +5285,13 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
             "--quiet",
         ])
         .env(CHILD, "1")
+        .env(SUPERVISOR_STDERR, &log)
+        .stderr(fs::File::create(&log).expect("the scenario's stderr file"))
         .output_bounded()
         .await
         .expect("run the APFS holder scenario in a child test process");
         let stdout = String::from_utf8(output.stdout).expect("child test stdout");
-        let stderr = String::from_utf8(output.stderr).expect("child test stderr");
+        let stderr = fs::read_to_string(&log).expect("child test stderr");
         assert!(
             output.status.success(),
             "child scenario failed\n{stdout}\n{stderr}"
@@ -5237,13 +5382,15 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
     println!("build-volume-holder-pid={pid}");
-    eventually(|| {
+    // The holder's cwd is the volume once spawn returns: the kernel changed it before the exec
+    // spawn waited for.
+    assert!(
         nx::volume_holders(&mount)
             .expect("query build volume holders")
             .iter()
-            .any(|holder| holder.pid == pid)
-    })
-    .await;
+            .any(|holder| holder.pid == pid),
+        "the census names the holder working in the volume"
+    );
     // Forked seconds ago: forced past the age floor alone. The holder is a host process, not a
     // job, so the force changes nothing the release does to it.
     succeed(&mut service, ["rm", "sibling", "--force"]).await;
@@ -6642,46 +6789,48 @@ async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
     let image_b_path = image_b.image().to_path_buf();
     let image_a_path = image_a.image().to_path_buf();
 
-    let observer = tokio::task::spawn_blocking({
-        let tracked = a_mount.join("tracked.txt");
-        let untracked = a_mount.join("u");
-        move || -> Instant {
-            loop {
-                match cowshed_core::metadata::read_json::<
-                    cowshed_core::metadata::DetachedWorkspaceMetadata,
-                >(&sidecar_b)
-                {
-                    Ok(metadata)
-                        if metadata.publication_state
-                            == cowshed_core::metadata::PublicationState::Active =>
-                    {
-                        break;
-                    }
-                    Ok(_) => std::thread::sleep(Duration::from_millis(1)),
-                    Err(cowshed_core::metadata::MetadataError::Io { source, .. })
-                        if source.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(error) => panic!("read the destination sidecar: {error}"),
-                }
-            }
-            fs::write(&tracked, b"five\n").expect("edit tracked after publication");
-            fs::write(&untracked, b"u2\n").expect("edit untracked after publication");
-            Instant::now()
+    let active = || match cowshed_core::metadata::read_json::<
+        cowshed_core::metadata::DetachedWorkspaceMetadata,
+    >(&sidecar_b)
+    {
+        Ok(metadata) => {
+            metadata.publication_state == cowshed_core::metadata::PublicationState::Active
         }
-    });
-
-    let (result, _, _) = run(&mut service, ["mv", "a", "b"]).await;
-    let finished = Instant::now();
-    let written = observer.await.expect("publication observer");
-    assert!(
-        written <= finished,
-        "the source edits must race the live rename, not follow it"
-    );
+        Err(cowshed_core::metadata::MetadataError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            false
+        }
+        Err(error) => panic!("read the destination sidecar: {error}"),
+    };
+    // The observer writes the source once the destination's canonical clone is published, on the
+    // kernel's word that the sidecar changed. The rename is still pending then: had it returned
+    // first, the edits would not have raced it.
+    let observer = async {
+        until_changed(&[Watched::Content(&sidecar_b)], active).await;
+        fs::write(a_mount.join("tracked.txt"), b"five\n").expect("edit tracked after publication");
+        fs::write(a_mount.join("u"), b"u2\n").expect("edit untracked after publication");
+    };
+    let rename = run(&mut service, ["mv", "a", "b"]);
+    tokio::pin!(rename);
+    let (result, _, _) = tokio::select! {
+        biased;
+        () = observer => rename.await,
+        (result, _, _) = &mut rename => panic!(
+            "the rename returned before the destination was published Active: {result:?}"
+        ),
+    };
     let error = result.expect_err("a rename whose source changed after clone must refuse");
     assert_eq!(error.code.as_str(), "conflict", "{}", error.message);
     assert!(error.hint.contains("rm b --force"), "{}", error.hint);
+    // The refusal the raced edits cause, not another conflict: the source's work no longer matches
+    // what its destination was cloned holding.
+    assert!(
+        error.message.contains("the source a was not retired")
+            && error.message.contains("source work matches: false"),
+        "{}",
+        error.message
+    );
 
     assert_eq!(
         fs::read(a_mount.join("tracked.txt")).expect("source tracked"),
@@ -6797,7 +6946,10 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
     // daemon), so its record may follow the run's end. The patched Nx
     // daemon claims the record when it starts and replaces one of another workspace root as
     // stale, so the foreign record is copied in only once the kept daemon holds it.
-    eventually(|| recorded_daemon(&topic).is_some()).await;
+    until_changed(&[Watched::Entry(&daemon_record(&topic))], || {
+        recorded_daemon(&topic).is_some()
+    })
+    .await;
 
     // A real foreign stock daemon owns a standalone root that retirement must not remove.
     // Its produced record nominates it in the landing checkout; it grants no ledger ownership.
@@ -6811,8 +6963,13 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
     );
     let state = fixture._scratch.path().join("foreign-daemon-state");
     let data = state.join("workspace-data");
-    let socket = cowshed_core::sandbox::workspace_runtime_link(&foreign).join("nx");
-    fs::create_dir_all(&socket).unwrap();
+    // The daemon's sockets lie in the scratch root itself, not behind a short alias outside it:
+    // the root's teardown and the next run's dead-run sweep end the daemon working in the root and
+    // remove its sockets with it (08_testing.md, "Integration tests (real substrate)"). A directory
+    // root's name is fixed-length; Nx itself refuses to bind a socket past its bound
+    // (`assertValidSocketPath`), and that refusal fails the daemon start asserted below.
+    let socket = fixture._scratch.path().join("fs");
+    fs::create_dir(&socket).unwrap();
     let mut command = Command::new(node);
     command
         .args(["node_modules/nx/dist/bin/nx.js", "daemon", "--start"])
@@ -6874,7 +7031,13 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
         "retirement leaves the foreign owner record unchanged"
     );
     let socket_path: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    std::os::unix::net::UnixStream::connect_bounded(socket_path["socketPath"].as_str().unwrap())
+    let socket_path = Path::new(socket_path["socketPath"].as_str().unwrap());
+    assert!(
+        socket_path.starts_with(fixture._scratch.path()),
+        "the daemon bound {} outside the scratch root that reclaims it",
+        socket_path.display()
+    );
+    std::os::unix::net::UnixStream::connect_bounded(socket_path)
         .expect("the real foreign daemon socket survives");
 
     // Cleanup belongs to the daemon's standalone owner, only after the survival proof.
@@ -6897,8 +7060,6 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
         String::from_utf8_lossy(&stopped.stderr)
     );
     exit.wait().expect("owned foreign cleanup completes");
-    fs::remove_dir_all(socket.parent().expect("owned short socket root"))
-        .expect("remove the standalone daemon socket namespace");
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
@@ -6919,7 +7080,10 @@ async fn default_land_never_signals_a_foreign_nominee_during_retirement(
     // run's end. The patched Nx daemon claims the record when it starts and replaces one that
     // names no Nx version or root as stale, so the nominee is forged only once the kept daemon
     // holds the record: a forgery written first would be replaced, not left for the land.
-    eventually(|| recorded_daemon(&topic).is_some()).await;
+    until_changed(&[Watched::Entry(&daemon_record(&topic))], || {
+        recorded_daemon(&topic).is_some()
+    })
+    .await;
     // A process no job started, under sandbox-exec with signals to other pids denied. The ledger
     // names no group for it, so the forged record is an unproven nominee.
     let mut foreign = Command::new("/usr/bin/sandbox-exec")
@@ -7040,7 +7204,7 @@ async fn land_skips_an_unverifiable_daemon_record_before_quiesce(
         // The run put the shed in use at its admission, and the keeper started its daemon alongside
         // it; a supervisor's own start is no use (04_sandbox.md, the kept daemon), so the record
         // may follow the run's end.
-        eventually(|| record.is_file()).await;
+        until_changed(&[Watched::Entry(&record)], || record.is_file()).await;
         let recorded: serde_json::Value =
             serde_json::from_slice(&fs::read(&record).expect("the run's daemon record"))
                 .expect("a daemon record");
@@ -7147,7 +7311,7 @@ async fn logged_starts(log: &Path, count: usize) -> Vec<libc::pid_t> {
             .map(|line| line.parse().expect("a logged pid"))
             .collect()
     };
-    eventually(|| read().len() >= count).await;
+    until_changed(&[Watched::Content(log)], || read().len() >= count).await;
     read()
 }
 

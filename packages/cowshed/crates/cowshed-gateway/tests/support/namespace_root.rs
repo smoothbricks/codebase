@@ -2,38 +2,31 @@
 
 use std::path::Path;
 
-use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_os::namespace::TestNamespace;
 
-use crate::fixture_dir::{FixtureDir, secure_fixture_dir_in};
+use cowshed_apfs::{
+    CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
+    store_lock::verify_no_symlinks,
+};
 
-/// A test namespace of a fixture's own and its root: the namespace's directory below the per-user
-/// root `cowshed setup` makes, where the fixture's gateway binds `gateway.sock` and from which every
-/// other name the fixture mints derives. The root is made 0700, refused when the per-user root is
-/// missing, and removed when the guard drops, on every way out of the test.
-pub struct NamespaceRoot {
-    namespace: TestNamespace,
-    dir: FixtureDir,
-}
+#[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
+pub(crate) mod scratch_apfs;
+
+/// A fixture namespace owned by the shared scratch-root protocol: owner birth identity,
+/// dead-run reclamation and exact attachment cleanup all precede removal of its root.
+pub struct NamespaceRoot(scratch_apfs::ScratchRoot);
 
 impl NamespaceRoot {
     /// Mint a namespace and make its root.
     pub fn mint() -> Self {
-        let namespace = TestNamespace::mint().expect("a test namespace");
-        // SAFETY: geteuid has no preconditions.
-        let euid = unsafe { libc::geteuid() };
-        let root = HostNamespace::Test(namespace).macos_user_root(euid);
-        let user_root = root
-            .parent()
-            .expect("a test namespace's root lies below the per-user root");
-        let dir = secure_fixture_dir_in(user_root, namespace.as_str());
-        Self { namespace, dir }
+        Self(scratch_apfs::ScratchRoot::new("gateway namespace").expect("a swept namespace root"))
     }
 
     pub fn namespace(&self) -> TestNamespace {
-        self.namespace
+        self.0.namespace()
     }
 
     pub fn path(&self) -> &Path {
-        self.dir.path()
+        self.0.path()
     }
 }

@@ -571,8 +571,6 @@ pub(crate) mod tests {
             let root = main.root.clone();
             async move { InstallSlot::take(&root).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!waiter.is_finished(), "a second installer waits in line");
         drop(held);
         waiter
             .await
@@ -580,10 +578,11 @@ pub(crate) mod tests {
             .expect("the second installer takes the slot once the first lets go");
     }
 
-    /// A land step never holds the slot: an install takes it while land steps run, and a land
-    /// step that arrives while an install holds it waits for that install, then holds nothing.
+    /// A land step holds no slot of its own; an install can take it, its ownership is
+    /// observable, and a later step leaves it free for the next installer. The wait
+    /// decision and its one held-flock witness belong to host_dirs.
     #[tokio::test]
-    async fn an_install_never_waits_on_a_land_step_and_a_land_step_waits_on_an_install() {
+    async fn a_land_step_holds_no_slot_and_install_ownership_is_observable() {
         let main = Main::new("land-wait");
         assert!(
             !wait_for_install(&main.root)
@@ -594,23 +593,21 @@ pub(crate) mod tests {
         let slot = InstallSlot::take(&main.root)
             .await
             .expect("an install takes the slot although a land step ran");
-        let step = tokio::spawn({
-            let root = main.root.clone();
-            async move { wait_for_install(&root).await }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!step.is_finished(), "the land step waits for the install");
+        assert!(
+            InstallSlot::observe(&main.root).expect("observe the slot"),
+            "the install in progress is observed while it holds the slot"
+        );
         drop(slot);
         assert!(
-            step.await
-                .expect("land step")
-                .expect("the land step goes on once the install ends"),
-            "a step that waited says so, so it can go on as the build the install left"
+            !wait_for_install(&main.root)
+                .await
+                .expect("the completed install holds no slot"),
+            "the step found no running install"
         );
         let probe = File::open(main.root.join(INSTALL_LOCK_NAME)).expect("lock file");
         probe
             .try_lock()
-            .expect("the land step holds nothing once it goes on: the next install takes the slot");
+            .expect("the land step leaves the slot free for the next install");
     }
 
     /// A land step the install it waited for replaced goes on as the copy the stable name says

@@ -48,6 +48,16 @@ pub enum SimRequest {
     Install { device: String, digest: String },
 }
 
+impl SimRequest {
+    /// The verb the request names, as its audit records it.
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::OpenUrl { .. } => "openurl",
+            Self::Install { .. } => "install",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SimResult {
@@ -464,6 +474,90 @@ struct ExecutionContext<'a> {
     auditor: &'a dyn BrokerAuditor,
 }
 
+/// What the broker will run for a request that passed every gate that needs no effect: the
+/// command's operands, and for an openurl the audit path it runs under.
+enum Admitted {
+    OpenUrl {
+        device: String,
+        url: String,
+        scheme: String,
+    },
+    Install {
+        device: String,
+        digest: String,
+        app: PathBuf,
+    },
+}
+
+/// A request refused before any effect: the error it answers and the classification its denial
+/// audits.
+struct Refused {
+    error: SimBrokerError,
+    classification: &'static str,
+}
+
+impl Refused {
+    fn new(error: SimBrokerError) -> Self {
+        let classification = error.classification();
+        Self {
+            error,
+            classification,
+        }
+    }
+}
+
+/// The gates a request passes before anything runs (05_gateway.md, "/sim/"): the project's grant,
+/// the device and URL (a scheme the project registered, never `file`), and for an install the
+/// artifact's digest, its grant and one human approval, which this consumes. Nothing here touches
+/// the disk or the runner.
+fn admit(
+    project: &ProjectState,
+    repo_id: &str,
+    request: SimRequest,
+    approvals: &mut VecDeque<ApprovalKey>,
+    drop_root: Option<&Path>,
+) -> Result<Admitted, Refused> {
+    match request {
+        SimRequest::OpenUrl { device, url } => {
+            let parsed = validate_openurl(project, &device, &url).map_err(Refused::new)?;
+            let scheme = format!("{}:", parsed.scheme());
+            Ok(Admitted::OpenUrl {
+                device,
+                url,
+                scheme,
+            })
+        }
+        SimRequest::Install { device, digest } => {
+            validate_device(&device)
+                .and_then(|()| validate_digest(&digest))
+                .map_err(Refused::new)?;
+            if !project.grants.contains(&SimGrant::Install) {
+                return Err(Refused {
+                    error: SimBrokerError::NotGranted,
+                    classification: "sim-install-not-granted",
+                });
+            }
+            let Some(index) = approvals.iter().position(|approval| {
+                approval.repo_id == repo_id
+                    && approval.device == device
+                    && approval.digest == digest
+            }) else {
+                return Err(Refused::new(SimBrokerError::ApprovalRequired));
+            };
+            let _consumed = approvals.remove(index).expect("approval index exists");
+            let Some(root) = drop_root else {
+                return Err(Refused::new(SimBrokerError::InstallDisabled));
+            };
+            let app = root.join(repo_id).join(format!("{digest}.app"));
+            Ok(Admitted::Install {
+                device,
+                digest,
+                app,
+            })
+        }
+    }
+}
+
 async fn execute_request(
     workspace_id: &str,
     request: SimRequest,
@@ -483,24 +577,28 @@ async fn execute_request(
     let project = projects
         .get(repo_id)
         .ok_or(SimBrokerError::ProjectNotConfigured)?;
-    match request {
-        SimRequest::OpenUrl { device, url } => {
-            let classification = validate_openurl(project, &device, &url);
-            if let Err(error) = classification {
-                audit(
-                    auditor,
-                    workspace_id,
-                    "openurl",
-                    None,
-                    AuditStatus::Denied,
-                    Some(error.classification()),
-                )
-                .await?;
-                return Err(error);
-            }
-            let scheme = Url::parse(&url)
-                .map(|parsed| format!("{}:", parsed.scheme()))
-                .map_err(|_| SimBrokerError::InvalidUrl)?;
+    let verb = request.verb();
+    let admitted = match admit(project, repo_id, request, approvals, drop_root) {
+        Ok(admitted) => admitted,
+        Err(refused) => {
+            audit(
+                auditor,
+                workspace_id,
+                verb,
+                None,
+                AuditStatus::Denied,
+                Some(refused.classification),
+            )
+            .await?;
+            return Err(refused.error);
+        }
+    };
+    match admitted {
+        Admitted::OpenUrl {
+            device,
+            url,
+            scheme,
+        } => {
             run_audited(
                 auditor,
                 runner,
@@ -518,66 +616,13 @@ async fn execute_request(
                 device,
             })
         }
-        SimRequest::Install { device, digest } => {
-            if let Err(error) = validate_device(&device).and_then(|()| validate_digest(&digest)) {
-                audit(
-                    auditor,
-                    workspace_id,
-                    "install",
-                    None,
-                    AuditStatus::Denied,
-                    Some(error.classification()),
-                )
-                .await?;
-                return Err(error);
-            }
-            if !project.grants.contains(&SimGrant::Install) {
-                audit(
-                    auditor,
-                    workspace_id,
-                    "install",
-                    None,
-                    AuditStatus::Denied,
-                    Some("sim-install-not-granted"),
-                )
-                .await?;
-                return Err(SimBrokerError::NotGranted);
-            }
-            let Some(approval_index) = approvals.iter().position(|approval| {
-                approval.repo_id == *repo_id
-                    && approval.device == device
-                    && approval.digest == digest
-            }) else {
-                audit(
-                    auditor,
-                    workspace_id,
-                    "install",
-                    None,
-                    AuditStatus::Denied,
-                    Some("sim-human-approval-required"),
-                )
-                .await?;
-                return Err(SimBrokerError::ApprovalRequired);
-            };
-            let _consumed = approvals
-                .remove(approval_index)
-                .expect("approval index exists");
-            let Some(root) = drop_root else {
-                audit(
-                    auditor,
-                    workspace_id,
-                    "install",
-                    None,
-                    AuditStatus::Denied,
-                    Some("sim-install-source-denied"),
-                )
-                .await?;
-                return Err(SimBrokerError::InstallDisabled);
-            };
-            let app = root.join(repo_id).join(format!("{digest}.app"));
-            let expected = digest.clone();
+        Admitted::Install {
+            device,
+            digest,
+            app,
+        } => {
             let checked =
-                match tokio::task::spawn_blocking(move || verify_app(&app, &expected).map(|_| app))
+                match tokio::task::spawn_blocking(move || verify_app(&app, &digest).map(|_| app))
                     .await
                 {
                     Ok(Ok(app)) => app,
@@ -630,7 +675,7 @@ fn validate_openurl(
     project: &ProjectState,
     device: &str,
     value: &str,
-) -> Result<(), SimBrokerError> {
+) -> Result<Url, SimBrokerError> {
     if !project.grants.contains(&SimGrant::OpenUrl) {
         return Err(SimBrokerError::NotGranted);
     }
@@ -642,7 +687,19 @@ fn validate_openurl(
     if url.scheme() == "file" || !project.schemes.contains(url.scheme()) {
         return Err(SimBrokerError::InvalidScheme);
     }
-    Ok(())
+    Ok(url)
+}
+
+/// How a runner's end is audited: one terminal status per admitted command, naming its
+/// classification unless the command completed.
+fn terminal(outcome: &Result<(), SimBrokerError>) -> (AuditStatus, Option<&'static str>) {
+    match outcome {
+        Ok(()) => (AuditStatus::Completed, None),
+        Err(error @ SimBrokerError::RunnerTimeout) => {
+            (AuditStatus::TimedOut, Some(error.classification()))
+        }
+        Err(error) => (AuditStatus::Failed, Some(error.classification())),
+    }
 }
 
 async fn run_audited(
@@ -662,36 +719,10 @@ async fn run_audited(
         Some("sim-admitted"),
     )
     .await?;
-    match runner.run(command).await {
-        Ok(_) => {
-            audit(
-                auditor,
-                workspace_id,
-                method,
-                path,
-                AuditStatus::Completed,
-                None,
-            )
-            .await
-        }
-        Err(error) => {
-            let status = if matches!(error, SimBrokerError::RunnerTimeout) {
-                AuditStatus::TimedOut
-            } else {
-                AuditStatus::Failed
-            };
-            audit(
-                auditor,
-                workspace_id,
-                method,
-                path,
-                status,
-                Some(error.classification()),
-            )
-            .await?;
-            Err(error)
-        }
-    }
+    let outcome = runner.run(command).await.map(|_| ());
+    let (status, classification) = terminal(&outcome);
+    audit(auditor, workspace_id, method, path, status, classification).await?;
+    outcome
 }
 
 async fn audit(
@@ -993,20 +1024,6 @@ mod tests {
             })
         }
     }
-    struct FailingRunner {
-        timeout: bool,
-    }
-
-    #[async_trait]
-    impl SimRunner for FailingRunner {
-        async fn run(&self, _command: SimCommand) -> Result<SimCommandOutput, SimBrokerError> {
-            if self.timeout {
-                Err(SimBrokerError::RunnerTimeout)
-            } else {
-                Err(SimBrokerError::RunnerFailed)
-            }
-        }
-    }
 
     #[derive(Default)]
     struct RecordingAuditor {
@@ -1049,9 +1066,311 @@ mod tests {
         format!("{:x}", digest.finalize())
     }
 
+    fn projects_with(grants: impl IntoIterator<Item = SimGrant>) -> HashMap<String, ProjectState> {
+        let mut projects = HashMap::new();
+        configure_project(&mut projects, project(grants)).expect("configure");
+        projects
+    }
+
+    fn approval(device: &str, digest: &str, receipt: &str) -> SimInstallApproval {
+        SimInstallApproval {
+            repo_id: "owner/repo-a".to_owned(),
+            device: device.to_owned(),
+            artifact_digest: digest.to_owned(),
+            human_receipt: receipt.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_request_is_admitted_or_refused_before_any_effect_naming_what_its_denial_audits() {
+        let openurl = |url: &str| SimRequest::OpenUrl {
+            device: "booted".to_owned(),
+            url: url.to_owned(),
+        };
+        let install = |device: &str, digest: &str| SimRequest::Install {
+            device: device.to_owned(),
+            digest: digest.to_owned(),
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let both = projects_with([SimGrant::OpenUrl, SimGrant::Install]);
+        let install_only = projects_with([SimGrant::Install]);
+        let openurl_only = projects_with([SimGrant::OpenUrl]);
+        let (opened, installed) = (
+            "run openurl on booted under cowshed-demo:".to_owned(),
+            format!("run install on booted of /drop/owner/repo-a/{a}.app"),
+        );
+        let overlong = format!("cowshed-demo://{}", "a".repeat(8200));
+        // (label, the project, the approvals given as (device, artifact), the request, the drop
+        // root, what the request comes to, the approvals left)
+        for (label, projects, approved, request, root, expected, left) in [
+            (
+                "a registered scheme",
+                &both,
+                vec![],
+                openurl("cowshed-demo://open/item"),
+                None,
+                opened.as_str(),
+                0,
+            ),
+            (
+                "a scheme the project never registered",
+                &both,
+                vec![],
+                openurl("https://example.test/private"),
+                None,
+                "InvalidScheme audited sim-scheme-denied",
+                0,
+            ),
+            (
+                "a file URL",
+                &both,
+                vec![],
+                openurl("file:///etc/passwd"),
+                None,
+                "InvalidScheme audited sim-scheme-denied",
+                0,
+            ),
+            (
+                "no openurl grant",
+                &install_only,
+                vec![],
+                openurl("cowshed-demo://open/item"),
+                None,
+                "NotGranted audited sim-not-granted",
+                0,
+            ),
+            (
+                "a URL that is none",
+                &both,
+                vec![],
+                openurl("not a url"),
+                None,
+                "InvalidUrl audited sim-invalid-url",
+                0,
+            ),
+            (
+                "a URL past its bound",
+                &both,
+                vec![],
+                openurl(&overlong),
+                None,
+                "InvalidUrl audited sim-invalid-url",
+                0,
+            ),
+            (
+                "a device that is no identifier",
+                &both,
+                vec![],
+                install("../evil", &a),
+                Some("/drop"),
+                "InvalidIdentifier audited sim-request-rejected",
+                0,
+            ),
+            (
+                "a digest that is no SHA-256",
+                &both,
+                vec![],
+                install("booted", "abc"),
+                Some("/drop"),
+                "InvalidDigest audited sim-request-rejected",
+                0,
+            ),
+            (
+                "no install grant",
+                &openurl_only,
+                vec![("booted", a.as_str())],
+                install("booted", &a),
+                Some("/drop"),
+                "NotGranted audited sim-install-not-granted",
+                1,
+            ),
+            (
+                "no human approval",
+                &both,
+                vec![],
+                install("booted", &a),
+                Some("/drop"),
+                "ApprovalRequired audited sim-human-approval-required",
+                0,
+            ),
+            (
+                "an approval for another device",
+                &both,
+                vec![("other", a.as_str())],
+                install("booted", &a),
+                Some("/drop"),
+                "ApprovalRequired audited sim-human-approval-required",
+                1,
+            ),
+            (
+                "an approval for another artifact",
+                &both,
+                vec![("booted", b.as_str())],
+                install("booted", &a),
+                Some("/drop"),
+                "ApprovalRequired audited sim-human-approval-required",
+                1,
+            ),
+            (
+                "an approval, and no drop root to install from",
+                &both,
+                vec![("booted", a.as_str())],
+                install("booted", &a),
+                None,
+                "InstallDisabled audited sim-install-source-denied",
+                0,
+            ),
+            (
+                "an approval and a drop root",
+                &both,
+                vec![("booted", a.as_str())],
+                install("booted", &a),
+                Some("/drop"),
+                installed.as_str(),
+                0,
+            ),
+        ] {
+            let mut approvals = approved
+                .iter()
+                .map(|(device, digest)| ApprovalKey {
+                    repo_id: "owner/repo-a".to_owned(),
+                    device: (*device).to_owned(),
+                    digest: (*digest).to_owned(),
+                    receipt_hash: [0; 32],
+                })
+                .collect::<VecDeque<_>>();
+            let admitted = admit(
+                &projects["owner/repo-a"],
+                "owner/repo-a",
+                request,
+                &mut approvals,
+                root.map(Path::new),
+            );
+            let outcome = match admitted {
+                Ok(Admitted::OpenUrl { device, scheme, .. }) => {
+                    format!("run openurl on {device} under {scheme}")
+                }
+                Ok(Admitted::Install { device, app, .. }) => {
+                    format!("run install on {device} of {}", app.display())
+                }
+                Err(refused) => format!("{:?} audited {}", refused.error, refused.classification),
+            };
+            assert_eq!(outcome, expected, "{label}");
+            assert_eq!(approvals.len(), left, "{label}: the approvals left");
+        }
+    }
+
+    #[test]
+    fn an_approval_needs_a_valid_receipt_and_a_granted_project_and_the_ledger_is_bounded() {
+        let digest = "a".repeat(64);
+        let granted = projects_with([SimGrant::Install]);
+        let ungranted = projects_with([SimGrant::OpenUrl]);
+        let nobody = HashMap::new();
+        let long = "r".repeat(4097);
+        let (mut approvals, mut used) = (VecDeque::new(), VecDeque::new());
+        // (label, the projects configured, the approval, how the broker answers it); each answer
+        // leaves its ledger to the next.
+        for (label, projects, approved, expected) in [
+            (
+                "a receipt too short to be a human's",
+                &granted,
+                approval("booted", &digest, "short"),
+                "InvalidReceipt",
+            ),
+            (
+                "a receipt past its bound",
+                &granted,
+                approval("booted", &digest, &long),
+                "InvalidReceipt",
+            ),
+            (
+                "a project nobody configured",
+                &nobody,
+                approval("booted", &digest, "human-confirmation-0001"),
+                "ProjectNotConfigured",
+            ),
+            (
+                "a project without the install grant",
+                &ungranted,
+                approval("booted", &digest, "human-confirmation-0001"),
+                "NotGranted",
+            ),
+            (
+                "a device that is no identifier",
+                &granted,
+                approval("../evil", &digest, "human-confirmation-0001"),
+                "InvalidIdentifier",
+            ),
+            (
+                "a digest that is no SHA-256",
+                &granted,
+                approval("booted", "abc", "human-confirmation-0001"),
+                "InvalidDigest",
+            ),
+            (
+                "a receipt nobody used",
+                &granted,
+                approval("booted", &digest, "human-confirmation-0001"),
+                "approved",
+            ),
+            (
+                "the same receipt again, for another device",
+                &granted,
+                approval("other", &digest, "human-confirmation-0001"),
+                "ReceiptReplay",
+            ),
+        ] {
+            let answer = match approve_install(projects, &mut approvals, &mut used, approved) {
+                Ok(()) => "approved".to_owned(),
+                Err(error) => format!("{error:?}"),
+            };
+            assert_eq!(answer, expected, "{label}");
+        }
+        assert_eq!(approvals.len(), 1, "only the approved one is recorded");
+
+        for index in 0..=MAX_APPROVALS {
+            let receipt = format!("human-confirmation-{index:08}");
+            approve_install(
+                &granted,
+                &mut approvals,
+                &mut used,
+                approval("booted", &digest, &receipt),
+            )
+            .expect("a fresh receipt is approved");
+        }
+        assert_eq!(
+            approvals.len(),
+            MAX_APPROVALS,
+            "the oldest approval makes room"
+        );
+        assert_eq!(used.len(), MAX_APPROVALS, "the oldest receipt makes room");
+    }
+
+    #[test]
+    fn a_runner_ends_in_one_terminal_status_naming_why_it_did_not_complete() {
+        for (outcome, expected) in [
+            (Ok(()), "Completed None"),
+            (
+                Err(SimBrokerError::RunnerFailed),
+                "Failed Some(\"sim-request-rejected\")",
+            ),
+            (
+                Err(SimBrokerError::RunnerTimeout),
+                "TimedOut Some(\"sim-request-rejected\")",
+            ),
+            (
+                Err(SimBrokerError::InvalidRunnerOutput),
+                "Failed Some(\"sim-request-rejected\")",
+            ),
+        ] {
+            let (status, classification) = terminal(&outcome);
+            assert_eq!(format!("{status:?} {classification:?}"), expected);
+        }
+    }
+
     #[tokio::test]
-    async fn scheme_drop_receipt_and_replay_are_fenced() {
-        let root = fixture_root("gates");
+    async fn the_broker_audits_before_it_runs_and_carries_an_admitted_command_to_its_runner() {
+        let root = fixture_root("adapter");
         let runner = Arc::new(RecordingRunner::default());
         let auditor = Arc::new(RecordingAuditor::default());
         let (handle, task) =
@@ -1066,16 +1385,7 @@ mod tests {
             .await
             .expect("bind");
 
-        let denied = handle
-            .request(
-                "ws-a".to_owned(),
-                SimRequest::OpenUrl {
-                    device: "booted".to_owned(),
-                    url: "https://example.test/private".to_owned(),
-                },
-            )
-            .await;
-        assert!(matches!(denied, Err(SimBrokerError::InvalidScheme)));
+        // An admitted openurl reaches the runner between its two audit lines.
         handle
             .request(
                 "ws-a".to_owned(),
@@ -1087,47 +1397,45 @@ mod tests {
             .await
             .expect("allowed openurl");
 
+        // An approved install runs the verified bundle from the drop root.
         let contents = b"verified bundle";
         let digest = app_digest(contents);
         let app = root.join("owner/repo-a").join(format!("{digest}.app"));
         std::fs::create_dir_all(&app).expect("create app");
         std::fs::write(app.join("Info.plist"), contents).expect("write app");
-        let approval = SimInstallApproval {
-            repo_id: "owner/repo-a".to_owned(),
-            device: "booted".to_owned(),
-            artifact_digest: digest.clone(),
-            human_receipt: "human-confirmation-0001".to_owned(),
-        };
-        handle.approve(approval.clone()).await.expect("approve");
-        assert!(matches!(
-            handle.approve(approval).await,
-            Err(SimBrokerError::ReceiptReplay)
-        ));
+        handle
+            .approve(approval("booted", &digest, "human-confirmation-0001"))
+            .await
+            .expect("approve");
         handle
             .request(
                 "ws-a".to_owned(),
                 SimRequest::Install {
                     device: "booted".to_owned(),
-                    digest: digest.clone(),
+                    digest,
                 },
             )
             .await
             .expect("install");
+
+        // With its audit unavailable the broker runs nothing.
+        auditor.failed.store(true, Ordering::SeqCst);
         assert!(matches!(
             handle
                 .request(
                     "ws-a".to_owned(),
-                    SimRequest::Install {
+                    SimRequest::OpenUrl {
                         device: "booted".to_owned(),
-                        digest,
+                        url: "cowshed-demo://open/other".to_owned(),
                     },
                 )
                 .await,
-            Err(SimBrokerError::ApprovalRequired)
+            Err(SimBrokerError::AuditUnavailable)
         ));
 
         {
             let commands = runner.commands.lock().expect("commands");
+            assert_eq!(commands.len(), 2);
             assert!(matches!(
                 &commands[0],
                 SimCommand::OpenUrl { device, url }
@@ -1141,102 +1449,23 @@ mod tests {
         }
         {
             let events = auditor.events.lock().expect("events");
-            assert!(events.iter().all(|event| {
-                event
-                    .path
-                    .as_deref()
-                    .is_none_or(|path| path == "cowshed-demo:")
-            }));
+            let decisions = events
+                .iter()
+                .map(|event| (event.status, event.path.as_deref()))
+                .collect::<Vec<_>>();
             assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.status == AuditStatus::Completed)
-                    .count(),
-                2
+                decisions,
+                [
+                    (AuditStatus::Allowed, Some("cowshed-demo:")),
+                    (AuditStatus::Completed, Some("cowshed-demo:")),
+                    (AuditStatus::Allowed, None),
+                    (AuditStatus::Completed, None),
+                ]
             );
         }
         handle.shutdown().await;
         task.await.expect("join");
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn unavailable_audit_prevents_runner_side_effect() {
-        let root = fixture_root("audit");
-        let runner = Arc::new(RecordingRunner::default());
-        let auditor = Arc::new(RecordingAuditor::default());
-        auditor.failed.store(true, Ordering::SeqCst);
-        let (handle, task) = SimBrokerHandle::start(Some(root.clone()), 4, runner.clone(), auditor)
-            .expect("start broker");
-        handle
-            .configure(project([SimGrant::OpenUrl]))
-            .await
-            .expect("configure");
-        handle
-            .bind_session("ws-a".to_owned(), "owner/repo-a".to_owned())
-            .await
-            .expect("bind");
-        assert!(matches!(
-            handle
-                .request(
-                    "ws-a".to_owned(),
-                    SimRequest::OpenUrl {
-                        device: "booted".to_owned(),
-                        url: "cowshed-demo://open".to_owned(),
-                    },
-                )
-                .await,
-            Err(SimBrokerError::AuditUnavailable)
-        ));
-        {
-            let commands = runner.commands.lock().expect("commands");
-            assert!(commands.is_empty());
-        }
-        handle.shutdown().await;
-        task.await.expect("join");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn runner_failure_and_timeout_emit_one_terminal_outcome() {
-        for (timeout, terminal) in [(false, AuditStatus::Failed), (true, AuditStatus::TimedOut)] {
-            let root = fixture_root(if timeout { "timeout" } else { "failure" });
-            let runner = Arc::new(FailingRunner { timeout });
-            let auditor = Arc::new(RecordingAuditor::default());
-            let (handle, task) =
-                SimBrokerHandle::start(Some(root.clone()), 4, runner, auditor.clone())
-                    .expect("start broker");
-            handle
-                .configure(project([SimGrant::OpenUrl]))
-                .await
-                .expect("configure");
-            handle
-                .bind_session("ws-a".to_owned(), "owner/repo-a".to_owned())
-                .await
-                .expect("bind");
-            let result = handle
-                .request(
-                    "ws-a".to_owned(),
-                    SimRequest::OpenUrl {
-                        device: "booted".to_owned(),
-                        url: "cowshed-demo://open".to_owned(),
-                    },
-                )
-                .await;
-            if timeout {
-                assert!(matches!(result, Err(SimBrokerError::RunnerTimeout)));
-            } else {
-                assert!(matches!(result, Err(SimBrokerError::RunnerFailed)));
-            }
-            {
-                let events = auditor.events.lock().expect("events");
-                let statuses = events.iter().map(|event| event.status).collect::<Vec<_>>();
-                assert_eq!(statuses, vec![AuditStatus::Allowed, terminal]);
-            }
-            handle.shutdown().await;
-            task.await.expect("join");
-            let _ = std::fs::remove_dir_all(root);
-        }
     }
 
     #[test]

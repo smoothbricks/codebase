@@ -36,12 +36,13 @@ use cowshed_gateway::{
     MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
 use cowshed_gateway_types::{
-    RamDiskDevice, RamDiskEntry, RamDiskSectors, RamLeaseEnd, RamLeaseEndLine, RamLeaseRequest,
+    RamAttachRefusal, RamDetached, RamDiskAttached, RamDiskDevice, RamDiskEntry, RamDiskSectors,
+    RamDisks, RamLeaseEnd, RamLeaseEndLine, RamLeaseRequest,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 #[path = "namespace_root.rs"]
-mod namespace_root;
+pub(crate) mod namespace_root;
 use namespace_root::NamespaceRoot;
 
 struct NoCredentials;
@@ -114,12 +115,75 @@ pub fn fixture_sectors(index: u64) -> RamDiskSectors {
     RamDiskSectors::new(NonZeroU64::new(sectors).expect("a positive size"))
 }
 
+/// A real disk runner whose existing operation returns are fixture completion events.
+/// It records ownership before returning an attach, including before a keep can erase
+/// the gateway's own lease record.
+#[derive(Debug)]
+struct ObservedDisks {
+    system: SystemRamDisks,
+    namespace: TestNamespace,
+    detached: tokio::sync::mpsc::UnboundedSender<RamDiskEntry>,
+}
+
+impl RamDisks for ObservedDisks {
+    fn attach(&self, sectors: RamDiskSectors) -> Result<RamDiskAttached, RamAttachRefusal> {
+        let disk = self.system.attach(sectors)?;
+        if let Err(error) = namespace_root::scratch_apfs::ram::record(self.namespace, &disk) {
+            let outcome = self
+                .system
+                .detach(&disk.device, disk.registry_entry, 64 * 1024);
+            return Err(RamAttachRefusal::Failed(format!(
+                "retain fixture RAM {} entry={}: {error}; cleanup={outcome}",
+                disk.device, disk.registry_entry
+            )));
+        }
+        Ok(disk)
+    }
+
+    fn detach(&self, device: &RamDiskDevice, entry: RamDiskEntry, limit: usize) -> RamDetached {
+        let outcome = self.system.detach(device, entry, limit);
+        // A dropped fixture has nobody left to consume completion; the real operation
+        // still ran to its end and returned the same outcome to the gateway.
+        let _ = self.detached.send(entry);
+        outcome
+    }
+
+    fn registered(&self, entry: RamDiskEntry) -> std::io::Result<bool> {
+        self.system.registered(entry)
+    }
+
+    fn unmounted(&self, sectors: RamDiskSectors) -> std::io::Result<Vec<RamDiskAttached>> {
+        self.system.unmounted(sectors)
+    }
+}
+
+pub struct FixtureGateway {
+    gateway: Gateway,
+    detached: tokio::sync::mpsc::UnboundedReceiver<RamDiskEntry>,
+}
+
+impl FixtureGateway {
+    /// Wait for the exact operation to return, then let the caller inspect registry once.
+    pub async fn detached(&mut self, entry: RamDiskEntry) {
+        while let Some(ended) = self.detached.recv().await {
+            if ended == entry {
+                return;
+            }
+        }
+        panic!("fixture gateway ended without completing detach of {entry}");
+    }
+
+    pub async fn drain(self) -> Result<(), cowshed_gateway::GatewayError> {
+        self.gateway.drain().await
+    }
+}
+
 /// A gateway serving the RAM disk operations and the disk lease on the socket of a test namespace of
 /// its own under `disk_lease`, its RAM disks attached and detached under its own lease, and the
 /// guard that removes the namespace's root on every exit path. That socket is where the
 /// namespace's disk tools lease from (`lease_socket`), so the runners that attach and detach ask
 /// this gateway and no other.
-pub async fn gateway(disk_lease: DiskLeaseLimits) -> (Gateway, NamespaceRoot, PathBuf) {
+pub async fn gateway(disk_lease: DiskLeaseLimits) -> (FixtureGateway, NamespaceRoot, PathBuf) {
     let root = NamespaceRoot::mint();
     let (gateway, socket) = gateway_on(&root, disk_lease).await;
     (gateway, root, socket)
@@ -127,17 +191,26 @@ pub async fn gateway(disk_lease: DiskLeaseLimits) -> (Gateway, NamespaceRoot, Pa
 
 /// A gateway on `root`'s namespace, as [`gateway`] starts one: a second one on the same root is
 /// the next gateway of that namespace, which finds what the first left recorded.
-pub async fn gateway_on(root: &NamespaceRoot, disk_lease: DiskLeaseLimits) -> (Gateway, PathBuf) {
+pub async fn gateway_on(
+    root: &NamespaceRoot,
+    disk_lease: DiskLeaseLimits,
+) -> (FixtureGateway, PathBuf) {
     let host = HostNamespace::Test(root.namespace());
     let cache = root.path().join("cache");
     std::fs::create_dir_all(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
     let socket = lease_socket(host);
+    let (detached, completions) = tokio::sync::mpsc::unbounded_channel();
+    let disks = ObservedDisks {
+        system: SystemRamDisks::new(host),
+        namespace: root.namespace(),
+        detached,
+    };
     let gateway = Gateway::start(
         GatewayConfig {
             control_socket: Some(socket.clone()),
             mirror_cache: MirrorCacheConfig::new(cache),
-            ram_disks: Some(Arc::new(SystemRamDisks::new(host))),
+            ram_disks: Some(Arc::new(disks)),
             disk_lease,
             ..GatewayConfig::default()
         },
@@ -147,7 +220,13 @@ pub async fn gateway_on(root: &NamespaceRoot, disk_lease: DiskLeaseLimits) -> (G
     )
     .await
     .expect("start gateway");
-    (gateway, socket)
+    (
+        FixtureGateway {
+            gateway,
+            detached: completions,
+        },
+        socket,
+    )
 }
 
 /// Take a `ram-lease` of `sectors` from the gateway at `socket`: its one answer line and the

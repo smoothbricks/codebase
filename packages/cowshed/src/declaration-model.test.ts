@@ -3,10 +3,11 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { DeclarationModel } from '@smoothbricks/cowshed/declaration-ir';
+import { ownedFixtureRoot } from '@smoothbricks/nx-plugin/testing';
 import typia, { TypeGuardError } from 'typia';
 
 const assertPublicModel = typia.createAssertEquals<DeclarationModel>();
@@ -202,7 +203,7 @@ describe('declaration model admission', () => {
   let probe = '';
 
   beforeAll(async () => {
-    scratch = mkdtempSync(join(project, '.cache', 'ir-model-admission-'));
+    scratch = await ownedFixtureRoot(join(project, '.cache'), 'ir-model-admission', 'clone-');
     const core = join(scratch, 'crates/cowshed-core/src');
     cpSync(join(project, 'crates/cowshed-core/src'), core, { recursive: true });
     mkdirSync(join(scratch, 'crates/cowshed-gateway-types/src'), { recursive: true });

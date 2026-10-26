@@ -7,6 +7,7 @@
 //! actor has authenticated the endpoint and token and admitted the exact target.
 
 mod actor;
+mod admission;
 mod cache;
 mod cleanup;
 mod config;
@@ -18,6 +19,7 @@ mod listener_handoff;
 mod mirror;
 mod npm_index;
 mod nx_cache;
+mod nx_lifecycle;
 mod platform;
 mod proxy;
 mod ram_lease;
