@@ -4214,7 +4214,7 @@ mod tests {
     async fn setup_refuses_a_build_that_lacks_the_installed_fix_unless_told_to_downgrade() {
         let (home, executable, _) = host_with_agent("basis");
         let main = crate::install_basis::tests::Main::new("refresh");
-        let landing = cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH;
+        let landing = cowshed_types::paths::DEFAULT_LANDING_BRANCH;
         main.git(["checkout", "-q", "-b", "gc-fix"]);
         let fix = main.commit(
             "gc.rs",

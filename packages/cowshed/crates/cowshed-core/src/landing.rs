@@ -558,7 +558,7 @@ async fn counted(
 /// The branch `ls` measures against, which is the same constant `land` merges into and `rm` gates
 /// on. Sharing it is the point: a listing that reported against a different branch than the gate
 /// enforces would be a listing that lies about what `rm` will do.
-const LISTING_TARGET_BRANCH: &str = crate::runtime::project::DEFAULT_LANDING_BRANCH;
+const LISTING_TARGET_BRANCH: &str = cowshed_types::paths::DEFAULT_LANDING_BRANCH;
 
 /// Measure every session workspace of one project's listing against the project's own main.
 ///

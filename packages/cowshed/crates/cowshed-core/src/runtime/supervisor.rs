@@ -6172,7 +6172,7 @@ impl SupervisorActor {
         want: std::num::NonZeroUsize,
         parent: Option<super::job_cpu::InheritedJobserver>,
     ) -> tokio::task::AbortHandle {
-        let directory = super::job_cpu::cpu_pool_directory(
+        let directory = cowshed_types::paths::cpu_pool_directory(
             &self.policy.ceiling().store_root,
             &self.authority.workspace_incarnation,
         );

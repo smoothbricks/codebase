@@ -1046,6 +1046,7 @@ dependencies = [
 name = "cowshed-types"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "cowshed-gateway-types",
  "cowshed-os",
  "lmao-core",

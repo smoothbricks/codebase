@@ -164,8 +164,8 @@ fn directories(directory: &Path) -> Vec<PathBuf> {
 /// A lease is a lock whatever its length: the record it holds describes its holder, or a holder
 /// that ended without unwinding, and is no state of its own.
 pub fn is_lease(name: &str) -> bool {
-    name.ends_with(crate::storage::recovery::INTENT_LEASE_SUFFIX)
-        || name.ends_with(crate::runtime::land_lease::LAND_LEASE_SUFFIX)
+    name.ends_with(cowshed_types::paths::INTENT_LEASE_SUFFIX)
+        || name.ends_with(cowshed_types::paths::LAND_LEASE_SUFFIX)
 }
 
 /// The intent and land lease files in a project's `sessions` directory ([`is_lease`]).

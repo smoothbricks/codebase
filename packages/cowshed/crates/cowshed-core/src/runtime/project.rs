@@ -53,6 +53,7 @@ use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
 use cowshed_os::timing::timed_async;
 use cowshed_types::metadata::WorkspaceName;
+use cowshed_types::paths::DEFAULT_LANDING_BRANCH;
 #[cfg(target_os = "macos")]
 use cowshed_types::repository::OwnedRepoIds;
 use cowshed_types::repository::{RepoId, RepositoryBinding};
@@ -60,13 +61,6 @@ use cowshed_types::repository::{RepoId, RepositoryBinding};
 const ROUTER_CAPACITY: usize = 64;
 const STARTUP_LIFECYCLE_ATTEMPTS: usize = 8;
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
-
-/// The branch a workspace's commits are expected to reach.
-///
-/// One constant for two questions that must never disagree: where `land` merges by default, and
-/// which branch `rm` requires to contain a workspace's head before destroying its object store.
-/// If they diverged, `land` would satisfy a check `rm` does not make.
-pub const DEFAULT_LANDING_BRANCH: &str = "main";
 
 /// The hidden verb a land starts to compact its target's seed, `cowshed __compact-seed
 /// <project-root>` ([`ProjectRuntimeHost::compact_seed`]; 16_build_volumes.md, "Seed
@@ -6521,7 +6515,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         name: WorkspaceName,
         incarnation: WorkspaceIncarnation,
     ) -> Result<super::build_volumes::ReseedWorkspace> {
-        use crate::storage::recovery::INTENT_LEASE_SUFFIX;
+        use cowshed_types::paths::INTENT_LEASE_SUFFIX;
         Ok(super::build_volumes::ReseedWorkspace {
             checkout: self.workspace_mount_path(&name)?,
             image: self
@@ -15339,7 +15333,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             ),
             Err(error) => cowshed_os::eprintln!(
                 "cowshed: gc left the sandbox profile files in {}: {error}",
-                crate::exec::profile_directory(&store_root).display()
+                cowshed_types::paths::profile_directory(&store_root).display()
             ),
         }
         Ok(GcReport {
@@ -27775,10 +27769,9 @@ mod terminal_project_cleanup_tests {
                 .expect("claim")
                 .expect("the lease is free"),
         );
-        let stale = paths.sessions.join(format!(
-            "wren{}",
-            crate::storage::recovery::INTENT_LEASE_SUFFIX
-        ));
+        let stale = paths
+            .sessions
+            .join(format!("wren{}", cowshed_types::paths::INTENT_LEASE_SUFFIX));
         std::fs::write(
             &stale,
             serde_json::to_vec(&crate::lease_holder::Process::this().expect("this process"))
@@ -27793,10 +27786,9 @@ mod terminal_project_cleanup_tests {
             )
             .expect("land lease"),
         );
-        let main_lease = paths.sessions.join(format!(
-            "main{}",
-            crate::storage::recovery::INTENT_LEASE_SUFFIX
-        ));
+        let main_lease = paths
+            .sessions
+            .join(format!("main{}", cowshed_types::paths::INTENT_LEASE_SUFFIX));
         assert!(
             !std::fs::read(&main_lease).expect("read").is_empty(),
             "the held lease records its holder"

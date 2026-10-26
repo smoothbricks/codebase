@@ -207,7 +207,7 @@ impl SandboxConfig {
     /// Where launches under this sandbox keep their profile file: the `run/profiles` directory of
     /// the store the launcher serves.
     pub fn profile_directory(&self) -> PathBuf {
-        crate::exec::profile_directory(&self.store_root)
+        cowshed_types::paths::profile_directory(&self.store_root)
     }
 
     /// [`Self::configure_capabilities_for`] a command at the workspace root: the snapshot a
@@ -391,7 +391,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         exec_temp_dir,
         store_root: store_root.to_path_buf(),
 
-        cpu_pool_directory: Some(crate::runtime::job_cpu::cpu_pool_directory(
+        cpu_pool_directory: Some(cowshed_types::paths::cpu_pool_directory(
             store_root,
             workspace_incarnation,
         )),
@@ -1285,9 +1285,9 @@ pub fn seatbelt_profile(
         crate::storage::WORKSPACE_MARKER_PATH,
         crate::workspace_credentials::CA_CERTIFICATE_PATH,
         crate::workspace_credentials::WORKSPACE_TOKEN_PATH,
-        crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH,
-        crate::workspace_git_fetch::WORKSPACE_GIT_FETCH_CONFIG_PATH,
-        crate::git::WORKSPACE_GIT_IDENTITY_CONFIG_PATH,
+        cowshed_types::paths::WORKSPACE_ENVIRONMENT_PATH,
+        cowshed_types::paths::WORKSPACE_GIT_FETCH_CONFIG_PATH,
+        cowshed_types::paths::WORKSPACE_GIT_IDENTITY_CONFIG_PATH,
     ] {
         push_literal_rule(
             &mut profile,
@@ -1302,7 +1302,7 @@ pub fn seatbelt_profile(
         "deny file-write*",
         &config
             .workspace_mount
-            .join(crate::runtime::shell_host::SHELL_HOST_DIRECTORY),
+            .join(cowshed_types::paths::SHELL_HOST_DIRECTORY),
     )?;
 
     match role {
@@ -3205,7 +3205,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     #[cfg(target_os = "macos")]
     #[test]
     fn no_allow_precedes_a_deny_that_covers_it() {
-        let pool = crate::runtime::job_cpu::cpu_pool_directory(
+        let pool = cowshed_types::paths::cpu_pool_directory(
             Path::new("/private/cowshed/store"),
             &cowshed_types::metadata::WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
                 .unwrap(),

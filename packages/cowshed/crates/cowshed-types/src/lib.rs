@@ -10,6 +10,7 @@ pub mod image;
 pub mod land_turn;
 pub mod lifecycle;
 pub mod metadata;
+pub mod paths;
 pub mod repository;
 pub mod trace_enum;
 pub mod wait;

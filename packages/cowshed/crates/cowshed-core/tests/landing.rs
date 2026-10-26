@@ -1195,7 +1195,7 @@ async fn a_listing_measures_with_the_controller_git_of_the_store_it_is_given() {
     // and writes none.
     #[cfg(target_os = "macos")]
     {
-        let profiles = fs::read_dir(cowshed_core::exec::profile_directory(fixture.store()))
+        let profiles = fs::read_dir(cowshed_types::paths::profile_directory(fixture.store()))
             .expect("the given store holds the controller Git's profile directory")
             .map(|entry| entry.expect("profile entry").path())
             .filter(|path| path.extension() == Some(OsStr::new("sb")))

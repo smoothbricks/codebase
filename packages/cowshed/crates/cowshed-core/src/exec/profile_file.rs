@@ -29,12 +29,7 @@ use std::time::SystemTime;
 
 use crate::api::dto::Sha256Digest;
 use crate::sandbox::{BUILD_VOLUME_PARAM, SeatbeltProfile};
-
-/// Where the profile files of `store_root`'s launches live: beside its supervisors' sockets in
-/// its `run` directory.
-pub fn profile_directory(store_root: &Path) -> PathBuf {
-    store_root.join("run").join("profiles")
-}
+use cowshed_types::paths::profile_directory;
 
 /// One rendered profile on disk, `<sha256>.sb`, whole once it exists.
 #[derive(Clone, Debug, Eq, PartialEq)]

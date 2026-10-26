@@ -17,10 +17,10 @@ use std::process::{Command, ExitStatus};
 use crate::capabilities::bun::BUN_HOME;
 use crate::capabilities::cache::SharedToolHome;
 use crate::capabilities::pnpm::PNPM_HOME;
-use crate::runtime::shell_host::SHELL_HOST_DIRECTORY;
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_types::paths::SHELL_HOST_DIRECTORY;
 
 /// The mode's private `tools/manager-bin`: the package-manager wrapper links, the only route that
 /// leads PATH after shell activation (15_capabilities.md, "Bootstrap executables").

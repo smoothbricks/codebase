@@ -15,9 +15,9 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cowshed_core::git::{
-    GitRepository, WORKSPACE_GIT_IDENTITY_CONFIG_PATH, workspace_git_identity_config,
-};
+use cowshed_core::git::{GitRepository, workspace_git_identity_config};
+
+use cowshed_types::paths::WORKSPACE_GIT_IDENTITY_CONFIG_PATH;
 
 const INCLUDED_NAME: &str = "Included Identity";
 const INCLUDED_EMAIL: &str = "included@example.invalid";

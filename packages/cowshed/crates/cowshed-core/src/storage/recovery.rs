@@ -13,6 +13,7 @@ use cowshed_os::fork_lock::Fenced;
 use cowshed_types::metadata::{
     MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json,
 };
+use cowshed_types::paths::INTENT_LEASE_SUFFIX;
 use cowshed_types::repository::RepoId;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
 pub const STAGING_NAMESPACE: &str = ".staging";
@@ -126,8 +127,6 @@ impl std::fmt::Display for KeptAbandonBundles {
 pub const ROOT_HELD_MOUNT_PREFIX: &str = ".root-held-";
 pub const LIFECYCLE_INTENTS_FILE: &str = "lifecycle-intents.json";
 const LIFECYCLE_INTENT_VERSION: u32 = 1;
-/// Suffix of the per-workspace lease file beside a project's session images.
-pub const INTENT_LEASE_SUFFIX: &str = ".intent.lock";
 
 /// A filesystem input retained by explicit re-adoption, never a second runtime image format.
 /// Exact paths and kernel IOMedia capacities are captured before the first detach.
