@@ -2464,10 +2464,9 @@ mod tests {
             .args(["-c", "exit 4"])
             .spawn_locked()
             .expect("spawn sh");
-        let exit = crate::process::ExitWatch::of(child.id()).expect("watch sh");
-        if let Some(exit) = exit {
-            exit.wait().expect("sh exits");
-        }
+        // Darwin can report NOTE_EXIT before the exit status is collectable.
+        crate::test_backstop::waitid(libc::P_PID, child.id(), libc::WEXITED | libc::WNOWAIT)
+            .expect("sh's exit is waitable without reaping it");
         let spent = start("reap probe", Bound::new(LatencyClass::Reap, Duration::ZERO));
         let status = reap("probe child", &mut child, &spent, Progress::Nothing)
             .expect("an exited child is answered whatever the budget left");
@@ -2481,10 +2480,12 @@ mod tests {
             .args(["-c", "exit 5"])
             .spawn_locked()
             .expect("spawn sh");
-        let exit = crate::process::ExitWatch::of(child.id().expect("a pid")).expect("watch sh");
-        if let Some(exit) = exit {
-            exit.wait().expect("sh exits");
-        }
+        crate::test_backstop::waitid(
+            libc::P_PID,
+            child.id().expect("a pid"),
+            libc::WEXITED | libc::WNOWAIT,
+        )
+        .expect("sh's exit is waitable without reaping it");
         let spent = start("reap probe", Bound::new(LatencyClass::Reap, Duration::ZERO));
         let status = reap_async("probe child", &mut child, &spent, Progress::Nothing)
             .await
