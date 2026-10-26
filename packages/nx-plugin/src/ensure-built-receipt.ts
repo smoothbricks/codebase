@@ -187,7 +187,7 @@ export function receiptNode(
 }
 /**
  * Whether a tracked source node whose stamp does not prove it (its ctime alone moved, or it was read in the tick it
- * changed in) still holds the bytes or link text `files` recorded for it. A node that is gone does not.
+ * changed in) still holds the bytes or link text `files` recorded for it. A node that is gone, or no longer a file, does not.
  */
 function recordedSource(root: string, files: readonly EnsureBuiltProducerFileInput[]): (path: string) => boolean {
   const recorded = new Map(files.map((file) => [join(root, file.path), file.sha256]));
@@ -200,7 +200,8 @@ function recordedSource(root: string, files: readonly EnsureBuiltProducerFileInp
           .digest('hex')
       );
     } catch (error) {
-      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;
+      if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'EISDIR'))
+        return false;
       throw error;
     }
   };

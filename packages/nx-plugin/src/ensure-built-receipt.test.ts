@@ -295,7 +295,15 @@ describe('a tracked public output', () => {
       detail: expect.stringContaining('generated.txt'),
     });
     await rm(join(root, 'generated.txt'));
-    expect(producerSourceUnchanged(root, captured).ok).toBe(false);
+    expect(producerSourceUnchanged(root, captured)).toMatchObject({
+      ok: false,
+      detail: expect.stringContaining('generated.txt'),
+    });
+    await mkdir(join(root, 'generated.txt'));
+    expect(producerSourceUnchanged(root, captured)).toMatchObject({
+      ok: false,
+      detail: expect.stringContaining('generated.txt'),
+    });
   });
 
   it('binds none that differs from HEAD when the run starts', async () => {
