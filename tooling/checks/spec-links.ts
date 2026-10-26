@@ -19,7 +19,13 @@
 // new broken reference, a raised count, a fixed reference whose row stayed, and a row deleted
 // without its fix all fail. Fix the reference and its row in the same commit; never ledger a new
 // broken reference to make the check pass.
-import { existsSync, readFileSync } from 'node:fs';
+//
+// Run with repository paths (bun tooling/checks/spec-links.ts <path>...) it judges the tree a commit of those paths
+// will hold: a path the working tree has an entry for joins the tracked ones, and a path it lacks leaves them. A doc
+// lane that checks its edit before it stages it passes the paths of the edit so: a file the edit adds is not yet
+// tracked, and one it deletes still is. A path names a file, never a directory. The root lint target runs it with no
+// paths, on the tracked tree.
+import { existsSync, lstatSync, readFileSync, type Stats } from 'node:fs';
 import { posix, resolve } from 'node:path';
 import { SPEC_LINKS } from './spec-links.ledger.ts';
 
@@ -401,10 +407,45 @@ export function findSpecLinkViolations(
   return violations;
 }
 
-/** Every reference in tracked specs that does not resolve against the tracked tree. */
-export async function scanSpecLinks(): Promise<{ checked: number; findings: SpecLinkFinding[] }> {
+/**
+ * The paths a commit of the pending ones will hold: the tracked paths, plus each pending path the working tree has an
+ * entry for and minus each it lacks. A doc lane judges its edit before it stages it, so a file the edit adds is not
+ * yet tracked and one it deletes still is.
+ */
+export function trackedAfter(
+  tracked: readonly string[],
+  pending: readonly string[],
+  present: (path: string) => boolean,
+): string[] {
+  const held = new Set(tracked);
+  for (const path of pending) {
+    if (present(path)) held.add(path);
+    else held.delete(path);
+  }
+  return [...held];
+}
+
+/** A path argument as the repository-relative path git names, or undefined when it points outside the repository. */
+export function repoRelative(arg: string): string | undefined {
+  const path = posix.normalize(arg);
+  return path === '.' || path === '..' || path.startsWith('../') || path.startsWith('/') ? undefined : path;
+}
+
+/** The working tree's entry at path, not followed: a dangling symlink is an entry, and git adds and lists it. */
+function entryAt(root: string, path: string): Stats | undefined {
+  return lstatSync(resolve(root, path), { throwIfNoEntry: false });
+}
+
+/**
+ * Every reference in the specs of a tree that does not resolve against it: the tracked tree of the repository at root,
+ * changed by the pending paths as trackedAfter says.
+ */
+export async function scanSpecLinks(
+  pending: readonly string[] = [],
+  root: string = REPO_ROOT,
+): Promise<{ checked: number; findings: SpecLinkFinding[] }> {
   const git = Bun.spawn(['git', 'ls-files', '--cached', '-z'], {
-    cwd: REPO_ROOT,
+    cwd: root,
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -414,13 +455,14 @@ export async function scanSpecLinks(): Promise<{ checked: number; findings: Spec
     git.exited,
   ]);
   if (exitCode !== 0) throw new Error(`git ls-files failed with exit code ${exitCode}: ${diagnostic.trim()}`);
-  const files = out.split('\0').filter((f) => f !== '');
+  const tracked = out.split('\0').filter((f) => f !== '');
+  const files = trackedAfter(tracked, pending, (path) => entryAt(root, path) !== undefined);
   const cache = new Map<string, string | undefined>();
   const textOf = (path: string): string | undefined => {
     if (cache.has(path)) return cache.get(path);
     let text: string | undefined;
     try {
-      text = readFileSync(resolve(REPO_ROOT, path), 'utf8');
+      text = readFileSync(resolve(root, path), 'utf8');
     } catch {
       text = undefined;
     }
@@ -433,7 +475,7 @@ export async function scanSpecLinks(): Promise<{ checked: number; findings: Spec
     .flatMap((spec) => {
       let text: string;
       try {
-        text = readFileSync(resolve(REPO_ROOT, spec), 'utf8');
+        text = readFileSync(resolve(root, spec), 'utf8');
       } catch (error) {
         throw new Error(`cannot read tracked spec ${spec}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -484,7 +526,19 @@ export function formatViolation(violation: SpecLinkViolation): string {
 }
 
 if (import.meta.main) {
-  const { checked, findings } = await scanSpecLinks();
+  const pending: string[] = [];
+  const stray: string[] = [];
+  for (const arg of process.argv.slice(2)) {
+    const path = repoRelative(arg);
+    if (path === undefined || entryAt(REPO_ROOT, path)?.isDirectory()) stray.push(arg);
+    else pending.push(path);
+  }
+  if (stray.length > 0) {
+    console.error(`Not paths of files in the repository: ${stray.join(', ')}`);
+    console.error('usage: bun tooling/checks/spec-links.ts [<path>...]');
+    process.exit(2);
+  }
+  const { checked, findings } = await scanSpecLinks(pending);
   const violations = findSpecLinkViolations(findings, SPEC_LINKS, (path) => existsSync(resolve(REPO_ROOT, path)));
   if (violations.length === 0) {
     const sites = SPEC_LINKS.reduce((total, row) => total + row.count, 0);

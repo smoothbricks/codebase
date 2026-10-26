@@ -8,15 +8,21 @@
 // (kept as fixtures, not *.test.ts: the name must stay invisible to bun test globs, since no package tsconfig owns
 // this directory.)
 
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import {
   extractRefs,
   findSpecLinkViolations,
   judgeRefs,
   pinnedMissingKeys,
+  repoRelative,
   type SpecLinkFinding,
   type SpecLinkRow,
   type SpecLinkTree,
   type SpecLinkViolation,
+  scanSpecLinks,
+  trackedAfter,
 } from './spec-links.ts';
 
 let failures = 0;
@@ -160,6 +166,94 @@ const exact = judgeRefs(
   pinnedMissingKeys([{ ...row(1), raw: 'plugin/optimization.go:1' }]),
 ).length;
 if (exact !== 0) fail('creating the cited file itself resolves a pinned citation', 0, exact);
+
+// ── the tree a commit will hold ────────────────────────────────────────────────────────────────
+// A doc lane runs this check before it stages its edit, so a file the edit adds is untracked and one it deletes is
+// still tracked: the paths of the edit say which.
+function held(what: string, pending: readonly string[], present: readonly string[], expected: readonly string[]): void {
+  const actual = trackedAfter(['a.md', 'b.md'], pending, (p) => present.includes(p)).sort();
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) fail(what, expected, actual);
+}
+held('a file the edit adds joins the tracked ones', ['c.md'], ['a.md', 'b.md', 'c.md'], ['a.md', 'b.md', 'c.md']);
+held('a file the edit deletes leaves them', ['b.md'], ['a.md'], ['a.md']);
+held('a rename leaves its old path and holds its new one', ['b.md', 'c.md'], ['a.md', 'c.md'], ['a.md', 'c.md']);
+held('a file the edit rewrites stays once', ['a.md'], ['a.md', 'b.md'], ['a.md', 'b.md']);
+held('a deleted file that was never tracked changes nothing', ['z.md'], ['a.md', 'b.md'], ['a.md', 'b.md']);
+function place(arg: string, expected: string | undefined): void {
+  const actual = repoRelative(arg);
+  if (actual !== expected) fail(`the path argument ${arg}`, expected, actual);
+}
+place('specs/a/01.md', 'specs/a/01.md');
+place('./specs/a/../a/01.md', 'specs/a/01.md');
+place('../elsewhere/01.md', undefined);
+place('/abs/specs/a/01.md', undefined);
+place('.', undefined);
+
+// scanSpecLinks against a throwaway repository: its index lists the tracked tree and its working tree holds the edit.
+// A spec the edit adds is judged, a file the same edit adds resolves a citation, a dangling symlink the edit adds is an
+// entry of the tree (it makes a suffix ambiguous, and as a spec it fails the read), and a spec the edit deletes is not
+// read (reading a tracked spec that is gone fails the scan).
+const scratch = mkdtempSync(join(tmpdir(), 'spec-links-'));
+try {
+  const put = (path: string, text: string): void => {
+    mkdirSync(dirname(join(scratch, path)), { recursive: true });
+    writeFileSync(join(scratch, path), text);
+  };
+  const link = (path: string, target: string): void => {
+    mkdirSync(dirname(join(scratch, path)), { recursive: true });
+    symlinkSync(target, join(scratch, path));
+  };
+  const git = (...args: string[]): void => {
+    const run = Bun.spawnSync(['git', ...args], { cwd: scratch, stdout: 'pipe', stderr: 'pipe' });
+    if (run.exitCode !== 0) throw new Error(`git ${args.join(' ')} failed: ${run.stderr.toString().trim()}`);
+  };
+  const scan = async (what: string, pending: readonly string[], expected: readonly string[]): Promise<void> => {
+    const { findings } = await scanSpecLinks(pending, scratch);
+    const actual = findings.map((f) => `${f.ref.spec} ${f.reason}`);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) fail(what, expected, findings);
+  };
+  git('init', '-q');
+  put('src/lib.ts', 'export const a = 1;\n');
+  put('specs/a/01.md', `See ${q('src/lib.ts:1')}.\n`);
+  put('packages/a/src/util.ts', 'export const c = 3;\n');
+  put('specs/a/04.md', `See ${q('src/util.ts:1')}.\n`);
+  git('add', '-A');
+  await scan('the tracked tree resolves', [], []);
+  put('specs/a/02.md', `See ${q('src/gone.ts:1')}.\n`);
+  await scan('an untracked spec is outside the tracked tree', [], []);
+  await scan('a spec the edit adds is judged', ['specs/a/02.md'], ['specs/a/02.md missing-file']);
+  put('src/gone.ts', 'export const b = 2;\n');
+  await scan('a file the same edit adds resolves the citation', ['specs/a/02.md', 'src/gone.ts'], []);
+  link('packages/b/src/util.ts', 'nowhere.ts');
+  await scan(
+    'a dangling symlink the edit adds is an entry of the tree',
+    ['packages/b/src/util.ts'],
+    ['specs/a/04.md ambiguous-file'],
+  );
+  rmSync(join(scratch, 'packages/b'), { recursive: true });
+  link('specs/a/03.md', 'nowhere.md');
+  const failed = await scanSpecLinks(['specs/a/03.md'], scratch).then(
+    () => false,
+    () => true,
+  );
+  if (!failed)
+    fail('a dangling symlink spec the edit adds fails the scan, as it fails root lint once committed', true, failed);
+  rmSync(join(scratch, 'specs/a/03.md'));
+  rmSync(join(scratch, 'specs/a/01.md'));
+  await scan('a spec the edit deletes is not read', ['specs/a/01.md', 'specs/a/02.md', 'src/gone.ts'], []);
+} finally {
+  rmSync(scratch, { recursive: true, force: true });
+}
+
+// The CLI refuses a path that is no file of the repository before it scans: exit 2, the usage.
+for (const bad of ['../outside.md', 'specs']) {
+  const run = Bun.spawnSync([process.execPath, join(import.meta.dir, 'spec-links.ts'), bad], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (run.exitCode !== 2) fail(`the path argument ${bad} is usage`, 2, run.exitCode);
+}
+
 if (failures > 0) {
   console.error(`Spec-link fixtures failed: ${failures} planted shape(s) did not get the verdict they plant.`);
   process.exit(1);
