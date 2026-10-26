@@ -95,6 +95,24 @@ fn a_name_alone_passes_another_tools_entry_and_asks_for_the_rest() {
 /// passed otherwise. Its owner record decides next: a missing record passes another name's entry
 /// and keeps cowshed's, and a malformed one is an unknown owner, never a dead one.
 #[test]
+fn a_directory_is_private_only_for_its_owner_without_foreign_writers() {
+    for (directory, owner, mode, reader, expected) in [
+        (true, 501, 0o700, 501, true),
+        (true, 501, 0o755, 501, true),
+        (false, 501, 0o700, 501, false),
+        (true, 502, 0o700, 501, false),
+        (true, 501, 0o720, 501, false),
+        (true, 501, 0o702, 501, false),
+    ] {
+        assert_eq!(
+            private_directory(directory, owner, mode, reader),
+            expected,
+            "directory={directory} owner={owner} mode={mode:o} reader={reader}"
+        );
+    }
+}
+
+#[test]
 fn an_entry_is_judged_only_as_a_private_directory_with_a_complete_record() {
     let not_found = || io::Error::from(io::ErrorKind::NotFound);
     let metadata: [(bool, io::Result<Option<()>>, Oracle); 6] = [

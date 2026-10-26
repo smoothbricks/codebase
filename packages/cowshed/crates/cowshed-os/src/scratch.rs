@@ -339,6 +339,8 @@ impl Reaper {
     }
 
     pub fn sweep(&mut self, store: &Path, dry_run: bool) -> Report {
+        // SAFETY: geteuid has no preconditions. One pass observes its reader once.
+        let reader = unsafe { libc::geteuid() };
         let mut findings = Vec::new();
         let mut pass = self.cursors.pass(PASS_ENTRIES);
         let examined = loop {
@@ -369,7 +371,7 @@ impl Reaper {
                             true
                         }
                         Some(Ok(entry)) => {
-                            findings.extend(inspect(&entry.path(), store, dry_run));
+                            findings.extend(inspect(&entry.path(), store, dry_run, reader));
                             true
                         }
                     };
@@ -629,25 +631,23 @@ impl<M> Look<M> {
     }
 }
 
-/// Whether `metadata`, read without following a link, is a directory this user owns that no other
-/// user can write: the only entry a sweep judges, so it never crosses an ownership boundary or
-/// inspects a mutable public directory.
-fn private_directory(metadata: &fs::Metadata) -> bool {
-    // SAFETY: geteuid has no preconditions.
-    metadata.is_dir()
-        && metadata.uid() == unsafe { libc::geteuid() }
-        && metadata.mode() & 0o022 == 0
+/// Whether observed metadata names a directory of this reader that no other user
+/// may write. Metadata and the reader identity are inputs, never sampled by this decision.
+fn private_directory(directory: bool, owner: u32, mode: u32, reader: u32) -> bool {
+    directory && owner == reader && mode & 0o022 == 0
 }
 
-fn inspect(path: &Path, store: &Path, dry_run: bool) -> Option<Finding> {
+fn inspect(path: &Path, store: &Path, dry_run: bool, reader: u32) -> Option<Finding> {
     let name = path.file_name()?.to_string_lossy();
     let mut look = Look::name(&name);
     let verdict = loop {
         look = match look {
             Look::Metadata { known } => Look::metadata(
                 known,
-                fs::symlink_metadata(path)
-                    .map(|metadata| private_directory(&metadata).then_some(metadata)),
+                fs::symlink_metadata(path).map(|metadata| {
+                    private_directory(metadata.is_dir(), metadata.uid(), metadata.mode(), reader)
+                        .then_some(metadata)
+                }),
             ),
             Look::Owners { known, entry } => Look::owners(known, entry, owners(path)),
             Look::Liveness { entry, owners } => {
