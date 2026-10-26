@@ -6,7 +6,7 @@
 //! the lands wait.
 #![cfg(unix)]
 
-use cowshed_os::test_backstop::ChildBackstop as _;
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, ErrorKind, Write as _};
@@ -565,15 +565,11 @@ fn a_land_holding_its_turn_receives_the_git_and_managed_nx_policies() {
          echo \"$NX_DAEMON_START\"; }} > {}",
         seen.display()
     );
-    let mut land = Land::spawn(&home, "W", &script);
-    let status = land.wait_exit();
-    land.finish_stderr();
-    assert_eq!(
-        status,
-        ExitStatus::Exited { code: 0 },
-        "stderr: {:?}",
-        land.seen
-    );
+    let output = Land::command(&home, REPO, "W", None)
+        .args(["--", "sh", "-c", &script])
+        .output_bounded()
+        .expect("run and reap the policy command with its output drained");
+    assert!(output.status.success(), "{output:?}");
     assert_eq!(
         fs::read_to_string(&seen).expect("read what the land saw"),
         "0\nfalse\nfalse\nnever\n"
