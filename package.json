@@ -116,7 +116,8 @@
           "spec-links",
           "no-unbounded-wait",
           "forbidden-spellings",
-          "wiring-lint"
+          "wiring-lint",
+          "monorepo-check"
         ],
         "inputs": [
           "...",
@@ -222,6 +223,15 @@
           "cwd": "{workspaceRoot}"
         },
         "//": "The root lint's WIRING: every item of every Nx project tagged wiring:enforced is reached by production code. A project carries the tag once it is clean; agent-todo/wiring-sweep.md lists the rest until each is wired or deleted and tagged, so the enforced scope only grows and nothing is exempt. The inputs are the whole tree because removing a caller anywhere changes an enforced verdict."
+      },
+      "monorepo-check": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "smoo monorepo check --warn",
+          "cwd": "{workspaceRoot}"
+        },
+        "//": "MONOREPO: the package conventions and managed-file drift that publish's 'Check managed monorepo files' step refuses on, run in the root lint where lands are judged instead of first at publish. Uncached on purpose: one check lists the devenv release tags from the remote on every run and keeps no copy, so a cached verdict could outlive what it judged. It needs the remote reachable and fails rather than passes offline."
       },
       "local-registry": {
         "executor": "@nx/js:verdaccio",
