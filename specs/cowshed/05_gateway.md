@@ -935,10 +935,12 @@ the handshake bound.
     launchd's kill: the force stop at 20 s (`GATEWAY_DRAIN_WITHIN`), this bound and the audit flush fit in the 30 s exit
     timeout (`GATEWAY_EXIT_TIMEOUT`, "The installed cowshed"). A backend still running past the bound fails the drain
     `TIMEOUT`, naming its pid and the state the kernel shows it in, said on stderr for each such backend; the sessions
-    still stop and the audit is still flushed first. The wait itself kills nothing: the backend is dropped with the
-    actor and killed as every backend the gateway owns is when dropped (`kill_on_drop`), and its stdin closes with the
-    gateway (Nx route). Measured 2026-10-26: a backend stand-in that ignores `SIGTERM` parked the drain past a 10 s
-    guard; it now fails at its bound (`drain_names_an_nx_backend_that_ignores_sigterm`).
+    still stop and the audit is still flushed first. The expiry ends the wait, never the backend: its stdin closes,
+    which asks it to drain and exit (`--exit-on-stdin-eof`, Nx route), and a task owns it until it exits and collects
+    its exit (`cowshed-os::deadline::collect_later_async`), since dropping it would kill it (`kill_on_drop`). If the
+    gateway process ends first, its runtime drops that task and the backend's `kill_on_drop` kills it: the process
+    ending kills it, not the wait. `drain_names_an_nx_backend_that_ignores_sigterm` pins the bound, the named pid and
+    the backend left running.
 - **A short lock is a request.** A lock taken for one short critical section is waited for within its class's bound. The
   job records lock (11_shell.md, "Job control") is held for an open's recovery of the records and its scan of the job
   directories that stay, a refresh, one record-sequence allocation and its append, and a checkpoint's hash of the

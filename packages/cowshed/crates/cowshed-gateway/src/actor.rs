@@ -2870,8 +2870,8 @@ impl Actor {
 
     /// Ends a drain once nothing is in flight: every Nx backend it started is signalled `SIGTERM`
     /// and waited for within one reap bound, the sessions stop and the audit is flushed. A
-    /// backend still running past the bound fails the drain naming its pid and state; it is
-    /// dropped with the actor and killed as every backend the gateway owns is (`kill_on_drop`).
+    /// backend still running past the bound fails the drain naming its pid and state, and is
+    /// left running: its stdin closes, which asks it to drain and exit, and a task collects it.
     async fn finish_drain(&mut self) -> Result<bool, GatewayError> {
         if !self.draining || self.global_active.total() != 0 {
             return Ok(false);
@@ -2918,6 +2918,10 @@ impl Actor {
             {
                 cowshed_os::eprintln!("cowshed: {failure}");
                 stuck.get_or_insert(failure);
+                // Expiry ends the wait, never the backend: dropped, its `kill_on_drop` would kill it.
+                // Its stdin closes, which asks it to drain and exit (`--exit-on-stdin-eof`).
+                drop(process.stdin.take());
+                cowshed_os::deadline::collect_later_async("nx cache backend", *process);
             }
         }
         let sessions = std::mem::take(&mut self.sessions);
@@ -4318,9 +4322,9 @@ mod tests {
 
     /// 05_gateway.md "Deadlines": the drain waits for an Nx backend it signalled within the reap
     /// bound. A backend that ignores `SIGTERM` fails the drain naming its pid within that bound,
-    /// and the actor turns again, so it is never parked past launchd's exit timeout. Real time: the
-    /// child's exit arrives outside the runtime, so a short bound is injected where production
-    /// passes `REAP`.
+    /// the actor turns again, so it is never parked past launchd's exit timeout, and the backend
+    /// is left running. Real time: the child's exit arrives outside the runtime, so a short bound
+    /// is injected where production passes `REAP`.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn drain_names_an_nx_backend_that_ignores_sigterm() {
@@ -4383,6 +4387,21 @@ mod tests {
         let said = drained.expect_err("matched above").to_string();
         assert!(said.contains(&format!("pid {pid}")), "{said}");
         assert!(fixture.actor.nx_backends.is_empty());
+        let pid = libc::pid_t::try_from(pid).expect("a pid_t");
+        let state = cowshed_os::process::run_state(pid);
+        assert!(
+            matches!(
+                state,
+                cowshed_os::process::RunState::Running | cowshed_os::process::RunState::Sleeping
+            ),
+            "the expiry leaves the backend running: {state}"
+        );
+        // SAFETY: `pid` is this test's own stand-in, still unreaped (its collector holds it).
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGKILL) },
+            0,
+            "kill the stand-in"
+        );
         fixture.finish().await;
     }
 
