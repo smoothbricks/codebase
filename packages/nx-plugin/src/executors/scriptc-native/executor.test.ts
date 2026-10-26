@@ -115,6 +115,14 @@ describe('scriptc-native', () => {
       ].join('\n'),
       // ttsc keeps the import after replacing every call; a kept import is not a call.
       'transformed.js': "import typia from 'typia';\nexport const is = (input) => typeof input === 'string';\n",
+      // The transform's output calls typia's internal helpers; those calls are the transform working.
+      'helpers.js': [
+        "import * as _validateReport_1 from 'typia/lib/internal/_validateReport';",
+        "import { _accessExpressionAsString } from 'typia/lib/internal/_accessExpressionAsString.js';",
+        'export const report = _validateReport_1._validateReport([]);',
+        "export const path = _accessExpressionAsString('key');",
+        '',
+      ].join('\n'),
       // A name the module never imported from typia, and the text of a call, are not calls.
       'unrelated.js':
         "const typia = { createIs: () => true };\nexport const note = 'typia.createIs()' + typia.createIs();\n",
@@ -238,8 +246,28 @@ describe('scriptc-native', () => {
           triple: 'aarch64-linux-musl',
         }),
       ).toEqual([
-        ['cc', '-target', 'aarch64-linux-musl', '-c', '/p/native/a.c', '-o', '/stage/native/ffi.a.0.o'],
-        ['cc', '-target', 'aarch64-linux-musl', '-c', '/p/native/b.c', '-o', '/stage/native/ffi.a.1.o'],
+        [
+          'cc',
+          '-target',
+          'aarch64-linux-musl',
+          '-O2',
+          '-fno-sanitize=undefined',
+          '-c',
+          '/p/native/a.c',
+          '-o',
+          '/stage/native/ffi.a.0.o',
+        ],
+        [
+          'cc',
+          '-target',
+          'aarch64-linux-musl',
+          '-O2',
+          '-fno-sanitize=undefined',
+          '-c',
+          '/p/native/b.c',
+          '-o',
+          '/stage/native/ffi.a.1.o',
+        ],
         ['ar', 'rcs', '/stage/native/ffi.a', '/stage/native/ffi.a.0.o', '/stage/native/ffi.a.1.o'],
       ]);
     });

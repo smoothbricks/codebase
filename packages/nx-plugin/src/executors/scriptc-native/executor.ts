@@ -205,7 +205,8 @@ function chainRoot(expression: ts.Expression): ts.Identifier | undefined {
 
 /**
  * Every name a typia call can be made through: the default, namespace and named bindings of the module's `typia`
- * imports, and, in source order, each name destructured from one of those (`const { createIs } = typia`).
+ * imports, and, in source order, each name destructured from one of those (`const { createIs } = typia`). The helpers
+ * under `typia/lib/internal/` are what the transform emits calls to, so they are never such an import.
  */
 function typiaBindings(source: ts.SourceFile): Set<string> {
   const bindings = new Set<string>();
@@ -213,6 +214,7 @@ function typiaBindings(source: ts.SourceFile): Set<string> {
     if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
     const specifier = statement.moduleSpecifier.text;
     if (specifier !== 'typia' && !specifier.startsWith('typia/')) continue;
+    if (specifier.startsWith('typia/lib/internal/')) continue;
     const clause = statement.importClause;
     if (clause === undefined || clause.isTypeOnly) continue;
     if (clause.name !== undefined) bindings.add(clause.name.text);
@@ -333,11 +335,25 @@ export function scriptcBuildArguments(invocation: ScriptcInvocation): string[] {
   ];
 }
 
-/** The zig commands that archive a package's C: one compile per source for the triple, then one archive of the objects. */
+/**
+ * The zig commands that archive a package's C: one compile per source for the triple, then one archive of the objects.
+ * zig cc without an optimization flag compiles in Debug mode with UBSan, whose handlers only a zig link carries;
+ * scriptc links the archive itself, so the C is compiled `-O2` (scriptc's own release posture) with UBSan off.
+ */
 export function zigArchiveCommands(invocation: ArchiveInvocation): string[][] {
   const compiled = invocation.sources.map((source, index) => ({ source, object: `${invocation.archive}.${index}.o` }));
   return [
-    ...compiled.map(({ source, object }) => ['cc', '-target', invocation.triple, '-c', source, '-o', object]),
+    ...compiled.map(({ source, object }) => [
+      'cc',
+      '-target',
+      invocation.triple,
+      '-O2',
+      '-fno-sanitize=undefined',
+      '-c',
+      source,
+      '-o',
+      object,
+    ]),
     ['ar', 'rcs', invocation.archive, ...compiled.map(({ object }) => object)],
   ];
 }
