@@ -156,7 +156,11 @@ pub fn collect_profiles(store_root: &Path) -> io::Result<usize> {
     Ok(removed)
 }
 
-/// When the oldest supervisor still serving a socket in `run` started serving it.
+/// When the oldest workspace supervisor still serving its socket in `run` started serving it.
+/// Only a supervisor's own socket counts ([`is_socket_name`]): the manager's `manager.sock` lives
+/// as long as the daemon, and a supervisor's `.members.sock` twin is the same supervisor.
+///
+/// [`is_socket_name`]: crate::runtime::supervisor_socket::is_socket_name
 fn oldest_live_supervisor(run: &Path) -> io::Result<Option<SystemTime>> {
     let entries = match fs::read_dir(run) {
         Ok(entries) => entries,
@@ -165,11 +169,11 @@ fn oldest_live_supervisor(run: &Path) -> io::Result<Option<SystemTime>> {
     };
     let mut oldest: Option<SystemTime> = None;
     for entry in entries {
-        let path = entry?.path();
-        if path.extension() != Some(OsStr::new("sock")) {
+        let entry = entry?;
+        if !crate::runtime::supervisor_socket::is_socket_name(&entry.file_name()) {
             continue;
         }
-        if let Some(started) = crate::runtime::supervisor_socket::serving_since(&path)? {
+        if let Some(started) = crate::runtime::supervisor_socket::serving_since(&entry.path())? {
             oldest = Some(oldest.map_or(started, |oldest| oldest.min(started)));
         }
     }
@@ -253,6 +257,15 @@ mod tests {
         assert_eq!(set, 0, "{}", io::Error::last_os_error());
     }
 
+    /// Where the supervisor of `workspace` of `acme/widget` listens in `store`.
+    fn supervisor_socket(store: &Path, workspace: &str) -> PathBuf {
+        crate::runtime::supervisor_socket::socket_path(
+            store,
+            &crate::repository::RepoId::parse("acme/widget").unwrap(),
+            &crate::metadata::WorkspaceName::new(workspace).unwrap(),
+        )
+    }
+
     fn mtime(path: &Path) -> SystemTime {
         fs::symlink_metadata(path).unwrap().modified().unwrap()
     }
@@ -303,13 +316,12 @@ mod tests {
     fn gc_removes_a_profile_only_when_every_live_supervisor_started_after_its_last_launch() {
         let scratch = scratch();
         let store = scratch.join("store");
-        let run = store.join("run");
         let profile = "(version 1)(allow default)";
         let file = ProfileFile::write(&profile_directory(&store), profile).unwrap();
         set_mtime(file.path(), 2_000);
         assert_eq!(collect_profiles(&store).unwrap(), 0, "no live supervisor");
 
-        let stopped = run.join("stopped.sock");
+        let stopped = supervisor_socket(&store, "stopped");
         drop(std::os::unix::net::UnixListener::bind(&stopped).unwrap());
         set_mtime(&stopped, 3_000);
         assert_eq!(
@@ -318,10 +330,10 @@ mod tests {
             "a socket nothing is attached to is no live supervisor"
         );
 
-        let older = run.join("older.sock");
+        let older = supervisor_socket(&store, "older");
         let older_listener = std::os::unix::net::UnixListener::bind(&older).unwrap();
         set_mtime(&older, 1_000);
-        let younger = run.join("younger.sock");
+        let younger = supervisor_socket(&store, "younger");
         let _younger_listener = std::os::unix::net::UnixListener::bind(&younger).unwrap();
         set_mtime(&younger, 3_000);
         assert_eq!(
@@ -347,6 +359,30 @@ mod tests {
             0,
             "a launch after the youngest supervisor started keeps its file"
         );
+    }
+
+    /// The oldest live supervisor gc dates profiles by is a workspace supervisor: the manager's
+    /// `manager.sock`, live for the daemon's whole life, is none, so it holds back no profile
+    /// that every workspace supervisor started after.
+    #[test]
+    fn gc_dates_profiles_by_workspace_supervisors_alone() {
+        let scratch = scratch();
+        let store = scratch.join("store");
+        let file =
+            ProfileFile::write(&profile_directory(&store), "(version 1)(allow default)").unwrap();
+        set_mtime(file.path(), 2_000);
+        let supervisor = supervisor_socket(&store, "raven");
+        let _supervisor = std::os::unix::net::UnixListener::bind(&supervisor).unwrap();
+        set_mtime(&supervisor, 3_000);
+        let manager = crate::runtime::supervisor_manager::manager_socket_path(&store);
+        let _manager = std::os::unix::net::UnixListener::bind(&manager).unwrap();
+        set_mtime(&manager, 1_000);
+        assert_eq!(
+            collect_profiles(&store).unwrap(),
+            1,
+            "the only workspace supervisor started after the file's last launch"
+        );
+        assert!(!file.path().exists());
     }
 
     #[test]
