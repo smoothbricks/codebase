@@ -865,17 +865,17 @@ read or write clipped to the wait's bound, and no socket timeout option, since D
 has shut down and a kernel timeout restarts on every partial read. Both name the peer by the pid the kernel reports for
 the connection (`peer_pid`: `LOCAL_PEERPID` on Darwin, `SO_PEERCRED` on Linux), never by who owns the socket path.
 
-| class       | covers                                                                                                           | bound |
-| ----------- | ---------------------------------------------------------------------------------------------------------------- | ----- |
-| control     | connecting to a running daemon and sending it one request                                                        | 5 s   |
-| handshake   | connecting to a peer that should be running, and its hello                                                       | 10 s  |
-| reap        | a child's exit once its pipes closed or it was killed                                                            | 5 s   |
-| ffi         | the image lease a disk-image command holds for its run                                                           | 120 s |
-| ffi         | one launchctl print or bootstrap                                                                                 | 10 s  |
-| ffi         | a launchctl bootout of an agent whose exit timeout is ET                                                         | ET+1  |
-| ffi         | a launchctl kickstart -k of that agent                                                                           | ET+11 |
-| ffi         | one codesign signature or verification of the host binary                                                        | 10 s  |
-| remote-http | one request to GitHub, Forgejo or the npm registry, or one `gh` command that makes one, through its whole answer | 17 s  |
+| class       | covers                                                                                                                                                                                             | bound |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| control     | connecting to a running daemon and sending it one request                                                                                                                                          | 5 s   |
+| handshake   | connecting to a peer that should be running, and its hello                                                                                                                                         | 10 s  |
+| reap        | a child's exit once its pipes closed or it was killed                                                                                                                                              | 5 s   |
+| ffi         | the image lease a disk-image command holds for its run                                                                                                                                             | 120 s |
+| ffi         | one launchctl print or bootstrap                                                                                                                                                                   | 10 s  |
+| ffi         | a launchctl bootout of an agent whose exit timeout is ET                                                                                                                                           | ET+1  |
+| ffi         | a launchctl kickstart -k of that agent                                                                                                                                                             | ET+11 |
+| ffi         | one codesign signature or verification of the host binary                                                                                                                                          | 10 s  |
+| remote-http | one request to GitHub, Forgejo or the npm registry, or one `gh` command that makes one, through its whole answer; a stream read as it arrives waits at most this long for each read, with no total | 17 s  |
 
 The remote-http bound is measured, not chosen: the slowest kind's p99 × 20, rounded up to the second. Measured
 2026-10-25 23:10–23:14 UTC from the macOS development host (18 CPUs, load average 15–28 while other gates ran), each
