@@ -4321,12 +4321,13 @@ mod tests {
     }
 
     /// 05_gateway.md "Deadlines": the drain waits for an Nx backend it signalled within the reap
-    /// bound. A backend that ignores `SIGTERM` fails the drain naming its pid within that bound,
-    /// the actor turns again, so it is never parked past launchd's exit timeout, and the backend
-    /// is left running. Real time: the child's exit arrives outside the runtime, so a short bound
-    /// is injected where production passes `REAP`.
+    /// bound. A backend that ignores `SIGTERM` fails the drain naming its pid at that bound, the
+    /// actor turns again, so it is never parked past launchd's exit timeout, and the backend is
+    /// left running. Paused time: the stand-in never exits, so nothing real ends the wait before
+    /// its bound, and the drain's deadline runs on tokio's clock, so the wait lasts the injected
+    /// bound exactly. A drain parked on the backend is a hang the no-progress bound names.
     #[cfg(target_os = "macos")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_names_an_nx_backend_that_ignores_sigterm() {
         use cowshed_os::deadline::{Bound, LatencyClass, Progress, ReapError};
         use cowshed_os::fork_lock::Spawn as _;
@@ -4362,10 +4363,8 @@ mod tests {
         let bound = Duration::from_millis(500);
         fixture.actor.nx_backend_reap = Bound::new(LatencyClass::Reap, bound);
         fixture.actor.draining = true;
-        let started = std::time::Instant::now();
-        let drained = timeout(Duration::from_secs(10), fixture.actor.finish_drain())
-            .await
-            .expect("the drain returns instead of parking the actor on the backend");
+        let started = tokio::time::Instant::now();
+        let drained = fixture.actor.finish_drain().await;
         let waited = started.elapsed();
         let Err(GatewayError::NxBackendExit(ReapError::Expired(expired))) = &drained else {
             panic!("the drain fails with the backend's reap expiry: {drained:?}");
@@ -4380,9 +4379,9 @@ mod tests {
                 signal: libc::SIGTERM
             }
         );
-        assert!(
-            waited >= bound && waited < bound + Duration::from_secs(2),
-            "the drain gives up at its bound, not before or long after: {waited:?}"
+        assert_eq!(
+            waited, bound,
+            "the drain gives up at its bound, neither before nor after it"
         );
         let said = drained.expect_err("matched above").to_string();
         assert!(said.contains(&format!("pid {pid}")), "{said}");

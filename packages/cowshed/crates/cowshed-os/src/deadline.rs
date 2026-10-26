@@ -1557,17 +1557,20 @@ mod tests {
             "the child is left running: {}",
             crate::process::run_state(pid)
         );
-        // Its stdin closed, sh exits, and the task collects it: no zombie is left.
+        // Its stdin closed, sh exits, and the task collects it: no zombie is left. A collection that
+        // never comes is a hang the no-progress bound names, not a deadline of this test.
         drop(stdin);
-        let mut state = crate::process::run_state(pid);
-        for _ in 0..200 {
-            if state == RunState::Gone {
-                break;
+        loop {
+            match crate::process::run_state(pid) {
+                RunState::Gone => break,
+                RunState::Unread(why) => panic!("the child's state is unread: {why}"),
+                RunState::Running
+                | RunState::Sleeping
+                | RunState::Uninterruptible
+                | RunState::Stopped
+                | RunState::Zombie => tokio::time::sleep(Duration::from_millis(10)).await,
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            state = crate::process::run_state(pid);
         }
-        assert_eq!(state, RunState::Gone);
     }
 
     #[test]
