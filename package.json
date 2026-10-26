@@ -113,7 +113,8 @@
       "lint": {
         "dependsOn": [
           "...",
-          "spec-links"
+          "spec-links",
+          "no-unbounded-wait"
         ],
         "inputs": [
           "...",
@@ -153,6 +154,21 @@
         ],
         "options": {
           "command": "bun tooling/checks/spec-links.fixtures.ts && bun tooling/checks/spec-links.ts",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "no-unbounded-wait": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/tooling/checks/no-unbounded-wait.ts",
+          "{workspaceRoot}/tooling/checks/no-unbounded-wait.fixtures.ts",
+          "{workspaceRoot}/packages/lmao/src/lib/errors/Deadline.ts",
+          "{workspaceRoot}/packages/lmao/src/lib/result.ts",
+          "{workspaceRoot}/bun.lock"
+        ],
+        "options": {
+          "command": "bun tooling/checks/no-unbounded-wait.fixtures.ts",
           "cwd": "{workspaceRoot}"
         }
       },

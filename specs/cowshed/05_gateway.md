@@ -962,6 +962,23 @@ the handshake bound.
   `forMs` keeps rising. A version 1 connection, an older client's, hears none (07_api.md, "Controller handshake").
 - **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
   with the failure's message.
+- **Enforcement.** TypeScript: the `deadline/no-unbounded-wait` ESLint rule (`tooling/checks/no-unbounded-wait.ts`,
+  wired in `eslint.config.ts` over `packages/*/src`) refuses `fetch` without a `signal`, a socket connect (`net`/`tls`
+  `connect`, `createConnection`, `Socket#connect`, `Bun.connect`), a Bun child's `exited`, `events.once` on a child,
+  socket or stream without a `signal`, a promise settled only from a child's, socket's or stream's callback, and a
+  child_process or `Bun.spawnSync` call that waits for the child without `timeout`. Inside the body of lmao's `deadline`
+  or `idle` (specs/lmao/01r_transient_errors_and_retry.md, "TypeScript: deadlines") only a `fetch` without the wait's
+  signal and a synchronous child are refused. A kept site carries
+  `// eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: <what ends the wait>`, and
+  `deadline/unbounded-wait-why` refuses a disable of the rule without that reason. The root `no-unbounded-wait` target
+  runs the rule's planted fixtures. Rust: each cowshed crate's `clippy.toml` disallows every wait on another process (a
+  child's `wait`/`wait_with_output`, tokio `Child::kill`, `fork_lock`'s `output_locked`/`status_locked`, a unix-socket
+  `connect`, `libc::flock` and `File::lock`/`lock_shared`, `waitpid`/`waitid`/`wait4`), each reason naming its bounded
+  form in `cowshed_os::deadline` (`reap`, `reap_async`, `output_within`, `connect_unix`). A kept site allows
+  `clippy::disallowed_methods` for its one item or statement beside `// WHY unbounded: <what ends the wait>`, and
+  `cowshed:wait-why` (WAIT-WHY, `packages/nx-plugin/src/wait-why-policy.ts`, a dependency of `cowshed:lint`) refuses the
+  allow without it. Tests take no allow: they wait through `cowshed_os::test_backstop`'s helpers, bounded by the
+  no-progress backstop.
 
 ## Disk-lifecycle lease
 
