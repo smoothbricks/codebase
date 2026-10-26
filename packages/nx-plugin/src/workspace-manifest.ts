@@ -1,4 +1,4 @@
-import type { ProjectConfiguration } from 'nx/src/config/workspace-json-project-json.js';
+import type { ProjectConfiguration, TargetConfiguration } from 'nx/src/config/workspace-json-project-json.js';
 import type typia from 'typia';
 
 /** String-keyed dependency / script / engine maps. */
@@ -362,7 +362,10 @@ export interface NxTargetConfig {
   outputs?: string[];
   inputs?: NxInput[];
   options?: NxTargetOptions;
-  configurations?: Record<string, NxTargetConfig>;
+  /** Each named configuration's overrides of `options`: executor options, merged over them for a task run under it. */
+  configurations?: Record<string, NxTargetOptions>;
+  /** The configuration Nx runs a request naming none under; Nx's own target type owns it. */
+  defaultConfiguration?: TargetConfiguration['defaultConfiguration'];
   cache?: boolean;
   command?: string;
 }

@@ -14,6 +14,9 @@ import {
   checkWorkspaceConfig,
   checkWorkspaceConfigPolicy,
   checkWorkspaceConfigTree,
+  isBuildOutputTargetName,
+  isTestNamespaceTargetName,
+  isTestRunnerTargetName,
   LINUX_PLATFORM_TARGET_GLOBS,
   MACOS_PLATFORM_TARGET_GLOBS,
   PLATFORM_TARGET_GLOBS,
@@ -80,6 +83,67 @@ describe('target family conventions', () => {
       '*-bun',
       '*-wasm',
     ]);
+  });
+
+  it('classifies the runners and compilations of tests as test work, however their names end', () => {
+    // The `test` namespace: `test`, its variants, and the plugin's own `cargo-test-<…>` targets, the archive among them.
+    const namespace = [
+      'test',
+      'test-shard1',
+      'test:unit',
+      'cargo-test-ferris-core',
+      'cargo-test-archive',
+      'cargo-test-group-real-apfs',
+    ];
+    for (const name of namespace) {
+      expect(isTestNamespaceTargetName(name), name).toBe(true);
+      expect(isTestRunnerTargetName(name), name).toBe(true);
+    }
+    // A suite named for what it tests (the plugin's `cargo-test` aggregate among them) and a foreign triple's archive and
+    // runner are test work too, outside the namespace whose declared runners take `test`'s build prerequisites.
+    const suitesAndCross = [
+      'cargo-test',
+      'napi-test',
+      'launcher-test',
+      'cargo-cross-test-archive-aarch64-apple-darwin',
+      'cargo-cross-test-aarch64-apple-darwin',
+    ];
+    for (const name of suitesAndCross) {
+      expect(isTestNamespaceTargetName(name), name).toBe(false);
+      expect(isTestRunnerTargetName(name), name).toBe(true);
+    }
+    // Builds, their aggregates and the checks of test files are not test work: `typecheck-tests` runs no test.
+    const notTestWork = [
+      'build',
+      'tsc-js',
+      'cargo-wasm',
+      'cargo-napi',
+      'cli-native',
+      'napi-native',
+      'napi-arm64-macos',
+      'napi-debug',
+      'typecheck',
+      'typecheck-tests',
+      'typecheck-tests:watch',
+      'cargo-lint',
+      'cargo-lint-cross',
+      'cargo-fetch',
+      'testbed-js',
+    ];
+    for (const name of notTestWork) {
+      expect(isTestRunnerTargetName(name), name).toBe(false);
+    }
+    // A runner whose name ends in a build family is still test work: the class, not the family, decides.
+    const collisions = [
+      'test-bun',
+      'cargo-test-ferris-js',
+      'cargo-test-ferris-wasm',
+      'cargo-cross-test-aarch64-linux-android',
+    ];
+    for (const name of collisions) {
+      expect(isBuildOutputTargetName(name), name).toBe(true);
+      expect(isTestRunnerTargetName(name), name).toBe(true);
+    }
   });
 });
 

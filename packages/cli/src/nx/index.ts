@@ -1,4 +1,5 @@
 import { join, posix } from 'node:path';
+import { taskConfigurations } from '@smoothbricks/nx-plugin/build-state-output-policy';
 import {
   refreshTestTimingsCommand,
   timingsCoverage,
@@ -9,7 +10,8 @@ import {
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph.js';
 import type { TargetConfiguration } from 'nx/src/config/workspace-json-project-json.js';
 import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
-import { normalizeDependencyConfigDefinition } from 'nx/src/tasks-runner/utils.js';
+import { ProcessTasks } from 'nx/src/tasks-runner/create-task-graph.js';
+import { interpolate, normalizeDependencyConfigDefinition } from 'nx/src/tasks-runner/utils.js';
 import { workspaceRoot as primaryWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 import typia from 'typia';
 import type { NxDependsOn, NxProjectJson, NxTargetConfig, NxTargetOptions } from '../lib/json.js';
@@ -21,6 +23,10 @@ export interface ProjectTargets {
   targets: string[];
   /** Per-target `cache`, for policies that only govern what Nx can restore. */
   targetCache?: Map<string, boolean>;
+  /** Per-target `configurations`: each named configuration's overrides of the target's `options`. */
+  targetConfigurations?: Map<string, Record<string, NxTargetOptions>>;
+  /** Per-target `defaultConfiguration`: the configuration Nx runs a request naming none under. */
+  targetDefaultConfigurations?: Map<string, string>;
   targetDependencies?: Map<string, string[]>;
   /**
    * Per target, the targets of this project its `dependsOn` schedules, resolved by Nx's own normalization: `^` and
@@ -163,6 +169,30 @@ export function targetOptionsFromNxProjectJson(value: NxProjectJson | null | und
     }
   }
   return options;
+}
+
+export function targetConfigurationsFromNxProjectJson(
+  value: NxProjectJson | null | undefined,
+): Map<string, Record<string, NxTargetOptions>> {
+  const configurations = new Map<string, Record<string, NxTargetOptions>>();
+  for (const [targetName, target] of Object.entries(value?.targets ?? {})) {
+    if (target.configurations) {
+      configurations.set(targetName, target.configurations);
+    }
+  }
+  return configurations;
+}
+
+export function targetDefaultConfigurationsFromNxProjectJson(
+  value: NxProjectJson | null | undefined,
+): Map<string, string> {
+  const defaults = new Map<string, string>();
+  for (const [targetName, target] of Object.entries(value?.targets ?? {})) {
+    if (target.defaultConfiguration) {
+      defaults.set(targetName, target.defaultConfiguration);
+    }
+  }
+  return defaults;
 }
 
 export function targetOutputsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string[]> {
@@ -408,6 +438,8 @@ export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTarge
         root: projectRootFromNxProjectJson(metadata),
         targets: targetNamesFromNxProjectJson(metadata),
         targetCache: targetCacheFromNxProjectJson(metadata),
+        targetConfigurations: targetConfigurationsFromNxProjectJson(metadata),
+        targetDefaultConfigurations: targetDefaultConfigurationsFromNxProjectJson(metadata),
         targetDependencies,
         localTargetDependencies: localDependenciesOf(project, metadata, graph, allTargetNames),
         targetInputs: targetInputsFromNxProjectJson(metadata),
@@ -422,6 +454,78 @@ export function projectTargetsFromNxProjects(projects: NxProjects): ProjectTarge
 
 export async function readProjectTargets(root: string): Promise<ProjectTargets[]> {
   return projectTargetsFromNxProjects(await loadNxProjects(root));
+}
+
+/**
+ * The configuration Nx runs `target` of `project` under for a run that requests `configuration`, by Nx's own task graph
+ * resolution: a request the target has no configuration for, and a request naming none, run it under its
+ * `defaultConfiguration`. `undefined` runs the target under its own options alone.
+ */
+export function resolveTaskConfiguration(
+  project: ProjectTargets,
+  target: string,
+  configuration: string | undefined,
+): string | undefined {
+  const node: ProjectGraphProjectNode = {
+    name: project.project,
+    type: 'lib',
+    data: {
+      root: project.root ?? '',
+      targets: {
+        [target]: {
+          configurations: project.targetConfigurations?.get(target),
+          defaultConfiguration: project.targetDefaultConfigurations?.get(target),
+        },
+      },
+    },
+  };
+  const graph: ProjectGraph = { nodes: { [project.project]: node }, dependencies: {} };
+  return new ProcessTasks({}, graph).resolveConfiguration(node, target, configuration);
+}
+
+/**
+ * Every configuration a task of `target` runs under: each named one, and the run naming none, which is the target's
+ * own options or its `defaultConfiguration`. The nx-plugin's output policy reads the same tasks.
+ */
+export function targetTaskConfigurations(project: ProjectTargets, target: string): (string | undefined)[] {
+  return taskConfigurations({
+    defaultConfiguration: project.targetDefaultConfigurations?.get(target),
+    configurations: project.targetConfigurations?.get(target),
+  });
+}
+
+/**
+ * `declaredOutput` of `target` as Nx interpolates it for the task a run requesting `configuration` makes of it:
+ * `{projectRoot}`, `{projectName}`, a leading `{workspaceRoot}/` and `{options.*}` resolve, the options being the
+ * target's under the configuration the run resolves to. Nx normalizes the result as it does every output, so the `/`
+ * that names a directory and any `..` segment are gone, and a placeholder it cannot resolve stays in the text.
+ */
+export function interpolateTaskOutput(
+  declaredOutput: string,
+  project: ProjectTargets,
+  target: string,
+  configuration: string | undefined,
+): string {
+  if (project.root === undefined) {
+    throw new Error(`Nx project ${project.project} is missing its resolved root.`);
+  }
+  const task = resolveTaskConfiguration(project, target, configuration);
+  const overrides = task === undefined ? undefined : project.targetConfigurations?.get(target)?.[task];
+  try {
+    return interpolate(declaredOutput, {
+      projectRoot: project.root,
+      projectName: project.project,
+      options: { ...project.targetOptions?.get(target), ...overrides },
+    });
+  } catch (error) {
+    // Nx tests a template against a module-level global regex before it throws, leaving that regex's lastIndex past
+    // the first placeholder; the next interpolation in this process would then skip its placeholders. One
+    // interpolation rewinds it: a test that fails resets lastIndex.
+    interpolate('', {});
+    throw new Error(`${project.project}:${target}: ${error instanceof Error ? error.message : String(error)}`, {
+      cause: error,
+    });
+  }
 }
 
 export type { NxProjectJson, NxTargetConfig };

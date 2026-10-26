@@ -428,41 +428,107 @@ function createImports(memory: WebAssembly.Memory) {
 // This eliminates recompilation cost in benchmarks and production
 let cachedWasmModule: WebAssembly.Module | null = null;
 
-// The shipped Rust allocator is the only supported artifact. Node and browser loading
-// deliberately share this fixed path so runtime selection cannot drift by environment.
+// The shipped Rust allocator is the only supported artifact, always under this name: a checkout and a published
+// package differ in the directory it sits in, never in the file, and Node and browser loading share
+// selectWasmArtifact, so the choice between those directories cannot drift by environment.
 const WASM_ARTIFACT_NAME = 'allocator.wasm';
+
+// The allocator crate's tracked source entry. `files` publishes dist/ and never crates/, so a package that holds it
+// is a checkout and one that lacks it is installed, or a snapshot of an installed one. src/index.ts cannot say so
+// here: lmao publishes src/ for its bun and development exports.
+const SOURCE_ENTRY = 'crates/lmao-wasm/src/lib.rs';
+
+export function wasmPackageRoot(moduleUrl: string): URL {
+  // Source modules sit at src/lib/wasm/ and built ones at dist/ts/lib/wasm/.
+  return new URL(moduleUrl.includes('/dist/ts/') ? '../../../../' : '../../../', moduleUrl);
+}
+
+/** Only an absent source entry selects the shipping profile; other HTTP failures remain failures. */
+export function sourceEntryStatus(status: number): 'present' | 'absent' | 'error' {
+  if (status >= 200 && status < 300) return 'present';
+  return status === 404 ? 'absent' : 'error';
+}
+
+async function holdsTrackedSource(entry: URL): Promise<boolean> {
+  try {
+    if (entry.protocol === 'file:') {
+      const { access } = await import('node:fs/promises');
+      await access(entry);
+      return true;
+    }
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a HEAD request for this module's own source entry on the page's origin; a hung page load ends with the page
+    const response = await fetch(entry, { method: 'HEAD' });
+    const status = sourceEntryStatus(response.status);
+    if (status === 'error') throw new Error(`HTTP ${response.status}`);
+    return status === 'present';
+  } catch (cause) {
+    if (entry.protocol === 'file:' && cause instanceof Error && Reflect.get(cause, 'code') === 'ENOENT') return false;
+    throw new Error(`Could not check source authority at ${entry.href}.`, { cause });
+  }
+}
+
+/** The build of allocator.wasm a package runs, and the Nx target that writes it where a checkout builds it. */
+export interface WasmArtifact {
+  readonly url: URL;
+  /** `lmao:cargo-wasm` in a checkout; `null` for an installed package, which ships its build. */
+  readonly producer: string | null;
+}
+
+/**
+ * Which build a package loads, by source authority (packages/nx-plugin/README.md, "Cargo profiles").
+ * A package holding its crate's tracked source entry is a checkout: it loads its own dev build,
+ * .cache/wasm-dev/allocator.wasm, even through its compiled dist/ts, because those are the bytes its sources and
+ * tests describe. Any other package loads the shipped build, dist/allocator.wasm. Neither stands in for the other:
+ * whichever is selected and absent is an error. The I/O shell supplies source presence, not an artifact probe.
+ */
+export function selectWasmArtifact(root: URL, holdsSource: boolean): WasmArtifact {
+  return holdsSource
+    ? { url: new URL(`.cache/wasm-dev/${WASM_ARTIFACT_NAME}`, root), producer: 'lmao:cargo-wasm' }
+    : { url: new URL(`dist/${WASM_ARTIFACT_NAME}`, root), producer: null };
+}
+
+/** The selected build is absent: name it and what writes it. */
+function missingArtifact(artifact: WasmArtifact, cause: unknown): Error {
+  const remedy =
+    artifact.producer === null
+      ? ' Reinstall @smoothbricks/lmao, whose dist/ ships it.'
+      : ` Run "nx run ${artifact.producer}".`;
+  return new Error(`Could not load ${WASM_ARTIFACT_NAME} from ${artifact.url.href}.${remedy}`, { cause });
+}
 
 /**
  * Load WASM bytes - handles both Node.js and browser environments.
+ *
+ * Node asks the filesystem whether this package holds its unpublished source entry; a browser probes the same
+ * entry with HEAD. Only absence selects the shipping build. An app that bundles the library stages the artifact as
+ * a static asset and hands the compiled module to createWasmAllocatorSync or createThreadBufferStrategy
+ * (lmao-expo-benchmark's prepare-web-wasm target stages the dev build as public/allocator.wasm).
  */
 async function loadWasmBytes(): Promise<ArrayBuffer> {
+  const root = wasmPackageRoot(import.meta.url);
+  const holdsSource = await holdsTrackedSource(new URL(SOURCE_ENTRY, root));
+  const artifact = selectWasmArtifact(root, holdsSource);
   // Try Node.js first
   if (typeof process !== 'undefined' && process.versions?.node) {
     const { readFile } = await import('node:fs/promises');
-    const { fileURLToPath } = await import('node:url');
-    const { dirname, join } = await import('node:path');
 
-    // Source imports live under src/; published modules live under dist/ts/.
-    const currentFile = fileURLToPath(import.meta.url);
-    const currentDir = dirname(currentFile);
-    const wasmPath = import.meta.url.includes('/dist/ts/')
-      ? join(currentDir, '../../../', WASM_ARTIFACT_NAME)
-      : join(currentDir, '../../../dist', WASM_ARTIFACT_NAME);
-
-    const buffer = await readFile(wasmPath);
+    const buffer = await readFile(artifact.url).catch((cause: unknown) => {
+      throw missingArtifact(artifact, cause);
+    });
     // Create a proper ArrayBuffer from the Node.js Buffer
     const arrayBuffer = new ArrayBuffer(buffer.byteLength);
     new Uint8Array(arrayBuffer).set(buffer);
     return arrayBuffer;
   }
 
-  // Browser: fetch from relative path
-  const wasmPath = import.meta.url.includes('/dist/ts/')
-    ? `../../../${WASM_ARTIFACT_NAME}`
-    : `../../../dist/${WASM_ARTIFACT_NAME}`;
-  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the package's own wasm artifact beside this module, a static asset of the page's own origin in a browser, loaded the way its scripts are; a hung page load ends with the page
-  const response = await fetch(new URL(wasmPath, import.meta.url));
-  return response.arrayBuffer();
+  try {
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: this module's selected wasm artifact on the page's origin, loaded the way its scripts are; a hung page load ends with the page
+    const response = await fetch(artifact.url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.arrayBuffer();
+  } catch (cause) {
+    throw missingArtifact(artifact, cause);
+  }
 }
 
 /**

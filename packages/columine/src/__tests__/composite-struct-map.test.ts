@@ -15,11 +15,12 @@ import {
 } from '../types.js';
 import { createColumineWasmBackend } from '../wasm-backend.js';
 
-// The wasm-opt output, which is what ships and what `cargo-wasm` declares as its Nx
-// output. The pre-optimization intermediate under target/ is neither: a cached build
-// never restores it, so gating on its presence skipped these tests silently, and when
-// they did run they exercised bytes nobody ships.
-const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
+// The wasm-opt output `cargo-wasm` declares as its Nx output, in this checkout's dev tree: the build a checkout's
+// source authority names (packages/nx-plugin/README.md, "Cargo profiles"), which the loaders follow too; the shipped
+// build is the production configuration's dist/columine.wasm. The pre-optimization intermediate under target/ is not
+// an output: a cached build never restores it, so gating on its presence skipped these tests silently, and when they
+// did run they exercised bytes no build declares.
+const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 
 function reducer(
   reduce: readonly number[],

@@ -8,7 +8,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "bun run prepare:web-wasm && expo start --web",
-    "prepare:web-wasm": "mkdir -p public && cp ../lmao/dist/allocator.wasm public/allocator.wasm",
+    "prepare:web-wasm": "nx run lmao-expo-benchmark:prepare-web-wasm",
     "test": "nx run lmao-expo-benchmark:test --outputStyle=stream"
   },
   "dependencies": {
@@ -113,21 +113,50 @@
           "killAfterMs": 10000
         }
       },
+      "prepare-web-wasm": {
+        "//": "The one producer of public/allocator.wasm, the allocator the web page fetches beside index.html (src/platform-runtime.web.ts) and hands to the thread runtime as a compiled module, since a bundled page cannot resolve it from import.meta.url. It stages this checkout's dev build, the one lmao's source authority loads (packages/nx-plugin/README.md, Cargo profiles), so the web script and every export-browser flavour share this one declared write instead of copying inline.",
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          {
+            "dependentTasksOutputFiles": "**/allocator.wasm"
+          }
+        ],
+        "dependsOn": [
+          {
+            "projects": [
+              "lmao"
+            ],
+            "target": "cargo-wasm"
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/allocator.wasm"
+        ],
+        "options": {
+          "command": "mkdir -p {args.outputDir} && cp ../lmao/.cache/wasm-dev/allocator.wasm {args.outputDir}/allocator.wasm",
+          "cwd": "{projectRoot}",
+          "outputDir": "public"
+        }
+      },
       "export-browser": {
+        "//": "Each configuration exports its flavour to its own dist/web/<transform>-<mode>/: outputs interpolate the LMAO_BENCH_TRANSFORM and LMAO_BENCH_MODE its env sets and the command expands the same pair, so what Nx declares is what expo export writes and no two configurations share a directory. A flavour is never implicit (metro.config.cjs refuses a missing pair), so defaultConfiguration names off-steady, and the command's :? refuses an env without the pair before expo export deletes any directory.",
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "dependsOn": [
-          "^build"
+          "^build",
+          "prepare-web-wasm"
         ],
         "outputs": [
-          "{projectRoot}/dist/web/"
+          "{projectRoot}/dist/web/{options.env.LMAO_BENCH_TRANSFORM}-{options.env.LMAO_BENCH_MODE}/"
         ],
         "options": {
-          "command": "bun run prepare:web-wasm && bun expo export --platform web --output-dir dist/web --clear --max-workers 1",
+          "command": "out=\"dist/web/${LMAO_BENCH_TRANSFORM:?}-${LMAO_BENCH_MODE:?}\" && bun expo export --platform web --output-dir \"$out\" --clear --max-workers 1",
           "cwd": "{projectRoot}",
           "timeoutMs": 600000,
           "killAfterMs": 10000
         },
+        "defaultConfiguration": "off-steady",
         "configurations": {
           "off-cold": {
             "env": {
@@ -168,20 +197,22 @@
         }
       },
       "export-hermes": {
+        "//": "The same layout under dist/headless/<transform>-<mode>/: the bytecode bundle, its source map and the assets all go to the one directory the env pair names, and defaultConfiguration is off-steady for the same reason.",
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "dependsOn": [
           "^build"
         ],
         "outputs": [
-          "{projectRoot}/dist/headless/"
+          "{projectRoot}/dist/headless/{options.env.LMAO_BENCH_TRANSFORM}-{options.env.LMAO_BENCH_MODE}/"
         ],
         "options": {
-          "command": "bun expo export:embed --entry-file headless-bootstrap.js --platform android --dev false --minify true --bytecode --reset-cache --max-workers 1 --bundle-output dist/headless/lmao-benchmark.hbc --sourcemap-output dist/headless/lmao-benchmark.hbc.map --assets-dest dist/headless",
+          "command": "out=\"dist/headless/${LMAO_BENCH_TRANSFORM:?}-${LMAO_BENCH_MODE:?}\" && bun expo export:embed --entry-file headless-bootstrap.js --platform android --dev false --minify true --bytecode --reset-cache --max-workers 1 --bundle-output \"$out/lmao-benchmark.hbc\" --sourcemap-output \"$out/lmao-benchmark.hbc.map\" --assets-dest \"$out\"",
           "cwd": "{projectRoot}",
           "timeoutMs": 600000,
           "killAfterMs": 10000
         },
+        "defaultConfiguration": "off-steady",
         "configurations": {
           "off-cold": {
             "env": {

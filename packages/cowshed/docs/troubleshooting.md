@@ -354,7 +354,8 @@ A supervisor that could not start leaves its reason in `~/Library/Logs/cowshed/d
 The daemon and the `cowshed` you ran are different builds. Every command that would change a workspace or run work in
 one asks the daemon first and stops before it changes anything, so nothing was half done. Run `cowshed setup` from the
 cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on your `PATH`. To install a
-checkout's build, run its own `packages/cowshed/bin/cowshed setup`; a plain `cowshed setup` runs the installed copy and
+checkout's release build, run it by its own path, `packages/cowshed/dist/bin/<platform>/cowshed setup` (the checkout's
+`bin/cowshed` runs its development build, which setup refuses); a plain `cowshed setup` runs the installed copy and
 installs nothing new. A `cowshed` on `PATH` that is a link into a checkout runs whatever that checkout last built, which
 is how the two drift apart; setup repoints such a link at the installed copy.
 

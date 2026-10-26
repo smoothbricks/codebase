@@ -25,19 +25,37 @@ make that possible and they are absolute:
 
 The npm package's `cowshed` bin is `bin/cowshed`, a POSIX shell script that execs the native binary for the host:
 `sccache` (the one daemon-control verb) runs the installed cowshed launchd runs when it exists; everything else runs the
-package's own build — `dist/bin/<platform>/cowshed`, restoring an execute bit a publish dropped, or else
-`target/release/cowshed` of the workspace a linked checkout sits in — `setup` and `gateway` included, since they install
-the invoking build. A host with none of them gets exit 5 naming every path looked in. It is a shell script rather than
-Node because it runs before every command, and Node's own start (~30 ms) costs more than the fastest verbs take in
-total; `exec` hands the binary the command's signals, exit status and standard streams unchanged. The library's
-`runCli`, `openHost`, `openSccacheHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`,
-`spawnLandTurn`; 07_api.md, "Launchers") run the CLI through the same script, so one rule picks the binary.
+package's own build, which its source authority picks (packages/nx-plugin/README.md, "Cargo profiles"). A checkout holds
+the tracked entry of the CLI's own crate, `crates/cowshed-cli/src/main.rs`, which a published package never ships, and
+runs its development build, `.cache/bin/<platform>/cowshed`; a published package runs `dist/bin/<platform>/cowshed`,
+restoring an execute bit a publish dropped. Neither falls back to the other or to a cargo `target/release/cowshed`: a
+checkout without its development build exits 5 naming the path and `nx run cowshed:cli-native`, a package without its
+binary exits 5 naming its path, and a host the package ships no binary for exits 5 naming the host. `setup` and
+`gateway` run that binary too, since they install the invoking build. It is a shell script rather than Node because it
+runs before every command, and Node's own start (~30 ms) costs more than the fastest verbs take in total; `exec` hands
+the binary the command's signals, exit status and standard streams unchanged. The library's `runCli`, `openHost`,
+`openSccacheHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`, `spawnLandTurn`; 07_api.md,
+"Launchers") run the CLI through the same script, so one rule picks the binary.
 
-The launcher is how a build that is not installed yet is run — a checkout's `packages/cowshed/bin/cowshed setup`
-installs that checkout's build — and not the `cowshed` on `PATH`. After `setup`, the `cowshed` on `PATH` is the
-installed copy (05_gateway.md "The installed cowshed"): setup repoints the first `cowshed` on `PATH` at it when that
-entry is a symbolic link, which is what `bun link` of the package or `bun add --global` leaves. A `PATH` entry left on
-the launcher would run whatever a checkout last built, under a daemon still running the build setup installed.
+The launcher is how a build that is not installed yet is run, and not the `cowshed` on `PATH`. After `setup`, the
+`cowshed` on `PATH` is the installed copy (05_gateway.md "The installed cowshed"): setup repoints the first `cowshed` on
+`PATH` at it when that entry is a symbolic link, which is what `bun link` of the package or `bun add --global` leaves. A
+`PATH` entry left on the launcher would run whatever a checkout last built, under a daemon still running the build setup
+installed. `setup` installs only a release build and refuses a debug one as the supervised binary, and a checkout's
+launcher runs its development build, so a checkout's release build installs itself by its own path,
+`dist/bin/<platform>/cowshed setup`.
+
+The development build is the default configuration of the platform's `cli-<arch>-<os>` target (`cli-native` is the
+host's) and the shipped one its `production` configuration, each writing its own tree with the `.build-inputs.json`
+receipt of what it read beside the binary. The launcher only tests that the file exists and carries no per-exec
+currentness check: building is the target's job, and the builds of a developer-linked checkout are judged once, at shell
+entry, by the receipt beside each binary (specs/cli/01_workspace_reconciliation.md, "Declared developer link pins").
+
+The shipped trees are judged where they are assembled. The package's `release-check` target
+(`scripts/verify-packaged-bin-bits.ts`) fails on a missing or empty `dist/bin` and on any binary in it without its
+execute bit, and never reads `.cache/bin`. `smoo release pack` runs it in the publishing job, after every platform's
+prebuilt outputs are applied and before the tarball is packed, and refuses a gate that declares dependencies or a cache,
+so the gate judges the bytes that get packed, never a rebuild or a replay.
 
 ### Linux artifacts
 

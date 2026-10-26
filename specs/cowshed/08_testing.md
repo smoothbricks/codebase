@@ -762,12 +762,13 @@ while the explicit land gate includes host coverage and each proof replays from 
 `nx run-many -t host-e2e` is the focused host proof. Every test has one runner, and non-macOS inference supplies neither
 APFS runner; package-declared placeholders and explicit dependency edges may remain.
 
-`cowshed:host-napi-test` is the built addon's host proof, run against this checkout's launcher and CLI binary, which is
-why it depends on `build`. `host.napi.test.ts` runs `openHost`: each host row answers what its verb prints, refusals are
-typed, and `close()` resolves once `cowshed host` has exited. `launchers.napi.test.ts` runs `spawnLock`, `spawnHold`,
-`spawnSubtreeRoot` and `spawnLandTurn` through the same launcher. The disk-command case of `host.napi.test.ts` runs the
-real `hdiutil`, the TypeScript twin of the CLI `host.rs` proof in `real_apfs_host`, so the target needs a Mac and is
-reached only through `host-e2e`: the Linux CI job (the CI section, below) runs `test` and cannot host it.
+`cowshed:host-napi-test` is the built addon's host proof, run against this checkout's launcher and development CLI
+build, which is why it depends on `cli-native`. `host.napi.test.ts` runs `openHost`: each host row answers what its verb
+prints, refusals are typed, and `close()` resolves once `cowshed host` has exited. `launchers.napi.test.ts` runs
+`spawnLock`, `spawnHold`, `spawnSubtreeRoot` and `spawnLandTurn` through the same launcher. The disk-command case of
+`host.napi.test.ts` runs the real `hdiutil`, the TypeScript twin of the CLI `host.rs` proof in `real_apfs_host`, so the
+target needs a Mac and is reached only through `host-e2e`: the Linux CI job (the CI section, below) runs `test` and
+cannot host it.
 
 The land gate uses `--outputStyle=static-failures-only` and must exit zero before the expected-tip fast-forward and
 workspace retirement. Any failed task, timeout or infrastructure failure stops the land: there is no bound-only retry,

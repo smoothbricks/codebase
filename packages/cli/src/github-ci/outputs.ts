@@ -4,11 +4,22 @@ import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/pr
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import typia from 'typia';
 import { listPublishablePackages, type PackageInfo } from '../lib/workspace.js';
-import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
+import {
+  interpolateTaskOutput,
+  type ProjectTargets,
+  readProjectTargets,
+  resolveTaskConfiguration,
+  targetTaskConfigurations,
+} from '../nx/index.js';
 
 export interface CollectedOutputFile {
   project: string;
   target: string;
+  /**
+   * The output declaration Nx interpolated for the task that wrote the file: workspace-relative, ending in `/` exactly
+   * when the declared output names a directory. Each configuration of a target writes its own paths, so the paths it
+   * names say which configuration built the file.
+   */
   output: string;
   path: string;
   size: number;
@@ -17,7 +28,7 @@ export interface CollectedOutputFile {
 }
 
 export interface CollectedOutputsManifest {
-  version: 3;
+  version: 4;
   sourceSha: string;
   /** Independently versioned platform jobs must agree on the full npm closure. */
   packageVersions: Record<string, string>;
@@ -37,7 +48,10 @@ export interface OutputFileFact {
   mode: number;
 }
 
-/** One declared output of one target, with the files it matched on disk. */
+/**
+ * One declared output of one target as its task resolved it (`resolveDeclaredOutput`), with the files it matched on
+ * disk.
+ */
 export interface DeclaredOutputMatch {
   declaredOutput: string;
   files: readonly OutputFileFact[];
@@ -112,14 +126,20 @@ const assertExactManifest = typia.createAssertEquals<CollectedOutputsManifest>()
 const GLOB_MAGIC = /[*?{[]/;
 const GIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
+/**
+ * Stages the declared outputs of `runs` and writes their manifest. `configuration` is the one the runs were built
+ * under (`nx run-many --configuration`): each task resolves it as Nx does, so the collector observes the tree that
+ * build wrote and refuses another configuration's.
+ */
 export async function collectNxOutputs(
   root: string,
   destination: string,
   runs: NxTargetRun[],
   sourceSha: string,
+  configuration?: string,
 ): Promise<CollectedOutputsManifest> {
   assertGitSha(sourceSha, 'Collected output source SHA');
-  const pending = await inspectNxOutputs(root, runs);
+  const pending = await inspectNxOutputs(root, runs, configuration);
 
   await requireEmptyDestination(destination);
   const workspace = resolve(destination, 'workspace');
@@ -144,7 +164,7 @@ export async function collectNxOutputs(
   }
 
   const manifest: CollectedOutputsManifest = {
-    version: 3,
+    version: 4,
     sourceSha,
     packageVersions: Object.fromEntries(listPublishablePackages(root).map((pkg) => [pkg.name, pkg.version])),
     files: pending.map(({ source: _source, ...file }) => file),
@@ -166,14 +186,24 @@ function refuse(reason: string, cause?: unknown): { readonly ok: false } & Refus
   return { ok: false, reason, cause };
 }
 
-async function inspectNxOutputs(root: string, runs: NxTargetRun[]): Promise<PendingOutputFile[]> {
+async function inspectNxOutputs(
+  root: string,
+  runs: NxTargetRun[],
+  configuration: string | undefined,
+): Promise<PendingOutputFile[]> {
   const claimants: OutputClaimant[] = [];
   for (const run of runs) {
     for (const project of run.projects) {
       const outputs: DeclaredOutputMatch[] = [];
       for (const declaredOutput of project.targetOutputs?.get(run.target) ?? []) {
-        const output = resolveDeclaredOutput(declaredOutput, project);
-        outputs.push({ declaredOutput, files: await observeOutputFiles(root, output) });
+        const resolved = resolveDeclaredOutput(declaredOutput, project, run.target, configuration);
+        if (!resolved.ok) {
+          throw new Error(resolved.reason, { cause: resolved.cause });
+        }
+        outputs.push({
+          declaredOutput: resolved.value,
+          files: await observeOutputFiles(root, outputPattern(resolved.value)),
+        });
       }
       claimants.push({ project, target: run.target, outputs });
     }
@@ -397,6 +427,7 @@ export function planOverlays(
   packages: readonly Pick<PackageInfo, 'name' | 'version'>[],
 ): Planned<readonly StagedOverlay[]> {
   const projectsByName = new Map(projects.map((project) => [project.project, project]));
+  const declarations = new Map<ProjectTargets, Map<string, ReadonlySet<string>>>();
   const overlays: StagedOverlay[] = [];
   const claimedPaths = new Set<string>();
   for (const tree of trees) {
@@ -429,14 +460,22 @@ export function planOverlays(
           `Manifest ${manifestPath} references unknown Nx target ${file.project}:${file.target} for ${path}.`,
         );
       }
-      const declaredOutputs = project.targetOutputs?.get(file.target) ?? [];
-      if (!declaredOutputs.includes(file.output)) {
+      let targetDeclarations = declarations.get(project);
+      if (targetDeclarations === undefined) {
+        targetDeclarations = new Map();
+        declarations.set(project, targetDeclarations);
+      }
+      let outputs = targetDeclarations.get(file.target);
+      if (outputs === undefined) {
+        outputs = taskDeclarations(project, file.target);
+        targetDeclarations.set(file.target, outputs);
+      }
+      if (!outputs.has(file.output)) {
         return refuse(
           `Manifest output ${file.output} for ${path} is not declared by Nx target ${file.project}:${file.target}.`,
         );
       }
-      const output = resolveDeclaredOutput(file.output, project);
-      if (!outputContainsPath(output, path)) {
+      if (!outputContainsPath(outputPattern(file.output), path)) {
         return refuse(`Manifest file ${path} is not contained by declared output ${file.output}.`);
       }
       if (declaredPaths.has(path)) {
@@ -564,20 +603,48 @@ async function readCollectedOutputsManifest(
   return { manifest, manifestPath };
 }
 
-export function resolveDeclaredOutput(declaredOutput: string, project: ProjectTargets): string {
-  if (!project.root) {
-    throw new Error(`Nx project ${project.project} is missing its resolved root.`);
+/**
+ * `declaredOutput` of `project`'s `target` as Nx interpolates it for the task a run under `configuration` makes of it,
+ * judged for the collector: workspace-relative, no placeholder left, and ending in `/` exactly when the declaration
+ * names a directory, which Nx drops. A manifest records this declaration. A declaration the collector cannot use is a
+ * refusal, never a guess.
+ */
+export function resolveDeclaredOutput(
+  declaredOutput: string,
+  project: ProjectTargets,
+  target: string,
+  configuration: string | undefined,
+): Planned<string> {
+  try {
+    const interpolated = interpolateTaskOutput(declaredOutput, project, target, configuration);
+    if (hasUnsupportedOutputBraces(interpolated)) {
+      const task = resolveTaskConfiguration(project, target, configuration);
+      const name = task === undefined ? `${project.project}:${target}` : `${project.project}:${target}:${task}`;
+      return refuse(`Unsupported Nx output placeholder in ${name}: ${interpolated} (declared ${declaredOutput})`);
+    }
+    const pattern = validateWorkspaceRelativePattern(outputPattern(interpolated), `output for ${project.project}`);
+    return { ok: true, value: declaredOutput.endsWith('/') ? `${pattern}/` : pattern };
+  } catch (error) {
+    return refuse(describeError(error), error);
   }
-  const substituted = declaredOutput
-    .replaceAll('{workspaceRoot}/', '')
-    .replaceAll('{workspaceRoot}', '.')
-    .replaceAll('{projectRoot}/', `${project.root}/`)
-    .replaceAll('{projectRoot}', project.root);
-  if (hasUnsupportedOutputBraces(substituted)) {
-    throw new Error(`Unsupported Nx output placeholder in ${project.project}:${declaredOutput}`);
+}
+
+/**
+ * Every declaration a task of `target` writes: each declared output as Nx interpolates it for each configuration a
+ * task of the target runs under. A declaration a configuration leaves unresolved is no output of that task. Every
+ * output path has one producing task, so a declaration names the configuration that wrote the files under it.
+ */
+function taskDeclarations(project: ProjectTargets, target: string): ReadonlySet<string> {
+  const declarations = new Set<string>();
+  for (const configuration of targetTaskConfigurations(project, target)) {
+    for (const declaredOutput of project.targetOutputs?.get(target) ?? []) {
+      const resolved = resolveDeclaredOutput(declaredOutput, project, target, configuration);
+      if (resolved.ok) {
+        declarations.add(resolved.value);
+      }
+    }
   }
-  // A trailing `/` declares a directory output (nx-plugin build-state-output-policy); the path it names has none.
-  return validateWorkspaceRelativePattern(substituted.replace(/\/+$/, ''), `output for ${project.project}`);
+  return declarations;
 }
 
 function hasUnsupportedOutputBraces(value: string): boolean {
@@ -761,6 +828,11 @@ function workspaceRelativePath(root: string, path: string, description: string):
 
 function outputContainsPath(output: string, path: string): boolean {
   return GLOB_MAGIC.test(output) ? new Bun.Glob(output).match(path) : path === output || path.startsWith(`${output}/`);
+}
+
+/** What a declaration matches: the path or glob it states, without the `/` that names a directory. */
+function outputPattern(declaration: string): string {
+  return declaration.replace(/\/+$/, '');
 }
 
 async function requireEmptyDestination(destination: string): Promise<void> {

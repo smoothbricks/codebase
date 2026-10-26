@@ -143,11 +143,13 @@ The two build/collection commands remain separate so their job steps and artifac
 ```sh
 smoo github-ci nx-run-many \
   --targets "build" \
+  --configuration production \
   --projects "$RELEASE_PROJECTS" \
   --collect-outputs "$RUNNER_TEMP/release-build-outputs"
 
 smoo github-ci nx-run-many \
   --targets "*-linux" \
+  --configuration production \
   --projects "$RELEASE_PROJECTS" \
   --collect-outputs "$RUNNER_TEMP/linux-platform-outputs"
 ```
@@ -156,6 +158,11 @@ smoo github-ci nx-run-many \
 projects. Collection follows each selected target's resolved same-project dependency closure, so an aggregate `build`
 transports the concrete `*-js`, `*-napi`, `*-wasm`, or other tool-output files it actually consumed. A clean glob
 no-match is a successful no-op; an explicit empty project selection or target failure remains fatal.
+
+`--configuration` names the configuration both the run and its collection use. Each collected task resolves it as Nx
+does (a target without that configuration runs under its `defaultConfiguration`) and declares the outputs that
+configuration writes, so a production run collects the production trees and refuses a development tree that happens to
+exist.
 
 The Linux manifest records the release candidate's `git rev-parse HEAD`. The Git bundle—not a remote checkout and not an
 inferred version—is the source of truth for the final job.
@@ -177,6 +184,7 @@ The platform invocation is generic:
 ```sh
 smoo github-ci nx-run-many \
   --targets "*-macos,*-ios" \
+  --configuration production \
   --collect-outputs "$RUNNER_TEMP/macos-platform-outputs"
 ```
 
@@ -237,14 +245,19 @@ smoo github-ci apply-outputs \
 
 - owning Nx project;
 - exact resolved target;
-- declared output expression;
+- resolved output declaration: the declared output as Nx interpolates it for the collecting run's configuration,
+  workspace-relative, ending in `/` exactly when the declaration names a directory;
 - workspace-relative destination path;
 - producer source SHA;
 - byte size;
 - SHA-256 digest.
 
 The manifest is not authority for its own permissions. `apply-outputs` resolves the destination checkout's Nx metadata
-and requires the manifest's project, target, output expression, and path to match that current contract.
+and requires the manifest's project, target, output declaration, and path to match that current contract: the
+declaration must be one Nx interpolates for some task of the target (each configuration it runs under, its default
+included), and the path must lie within it. Every output path has one producing task, so the declaration names the
+configuration that built the files, and the manifest records no configuration of its own. The manifest is version 4;
+`apply-outputs` refuses every earlier version.
 
 Application rejects malformed or extra manifest properties, stale SHAs, checksum/size mismatches, missing or undeclared
 files, duplicate destinations, existing destination collisions, absolute paths, traversal, and symlinks in either the

@@ -5,7 +5,7 @@
   "sideEffects": false,
   "scripts": {
     "test": "nx run cowshed:test --outputStyle=stream",
-    "cowshed": "nx run cowshed:build && bin/cowshed"
+    "cowshed": "nx run cowshed:cli-native && bin/cowshed"
   },
   "bin": {
     "cowshed": "./bin/cowshed"
@@ -283,11 +283,19 @@
           "wait-why"
         ]
       },
+      "build": {
+        "//": "Replaces the inferred build's native edges: build is the TypeScript library and its dependencies. The CLI is its own target, cli-native, the host's development build under .cache/bin/<platform> that the package launcher runs, so an ordinary build compiles no Rust; the shipping trees come from each platform target's production configuration.",
+        "dependsOn": [
+          "^build",
+          "tsc-js"
+        ]
+      },
       "cli": {
         "executor": "nx:run-commands",
         "cache": false,
+        "//": "Runs the package launcher, not a platform binary directly: bin/cowshed resolves the host's native binary, so this works on every arch instead of only Apple Silicon. A note, not an option: nx:run-commands forwards every option it does not know to {args}, and the CLI would be handed it as a flag.",
         "dependsOn": [
-          "build"
+          "cli-native"
         ],
         "//": "Runs the package launcher, not dist/bin/darwin-arm64 directly: bin/cowshed resolves the host's native binary, so this works on every arch instead of only Apple Silicon. The note is not an option: nx:run-commands forwards every option it does not know to the command as an argument.",
         "options": {
@@ -329,16 +337,19 @@
           },
           "cargoToolchain"
         ],
+        "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees.",
         "outputs": [
-          "{projectRoot}/dist/bin/darwin-arm64/"
+          "{projectRoot}/{options.outputDir}/"
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-arm64"
+          "outputDir": ".cache/bin/darwin-arm64",
+          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir {args.outputDir} && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/debug/cowshed.d --output {args.outputDir}"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/release/cowshed.d --output dist/bin/darwin-arm64"
+            "outputDir": "dist/bin/darwin-arm64",
+            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir {args.outputDir} && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/release/cowshed.d --output {args.outputDir}"
           }
         }
       },
@@ -368,16 +379,19 @@
           },
           "cargoToolchain"
         ],
+        "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees.",
         "outputs": [
-          "{projectRoot}/dist/bin/darwin-x64/"
+          "{projectRoot}/{options.outputDir}/"
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-x64"
+          "outputDir": ".cache/bin/darwin-x64",
+          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir {args.outputDir} && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/debug/cowshed.d --output {args.outputDir}"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/release/cowshed.d --output dist/bin/darwin-x64"
+            "outputDir": "dist/bin/darwin-x64",
+            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir {args.outputDir} && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/release/cowshed.d --output {args.outputDir}"
           }
         }
       },
@@ -406,19 +420,21 @@
           },
           "cargoToolchain"
         ],
+        "//": "output is the file this configuration writes: .cache/bin/<platform>/cowshed by default, dist/bin/<platform>/cowshed in production (specs/cowshed/06_cli.md, Launcher). The declared output is its directory, which {options.output}/.. resolves to, so the tree is restored whole and reads the same option the executor writes through.",
         "outputs": [
-          "{projectRoot}/dist/bin/linux-arm64/"
+          "{options.output}/../"
         ],
         "options": {
           "target": "aarch64-unknown-linux-musl",
           "manifestPath": "{projectRoot}/crates/cowshed-cli/Cargo.toml",
           "package": "cowshed-cli",
           "bin": "cowshed",
-          "output": "{projectRoot}/dist/bin/linux-arm64/cowshed"
+          "output": "{projectRoot}/.cache/bin/linux-arm64/cowshed"
         },
         "configurations": {
           "production": {
-            "release": true
+            "release": true,
+            "output": "{projectRoot}/dist/bin/linux-arm64/cowshed"
           }
         }
       },
@@ -447,19 +463,21 @@
           },
           "cargoToolchain"
         ],
+        "//": "output is the file this configuration writes: .cache/bin/<platform>/cowshed by default, dist/bin/<platform>/cowshed in production (specs/cowshed/06_cli.md, Launcher). The declared output is its directory, which {options.output}/.. resolves to, so the tree is restored whole and reads the same option the executor writes through.",
         "outputs": [
-          "{projectRoot}/dist/bin/linux-x64/"
+          "{options.output}/../"
         ],
         "options": {
           "target": "x86_64-unknown-linux-musl",
           "manifestPath": "{projectRoot}/crates/cowshed-cli/Cargo.toml",
           "package": "cowshed-cli",
           "bin": "cowshed",
-          "output": "{projectRoot}/dist/bin/linux-x64/cowshed"
+          "output": "{projectRoot}/.cache/bin/linux-x64/cowshed"
         },
         "configurations": {
           "production": {
-            "release": true
+            "release": true,
+            "output": "{projectRoot}/dist/bin/linux-x64/cowshed"
           }
         }
       },
@@ -480,10 +498,10 @@
         "dependsOn": [
           "napi-debug",
           "tsc-js",
-          "build",
+          "cli-native",
           "^build"
         ],
-        "//": "openHost and the typed launchers end to end: the built addon starts the package launcher's cowshed host, and each launcher spawns its verb through the package launcher, so the launcher's binary must be this checkout's build. It needs a Mac: host.diskCommand runs the real hdiutil. The root host-e2e aggregate reaches it and gate reaches it through that; test never does, because the Linux CI job runs test (specs/cowshed/08_testing.md, CI).",
+        "//": "openHost and the typed launchers end to end: the built addon starts the package launcher's cowshed host, and each launcher spawns its verb through the package launcher, so the launcher's binary must be this checkout's build, the cli-native development build under .cache/bin/<platform>. It needs a Mac: host.diskCommand runs the real hdiutil. The root host-e2e aggregate reaches it and gate reaches it through that; test never does, because the Linux CI job runs test (specs/cowshed/08_testing.md, CI).",
         "options": {
           "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 host.napi.test.ts launchers.napi.test.ts",
           "cwd": "{projectRoot}/src",
@@ -711,13 +729,10 @@
           "killAfterMs": 10000
         }
       },
-      "verify-packaging": {
+      "release-check": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
-        "dependsOn": [
-          "build"
-        ],
-        "//": "dependsOn build so dist/bin exists: the check used to pass by finding nothing.",
+        "//": "The package's release gate: smoo release pack runs it in the publishing job after every platform's prebuilt outputs are applied and before the tarball is packed, and refuses a gate that declares dependsOn or caches, so it judges the bytes that get packed, never a rebuild or a replay. It judges the shipping trees under dist/bin only (the execute bits that survive the artifact round trip), and a missing or empty tree fails it: it used to pass by finding nothing. The development builds under .cache/bin are never shipped.",
         "options": {
           "command": "bun scripts/verify-packaged-bin-bits.ts",
           "cwd": "{projectRoot}",
@@ -735,8 +750,7 @@
           "wire-fixtures-test",
           "apfs-test-root-test",
           "wire-test",
-          "declaration-model-test",
-          "verify-packaging"
+          "declaration-model-test"
         ]
       },
       "apfs-test-root": {
@@ -775,7 +789,9 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "dependsOn": [
-          "build",
+          "cli-native",
+          "napi-native",
+          "tsc-js",
           "apfs-test-root",
           {
             "target": "cargo-test-archive",
@@ -798,7 +814,7 @@
             "transitive": false
           }
         ],
-        "//": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests from the owning workspace's prebuilt nextest archive, whose output bytes are hashed inputs. Compilation is cached and paid by cargo-test-archive before this run; the private runtime TMPDIR cannot change the compiled environment, so the 120s guard covers only extraction and tests.",
+        "//": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests from the owning workspace's prebuilt nextest archive, whose output bytes are hashed inputs. Compilation is cached and paid by cargo-test-archive before this run; the private runtime TMPDIR cannot change the compiled environment, so the 120s guard covers only extraction and tests. The fixtures run the development CLI (cli-native), the compiled TypeScript package (tsc-js) and the host's default Node-API addon (napi-native), which build first.",
         "options": {
           "command": "bun packages/cowshed/scripts/host-controller-test.ts",
           "cwd": ".",

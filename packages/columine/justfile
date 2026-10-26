@@ -19,38 +19,43 @@ check:
 
 # `profile` is a cargo profile: `dev` for every local build and test,
 # `wasm-release` for the artifact that ships (the nx `cargo-wasm` production
-# configuration). Cargo writes the dev profile under `debug/`.
+# configuration). Cargo writes the dev profile under `debug/`. `out` is the
+# directory, relative to this package, that receives the artifact: the nx target
+# passes its `outputDir` option, which also names its declared outputs, so the copy
+# and the declaration cannot disagree (`.cache/wasm-dev` for the dev build a
+# checkout loads, `dist` for the build the package ships; packages/nx-plugin/README.md,
+# "Cargo profiles").
 
 # columine.wasm — the standalone VM artifact (Parse/Reduce/Compact/Undo, no
 # RETE). Nightly immediate-abort strips the fmt/panic machinery stable
 # cannot remove; the shell's single nightly toolchain provides it, so this
-# calls plain `cargo`. Deploys to dist/columine.wasm, which the export
-# checklist audits in the cargo-test-columine-wasm target that depends on this.
-wasm profile="dev":
+# calls plain `cargo`. Copies to `<out>/columine.wasm`; the export checklist audits
+# the checkout's dev build, in the cargo-test-columine-wasm target that depends on this.
+wasm profile out:
     #!/usr/bin/env bash
     set -euo pipefail
-    out=../../target/wasm32-unknown-unknown/{{ if profile == "dev" { "debug" } else { profile } }}
+    built=../../target/wasm32-unknown-unknown/{{ if profile == "dev" { "debug" } else { profile } }}
     RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" \
     cargo build -p columine-wasm --target wasm32-unknown-unknown --profile {{profile}} \
         -Zbuild-std=std,panic_abort
     wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
-        "$out/columine_wasm.wasm" -o "$out/columine_wasm.opt.wasm"
-    mkdir -p dist
-    cp "$out/columine_wasm.opt.wasm" dist/columine.wasm
-    ls -la dist/columine.wasm
+        "$built/columine_wasm.wasm" -o "$built/columine_wasm.opt.wasm"
+    mkdir -p {{out}}
+    cp "$built/columine_wasm.opt.wasm" {{out}}/columine.wasm
+    ls -la {{out}}/columine.wasm
 
 # event_processor.wasm — the columine EP artifact (ParseOptions{base_path:
 # true, msgpack_growth: true, diagnostics: false}; six exports,
 # caller-provided buffers).
-wasm-ep profile="dev":
+wasm-ep profile out:
     #!/usr/bin/env bash
     set -euo pipefail
-    out=../../target/wasm32-unknown-unknown/{{ if profile == "dev" { "debug" } else { profile } }}
+    built=../../target/wasm32-unknown-unknown/{{ if profile == "dev" { "debug" } else { profile } }}
     RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" \
     cargo build -p columine-ep-wasm --target wasm32-unknown-unknown --profile {{profile}} \
         -Zbuild-std=std,panic_abort
     wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
-        "$out/columine_ep_wasm.wasm" -o "$out/columine_ep_wasm.opt.wasm"
-    mkdir -p dist
-    cp "$out/columine_ep_wasm.opt.wasm" dist/event_processor.wasm
-    ls -la dist/event_processor.wasm
+        "$built/columine_ep_wasm.wasm" -o "$built/columine_ep_wasm.opt.wasm"
+    mkdir -p {{out}}
+    cp "$built/columine_ep_wasm.opt.wasm" {{out}}/event_processor.wasm
+    ls -la {{out}}/event_processor.wasm

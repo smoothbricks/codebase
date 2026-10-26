@@ -39,7 +39,7 @@ import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
 // `columine:test` depends on `cargo-wasm`, so this artifact is a prerequisite and
 // never conditional: gating the suite on its presence turned a missing build into
 // a green run of 22 tests that never entered the VM.
-const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
+const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 const TEST_PARSE_BACKEND: ParseCompactBackend = {
   backend: 'test-parse',
   parse: () => ({ arrowIpc: new Uint8Array(0), eventCount: 0 }),

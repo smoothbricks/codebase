@@ -949,18 +949,12 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
 /**
  * Load columine's reducer-only WASM backend.
  *
- * Searches for columine.wasm in default locations relative to this module.
- * For standalone columine usage.
+ * Without a path it loads the build this package's source authority names (see selectWasmArtifact in
+ * wasm-memory-contract.ts): a checkout's own dev build under .cache/wasm-dev, any other package's shipped
+ * dist/columine.wasm. For standalone columine usage.
  *
  * @param wasmPath - Optional explicit path to columine.wasm
  */
 export async function loadColumineWasm(wasmPath?: string | URL): Promise<ColumineBackend> {
-  const wasmBytes = await loadWasmBytes(wasmPath, 'columine.wasm');
-  if (!wasmBytes) {
-    throw new Error(
-      'Could not find columine.wasm. Provide an explicit path via loadColumineWasm(path), ' +
-        'or ensure columine.wasm is beside the built module or in ../dist/columine.wasm relative to source.',
-    );
-  }
-  return createColumineWasmBackend(wasmBytes);
+  return createColumineWasmBackend(await loadWasmBytes(wasmPath, 'columine.wasm'));
 }

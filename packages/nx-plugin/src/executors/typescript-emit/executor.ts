@@ -4,7 +4,9 @@ import { realpathSync } from 'node:fs';
 import { chmod, lstat, readdir, rm, rmdir, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
+  type BuildInputProducer,
   type BuildInputRecord,
+  buildInputProducer,
   buildInputRecord,
   gitWorkspaceRoot,
   globPathspec,
@@ -61,13 +63,16 @@ export default function typescriptEmitExecutor(
   options: TypeScriptEmitOptions,
   context: TypeScriptEmitContext,
 ): Promise<TypeScriptEmitResult> {
-  return runTypeScriptEmit(options, context, runCompiler);
+  const producer = buildInputProducer(process.env);
+  return runTypeScriptEmit(options, context, runCompiler, producer);
 }
 
+/** Runs with the caller's compiler and task identity; only the Nx entry reads its environment. */
 export async function runTypeScriptEmit(
   options: TypeScriptEmitOptions,
   context: TypeScriptEmitContext,
   runner: CompilerRunner,
+  producer?: BuildInputProducer,
 ): Promise<TypeScriptEmitResult> {
   const cwd = isAbsolute(options.cwd) ? options.cwd : join(context.root, options.cwd);
   const tsConfigPath = isAbsolute(options.tsConfig) ? options.tsConfig : join(cwd, options.tsConfig);
@@ -75,7 +80,7 @@ export async function runTypeScriptEmit(
   const outputDirectory = emitOutputDirectory(tsConfigPath, tsConfig);
 
   // Taken before the emit, so a source edited while it runs is recorded with its earlier bytes and reads as changed.
-  const inputs = outputDirectory === null ? null : typeScriptInputs(tsConfigPath, tsConfig);
+  const inputs = outputDirectory === null ? null : typeScriptInputs(tsConfigPath, tsConfig, producer);
   const previous = outputDirectory === null ? null : await snapshotOutput(outputDirectory);
   const javascriptSucceeded = await runner({
     command: 'ttsc',
@@ -201,7 +206,11 @@ const TYPESCRIPT_SOURCES = ['ts', 'tsx', 'mts', 'cts'];
  * include gets none, nor does an emit that owns no outDir (emitOutputDirectory), and its consumers judge it by
  * modification time.
  */
-function typeScriptInputs(tsConfigPath: string, tsConfig: TsConfigJson): BuildInputRecord | null {
+function typeScriptInputs(
+  tsConfigPath: string,
+  tsConfig: TsConfigJson,
+  producer?: BuildInputProducer,
+): BuildInputRecord | null {
   const strings = (value: unknown) =>
     Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
   const include = strings(tsConfig.include);
@@ -228,6 +237,7 @@ function typeScriptInputs(tsConfigPath: string, tsConfig: TsConfigJson): BuildIn
       workspacePath(workspaceRoot, join(configDirectory, basename(tsConfigPath))),
     ],
     complete,
+    producer,
   );
 }
 

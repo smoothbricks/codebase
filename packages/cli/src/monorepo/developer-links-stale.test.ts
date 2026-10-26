@@ -17,7 +17,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   applyDeclaredLinks,
+  decodeBuildInputRecord,
   planDeclaredLinks,
+  selectedBuildInputProducer,
 } from '../../../nx-plugin/managed/raw/tooling/direnv/developer-links.ts';
 
 /**
@@ -60,6 +62,17 @@ interface Fixture {
 }
 
 /**
+ * A CLI build for one platform as a package manifest declares it: a run without a configuration writes the developer
+ * directory, which no `files` entry publishes, and `-c production` the shipping directory.
+ */
+const cliTarget = (platform: string) => ({
+  outputs: ['{projectRoot}/{options.outputDirectory}/'],
+  options: { outputDirectory: `.cache/bin/${platform}` },
+  defaultConfiguration: 'development',
+  configurations: { development: {}, production: { outputDirectory: `dist/ship/${platform}` } },
+});
+
+/**
  * A provider package with a TypeScript build (stamped by its build info) and a declared per-host native target, its
  * sources older than its outputs, and a consumer whose alias still links the store version, built under `base`.
  */
@@ -85,6 +98,8 @@ function build(base: string): void {
             outputs: [`{projectRoot}/dist/bin/${HOST}`],
             inputs: ['{projectRoot}/**/*.rs', '!{projectRoot}/**/target/**', 'cargoToolchain'],
           },
+          [`cli-${HOST}`]: cliTarget(HOST),
+          [`cli-${OTHER_HOST}`]: cliTarget(OTHER_HOST),
         },
       },
     }),
@@ -102,7 +117,9 @@ function build(base: string): void {
   write(join(source, 'src/index.ts'), 'export const value = 1;\n', SOURCES);
   write(join(source, 'src/index.test.ts'), 'export {};\n', SOURCES);
   write(join(source, 'README.md'), '# api\n', SOURCES);
+  write(join(source, 'skills/SKILL.md'), '# api skill\n', SOURCES);
   write(join(source, 'crates/api/src/lib.rs'), 'pub fn value() -> u8 { 1 }\n', SOURCES);
+  write(join(source, 'crates/addon/src/lib.rs'), 'pub fn addon() -> u8 { 1 }\n', SOURCES);
   git(provider, 'init', '-q');
   git(provider, 'add', '-A');
   git(
@@ -284,7 +301,11 @@ function record(fixture: Fixture): void {
   );
   writeFileSync(
     join(fixture.source, `dist/bin/${HOST}/.build-inputs.json`),
-    JSON.stringify({ version: 1, files: files(['packages/api/crates/api/src/lib.rs']) }),
+    JSON.stringify({
+      version: 1,
+      producer: { project: 'api', target: 'native-host' },
+      files: files(['packages/api/crates/api/src/lib.rs']),
+    }),
   );
 }
 
@@ -307,7 +328,7 @@ describe('a live developer link whose build recorded its inputs', () => {
       `packages/api/dist/bin/${HOST} is stale: input packages/api/crates/api/src/lib.rs has other bytes than the build read`,
     );
     expect(refused).not.toContain('packages/api/dist/js is stale');
-    expect(refused).toContain('nx run api:build');
+    expect(refused).toContain('nx run api:native-host');
     expect(readlinkSync(changed.alias)).toBe(STORE);
   });
 
@@ -360,5 +381,204 @@ describe('a live developer link whose build recorded its inputs', () => {
     writeFileSync(join(broken.source, 'dist/js/.build-inputs.json'), JSON.stringify({ version: 2, files: {} }));
     expect(await refusal(broken)).toContain('dist/js/.build-inputs.json is not a version 1 build input record');
     expect(readlinkSync(broken.alias)).toBe(STORE);
+  });
+});
+
+/** Actual default tasks leave the CLI and inferred addon's receipts beside their source-owned development outputs. */
+function recordDevelopment(fixture: Fixture): void {
+  write(join(fixture.source, `.cache/bin/${HOST}/api`), 'native', BUILT);
+  writeFileSync(
+    join(fixture.source, `.cache/bin/${HOST}/.build-inputs.json`),
+    JSON.stringify({
+      version: 1,
+      producer: { project: 'api', target: `cli-${HOST}`, configuration: 'development' },
+      files: { 'packages/api/skills/SKILL.md': sha256(join(fixture.source, 'skills/SKILL.md')) },
+    }),
+  );
+  write(join(fixture.source, `.cache/native-dev/${HOST}/api.node`), 'addon', BUILT);
+  writeFileSync(
+    join(fixture.source, `.cache/native-dev/${HOST}/.build-inputs.json`),
+    JSON.stringify({
+      version: 1,
+      producer: { project: 'api', target: `napi-${HOST}` },
+      files: { 'packages/api/crates/addon/src/lib.rs': sha256(join(fixture.source, 'crates/addon/src/lib.rs')) },
+    }),
+  );
+}
+
+const INVALID_PRODUCERS: readonly unknown[] = [
+  null,
+  'api:native',
+  [],
+  { target: 'native' },
+  { project: 'api' },
+  { project: '', target: 'native' },
+  { project: 'api', target: '' },
+  { project: 'api', target: 1 },
+  { project: 'api', target: 'native', configuration: '' },
+  { project: 'api', target: 'native', configuration: 1 },
+];
+
+describe('a live developer link whose developer build lies outside the published files', () => {
+  it('judges the record beside each output the checkout runs, by content, and none of a build it does not run', async () => {
+    const dev = fixture();
+    const skill = join(dev.source, 'skills/SKILL.md');
+    const original = readFileSync(skill, 'utf8');
+    const addon = join(dev.source, 'crates/addon/src/lib.rs');
+    const originalAddon = readFileSync(addon, 'utf8');
+    record(dev);
+    recordDevelopment(dev);
+
+    // Current: both sources are newer than the outputs but retain the bytes the actual tasks read.
+    for (const file of [skill, addon]) touch(file, LATER);
+    expect((await planDeclaredLinks(dev.consumer)).changes.map((change) => change.path)).toEqual([
+      'node_modules/linked-api',
+    ]);
+
+    // Both declared CLI and inferred addon refuse by content, naming their actual tasks, not the tsc-only build.
+    write(skill, '# api skill, edited\n', LATER);
+    write(addon, 'pub fn addon() -> u8 { 2 }\n', LATER);
+    const refused = await refusal(dev);
+    expect(refused).toContain(
+      `packages/api/.cache/bin/${HOST} is stale: input packages/api/skills/SKILL.md has other bytes than the build read`,
+    );
+    expect(refused).toContain(
+      `packages/api/.cache/native-dev/${HOST} is stale: input packages/api/crates/addon/src/lib.rs has other bytes than the build read`,
+    );
+    expect(refused).toContain(`nx run api:cli-${HOST}:development`);
+    expect(refused).toContain(`nx run api:napi-${HOST}`);
+    expect(refused).not.toContain('nx run api:build');
+    expect(refused).not.toContain('modification time');
+    expect(readlinkSync(dev.alias)).toBe(STORE);
+
+    // Restored: the bytes the build read are current again with no rebuild, though the file is newer than the binary.
+    write(skill, original, LATER + 1);
+    write(addon, originalAddon, LATER + 1);
+    expect(await link(dev)).not.toContain('refusing');
+    expect(realpathSync(dev.alias)).toBe(dev.source);
+
+    // Foreign hosts, projects, nondefault/production tasks and obsolete native records do not own this checkout's
+    // outputs. Their stale surrounding trees must not reappear as timestamp-fallback units either.
+    const staleInputs = { 'packages/api/skills/SKILL.md': '0'.repeat(64) };
+    const outdated = JSON.stringify({ version: 1, files: staleInputs });
+    const ignored = [
+      { output: `.cache/bin/${OTHER_HOST}`, producer: { project: 'api', target: `cli-${OTHER_HOST}` } },
+      {
+        output: `.cache/production/${HOST}`,
+        producer: { project: 'api', target: `napi-${HOST}`, configuration: 'production' },
+      },
+      { output: `.cache/foreign/${HOST}`, producer: { project: 'foreign', target: `napi-${HOST}` } },
+      { output: `dist/ship/${HOST}`, producer: { project: 'api', target: `cli-${HOST}`, configuration: 'production' } },
+      { output: `dist/foreign/${HOST}`, producer: { project: 'foreign', target: `napi-${HOST}` } },
+      { output: `dist/native/${HOST}`, producer: undefined },
+    ];
+    for (const { output, producer } of ignored) {
+      write(
+        join(dev.source, output, '.build-inputs.json'),
+        JSON.stringify({ version: 1, producer, files: staleInputs }),
+        SOURCES - 100,
+      );
+      write(join(dev.source, output, 'api.node'), 'old native', SOURCES - 100);
+    }
+    // A scan may not enter build-state directories or follow a link, even if they contain unreadable receipts.
+    for (const excluded of ['target', 'node_modules'])
+      write(join(dev.source, '.cache', excluded, '.build-inputs.json'), 'not JSON', BUILT);
+    write(join(dev.source, 'external-state/.build-inputs.json'), 'not JSON', BUILT);
+    symlinkSync('../external-state', join(dev.source, '.cache/redirect'), 'dir');
+    expect(await link(dev)).not.toContain('refusing');
+
+    // The standalone TypeScript receipt has no producer and still owns the nested emit independently of an old dist
+    // receipt. The same boundary also preserves the missing-record timestamp fallback.
+    write(join(dev.source, 'dist/.build-inputs.json'), outdated, BUILT);
+    expect(await link(dev)).not.toContain('refusing');
+    write(join(dev.source, 'src/index.ts'), 'export const value = 2;\n', LATER);
+    const emitted = await refusal(dev);
+    expect(emitted).toContain(
+      'packages/api/dist/js is stale: input packages/api/src/index.ts has other bytes than the build read',
+    );
+    expect(emitted).toContain('nx run api:build');
+    expect(emitted).not.toContain('packages/api/dist is stale');
+    rmSync(join(dev.source, 'dist/js/.build-inputs.json'));
+    const fallback = await refusal(dev);
+    expect(fallback).toContain('tsconfig.lib.json (outDir dist/js) was built at');
+    expect(fallback).toContain('no .build-inputs.json, so judged by modification time');
+    expect(fallback).not.toContain('packages/api/dist is stale');
+
+    // A present malformed identity is corrupt data, not an unselected producer that can hide its stale tree.
+    writeFileSync(
+      join(dev.source, '.cache/bin', HOST, '.build-inputs.json'),
+      JSON.stringify({
+        version: 1,
+        files: {},
+        producer: { project: 'api', target: 1 },
+      }),
+    );
+    await expect(planDeclaredLinks(dev.consumer)).rejects.toThrow('is not a version 1 build input record: producer');
+  });
+});
+
+interface ProducerCase {
+  readonly label: string;
+  readonly producer: Parameters<typeof selectedBuildInputProducer>[0];
+  readonly targets?: unknown;
+  readonly expected?: NonNullable<ReturnType<typeof selectedBuildInputProducer>>;
+}
+
+const PRODUCER_CASES: readonly ProducerCase[] = [
+  {
+    label: 'a declared default task',
+    producer: { project: 'api', target: 'cli-host' },
+    targets: { 'cli-host': {} },
+    expected: { project: 'api', target: 'cli-host' },
+  },
+  {
+    label: 'an inferred task absent from the manifest',
+    producer: { project: 'api', target: 'napi-host' },
+    expected: { project: 'api', target: 'napi-host' },
+  },
+  {
+    label: 'the manifest target names its default configuration',
+    producer: { project: 'api', target: 'native', configuration: 'development' },
+    targets: { native: { defaultConfiguration: 'development' } },
+    expected: { project: 'api', target: 'native', configuration: 'development' },
+  },
+  {
+    label: 'an unconfigured receipt remains selected with a named default',
+    producer: { project: 'api', target: 'native' },
+    targets: { native: { defaultConfiguration: 'development' } },
+    expected: { project: 'api', target: 'native' },
+  },
+  { label: 'another project', producer: { project: 'foreign', target: 'native' } },
+  { label: 'a production task', producer: { project: 'api', target: 'native', configuration: 'production' } },
+  {
+    label: 'production is never a developer configuration',
+    producer: { project: 'api', target: 'native', configuration: 'production' },
+    targets: { native: { defaultConfiguration: 'production' } },
+  },
+  { label: 'a nondefault named configuration', producer: { project: 'api', target: 'native', configuration: 'debug' } },
+  {
+    label: 'a different named configuration than the default',
+    producer: { project: 'api', target: 'native', configuration: 'debug' },
+    targets: { native: { defaultConfiguration: 'development' } },
+  },
+  { label: 'an obsolete native receipt without provenance', producer: undefined },
+];
+
+describe('the actual producer of a developer build receipt', () => {
+  it('decodes absent provenance and rejects malformed present provenance without I/O', () => {
+    expect(decodeBuildInputRecord({ version: 1, files: {} }, 'record').producer).toBeUndefined();
+    for (const producer of INVALID_PRODUCERS) {
+      expect(() => decodeBuildInputRecord({ version: 1, files: {}, producer }, 'record')).toThrow(
+        'record is not a version 1 build input record: producer',
+      );
+    }
+  });
+  it('selects only this project and its default development task without reading files or starting Nx', () => {
+    for (const { label, producer, targets, expected } of PRODUCER_CASES) {
+      expect({ label, producer: selectedBuildInputProducer(producer, 'api', targets) }).toEqual({
+        label,
+        producer: expected,
+      });
+    }
   });
 });

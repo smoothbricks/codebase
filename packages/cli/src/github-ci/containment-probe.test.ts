@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
+import { RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { expandNxTargetDependencyRuns, expandNxTargetRuns } from './index.js';
 import {
@@ -58,11 +59,19 @@ const DARWIN_ARM64_BIN = 'packages/cowshed/dist/bin/darwin-arm64/cowshed';
 const DARWIN_ARM64_NAPI = 'packages/cowshed/dist/native/darwin-arm64/cowshed.node';
 const DARWIN_X64_BIN = 'packages/cowshed/dist/bin/darwin-x64/cowshed';
 
+/** The declarations the collector records for the project's raw `{projectRoot}/…` outputs, as Nx interpolates them. */
+const TS_OUTPUT = 'packages/cowshed/dist/ts/';
+const DIST_OUTPUT = 'packages/cowshed/dist/';
+const LINUX_X64_OUTPUT = 'packages/cowshed/dist/bin/linux-x64/';
+const DARWIN_ARM64_OUTPUT = 'packages/cowshed/dist/bin/darwin-arm64/';
+const DARWIN_ARM64_NAPI_OUTPUT = 'packages/cowshed/dist/native/darwin-arm64/';
+const DARWIN_X64_OUTPUT = 'packages/cowshed/dist/bin/darwin-x64/';
+
 /** The one claim `tsc-js` makes, exactly as the collect planner records it. */
 const TS_CLAIM: OutputClaim = {
   project: 'cowshed',
   target: 'tsc-js',
-  output: '{projectRoot}/dist/ts/',
+  output: TS_OUTPUT,
   path: TS_ENTRY,
   size: 4,
   mode: 0o644,
@@ -140,7 +149,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'tsc-js',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/ts/', files: [fileFact(TS_ENTRY)] }],
+          outputs: [{ declaredOutput: TS_OUTPUT, files: [fileFact(TS_ENTRY)] }],
         },
       ]),
     );
@@ -149,7 +158,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64/', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: LINUX_X64_OUTPUT, files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     );
@@ -173,7 +182,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'build',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/', files: distFiles.map((path) => fileFact(path)) }],
+          outputs: [{ declaredOutput: DIST_OUTPUT, files: distFiles.map((path) => fileFact(path)) }],
         },
       ]),
     );
@@ -182,7 +191,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64/', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: LINUX_X64_OUTPUT, files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     );
@@ -202,7 +211,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64/', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: LINUX_X64_OUTPUT, files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     ).toEqual({
@@ -211,7 +220,7 @@ describe('publish collect containment probe', () => {
         {
           project: 'cowshed',
           target: 'cli-x64-linux',
-          output: '{projectRoot}/dist/bin/linux-x64/',
+          output: LINUX_X64_OUTPUT,
           path: LINUX_X64_BIN,
           size: 4,
           mode: 0o644,
@@ -233,7 +242,7 @@ describe('publish collect containment probe', () => {
       targets: ['other-x64-linux'],
       targetOutputs: new Map([['other-x64-linux', ['{projectRoot}/dist/bin/linux-x64/']]]),
     };
-    const outputs = [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64/', files: [fileFact(LINUX_X64_BIN)] }];
+    const outputs = [{ declaredOutput: LINUX_X64_OUTPUT, files: [fileFact(LINUX_X64_BIN)] }];
 
     expect(
       planOutputClaims([
@@ -263,14 +272,12 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-arm64-macos',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/darwin-arm64/', files: [fileFact(DARWIN_ARM64_BIN)] }],
+          outputs: [{ declaredOutput: DARWIN_ARM64_OUTPUT, files: [fileFact(DARWIN_ARM64_BIN)] }],
         },
         {
           project,
           target: 'napi-arm64-macos',
-          outputs: [
-            { declaredOutput: '{projectRoot}/dist/native/darwin-arm64/', files: [fileFact(DARWIN_ARM64_NAPI)] },
-          ],
+          outputs: [{ declaredOutput: DARWIN_ARM64_NAPI_OUTPUT, files: [fileFact(DARWIN_ARM64_NAPI)] }],
         },
       ]),
     );
@@ -279,7 +286,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-macos',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/darwin-x64/', files: [fileFact(DARWIN_X64_BIN)] }],
+          outputs: [{ declaredOutput: DARWIN_X64_OUTPUT, files: [fileFact(DARWIN_X64_BIN)] }],
         },
       ]),
     );
@@ -307,15 +314,15 @@ describe('publish collect containment probe', () => {
   });
 
   it('refuses a declared output that matched no file', () => {
-    const outputs = [{ declaredOutput: '{projectRoot}/dist/ts/', files: [] }];
+    const outputs = [{ declaredOutput: TS_OUTPUT, files: [] }];
     expect(planOutputClaims([{ project: cowshedShapedProject(), target: 'tsc-js', outputs }])).toEqual({
       ok: false,
-      reason: 'Declared output {projectRoot}/dist/ts/ for cowshed:tsc-js is missing.',
+      reason: 'Declared output packages/cowshed/dist/ts/ for cowshed:tsc-js is missing.',
     });
   });
 
   it('refuses an output file that is not a regular file', () => {
-    const outputs = [{ declaredOutput: '{projectRoot}/dist/ts/', files: [fileFact(TS_ENTRY, 'symlink')] }];
+    const outputs = [{ declaredOutput: TS_OUTPUT, files: [fileFact(TS_ENTRY, 'symlink')] }];
     expect(planOutputClaims([{ project: cowshedShapedProject(), target: 'tsc-js', outputs }])).toEqual({
       ok: false,
       reason: `Output file must be a regular file: ${TS_ENTRY}`,
@@ -329,9 +336,9 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'tsc-js',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/ts/', files: [fileFact(TS_ENTRY)] }],
+          outputs: [{ declaredOutput: TS_OUTPUT, files: [fileFact(TS_ENTRY)] }],
         },
-        { project, target: 'build', outputs: [{ declaredOutput: '{projectRoot}/dist/', files: [fileFact(TS_ENTRY)] }] },
+        { project, target: 'build', outputs: [{ declaredOutput: DIST_OUTPUT, files: [fileFact(TS_ENTRY)] }] },
       ]),
     ).toEqual({ ok: true, value: [TS_CLAIM] });
   });
@@ -466,18 +473,169 @@ describe('publish collect containment probe', () => {
 });
 
 /**
- * Plant one file inside every output the given runs declare, under `root`.
+ * The cowshed CLI as its profiles declare it: development writes under `.cache/bin/<platform>/`, production under
+ * `dist/bin/<platform>/`, and one declaration reads the option each configuration sets. Nx resolves `{projectRoot}` in
+ * option values before the graph hook, so the options hold resolved paths.
+ */
+function profiledProject(): ProjectTargets {
+  return {
+    project: 'cowshed',
+    root: 'packages/cowshed',
+    targets: ['cli-arm64-macos', 'cli-x64-linux'],
+    targetOutputs: new Map([
+      ['cli-arm64-macos', ['{projectRoot}/{options.outputDir}/']],
+      ['cli-x64-linux', ['{options.output}/../']],
+    ]),
+    targetOptions: new Map([
+      ['cli-arm64-macos', { outputDir: '.cache/bin/darwin-arm64' }],
+      ['cli-x64-linux', { output: 'packages/cowshed/.cache/bin/linux-x64/cowshed' }],
+    ]),
+    targetConfigurations: new Map([
+      ['cli-arm64-macos', { production: { outputDir: 'dist/bin/darwin-arm64' } }],
+      ['cli-x64-linux', { production: { release: true, output: 'packages/cowshed/dist/bin/linux-x64/cowshed' } }],
+    ]),
+  };
+}
+
+const DEVELOPMENT_LINUX_X64_OUTPUT = 'packages/cowshed/.cache/bin/linux-x64/';
+const DEVELOPMENT_LINUX_X64_BIN = 'packages/cowshed/.cache/bin/linux-x64/cowshed';
+
+/** The claim `cli-x64-linux` makes of one file, as the collect planner records it. */
+function linuxClaim(output: string, path: string): OutputClaim {
+  return { project: 'cowshed', target: 'cli-x64-linux', output, path, size: 4, mode: 0o755 };
+}
+
+describe('profile-separated outputs', () => {
+  it.each([
+    {
+      name: 'a development run declares the development tree through an option',
+      target: 'cli-arm64-macos',
+      configuration: undefined,
+      expected: 'packages/cowshed/.cache/bin/darwin-arm64/',
+    },
+    {
+      name: 'a production run declares the production tree through the same declaration',
+      target: 'cli-arm64-macos',
+      configuration: 'production',
+      expected: DARWIN_ARM64_OUTPUT,
+    },
+    {
+      name: 'a development run declares the directory of the file its option names',
+      target: 'cli-x64-linux',
+      configuration: undefined,
+      expected: DEVELOPMENT_LINUX_X64_OUTPUT,
+    },
+    {
+      name: 'a production run declares the directory of the file its configuration names',
+      target: 'cli-x64-linux',
+      configuration: 'production',
+      expected: LINUX_X64_OUTPUT,
+    },
+  ])('$name', ({ target, configuration, expected }) => {
+    const project = profiledProject();
+    const declared = project.targetOutputs?.get(target) ?? [];
+    expect(declared.map((output) => resolveDeclaredOutput(output, project, target, configuration))).toEqual([
+      { ok: true, value: expected },
+    ]);
+  });
+
+  it('refuses a declaration the run leaves unresolved, naming the task and what is left', () => {
+    const project = profiledProject();
+    project.targetOptions?.set('cli-arm64-macos', {});
+    expect(resolveDeclaredOutput('{projectRoot}/{options.outputDir}/', project, 'cli-arm64-macos', undefined)).toEqual({
+      ok: false,
+      reason:
+        'Unsupported Nx output placeholder in cowshed:cli-arm64-macos: packages/cowshed/{options.outputDir} (declared {projectRoot}/{options.outputDir}/)',
+    });
+    expect(
+      resolveDeclaredOutput('{projectRoot}/{options.outputDir}/', project, 'cli-arm64-macos', 'production'),
+    ).toEqual({
+      ok: true,
+      value: DARWIN_ARM64_OUTPUT,
+    });
+  });
+
+  it('refuses a declaration that leaves the workspace', () => {
+    expect(resolveDeclaredOutput('../outside', profiledProject(), 'cli-x64-linux', undefined)).toMatchObject({
+      ok: false,
+      reason: 'output for cowshed escapes the workspace: ../outside',
+    });
+  });
+
+  it.each([
+    { name: 'the production tree', output: LINUX_X64_OUTPUT, path: LINUX_X64_BIN },
+    { name: 'the development tree', output: DEVELOPMENT_LINUX_X64_OUTPUT, path: DEVELOPMENT_LINUX_X64_BIN },
+  ])('applies $name the configuration that wrote it declared', ({ output, path }) => {
+    const tree = stagedTree('linux', [linuxClaim(output, path)]);
+    expect(planOverlays([tree], SOURCE_SHA, [profiledProject()], PACKAGES)).toEqual({
+      ok: true,
+      value: [{ source: `/collected/linux/workspace/${path}`, destination: path, mode: 0o755 }],
+    });
+  });
+
+  it('applies a production file although the development configuration leaves the declaration unresolved', () => {
+    const project = profiledProject();
+    // Development sets no `outputDir`, so only production resolves `{options.outputDir}`.
+    project.targetOptions?.set('cli-arm64-macos', {});
+    const claim: OutputClaim = {
+      project: 'cowshed',
+      target: 'cli-arm64-macos',
+      output: DARWIN_ARM64_OUTPUT,
+      path: DARWIN_ARM64_BIN,
+      size: 4,
+      mode: 0o755,
+    };
+    expect(planOverlays([stagedTree('macos', [claim])], SOURCE_SHA, [project], PACKAGES)).toEqual({
+      ok: true,
+      value: [{ source: `/collected/macos/workspace/${DARWIN_ARM64_BIN}`, destination: DARWIN_ARM64_BIN, mode: 0o755 }],
+    });
+  });
+
+  it.each([
+    {
+      name: 'the raw declaration a v3 manifest recorded',
+      output: '{options.output}/../',
+      path: LINUX_X64_BIN,
+      reason: `Manifest output {options.output}/../ for ${LINUX_X64_BIN} is not declared by Nx target cowshed:cli-x64-linux.`,
+    },
+    {
+      name: 'a declaration of another target',
+      output: DARWIN_ARM64_OUTPUT,
+      path: DARWIN_ARM64_BIN,
+      reason: `Manifest output ${DARWIN_ARM64_OUTPUT} for ${DARWIN_ARM64_BIN} is not declared by Nx target cowshed:cli-x64-linux.`,
+    },
+    {
+      name: 'a file declaration at the path of a directory declaration',
+      output: 'packages/cowshed/dist/bin/linux-x64',
+      path: LINUX_X64_BIN,
+      reason: `Manifest output packages/cowshed/dist/bin/linux-x64 for ${LINUX_X64_BIN} is not declared by Nx target cowshed:cli-x64-linux.`,
+    },
+    {
+      name: 'a path under the tree of another configuration',
+      output: LINUX_X64_OUTPUT,
+      path: DEVELOPMENT_LINUX_X64_BIN,
+      reason: `Manifest file ${DEVELOPMENT_LINUX_X64_BIN} is not contained by declared output ${LINUX_X64_OUTPUT}.`,
+    },
+  ])('refuses $name', ({ output, path, reason }) => {
+    const tree = stagedTree('linux', [linuxClaim(output, path)]);
+    expect(planOverlays([tree], SOURCE_SHA, [profiledProject()], PACKAGES)).toEqual({ ok: false, reason });
+  });
+});
+
+/**
+ * Plant one file inside every output the given runs declare under `configuration`, under `root`.
  *
  * The probe needs the REAL inferred graph but must not need the real build's
  * artifacts: `dist/bin/darwin-arm64` only exists on a macOS host, so collecting
  * from the repo made this a macOS-only test that failed on Linux with
- * "Declared output {projectRoot}/dist/bin/darwin-arm64/ for cowshed:cli-arm64-macos
+ * "Declared output packages/cowshed/dist/bin/darwin-arm64/ for cowshed:cli-arm64-macos
  * is missing." Planting the declared outputs keeps the graph real, the files
  * deterministic, and the assertion identical on every runner.
  */
 async function plantDeclaredOutputs(
   root: string,
   runs: readonly { target: string; projects: readonly ProjectTargets[] }[],
+  configuration: string,
 ): Promise<string[]> {
   const planted: string[] = [];
   for (const run of runs) {
@@ -487,8 +645,9 @@ async function plantDeclaredOutputs(
       if (project.root === undefined) continue;
       for (const output of project.targetOutputs?.get(run.target) ?? []) {
         // The collector's own resolution, so every placeholder a declaration
-        // may use (`{workspaceRoot}` included) lands where it will look.
-        const directory = join(root, resolveDeclaredOutput(output, project));
+        // may use (`{workspaceRoot}` and the options a configuration sets included) lands where it will look.
+        const resolved = resolveDeclaredOutput(output, project, run.target, configuration);
+        const directory = join(root, expectPlanned(resolved));
         await mkdir(directory, { recursive: true });
         const file = join(directory, run.target);
         // 0o755 because `applyCollectedOutputs` must carry the executable bit
@@ -533,13 +692,25 @@ describe('publish collect containment probe against the resolved graph', () => {
     const macosArtifact = join(temp, 'mp');
     const applyRoot = join(temp, 'apply');
     try {
-      const plantedBuild = await plantDeclaredOutputs(graphRoot, buildRuns);
-      const plantedMacos = await plantDeclaredOutputs(graphRoot, macosRuns);
+      const plantedBuild = await plantDeclaredOutputs(graphRoot, buildRuns, RELEASE_CONFIGURATION);
+      const plantedMacos = await plantDeclaredOutputs(graphRoot, macosRuns, RELEASE_CONFIGURATION);
       expect(plantedBuild.length).toBeGreaterThan(0);
       expect(plantedMacos.length).toBeGreaterThan(0);
 
-      const buildManifest = await collectNxOutputs(graphRoot, buildArtifact, buildRuns, SOURCE_SHA);
-      const macosManifest = await collectNxOutputs(graphRoot, macosArtifact, macosRuns, SOURCE_SHA);
+      const buildManifest = await collectNxOutputs(
+        graphRoot,
+        buildArtifact,
+        buildRuns,
+        SOURCE_SHA,
+        RELEASE_CONFIGURATION,
+      );
+      const macosManifest = await collectNxOutputs(
+        graphRoot,
+        macosArtifact,
+        macosRuns,
+        SOURCE_SHA,
+        RELEASE_CONFIGURATION,
+      );
 
       // The aggregate itself declares no outputs, so nothing may be attributed
       // to it, and the platform families must stay out of the build tree.

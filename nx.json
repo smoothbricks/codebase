@@ -79,7 +79,7 @@
     "cargo-test-group-real-apfs": {
       "dependsOn": [
         "...",
-        { "projects": ["cowshed"], "target": "build" },
+        { "projects": ["cowshed"], "target": "cli-native" },
         { "projects": ["cowshed"], "target": "apfs-test-root" }
       ],
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
@@ -87,7 +87,7 @@
     "cargo-test-group-real-apfs-host": {
       "dependsOn": [
         "...",
-        { "projects": ["cowshed"], "target": "build" },
+        { "projects": ["cowshed"], "target": "cli-native" },
         { "projects": ["cowshed"], "target": "apfs-test-root" },
         "cargo-test-group-real-apfs"
       ],
@@ -99,7 +99,13 @@
       "plugin": "@smoothbricks/nx-plugin",
       "options": {
         "producerReceipts": {
-          "targets": ["lmao:rust-dist", "lmao:cargo-wasm", "lmao:cargo-thread-ffi", "cli:build", "nx-plugin:build"]
+          "targets": [
+            "lmao:rust-dist",
+            "lmao:cargo-wasm:production",
+            "lmao:cargo-thread-ffi",
+            "cli:build",
+            "nx-plugin:build"
+          ]
         }
       }
     }

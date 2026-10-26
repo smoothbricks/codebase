@@ -64,14 +64,28 @@ packages and does not apply developer links. Managed-file drift checks remain in
 not which differences they accept.
 
 A live link runs whatever its checkout last built, so linking one whose build does not describe its sources refuses,
-names each such build unit and its cached `nx run <project>:build`, and leaves every alias unchanged. Packages resolved
-from Bun's store are not judged. A producer writes `.build-inputs.json` into each output directory it owns: the SHA-256
-of every input it read and, where it knows them, the Git pathspecs whose every match is an input. The record is part of
-the target's Nx outputs, so a cache hit restores the record that describes the restored outputs. A unit with a record is
+names each such build unit and its cached Nx rebuild, and leaves every alias unchanged. Packages resolved from Bun's
+store are not judged. A producer writes `.build-inputs.json` into each output directory it owns: the SHA-256 of every
+input it read and, where it knows them, the Git pathspecs whose every match is an input. The record is part of the
+target's Nx outputs, so a cache hit restores the record that describes the restored outputs. A unit with a record is
 current while every recorded input keeps its bytes and no matching source was added; a rewrite with the same bytes
 changes nothing. A unit without one is judged by modification time, and its refusal says that this also counts a file
 rewritten with its own bytes. Producer receipts above stay the proof for pins: they bind a clean HEAD and live outside
 Nx outputs, so neither a dirty working tree nor a cache hit can vouch through them.
+
+The records judged are those beside the outputs the checkout runs. Writers add optional `producer` provenance to the
+existing version 1 record from the actual Nx task environment: its project, target and optional configuration. Shell
+entry inventories source-owned package `.cache` receipts and published receipts, without following cache symlinks or
+entering build-volume `target` or `node_modules` trees. It selects the current package's producer with no configuration
+or the manifest target's named `defaultConfiguration`, but never `production`. Declared development CLIs under
+`.cache/bin/<platform>` and inferred addons under `.cache/native-dev/<platform>` are therefore covered without a
+hand-normalized shadow graph, an output registry, an inferred-target list or starting Nx. A refusal names that exact
+producer target and configuration as its cached rebuild: the package's `build` need not reach it. Foreign projects,
+other hosts, nondefault/production records and obsolete native records without provenance do not select a unit, and
+their surrounding trees are not judged. The TypeScript emit's directory is an independent boundary and still accepts a
+standalone bootstrap record without producer provenance; an enclosing obsolete `dist` record cannot hide the nested
+emit's record or its missing-record timestamp fallback. Normal published units without records retain their existing
+timestamp fallback. These currentness checks run once at shell entry, never per artifact execution.
 
 ## Acceptance
 

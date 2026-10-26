@@ -7,6 +7,7 @@ import {
   listCargoWorkspacePackages,
   packageNameFromCargoTestTarget,
 } from './cargo-workspace.js';
+import { cargoCrossTestTripleFromArchiveTarget } from './cross-check-policy.js';
 import { writeJsonFile } from './managed-files/managed-format.js';
 import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './package-target-policy.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './test-backstop.js';
@@ -451,7 +452,11 @@ function bunTestHasNoDeadline(command: string): boolean {
 }
 
 function isTestLegTargetName(name: string): boolean {
-  return name !== CARGO_TEST_ARCHIVE_TARGET && (isTestRunnerTargetName(name) || name.endsWith('-test'));
+  return (
+    name !== CARGO_TEST_ARCHIVE_TARGET &&
+    cargoCrossTestTripleFromArchiveTarget(name) === null &&
+    isTestRunnerTargetName(name)
+  );
 }
 
 function resolvedAggregateTestIsBounded(project: ResolvedProjectTargets | undefined): boolean {

@@ -17,7 +17,10 @@ export interface BuildStatePath {
  */
 export type OutputKind = 'file' | 'directory';
 
-/** One output a target declares under one configuration (`undefined`: its default options), as Nx interpolates it. */
+/**
+ * One output a task declares (a target under one configuration), as Nx interpolates it. `undefined` is the target's own
+ * options, a task only when it has no `defaultConfiguration`: Nx resolves a run naming none to that.
+ */
 export interface DeclaredOutput {
   readonly project: string;
   readonly target: string;
@@ -69,7 +72,10 @@ export class OutputDeclarationError extends Error {
   }
 }
 
-/** Two targets that declare one output path, or one inside the other. */
+/**
+ * Two tasks, each a target under one configuration, that declare one output path or pattern, or one inside the other.
+ * Each side names its project, target, configuration and output.
+ */
 export interface OutputOverlap {
   readonly left: DeclaredOutput;
   readonly right: DeclaredOutput;
@@ -78,7 +84,7 @@ export interface OutputOverlap {
 export class OutputOverlapError extends Error {
   constructor(readonly overlaps: readonly OutputOverlap[]) {
     super(
-      `Each Nx output path has one producing target; these targets declare one path, or one inside another:\n${overlaps
+      `Each Nx output path has one producing task; these tasks declare one path or pattern, or one inside another:\n${overlaps
         .map(
           ({ left, right }) =>
             `  ${taskName(left)}: ${JSON.stringify(left.output)} overlaps ${taskName(right)}: ${JSON.stringify(right.output)}`,
@@ -177,12 +183,28 @@ function declaredKind(declaration: string): OutputKind {
   return declaration.endsWith('/') ? 'directory' : 'file';
 }
 
-/** Every output of every target in the resolved graph (project overrides included), for each configuration. */
-function declaredOutputs(graph: ProjectGraph, root: string): DeclaredOutput[] {
+/**
+ * The configurations a target's tasks run under: each named one, and the run naming none. Nx resolves that run to the
+ * target's `defaultConfiguration` when it has one, so the target's own options are a task only without one.
+ */
+export function taskConfigurations({
+  defaultConfiguration,
+  configurations,
+}: TargetConfiguration): (string | undefined)[] {
+  const named = Object.keys(configurations ?? {});
+  return defaultConfiguration ? [...new Set([defaultConfiguration, ...named])] : [undefined, ...named];
+}
+
+/**
+ * Every output of every task in the resolved graph (project overrides included), as Nx interpolates it: one task per
+ * configuration a target runs under. A target declaring no outputs yields Nx's fallback outputs. Pass the absolute
+ * workspace root. This is the one reading of what a task writes: every output policy takes its declarations from here.
+ */
+export function declaredOutputs(graph: ProjectGraph, root: string): DeclaredOutput[] {
   const declared: DeclaredOutput[] = [];
   for (const [project, node] of Object.entries(graph.nodes)) {
     for (const [target, options] of Object.entries(node.data.targets ?? {})) {
-      for (const configuration of [undefined, ...Object.keys(options.configurations ?? {})]) {
+      for (const configuration of taskConfigurations(options)) {
         for (const output of targetOutputs(project, target, options, configuration, node, root)) {
           declared.push({ project, target, configuration, ...output });
         }
@@ -236,9 +258,9 @@ interface GlobClaim {
 type OutputClaim = PathClaim | GlobClaim;
 
 /**
- * Each target's declared outputs once per distinct path and declared kind across its configurations; a negation claims
- * nothing. The kind is part of the identity, so a path a target declares as both a file and a directory is two claims,
- * and each is judged.
+ * Each task's declared outputs once per distinct path and declared kind; a negation claims nothing. A task is a target
+ * under one configuration, and the configuration is part of the identity: two configurations declaring one path are
+ * two claims, and each is judged. So is the kind: a path a task declares as both a file and a directory is two claims.
  */
 function outputClaims(declared: readonly DeclaredOutput[], root: string): OutputClaim[] {
   const seen = new Set<string>();
@@ -246,7 +268,7 @@ function outputClaims(declared: readonly DeclaredOutput[], root: string): Output
   for (const output of declared) {
     if (output.output.startsWith('!')) continue;
     const absolute = posix.resolve(root, output.output);
-    const key = JSON.stringify([output.project, output.target, absolute, output.kind]);
+    const key = JSON.stringify([output.project, output.target, output.configuration, absolute, output.kind]);
     if (seen.has(key)) continue;
     seen.add(key);
     const relative = posix.relative(root, absolute);
@@ -281,8 +303,9 @@ function patternMeetsPath(pattern: GlobClaim, path: PathClaim): boolean {
 }
 
 /**
- * Two paths conflict at, under or above each other. Two patterns are not judged: Nx restores a pattern file by file,
- * so only a file both match collides, and a pattern pair cannot name one without the tree.
+ * Two paths conflict at, under or above each other. Two patterns conflict only as one pattern named twice, which
+ * matches the same files: Nx restores a pattern file by file, so two different patterns collide only on a file both
+ * match, and that cannot be named without the tree.
  */
 function conflicts(left: OutputClaim, right: OutputClaim): boolean {
   if (left.form === 'path') {
@@ -290,14 +313,17 @@ function conflicts(left: OutputClaim, right: OutputClaim): boolean {
       ? contains(left.absolute, right.absolute) || contains(right.absolute, left.absolute)
       : patternMeetsPath(right, left);
   }
-  return right.form === 'path' && patternMeetsPath(left, right);
+  return right.form === 'path' ? patternMeetsPath(left, right) : left.matcher.pattern === right.matcher.pattern;
 }
 
 /**
- * One producing target per output path: refuse any target whose output is at, under or above another target's output,
- * across every configuration of the resolved graph. Nx restores a directory output as one tree, so a second target
- * writing inside it makes the first target's tree differ from its cache artifact after every build: each run restores
- * one producer over the other, and neither is ever a cache hit.
+ * One producing task per output path: refuse any task whose output is at, under or above another task's output. A task
+ * is a target under one configuration (`project:target[:configuration]`, as Nx names it): two targets conflict, and so
+ * do two configurations of one target. `outputs` belongs to the target, so only an options placeholder
+ * (`{options.out}`) that the configurations set apart gives each its own. A task's own outputs never conflict with
+ * each other. Nx restores a directory output as one tree, so a second task writing inside it makes the first task's
+ * tree differ from its cache artifact after every build: each run restores one producer over the other, and neither is
+ * ever a cache hit.
  */
 export function refuseOverlappingOutputs(graph: ProjectGraph, workspaceRoot: string): void {
   const root = absoluteRoot(workspaceRoot);
@@ -305,9 +331,11 @@ export function refuseOverlappingOutputs(graph: ProjectGraph, workspaceRoot: str
   const overlaps: OutputOverlap[] = [];
   for (const [index, left] of claims.entries()) {
     for (const right of claims.slice(index + 1)) {
-      const sameTarget =
-        left.declared.project === right.declared.project && left.declared.target === right.declared.target;
-      if (!sameTarget && conflicts(left, right)) overlaps.push({ left: left.declared, right: right.declared });
+      const sameTask =
+        left.declared.project === right.declared.project &&
+        left.declared.target === right.declared.target &&
+        left.declared.configuration === right.declared.configuration;
+      if (!sameTask && conflicts(left, right)) overlaps.push({ left: left.declared, right: right.declared });
     }
   }
   if (overlaps.length) throw new OutputOverlapError(overlaps);

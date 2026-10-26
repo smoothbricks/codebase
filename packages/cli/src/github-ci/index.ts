@@ -299,7 +299,14 @@ export async function githubCiNxRunMany(
     // bump, so its HEAD is a coordinate no other job can name; such callers must
     // declare the shared coordinate their consumer validates against instead.
     const sourceSha = options.collectOutputsSourceSha ?? (await readGitHeadSha(root));
-    await collectNxOutputs(root, options.collectOutputs, expandNxTargetDependencyRuns(expanded.runs), sourceSha);
+    // The run's own configuration picks each task's output tree: a production run collects the production tree.
+    await collectNxOutputs(
+      root,
+      options.collectOutputs,
+      expandNxTargetDependencyRuns(expanded.runs),
+      sourceSha,
+      options.configuration,
+    );
   }
   return expanded;
 }

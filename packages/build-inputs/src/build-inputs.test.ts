@@ -5,8 +5,11 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node
 import { dirname, join } from 'node:path';
 import { outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 import {
+  type BuildInputProducer,
   type BuildInputRecord,
+  buildInputProducer,
   buildInputRecord,
+  cargoBuildInputs,
   depInfoFiles,
   gitWorkspaceRoot,
   globPathspec,
@@ -49,45 +52,44 @@ function inGitRepository(files: Readonly<Record<string, string>>, body: (root: s
 }
 
 describe('depInfoFiles', () => {
-  it('names the tracked files of this checkout for the paths of the clone that compiled', async () => {
-    const files = {
-      'package.json': '{}\n',
-      'crates/a/Cargo.toml': '[package]\nname = "a"\n',
-      'crates/a/src/lib.rs': 'pub fn a() {}\n',
-      'crates/a/src/with space.rs': 'pub fn spaced() {}\n',
+  it('names the tracked files of this checkout for the paths of the clone that compiled', () => {
+    const tracked = new Set([
+      'package.json',
+      'crates/a/Cargo.toml',
+      'crates/a/src/lib.rs',
+      'crates/a/src/with space.rs',
+    ]);
+    const root = '/current/checkout';
+    const clone = '/elsewhere/clone';
+    const registry = '/registry/src/foo-1.0';
+    const lib = `${clone}/crates/a/src/lib.rs`;
+    const spaced = `${clone}/crates/a/src/with\\ space.rs`;
+    const manifest = `${clone}/crates/a/src/../Cargo.toml`;
+    const climbing = `${clone}/crates/a/src/../../../package.json`;
+    // As rustc writes one: a rule naming an output's dependencies, then an empty rule for each of them.
+    const depInfo = (...dependencies: string[]) => {
+      const rule = `${clone}/target/debug/deps/liba-0123.d: ${dependencies.join(' ')}`;
+      return [rule, '', ...dependencies.map((path) => `${path}:`), ''].join('\n');
     };
-    await inGitRepository(files, (root) => {
-      const clone = '/elsewhere/clone';
-      const registry = '/Users/x/.cargo/registry/src/foo-1.0';
-      const lib = `${clone}/crates/a/src/lib.rs`;
-      const spaced = `${clone}/crates/a/src/with\\ space.rs`;
-      const manifest = `${clone}/crates/a/src/../Cargo.toml`;
-      const climbing = `${clone}/crates/a/src/../../../package.json`;
-      // As rustc writes one: a rule naming an output's dependencies, then an empty rule for each of them.
-      const depInfo = (...dependencies: string[]) => {
-        const rule = `${clone}/target/debug/deps/liba-0123.d: ${dependencies.join(' ')}`;
-        return [rule, '', ...dependencies.map((path) => `${path}:`), ''].join('\n');
-      };
-      // The clone's absolute paths, one with an escaped space; a registry path that ends in no tracked path is dropped.
-      expect(depInfoFiles(root, depInfo(spaced, `${registry}/src/lib.rs`, lib))).toEqual([
-        'crates/a/src/lib.rs',
-        'crates/a/src/with space.rs',
-      ]);
-      // Paths are normalized first, so one may climb out of its crate to a sibling file or to the clone root.
-      expect(depInfoFiles(root, depInfo(lib, manifest, climbing))).toEqual([
-        'crates/a/Cargo.toml',
-        'crates/a/src/lib.rs',
-        'package.json',
-      ]);
-      // Only the clone root most paths share counts: a registry file whose tail matches a tracked path is no input.
-      expect(depInfoFiles(root, depInfo(`${registry}/crates/a/src/lib.rs`, spaced, manifest, climbing))).toEqual([
-        'crates/a/Cargo.toml',
-        'crates/a/src/with space.rs',
-        'package.json',
-      ]);
-      // The checkout that compiled the artifact itself is the common case.
-      expect(depInfoFiles(root, depInfo(`${root}/crates/a/src/lib.rs`))).toEqual(['crates/a/src/lib.rs']);
-    });
+    // The clone's absolute paths, one with an escaped space; a registry path that ends in no tracked path is dropped.
+    expect(depInfoFiles(tracked, depInfo(spaced, `${registry}/src/lib.rs`, lib))).toEqual([
+      'crates/a/src/lib.rs',
+      'crates/a/src/with space.rs',
+    ]);
+    // Paths are normalized first, so one may climb out of its crate to a sibling file or to the clone root.
+    expect(depInfoFiles(tracked, depInfo(lib, manifest, climbing))).toEqual([
+      'crates/a/Cargo.toml',
+      'crates/a/src/lib.rs',
+      'package.json',
+    ]);
+    // Only the clone root most paths share counts: a registry file whose tail matches a tracked path is no input.
+    expect(depInfoFiles(tracked, depInfo(`${registry}/crates/a/src/lib.rs`, spaced, manifest, climbing))).toEqual([
+      'crates/a/Cargo.toml',
+      'crates/a/src/with space.rs',
+      'package.json',
+    ]);
+    // The checkout that compiled the artifact itself is the common case.
+    expect(depInfoFiles(tracked, depInfo(`${root}/crates/a/src/lib.rs`))).toEqual(['crates/a/src/lib.rs']);
   });
 });
 
@@ -120,6 +122,61 @@ describe('pathspecFiles', () => {
   });
 });
 
+describe('buildInputProducer', () => {
+  const task = { project: 'lib', target: 'tsc-js' };
+  const cases: readonly {
+    name: string;
+    env: NodeJS.ProcessEnv;
+    producer: BuildInputProducer | undefined;
+  }[] = [
+    { name: 'outside an Nx task', env: {}, producer: undefined },
+    { name: 'missing project', env: { NX_TASK_TARGET_TARGET: 'tsc-js' }, producer: undefined },
+    { name: 'missing target', env: { NX_TASK_TARGET_PROJECT: 'lib' }, producer: undefined },
+    { name: 'configuration alone', env: { NX_TASK_TARGET_CONFIGURATION: 'production' }, producer: undefined },
+    {
+      name: 'empty project',
+      env: { NX_TASK_TARGET_PROJECT: '', NX_TASK_TARGET_TARGET: 'tsc-js' },
+      producer: undefined,
+    },
+    {
+      name: 'empty target',
+      env: { NX_TASK_TARGET_PROJECT: 'lib', NX_TASK_TARGET_TARGET: '' },
+      producer: undefined,
+    },
+    {
+      name: 'default configuration',
+      env: { NX_TASK_TARGET_PROJECT: 'lib', NX_TASK_TARGET_TARGET: 'tsc-js' },
+      producer: task,
+    },
+    {
+      name: 'empty configuration is omitted',
+      env: { NX_TASK_TARGET_PROJECT: 'lib', NX_TASK_TARGET_TARGET: 'tsc-js', NX_TASK_TARGET_CONFIGURATION: '' },
+      producer: task,
+    },
+    {
+      name: 'named configuration',
+      env: {
+        NX_TASK_TARGET_PROJECT: 'lib',
+        NX_TASK_TARGET_TARGET: 'tsc-js',
+        NX_TASK_TARGET_CONFIGURATION: 'production',
+      },
+      producer: { ...task, configuration: 'production' },
+    },
+  ];
+
+  it.each(cases)('$name', ({ env, producer }) => {
+    const actual = buildInputProducer(env);
+    expect(actual).toEqual(producer);
+    // No file inputs: constructing and serializing provenance needs no filesystem or process environment.
+    const record = buildInputRecord('', [], undefined, actual);
+    expect('producer' in record).toBe(producer !== undefined);
+    expect(JSON.parse(JSON.stringify(record))).toEqual({
+      version: 1,
+      files: {},
+      ...(producer === undefined ? {} : { producer }),
+    });
+  });
+});
 describe('buildInputRecord', () => {
   it('records each file by the SHA-256 of its bytes, sorted by path, and `complete` only when given', async () => {
     await inTemporaryDirectory(async (root) => {
@@ -176,6 +233,69 @@ describe('gitWorkspaceRoot', () => {
   it('is null outside a Git work tree, where a build records nothing', async () => {
     await inTemporaryDirectory((directory) => {
       expect(gitWorkspaceRoot(directory)).toBeNull();
+    });
+  });
+});
+
+/**
+ * The dep-info rustc writes for an artifact built from `sources` in the clone at `clone`: a rule naming its
+ * dependencies, then an empty rule for each of them.
+ */
+function rustcDepInfo(clone: string, sources: readonly string[]): string {
+  const paths = sources.map((source) => `${clone}/${source}`);
+  return [`${clone}/target/release/cowshed: ${paths.join(' ')}`, '', ...paths.map((path) => `${path}:`), ''].join('\n');
+}
+
+describe('cargoBuildInputs', () => {
+  // A Cargo workspace of three crates, of which a build reads two.
+  const workspace = {
+    'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
+    'Cargo.lock': '# lock\n',
+    'crates/a/Cargo.toml': '[package]\nname = "a"\n',
+    'crates/a/src/lib.rs': 'pub fn a() {}\n',
+    'crates/b/Cargo.toml': '[package]\nname = "b"\n',
+    'crates/b/src/lib.rs': 'pub fn b() {}\n',
+    'crates/c/Cargo.toml': '[package]\nname = "c"\n',
+    'crates/c/src/lib.rs': 'pub fn c() {}\n',
+  };
+
+  it('records the sources rustc read, the manifest of each crate they belong to, and the workspace manifest and lock', async () => {
+    await inGitRepository(workspace, (root) => {
+      // Compiled in a sibling clone, as a shed's cloned `target/` records it; crate `c` was never read.
+      const depInfo = rustcDepInfo('/elsewhere/clone', ['crates/a/src/lib.rs', 'crates/b/src/lib.rs']);
+      const producer = { project: 'cli', target: 'cli-x64-linux', configuration: 'production' };
+      expect(cargoBuildInputs(root, depInfo, root, producer)).toEqual(
+        buildInputRecord(
+          root,
+          [
+            'Cargo.lock',
+            'Cargo.toml',
+            'crates/a/Cargo.toml',
+            'crates/a/src/lib.rs',
+            'crates/b/Cargo.toml',
+            'crates/b/src/lib.rs',
+          ],
+          undefined,
+          producer,
+        ),
+      );
+    });
+  });
+
+  it('leaves out a workspace lock the checkout does not hold', async () => {
+    await inGitRepository({ ...workspace, '.gitignore': 'Cargo.lock\n' }, (root) => {
+      const depInfo = rustcDepInfo(root, ['crates/a/src/lib.rs']);
+      expect(cargoBuildInputs(root, depInfo, root)).toEqual(
+        buildInputRecord(root, ['Cargo.toml', 'crates/a/Cargo.toml', 'crates/a/src/lib.rs']),
+      );
+    });
+  });
+
+  it('is null when the dep-info names no file of the checkout', async () => {
+    await inGitRepository(workspace, (root) => {
+      // A registry file whose tail is no tracked path is no input of this checkout.
+      const depInfo = rustcDepInfo('/registry/src/foo-1.0', ['src/lib.rs']);
+      expect(cargoBuildInputs(root, depInfo, root)).toBeNull();
     });
   });
 });

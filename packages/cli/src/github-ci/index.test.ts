@@ -242,7 +242,7 @@ describe('collected Nx outputs', () => {
 
       const sourceSha = await readGitHeadSha(root);
       expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
-        version: 3,
+        version: 4,
         sourceSha,
         packageVersions: {},
         files: [],
@@ -268,7 +268,7 @@ describe('collected Nx outputs', () => {
       );
 
       expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
-        version: 3,
+        version: 4,
         sourceSha: dispatchSha,
         packageVersions: {},
         files: [],
@@ -290,7 +290,7 @@ describe('collected Nx outputs', () => {
     await withOutputFixture(async ({ root, artifact }) => {
       const manifest = await collectNxOutputs(root, artifact, [], SOURCE_SHA);
 
-      expect(manifest).toEqual({ version: 3, sourceSha: SOURCE_SHA, packageVersions: {}, files: [] });
+      expect(manifest).toEqual({ version: 4, sourceSha: SOURCE_SHA, packageVersions: {}, files: [] });
       await rm(join(artifact, 'workspace'), { recursive: true });
       await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [])).resolves.toBeUndefined();
     });
@@ -433,17 +433,90 @@ describe('collected Nx outputs', () => {
         SOURCE_SHA,
       );
 
-      expect(resolveDeclaredOutput(declaredOutput, outputProject)).toBe(
-        'packages/app/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
-      );
+      expect(resolveDeclaredOutput(declaredOutput, outputProject, 'build-macos', undefined)).toEqual({
+        ok: true,
+        value: 'packages/app/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
+      });
       expect(manifest.files.map((file) => file.path)).toEqual([
         'packages/app/dist/index.d.ts',
         'packages/app/dist/index.d.ts.map',
         'packages/app/dist/index.js',
       ]);
-      expect(() => resolveDeclaredOutput('{options.outputPath}', outputProject)).toThrow(
-        'Unsupported Nx output placeholder',
+      expect(resolveDeclaredOutput('{options.outputPath}', outputProject, 'build-macos', undefined)).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining('Unsupported Nx output placeholder'),
+      });
+    });
+  });
+
+  it('collects the tree of the configuration the run built and refuses a tree another configuration built', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
+      outputProject.targetOutputs = new Map([['build-macos', ['{projectRoot}/{options.outputDir}/']]]);
+      outputProject.targetOptions = new Map([['build-macos', { outputDir: '.cache/bin/darwin' }]]);
+      outputProject.targetConfigurations = new Map([['build-macos', { production: { outputDir: 'dist/bin/darwin' } }]]);
+      const runs = [{ target: 'build-macos', projects: [outputProject] }];
+      await mkdir(join(root, 'packages/app/.cache/bin/darwin'), { recursive: true });
+      await writeFile(join(root, 'packages/app/.cache/bin/darwin/app'), 'development build');
+
+      // A production run declares the production tree, which a development build leaves empty.
+      await expect(collectNxOutputs(root, artifact, runs, SOURCE_SHA, 'production')).rejects.toThrow(
+        'Declared output packages/app/dist/bin/darwin/ for app:build-macos is missing.',
       );
+
+      await mkdir(join(root, 'packages/app/dist/bin/darwin'), { recursive: true });
+      await writeFile(join(root, 'packages/app/dist/bin/darwin/app'), 'production build');
+      const development = await collectNxOutputs(root, join(temp, 'artifact-development'), runs, SOURCE_SHA);
+      expect(development.files.map((file) => [file.output, file.path])).toEqual([
+        ['packages/app/.cache/bin/darwin/', 'packages/app/.cache/bin/darwin/app'],
+      ]);
+      const production = await collectNxOutputs(root, artifact, runs, SOURCE_SHA, 'production');
+      expect(production.files.map((file) => [file.output, file.path])).toEqual([
+        ['packages/app/dist/bin/darwin/', 'packages/app/dist/bin/darwin/app'],
+      ]);
+
+      await rm(join(root, 'packages/app/dist'), { recursive: true });
+      await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
+      expect(await readFile(join(root, 'packages/app/dist/bin/darwin/app'), 'utf8')).toBe('production build');
+    });
+  });
+
+  it('collects the outputs of the configuration an nx-run-many run builds', async () => {
+    await withNxRunManyFixture(async ({ root, artifact, nx, runs }) => {
+      const app: ProjectTargets = {
+        project: 'app',
+        root: 'packages/app',
+        targets: ['build-macos'],
+        targetOutputs: new Map([['build-macos', ['{projectRoot}/{options.outputDir}/']]]),
+        targetOptions: new Map([['build-macos', { outputDir: '.cache/bin/darwin' }]]),
+        targetConfigurations: new Map([
+          [
+            'build-macos',
+            {
+              production: { outputDir: 'dist/bin/darwin' },
+              preview: { outputDir: '.cache/preview/bin/darwin' },
+            },
+          ],
+        ]),
+      };
+      await mkdir(join(root, 'packages/app/dist/bin/darwin'), { recursive: true });
+      await writeFile(join(root, 'packages/app/dist/bin/darwin/app'), 'production build');
+      await mkdir(join(root, 'packages/app/.cache/preview/bin/darwin'), { recursive: true });
+      await writeFile(join(root, 'packages/app/.cache/preview/bin/darwin/app'), 'preview build');
+
+      await githubCiNxRunMany(
+        root,
+        { targets: 'build-macos', projects: 'app', configuration: 'preview', collectOutputs: artifact },
+        { ...nx, readProjectTargets: async () => [app] },
+      );
+
+      expect(runs).toEqual([
+        ['run-many', '-t', 'build-macos', '--projects=app', '--configuration=preview', '--parallel=100%'],
+      ]);
+      expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toMatchObject({
+        files: [
+          { output: 'packages/app/.cache/preview/bin/darwin/', path: 'packages/app/.cache/preview/bin/darwin/app' },
+        ],
+      });
     });
   });
 
@@ -512,13 +585,13 @@ describe('collected Nx outputs', () => {
         SOURCE_SHA,
       );
       expect(manifest).toMatchObject({
-        version: 3,
+        version: 4,
         sourceSha: SOURCE_SHA,
         files: [
           {
             project: 'app',
             target: 'build-macos',
-            output: '{projectRoot}/dist/**/*.bin',
+            output: 'packages/app/dist/**/*.bin',
             path: 'packages/app/dist/result.bin',
             size: 15,
           },
@@ -555,7 +628,7 @@ describe('collected Nx outputs', () => {
     });
   });
 
-  it('rejects v1 and v2 collected manifests', async () => {
+  it('rejects v1, v2 and v3 collected manifests', async () => {
     await withOutputFixture(async ({ root, artifact, outputProject }) => {
       await writeFile(join(root, 'packages/app/dist/result.bin'), 'native artifact');
       const manifest = await collectNxOutputs(
@@ -565,7 +638,7 @@ describe('collected Nx outputs', () => {
         SOURCE_SHA,
       );
 
-      for (const version of [1, 2]) {
+      for (const version of [1, 2, 3]) {
         await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify({ ...manifest, version })}\n`);
         await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
           'Invalid collected output manifest',
@@ -684,6 +757,16 @@ describe('collected Nx outputs', () => {
         'Invalid collected output manifest',
       );
 
+      await writeFile(
+        join(artifact, 'manifest.json'),
+        JSON.stringify({
+          ...manifest,
+          files: manifest.files.map((file) => ({ ...file, configuration: 'production' })),
+        }),
+      );
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'Invalid collected output manifest',
+      );
       await writeFile(
         join(artifact, 'manifest.json'),
         `${JSON.stringify({

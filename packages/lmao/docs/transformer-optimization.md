@@ -240,7 +240,11 @@ The identical wrapper harness under Bun measured child-span results from 0.5% sl
 faster) and overflow results from 9.6% to 9.9% faster (median run: 9.7% faster). Chrome therefore confirms a small
 root/child improvement and a repeatable overflow improvement, not the superseded 10x projection. The retained browser
 harness is `packages/lmao-expo-benchmark/src/superblock-benchmark.ts`; its CLI entry point is
-`superblock-benchmark.bench.ts`.
+`superblock-benchmark.bench.ts`. `nx run lmao-expo-benchmark:export-browser` builds the Expo web benchmark and
+`export-hermes` its Hermes bundle. Each runs its `off-steady` configuration unless another `<transform>-<mode>` one is
+named, and writes that flavour to `dist/web/<transform>-<mode>/` or `dist/headless/<transform>-<mode>/` respectively.
+The web build serves `public/allocator.wasm`, which the one `prepare-web-wasm` target stages from `lmao:cargo-wasm`'s
+dev build, so what a new run records describes that build, not the shipped release one.
 
 ### E. Compile-time row-header packing (the write batching that works)
 

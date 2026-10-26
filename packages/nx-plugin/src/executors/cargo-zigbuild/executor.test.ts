@@ -1,6 +1,20 @@
 import { describe, expect, it } from 'bun:test';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
+import { BUILD_INPUTS_FILE, type BuildInputRecord, cargoBuildInputs } from '@smoothbricks/build-inputs';
+import { outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 
-import { artifactFile, cargoTriple, zigbuildArgs, zigbuildEnv } from './executor.js';
+import {
+  artifactFile,
+  buildInputsOf,
+  cargoTriple,
+  depInfoPath,
+  publishArtifact,
+  type ZigbuildArtifact,
+  zigbuildArgs,
+  zigbuildEnv,
+} from './executor.js';
 
 const MANIFEST = '/repo/packages/cowshed/crates/cowshed-cli/Cargo.toml';
 
@@ -23,6 +37,16 @@ function artifactLine(fields: {
     executable: fields.executable,
     fresh: false,
   });
+}
+
+/** Runs `body` in a new physical directory outside any Git work tree, removed however `body` ends. */
+async function inTemporaryDirectory(body: (root: string) => Promise<void>): Promise<void> {
+  const root = await realpath(await mkdtemp(join(outsideTreesTmpdir(), 'smoo-cargo-zigbuild-')));
+  try {
+    await body(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 describe('cargo-zigbuild executor', () => {
@@ -125,5 +149,93 @@ describe('cargo-zigbuild executor', () => {
     expect(() =>
       artifactFile('{"reason":"compiler-artifact","manifest_path":7}', MANIFEST, { kind: 'cdylib' }),
     ).toThrow('does not match the artifact contract');
+  });
+
+  it('finds the dep-info cargo uplifts beside an artifact: its file name with any extension replaced by .d', () => {
+    const uplifted: [artifact: string, depInfo: string][] = [
+      // The static CLI has no extension; the addon's shared object and a Windows executable lose theirs.
+      [
+        '/repo/target/x86_64-unknown-linux-musl/release/cowshed',
+        '/repo/target/x86_64-unknown-linux-musl/release/cowshed.d',
+      ],
+      [
+        '/repo/target/x86_64-unknown-linux-gnu/debug/libcowshed_napi.so',
+        '/repo/target/x86_64-unknown-linux-gnu/debug/libcowshed_napi.d',
+      ],
+      [
+        '/repo/target/x86_64-pc-windows-gnu/release/cowshed.exe',
+        '/repo/target/x86_64-pc-windows-gnu/release/cowshed.d',
+      ],
+      // A dot in a directory is no extension of the file.
+      ['/repo/v1.2/target/release/cowshed', '/repo/v1.2/target/release/cowshed.d'],
+    ];
+    for (const [artifact, depInfo] of uplifted) expect(depInfoPath(artifact)).toBe(depInfo);
+  });
+
+  it('names the inputs of a build from the dep-info beside its artifact, or why it cannot', async () => {
+    await inTemporaryDirectory(async (root) => {
+      const manifest = join(root, 'crates/cli/Cargo.toml');
+      const built = join(root, 'target/x86_64-unknown-linux-musl/release/cowshed');
+      const depInfo = join(root, 'target/x86_64-unknown-linux-musl/release/cowshed.d');
+      await mkdir(dirname(manifest), { recursive: true });
+      // Outside a Git work tree there is nothing to name an input relative to.
+      expect(buildInputsOf(built, manifest, root)).toEqual({
+        ok: false,
+        error: `${dirname(manifest)} is not in a Git work tree, so no input can be named`,
+      });
+      execFileSync('git', ['init', '-q', root]);
+      expect(buildInputsOf(built, manifest, root)).toEqual({
+        ok: false,
+        error: `${depInfo} does not exist: cargo wrote no dep-info beside ${built}`,
+      });
+      const files = {
+        '.gitignore': 'target/\n',
+        'Cargo.toml': '[workspace]\nmembers = ["crates/cli"]\n',
+        'Cargo.lock': '# lock\n',
+        'crates/cli/Cargo.toml': '[package]\nname = "cli"\n',
+        'crates/cli/src/main.rs': 'fn main() {}\n',
+      };
+      for (const [file, text] of Object.entries(files)) {
+        await mkdir(dirname(join(root, file)), { recursive: true });
+        await writeFile(join(root, file), text);
+      }
+      await mkdir(dirname(depInfo), { recursive: true });
+      // A registry file whose tail is no tracked path is no input of this checkout.
+      await writeFile(depInfo, `${built}: /registry/src/foo-1.0/src/lib.rs\n`);
+      expect(buildInputsOf(built, manifest, root)).toEqual({ ok: false, error: `${depInfo} names no file of ${root}` });
+      // Compiled in a sibling clone, as a shed's cloned target directory records it.
+      const depInfoText = `${built}: /elsewhere/clone/crates/cli/src/main.rs\n`;
+      await writeFile(depInfo, depInfoText);
+      const producer = { project: 'cli', target: 'cli-x64-linux' };
+      expect(buildInputsOf(built, manifest, root, producer)).toEqual({
+        ok: true,
+        value: cargoBuildInputs(root, depInfoText, root, producer),
+      });
+    });
+  });
+
+  it('publishes the artifact and its input record into the output directory and leaves nothing partial', async () => {
+    await inTemporaryDirectory(async (root) => {
+      const built = join(root, 'target/release/artifact');
+      await mkdir(dirname(built), { recursive: true });
+      await writeFile(built, 'artifact bytes');
+      const record: BuildInputRecord = {
+        version: 1,
+        files: { 'crates/cli/src/main.rs': '0'.repeat(64) },
+        producer: { project: 'cli', target: 'cli-x64-linux' },
+      };
+      const published: [ZigbuildArtifact, string][] = [
+        [{ kind: 'bin', name: 'cowshed' }, join(root, '.cache/bin/linux-x64/cowshed')],
+        [{ kind: 'cdylib' }, join(root, 'dist/native/linux-x64-gnu/cowshed.linux-x64-gnu.node')],
+      ];
+      for (const [artifact, output] of published) {
+        await publishArtifact(built, output, artifact, record);
+        expect(await readFile(output, 'utf8')).toBe('artifact bytes');
+        if (artifact.kind === 'bin') expect((await stat(output)).mode & 0o111).toBe(0o111);
+        const directory = dirname(output);
+        expect(JSON.parse(await readFile(join(directory, BUILD_INPUTS_FILE), 'utf8'))).toEqual(record);
+        expect((await readdir(directory)).sort()).toEqual([BUILD_INPUTS_FILE, basename(output)]);
+      }
+    });
   });
 });

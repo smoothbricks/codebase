@@ -644,7 +644,7 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
         error.message
     );
     assert!(error.hint.contains("--release"), "{}", error.hint);
-    // The remedy must name a build that this guard accepts. `nx run cowshed:build` builds the
+    // The remedy must name a build that this guard accepts. `nx run cowshed:cli-native` builds the
     // platform `cli-*` target in its default configuration, which is a debug build: a hint
     // naming it sent the operator straight back here.
     // Resolved at run time: `env!` would compile the building checkout's path into the binary,

@@ -19,8 +19,8 @@ import {
 import { VoProgramAdmissionUnavailableError } from '../vo-program-metadata.js';
 import { createColumineWasmBackend, VmStateAdmissionError } from '../wasm-backend.js';
 
-// The shipped wasm-opt output, as in composite-struct-map.test.ts: never gated on presence.
-const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
+// The dev wasm-opt output, as in composite-struct-map.test.ts: never gated on presence.
+const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 
 const CAPACITY = 4;
 const VALUE_FIELD = 0;

@@ -6,6 +6,7 @@ import { readJson, writeJson } from 'nx/src/devkit-exports.js';
 import typia from 'typia';
 
 import { CARGO_TEST_TARGET } from './cargo-workspace.js';
+import { cargoCrossTestTargetName } from './cross-check-policy.js';
 import { writeJsonFile } from './managed-files/managed-format.js';
 
 export const MANAGED_FILES_SYNC_GENERATOR = '@smoothbricks/nx-plugin:managed-files';
@@ -50,20 +51,35 @@ export function isBuildOutputTargetName(name: string): boolean {
 }
 
 /**
- * A target whose job is to RUN tests. `test`, anything under `test-`/`test:`,
- * and the plugin's own `cargo-test-<crate>` namespace. Deliberately name-based:
- * the aggregate is assembled from declared AND inferred target names, and a
- * declaration carries no marker saying "this executes rather than emits".
- *
- * A runner collides with the families by construction whenever its name ends in
- * one: a crate named `…-js` puts `cargo-test-<crate>` in the family, and a bun
- * suite named `test-bun` reads as "tool=test, output=bun". Both would drag a
- * test suite into `build`, so the rule is the CLASS, not one namespace.
+ * The runners under the `test` namespace: `test`, anything under `test-`/`test:`, and the plugin's own
+ * `cargo-test-<crate>` namespace. Inference gives a declared one `test`'s build prerequisites, which a suite named for
+ * what it tests (`launcher-test`) never gets: it states its own producers.
  */
-export function isTestRunnerTargetName(name: string): boolean {
+export function isTestNamespaceTargetName(name: string): boolean {
   return (
     name === 'test' || name.startsWith('test-') || name.startsWith('test:') || name.startsWith(`${CARGO_TEST_TARGET}-`)
   );
+}
+
+/**
+ * The plugin's foreign-triple test namespace, `cargo-cross-test-archive-<triple>` and `cargo-cross-test-<triple>`. It
+ * sits beside `cargo-test-<crate>`, not under it, so a triple never reads as a crate.
+ */
+const CARGO_CROSS_TEST_NAMESPACE = cargoCrossTestTargetName('');
+
+/**
+ * A target whose job is to RUN tests or to compile the binaries they run: the `test` namespace above, any
+ * `<suite>-test` (the `cargo-test` aggregate, `napi-test`, `launcher-test`) and the cross namespace. Deliberately
+ * name-based: the aggregate is assembled from declared AND inferred target names, and a declaration carries no marker
+ * saying "this executes rather than emits".
+ *
+ * A runner collides with the families by construction whenever its name ends in one: a crate named `…-js` puts
+ * `cargo-test-<crate>` in the family, a triple ending `-android` does the same to `cargo-cross-test-<triple>`, and a
+ * bun suite named `test-bun` reads as "tool=test, output=bun". All would drag a test suite into `build`, so the rule
+ * is the CLASS, not one namespace.
+ */
+export function isTestRunnerTargetName(name: string): boolean {
+  return isTestNamespaceTargetName(name) || name.endsWith('-test') || name.startsWith(CARGO_CROSS_TEST_NAMESPACE);
 }
 
 const nxJsTypescriptPlugin = '@nx/js/typescript';

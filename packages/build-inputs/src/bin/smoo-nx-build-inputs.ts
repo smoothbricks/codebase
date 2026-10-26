@@ -8,21 +8,15 @@
  *
  * `--dep-info` is relative to Cargo's target directory (`aarch64-apple-darwin/debug/libcowshed_napi.d`), the file
  * rustc wrote listing every source it read. The record lists those workspace files, the `Cargo.toml` of each crate
- * they belong to, and the workspace `Cargo.lock`, which decides every dependency's bytes. It is part of the target's
- * Nx outputs, so a cache hit restores the record that describes the restored binary.
+ * they belong to, and the workspace `Cargo.lock`, which decides every dependency's bytes (`cargoBuildInputs`, the same
+ * record the cargo-zigbuild executor writes for a Linux build). It is part of the target's Nx outputs, so a cache hit
+ * restores the record that describes the restored binary. Run by an Nx task, it also names that task
+ * (`buildInputProducer`).
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
-import { dirname as dirnamePosix, join as joinPosix } from 'node:path/posix';
-import {
-  buildInputRecord,
-  depInfoFiles,
-  gitWorkspaceRoot,
-  pathspecFiles,
-  workspacePath,
-  writeBuildInputs,
-} from '../build-inputs.js';
+import { buildInputProducer, cargoBuildInputs, gitWorkspaceRoot, writeBuildInputs } from '../build-inputs.js';
 
 const USAGE =
   'usage: smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <path under the Cargo target directory> --output <directory>';
@@ -65,23 +59,7 @@ if (typeof cargoRoot !== 'string') fail('cargo metadata names no workspace_root'
 const depInfo = isAbsolute(depInfoPath) ? depInfoPath : join(targetDirectory, depInfoPath);
 if (!existsSync(depInfo)) fail(`${depInfo} does not exist: the build did not write the dep-info this target names`);
 
-const sources = depInfoFiles(workspaceRoot, readFileSync(depInfo, 'utf8'));
-if (sources.length === 0) fail(`${depInfo} names no file of ${workspaceRoot}`);
-const tracked = new Set(pathspecFiles(workspaceRoot, ['.']));
-const manifests = new Set<string>();
-for (const source of sources) {
-  for (let directory = dirnamePosix(source); directory !== '.'; directory = dirnamePosix(directory)) {
-    const manifest = joinPosix(directory, 'Cargo.toml');
-    if (tracked.has(manifest)) {
-      manifests.add(manifest);
-      break;
-    }
-  }
-}
-for (const name of ['Cargo.toml', 'Cargo.lock']) {
-  const file = workspacePath(workspaceRoot, join(realpathSync(cargoRoot), name));
-  if (tracked.has(file)) manifests.add(file);
-}
-// Hashed after the build, the only time rustc's list exists: a source edited during the build is recorded with its new
-// bytes. Nx's own cache key is computed before the build and has the same window.
-writeBuildInputs(output, buildInputRecord(workspaceRoot, [...sources, ...manifests]));
+const producer = buildInputProducer(process.env);
+const inputs = cargoBuildInputs(workspaceRoot, readFileSync(depInfo, 'utf8'), cargoRoot, producer);
+if (inputs === null) fail(`${depInfo} names no file of ${workspaceRoot}`);
+writeBuildInputs(output, inputs);

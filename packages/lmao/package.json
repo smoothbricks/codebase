@@ -267,6 +267,7 @@
         }
       },
       "cargo-wasm": {
+        "//": "outputDir is the directory each configuration copies allocator.wasm into, and the declared output reads the same option, so the copy and what Nx restores cannot differ: .cache/wasm-dev by default, dist in production, the tree the package publishes (packages/nx-plugin/README.md, Cargo profiles). src/lib/wasm/wasmAllocator.ts loads the build its package's source authority names.",
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
@@ -292,15 +293,17 @@
           }
         ],
         "outputs": [
-          "{projectRoot}/dist/allocator.wasm"
+          "{projectRoot}/{options.outputDir}/allocator.wasm"
         ],
         "options": {
-          "command": "just wasm",
-          "cwd": "{projectRoot}"
+          "command": "just wasm dev {args.outputDir}",
+          "cwd": "{projectRoot}",
+          "outputDir": ".cache/wasm-dev"
         },
         "configurations": {
           "production": {
-            "command": "just wasm release"
+            "command": "just wasm release {args.outputDir}",
+            "outputDir": "dist"
           }
         }
       },

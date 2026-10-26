@@ -116,40 +116,91 @@ export function align8(value: number, label = 'aligned byte count'): number {
   return result;
 }
 
-/** Load a wasm artifact from an explicit path or the two default dist locations. */
-export async function loadWasmBytes(
-  customPath: string | URL | undefined,
-  defaultFileName: string,
-): Promise<ArrayBuffer | undefined> {
+// The VM crate's tracked source entry. `files` publishes dist/ and never crates/, so a package that holds it is a
+// checkout and one that lacks it is installed, or a snapshot of an installed one.
+const SOURCE_ENTRY = 'crates/columine-wasm/src/lib.rs';
+
+export function wasmPackageRoot(moduleUrl: string): URL {
+  // Source modules sit in src/ and built ones in dist/ts/.
+  return new URL(moduleUrl.includes('/dist/ts/') ? '../../' : '../', moduleUrl);
+}
+
+/** The build of one wasm artifact a package runs, and the Nx target that writes it where a checkout builds it. */
+export interface WasmArtifact {
+  readonly url: URL;
+  /** `columine:cargo-wasm` in a checkout; `null` for an installed package, which ships its build. */
+  readonly producer: string | null;
+}
+
+/**
+ * Which build a package loads for `fileName`, by source authority
+ * (packages/nx-plugin/README.md, "Cargo profiles"). A package holding its crate's tracked source entry is a checkout:
+ * it loads its own dev build, .cache/wasm-dev/<fileName>, even through its compiled dist/ts, because those are the
+ * bytes its sources and tests describe. Any other package loads the shipped build, dist/<fileName>. Neither stands in
+ * for the other: whichever is selected and absent is an error. The I/O shell supplies source presence.
+ */
+export function selectWasmArtifact(root: URL, fileName: string, holdsSource: boolean): WasmArtifact {
+  return holdsSource
+    ? { url: new URL(`.cache/wasm-dev/${fileName}`, root), producer: 'columine:cargo-wasm' }
+    : { url: new URL(`dist/${fileName}`, root), producer: null };
+}
+
+/** Only an absent source entry selects the shipping profile; other HTTP failures remain failures. */
+export function sourceEntryStatus(status: number): 'present' | 'absent' | 'error' {
+  if (status >= 200 && status < 300) return 'present';
+  return status === 404 ? 'absent' : 'error';
+}
+
+async function fetchBytes(location: string | URL): Promise<BufferSource> {
+  const address = typeof location === 'string' && URL.canParse(location) ? new URL(location) : location;
+  if (
+    typeof process !== 'undefined' &&
+    process.versions?.node &&
+    (typeof address === 'string' || address.protocol === 'file:')
+  ) {
+    const { readFile } = await import('node:fs/promises');
+    return await readFile(address);
+  }
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the package's own wasm artifact at a caller-given or module-relative URL: a local file read under Bun, or a static asset of the page's own origin in a browser, loaded the way its scripts are; a hung page load ends with the page
+  const response = await fetch(address);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return await response.arrayBuffer();
+}
+
+/** The filesystem or served package tree, never the JavaScript output directory, answers source authority. */
+async function holdsTrackedSource(entry: URL): Promise<boolean> {
+  try {
+    if (entry.protocol === 'file:') {
+      const { access } = await import('node:fs/promises');
+      await access(entry);
+      return true;
+    }
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a HEAD request for this module's own source entry on the page's origin; a hung page load ends with the page
+    const response = await fetch(entry, { method: 'HEAD' });
+    const status = sourceEntryStatus(response.status);
+    if (status === 'error') throw new Error(`HTTP ${response.status}`);
+    return status === 'present';
+  } catch (cause) {
+    if (entry.protocol === 'file:' && cause instanceof Error && Reflect.get(cause, 'code') === 'ENOENT') return false;
+    throw new Error(`Could not check source authority at ${entry.href}.`, { cause });
+  }
+}
+
+/** Load a wasm artifact from an explicit path, or from the build this package runs (see selectWasmArtifact). */
+export async function loadWasmBytes(customPath: string | URL | undefined, fileName: string): Promise<BufferSource> {
   if (customPath) {
-    try {
-      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the package's own wasm artifact at a caller-given path: a local file read under Bun and Node, or a static asset of the page's own origin in a browser, loaded the way its scripts are; a hung page load ends with the page
-      const response = await fetch(customPath);
-      if (response.ok) {
-        return await response.arrayBuffer();
-      }
-    } catch {
-      // File not found or other error
-    }
-    return undefined;
+    return await fetchBytes(customPath).catch((cause: unknown) => {
+      throw new Error(`Could not load ${fileName} from ${String(customPath)}.`, { cause });
+    });
   }
-
-  const defaultPaths = [
-    new URL(`../${defaultFileName}`, import.meta.url),
-    new URL(`../dist/${defaultFileName}`, import.meta.url),
-  ];
-
-  for (const path of defaultPaths) {
-    try {
-      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the package's own wasm artifact beside this module: a local file read under Bun and Node, or a static asset of the page's own origin in a browser, loaded the way its scripts are; a hung page load ends with the page
-      const response = await fetch(path);
-      if (response.ok) {
-        return await response.arrayBuffer();
-      }
-    } catch {
-      // Try next
-    }
-  }
-
-  return undefined;
+  const root = wasmPackageRoot(import.meta.url);
+  const holdsSource = await holdsTrackedSource(new URL(SOURCE_ENTRY, root));
+  const artifact = selectWasmArtifact(root, fileName, holdsSource);
+  const remedy =
+    artifact.producer === null
+      ? ' Reinstall @smoothbricks/columine, whose dist/ ships it.'
+      : ` Run "nx run ${artifact.producer}".`;
+  return await fetchBytes(artifact.url).catch((cause: unknown) => {
+    throw new Error(`Could not load ${fileName} from ${artifact.url.href}.${remedy}`, { cause });
+  });
 }

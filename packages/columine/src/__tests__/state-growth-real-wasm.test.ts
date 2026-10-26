@@ -18,7 +18,7 @@ import {
 import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
 import { WasmHostRegion } from '../wasm-memory-contract.js';
 
-const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
+const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 
 function program(init: readonly number[], reduce: readonly number[], numSlots: number, numInputs: number): Uint8Array {
   const initCode = new Uint8Array([...init, Opcode.HALT]);

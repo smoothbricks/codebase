@@ -28,9 +28,10 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    findings aside, a waiver in the named `waivers.json` is only for committed synthetic fixtures.
 2. Host storage missing → `cowshed doctor` (bare doctor mutates nothing; `--repair` also runs the gc sweep), then its
    `next:` command, usually `cowshed setup`. Setup installs the invoking build as the one installed cowshed (CLI and
-   daemon, one artifact): typing `cowshed setup` runs the installed copy and installs nothing new, so install a checkout
-   build via its own `packages/cowshed/bin/cowshed setup`, never symlink `cowshed` on PATH into a checkout, and expect
-   setup to refuse a build older than the installed one (`--downgrade` only when intended).
+   daemon, one artifact): typing `cowshed setup` runs the installed copy and installs nothing new, so install a
+   checkout's release build by its own path, `packages/cowshed/dist/bin/<platform>/cowshed setup`, never symlink
+   `cowshed` on PATH into a checkout, and expect setup to refuse a build older than the installed one (`--downgrade`
+   only when intended).
 3. One workspace per agent; work there, never in shared `main` (standalone Markdown unrelated to any shed's code is the
    exception: see "Batch a round of units"). Pass `--project <git-root>` explicitly rather than trusting cwd. Retire
    finished sheds; storage grows with divergence, not clone count.

@@ -27,9 +27,11 @@ afterEach(async () => {
 });
 
 /**
- * A checkout-shaped fixture: the launcher at `packages/cowshed/bin/cowshed`, a workspace
- * `target/release`, and a home for the host-stable install. Every binary is a script that says
- * which one it is and echoes its argv, then exits 17.
+ * A published-package-shaped fixture: the launcher at `packages/cowshed/bin/cowshed`, the package's
+ * development (`.cache/bin`) and packaged (`dist/bin`) trees, a cargo `target/release` no profile
+ * falls back to, and a home for the host-stable install. `checkout()` adds the tracked CLI crate
+ * entry, `crates/cowshed-cli/src/main.rs`, that makes it a source checkout. Every binary is a script
+ * that says which one it is and echoes its argv, then exits 17.
  */
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'cowshed-launcher-'));
@@ -44,7 +46,14 @@ async function fixture() {
     packageRoot,
     launcher,
     home,
+    development: (directory: string) => join(packageRoot, '.cache', 'bin', directory, 'cowshed'),
     packaged: (directory: string) => join(packageRoot, 'dist', 'bin', directory, 'cowshed'),
+    /** The tracked CLI crate entry a checkout holds and no published package ships. */
+    async checkout(): Promise<void> {
+      const entry = join(packageRoot, 'crates', 'cowshed-cli', 'src');
+      await mkdir(entry, { recursive: true });
+      await writeFile(join(entry, 'main.rs'), '');
+    },
     workspace: join(root, 'target', 'release', 'cowshed'),
     stable: join(home, 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed'),
     /** A `uname` on PATH that reports `answer` for `-sm`. */
@@ -82,15 +91,43 @@ const host = HOST_DIRECTORY ?? 'darwin-arm64';
 const hostOnly = HOST_DIRECTORY === null ? it.skip : it;
 
 describe('cowshed launcher', () => {
-  hostOnly('runs the binary packaged for this host, passing argv and exit status through', async () => {
+  hostOnly('runs the build its source authority picks, passing argv and exit status through', async () => {
     const f = await fixture();
-    await named(f.packaged(host), 'packaged');
     await named(f.workspace, 'workspace');
+    const argv = ['exec', 'raven', '--', 'printf', 'two words'];
 
-    const run = launch(f.launcher, ['exec', 'raven', '--', 'printf', 'two words'], f);
+    const unbuilt = launch(f.launcher, argv, f);
 
-    expect(run.status).toBe(17);
-    expect(run.stdout).toBe('packaged [exec] [raven] [--] [printf] [two words]');
+    expect(unbuilt.status).toBe(5);
+    expect(unbuilt.stdout).toBe('');
+    expect(unbuilt.stderr).toContain(`dist/bin/${host}/cowshed`);
+    expect(unbuilt.stderr).toContain('next: install a published @smoothbricks/cowshed');
+
+    await named(f.packaged(host), 'packaged');
+
+    const published = launch(f.launcher, argv, f);
+
+    expect(published.status).toBe(17);
+    expect(published.stdout).toBe('packaged [exec] [raven] [--] [printf] [two words]');
+
+    // A tracked CLI crate entry makes it a checkout: it runs its development build, and neither the packaged
+    // tree beside it nor a cargo release is a substitute for one it has not built.
+    await f.checkout();
+
+    const unbuiltCheckout = launch(f.launcher, argv, f);
+
+    expect(unbuiltCheckout.status).toBe(5);
+    expect(unbuiltCheckout.stdout).toBe('');
+    expect(unbuiltCheckout.stderr).toContain(`.cache/bin/${host}/cowshed`);
+    expect(unbuiltCheckout.stderr).not.toContain('dist/bin');
+    expect(unbuiltCheckout.stderr).toContain('next: build it with `nx run cowshed:cli-native`');
+
+    await named(f.development(host), 'development');
+
+    const developed = launch(f.launcher, argv, f);
+
+    expect(developed.status).toBe(17);
+    expect(developed.stdout).toBe('development [exec] [raven] [--] [printf] [two words]');
   });
 
   it('picks the directory for the host uname reports, for every host the package ships', async () => {
@@ -106,15 +143,6 @@ describe('cowshed launcher', () => {
     }
   });
 
-  hostOnly('uses target/release of the workspace a linked checkout sits in when nothing is packaged', async () => {
-    const f = await fixture();
-    await named(f.workspace, 'workspace');
-
-    const run = launch(f.launcher, ['doctor'], f);
-
-    expect(run.stdout).toBe('workspace [doctor]');
-  });
-
   hostOnly('follows the chain of links a package manager puts in front of it', async () => {
     const f = await fixture();
     await named(f.packaged(host), 'packaged');
@@ -128,27 +156,17 @@ describe('cowshed launcher', () => {
     expect(launch(absolute, ['--version'], f).stdout).toBe('packaged [--version]');
   });
 
-  hostOnly('says every path it looked in, and exits environment-missing, when no binary exists', async () => {
-    const f = await fixture();
-
-    const run = launch(f.launcher, ['path', 'main'], f);
-
-    expect(run.status).toBe(5);
-    expect(run.stdout).toBe('');
-    expect(run.stderr).toContain(`dist/bin/${host}/cowshed`);
-    expect(run.stderr).toContain('target/release/cowshed');
-    expect(run.stderr).toContain('next: build this platform with `nx build cowshed -c production`');
-  });
-
-  it('names the host it ships no binary for without looking in dist', async () => {
+  it('names the host it ships no binary for without looking in dist or .cache', async () => {
     const f = await fixture();
     await named(f.packaged(host), 'packaged');
+    await named(f.development(host), 'development');
 
     const run = launch(f.launcher, ['ls'], { home: f.home, path: await f.uname('FreeBSD amd64') });
 
     expect(run.status).toBe(5);
     expect(run.stderr).toContain('ships no CLI binary for FreeBSD amd64');
     expect(run.stderr).not.toContain('dist/bin');
+    expect(run.stderr).not.toContain('.cache/bin');
   });
 
   hostOnly('restores the execute bit a publish dropped from a packaged binary', async () => {

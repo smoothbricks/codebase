@@ -18,14 +18,14 @@ const parseCowshedManifest = typia.json.createAssertParse<CowshedManifest>();
 const ARCHIVE_EDGE = { target: 'cargo-test-archive', projects: ['@smoothbricks/codebase'] };
 
 describe('cowshed host-controller-test wiring', () => {
-  it('depends on the host build aggregate and the root archive', async () => {
+  it('depends on the host CLI, addon, JavaScript and root archive it actually reads', async () => {
     const manifest = parseCowshedManifest(
       await readFile(new URL('../../cowshed/package.json', import.meta.url), 'utf8'),
     );
     const { dependsOn } = manifest.nx.targets['host-controller-test'];
-    // `build` refreshes the JS and host-platform addon the worker proofs load. Without it, a run loads
-    // whatever `dist/native` addon an earlier build left behind.
-    expect(dependsOn).toContain('build');
+    // The worker proof loads the compiled package without NAPI_DEBUG_ADDON, and starts the checkout's host CLI.
+    for (const producer of ['cli-native', 'napi-native', 'tsc-js']) expect(dependsOn).toContain(producer);
+    expect(dependsOn).not.toContain('build');
     expect(dependsOn).toContainEqual(ARCHIVE_EDGE);
   });
 });

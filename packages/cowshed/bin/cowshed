@@ -11,9 +11,13 @@
 #   it exists: for it the installed copy is authoritative even when stale. `setup` and `gateway`
 #   deliberately run the invoking binary, because `setup` writes the stable install and
 #   `gateway start`/`status` compare the daemon's executable with the one asking.
-# - otherwise the binary packaged for this host under dist/bin/<platform>/, restoring an execute
-#   bit a publish lost;
-# - otherwise target/release/cowshed of the workspace a linked checkout of this package sits in.
+# - otherwise the package's source authority picks the one build. A checkout, which holds the
+#   tracked crates/cowshed-cli/src/main.rs no published package ships, runs the development build
+#   under .cache/bin/<platform>/ that the default `cli-*` target writes; a published package runs
+#   the binary packaged under dist/bin/<platform>/, restoring an execute bit a publish lost.
+#   Neither falls back to the other, nor to a cargo target/release: a missing build is an error.
+#   Only its presence is judged: whether a development build still matches its sources is the
+#   shell-entry guard's question, asked once, never on each exec.
 set -eu
 
 # Package managers link `bin` entries, sometimes through a chain of links.
@@ -57,25 +61,29 @@ for argument in "$@"; do
   break
 done
 
-if [ -n "$platform" ]; then
-  packaged=$package/dist/bin/$platform/cowshed
-  if consider "$packaged"; then
-    # A publish can apply the binaries without their execute bit; restore it once. An
-    # unwritable copy stays as it is, and exec reports the permission it lacks.
-    [ -x "$packaged" ] || chmod +x "$packaged" 2>/dev/null || :
-    exec "$packaged" "$@"
+if [ -z "$platform" ]; then
+  echo "cowshed: cowshed ships no CLI binary for $(uname -sm)" >&2
+  exit 5
+fi
+
+if [ -f "$package/crates/cowshed-cli/src/main.rs" ]; then
+  # Written by this checkout's own build, so unlike a published binary it keeps its execute bit.
+  development=$package/.cache/bin/$platform/cowshed
+  if consider "$development"; then
+    exec "$development" "$@"
   fi
+  echo "cowshed: no development CLI build found; looked in $searched" >&2
+  echo "next: build it with \`nx run cowshed:cli-native\`" >&2
+  exit 5
 fi
 
-workspace=$package/../../target/release/cowshed
-if consider "$workspace"; then
-  exec "$workspace" "$@"
+packaged=$package/dist/bin/$platform/cowshed
+if consider "$packaged"; then
+  # A publish can apply the binaries without their execute bit; restore it once. An
+  # unwritable copy stays as it is, and exec reports the permission it lacks.
+  [ -x "$packaged" ] || chmod +x "$packaged" 2>/dev/null || :
+  exec "$packaged" "$@"
 fi
-
-if [ -n "$platform" ]; then
-  echo "cowshed: no cowshed CLI binary found; looked in $searched" >&2
-else
-  echo "cowshed: cowshed ships no CLI binary for $(uname -sm); looked in $searched" >&2
-fi
-echo "next: build this platform with \`nx build cowshed -c production\`, or install a published @smoothbricks/cowshed" >&2
+echo "cowshed: no cowshed CLI binary found; looked in $searched" >&2
+echo "next: install a published @smoothbricks/cowshed" >&2
 exit 5

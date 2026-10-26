@@ -67,7 +67,7 @@
         ]
       },
       "cargo-wasm": {
-        "//": "Every workspace member's Cargo.toml is an input, not only columine's and bitmosaic's: .cargo/config.toml resolves features workspace-wide, so a host-only crate's manifest decides which features the wasm32 build compiles. Moving cowshed-shell's brush edge out of wasm32 changed event_processor.wasm's imports without touching any path this target used to hash.",
+        "//": "Every workspace member's Cargo.toml is an input, not only columine's and bitmosaic's: .cargo/config.toml resolves features workspace-wide, so a host-only crate's manifest decides which features the wasm32 build compiles. Moving cowshed-shell's brush edge out of wasm32 changed event_processor.wasm's imports without touching any path this target used to hash. outputDir is the directory each configuration's recipes copy into and its declared outputs name, one option for both so the copy cannot differ from what Nx restores: .cache/wasm-dev by default, dist in production, the tree the package publishes (packages/nx-plugin/README.md, Cargo profiles). src/wasm-memory-contract.ts loads the build its package's source authority names.",
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
@@ -88,16 +88,18 @@
           "{projectRoot}/justfile"
         ],
         "outputs": [
-          "{projectRoot}/dist/columine.wasm",
-          "{projectRoot}/dist/event_processor.wasm"
+          "{projectRoot}/{options.outputDir}/columine.wasm",
+          "{projectRoot}/{options.outputDir}/event_processor.wasm"
         ],
         "options": {
-          "command": "just wasm && just wasm-ep",
-          "cwd": "{projectRoot}"
+          "command": "just wasm dev {args.outputDir} && just wasm-ep dev {args.outputDir}",
+          "cwd": "{projectRoot}",
+          "outputDir": ".cache/wasm-dev"
         },
         "configurations": {
           "production": {
-            "command": "just wasm wasm-release && just wasm-ep wasm-release"
+            "command": "just wasm wasm-release {args.outputDir} && just wasm-ep wasm-release {args.outputDir}",
+            "outputDir": "dist"
           }
         }
       }

@@ -8,8 +8,7 @@
 //!
 //! `built_wasm_matches_the_export_table` needs the compiled artifact and says
 //! so out loud when it is missing rather than reporting success: the nx
-//! `cargo-test` target builds it first (`dependsOn: cargo-wasm`), and `just
-//! wasm-ep` runs this file after deploying it.
+//! `cargo-test` target builds it first (`dependsOn: cargo-wasm`).
 
 use columine_types::wasm_abi::{COLUMINE_EP_EXPORTS, EXPORTED_MEMORY, parse_exports};
 use std::collections::BTreeSet;
@@ -22,11 +21,13 @@ fn manifest_path(relative: &str) -> String {
     format!("{manifest}{relative}")
 }
 
-/// The deployed artifact, `dist/event_processor.wasm`: the file that ships,
-/// whichever cargo profile `just wasm-ep` and the nx `cargo-wasm` target
-/// compiled it with.
+/// The checkout's dev build, `.cache/wasm-dev/event_processor.wasm`: the build a
+/// checkout's source authority names (packages/nx-plugin/README.md, "Cargo profiles"),
+/// which the default configuration of the nx `cargo-wasm` target writes and
+/// `cargo-test` depends on. The shipped `dist/event_processor.wasm` is its production
+/// configuration's.
 fn artifact() -> String {
-    manifest_path("/../../dist/event_processor.wasm")
+    manifest_path("/../../.cache/wasm-dev/event_processor.wasm")
 }
 
 fn parse_backend_ts() -> String {
@@ -59,7 +60,7 @@ fn built_wasm_matches_the_export_table() {
         panic!(
             "read {path}: {error}\n\
              This test audits the compiled artifact, so it cannot pass without \
-             one. Build it with `just wasm-ep` (or run this through \
+             one. Build it with `nx run columine:cargo-wasm` (or run this through \
              `nx run columine:cargo-test`, which depends on cargo-wasm)."
         )
     });

@@ -41,6 +41,12 @@
       "import": "./dist/build-state-output-policy.js",
       "default": "./dist/build-state-output-policy.js"
     },
+    "./task-graph-policy": {
+      "types": "./dist/task-graph-policy.d.ts",
+      "development": "./src/task-graph-policy.ts",
+      "import": "./dist/task-graph-policy.js",
+      "default": "./dist/task-graph-policy.js"
+    },
     "./test-clock-policy": {
       "types": "./dist/test-clock-policy.d.ts",
       "development": "./src/test-clock-policy.ts",
@@ -344,7 +350,7 @@
             "projects": [
               "cowshed"
             ],
-            "target": "build"
+            "target": "cli-native"
           },
           {
             "projects": [

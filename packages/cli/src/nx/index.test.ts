@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'bun:test';
+import { parseNxProjectJsonText } from '../lib/json.js';
 import {
   formatProjectTargetLines,
+  interpolateTaskOutput,
+  type ProjectTargets,
   projectNamesWithTarget,
   projectRootFromNxProjectJson,
   projectTargetsFromNxProjects,
@@ -97,19 +100,27 @@ describe('Nx helper output formatting', () => {
             inputs: ['default', { runtime: 'echo version' }],
             options: { command: 'bun test', timeoutMs: 120_000 },
           },
-          build: { outputs: ['{projectRoot}/dist/'] },
+          build: {
+            outputs: ['{projectRoot}/{options.out}/'],
+            options: { out: 'dist/dev' },
+            defaultConfiguration: 'production',
+            configurations: { production: { out: 'dist/prod', cache: { type: 'filesystem' } } },
+          },
         },
       },
       cli: { root: 'packages/cli', targets: { lint: {} } },
     };
 
     expect(targetNamesFromProjects(projects).sort()).toEqual(['build', 'lint', 'test']);
+    expect(parseNxProjectJsonText(JSON.stringify(projects.web))).toEqual(projects.web);
     expect(projectTargetsFromNxProjects(projects)).toEqual([
       {
         project: 'cli',
         root: 'packages/cli',
         targets: ['lint'],
         targetCache: new Map(),
+        targetConfigurations: new Map(),
+        targetDefaultConfigurations: new Map(),
         targetDependencies: new Map(),
         localTargetDependencies: new Map([['lint', []]]),
         targetExecutors: new Map(),
@@ -123,6 +134,8 @@ describe('Nx helper output formatting', () => {
         root: 'packages/web',
         targets: ['build', 'test'],
         targetCache: new Map([['test', true]]),
+        targetConfigurations: new Map([['build', { production: { out: 'dist/prod', cache: { type: 'filesystem' } } }]]),
+        targetDefaultConfigurations: new Map([['build', 'production']]),
         targetDependencies: new Map([['test', ['build']]]),
         localTargetDependencies: new Map([
           ['test', ['build']],
@@ -130,10 +143,31 @@ describe('Nx helper output formatting', () => {
         ]),
         targetExecutors: new Map([['test', '@smoothbricks/nx-plugin:bounded-exec']]),
         targetInputs: new Map([['test', ['default', { runtime: 'echo version' }]]]),
-        targetOptions: new Map([['test', { command: 'bun test', timeoutMs: 120_000 }]]),
-        targetOutputs: new Map([['build', ['{projectRoot}/dist/']]]),
+        targetOptions: new Map([
+          ['test', { command: 'bun test', timeoutMs: 120_000 }],
+          ['build', { out: 'dist/dev' }],
+        ]),
+        targetOutputs: new Map([['build', ['{projectRoot}/{options.out}/']]]),
         targetScripts: new Map(),
       },
     ]);
+  });
+});
+
+const web: ProjectTargets = { project: 'web', root: 'packages/web', targets: ['bundle'] };
+
+describe('Nx task output interpolation', () => {
+  it('names the task whose output Nx refuses and leaves the next interpolation intact', () => {
+    // Nx refuses a `{workspaceRoot}` that does not lead the declaration.
+    expect(() => interpolateTaskOutput('{projectRoot}/{workspaceRoot}/dist', web, 'bundle', undefined)).toThrow(
+      'web:bundle: Output',
+    );
+    expect(interpolateTaskOutput('{projectRoot}/dist/', web, 'bundle', undefined)).toBe('packages/web/dist');
+  });
+
+  it('refuses a project without its resolved root', () => {
+    expect(() =>
+      interpolateTaskOutput('{projectRoot}/dist/', { project: 'orphan', targets: [] }, 'build', undefined),
+    ).toThrow('Nx project orphan is missing its resolved root.');
   });
 });

@@ -11,6 +11,7 @@ import {
 } from '@smoothbricks/nextest-extract';
 import {
   type CreateDependencies,
+  type CreateMetadata,
   type CreateNodesContextV2,
   type CreateNodesResultV2,
   type CreateNodesV2,
@@ -24,6 +25,7 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 import { type ParsedCommandLine, parseJsonConfigFileContent, readConfigFile, sys as typescriptSys } from 'typescript';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
+import { refuseOverlappingOutputs } from './build-state-output-policy.js';
 import { bunLockDependencies, bunLockInput, bunLockNode } from './bun-lock-scope.js';
 import {
   CARGO_CLOSURE_INPUT,
@@ -89,12 +91,14 @@ import {
 } from './producer-receipts.js';
 import { runtimeInput, shellWord } from './runtime-input.js';
 import { isNonSourceDirectory } from './source-directories.js';
+import { inferredTaskKind, refuseBuildTestDependencies } from './task-graph-policy.js';
 import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
 import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
 import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
 import { type NativeTools, nativeToolCommand, nativeToolDependsOn, resolveNativeTools } from './tool-bins.js';
 import {
   isBuildOutputTargetName,
+  isTestNamespaceTargetName,
   isTestRunnerTargetName,
   PLATFORM_TARGET_GLOBS,
   RELEASE_CONFIGURATION,
@@ -688,6 +692,27 @@ const CARGO_PROFILE_FLAG: Readonly<Record<CargoProfile, string>> = { dev: '', re
 const CARGO_PROFILE_OUTPUT_DIR: Readonly<Record<CargoProfile, string>> = { dev: 'debug', release: 'release' };
 
 /**
+ * Where a build that ships writes, per profile. Two directories, never one: Nx restores a task's outputs as a tree, so
+ * a dev and a release build that share a path replace each other's restore and neither is a cache hit again. A release
+ * build writes where its package ships it (`dist/`, which publishes wholesale); a dev build writes under `.cache/`,
+ * which no package publishes and no loader mistakes for a release artifact.
+ *
+ * The target states each profile's directory once, as its `outputDir` option. Its declared output reads that as
+ * `{options.outputDir}` (Nx resolves it against the options of the run's configuration) and its command as
+ * `{args.outputDir}` (`nx:run-commands` fills it from the same option), so neither holds a copy that could drift.
+ */
+const OUTPUT_DIR_OPTION = '{options.outputDir}';
+const OUTPUT_DIR_ARGUMENT = '{args.outputDir}';
+/** Dev builds of N-API addons (one subdirectory per platform, beside `host`) and of wasm-bindgen's modules. */
+const NATIVE_DEV_DIRECTORY = '.cache/native-dev';
+const WASM_DEV_DIRECTORY = '.cache/wasm-dev';
+
+/** An addon's directory per profile: `dist/native/<name>` ships, `.cache/native-dev/<name>` is for local builds. */
+function nativeOutputPaths(name: string): Readonly<Record<CargoProfile, string>> {
+  return { dev: `${NATIVE_DEV_DIRECTORY}/${name}`, release: `dist/native/${name}` };
+}
+
+/**
  * Cargo's default target directory for a crate, relative to the command's cwd:
  * `target/` beside the workspace root that owns the crate, or beside the
  * crate's own manifest when no workspace claims it. Naming it rather than
@@ -716,7 +741,7 @@ function createCargoWasmTarget(
   repoRooted: boolean,
   cargoTargetDirectory: string,
 ): TargetConfiguration {
-  const outputDirectory = repoRooted ? posix.join(projectRoot, config.outputDirectory) : config.outputDirectory;
+  const outputDirectory = repoRooted ? posix.join(projectRoot, OUTPUT_DIR_ARGUMENT) : OUTPUT_DIR_ARGUMENT;
   const cargoSelection = repoRooted ? `-p ${config.cargoPackage}` : `--manifest-path ${config.manifestPath}`;
   const buildCommand = (profile: CargoProfile): string =>
     sequence([
@@ -735,12 +760,15 @@ function createCargoWasmTarget(
     inputs: repoRooted
       ? [CARGO_CLOSURE_INPUT, '{workspaceRoot}/scripts/*.sh', '{projectRoot}/scripts/*.sh']
       : CARGO_OUTPUT_INPUTS,
-    outputs: [`{projectRoot}/${config.outputDirectory}/`],
+    outputs: [`{projectRoot}/${OUTPUT_DIR_OPTION}/`],
     options: {
       command: buildCommand('dev'),
       cwd: repoRooted ? '.' : projectRoot,
+      outputDir: WASM_DEV_DIRECTORY,
     },
-    configurations: { [RELEASE_CONFIGURATION]: { command: buildCommand('release') } },
+    configurations: {
+      [RELEASE_CONFIGURATION]: { command: buildCommand('release'), outputDir: config.outputDirectory },
+    },
   };
 }
 
@@ -758,10 +786,11 @@ function createCargoWasmTarget(
  *
  * It is also the step that keeps compilation out of the bounded test window: a
  * cold workspace can take many minutes to compile while still making progress,
- * which is not a property of the tests, and the runners start after it. A
- * project's `build` depends on it, so `nx build` leaves the test binaries
- * compiled. There is no separate uncached `cargo test --no-run` warm-up: it
- * compiled the same dev units a second time, queued on the same `target/` lock.
+ * which is not a property of the tests, and the runners start after it. It is
+ * test work, so no `build` depends on it (a build never consumes test binaries)
+ * and each target that executes them names the edge itself. There is no separate
+ * uncached `cargo test --no-run` warm-up: it compiled the same dev units a
+ * second time, queued on the same `target/` lock.
  *
  * Cached because it produces a VALUE: one file, not a mutable build tree Nx
  * would have to restore. `--workspace` matches the clippy selection exactly, so
@@ -769,9 +798,8 @@ function createCargoWasmTarget(
  *
  * Tests compile the dev profile only, so no test target carries a
  * RELEASE_CONFIGURATION: Nx forwards a run's configuration down every
- * `dependsOn` edge to each target that has it, and a release `build` must
- * reach the dev test binaries the test run will use, not release ones nobody
- * runs.
+ * `dependsOn` edge to each target that has it, and a release configuration
+ * must never turn the test binaries into release ones nobody runs.
  *
  * The directory and the archive are ONE command: nextest does not create the
  * archive's parent, so the archive step consumes what the `mkdir` produced.
@@ -1143,7 +1171,14 @@ export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = a
 /** The lock-scope nodes' edges: each bun node's to the packages and members its manifest resolves. */
 export const createDependencies: CreateDependencies = (_options, context) => bunLockDependencies(context);
 
-export default { createNodesV2, createDependencies, postTasksExecution, preTasksExecution };
+/** Nx invokes this only after merging inferred/declarative targets and every plugin's project dependencies. */
+export const createMetadata: CreateMetadata = (graph, _options, context) => {
+  refuseOverlappingOutputs(graph, context.workspaceRoot);
+  refuseBuildTestDependencies(graph, context.workspaceRoot);
+  return {};
+};
+
+export default { createNodesV2, createDependencies, createMetadata, postTasksExecution, preTasksExecution };
 
 interface PackageJson {
   bin?: unknown;
@@ -1882,7 +1917,7 @@ async function createProjectTargets(
     };
   }
   for (const name of Object.keys(declaredTargets)) {
-    if (name === 'test' || !isTestRunnerTargetName(name) || targets[name] !== undefined) continue;
+    if (name === 'test' || !isTestNamespaceTargetName(name) || targets[name] !== undefined) continue;
     targets[name] = { dependsOn: ['^build', 'build'] };
   }
 
@@ -1992,16 +2027,6 @@ async function createProjectTargets(
     ];
   }
 
-  // `build` compiles the test executables through the workspace's one
-  // archive; in a nested package that names the root workspace's archive.
-  const cargoTestArchiveDependency: CargoTargetDependency | null = targets[CARGO_TEST_ARCHIVE_TARGET]
-    ? CARGO_TEST_ARCHIVE_TARGET
-    : isCargoProject && cargoWorkspace
-      ? cargoTargetDependency(projectName, {
-          projectName: cargoWorkspace.rootProjectName,
-          targetName: CARGO_TEST_ARCHIVE_TARGET,
-        })
-      : null;
   const napiDebug = targets['napi-debug'];
   if (napiDebug && cargoWorkspace) {
     // A crate whose project also builds the debug cdylib runs its tests after
@@ -2040,6 +2065,24 @@ async function createProjectTargets(
     [...Object.keys(declaredTargets), ...Object.keys(targets)],
     hostPlatform,
   );
+
+  // `<tool>-native` is the host's own build of one tool, so a test that runs it names one edge: `cli-native` is the
+  // declared `cli-<arch>-<family>` build for this machine, `napi-native` the addon (this host's platform target, or
+  // `cargo-napi` where no configured triple is this machine's). Each is picked from `hostPlatformBinaries` by the same
+  // suffix rule, its family name `-native` joins it to `build`, and it states no outputs. It runs nothing, so it
+  // states `cache: false`; a cached aggregate would need inputs of its own. A host with no such producer gets no
+  // aggregate, and inference makes no test depend on one.
+  const hostBuilds: Record<string, string[]> = {
+    'cli-native': hostPlatformBinaries.filter((name) => name.startsWith('cli-')),
+    'napi-native': targets['cargo-napi']
+      ? ['cargo-napi']
+      : hostPlatformBinaries.filter((name) => name.startsWith('napi-')),
+  };
+  for (const [name, dependsOn] of Object.entries(hostBuilds)) {
+    if (dependsOn.length > 0) {
+      targets[name] = { executor: 'nx:noop', cache: false, outputs: [], dependsOn };
+    }
+  }
 
   // A deploy is never cached; the build half beside it always is.
   //
@@ -2125,9 +2168,6 @@ async function createProjectTargets(
       dependsOn: [
         ...new Set([
           '^build',
-          // Compiling the test executables is unbounded preparation. Cargo
-          // reuses its incremental state; Nx restores only the archive file.
-          ...(cargoTestArchiveDependency ? [cargoTestArchiveDependency] : []),
           ...buildOutputTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)]),
           ...hostPlatformBinaries,
         ]),
@@ -2234,6 +2274,16 @@ async function createProjectTargets(
           }
         : {}),
     };
+  }
+
+  // Publish each inferred target's semantic kind (`inferredTaskKind`) as metadata. Nx merges metadata beneath a
+  // declaration, so the final graph still says which tasks are build and which are test work after a package rewrites
+  // one. Fresh objects: `CARGO_PRODUCER_METADATA` is shared by every producer.
+  for (const [name, target] of Object.entries(targets)) {
+    const kind = inferredTaskKind(name);
+    if (kind !== undefined) {
+      target.metadata = { ...target.metadata, smooTaskKind: kind };
+    }
   }
 
   // A declared target REPLACES the inferred input list, pin included, so a
@@ -2557,7 +2607,9 @@ function createNapiTargets(
   // A repository-root Cargo invocation runs outside the owning npm package, so
   // Nx's root-only PATH cannot resolve that package's napi CLI.
   const napiCommand = repoRooted ? posix.join(projectRoot, 'node_modules/.bin/napi') : 'napi';
-  const outputPath = (projectOutput: string) => (repoRooted ? posix.join(projectRoot, projectOutput) : projectOutput);
+  const outputDir = (projectOutput: string) => (repoRooted ? posix.join(projectRoot, projectOutput) : projectOutput);
+  // The directory a run writes into, as its `outputDir` option states it for the run's profile.
+  const runOutputDirectory = outputDir(OUTPUT_DIR_ARGUMENT);
   // After a build, the step that writes its input record (build-inputs.ts) into the output directory from the dep-info
   // rustc wrote for the addon (`target/[<triple>/]<profile>/lib<crate>.d`). The record is inside the target's
   // outputs, so Nx restores it with the addon it describes. Relative to the runner's cwd, so the hashed command is
@@ -2596,7 +2648,7 @@ function createNapiTargets(
     outputs: ['{projectRoot}/.cache/native-debug/'],
     options: {
       cwd: cargoCwd,
-      command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('.cache/native-debug')}`,
+      command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputDir('.cache/native-debug')}`,
     },
   };
 
@@ -2605,22 +2657,27 @@ function createNapiTargets(
     // second cargo-napi invocation only buys a duplicate dependency graph
     // (a plain build and a `--target` build write different target/
     // subdirectories); native.ts already resolves the identical
-    // platform-suffixed filename from dist/native/<platform-dir> after
-    // dist/native/host.
+    // platform-suffixed filename from <tree>/<platform-dir> after <tree>/host,
+    // in the one tree its package's source authority selects (.cache/native-dev
+    // in a checkout, dist/native installed).
     const hostBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}${recordInputs(null, profile, outputPath('dist/native/host'))}`;
+      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${runOutputDirectory}${recordInputs(null, profile, runOutputDirectory)}`;
+    const hostOutputs = nativeOutputPaths('host');
     targets['cargo-napi'] = {
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       dependsOn: ['^build', ...buildInputsTool],
       inputs: cargoInputs,
-      outputs: ['{projectRoot}/dist/native/host/'],
+      outputs: [`{projectRoot}/${OUTPUT_DIR_OPTION}/`],
       options: {
         cwd: cargoCwd,
         command: hostBuild('dev'),
+        outputDir: hostOutputs.dev,
       },
-      configurations: { [RELEASE_CONFIGURATION]: { command: hostBuild('release') } },
+      configurations: {
+        [RELEASE_CONFIGURATION]: { command: hostBuild('release'), outputDir: hostOutputs.release },
+      },
     };
   }
 
@@ -2630,44 +2687,52 @@ function createNapiTargets(
       throw new Error(`Missing N-API target convention for ${triple}`);
     }
     const targetName = `napi-${convention.architecture}-${convention.targetFamily}`;
-    const outputDirectory = `dist/native/${convention.outputName}`;
+    const outputs = nativeOutputPaths(convention.outputName);
     if (convention.targetFamily === 'linux') {
       // Every host builds a Linux addon the same way: devenv's zig through
       // cargo-zigbuild, glibc pinned by the triple suffix. The napi CLI cannot
       // carry that suffix (it looks for the artifact under
       // target/<triple>.2.17/), so the executor names the `.node` itself.
+      const nodeFile = (directory: string): string =>
+        `{projectRoot}/${directory}/${config.binaryName}.${convention.outputName}.node`;
       targets[targetName] = {
         executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
         metadata: CARGO_PRODUCER_METADATA,
         cache: true,
         inputs: napiInputs(projectRoot, repoRooted, []),
-        outputs: [`{projectRoot}/${outputDirectory}/`],
+        // The executor takes no `outputDir`: its `output` file is the one place each profile states where it
+        // writes, and the declared output reads the directory holding it from there (`/../`, which Nx's interpolation
+        // joins to the parent). The build-input record stamped beside the `.node` file is restored with it.
+        outputs: ['{options.output}/../'],
         options: {
           target: `${triple}.${LINUX_GLIBC_FLOOR}`,
           manifestPath: posix.join(cargoCwd, config.manifestPath),
           package: config.cargoPackage,
-          output: `{projectRoot}/${outputDirectory}/${config.binaryName}.${convention.outputName}.node`,
+          output: nodeFile(outputs.dev),
         },
-        configurations: { [RELEASE_CONFIGURATION]: { release: true } },
+        configurations: { [RELEASE_CONFIGURATION]: { release: true, output: nodeFile(outputs.release) } },
       };
       continue;
     }
     // macOS addons need Apple's SDK, which zig does not carry: the napi CLI
     // drives the host's own toolchain and writes the platform `.d.ts`.
     const platformBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${outputPath(outputDirectory)}${recordInputs(triple, profile, outputPath(outputDirectory))}`;
+      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${runOutputDirectory}${recordInputs(triple, profile, runOutputDirectory)}`;
     targets[targetName] = {
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       ...(buildInputsTool.length > 0 ? { dependsOn: buildInputsTool } : {}),
       inputs: cargoInputs,
-      outputs: [`{projectRoot}/${outputDirectory}/`],
+      outputs: [`{projectRoot}/${OUTPUT_DIR_OPTION}/`],
       options: {
         cwd: cargoCwd,
         command: platformBuild('dev'),
+        outputDir: outputs.dev,
       },
-      configurations: { [RELEASE_CONFIGURATION]: { command: platformBuild('release') } },
+      configurations: {
+        [RELEASE_CONFIGURATION]: { command: platformBuild('release'), outputDir: outputs.release },
+      },
     };
   }
   return targets;

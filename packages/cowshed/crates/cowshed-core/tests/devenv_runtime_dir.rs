@@ -2393,9 +2393,9 @@ async fn host_controller_managed_cargo_is_the_toolchain_and_the_installed_cli_st
         "x86_64" => "darwin-x64",
         arch => panic!("unsupported macOS CLI architecture: {arch}"),
     };
-    let binary = package.join("dist/bin").join(platform).join("cowshed");
+    let binary = package.join(".cache/bin").join(platform).join("cowshed");
     let mut input = std::fs::File::open(&binary)
-        .expect("the owning host-controller build produces the CLI before this test");
+        .expect("host-controller-test builds the development CLI (cli-native) before this test");
     let mut hasher = sha2::Sha256::new();
     let mut buffer = [0_u8; 8192];
     loop {

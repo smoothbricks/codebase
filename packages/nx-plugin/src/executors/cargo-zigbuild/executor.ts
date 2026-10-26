@@ -1,8 +1,17 @@
 import { spawn } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { chmod, copyFile, mkdir, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
+import {
+  type BuildInputProducer,
+  type BuildInputRecord,
+  buildInputProducer,
+  cargoBuildInputs,
+  gitWorkspaceRoot,
+  writeBuildInputs,
+} from '@smoothbricks/build-inputs';
+import { cargoWorkspace, describeRetentionError, type Result } from '@smoothbricks/cargo-retain';
 import typia from 'typia';
 
 import type { CargoZigbuildOptions } from './schema.js';
@@ -113,10 +122,69 @@ export function artifactFile(line: string, manifestPath: string, artifact: Zigbu
   return data.filenames.find((file) => file.endsWith('.so')) ?? null;
 }
 
+/**
+ * The dep-info file cargo uplifts beside an artifact, which lists every source rustc read for it: the artifact's file
+ * name with any extension replaced by `.d`. The static CLI `cowshed` has none (`cowshed.d`); the addon
+ * `libcowshed_napi.so` loses its `.so`.
+ */
+export function depInfoPath(built: string): string {
+  const { dir, name } = path.parse(built);
+  return path.join(dir, `${name}.d`);
+}
+
+/**
+ * The input record (build-inputs.ts) of the build that wrote `built`, or why none can be made: the record
+ * `smoo-nx-build-inputs` writes after a macOS build, from the dep-info beside the artifact, so one link check judges
+ * both. `cargoRoot` is the Cargo workspace root, whose manifest and lock the record names as well. `producer` is the
+ * Nx task running the build, which the executor reads from its environment.
+ */
+export function buildInputsOf(
+  built: string,
+  manifestPath: string,
+  cargoRoot: string,
+  producer?: BuildInputProducer,
+): Result<BuildInputRecord, string> {
+  const directory = path.dirname(manifestPath);
+  const workspaceRoot = gitWorkspaceRoot(directory);
+  if (workspaceRoot === null) {
+    return { ok: false, error: `${directory} is not in a Git work tree, so no input can be named` };
+  }
+  const depInfo = depInfoPath(built);
+  if (!existsSync(depInfo)) {
+    return { ok: false, error: `${depInfo} does not exist: cargo wrote no dep-info beside ${built}` };
+  }
+  const record = cargoBuildInputs(workspaceRoot, readFileSync(depInfo, 'utf8'), cargoRoot, producer);
+  if (record === null) return { ok: false, error: `${depInfo} names no file of ${workspaceRoot}` };
+  return { ok: true, value: record };
+}
+
+/**
+ * Writes the artifact and its input record into the directory `output` is in, which the target declares as its Nx
+ * output (`{options.output}/../`), so a cache hit restores both. The artifact is copied then renamed, so the output
+ * path never holds a partial file, and the record follows it.
+ */
+export async function publishArtifact(
+  built: string,
+  output: string,
+  artifact: ZigbuildArtifact,
+  inputs: BuildInputRecord,
+): Promise<void> {
+  const directory = path.dirname(output);
+  await mkdir(directory, { recursive: true });
+  const staging = `${output}.partial`;
+  await copyFile(built, staging);
+  if (artifact.kind === 'bin') {
+    await chmod(staging, 0o755);
+  }
+  await rename(staging, output);
+  writeBuildInputs(directory, inputs);
+}
+
 export default async function cargoZigbuildExecutor(
   options: CargoZigbuildOptions,
   context: CargoZigbuildContext,
 ): Promise<{ success: boolean }> {
+  const producer = buildInputProducer(process.env);
   const manifestPath = realpathSync(path.resolve(context.root, options.manifestPath));
   const output = path.resolve(context.root, options.output);
   const artifact = zigbuildArtifact(options);
@@ -164,14 +232,19 @@ export default async function cargoZigbuildExecutor(
     return { success: false };
   }
 
-  // Copy then rename, so the output path never holds a partial file.
-  await mkdir(path.dirname(output), { recursive: true });
-  const staging = `${output}.partial`;
-  await copyFile(built, staging);
-  if (artifact.kind === 'bin') {
-    await chmod(staging, 0o755);
+  // From the dep-info cargo just wrote, before the artifact is copied: a build whose inputs cannot be named leaves the
+  // output as it was, and a source edited while the artifact is copied is not recorded with its new bytes.
+  const cargo = await cargoWorkspace(path.dirname(manifestPath));
+  if (!cargo.ok) {
+    console.error(`${command}: ${describeRetentionError(cargo.error)}`);
+    return { success: false };
   }
-  await rename(staging, output);
+  const inputs = buildInputsOf(built, manifestPath, cargo.value.workspaceRoot, producer);
+  if (!inputs.ok) {
+    console.error(`${command}: ${inputs.error}`);
+    return { success: false };
+  }
+  await publishArtifact(built, output, artifact, inputs.value);
   console.log(`${path.relative(context.root, built)} -> ${path.relative(context.root, output)}`);
   return { success: true };
 }

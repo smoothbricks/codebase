@@ -294,9 +294,18 @@ workspace. It is not a separate project: the wasm the TypeScript loads and the c
 number and are built from one tree, so they cannot disagree.
 
 `lmao-wasm` is the production allocator. Its `[lib] name` is `allocator`, so `cargo build` emits `allocator.wasm`
-directly and `nx run lmao:cargo-wasm` only lifts it out of `target/` into `dist/allocator.wasm` — the exact path
-`src/lib/wasm/wasmAllocator.ts` resolves at runtime. Its tiered freelist clamps sub-20-byte `col_1b` blocks to the first
-≥20-byte tier so free-block bookkeeping always fits.
+directly and `nx run lmao:cargo-wasm` only lifts it out of `target/`, into one of two disjoint trees: the default
+configuration copies the dev profile to `.cache/wasm-dev/allocator.wasm`, and `--configuration=production` copies the
+release profile to `dist/allocator.wasm`, the file the package ships. Which one runs is the package's source authority
+([Cargo profiles](../nx-plugin/README.md#cargo-profiles)): `src/lib/wasm/wasmAllocator.ts` takes a package that holds
+the tracked crate entry `crates/lmao-wasm/src/lib.rs`, which `files` never publishes, for a checkout and loads its dev
+build even through its compiled `dist/ts`; any other package, installed or a snapshot of one, loads
+`dist/allocator.wasm`. Neither stands in for the other, and a missing build fails naming the Nx target that writes it. A
+browser asks for the same unpublished crate entry with HEAD: only 404 selects the shipping build, while network and
+other HTTP failures remain errors with their cause. Bundled apps stage a static asset and pass the compiled module
+through the existing synchronous allocator API (the Expo benchmark's `prepare-web-wasm` target copies the dev build to
+`public/allocator.wasm`). Its tiered freelist clamps sub-20-byte `col_1b` blocks to the first ≥20-byte tier so
+free-block bookkeeping always fits.
 
 `lmao-core`'s `build.rs` generates the entry-type enum and capacity-tuning constants from the TypeScript SSOT
 (`src/lib/schema/systemSchema.ts`, `src/lib/capacityTuning.ts`). Those files are in the same package, and both ship,
@@ -364,7 +373,7 @@ cd packages/lmao
 just test            # fast tier: unit + property tests (green suite)
 just proptest-heavy  # heavy tier: 10k proptest cases, includes TDD-red ignored tests
 just mutants         # mutation tier (cargo install cargo-mutants)
-just wasm            # wasm32 ABI build (rustup target add wasm32-unknown-unknown)
+just wasm dev .cache/wasm-dev  # wasm32 ABI dev build (rustup target add wasm32-unknown-unknown)
 just bench           # criterion harness for the overhead gates
 just check           # cargo check + clippy, warnings denied
 ```
@@ -372,7 +381,9 @@ just check           # cargo check + clippy, warnings denied
 Without `just`: the same commands are spelled out in `justfile`, and `.cargo/config.toml` provides `cargo t`,
 `cargo proptest-heavy`, `cargo wasm`. Under Nx the inferred targets are `cargo-test`, `cargo-lint`, `cargo-lint-cross`,
 `mutation` and `bench`; `cargo-wasm` is declared here because whether this package ships a wasm artifact is a packaging
-decision.
+decision. `just wasm` takes the cargo profile and the output directory the `cargo-wasm` target passes it
+(`dev .cache/wasm-dev`, or `release dist` for the shipped build), so prefer `nx run lmao:cargo-wasm`, which also caches
+and restores the output.
 
 ### Port order
 

@@ -33,7 +33,7 @@ import { loadColumineWasm } from '../wasm-backend.js';
 // =============================================================================
 
 // A prerequisite, not a condition — see columine-integration.test.ts.
-const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
+const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 const TEST_PARSE_BACKEND: ParseCompactBackend = {
   backend: 'test-parse',
   parse: () => ({ arrowIpc: new Uint8Array(0), eventCount: 0 }),

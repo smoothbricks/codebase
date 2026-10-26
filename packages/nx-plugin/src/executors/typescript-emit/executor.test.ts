@@ -160,6 +160,7 @@ describe('@smoothbricks/nx-plugin TypeScript emit build input record', () => {
       expect(await runTypeScriptEmit(options, { root }, async () => true)).toEqual({ success: true });
       const record: BuildInputRecord = JSON.parse(await readFile(join(lib, 'dist/.build-inputs.json'), 'utf8'));
       expect(record.version).toBe(1);
+      expect('producer' in record).toBe(false);
       expect(record.files).toEqual({
         'packages/lib/src/index.ts': sha256(LIB['packages/lib/src/index.ts']),
         'packages/lib/tsconfig.lib.json': sha256(LIB['packages/lib/tsconfig.lib.json']),
@@ -178,10 +179,12 @@ describe('@smoothbricks/nx-plugin TypeScript emit build input record', () => {
         await writeFile(join(lib, 'src/index.ts'), edited);
         return true;
       };
-      expect(await runTypeScriptEmit(options, { root }, editDuringEmit)).toEqual({ success: true });
+      const producer = { project: 'lib', target: 'tsc-js', configuration: 'development' };
+      expect(await runTypeScriptEmit(options, { root }, editDuringEmit, producer)).toEqual({ success: true });
       expect(await readFile(join(lib, 'src/index.ts'), 'utf8')).toBe(edited);
       const record: BuildInputRecord = JSON.parse(await readFile(join(lib, 'dist/.build-inputs.json'), 'utf8'));
       expect(record.files['packages/lib/src/index.ts']).toBe(sha256(LIB['packages/lib/src/index.ts']));
+      expect(record.producer).toEqual(producer);
     });
   });
 

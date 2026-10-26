@@ -7,15 +7,18 @@
  * so the publish job applies 0644 binaries into the tree that `bun pm pack`
  * then tars verbatim (pack only forces +x for `bin`-manifest targets, which
  * the platform binaries are not — @smoothbricks/cowshed@0.1.4 shipped them
- * 0644). This guard runs wherever freshly built outputs exist so a stripped
- * state is a red pipeline instead of an EACCES in a user's bunx.
+ * 0644). This guard is the package's `release-check` target: `smoo release pack` runs it in the
+ * publishing job, after every platform's prebuilt outputs merge and before the tarball is packed,
+ * so a stripped state is a red pipeline instead of an EACCES in a user's bunx.
  *
  * An absent `dist/bin` is a failure, not a pass. This used to exit 0 with "no packaged binaries
  * to verify", which meant the guard reported success in exactly the situation where it had
- * verified nothing — including a build that silently produced no binaries at all. The nx target
- * depends on `build`, so by the time this runs the directory has to be there.
+ * verified nothing — including a build that silently produced no binaries at all. The target
+ * declares no dependencies, so it judges the merged bytes and never rebuilds them: by the time
+ * this runs, the publishing job has put the directory there. The development builds under
+ * `.cache/bin/` are not shipped, and this never reads them.
  *
- * Run with: `nx run cowshed:verify-packaging`
+ * Run with: `nx run cowshed:release-check`
  */
 
 import { readdirSync, type Stats, statSync } from 'node:fs';

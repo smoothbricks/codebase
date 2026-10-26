@@ -159,7 +159,14 @@ const run = (outputs: string[], extra: Partial<TargetConfiguration> = {}): Targe
   ...extra,
 });
 
-describe('one producing target per Nx output', () => {
+/** A target writing the directory `{options.out}/`; its default options and each configuration set `out`. */
+const writesTo = (defaults: { readonly out?: string }, configurations: Record<string, { readonly out: string }>) =>
+  run(['{options.out}/'], { options: { command: 'true', ...defaults }, configurations });
+
+/** `app`'s targets and the lines `overlaps` reads off their refusal: [] when each output has one producer. */
+type OverlapCase = readonly [name: string, targets: Record<string, TargetConfiguration>, expected: string[]];
+
+describe('one producing task per Nx output', () => {
   it('refuses an output at, under or above another target output, in every configuration and project', () => {
     expect(
       overlaps({
@@ -304,6 +311,177 @@ describe('one producing target per Nx output', () => {
         },
       }),
     ).toEqual(['app:build packages/app/dist <> app:bundle packages/app/dist/a.js']);
+  });
+
+  it('judges the configurations of one target against each other, and a task only against other tasks', () => {
+    const cases: readonly OverlapCase[] = [
+      [
+        'default and production write one literal output',
+        { bundle: run(['{projectRoot}/dist/'], { configurations: { production: { command: 'true --release' } } }) },
+        ['app:bundle packages/app/dist <> app:bundle:production packages/app/dist'],
+      ],
+      [
+        'default and production point one option at one directory',
+        { bundle: writesTo({ out: 'packages/app/dist' }, { production: { out: 'packages/app/dist' } }) },
+        ['app:bundle packages/app/dist <> app:bundle:production packages/app/dist'],
+      ],
+      [
+        'two named configurations point one option at one directory, and the default at none',
+        { bundle: writesTo({}, { dev: { out: 'packages/app/dist' }, ci: { out: 'packages/app/dist' } }) },
+        ['app:bundle:dev packages/app/dist <> app:bundle:ci packages/app/dist'],
+      ],
+      [
+        'a configuration writes inside the default directory',
+        { bundle: writesTo({ out: 'packages/app/dist' }, { production: { out: 'packages/app/dist/production' } }) },
+        ['app:bundle packages/app/dist <> app:bundle:production packages/app/dist/production'],
+      ],
+      [
+        'the default pattern meets the configuration file it matches, not the one beside it',
+        {
+          bundle: run(['{options.out}'], {
+            options: { command: 'true', out: 'packages/app/dist/*.js' },
+            configurations: {
+              production: { out: 'packages/app/dist/main.js' },
+              debug: { out: 'packages/app/dist/main.map' },
+            },
+          }),
+        },
+        ['app:bundle packages/app/dist/*.js <> app:bundle:production packages/app/dist/main.js'],
+      ],
+      [
+        'options interpolation gives each configuration an output of its own',
+        {
+          bundle: writesTo(
+            { out: 'packages/app/dist/dev' },
+            { production: { out: 'packages/app/dist/prod' }, ci: { out: 'packages/app/dist/ci' } },
+          ),
+        },
+        [],
+      ],
+      [
+        'a task repeats, nests and patterns its own output',
+        {
+          bundle: run([
+            '{projectRoot}/dist/',
+            '{projectRoot}/dist/',
+            '{projectRoot}/dist/main.js',
+            '{projectRoot}/dist/*.js',
+            '{projectRoot}/dist/*.js',
+          ]),
+        },
+        [],
+      ],
+      [
+        'each configuration repeats and nests its own output',
+        {
+          bundle: run(['{options.out}/', '{options.out}/', '{options.out}/main.js'], {
+            options: { command: 'true', out: 'packages/app/dist/dev' },
+            configurations: { production: { out: 'packages/app/dist/prod' } },
+          }),
+        },
+        [],
+      ],
+      [
+        'default and production write one literal pattern',
+        {
+          bundle: run(['{projectRoot}/dist/**/*.js'], {
+            configurations: { production: { command: 'true --release' } },
+          }),
+        },
+        ['app:bundle packages/app/dist/**/*.js <> app:bundle:production packages/app/dist/**/*.js'],
+      ],
+      [
+        'two targets write one pattern, spelled from the project root and from the workspace root',
+        {
+          tsc: run(['{projectRoot}/dist/**/*.js']),
+          bundle: run(['{workspaceRoot}/packages/app/dist/**/*.js']),
+        },
+        ['app:tsc packages/app/dist/**/*.js <> app:bundle /checkout/packages/app/dist/**/*.js'],
+      ],
+      [
+        'different patterns stay unjudged, across targets and across configurations',
+        {
+          tsc: run(['{projectRoot}/dist/**/*.js']),
+          maps: run(['{projectRoot}/dist/**/*.map']),
+          bundle: run(['{options.out}'], {
+            options: { command: 'true', out: 'packages/app/dist/*.cjs' },
+            configurations: { production: { out: 'packages/app/dist/*.mjs' } },
+          }),
+        },
+        [],
+      ],
+      [
+        'a run naming no configuration is the default configuration, so its own options are no second task',
+        {
+          bundle: run(['{options.out}/'], {
+            defaultConfiguration: 'production',
+            options: { command: 'true', out: 'packages/app/dist/dev' },
+            configurations: { development: {}, production: { out: 'packages/app/dist/prod' } },
+          }),
+        },
+        [],
+      ],
+      [
+        'configurations beside the default one still overlap it, the default first',
+        {
+          bundle: run(['{options.out}/'], {
+            defaultConfiguration: 'production',
+            options: { command: 'true', out: 'packages/app/dist' },
+            configurations: { development: { out: 'packages/app/dist' }, production: {} },
+          }),
+        },
+        ['app:bundle:production packages/app/dist <> app:bundle:development packages/app/dist'],
+      ],
+    ];
+    for (const [name, targets, expected] of cases) {
+      const found = overlaps({ app: { root: 'packages/app', targets } });
+      expect({ name, overlaps: found }).toEqual({ name, overlaps: expected });
+    }
+  });
+
+  it('names both tasks of an overlap, configuration included', () => {
+    let refusal: unknown;
+    try {
+      refuseOverlappingOutputs(
+        projects({
+          app: {
+            root: 'packages/app',
+            targets: {
+              bundle: writesTo({ out: 'packages/app/dist' }, { production: { out: 'packages/app/dist' } }),
+              docs: run(['{projectRoot}/dist/index.html']),
+            },
+          },
+        }),
+        workspaceRoot,
+      );
+    } catch (error) {
+      refusal = error;
+    }
+    if (!(refusal instanceof OutputOverlapError)) {
+      throw new Error(`expected an OutputOverlapError, got ${String(refusal)}`);
+    }
+    expect(
+      refusal.overlaps.map(({ left, right }) => [
+        [left.project, left.target, left.configuration],
+        [right.project, right.target, right.configuration],
+      ]),
+    ).toEqual([
+      [
+        ['app', 'bundle', undefined],
+        ['app', 'bundle', 'production'],
+      ],
+      [
+        ['app', 'bundle', undefined],
+        ['app', 'docs', undefined],
+      ],
+      [
+        ['app', 'bundle', 'production'],
+        ['app', 'docs', undefined],
+      ],
+    ]);
+    expect(refusal.message).toContain(
+      'app:bundle: "packages/app/dist" overlaps app:bundle:production: "packages/app/dist"',
+    );
   });
 });
 

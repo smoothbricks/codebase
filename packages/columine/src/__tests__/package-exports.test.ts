@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'bun:test';
-import { fileURLToPath } from 'node:url';
 import {
   getExportConditions,
   importDeclaredModule,
   pickTarget,
   readPackageManifest,
 } from '@smoothbricks/validation/testing';
+
+type WasmLoaders = Pick<typeof import('../index.js'), 'loadColumineWasm' | 'loadParseBackend'>;
+
+function hasWasmLoaders(module: Record<string, unknown>): module is Record<string, unknown> & WasmLoaders {
+  return typeof module.loadColumineWasm === 'function' && typeof module.loadParseBackend === 'function';
+}
 
 const packageUrl = new URL('../../package.json', import.meta.url);
 
@@ -21,10 +26,9 @@ describe('package export contract', () => {
     expect(await Bun.file(new URL(pickTarget(rootConditions, '.', ['import', 'default']), packageUrl)).exists()).toBe(
       true,
     );
-    expect(await Bun.file(new URL('./dist/columine.wasm', packageUrl)).exists()).toBe(true);
   });
 
-  it('loads the declared root module', async () => {
+  it('loads both selected dev artifacts through the declared compiled root module', async () => {
     const manifest = await readPackageManifest(packageUrl);
     const mod = await importDeclaredModule(manifest, packageUrl, '.');
 
@@ -32,22 +36,30 @@ describe('package export contract', () => {
     expect(typeof mod.createParseCompactWasmBackend).toBe('function');
     expect('getBackend' in mod).toBe(false);
     expect(typeof mod.parseReducerProgram).toBe('function');
+    if (!hasWasmLoaders(mod)) throw new Error('Published columine module lacks its Wasm loaders');
+    expect((await mod.loadColumineWasm()).backend).toBe('wasm');
+    const parseBackend = await mod.loadParseBackend();
+    try {
+      expect(parseBackend.backend).toBe('event-processor-wasm');
+    } finally {
+      parseBackend.dispose();
+    }
   });
 
-  // The shipped modules are instantiated with an empty import object, so a wasm-bindgen import
+  // Both modules are instantiated with an empty import object, so a wasm-bindgen import
   // (chrono's `wasmbind` unified in from a host-only crate did exactly this) is a load failure for
   // every consumer, not a warning.
-  it('ships wasm modules that import nothing from wasm-bindgen', async () => {
-    const dist = new URL('../../dist/', import.meta.url);
-    const shipped = await Array.fromAsync(new Bun.Glob('**/*.wasm').scan(fileURLToPath(dist)));
-    // Every file `dist/**/*.wasm` publishes is judged; the two cargo-wasm outputs must be among them.
-    expect(shipped).toEqual(expect.arrayContaining(['columine.wasm', 'event_processor.wasm']));
+  it('builds wasm modules that import nothing from wasm-bindgen', async () => {
+    // Only this task's two declared development outputs participate in its verdict.
+    const files = ['columine.wasm', 'event_processor.wasm'].map(
+      (name) => new URL(`../../.cache/wasm-dev/${name}`, import.meta.url),
+    );
 
-    for (const file of shipped) {
-      const module = await WebAssembly.compile(await Bun.file(new URL(file, dist)).arrayBuffer());
+    for (const file of files) {
+      const module = await WebAssembly.compile(await Bun.file(file).arrayBuffer());
       const bindgenImports = WebAssembly.Module.imports(module)
         .filter((entry) => entry.module.startsWith('__wbindgen'))
-        .map((entry) => `${file}: ${entry.module}.${entry.name}`);
+        .map((entry) => `${file.pathname}: ${entry.module}.${entry.name}`);
       expect(bindgenImports).toEqual([]);
     }
   });

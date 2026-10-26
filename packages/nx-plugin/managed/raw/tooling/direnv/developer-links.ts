@@ -123,6 +123,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
+import type { BuildInputProducer } from '@smoothbricks/build-inputs';
 import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 import {
   type ProducerProbe,
@@ -784,14 +785,22 @@ export type StaleBuild = {
  */
 const BUILD_INPUTS_FILE = '.build-inputs.json';
 
-/** The first input whose bytes differ from what the build recorded, or null when the record describes the sources. */
-function recordedChange(
-  workspaceRoot: string,
-  record: string,
-): { readonly input: string; readonly change: 'changed' | 'removed' | 'added' } | null {
-  const parsed: unknown = JSON.parse(readFileSync(path.join(workspaceRoot, record), 'utf8'));
-  const files = typeof parsed === 'object' && parsed !== null ? Reflect.get(parsed, 'files') : undefined;
-  const complete = typeof parsed === 'object' && parsed !== null ? Reflect.get(parsed, 'complete') : undefined;
+interface BuildInputRecord {
+  readonly files: ReadonlyMap<string, string>;
+  readonly complete: readonly string[];
+  readonly producer: BuildInputProducer | undefined;
+}
+
+/** The file boundary parses JSON once, then the pure decoder validates its data and provenance together. */
+function readBuildInputRecord(workspaceRoot: string, record: string): BuildInputRecord {
+  const location = path.join(workspaceRoot, record);
+  return decodeBuildInputRecord(JSON.parse(readFileSync(location, 'utf8')), location);
+}
+
+/** Parse once: provenance selects the unit, and the same validated inputs judge its currentness. */
+export function decodeBuildInputRecord(parsed: unknown, record: string): BuildInputRecord {
+  const files: unknown = typeof parsed === 'object' && parsed !== null ? Reflect.get(parsed, 'files') : undefined;
+  const complete: unknown = typeof parsed === 'object' && parsed !== null ? Reflect.get(parsed, 'complete') : undefined;
   if (
     typeof parsed !== 'object' ||
     parsed === null ||
@@ -802,8 +811,22 @@ function recordedChange(
     (complete !== undefined &&
       (!Array.isArray(complete) || !complete.every((spec): spec is string => typeof spec === 'string')))
   )
-    throw new Error(`${path.join(workspaceRoot, record)} is not a version 1 build input record`);
-  const recorded = new Map(Object.entries(files).map(([file, hash]) => [file, String(hash)]));
+    throw new Error(`${record} is not a version 1 build input record`);
+  const producer: unknown = Reflect.get(parsed, 'producer');
+  if (producer !== undefined && !isBuildInputProducer(producer))
+    throw new Error(`${record} is not a version 1 build input record: producer`);
+  return {
+    files: new Map(Object.entries(files).map(([file, hash]) => [file, String(hash)])),
+    complete: complete ?? [],
+    producer,
+  };
+}
+
+/** The first input whose bytes differ from what the build recorded, or null when the record describes the sources. */
+function recordedChange(
+  workspaceRoot: string,
+  { files: recorded, complete }: BuildInputRecord,
+): { readonly input: string; readonly change: 'changed' | 'removed' | 'added' } | null {
   for (const [file, hash] of recorded) {
     const at = path.join(workspaceRoot, file);
     if (!existsSync(at)) return { input: file, change: 'removed' };
@@ -839,13 +862,72 @@ interface BuildUnit {
 /** A platform directory as packages name their per-host builds (`dist/bin/darwin-arm64`). */
 const PLATFORM_SEGMENT = /^(?:darwin|linux|win32|freebsd)-(?:arm64|x64|ia32|arm)(?:-[a-z0-9]+)?$/;
 
+const isObject = (value: unknown): value is object => typeof value === 'object' && value !== null;
+
+function isBuildInputProducer(value: unknown): value is BuildInputProducer {
+  if (!isObject(value) || Array.isArray(value)) return false;
+  const project: unknown = Reflect.get(value, 'project');
+  const target: unknown = Reflect.get(value, 'target');
+  const configuration: unknown = Reflect.get(value, 'configuration');
+  return (
+    typeof project === 'string' &&
+    project !== '' &&
+    typeof target === 'string' &&
+    target !== '' &&
+    (configuration === undefined || (typeof configuration === 'string' && configuration !== ''))
+  );
+}
+
+/** An Nx path declaration with `{projectRoot}` and `{workspaceRoot}` replaced: relative to the workspace root. */
+function resolveRoots(pattern: string, packagePath: string): string {
+  return pattern
+    .replaceAll('{projectRoot}', packagePath)
+    .replaceAll('{workspaceRoot}/', '')
+    .replaceAll('{workspaceRoot}', '');
+}
+
+/** The receipt's actual task owns the output; no target list or shadow Nx normalization is needed. */
+export function selectedBuildInputProducer(
+  producer: BuildInputProducer | undefined,
+  project: string,
+  targets: unknown,
+): BuildInputProducer | undefined {
+  if (producer === undefined || producer.project !== project || producer.configuration === 'production')
+    return undefined;
+  const definition: unknown = isObject(targets) ? Reflect.get(targets, producer.target) : undefined;
+  const defaultConfiguration: unknown = isObject(definition)
+    ? Reflect.get(definition, 'defaultConfiguration')
+    : undefined;
+  if (producer.configuration !== undefined && producer.configuration !== defaultConfiguration) return undefined;
+  return producer;
+}
+
+/** Only real source-owned directories: build-volume links, Cargo state and installed dependencies are never entered. */
+function cachedBuildInputRecords(directory: string): string[] {
+  const records: string[] = [];
+  const walk = (at: string) => {
+    for (const entry of directoryEntries(at)) {
+      const child = path.join(at, entry.name);
+      if (entry.isDirectory() && entry.name !== 'target' && entry.name !== 'node_modules') walk(child);
+      else if (entry.isFile() && entry.name === BUILD_INPUTS_FILE) records.push(child);
+    }
+  };
+  const cache = path.join(directory, '.cache');
+  if (lstatSync(cache, { throwIfNoEntry: false })?.isDirectory()) walk(cache);
+  return records;
+}
+
 /**
  * The build units of the package at `directory` that do not describe its current sources.
  *
  * A unit is first each output directory holding an input record: it is current exactly while every recorded input
  * still has the recorded bytes and no source the record's pathspecs match has been added. The producer writes the
  * record as part of its Nx outputs, so a cached build restores the record describing the outputs it restores, and a
- * file rewritten with its own bytes (a branch switch, a stash) changes nothing.
+ * file rewritten with its own bytes (a branch switch, a stash) changes nothing. Receipts under source-owned `.cache`
+ * and in published files carry the actual producer identity: this package's default task, including an inferred one,
+ * owns the unit. Foreign, nondefault and obsolete native records without provenance exclude their trees. The
+ * TypeScript emit's `outDir` is an independent boundary and accepts a standalone bootstrap's record without a producer,
+ * so an enclosing old layout cannot hide it. Shell entry starts no Nx graph and normalizes no output declarations.
  *
  * Outputs no record covers fall back to modification time, per unit, so a `.md` edit or a Rust change cannot make a
  * TypeScript build stale:
@@ -862,16 +944,19 @@ const PLATFORM_SEGMENT = /^(?:darwin|linux|win32|freebsd)-(?:arm64|x64|ia32|arm)
  * its refusal says so.
  *
  * Output directories built for another host (`darwin-x64` on an arm64 Mac) are skipped: nothing here runs them.
- * The remedy is the package's cached Nx build. A cached build that leaves a recorded unit stale is a cache-key defect
- * of that build (its inputs miss something its outputs depend on), never a reason to skip the cache.
+ * The remedy names the receipt's exact producer target and configuration; `build` need not reach a native producer.
+ * Missing-record published units retain their timestamp fallback and package `build` remedy. A cached build that
+ * leaves a recorded unit stale is a cache-key defect (its inputs miss something its outputs depend on), never a reason
+ * to skip the cache.
  */
 export function staleBuilds(packageName: string, directory: string): StaleBuild[] {
   const manifest: unknown = JSON.parse(readFileSync(path.join(directory, 'package.json'), 'utf8'));
   const manifestRecord = typeof manifest === 'object' && manifest !== null ? manifest : {};
-  // A package that publishes no files and declares no TypeScript build or Nx target builds nothing that could be
-  // stale. Every other one needs Git to tell its sources from its builds, and refuses without it.
+  // Packages without declared builds or development receipts need no Git build-state inspection.
+  const cachedRecords = cachedBuildInputRecords(directory);
   const nxDeclared = Reflect.get(manifestRecord, 'nx');
   if (
+    cachedRecords.length === 0 &&
     Reflect.get(manifestRecord, 'files') === undefined &&
     !existsSync(path.join(directory, 'tsconfig.lib.json')) &&
     (typeof nxDeclared !== 'object' || nxDeclared === null || Reflect.get(nxDeclared, 'targets') === undefined)
@@ -881,6 +966,17 @@ export function staleBuilds(packageName: string, directory: string): StaleBuild[
   const tracked = new Set(gitText(workspaceRoot, ['ls-files', '-z']).split('\0').filter(Boolean));
   const packagePath = path.relative(workspaceRoot, realpathSync(directory));
   const host = `${process.platform}-${process.arch}`;
+  const targets = isObject(nxDeclared) ? Reflect.get(nxDeclared, 'targets') : undefined;
+  const nxName: unknown = isObject(nxDeclared) ? Reflect.get(nxDeclared, 'name') : undefined;
+  const project = typeof nxName === 'string' ? nxName : packageName;
+  const rebuild = `nx run ${project}:build`;
+  const configPath = path.join(directory, 'tsconfig.lib.json');
+  const parsed: unknown = existsSync(configPath) ? Bun.JSONC.parse(readFileSync(configPath, 'utf8')) : undefined;
+  const config: object = isObject(parsed) ? parsed : {};
+  const compilerOptions: unknown = Reflect.get(config, 'compilerOptions');
+  const outDir: unknown = isObject(compilerOptions) ? Reflect.get(compilerOptions, 'outDir') : undefined;
+  // The TypeScript emit's output is a default build's too, though no target of the manifest declares it.
+  const emit = typeof outDir === 'string' ? { outDir, directory: path.join(packagePath, outDir) } : undefined;
   let published: string[];
   try {
     published = packedFiles(directory, manifestRecord);
@@ -888,17 +984,60 @@ export function staleBuilds(packageName: string, directory: string): StaleBuild[
     if (!(error instanceof SnapshotRefusal)) throw error;
     published = [];
   }
-  const built = published
-    .map((file) => path.relative(workspaceRoot, file))
-    .filter((file) => !tracked.has(file))
-    .filter((file) => file.split(path.sep).every((segment) => !PLATFORM_SEGMENT.test(segment) || segment === host));
+  const within = (parent: string, file: string) => file === parent || file.startsWith(`${parent}${path.sep}`);
+  // A file a build of this checkout wrote that runs here: not a tracked source, and not built for another host
+  // (nothing here runs it).
+  const written = (file: string) =>
+    !tracked.has(file) && file.split(path.sep).every((segment) => !PLATFORM_SEGMENT.test(segment) || segment === host);
+  const publishedHere = published.map((file) => path.relative(workspaceRoot, file)).filter(written);
+  const emitRecord = emit === undefined ? undefined : path.join(emit.directory, BUILD_INPUTS_FILE);
+  const receipts = [
+    ...new Set([
+      ...cachedRecords.map((file) => path.relative(workspaceRoot, file)),
+      ...publishedHere.filter((file) => path.basename(file) === BUILD_INPUTS_FILE),
+      ...(emitRecord !== undefined &&
+      lstatSync(path.join(workspaceRoot, emitRecord), { throwIfNoEntry: false })?.isFile()
+        ? [emitRecord]
+        : []),
+    ]),
+  ]
+    .filter(written)
+    .map((record) => {
+      const inputs = readBuildInputRecord(workspaceRoot, record);
+      const producer = selectedBuildInputProducer(inputs.producer, project, targets);
+      const unit = path.dirname(record);
+      return {
+        unit,
+        inputs,
+        producer,
+        selected: producer !== undefined || (unit === emit?.directory && inputs.producer === undefined),
+      };
+    });
+  const selected = new Set(receipts.filter((receipt) => receipt.selected).map(({ unit }) => unit));
+  const directories = receipts.map(({ unit }) => unit);
+  // Even without its own record, a nested emit keeps its timestamp fallback instead of inheriting an old parent record.
+  if (emit !== undefined && !directories.includes(emit.directory)) {
+    directories.push(emit.directory);
+    selected.add(emit.directory);
+  }
+  const nearest = (file: string) =>
+    directories
+      .filter((output) => within(output, file))
+      .reduce<string | undefined>(
+        (best, output) => (best === undefined || output.length > best.length ? output : best),
+        undefined,
+      );
+  const built = publishedHere.filter((file) => {
+    const owner = nearest(file);
+    return owner === undefined || selected.has(owner);
+  });
   const claimed = new Set<string>();
   const claim = (files: readonly string[]) => {
     const mine = files.filter((file) => !claimed.has(file));
     for (const file of mine) claimed.add(file);
     return mine;
   };
-  const under = (prefix: string) => built.filter((file) => file === prefix || file.startsWith(`${prefix}${path.sep}`));
+  const under = (prefix: string) => built.filter((file) => within(prefix, file));
   const trackedMatching = (patterns: readonly string[]) => {
     const include = patterns.filter((pattern) => !pattern.startsWith('!')).map((pattern) => new Bun.Glob(pattern));
     const exclude = patterns
@@ -908,65 +1047,54 @@ export function staleBuilds(packageName: string, directory: string): StaleBuild[
       (file) => include.some((glob) => glob.match(file)) && !exclude.some((glob) => glob.match(file)),
     );
   };
-  const nx = Reflect.get(manifestRecord, 'nx');
-  const nxName = typeof nx === 'object' && nx !== null ? Reflect.get(nx, 'name') : undefined;
-  const project = typeof nxName === 'string' ? nxName : packageName;
-  const rebuild = `nx run ${project}:build`;
   const stale: StaleBuild[] = [];
-  const recordedDirectories: string[] = [];
-  for (const record of built.filter((file) => path.basename(file) === BUILD_INPUTS_FILE)) {
-    const unit = path.dirname(record);
-    recordedDirectories.push(unit);
-    claim(under(unit));
-    const change = recordedChange(workspaceRoot, record);
+  for (const { unit, inputs, producer, selected: judge } of receipts) {
+    if (!judge) continue;
+    claim(under(unit).filter((file) => nearest(file) === unit));
+    const change = recordedChange(workspaceRoot, inputs);
     if (change !== null)
-      stale.push({ basis: 'recorded', packageName, directory, unit, rebuild, workspaceRoot, ...change });
+      stale.push({
+        basis: 'recorded',
+        packageName,
+        directory,
+        unit,
+        rebuild:
+          producer === undefined
+            ? rebuild
+            : `nx run ${producer.project}:${producer.target}${producer.configuration === undefined ? '' : `:${producer.configuration}`}`,
+        workspaceRoot,
+        ...change,
+      });
   }
-  // An outDir at or inside a recorded directory is judged by its record; one enclosing a record (outDir `dist`, a
-  // native record under `dist/native/host`) still judges its other files, the record's being claimed above.
-  const recorded = (prefix: string) =>
-    recordedDirectories.some((unit) => unit === prefix || prefix.startsWith(`${unit}${path.sep}`));
   const units: BuildUnit[] = [];
 
-  const configPath = path.join(directory, 'tsconfig.lib.json');
-  if (existsSync(configPath)) {
-    const parsed: unknown = Bun.JSONC.parse(readFileSync(configPath, 'utf8'));
-    const config: object = typeof parsed === 'object' && parsed !== null ? parsed : {};
-    const compilerOptions: unknown = Reflect.get(config, 'compilerOptions');
-    const options: object = typeof compilerOptions === 'object' && compilerOptions !== null ? compilerOptions : {};
-    const outDir: unknown = Reflect.get(options, 'outDir');
-    if (typeof outDir === 'string' && !recorded(path.join(packagePath, outDir))) {
-      const relativeOut = path.join(packagePath, outDir);
-      const globs = (key: string) => {
-        const value: unknown = Reflect.get(config, key);
-        return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
-      };
-      const files = Reflect.get(manifestRecord, 'files');
-      const publishes =
-        Array.isArray(files) &&
-        files.some((entry) => typeof entry === 'string' && (outDir === entry || outDir.startsWith(`${entry}/`)));
-      units.push({
-        label: `${path.join(packagePath, 'tsconfig.lib.json')} (outDir ${outDir})`,
-        // Claimed with the unit, so a leftover build info is judged by no unit at all.
-        outputs: claim(under(relativeOut)).filter((file) => !file.endsWith('.tsbuildinfo')),
-        inputs: [
-          ...trackedMatching([
-            ...globs('include').map((glob) => path.join(packagePath, glob)),
-            ...globs('exclude').map((glob) => `!${path.join(packagePath, glob)}`),
-          ]),
-          path.join(packagePath, 'tsconfig.lib.json'),
-        ],
-        expected: publishes,
-      });
-    }
+  if (emit !== undefined && !receipts.some(({ unit }) => unit === emit.directory)) {
+    const globs = (key: string) => {
+      const value: unknown = Reflect.get(config, key);
+      return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+    };
+    const files = Reflect.get(manifestRecord, 'files');
+    const publishes =
+      Array.isArray(files) &&
+      files.some(
+        (entry) => typeof entry === 'string' && (emit.outDir === entry || emit.outDir.startsWith(`${entry}/`)),
+      );
+    units.push({
+      label: `${path.join(packagePath, 'tsconfig.lib.json')} (outDir ${emit.outDir})`,
+      // Claimed with the unit, so a leftover build info is judged by no unit at all.
+      outputs: claim(under(emit.directory)).filter((file) => !file.endsWith('.tsbuildinfo')),
+      inputs: [
+        ...trackedMatching([
+          ...globs('include').map((glob) => path.join(packagePath, glob)),
+          ...globs('exclude').map((glob) => `!${path.join(packagePath, glob)}`),
+        ]),
+        path.join(packagePath, 'tsconfig.lib.json'),
+      ],
+      expected: publishes,
+    });
   }
 
-  const targets = typeof nx === 'object' && nx !== null ? Reflect.get(nx, 'targets') : undefined;
-  const resolve = (pattern: string) =>
-    pattern
-      .replaceAll('{projectRoot}', packagePath)
-      .replaceAll('{workspaceRoot}/', '')
-      .replaceAll('{workspaceRoot}', '');
+  const resolve = (pattern: string) => resolveRoots(pattern, packagePath);
   for (const [target, definition] of Object.entries(typeof targets === 'object' && targets !== null ? targets : {})) {
     if (typeof definition !== 'object' || definition === null) continue;
     const strings = (key: string) => {

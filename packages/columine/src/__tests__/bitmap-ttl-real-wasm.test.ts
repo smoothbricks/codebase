@@ -19,7 +19,7 @@ import { loadColumineWasm, VmProgramAdmissionError } from '../wasm-backend.js';
 // the real built artifact, never a bitmap/TTL implementation substituted for it.
 // The model is ordinary JS sets and exact optional timestamp bits, independent
 // of the native join/planner.
-const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
+const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 const META_BASE = 32;
 const META_SIZE = 48;
 const INDEX_OFFSET = 24;

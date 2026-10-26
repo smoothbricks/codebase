@@ -1204,17 +1204,15 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
 /**
  * Load event_processor WASM and create a ParseCompactBackend.
  *
+ * Without a path it loads the build this package's source authority names (see selectWasmArtifact in
+ * wasm-memory-contract.ts): a checkout's own dev build under .cache/wasm-dev, any other package's shipped
+ * dist/event_processor.wasm.
+ *
  * @param wasmPath - Optional explicit path to event_processor.wasm
  * @returns ParseCompactBackend wrapping the WASM instance
  */
 export async function loadParseBackend(wasmPath?: string | URL): Promise<ParseCompactBackend> {
   const wasmBytes = await loadWasmBytes(wasmPath, 'event_processor.wasm');
-  if (!wasmBytes) {
-    throw new Error(
-      'Could not find event_processor.wasm. Provide an explicit path via loadParseBackend(path), ' +
-        'or ensure event_processor.wasm is beside the built module or in ../dist/event_processor.wasm relative to source.',
-    );
-  }
 
   const wasmModule = await WebAssembly.compile(wasmBytes);
   // event_processor exports its own memory — no imports needed

@@ -9,8 +9,8 @@ import { WASM_PAGE_BYTES, WasmHostRegion, WasmMemoryContractError } from '../was
 
 // The host owns only pages above the module's linker-derived memory and skips
 // pages native allocation appends. These run against the real built artifacts.
-const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
-const EP_WASM_PATH = new URL('../../dist/event_processor.wasm', import.meta.url);
+const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
+const EP_WASM_PATH = new URL('../../.cache/wasm-dev/event_processor.wasm', import.meta.url);
 
 async function instantiate(path: URL = WASM_PATH): Promise<WebAssembly.Memory> {
   const module = await WebAssembly.compile(await Bun.file(path).arrayBuffer());

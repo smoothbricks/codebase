@@ -4,6 +4,11 @@
  * Generic columnar processing pipeline for Arrow column data.
  * Stages: Parse | Reduce | Compact | Undo
  *
+ * Artifact profiles follow [Cargo profiles](../../nx-plugin/README.md#cargo-profiles): a checkout holding the
+ * unpublished crates/columine-wasm/src/lib.rs entry loads .cache/wasm-dev/, including from compiled dist/ts.
+ * Packages and sealed snapshots without that entry load the shipping dist/ pair. A missing selected development
+ * artifact reports its cause and the cached producer, nx run columine:cargo-wasm; it never loads a shipping fallback.
+ *
  * Usage:
  *   import { createPipeline, loadColumineWasm, loadParseBackend } from '@smoothbricks/columine';
  *   const [backend, parseBackend] = await Promise.all([loadColumineWasm(), loadParseBackend()]);

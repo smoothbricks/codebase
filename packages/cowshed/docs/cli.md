@@ -108,8 +108,8 @@ nothing on `PATH` until a setup runs from that build. The details are in
 [gateway.md](gateway.md#start-at-login-launchd).
 
 `cowshed setup` typed at a shell therefore runs the installed copy, and installs nothing new (it says so). To install
-another build, run that build's own setup: a checkout's `packages/cowshed/bin/cowshed setup`, or its
-`dist/bin/<platform>/cowshed setup`. A debug build is never installed.
+another build, run that build's own setup by its path: a release build's `dist/bin/<platform>/cowshed setup`. A
+checkout's `packages/cowshed/bin/cowshed` runs its development build, and a debug build is never installed.
 
 Release builds record the commit they were built from. One install runs at a time: setup holds the install slot,
 `~/Library/Application Support/dev.cowshed/install.lock`, for its whole run, and a second `setup` or `gateway start`

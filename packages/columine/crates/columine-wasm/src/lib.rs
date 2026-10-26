@@ -10,6 +10,17 @@
 //!
 //! The published npm package ships this artifact as `dist/columine.wasm`
 //! (`"./wasm"` export).
+//! The default `nx run columine:cargo-wasm` instead writes the dev profile to
+//! `.cache/wasm-dev/`; `:production` writes the shipping pair to `dist/`.
+//! Both filenames are declared from the same outputDir option the recipes use.
+//! Per `packages/nx-plugin/README.md`, "Cargo profiles", this unpublished
+//! crate entry is the source authority: a checkout loads its dev pair even
+//! through compiled `dist/ts`, while a published package or sealed snapshot
+//! without this entry loads the shipping pair. The browser probes the same
+//! entry with HEAD; only 404 is absence, never a permission or network error.
+//! Missing selected dev bytes fail with their cause and `nx run columine:cargo-wasm`;
+//! neither loader falls back to shipping bytes. The event processor follows
+//! the same selection through `src/wasm-memory-contract.ts`.
 //!
 //! Statics policy: single-threaded wasm assumed (one caller per instance).
 //! Pointer policy: wasm32 pointers are bounded by linear memory; native tests

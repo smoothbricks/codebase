@@ -19,14 +19,20 @@ mutants:
 # for the artifact that ships (the nx `cargo-wasm` production configuration).
 # Cargo writes the dev profile under `debug/`.
 #
+# `out` is the directory, relative to this package, that receives `allocator.wasm`.
+# The nx `cargo-wasm` target passes its `outputDir` option, which also names its
+# declared output, so the copy and the declaration cannot disagree: `.cache/wasm-dev`
+# for the dev build a checkout loads, `dist` for the release build the package ships
+# (packages/nx-plugin/README.md, "Cargo profiles"). Neither stands in for the other.
+#
 # The lmao-wasm crate's [lib] name IS `allocator`, so this only lifts cargo's
 # output out of `target/` — the one placement cargo cannot do itself. It does
 # not rename: producer and consumer agree on `allocator.wasm` end to end.
-wasm profile="dev":
+wasm profile out:
     RUSTFLAGS="-C link-arg=--import-memory" cargo build -p lmao-wasm --target wasm32-unknown-unknown --profile {{profile}}
-    @mkdir -p dist
-    @cp ../../target/wasm32-unknown-unknown/{{ if profile == "dev" { "debug" } else { profile } }}/allocator.wasm dist/allocator.wasm
-    @ls -la dist/allocator.wasm
+    @mkdir -p {{out}}
+    @cp ../../target/wasm32-unknown-unknown/{{ if profile == "dev" { "debug" } else { profile } }}/allocator.wasm {{out}}/allocator.wasm
+    @ls -la {{out}}/allocator.wasm
 
 # Overhead gates placeholder (criterion). Real gate: traced-vs-untraced ≤20%
 # throughput delta + zero-alloc test (tests/alloc_gate.rs, currently TDD-red).

@@ -2584,7 +2584,7 @@ pub fn refuse_unsupervisable_build(source: PathBuf, debug_build: bool) -> Result
             format!(
                 "build a release binary with `nx run cowshed:{RELEASE_CLI_TARGET}:production` \
                  (or `cargo build --release -p cowshed-cli`) and run this from it; \
-                 `nx run cowshed:build` and `{RELEASE_CLI_TARGET}`'s default configuration \
+                 `nx run cowshed:cli-native` and `{RELEASE_CLI_TARGET}`'s default configuration \
                  build a debug one"
             ),
         ));

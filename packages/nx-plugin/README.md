@@ -306,6 +306,21 @@ test binaries. A package-local target that builds a shipped artifact follows the
 for an artifact family no other build compiles, such as a size-optimised wasm32 lane; a profile that compiles the same
 crates for the same target as `dev` or `release` compiles every dependency a second time.
 
+Native profiles have disjoint output trees: development CLIs live under `.cache/bin/<platform>/` and development
+platform addons under `.cache/native-dev/<platform>/`; production retains the shipping `dist/bin/` and `dist/native/`
+layout. Declarations interpolate the same options the commands use, so their outputs and restored input receipts move
+together. The host-resolved `cli-native` and `napi-native` aggregates delegate to the existing platform producers and
+declare no outputs of their own. A test that executes the CLI or loads the ordinary platform addon names those
+producers; tests using the explicit test addon still name `napi-debug`.
+
+Artifact loaders select the profile from package source authority, never from which artifact happens to exist. A
+checkout contains a tracked source entry that the package never publishes and loads the development artifact, even when
+its JavaScript runs from `dist/ts`. A published package or sealed snapshot omits that authority entry and loads the
+shipping `dist/` artifact. A missing selected development artifact fails loudly with its cached Nx producer remedy; it
+never falls back to an older shipping artifact. Developer-link input-receipt checks run once at shell entry and cover
+the selected development outputs, not once per CLI execution. Snapshots without that authority entry request the
+producer's `production` configuration so their artifact bytes and public paths agree.
+
 Rust LMAO's opt-in source-revision contract is defined in
 [01f](../../specs/lmao/01f_arrow_table_structure.md#smoo/lmao!n/arrow-table-module-id.not-git). Its native and Wasm
 targets declare `{ "env": "LMAO_GIT_REVISION" }` as an input. Default dev/test runs leave it unset; publishing jobs set
@@ -845,6 +860,23 @@ installed. Every fallback costs cache hits and never trades away invalidation, b
 reporting a failing one — a fileset that excluded a manifest with no digest replacing it would serve stale results
 silently.
 
+## Build/Test Graph Boundary
+
+The final-graph `createMetadata` hook also calls `refuseBuildTestDependencies(graph, workspaceRoot)` from
+`@smoothbricks/nx-plugin/task-graph-policy`. A `build` aggregate, an inferred build family, or any non-test target with
+outputs must not reach test work through `dependsOn`, directly or transitively. Inference publishes its semantic kind in
+target metadata; declared targets use the same test naming policy, including `test`, `test-*`, `cargo-test-*` and
+`*-test`. The archive is test work even though it compiles rather than executes.
+
+Nx's metadata hook precedes its implicit-project-edge pass. The decision first completes any declared implicit edges
+with Nx's own `applyImplicitDependencies` and `ProjectGraphBuilder` over an isolated dependency map, leaving the
+supplied graph unchanged. Nx then constructs each build's task graph itself, resolving string/object declarations,
+project selectors, wildcards, caret dependencies and configurations. The pure decision inspects only those reachable
+edges. A typed `BuildTestDependencyError.findings` names the originating build and the offending `source -> test` edge.
+Tests may consume build outputs; builds never consume test binaries or results. The graph rule has no name denylist in
+`nx.json` and needs no filesystem access. Its decision tables use in-memory Nx graphs; one wiring smoke exercises the
+installed hook through `nx show project`.
+
 ## Cowshed Build-State Output Policy
 
 Consuming repositories enforce build-volume safety in their Nx lint, using the graph that lint already resolved:
@@ -858,17 +890,19 @@ are resolved against the caller's workspace root. `BuildStateOutputError.finding
 configuration, output, and contributed path. Keep cacheable artifacts under source-tree paths such as `dist/` and
 `.cache/nextest/`; restoring an output under `target/` or `.nx/` can replace a build-volume link with a real directory.
 
-`refuseOverlappingOutputs(graph, workspaceRoot)` from the same module gives each output path one producing target. It
-refuses any target whose output is at, under or above another target's output, in any configuration: Nx restores a
-directory output as one tree, so a second target writing inside it leaves the first target's tree unlike its cache
-artifact after every build, and the two restore over each other without either ever being a cache hit. Each declaration
-states its kind: one ending in `/` names a directory, any other a file (`{projectRoot}/dist/`, `{options.out}/`). A
-pattern conflicts with a path at or above its static prefix (it writes beneath that path, so a file there collides by
-kind), a path it matches, or a directory it can reach inside under Nx's own minimatch, which expands brace alternatives
-before splitting segments; a file below its prefix that it does not match is not written by it. Two patterns are not
-judged, since only a file both match collides. `OutputOverlapError.overlaps` names both targets and outputs. Both
-validators interpolate the declarations themselves, so a declaration Nx refuses to interpolate raises
-`OutputDeclarationError` naming its target.
+`refuseOverlappingOutputs(graph, workspaceRoot)` from the same module gives each output path one producing task. The
+plugin calls it during its final-graph `createMetadata` hook, so every Nx command, including `nx show project`, refuses
+an overlap without additional workspace configuration. Two configurations of one target are distinct producers too. It
+refuses an output at, under or above another task's output: Nx restores a directory output as one tree, so a second
+target writing inside it leaves the first target's tree unlike its cache artifact after every build, and the two restore
+over each other without either ever being a cache hit. Each declaration states its kind: one ending in `/` names a
+directory, any other a file (`{projectRoot}/dist/`, `{options.out}/`). A pattern conflicts with a path at or above its
+static prefix (it writes beneath that path, so a file there collides by kind), a path it matches, or a directory it can
+reach inside under Nx's own minimatch, which expands brace alternatives before splitting segments; a file below its
+prefix that it does not match is not written by it. Identical patterns from distinct producing tasks are the same claim
+and are refused; different patterns are not judged, since only a file both match collides. `OutputOverlapError.overlaps`
+names both task/configuration identities and outputs. Both validators interpolate the declarations themselves, so a
+declaration Nx refuses to interpolate raises `OutputDeclarationError` naming its target.
 
 Raw project output declarations, including collect/apply fixtures, retain the directory suffix. Already-resolved Nx
 `Task.outputs` paths are normalized paths, not declarations, and need no trailing `/`.
@@ -1023,13 +1057,16 @@ Concrete targets come from concrete files:
   bin moved to another package, a deleted module) is gone before Nx captures the output, so no cache artifact carries
   it. A failed emit removes nothing, and an `outDir` that holds a TypeScript source is refused before the compiler runs.
   It writes `.build-inputs.json` into the `outDir`: the SHA-256 of every file the config's `include` matches less its
-  `exclude`, taken before the emit, and those globs as Git pathspecs. The macOS napi targets write the same record from
-  rustc's dep-info file through `@smoothbricks/build-inputs`'s
-  `smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <path under the target directory> --output <dir>`. The
-  record is inside the target's outputs, so a cache hit restores it with them; a live developer link
-  (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by content. The shell entry
-  that bootstraps the plugin (`tooling/direnv/enter-shell.ts`) keeps its build marker under `node_modules/.cache`, not
-  under `outDir`, where the executor would remove it as a file its emit did not write.
+  `exclude`, taken before the emit, and those globs as Git pathspecs. Native targets write the same record from rustc's
+  dep-info through `@smoothbricks/build-inputs`: macOS uses its `smoo-nx-build-inputs` CLI and Linux's `cargo-zigbuild`
+  executor calls that same collector. A record produced under Nx also carries its producer's project, target and
+  optional configuration, taken from the actual task environment. Shell entry uses that identity to judge the selected
+  development receipts, including inferred targets absent from package manifests, and name their actual cached rebuild.
+  It constructs no Nx graph, shadow output registry or second interpolation policy. The record is inside the target's
+  outputs, so a cache hit restores it with them; a live developer link (`@smoothbricks/cli`, "Declared Links") checks it
+  to tell a current build from a stale one by content. The shell entry that bootstraps the plugin
+  (`tooling/direnv/enter-shell.ts`) keeps its build marker under `node_modules/.cache`, not under `outDir`, where the
+  executor would remove it as a file its emit did not write.
 - `scriptc-<arch>-<family>` (`scriptc-arm64-macos`, `scriptc-x64-macos`, `scriptc-arm64-linux`, `scriptc-x64-linux`) are
   inferred for a package that lists `scriptc` in `devDependencies` (that pin is the compiler the targets run; the
   workspace root lists `scriptc` in `trustedDependencies` so its install links the platform compiler) together with each
@@ -1077,17 +1114,18 @@ Concrete targets come from concrete files:
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
 - `test-watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
-- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`. A project's
-  `build` depends on its cargo workspace's `cargo-test-archive` (for a nested package, the workspace root project's), so
-  `nx build` leaves the test binaries compiled. `cargo-test-archive` runs one
-  `cargo --frozen nextest archive --workspace` into `.cache/nextest/archive.tar.zst` and is the only cached cargo BUILD:
-  it produces a file outside the build-volume links rather than a mutable build tree. Nx cache restoration must never
-  replace Cargo's `target` link. Its inputs, like every cargo-derived fileset, are anchored at `{workspaceRoot}`: Nx
-  resolves a `{projectRoot}` glob against only the files its project owns, and a nested package owns the crates under
-  it, so a root workspace's archive spelled that way hashes none of its members and replays stale binaries against
-  edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning, no per-test kill)
-  whose inputs include the crates Cargo builds for that crate's tests (from Cargo's locked resolve: its dependencies and
-  its own dev-dependencies, never the dev-dependencies of the crates below it), and whose command runs
+- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`. Build targets
+  compile build outputs only: compiling every test binary makes every build a test build. Test runners depend on their
+  workspace's `cargo-test-archive` themselves, and a test that executes a CLI or loads an addon names its producer.
+  `cargo-test-archive` runs one `cargo --frozen nextest archive --workspace` into `.cache/nextest/archive.tar.zst` and
+  is the only cached Cargo compilation of test binaries: it produces a file outside the build-volume links rather than a
+  mutable build tree. Nx cache restoration must never replace Cargo's `target` link. Its inputs, like every
+  cargo-derived fileset, are anchored at `{workspaceRoot}`: Nx resolves a `{projectRoot}` glob against only the files
+  its project owns, and a nested package owns the crates under it, so a root workspace's archive spelled that way hashes
+  none of its members and replays stale binaries against edited crates. Each member crate gets a cached
+  `cargo-test-<package>` run (30s slow-test warning, no per-test kill) whose inputs include the crates Cargo builds for
+  that crate's tests (from Cargo's locked resolve: its dependencies and its own dev-dependencies, never the
+  dev-dependencies of the crates below it), and whose command runs
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
   from the archive's one extraction. Runners therefore execute rather than build: they compile nothing in cargo's build
   tree, and fan out instead of chaining. They do not unpack the archive each: before the run, the host's native
@@ -1371,10 +1409,10 @@ working tree, parent symlink replacement, and directory membership changes canno
 `probeBuilt({ target, cwd })` is the distinct typed read-only product operation. Its `hit` is an actual published
 `EnsureBuiltReceipt`, not a cache hit re-probed under the consumer's environment. The producer opts into publication in
 its own Nx plugin options as
-`producerReceipts: { targets: ["lmao:rust-dist", "lmao:cargo-wasm", "lmao:cargo-thread-ffi"] }`, naming every target a
-consumer's snapshot declaration names. The pre-task hook captures the committed HEAD/tree and tracked-source/tool basis;
-the post-task hook uses Nx's actual successful `TaskResults`, hashes/hash details, argv and start/end times, including
-successful uncacheable prerequisites, and atomically publishes the receipt in that checkout's
+`producerReceipts: { targets: ["lmao:rust-dist", "lmao:cargo-wasm:production", "lmao:cargo-thread-ffi"] }`, naming every
+target a consumer's snapshot declaration names. The pre-task hook captures the committed HEAD/tree and
+tracked-source/tool basis; the post-task hook uses Nx's actual successful `TaskResults`, hashes/hash details, argv and
+start/end times, including successful uncacheable prerequisites, and atomically publishes the receipt in that checkout's
 `.cache/producer-receipts`. That is its source tree, not Nx's workspace-data: under cowshed workspace-data is build
 state on the checkout's build volume, which a consumer's read grant of the provider checkout does not reach, so the
 consumer could not read the receipt it validates. The directory ignores itself with a `.gitignore` of `*`, so no
@@ -2107,8 +2145,8 @@ itself provides a launcher — its own cowshed package's `packages/cowshed/bin/c
 environment with no cowshed anywhere keeps the bare name, so its spawn failure names the missing installed tool. A
 target may set it in its `env`, workspace-relative or absolute: the task's own RAM volume work and its command then both
 run that cowshed, given to the command as an absolute path. This repository sets it to `packages/cowshed/bin/cowshed`,
-after `cowshed:build`, on the targets that exercise the facade (both real-APFS groups and `nx-plugin:test-host`), so
-they test this checkout's cowshed, not an installed one that may predate a command the checkout added. Cowshed alone
+after `cowshed:cli-native`, on the targets that exercise the facade (both real-APFS groups and `nx-plugin:test-host`),
+so they test this checkout's cowshed, not an installed one that may predate a command the checkout added. Cowshed alone
 owns disk-lifecycle leasing. Safe disk commands use
 `cowshed disk-command diskutil --deadline-ms <positive integer> -- <args>`: the CLI owns that total monotonic budget
 across lease admission and child execution, never starts a child after it expires, and kills and reaps an overrun safe

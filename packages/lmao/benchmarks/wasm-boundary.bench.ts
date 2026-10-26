@@ -2,26 +2,24 @@
  * Benchmark: JS↔WASM boundary-crossing cost, isolated.
  *
  * Uses the checked-in allocator's current exact-allocation ABI so the raw-call
- * measurements stay aligned with the production WasmAllocator wrapper.
+ * measurements stay aligned with the production WasmAllocator wrapper. It loads the
+ * build a source run loads, this checkout's dev build (`nx run lmao:cargo-wasm`), so its
+ * numbers describe that build and not the shipped release one.
  *
  * Run: bun packages/lmao/benchmarks/wasm-boundary.bench.ts
  */
 
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { bench, boxplot, group, run, summary } from 'mitata';
 import { S } from '../src/lib/schema/builder.js';
 import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
+import { getWasmModule } from '../src/lib/wasm/wasmAllocator.js';
 import { getWasmPhysicalLayout } from '../src/lib/wasm/wasmPhysicalLayout.js';
 
 const CAPACITY = 64;
 const NULL_BYTES = Math.ceil(CAPACITY / 8);
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const wasmBytes = readFileSync(join(__dirname, '../dist/allocator.wasm'));
 const memory = new WebAssembly.Memory({ initial: 17, maximum: 256 });
-const { instance } = await WebAssembly.instantiate(wasmBytes, {
+const instance = await WebAssembly.instantiate(await getWasmModule(), {
   env: {
     memory,
     performanceNow: () => performance.now(),

@@ -18,6 +18,7 @@ import type {
 import { WorkspaceContext } from 'nx/src/native/index.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { createTargetDefaultsResults } from 'nx/src/project-graph/utils/project-configuration/target-defaults.js';
+import { resolveNxTokensInOptions } from 'nx/src/project-graph/utils/project-configuration/target-merging.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { getOutputsForTargetAndConfiguration } from 'nx/src/tasks-runner/utils.js';
@@ -25,6 +26,7 @@ import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
+import { refuseOverlappingOutputs } from './build-state-output-policy.js';
 import { CARGO_CLOSURE_INPUT, isCargoLockInput } from './cargo-closure-input.js';
 import { CARGO_PRODUCER_METADATA } from './cargo-retention-hook.js';
 import { NIX_STORE_ROOT } from './cargo-toolchain-paths.js';
@@ -34,7 +36,7 @@ import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_CO
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
 import { isRecord } from './type-guards.js';
-import { applyWorkspaceConfig, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
+import { applyWorkspaceConfig, isTestRunnerTargetName, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
 
 useFixtureCargoHome();
 
@@ -993,6 +995,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
               // A real emitter in the same family, to prove the exclusion is
               // the test-runner class and not the family itself.
               'bundle-bun': { executor: 'nx:run-commands' },
+              // A suite named for what it tests is test work as well, and states its own producers: inference gives it no
+              // `test` prerequisites, which only the `test-<variant>` runners take.
+              'launcher-test': { executor: 'nx:run-commands' },
             },
           },
         }),
@@ -1001,6 +1006,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const targets = await inferProjectTargets(workspace, 'packages/suites/package.json');
 
       expect(targets.build?.dependsOn).toEqual(['^build', 'bundle-bun']);
+      expect(targets['launcher-test']).toBeUndefined();
+      // The variants take `test`'s prerequisites, and inference states that they are test work, whatever their suffix.
+      expect(targets['test-bun']).toEqual({ dependsOn: ['^build', 'build'], metadata: { smooTaskKind: 'test' } });
+      expect(targets['test-watch']).toEqual({ dependsOn: ['^build', 'build'], metadata: { smooTaskKind: 'test' } });
+      expectBuildNamesNoTestWork(targets);
     } finally {
       await workspace.cleanup();
     }
@@ -1123,12 +1133,28 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       }
       expect(targets['cargo-retention']?.dependsOn).toBeUndefined();
       // Retention starts after the tasks that build into the target directory, named by this metadata, and no other.
-      for (const name of ['cargo-test-archive', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
+      for (const name of ['cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
         expect(targets[name]?.metadata).toEqual(CARGO_PRODUCER_METADATA);
       }
       expect(targets['cargo-fetch']?.metadata).toBeUndefined();
+      // The archive compiles the tests, so it is test work as well as a producer, and says so beside the marker.
+      expect(targets['cargo-test-archive']?.metadata).toEqual({ ...CARGO_PRODUCER_METADATA, smooTaskKind: 'test' });
+      // Build and test work state their kind and nothing else does: the final graph reads it from here, a crate named
+      // `ferris-wasm` included, whose runner ends in a build family.
+      expect(
+        Object.fromEntries(
+          Object.entries(targets).flatMap(([name, target]) =>
+            target.metadata?.smooTaskKind === undefined ? [] : [[name, target.metadata.smooTaskKind]],
+          ),
+        ),
+      ).toEqual({
+        'cargo-test-archive': 'test',
+        'cargo-test-ferris-core': 'test',
+        'cargo-test-ferris-wasm': 'test',
+        'cargo-test': 'test',
+        test: 'test',
+      });
       // The archive and the lints hash every crate's sources
-      // The archive and the compile it stands for hash every crate's sources
       // AND the outputs of the targets they depend on: generated crate inputs
       // are gitignored, so a repository that had to restate `inputs` to add
       // them replaced the crate union with the root's `default` and shipped a
@@ -1761,23 +1787,27 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(wasm['cargo-wasm']?.inputs).not.toContain('{workspaceRoot}/**/*.rs');
       expect(wasm['cargo-wasm']?.options).toMatchObject({ cwd: '.' });
       // Dev by default, in the workspace's own `target/`; only the release
-      // configuration compiles, and binds, the release artifact.
+      // configuration compiles, and binds, the release artifact. Each profile writes its own directory, which the
+      // command reads from the option the declared output reads.
       expect(wasm['cargo-wasm']?.options?.command).toBe(
         [
           'cargo --frozen build --target wasm32-unknown-unknown -p runtime-wasm',
-          'wasm-bindgen --target web --out-dir packages/wasm/dist-wasm/web target/wasm32-unknown-unknown/debug/runtime_wasm.wasm',
+          'wasm-bindgen --target web --out-dir packages/wasm/{args.outputDir}/web target/wasm32-unknown-unknown/debug/runtime_wasm.wasm',
         ].join(' && '),
       );
+      expect(wasm['cargo-wasm']?.options?.outputDir).toBe('.cache/wasm-dev');
       expect(wasm['cargo-wasm']?.options?.commands).toBeUndefined();
       expect(wasm['cargo-wasm']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: [
           'cargo --frozen build --release --target wasm32-unknown-unknown -p runtime-wasm',
-          'wasm-bindgen --target web --out-dir packages/wasm/dist-wasm/web target/wasm32-unknown-unknown/release/runtime_wasm.wasm',
+          'wasm-bindgen --target web --out-dir packages/wasm/{args.outputDir}/web target/wasm32-unknown-unknown/release/runtime_wasm.wasm',
         ].join(' && '),
+        outputDir: 'dist-wasm',
       });
-      expect(wasm['cargo-wasm']?.outputs).toEqual(['{projectRoot}/dist-wasm/']);
+      expect(wasm['cargo-wasm']?.outputs).toEqual(['{projectRoot}/{options.outputDir}/']);
       expect(wasm['cargo-wasm']?.dependsOn).toEqual([rootFetch, '^build']);
-      expect(wasm.build?.dependsOn).toContainEqual(rootArchive);
+      // The aggregate build names its outputs, never the test archive.
+      expect(wasm.build?.dependsOn).toEqual(['^build', 'cargo-wasm']);
       expect(wasm.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
 
       // The crate whose project also builds the debug cdylib keeps that edge:
@@ -1819,12 +1849,19 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'packages/native/node_modules/.bin/napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/.cache/native-debug',
       });
       const platformBuild = (release: string): string =>
-        `packages/native/node_modules/.bin/napi build${release} --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/dist/native/darwin-arm64 && node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path packages/native/crates/native-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libnative_napi.d --output packages/native/dist/native/darwin-arm64`;
-      expect(native['napi-arm64-macos']?.options).toMatchObject({ cwd: '.', command: platformBuild('') });
+        `packages/native/node_modules/.bin/napi build${release} --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/{args.outputDir} && node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path packages/native/crates/native-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libnative_napi.d --output packages/native/{args.outputDir}`;
+      expect(native['napi-arm64-macos']?.options).toMatchObject({
+        cwd: '.',
+        command: platformBuild(''),
+        outputDir: '.cache/native-dev/darwin-arm64',
+      });
       expect(native['napi-arm64-macos']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: platformBuild(' --release'),
+        outputDir: 'dist/native/darwin-arm64',
       });
-      expect(native.build?.dependsOn).toContainEqual(rootArchive);
+      expect(native['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/{options.outputDir}/']);
+      expect(native.build?.dependsOn).not.toContainEqual(rootArchive);
+      expectBuildNamesNoTestWork(native);
       expect(native.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       for (const inferred of [root, runtime, wasm, native]) {
         expectNoSchedulerThrottle(inferred);
@@ -1892,11 +1929,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         ).toEqual([]);
       }
       expect(group['cargo-lint']?.dependsOn).toEqual([{ projects: ['outer-root'], target: 'cargo-lint' }]);
-      expect(group.build?.dependsOn).toEqual([
-        '^build',
-        { projects: ['outer-root'], target: 'cargo-test-archive' },
-        'tsc-js',
-      ]);
+      expect(group.build?.dependsOn).toEqual(['^build', 'tsc-js']);
       expect(outer['cargo-lint-host-core']).toBeUndefined();
       expect(inner['cargo-lint']?.options).toMatchObject({ cwd: 'nested' });
       expect(inner['cargo-lint']?.inputs).toContain('{workspaceRoot}/nested/**/*');
@@ -2292,14 +2325,17 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cache: true,
         dependsOn: ['cargo-fetch', '^build'],
         inputs: expect.arrayContaining(['{projectRoot}/**/*.rs', '{projectRoot}/**/Cargo.toml']),
-        outputs: ['{projectRoot}/generated/wasm/'],
+        // One declaration for both profiles: Nx reads it against the options of the run's configuration.
+        outputs: ['{projectRoot}/{options.outputDir}/'],
         options: {
           command: [
             'cargo --frozen build --target wasm32-unknown-unknown --manifest-path crates/git-do/Cargo.toml',
-            'wasm-bindgen --target nodejs --out-dir generated/wasm/node crates/git-do/target/wasm32-unknown-unknown/debug/gitoxide_engine.wasm',
-            'wasm-bindgen --target web --out-dir generated/wasm/web crates/git-do/target/wasm32-unknown-unknown/debug/gitoxide_engine.wasm',
+            'wasm-bindgen --target nodejs --out-dir {args.outputDir}/node crates/git-do/target/wasm32-unknown-unknown/debug/gitoxide_engine.wasm',
+            'wasm-bindgen --target web --out-dir {args.outputDir}/web crates/git-do/target/wasm32-unknown-unknown/debug/gitoxide_engine.wasm',
           ].join(' && '),
           cwd: 'packages/git-do',
+          // A dev build never writes where the package ships; only the release configuration writes the crate's `out-dir`.
+          outputDir: '.cache/wasm-dev',
         },
       });
       // No workspace claims the crate, so cargo's default target dir is the one
@@ -2309,9 +2345,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-wasm']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: [
           'cargo --frozen build --release --target wasm32-unknown-unknown --manifest-path crates/git-do/Cargo.toml',
-          'wasm-bindgen --target nodejs --out-dir generated/wasm/node crates/git-do/target/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
-          'wasm-bindgen --target web --out-dir generated/wasm/web crates/git-do/target/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
+          'wasm-bindgen --target nodejs --out-dir {args.outputDir}/node crates/git-do/target/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
+          'wasm-bindgen --target web --out-dir {args.outputDir}/web crates/git-do/target/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
         ].join(' && '),
+        outputDir: 'generated/wasm',
       });
       // A wasm-bindgen crate in a nested Cargo workspace still needs its locked
       // graph downloaded, and the project root is not a member of it, so the
@@ -2329,6 +2366,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test']).toBeUndefined();
       expect(targets['cargo-lint']).toBeUndefined();
       expectNoSchedulerThrottle(targets);
+      expectNoOverlappingOutputs(workspace.context.workspaceRoot, 'packages/git-do', targets);
+      expectBuildNamesNoTestWork(targets);
+      // Build work states its kind beside the producer marker; typecheck is neither build nor test.
+      expect(targets['cargo-wasm']?.metadata).toEqual({ ...CARGO_PRODUCER_METADATA, smooTaskKind: 'build' });
+      expect(targets['tsc-js']?.metadata).toEqual({ smooTaskKind: 'build' });
+      expect(targets.build?.metadata).toEqual({ smooTaskKind: 'build' });
+      expect(targets.typecheck?.metadata).toBeUndefined();
     } finally {
       await workspace.cleanup();
     }
@@ -2409,24 +2453,49 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         // The dedicated host build consumes only its dependencies' outputs; it is
         // not ordered behind the test compile.
         dependsOn: ['^build'],
-        outputs: ['{projectRoot}/dist/native/host/'],
+        outputs: ['{projectRoot}/{options.outputDir}/'],
         options: {
           cwd: 'packages/cowshed',
-          command: `napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info debug/libcowshed_napi.d --output dist/native/host`,
+          command: `napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info debug/libcowshed_napi.d --output {args.outputDir}`,
+          // A local build never writes where the package ships its addon.
+          outputDir: '.cache/native-dev/host',
         },
         configurations: {
           [RELEASE_CONFIGURATION]: {
-            command: `napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info release/libcowshed_napi.d --output dist/native/host`,
+            command: `napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info release/libcowshed_napi.d --output {args.outputDir}`,
+            outputDir: 'dist/native/host',
           },
         },
       });
       expect(unservedHostTargets.build?.dependsOn).toEqual([
         '^build',
-        'cargo-test-archive',
         'cargo-napi',
+        'cli-native',
+        'napi-native',
         'tsc-js',
         'cli-arm64-macos',
       ]);
+      // The host's own builds, picked by the same suffix rule as the platform binaries: the declared CLI build, and the
+      // dedicated host addon build where no declared triple is this machine's. Neither states outputs of its own.
+      expect(unservedHostTargets['cli-native']).toEqual({
+        executor: 'nx:noop',
+        cache: false,
+        outputs: [],
+        dependsOn: ['cli-arm64-macos'],
+        metadata: { smooTaskKind: 'build' },
+      });
+      expect(unservedHostTargets['napi-native']).toEqual({
+        executor: 'nx:noop',
+        cache: false,
+        outputs: [],
+        dependsOn: ['cargo-napi'],
+        metadata: { smooTaskKind: 'build' },
+      });
+      expect(unservedHostTargets['cargo-napi']?.metadata).toEqual({
+        ...CARGO_PRODUCER_METADATA,
+        smooTaskKind: 'build',
+      });
+      expectNoOverlappingOutputs(workspace.context.workspaceRoot, 'packages/cowshed', unservedHostTargets);
       // A platform no scriptc platform covers has no build-inputs executable for the napi commands to run.
       const unservedFailure = await inferProjectTargets(
         workspace,
@@ -2443,13 +2512,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         /ships smoo-nx-build-inputs for darwin-arm64, darwin-x64, linux-arm64 and linux-x64 only/,
       );
       await workspace.write('packages/cowshed/package.json', linuxOnly);
-      expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64/']);
-      // Every local build compiles dev; only the release configuration ships.
+      expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/{options.outputDir}/']);
+      expect(targets['napi-arm64-macos']?.options?.outputDir).toBe('.cache/native-dev/darwin-arm64');
+      // Every local build compiles dev into its own directory; only the release configuration ships. The command
+      // reads that directory from the option the declared output reads.
       const darwinArm64Build = (release: string): string =>
-        `napi build${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/darwin-arm64 && ../../node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path crates/cowshed-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libcowshed_napi.d --output dist/native/darwin-arm64`;
+        `napi build${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ../../node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path crates/cowshed-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libcowshed_napi.d --output {args.outputDir}`;
       expect(targets['napi-arm64-macos']?.options).toMatchObject({ command: darwinArm64Build('') });
       expect(targets['napi-arm64-macos']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: darwinArm64Build(' --release'),
+        outputDir: 'dist/native/darwin-arm64',
       });
       expect(targets['napi-arm64-macos']?.options?.env).toBeUndefined();
       // No cargo-test-archive edge here, on ANY host: the platform build consumes
@@ -2474,18 +2546,25 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(darwinArm64Targets['napi-x64-linux']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
         cache: true,
-        outputs: ['{projectRoot}/dist/native/linux-x64-gnu/'],
+        // The executor takes no `outputDir`, so each profile states its destination in the executor's `output` file
+        // and the declared output reads the directory holding it from there, beside the build-input record.
+        outputs: ['{options.output}/../'],
         options: {
           target: 'x86_64-unknown-linux-gnu.2.17',
           manifestPath: 'packages/cowshed/crates/cowshed-napi/Cargo.toml',
           package: 'cowshed-napi',
-          output: '{projectRoot}/dist/native/linux-x64-gnu/cowshed.linux-x64-gnu.node',
+          output: '{projectRoot}/.cache/native-dev/linux-x64-gnu/cowshed.linux-x64-gnu.node',
         },
-        configurations: { [RELEASE_CONFIGURATION]: { release: true } },
+        configurations: {
+          [RELEASE_CONFIGURATION]: {
+            release: true,
+            output: '{projectRoot}/dist/native/linux-x64-gnu/cowshed.linux-x64-gnu.node',
+          },
+        },
       });
       expect(darwinArm64Targets['napi-arm64-linux']?.options).toMatchObject({
         target: 'aarch64-unknown-linux-gnu.2.17',
-        output: '{projectRoot}/dist/native/linux-arm64-gnu/cowshed.linux-arm64-gnu.node',
+        output: '{projectRoot}/.cache/native-dev/linux-arm64-gnu/cowshed.linux-arm64-gnu.node',
       });
       for (const suffix of ['arm64-linux', 'x64-linux']) {
         expect(linuxX64Targets[`napi-${suffix}`]).toEqual(darwinArm64Targets[`napi-${suffix}`]);
@@ -2494,6 +2573,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       for (const inferred of [linuxX64Targets, darwinArm64Targets]) {
         expect(Object.keys(inferred).filter((name) => name.startsWith('napi-toolchain-'))).toEqual([]);
         expect(inferred['napi-debug']?.options?.env).toBeUndefined();
+        expectNoOverlappingOutputs(workspace.context.workspaceRoot, 'packages/cowshed', inferred);
         for (const suffix of ['arm64-macos', 'x64-macos']) {
           expect(inferred[`napi-${suffix}`]?.options?.command).toContain('napi build');
           expect(inferred[`napi-${suffix}`]?.options?.env).toBeUndefined();
@@ -2501,8 +2581,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       }
       // The aggregate build pulls in exactly the inferring host's
       // platform-suffixed targets (publish still owns foreign platforms), and
-      // the only cargo-test work it owns is compiling the executables — every
-      // RUNNER is reached through `test`. Both hosts are asserted here so the
+      // no test work at all: the archive and every RUNNER are reached through `test`. Both hosts are asserted here so the
       // expectation does not depend on which machine runs the suite: the
       // previous form read `process.platform`, and the macOS answer was the only
       // one anyone checked.
@@ -2521,20 +2600,37 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           .filter((name) => name.endsWith(hostSuffix))
           .sort();
         expect(hostNapiTargets.length).toBeGreaterThan(0);
-        expect(inferred.build?.dependsOn).toEqual(['^build', 'cargo-test-archive', 'tsc-js', ...hostNapiTargets]);
+        // `cli-native` and `napi-native` pick the host's own builds, and their family name `-native` joins them to
+        // `build`: the declared CLI build, and the addon platform target this machine runs.
+        expect(inferred['cli-native']?.dependsOn).toEqual([`cli${hostSuffix}`]);
+        expect(inferred['napi-native']?.dependsOn).toEqual([`napi${hostSuffix}`]);
+        expect(inferred.build?.dependsOn).toEqual([
+          '^build',
+          'cli-native',
+          'napi-native',
+          'tsc-js',
+          ...hostNapiTargets,
+        ]);
         // Crate `cowshed-napi` names its bounded runner `cargo-test-cowshed-napi`;
         // the retired `*-napi` output-family glob matched it on suffix alone and
         // put the whole cargo test suite inside `nx run-many -t build`.
         expect(inferred['cargo-test-cowshed-napi']).toBeDefined();
-        for (const dependency of inferred.build?.dependsOn ?? []) {
-          expect(String(dependency).startsWith('cargo-test-')).toBe(dependency === 'cargo-test-archive');
-        }
+        expectBuildNamesNoTestWork(inferred);
         for (const dependency of inferred.build?.dependsOn ?? []) {
           if (typeof dependency === 'string' && /-(?:arm64|x64)-(?:macos|linux)$/.test(dependency)) {
             expect(dependency.endsWith(hostSuffix)).toBe(true);
           }
         }
       }
+      // A host with no declared CLI build gets no `cli-native`; its addon aggregate still finds this platform's target.
+      const linuxArm64Targets = await inferProjectTargets(
+        workspace,
+        'packages/cowshed/package.json',
+        createNodesV2ForPlatform('linux', 'arm64'),
+      );
+      expect(linuxArm64Targets['cli-native']).toBeUndefined();
+      expect(linuxArm64Targets['napi-native']?.dependsOn).toEqual(['napi-arm64-linux']);
+      expect(linuxArm64Targets.build?.dependsOn).toEqual(['^build', 'napi-native', 'tsc-js', 'napi-arm64-linux']);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       // The test suite runs against the dev-profile addon, never a release
       // platform build: napi-debug shares target/debug with cargo-test, keeps
@@ -2616,10 +2712,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // duplicate for Nx to merge, even with a cdylib *-wasm member crate present.
       expect(targets['cargo-wasm']).toBeUndefined();
       // Its declared *-wasm output-family name feeds the aggregate build and
-      // clean by concrete name, and the cargo workspace's test-executable
-      // compilation comes with it.
+      // clean by concrete name; the cargo workspace's test archive is test work and stays out of it.
       expect(targets.build?.executor).toBe('nx:noop');
-      expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-test-archive', 'cargo-wasm']);
+      expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-wasm']);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
     } finally {
       await workspace.cleanup();
@@ -2643,7 +2738,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-wasm']?.options?.command).toBe(
         [
           'cargo --frozen build --target wasm32-unknown-unknown --manifest-path crates/columine-wasm/Cargo.toml',
-          'wasm-bindgen --target web --out-dir dist-wasm/web target/wasm32-unknown-unknown/debug/columine_wasm.wasm',
+          'wasm-bindgen --target web --out-dir {args.outputDir}/web target/wasm32-unknown-unknown/debug/columine_wasm.wasm',
         ].join(' && '),
       );
     } finally {
@@ -3246,7 +3341,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/custom/package.json');
       expect(targets['cargo-wasm']).toBeUndefined();
-      expect(targets.test).toEqual({ dependsOn: ['^build', 'build'] });
+      expect(targets.test).toEqual({ dependsOn: ['^build', 'build'], metadata: { smooTaskKind: 'test' } });
       expect(targets['cargo-test']).toBeDefined();
 
       // A member crate's own Cargo.toml (no [workspace]) infers nothing.
@@ -3279,7 +3374,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/money/tsconfig.lib.json', '{}\n');
 
       const targets = await inferProjectTargets(workspace, 'packages/money/package.json');
-      expect(targets.test).toEqual({ dependsOn: ['^build', 'build'] });
+      expect(targets.test).toEqual({ dependsOn: ['^build', 'build'], metadata: { smooTaskKind: 'test' } });
       expect(targets['cargo-test']).toBeUndefined();
     } finally {
       await workspace.cleanup();
@@ -3845,6 +3940,50 @@ function expectNoSchedulerThrottle(targets: Record<string, TargetConfiguration>)
     expect(target.parallelism, `${name} parallelism`).toBeUndefined();
     expect(target.options?.parallel, `${name} options.parallel`).toBeUndefined();
   }
+}
+
+/** The target a `dependsOn` entry names, whichever of Nx's spellings it uses. */
+function dependencyTarget(dependency: NonNullable<TargetConfiguration['dependsOn']>[number]): string {
+  return typeof dependency === 'string' ? dependency : dependency.target;
+}
+
+/** The aggregate build names no test work, in either spelling of an edge: tests consume builds, never the reverse. */
+function expectBuildNamesNoTestWork(targets: Record<string, TargetConfiguration>): void {
+  for (const dependency of targets.build?.dependsOn ?? []) {
+    expect(isTestRunnerTargetName(dependencyTarget(dependency)), `build dependsOn ${JSON.stringify(dependency)}`).toBe(
+      false,
+    );
+  }
+}
+
+/**
+ * The plugin's own overlap policy accepts these inferred targets. Each is normalized as Nx's project graph normalizes it
+ * (tokens in its options and in its configurations' options), so `{options.*}` outputs resolve per configuration through
+ * Nx's own interpolation, and every configuration of every target is judged as a producer of its own.
+ */
+function expectNoOverlappingOutputs(
+  workspaceRoot: string,
+  projectRoot: string,
+  targets: Record<string, TargetConfiguration>,
+): void {
+  const project = { name: 'p', root: projectRoot };
+  const normalized: Record<string, TargetConfiguration> = {};
+  for (const [name, target] of Object.entries(targets)) {
+    const configurations: Record<string, Record<string, unknown>> = {};
+    for (const [configuration, options] of Object.entries(target.configurations ?? {})) {
+      configurations[configuration] = resolveNxTokensInOptions(options, project, `${name}:${configuration}`);
+    }
+    normalized[name] = {
+      ...target,
+      options: resolveNxTokensInOptions(target.options ?? {}, project, name),
+      configurations,
+    };
+  }
+  const graph: ProjectGraph = {
+    nodes: { p: { name: 'p', type: 'lib', data: { root: projectRoot, targets: normalized } } },
+    dependencies: {},
+  };
+  expect(() => refuseOverlappingOutputs(graph, workspaceRoot)).not.toThrow();
 }
 
 /** A default-profile override that puts the tests `filter` selects in `group`, on the platform serial groups run on. */

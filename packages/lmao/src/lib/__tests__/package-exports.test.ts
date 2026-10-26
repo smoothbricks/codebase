@@ -56,7 +56,7 @@ describe('package export conditions', () => {
     expect(exports['./package.json']).toBe('./package.json');
   });
 
-  it('loads the declared published wasm module and allocator artifact', async () => {
+  it('loads the declared published wasm module and the build its source authority selects', async () => {
     const packageUrl = new URL('../../../package.json', import.meta.url);
     const exports = await readPackageExports(packageUrl);
     const wasmConditions = requireRecord(exports['./wasm'], 'wasm export conditions');

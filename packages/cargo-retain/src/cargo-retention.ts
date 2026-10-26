@@ -921,8 +921,11 @@ async function purgeTrash(profile: string, linked: Map<string, number>): Promise
 
 // ---- The pass ----
 
-/** Cargo's own answer for the workspace in `cwd`: its target directory and member packages. */
-async function cargoWorkspace(
+/**
+ * Cargo's own answer for the workspace `cwd` is in: its root, its target directory (physical) and its member
+ * packages. A refusal is a `cargo-metadata` error naming `cwd`.
+ */
+export async function cargoWorkspace(
   cwd: string,
 ): Promise<Result<{ workspaceRoot: string; targetDir: string; members: ReadonlySet<string> }, RetentionError>> {
   const args = ['--frozen', 'metadata', '--no-deps', '--format-version', '1'];

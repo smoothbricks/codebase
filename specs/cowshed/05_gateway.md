@@ -222,11 +222,11 @@ kept the build setup had installed, the daemon then refused the CLI's verbs ("th
 cowshed is build Y", 11_shell.md), and a removal refused half-way failed its own state restoration too.
 
 `cowshed setup` typed at a shell therefore runs the installed copy itself, and installs nothing: it says so, and names
-the remedy. To install another build, run that build's own binary — a checkout's `packages/cowshed/bin/cowshed setup`,
-or its `dist/bin/<platform>/cowshed setup`. Such a run still repairs everything else, the plist included, and restarts a
-gateway that answers while running other bytes than the build it leaves installed (status `executableSha256`): launchd
-keeps a running process whatever the stable name now says, so this is what ends the disagreement the build refusal
-names.
+the remedy. To install another build, run that build's own binary by its path — a release build's
+`dist/bin/<platform>/cowshed setup`; a checkout's `packages/cowshed/bin/cowshed` runs its development build, which setup
+refuses (06_cli.md "Launcher"). Such a run still repairs everything else, the plist included, and restarts a gateway
+that answers while running other bytes than the build it leaves installed (status `executableSha256`): launchd keeps a
+running process whatever the stable name now says, so this is what ends the disagreement the build refusal names.
 
 **Install order and rollback.** Every install holds the install slot (below). An install that replaces the running build
 refuses a debug build and a build that does not contain the installed one (below) before anything is installed. With the

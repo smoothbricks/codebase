@@ -749,12 +749,25 @@ fresh attested snapshot at each install or shell entry, not a fixed pin. Managed
 pinning fixes the bytes they inspect rather than accepting differences from a moving branch.
 
 A live link runs what its checkout last built, so it refuses a checkout whose build no longer describes its sources: the
-refusal names each build unit, the input that moved and `cd <checkout> && nx run <project>:build`, and leaves the alias
-as it was. The `@smoothbricks/nx-plugin` TypeScript emit and its inferred macOS napi targets (and a native target whose
-command runs `smoo-nx-build-inputs`) write `.build-inputs.json` into their output directory with the SHA-256 of every
-input; Nx restores it on a cache hit, so the cached build is the whole remedy and a branch switch that rewrites files
-with their own bytes refuses nothing. Outputs without that record (Linux cross builds among them) are judged by
-modification time, which also refuses such a same-bytes rewrite, and say so.
+refusal names each build unit, the input that moved and its cached Nx rebuild, and leaves the alias as it was. The
+TypeScript emit and native producers (the macOS collector and Linux cross executor) write `.build-inputs.json` beside
+their outputs with the SHA-256 of every input. When run under Nx, the writer also records its actual task's project,
+target and optional configuration as `producer`; this provenance is an ownership byproduct, not another output registry.
+Nx restores the record with its outputs on a cache hit, so a branch switch that rewrites inputs with their own bytes
+refuses nothing. Normal published units without records retain the modification-time fallback, which says that a
+same-bytes rewrite also counts.
+
+At shell entry, the check inventories source-owned package `.cache` receipts and published receipts without following
+cache symlinks or entering `target` or `node_modules`. It selects this package's producer with no configuration, or the
+manifest target's named `defaultConfiguration`, excluding `production`. This reaches both declared CLI outputs under
+`.cache/bin/<platform>` and inferred addons under `.cache/native-dev/<platform>` even when the manifest declares no such
+target. The exact producer target and configuration supply the remedy (`nx run <project>:<target>[:<configuration>]`):
+the package's `build` may only emit TypeScript and cannot repair native artifacts. Foreign projects, other hosts,
+nondefault/production tasks and obsolete native receipts without provenance are not judged, nor are their surrounding
+trees. The TypeScript emit's `outDir` remains an independent boundary: its standalone bootstrap record is judged even
+without a producer, and an enclosing old `dist` record cannot hide it or its missing-record timestamp fallback. This
+runs once per shell entry, never per CLI execution; it starts no Nx graph and hand-normalizes no Nx outputs, inferred
+targets or target defaults.
 
 Each key is a package name, scoped or not. Every directory is relative to the project checkout. For live links and
 capture, a project-contained declaration resolves within the current checkout, including a cowshed workspace, and

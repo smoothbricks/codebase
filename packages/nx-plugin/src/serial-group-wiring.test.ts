@@ -24,8 +24,8 @@ const DEVICE_GROUP = 'cargo-test-group-real-apfs';
 const HOST_GROUP = 'cargo-test-group-real-apfs-host';
 /** cowshed's host proof of the built addon (`openHost` and the typed launchers), which needs a Mac. */
 const HOST_NAPI = 'host-napi-test';
-/** cowshed's build, which leaves the host's own CLI where the package's launcher finds it. */
-const CHECKOUT_COWSHED_BUILD = { projects: ['cowshed'], target: 'build' };
+/** The host CLI producer, which leaves the development binary where the checkout's launcher finds it. */
+const CHECKOUT_COWSHED_BUILD = { projects: ['cowshed'], target: 'cli-native' };
 /** The target that provisions the per-user mount root the real-image fixtures keep their scratch trees below. */
 const APFS_TEST_ROOT = { projects: ['cowshed'], target: 'apfs-test-root' };
 const APFS_TEST_ROOT_TASK = 'cowshed:apfs-test-root';
@@ -99,7 +99,7 @@ describe('the real-APFS serial groups of this repository', () => {
     const nx = await readRecord('nx.json', JSON.parse);
     const plugin = await readRecord('packages/nx-plugin/package.json', JSON.parse);
     // The groups and the RAM-volume host tests exercise the disk-command facade. An installed cowshed that predates a
-    // command this checkout added would fail them, so each names the checkout's launcher, after cowshed's build.
+    // command this checkout added would fail them, so each names the checkout's launcher after its host CLI producer.
     const targets = [
       child(child(nx, 'targetDefaults'), DEVICE_GROUP),
       child(child(nx, 'targetDefaults'), HOST_GROUP),

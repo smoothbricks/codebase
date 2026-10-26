@@ -1479,16 +1479,17 @@ workspace root.
   published binary, never a borrowed executable under `target/`.
 - **Enforced by**: the consuming repository's Nx lint calls the plugin's `refuseOutputsUnderBuildState` validator with
   its already resolved graph (including project overrides), `cowshed build-state --json` path records, and its workspace
-  root. A refusal names the target, output, and build-state path. The same lint calls `refuseOverlappingOutputs` with
-  that graph and root: a target output at, under or above another target's output is refused, because a restore of
-  either replaces the other's tree, so neither target is ever a cache hit. A declaration states its output's kind: one
-  ending in `/` names a directory, any other a file. Below a pattern's static prefix, a pattern overlaps a file output
-  only by matching it; a file at or above the prefix collides with it by kind, since the pattern writes beneath that
-  path. The verdict is a function of the declarations alone. Where outputs exist after a build, the lint also calls
-  `refuseMisdeclaredOutputKinds`, which refuses a literal output whose on-disk kind contradicts its declaration. Job
-  admission and `cowshed doctor` never construct an Nx graph or execute repository plugins for this rule. Sandboxed lint
-  resolves the installed `cowshed` through the job's private `tools/bin` (15_capabilities.md, "Bootstrap executables");
-  its executable-only grant admits no controller data or socket.
+  root. A refusal names the target, output, and build-state path. The plugin's final-graph `createMetadata` hook calls
+  `refuseOverlappingOutputs` for every Nx command: an output at, under or above another producing task's output is
+  refused, including two configurations of one target, because a restore of either replaces the other's tree. A
+  declaration states its output's kind: one ending in `/` names a directory, any other a file. Below a pattern's static
+  prefix, a pattern overlaps a file output only by matching it; a file at or above the prefix collides by kind, since
+  the pattern writes beneath it. Identical patterns are one output claim and conflict; different patterns are not judged
+  without the tree. The verdict is a function of the declarations alone. Where outputs exist after a build, the lint
+  also calls `refuseMisdeclaredOutputKinds`, which refuses a literal output whose on-disk kind contradicts its
+  declaration. Job admission and `cowshed doctor` never construct an Nx graph or execute repository plugins for this
+  rule. Sandboxed lint resolves the installed `cowshed` through the job's private `tools/bin` (15_capabilities.md,
+  "Bootstrap executables"); its executable-only grant admits no controller data or socket.
 - `cowshed build-state --json` reads the selected checkout's volume-state record and prints
   `{paths:[{checkout,volume}]}` without opening the controller or store. It never rediscovers tools. A missing link or
   state record refuses with `environment-missing` (exit 5): "this checkout has no build volume yet; run `cowshed setup`
