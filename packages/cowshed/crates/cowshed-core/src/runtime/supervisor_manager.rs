@@ -1903,8 +1903,11 @@ mod tests {
             .expect_err("a supervisor that does not answer is not a vacancy");
 
         assert!(
-            refused.message.contains("did not answer within"),
-            "the refusal names the hello timeout: {refused:?}"
+            refused.message.starts_with("TIMEOUT: hello on ")
+                && refused
+                    .message
+                    .contains("no answer within its handshake bound"),
+            "the refusal is the hello's TIMEOUT: {refused:?}"
         );
         assert!(
             !refused.message.contains("starts no supervisor"),

@@ -4822,8 +4822,10 @@ async fn a_rebase_whose_supervisor_does_not_answer_skips_the_carry(
                 "{state:?}"
             );
             assert!(
-                reason.contains("cannot start the probe") && reason.contains("did not answer"),
-                "the skip names the unanswered supervisor: {reason}"
+                reason.contains("cannot start the probe")
+                    && reason.contains("TIMEOUT: hello on ")
+                    && reason.contains("no answer within its handshake bound"),
+                "the skip names the unanswered supervisor's hello TIMEOUT: {reason}"
             );
         }
         build_volume => panic!("an unanswering supervisor skips the carry: {build_volume:?}"),
