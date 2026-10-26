@@ -136,7 +136,7 @@ enum LocalCause {
     ImageLocksHeld(Box<[std::path::PathBuf]>),
     /// A wait on another process that expired (05_gateway.md, "Deadlines"), for the boundary that
     /// owns the wait to record as its span (13_telemetry.md, "Wait spans").
-    Wait(crate::runtime::wait_spans::WaitFailure),
+    Wait(cowshed_types::wait::WaitFailure),
 }
 
 /// Canonical wire fields remain flat; only the private storage groups these exclusive causes.
@@ -853,7 +853,7 @@ impl CowshedError {
 
     /// This error, carrying the wait that expired when `failure` is one, in place of any other
     /// in-process cause it held; with `None`, this error unchanged.
-    pub fn with_wait(self, failure: Option<crate::runtime::wait_spans::WaitFailure>) -> Self {
+    pub fn with_wait(self, failure: Option<cowshed_types::wait::WaitFailure>) -> Self {
         match failure {
             Some(failure) => Self {
                 local_cause: Some(Box::new(LocalCause::Wait(failure))),
@@ -872,7 +872,7 @@ impl CowshedError {
         }
     }
     /// The wait on another process that expired, when this error reports one.
-    pub fn wait_source(&self) -> Option<&crate::runtime::wait_spans::WaitFailure> {
+    pub fn wait_source(&self) -> Option<&cowshed_types::wait::WaitFailure> {
         match self.local_cause.as_deref()? {
             LocalCause::Wait(failure) => Some(failure),
             LocalCause::LifecycleConflict(_) | LocalCause::ImageLocksHeld(_) => None,

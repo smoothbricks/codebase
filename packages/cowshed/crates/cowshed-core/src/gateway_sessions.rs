@@ -28,12 +28,12 @@ use crate::gateway_inventory::{
     AttachedInventory, GatewaySessionFact, HeldWorkspace, NativeGatewayInventory, PortCollision,
     served_sessions,
 };
-use crate::runtime::wait_spans::WaitFailure;
 use crate::storage::bootstrap::{FixturePortClaims, ValidatedHostStorage};
 use cowshed_types::metadata::{
     EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation, WorkspaceName,
 };
 use cowshed_types::repository::RepoId;
+use cowshed_types::wait::WaitFailure;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReconcileReport {

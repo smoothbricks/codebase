@@ -31,7 +31,7 @@ use super::supervisor::{
     CheckpointBarrier, Command, LogChunk, NxDaemonRetirement, RetireWhen, SessionSnapshot,
     SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
-use super::wait_spans::{WaitFailure, peer_pid};
+use super::wait_spans::{peer_pid, wait_failure_of, wait_failure_silent};
 use crate::api::dto::{
     AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobId, JobInfo,
     JobJournalCursor, JobState, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand,
@@ -858,7 +858,7 @@ fn waited(failure: WaitError) -> CowshedError {
         WaitError::Io { .. } => "cowshed doctor --json names the supervisor and its socket",
     };
     CowshedError::environment_missing(failure.to_string(), hint)
-        .with_wait(WaitFailure::of(&failure))
+        .with_wait(wait_failure_of(&failure))
 }
 
 /// Connect to the supervisor at `path` for `op`, whose request has `bound` from now.
@@ -1000,7 +1000,7 @@ fn stuck(silent: Silent<String>, supervisor_pid: Option<i32>) -> CowshedError {
         silent.to_string(),
         "the supervisor has not published the job's end; cowshed doctor --json names the supervisor",
     )
-    .with_wait(Some(WaitFailure::silent(&silent, supervisor_pid)))
+    .with_wait(Some(wait_failure_silent(&silent, supervisor_pid)))
 }
 
 // ---------------------------------------------------------------------------------------------
