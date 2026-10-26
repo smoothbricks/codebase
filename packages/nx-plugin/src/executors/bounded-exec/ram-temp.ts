@@ -280,7 +280,7 @@ export interface HostCommands {
    * no receipt for counts only as the volume of its exact name.
    */
   ownsRamDisk?(disk: AttachedRamDisk): boolean;
-  detachRam(device: string, registryEntry: string, deadlineMs?: number): Promise<CommandOutput>;
+  detachRam(device: string, registryEntry: string): Promise<CommandOutput>;
 }
 
 /**
@@ -1207,7 +1207,6 @@ export class RamTempVolume {
     op: Operation,
     physical: string,
     registryEntry: string | null,
-    deadlineMs?: number,
   ): Promise<Result<CommandOutput, RamTempError>> {
     const custody: DetachCustody = { physical, registryEntry, phase: 'waiting', facadePid: null };
     const begun = await this.locked(op, 'detach custody', async (ledger): Promise<Step<boolean>> => {
@@ -1225,7 +1224,7 @@ export class RamTempVolume {
     try {
       if (registryEntry === null)
         throw new Error('detach has no captured registry identity; retained without dispatch');
-      output = await this.commands.detachRam(physical, registryEntry, deadlineMs);
+      output = await this.commands.detachRam(physical, registryEntry);
     } catch (error) {
       // Whether a child started is unknown, so its custody is reported, never dropped.
       const reported = await this.reportDetach(op, custody, null);
@@ -2069,7 +2068,7 @@ export class RamTempVolume {
           },
         };
       }
-      const command = await this.runDetach(op, disk.physical, disk.entry, STRAY_DETACH_DEADLINE_MS);
+      const command = await this.runDetach(op, disk.physical, disk.entry);
       if (!command.ok) return command;
       const detached = detachOutcome(command.value, disk, `hdiutil detach (stray ${disk.physical})`);
       if (!detached.ok) {
@@ -2655,9 +2654,8 @@ export async function detachRamDisk(
   commands: Pick<HostCommands, 'detachRam'>,
   disk: AttachedRamDisk,
   step: string,
-  deadlineMs?: number,
 ): Promise<Result<void, ProvisionFailed>> {
-  const detached = await commands.detachRam(disk.physical, disk.entry, deadlineMs);
+  const detached = await commands.detachRam(disk.physical, disk.entry);
   return detachOutcome(detached, disk, step);
 }
 
@@ -2685,13 +2683,6 @@ function detachOutcome(detached: CommandOutput, disk: AttachedRamDisk, step: str
  * DiskArbitration was saturated. Cowshed bounds its disk children the same way.
  */
 const HOST_COMMAND_DEADLINE_MS = 120_000;
-
-/**
- * How long a creator waits on a stray's detach before reporting it. The wait is bounded,
- * not the detach: its exact custody remains in the existing ledger until terminal completion
- * or the bound registry entry's absence. A wedged stray fences only this volume.
- */
-const STRAY_DETACH_DEADLINE_MS = 30_000;
 
 /** Disk tools delegate their lease and process lifetime to cowshed, with one image policy. */
 export function diskCommand(
@@ -2793,8 +2784,8 @@ export function createHostCommands(
         }
       }
     },
-    detachRam(device, registryEntry, callDeadlineMs) {
-      return detachGatewayRamDisk(gatewaySocket, device, registryEntry, callDeadlineMs ?? defaultDeadlineMs);
+    detachRam(device, registryEntry) {
+      return detachGatewayRamDisk(gatewaySocket, device, registryEntry);
     },
     attachRam(sectors) {
       return attachRamDisk(gatewaySocket, sectors, defaultDeadlineMs);

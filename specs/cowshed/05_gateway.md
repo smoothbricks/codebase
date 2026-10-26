@@ -1106,6 +1106,11 @@ gateway says every lease it detaches on its stderr, as
 `cowshed: ram-lease <device> entry=<entry> <why>: detach outcome=<outcome>; <record>`.
 `cowshed: ram-lease <device> entry=<entry> <why>: detach outcome=<outcome>; <record>`.
 
+A caller reads a `ram-detach` answer past its heartbeats under the silence rule of "Deadlines" (60 s before the first
+heartbeat, 15 s after each one) and under no total ceiling, so a creator waiting on a stray's detach waits as long as
+the detach runs. A silent gateway ends that wait `SILENT`, naming the socket, the bound, the time waited and the last
+progress; the detach's custody stays in the volume's ledger until its late terminal answer or its entry's absence.
+
 A kept disk's caller owns the volume on it and detaches the disk only through `ram-detach` naming its entry and whole
 disk. It never detaches one through `disk-command`, and never with `-force`. The helper's own session keeps it out of
 the gateway's process group, so a gateway restart leaves a kept disk attached. A volume counts as its own only the disks

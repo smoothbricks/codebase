@@ -767,8 +767,8 @@ describe('detaching a RAM disk an inventory found', () => {
     const calls: unknown[] = [];
     const result = await detachRamDisk(
       {
-        async detachRam(device, registryEntry, deadlineMs) {
-          calls.push({ device, registryEntry, deadlineMs });
+        async detachRam(device, registryEntry) {
+          calls.push({ device, registryEntry });
           return output;
         },
       },
@@ -784,7 +784,6 @@ describe('detaching a RAM disk an inventory found', () => {
     expect(calls).toEqual([
       {
         device: '/dev/disk540',
-        deadlineMs: undefined,
         registryEntry: '0x10005557b',
       },
     ]);
@@ -1574,8 +1573,8 @@ socket.end();
     },
     ownsRamDisk: (disk) =>
       recorded && disk.entry === entry && disk.physical === '/dev/disk7' && disk.sectors === capacity / 512,
-    detachRam: (device, registryEntry, deadlineMs) =>
-      commands.run('/usr/bin/hdiutil', ['detach', device], deadlineMs, { registryEntry }),
+    detachRam: (device, registryEntry) =>
+      commands.run('/usr/bin/hdiutil', ['detach', device], undefined, { registryEntry }),
     async attachRam() {
       attaches += 1;
       if (mode === 'rollback') {
@@ -1785,7 +1784,7 @@ const commands = {
   },
   async attachRam() { throw new Error('the bounded detach must precede attach admission'); },
   ownsRamDisk: (disk) => disk.entry === ${JSON.stringify(fixture.entry)} && disk.physical === '/dev/disk7',
-  detachRam: (device, registryEntry, deadlineMs) => commands.run('/usr/bin/hdiutil', ['detach', device], deadlineMs, { registryEntry }),
+  detachRam: (device, registryEntry) => commands.run('/usr/bin/hdiutil', ['detach', device], undefined, { registryEntry }),
 };
 const volume = new RamTempVolume(paths, ${fixture.capacity}, commands);
 const result = await volume.acquire({ rootArgv() { throw new Error('no subtree'); }, async retire() { throw new Error('no subtree'); } });

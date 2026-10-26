@@ -1,12 +1,60 @@
 import { connect } from 'node:net';
+import { StringDecoder } from 'node:string_decoder';
 import type { CommandOutput } from './ram-temp.js';
 
-/** Typed gateway mutation: no caller-owned native child or arbitrary argv. */
+/**
+ * The silence the client allows the gateway before its first heartbeat line (05_gateway.md, "Deadlines"; Rust
+ * `UNPROVEN_SILENCE`): a gateway of an earlier build never heartbeats, and its slow answers still arrive within the
+ * minute doctor always gave it.
+ */
+export const UNPROVEN_SILENCE_MS = 60_000;
+
+/** The silence allowed once a heartbeat has come: three 5 s heartbeats (Rust `deadline::HEARTBEAT_SILENCE`). */
+export const HEARTBEAT_SILENCE_MS = 15_000;
+
+/** A detach answers its native output, which the gateway bounds; no answer grows past that. */
+const ANSWER_BYTES_MAX = 2 * 64 * 1024 * 6 + 4096;
+
+/** Monotonic milliseconds and the one silence timer; `after` answers its cancel. A test fires its timer itself. */
+export interface SilenceTimers {
+  now(): number;
+  after(ms: number, fire: () => void): () => void;
+}
+
+const SYSTEM_TIMERS: SilenceTimers = {
+  now: () => performance.now(),
+  after(ms, fire) {
+    const timer = setTimeout(fire, ms);
+    return () => clearTimeout(timer);
+  },
+};
+
+/** The last thing the client saw the gateway do, which a `SILENT` failure names. */
+type GatewayProgress = { kind: 'nothing' } | { kind: 'sent' } | { kind: 'heartbeat'; seq: number };
+
+function describeProgress(progress: GatewayProgress): string {
+  switch (progress.kind) {
+    case 'nothing':
+      return 'nothing';
+    case 'sent':
+      return 'request sent';
+    case 'heartbeat':
+      return `heartbeat ${progress.seq}`;
+  }
+}
+
+/**
+ * Typed gateway mutation: no caller-owned native child or arbitrary argv. The request is a one-shot control op, so the
+ * answer is read under the gateway's silence rule (05_gateway.md, "Deadlines"), never under a total ceiling: until the
+ * first heartbeat line the gateway may be silent for {@link UNPROVEN_SILENCE_MS}, after each one for
+ * {@link HEARTBEAT_SILENCE_MS}. A silent gateway ends this caller's wait as `SILENT`, with unknown custody; the gateway's
+ * detach keeps running, and its late answer still completes `pending`.
+ */
 export function detachGatewayRamDisk(
   socket: string,
   device: string,
   registryEntry: string,
-  deadlineMs: number,
+  timers: SilenceTimers = SYSTEM_TIMERS,
 ): Promise<CommandOutput> {
   let resolve!: (output: CommandOutput) => void;
   const answer = new Promise<CommandOutput>((done) => {
@@ -16,45 +64,68 @@ export function detachGatewayRamDisk(
   const completion = new Promise<CommandOutput | null>((done) => {
     complete = done;
   });
-  const connection = connect(socket);
+  const started = timers.now();
+  let last: GatewayProgress = { kind: 'nothing' };
+  let silenceMs = UNPROVEN_SILENCE_MS;
+  let disarm = () => {};
+  const decoder = new StringDecoder('utf8');
   let received = '';
   let dispatched = false;
   let bounded = false;
   let finished = false;
   const pending = { pid: null, completion };
   const unknown = (reason: string): CommandOutput => ({ status: 1, stdout: '', stderr: reason, pending });
+  const connection = connect(socket);
   const finish = (output: CommandOutput | null, reason = 'gateway detach terminal status unavailable') => {
     if (finished) return;
     finished = true;
-    clearTimeout(timer);
+    disarm();
     complete(output);
     if (!bounded) resolve(output ?? unknown(reason));
     connection.destroy();
   };
-  const timer = setTimeout(() => {
+  const silent = () => {
     bounded = true;
-    resolve(unknown(`no gateway detach answer within ${deadlineMs} ms; gateway mutation keeps running, not killed`));
+    resolve(
+      unknown(
+        `SILENT: ram-detach: the gateway at ${socket} wrote no heartbeat or answer for ${silenceMs} ms (waited ${Math.max(0, timers.now() - started)} ms; last progress: ${describeProgress(last)}); the gateway's detach keeps running, not killed`,
+      ),
+    );
     connection.unref();
-  }, deadlineMs);
+  };
+  /** Allow the gateway `silenceMs` from now; once the caller's wait has ended there is nothing left to bound. */
+  const listen = () => {
+    if (bounded || finished) return;
+    disarm();
+    disarm = timers.after(silenceMs, silent);
+  };
+  listen();
   connection.on('connect', () => {
     dispatched = true;
     connection.end(`${JSON.stringify({ op: 'ram-detach', device, registryEntry })}\n`);
+    last = { kind: 'sent' };
   });
   connection.on('data', (chunk: Buffer) => {
-    received += chunk.toString('utf8');
-    // Native output is bounded by the gateway contract; never buffer an unbounded peer reply.
-    if (received.length > 2 * 64 * 1024 * 6 + 4096)
-      return finish(null, 'gateway detach reply exceeds its bounded output contract');
+    received += decoder.write(chunk);
     for (let newline = received.indexOf('\n'); newline >= 0; newline = received.indexOf('\n')) {
       const line = received.slice(0, newline);
       received = received.slice(newline + 1);
       // The gateway heartbeats an answer that is not ready yet (05_gateway.md, "Deadlines"): never the answer.
-      if (isHeartbeat(line)) continue;
+      const seq = heartbeatSeq(line);
+      if (seq !== null) {
+        last = { kind: 'heartbeat', seq };
+        silenceMs = HEARTBEAT_SILENCE_MS;
+        listen();
+        continue;
+      }
       const parsed = readDetachAnswer(line);
       if (parsed === null) finish(null, `gateway detach reply proves no terminal outcome: ${line.slice(0, 512)}`);
       else finish(parsed);
       return;
     }
+    // Native output is bounded by the gateway contract; never buffer an unbounded peer reply.
+    if (Buffer.byteLength(received) > ANSWER_BYTES_MAX)
+      finish(null, 'gateway detach reply exceeds its bounded output contract');
   });
   connection.on('error', (error) => {
     if (!dispatched) finish({ status: 103, stdout: '', stderr: `gateway detach did not start: ${error.message}` });
@@ -64,23 +135,23 @@ export function detachGatewayRamDisk(
   return answer;
 }
 
-/** `{"ok":true,"progress":<n>}`: a gateway control answer's heartbeat line (05_gateway.md, "Deadlines"). */
-function isHeartbeat(line: string): boolean {
+/**
+ * The heartbeat's `progress` when `line` is exactly a gateway heartbeat, `{"ok":<bool>,"progress":<u64>}` and nothing
+ * else (Rust `ProgressLine`, `deny_unknown_fields`); `null` for any other line, which is the answer.
+ */
+function heartbeatSeq(line: string): number | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
   } catch {
-    return false;
+    return null;
   }
-  return (
-    typeof parsed === 'object' &&
-    parsed !== null &&
-    'ok' in parsed &&
-    parsed.ok === true &&
-    'progress' in parsed &&
-    typeof parsed.progress === 'number' &&
-    !('ramDetach' in parsed)
-  );
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+  if (Object.keys(parsed).length !== 2 || !('ok' in parsed) || !('progress' in parsed)) return null;
+  const { ok, progress } = parsed;
+  return typeof ok === 'boolean' && typeof progress === 'number' && Number.isInteger(progress) && progress >= 0
+    ? progress
+    : null;
 }
 
 /** Only the gateway can attest whether its exact native child ran and was reaped. */

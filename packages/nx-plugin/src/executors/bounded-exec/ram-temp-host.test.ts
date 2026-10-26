@@ -534,8 +534,8 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
   const calls: { file: string; args: readonly string[]; output: CommandOutput }[] = [];
   const commands: HostCommands = {
     ownsRamDisk: (disk) => ownsRecordedDisk(owned, disk),
-    async detachRam(device, entry, deadlineMs) {
-      const output = await host.detachRam(device, entry, deadlineMs);
+    async detachRam(device, entry) {
+      const output = await host.detachRam(device, entry);
       calls.push({ file: '/usr/bin/hdiutil', args: ['detach', device], output });
       return output;
     },
