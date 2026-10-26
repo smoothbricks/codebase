@@ -930,6 +930,7 @@ async function cargoWorkspace(
   const stderr: Buffer[] = [];
   child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: cargo reads the workspace's manifests and resolves nothing (--frozen --no-deps), so it takes no package-cache lock and waits on no other process; the operator's interrupt ends a hung one
   const status = await new Promise<Result<number | null, string>>((resolve) => {
     child.once('error', (error) => resolve({ ok: false, error: error.message }));
     child.once('close', (code) => resolve({ ok: true, value: code }));

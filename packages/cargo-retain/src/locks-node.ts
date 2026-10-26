@@ -71,6 +71,7 @@ async function holdThroughPerl(paths: readonly string[], mode: LockMode): Promis
     // Node throws, not emits 'error', for exec failures it does not class as run-time, such as EPERM from a sandbox.
     return { kind: 'unavailable', reason: `cannot run perl: ${describeCause(error)}` };
   }
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: perl takes each flock without waiting (it answers busy instead) and ends on its stdin's EOF, which release() or the line after its answer sends; it waits on no other process
   const exited = new Promise<void>((resolve) => child.once('close', () => resolve()));
   let stderr = '';
   child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
