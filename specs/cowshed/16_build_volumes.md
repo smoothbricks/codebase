@@ -1410,7 +1410,17 @@ the same unit-identity environment. Concretely:
   `-fuse-ld=/usr/bin/ld`, selecting Apple's linker independently of PATH; only an absent SDK invokes `xcrun`. The Darwin
   dev shell disables devenv's C tools, uses a compiler-free stdenv, and removes only the Rust toolchain's propagated Nix
   compiler while retaining the pinned components and their runtime dependencies. Linux retains its existing C tools,
-  stdenv and toolchain propagation.
+  stdenv and toolchain propagation. Its Rust linker, devenv's clang driver, links with a patched LLD 21 that sizes ELF
+  relocation shards from the actual LLVM executor, whose worker indices address them. The driver's earlier CPU-affinity
+  snapshot cannot size those shards: an Incus cpuset can grow before the pool starts. The serial path keeps one shard
+  without creating a pool. Only that linker is patched, as local derivations in `tooling/direnv/devenv.nix` rather than
+  an overlay on `llvmPackages`, which would rebuild every package that links with the LLVM stdenv (Chromium, which no
+  binary cache holds): `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` names devenv's driver over the patched wrapper.
+  LLVM 23 removes implicit thread-index shards in
+  [905f654bb721](https://github.com/llvm/llvm-project/commit/905f654bb721f1df119bd2cfaa23736e30838e90); the local patch
+  retires when the pinned linker contains that change. The Linux regression (`tooling/direnv/lld-affinity-test.py`)
+  grows affinity from eight CPUs to twelve at the first parallel task, requires a successful link, checks every relative
+  relocation remains in the output, and fails when the first parallel task never runs.
 - **Two profiles.** `dev`, which includes unit tests, and `release`, for a released binary. `test` inherits `dev`. The
   owner's ruling, 2026-09-30: "BUILD EVERYTHING ONCE. CARGO ALREADY TRACKS CHANGES AND REBUILDS WHAT HAS CHANGED"; "You
   have realistically 2 profiles: dev (which includes unit testing) and release". 03_caches.md states the profile rule.

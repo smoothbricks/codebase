@@ -1,0 +1,18 @@
+LLD 21's driver snapshots the CPU count before the parallel executor is
+created. A growing affinity mask can give that executor more threads than
+there are relocation shards, so getThreadIndex() indexes outside relocsVec.
+Size the shards from the executor that supplies those indices. Preserve the
+single-threaded path, which executes on the main thread without an executor.
+
+LLVM 23 removes implicit thread-index shards altogether in:
+https://github.com/llvm/llvm-project/commit/905f654bb721f1df119bd2cfaa23736e30838e90
+That change depends on the newer RelocScan API and does not apply to LLVM 21.
+Remove this patch when the pinned linker includes that upstream change.
+
+--- a/ELF/SyntheticSections.cpp
++++ b/ELF/SyntheticSections.cpp
+@@ -4785,1 +4785,3 @@
+-  const unsigned threadCount = ctx.arg.threadCount;
++  const unsigned threadCount = parallel::strategy.ThreadsRequested == 1
++                                   ? 1
++                                   : parallel::getThreadCount();

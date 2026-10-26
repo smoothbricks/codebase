@@ -8,6 +8,23 @@
 # https://devenv.sh/inputs/
 let
   git-format-staged = inputs.git-format-staged.packages.${pkgs.stdenv.system}.default;
+  # LLD 21 snapshots CPU affinity before its worker pool exists. Incus can grow
+  # the mask between those reads, so workers outnumber the relocation shards
+  # they index. Patch only the lld the Rust linker uses: an overlay on
+  # llvmPackages would rebuild everything that links with the LLVM stdenv,
+  # Chromium included, and no binary cache holds those. Remove when the pinned
+  # lld includes LLVM 23's replacement (llvm/llvm-project 905f654bb721).
+  patchedLld = pkgs.llvmPackages.lld.overrideAttrs (old: {
+    patches = (old.patches or []) ++ [./nixpkgs-overlay/lld-affinity.patch];
+  });
+  patchedBintools = pkgs.llvmPackages.bintools.override {
+    bintools = pkgs.llvmPackages.bintools-unwrapped.override {lld = patchedLld;};
+  };
+  # devenv's clang driver for x86_64 Linux (languages.rust.clangLinker) over the
+  # patched lld wrapper, which keeps Nix's rpath and dynamic-linker flags.
+  rustLinker = pkgs.writeShellScript "smoothbricks-rust-linker" ''
+    exec ${lib.getExe pkgs.clang} --ld-path=${patchedBintools}/bin/ld.lld "$@"
+  '';
 in {
   # The SmoothBricks shell contract: PATH, toolchain, compiler-cache policy, and
   # the enterShell prologue/epilogue every repo shares. Managed by `smoo monorepo`.
@@ -106,10 +123,16 @@ in {
   # the native Linux target to the wrapper at the precedence point it honors.
   # Linux artifacts build with zig through cargo-zigbuild, whose Nx executor
   # drops this pin for the triple it builds.
-  env = lib.optionalAttrs pkgs.stdenv.isLinux {
-    CC_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/cc";
-    CXX_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/c++";
-  };
+  env =
+    lib.optionalAttrs pkgs.stdenv.isLinux {
+      CC_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/cc";
+      CXX_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/c++";
+    }
+    # devenv selects its own clang-and-lld driver for this triple; replace it
+    # with the same driver over the patched lld.
+    // lib.optionalAttrs (pkgs.stdenv.hostPlatform.rust.rustcTarget == "x86_64-unknown-linux-gnu") {
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = lib.mkForce "${rustLinker}";
+    };
 
   # Use system Xcode for iOS simulator, signing, and instruments.
   # Nix Apple SDK is build-only — no simctl/simulator runtimes, and nix's
