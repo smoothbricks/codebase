@@ -21,13 +21,13 @@ use crate::launchd::{
     StoreBackedProgram, kickstart_hint, plan_install,
 };
 use crate::output::Output;
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
 use cowshed_core::capabilities::sccache::{cache_directory, gc_root, server_socket};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
 use cowshed_os::fork_lock::RunAsync as _;
 use cowshed_os::namespace::HostNamespace;
+use cowshed_types::image::ImageCapacity;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt as _;

@@ -5,6 +5,7 @@
 //! `cowshed-gateway-types`, which owns repository-id character validation. Shells
 //! construct these values where they live.
 
+pub mod build_volume;
 pub mod capabilities;
 pub mod clock;
 pub mod config;

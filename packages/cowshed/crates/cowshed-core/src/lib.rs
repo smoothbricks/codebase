@@ -46,14 +46,14 @@ pub mod workspace_git_fetch;
 // Every real-image fixture in the lib test binary shares this one scratch-root protocol: one
 // sweep, one sequence, whichever module attaches the image; and one blank image template.
 #[cfg(all(test, target_os = "macos"))]
-use cowshed_apfs::image::ImageCapacity;
-#[cfg(all(test, target_os = "macos"))]
 use cowshed_apfs::{
     ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
 #[cfg(all(test, target_os = "macos"))]
 use cowshed_apfs::{store_lock::verify_no_symlinks, template::blank_template};
+#[cfg(all(test, target_os = "macos"))]
+use cowshed_types::image::ImageCapacity;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;

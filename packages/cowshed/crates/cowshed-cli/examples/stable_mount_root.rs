@@ -27,7 +27,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(target_os = "macos")]
 mod native {
     use cowshed_apfs::attach_budget::{self, KernelReading};
-    use cowshed_apfs::image::ImageCapacity;
     use cowshed_apfs::{
         ApfsBackend, CreateImageRequest, DetachIntent, MacOsApfsBackend, MountAccess,
         SystemCommandRunner,
@@ -35,6 +34,7 @@ mod native {
     use cowshed_core::storage::bootstrap::execute_mount_root_provisioning;
     use cowshed_core::storage::host_config::{HOST_CONFIG_FILE, HostConfig};
     use cowshed_os::namespace::HostNamespace;
+    use cowshed_types::image::ImageCapacity;
     use serde_json::json;
     use std::fs;
     use std::io;

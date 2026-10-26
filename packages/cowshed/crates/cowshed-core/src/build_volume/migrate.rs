@@ -15,8 +15,8 @@ use super::{
 };
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::{CowshedError, Result};
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_types::capabilities::BuildStatePath;
+use cowshed_types::image::ImageCapacity;
 
 pub struct FirstTouch<'a> {
     pub checkout: &'a Path,

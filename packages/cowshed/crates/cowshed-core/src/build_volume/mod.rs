@@ -58,11 +58,6 @@ const COMPACTING_DIRECTORY: &str = ".compacting";
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
 pub(crate) const RECORD_VERSION: u32 = 1;
-/// The capacity of a build volume created from nothing, unless `.cowshed.toml` `[build] capacity`
-/// says otherwise (16_build_volumes.md, "Substrate"). Sparse: a cap on build-cache growth, not an
-/// allocation.
-pub const DEFAULT_BUILD_VOLUME_CAPACITY: cowshed_apfs::image::ImageCapacity =
-    cowshed_apfs::image::ImageCapacity::from_gibibytes(100);
 
 /// A build volume's identity: 32 lowercase hex digits, minted once and never reused.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

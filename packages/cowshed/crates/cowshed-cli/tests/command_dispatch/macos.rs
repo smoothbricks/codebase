@@ -1,4 +1,3 @@
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{blank_template, blank_template_path};
 use cowshed_apfs::{
@@ -34,6 +33,7 @@ use cowshed_os::test_backstop::{
     AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _, FileBackstop as _,
     UnixStreamBackstop as _,
 };
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{PortBlock, WorkspaceName};
 use cowshed_types::repository::RepoId;
 use std::cell::Cell;

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
 use cowshed_apfs::{
@@ -29,6 +28,7 @@ use cowshed_core::storage::lifecycle::{
 };
 use cowshed_core::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::lifecycle::CheckpointLabel;
 use cowshed_types::lifecycle::{LifecycleWorkspace, MountState, Pin, Revision};
 use cowshed_types::metadata::{

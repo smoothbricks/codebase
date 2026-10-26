@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use cowshed_apfs::SystemCommandRunner;
-use cowshed_apfs::image::ImageCapacity;
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::operations::{ListLanding, ReAdoption};
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
@@ -35,8 +34,8 @@ use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
     CachesVolume, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
-    RETIRED_CACHES_MOUNTPOINT, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeRole, VolumeState,
-    execute_host_setup, plan_host_setup,
+    RETIRED_CACHES_MOUNTPOINT, ValidatedHostStorage, VolumeRole, VolumeState, execute_host_setup,
+    plan_host_setup,
 };
 use cowshed_core::storage::host_config::{
     RETIRED_LAYOUT_HINT, RetiredLayoutRecord, retired_layout_paths,
@@ -52,7 +51,9 @@ use cowshed_core::{
     JobHandle, NativeGatewayInventory, Result, UnreachableMain, validate_existing_host_storage,
 };
 use cowshed_gateway_types::STORE_ROOT;
+use cowshed_types::config::VOLUME_MARKER_FILE;
 use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::lifecycle::{DerivedWorkspace, MountState, Pin};
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,

@@ -3225,7 +3225,7 @@ mod tests {
         let caches = store.join("caches");
         fs::create_dir_all(&caches).expect("caches volume");
         fs::write(
-            caches.join(crate::storage::bootstrap::VOLUME_MARKER_FILE),
+            caches.join(cowshed_types::config::VOLUME_MARKER_FILE),
             b"{}",
         )
         .expect("volume marker");
@@ -3239,7 +3239,7 @@ mod tests {
         fs::create_dir_all(relocated.join("anything")).expect("relocated volume");
         fs::write(relocated.join("anything/repository.json"), b"{}").expect("decoy binding");
         fs::write(
-            relocated.join(crate::storage::bootstrap::VOLUME_MARKER_FILE),
+            relocated.join(cowshed_types::config::VOLUME_MARKER_FILE),
             b"{}",
         )
         .expect("relocated marker");

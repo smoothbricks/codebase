@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::LockMode;
 use cowshed_apfs::{DetachIntent, MountAccess};
 use cowshed_core::storage::apfs::{
@@ -19,6 +18,7 @@ use cowshed_core::storage::lifecycle::{
     StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::image::is_image_path;
 use cowshed_types::lifecycle::CheckpointLabel;
 use cowshed_types::lifecycle::{

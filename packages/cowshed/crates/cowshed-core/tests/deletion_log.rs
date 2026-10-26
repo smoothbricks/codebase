@@ -63,7 +63,7 @@ impl CommandRunner for StubRunner {
     fn grow_image(
         &self,
         image: &std::path::Path,
-        _: cowshed_apfs::image::ImageCapacity,
+        _: cowshed_types::image::ImageCapacity,
     ) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

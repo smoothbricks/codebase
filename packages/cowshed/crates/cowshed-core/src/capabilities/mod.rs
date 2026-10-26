@@ -262,18 +262,18 @@ pub fn detect_for_workspace(context: &DetectionContext<'_>) -> Result<DetectedCa
     detect(context, config.capabilities())
 }
 
-fn workspace_config(workspace_root: &Path) -> Result<crate::storage::bootstrap::CowshedConfig> {
+fn workspace_config(workspace_root: &Path) -> Result<cowshed_types::config::CowshedConfig> {
     let path = workspace_root.join(".cowshed.toml");
     if convention_file(workspace_root, &path)? {
         let source = fs::read_to_string(&path).map_err(|error| detection_error(&path, error))?;
-        crate::storage::bootstrap::parse_cowshed_config(&source).map_err(|error| {
+        cowshed_types::config::parse_cowshed_config(&source).map_err(|error| {
             CowshedError::usage(
                 format!("invalid {}: {error}", path.display()),
                 "repair the repository cowshed configuration",
             )
         })
     } else {
-        Ok(crate::storage::bootstrap::CowshedConfig::default())
+        Ok(cowshed_types::config::CowshedConfig::default())
     }
 }
 

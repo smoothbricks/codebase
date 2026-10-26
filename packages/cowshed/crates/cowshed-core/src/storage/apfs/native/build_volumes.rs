@@ -17,9 +17,9 @@ use crate::build_volume::{
 };
 use crate::storage::apfs::ApfsStorageError;
 use crate::storage::lifecycle::ResizeOutcome;
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, mount_is_in_progress};
 use cowshed_os::process::Holder;
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 use std::ops::ControlFlow;
 

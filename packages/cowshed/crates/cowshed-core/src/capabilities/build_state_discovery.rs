@@ -691,7 +691,7 @@ fn declare(
 /// and a finding for each workspace it could not answer for.
 fn discover_cargo_targets(
     context: &DetectionContext<'_>,
-    config: &crate::storage::bootstrap::CowshedConfig,
+    config: &cowshed_types::config::CowshedConfig,
     tracked: &mut TrackedManifests,
     cargo: &mut dyn CargoRunner,
     result: &mut BuildStateDiscovery,

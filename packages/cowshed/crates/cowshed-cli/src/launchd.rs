@@ -5,9 +5,9 @@
 //! tests remain entirely host-independent.
 
 use crate::agent_cycle::{self, LoadedAgent};
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_os::deadline::{self, Bound, Deadline, LatencyClass, RunError};
 use cowshed_os::namespace::HostNamespace;
+use cowshed_types::image::ImageCapacity;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;

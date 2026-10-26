@@ -44,15 +44,16 @@ use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::bootstrap::{
     CachesVolume, CanonicalRoots, FstabOutcome, HostAction, HostActionOutcome, HostActionResult,
     HostSetupPlan, HostSetupReport, HostUninstallPlan, RETIRED_CACHES_MOUNTPOINT,
-    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VOLUME_MARKER_FILE,
-    VolumeOutcome, VolumeState, execute_host_setup, execute_host_uninstall, main_cowshed_config,
-    plan_host_setup, plan_host_uninstall,
+    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState,
+    execute_host_setup, execute_host_uninstall, main_cowshed_config, plan_host_setup,
+    plan_host_uninstall,
 };
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
     CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
     validate_existing_host_storage,
 };
+use cowshed_types::config::VOLUME_MARKER_FILE;
 use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::RepoId;
 use std::fs;

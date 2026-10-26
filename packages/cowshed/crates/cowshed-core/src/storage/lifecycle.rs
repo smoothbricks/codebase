@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use cowshed_apfs::image::ImageCapacity;
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{GrantSet, WorkspaceIncarnation, WorkspaceName};
 use cowshed_types::repository::RepoId;
 

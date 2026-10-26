@@ -30,9 +30,9 @@ use crate::storage::apfs::native::{
 };
 use crate::storage::apfs::release::Drained;
 use crate::storage::lifecycle::ResizeOutcome;
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_os::fsio::AnchoredDirectory;
 use cowshed_os::process::Holder;
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 
 /// The record beside a build volume of the write instant it holds everything up to

@@ -4,13 +4,13 @@
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use cowshed_apfs::image::ImageCapacity;
     use cowshed_apfs::{
         ApfsBackend, CommandRequest, CommandRunner, CreateImageRequest, DetachIntent,
         DiskImageSource, MountAccess, SystemCommandRunner,
     };
     use cowshed_core::storage::apfs::{ApfsSubstrateConfig, native::MacOsApfsExecutionHost};
     use cowshed_os::namespace::{HostNamespace, TestNamespace};
+    use cowshed_types::image::ImageCapacity;
     use std::{fs, path::PathBuf, time::Duration};
 
     let mut args = std::env::args_os().skip(1);

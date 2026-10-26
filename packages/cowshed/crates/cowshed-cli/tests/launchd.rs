@@ -6,7 +6,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_cli::agent_cycle::LoadedAgent;
 use cowshed_cli::code_signing::{CODESIGN, CertificateHash, SigningIdentity};
 use cowshed_cli::launchd::{
@@ -25,6 +24,7 @@ use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::process::RunState;
 #[cfg(target_os = "macos")]
 use cowshed_os::test_backstop::CommandBackstop as _;
+use cowshed_types::image::ImageCapacity;
 
 #[cfg(target_os = "macos")]
 use cowshed_apfs::{

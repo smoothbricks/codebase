@@ -20,13 +20,13 @@ use crate::copy::copy_until_quiescent_blocking;
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, DetachIntent, MacOsApfsBackend,
     MountAccess, RecoveredImageAttachment,
 };
 #[cfg(target_os = "macos")]
 use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::image::{IMAGE_EXTENSION, is_image_path};
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, MARKER_VERSION, MetadataError, Platform,
