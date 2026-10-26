@@ -893,12 +893,6 @@ fn native_host_at(
     .expect("native APFS host")
 }
 
-fn wait_for_path(path: &Path) {
-    while !path.exists() {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn identity(fixture: &Fixture) -> OperationIdentity {
     identity_at(&fixture.root)
 }
@@ -6384,16 +6378,12 @@ fn real_apfs_retired_temp_dir_is_never_reclaimed_through_a_mounted_volume() {
 
 #[test]
 fn flock_child_helper() {
+    use std::io::Write as _;
     let Ok(root) = std::env::var("COWSHED_FLOCK_HELPER_ROOT") else {
         return;
     };
     let lock =
         PathBuf::from(std::env::var_os("COWSHED_FLOCK_HELPER_LOCK").expect("helper lock path"));
-    let ready =
-        PathBuf::from(std::env::var_os("COWSHED_FLOCK_HELPER_READY").expect("helper ready path"));
-    let release = PathBuf::from(
-        std::env::var_os("COWSHED_FLOCK_HELPER_RELEASE").expect("helper release path"),
-    );
     // Its own namespace suffices: this helper only takes image locks, which derive no names.
     let namespace = HostNamespace::Test(TestNamespace::mint().expect("a test namespace"));
     let host = native_host_at(namespace, Path::new(&root));
@@ -6401,8 +6391,13 @@ fn flock_child_helper() {
         .lock_images(&[lock], LockMode::Wait, &other_operation())
         .expect("helper lock")
         .expect("blocking helper lock");
-    std::fs::write(&ready, b"ready").expect("signal ready");
-    wait_for_path(&release);
+    // On stderr, which libtest neither captures nor frames: the lock is held from here.
+    std::io::stderr()
+        .write_all(b"held\n")
+        .expect("say the lock is held");
+    // Held in the parent's custody: its stdin closing -- the parent letting go, or the
+    // parent's own death closing the pipe -- ends this helper and releases the lock.
+    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("wait for the release");
     if std::env::var_os("COWSHED_FLOCK_HELPER_CRASH").is_some() {
         std::process::abort();
     }
@@ -6447,23 +6442,40 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
     );
 
     for crash in [false, true] {
-        let ready = fixture.root.join(format!("child-{crash}.ready"));
-        let release = fixture.root.join(format!("child-{crash}.release"));
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .arg("--exact")
             .arg("macos::flock_child_helper")
+            .arg("--nocapture")
             .env("COWSHED_FLOCK_HELPER_ROOT", &fixture.root)
             .env("COWSHED_FLOCK_HELPER_LOCK", &lock)
-            .env("COWSHED_FLOCK_HELPER_READY", &ready)
-            .env("COWSHED_FLOCK_HELPER_RELEASE", &release)
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if crash {
             command.env("COWSHED_FLOCK_HELPER_CRASH", "1");
         }
         let mut child = command.spawn_locked().expect("spawn lock helper");
-        wait_for_path(&ready);
+        let mut said = std::io::BufReader::new(child.stderr.take().expect("the helper's stderr"));
+        {
+            use std::io::BufRead as _;
+            let mut transcript = String::new();
+            loop {
+                let start = transcript.len();
+                let read = said
+                    .read_line(&mut transcript)
+                    .expect("the helper's stderr");
+                assert_ne!(
+                    read,
+                    0,
+                    "the lock helper ended before it held {}; it said: {transcript}",
+                    lock.display()
+                );
+                if transcript[start..].trim_end() == "held" {
+                    break;
+                }
+            }
+        }
         assert!(
             first
                 .lock_images(
@@ -6475,7 +6487,8 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
                 .is_none(),
             "another process must own the lock"
         );
-        std::fs::write(&release, b"release").expect("release helper");
+        drop(child.stdin.take());
+        std::io::copy(&mut said, &mut std::io::sink()).expect("the helper's last output");
         let status = child.wait_bounded().expect("wait for helper");
         assert_eq!(status.success(), !crash);
         drop(
