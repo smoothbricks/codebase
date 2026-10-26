@@ -794,12 +794,11 @@ coordinator-side; the data plane supplies neither git credentials nor a push pat
 ## Control plane (Unix socket + optional 7644)
 
 The control plane provides status and audit to host tools, a project-bound repo-mirror operation to coordinators, the
-host's disk-lifecycle lease to every process that runs a disk tool (below), and the nudge of the released-image
-cleanup to every process that releases an image ("Deleting released images"). Peer credentials on the Unix socket
-(and equivalent local authentication on TCP) must identify an authorized host process; the data-plane token is never
-accepted on the control plane. The Unix accept loop records listener failure, unreadable peer credentials,
-unauthorized UID, connection-capacity refusal, connection-task failure and shutdown; an admission refusal is never a
-silent return.
+host's disk-lifecycle lease to every process that runs a disk tool (below), and the nudge of the released-image cleanup
+to every process that releases an image ("Deleting released images"). Peer credentials on the Unix socket (and
+equivalent local authentication on TCP) must identify an authorized host process; the data-plane token is never accepted
+on the control plane. The Unix accept loop records listener failure, unreadable peer credentials, unauthorized UID,
+connection-capacity refusal, connection-task failure and shutdown; an admission refusal is never a silent return.
 
 Workspace sessions are installed and removed over the control plane, and the gateway's session table is a cache of host
 inventory, never an authority. Each session carries its workspace's effective grant revision, which every grant change
@@ -1702,10 +1701,13 @@ uninterruptible waits behind them.
   is `<store>/<owner>/<repo>` with both named as encoded components (`repository::is_encoded_component`), which never
   start with `.`, so the volume's own system directories (`.Spotlight-V100`, `.Trashes`) are never read. A stray or a
   non-regular file is named on stderr at the gateway's start and left untouched; a directory that cannot be read is
-  named at every pass that finds it so. The listing looks nowhere else and does no sync: an archive's released images
-  are no evidence, they were released before the archive's rename, and nothing else in an archive is opened. The thread
-  frees every entry the pass listed, then waits for a nudge; the nudges heard during a pass start one more pass. It has
-  no timer and carries nothing from one pass to the next.
+  named at every pass that finds it so. The listing takes each entry's type from the directory read (`d_type`) and never
+  stats or opens an entry, so neither it nor `cowshed gateway status`, which counts the same listing, waits on the entry
+  a cut holds (the first cut of a clone still sharing its extent map measured 32 to 81 s in one call, 2026-10-26). It
+  looks nowhere else and does no sync: an archive's released images are no evidence, they were released before the
+  archive's rename, and nothing else in an archive is opened. The thread frees every entry the pass listed, then waits
+  for a nudge; the nudges heard during a pass start one more pass. It has no timer and carries nothing from one pass to
+  the next.
 - **Oldest first.** A pass frees its entries by the change time (`st_ctime`) their release's rename set, then by path;
   an entry `stat` cannot read goes last, where its free says why. A cut changes an entry's change time, so one a
   previous gateway cut short goes after the rest. Ordering by an image's cost or yield would need what a listing and

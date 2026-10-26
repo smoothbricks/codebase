@@ -704,13 +704,17 @@ impl std::fmt::Display for Left {
 }
 
 /// The committed releases in `directory` (a [`DELETING_DIRECTORY`]): every regular file whose
-/// name `is_entry` accepts, read without following a link and without opening it; anything else is
-/// left, untouched, and named. The directory is held by descriptor and refused when it is a link.
-/// One that does not exist is empty. Listing syncs nothing and locks nothing: an entry another
-/// process holds is found busy when its free comes ([`free_committed`]).
+/// name `is_entry` accepts; anything else is left, untouched, and named. Each entry's type is the
+/// one the directory read reports (`d_type`), so the listing never stats or opens an entry: a
+/// stat of the entry the gateway's cleanup is cutting waits for that whole cut, and the first cut
+/// of a clone still sharing its extent map runs 32 to 81 s in one call (measured 2026-10-26).
+/// The directory is held by descriptor and refused when it is a link. One that does not exist is
+/// empty. Listing syncs nothing and locks nothing: an entry another process holds is found busy
+/// when its free comes ([`free_committed`]).
 pub fn released_in(directory: &Path, is_entry: impl Fn(&str) -> bool) -> io::Result<Listing> {
-    let directory_fd = match open_directory_nofollow(directory) {
-        Ok(directory_fd) => directory_fd,
+    // Held only to refuse a link in place of the directory.
+    let _held = match open_directory_nofollow(directory) {
+        Ok(held) => held,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Listing::default()),
         Err(error) => return Err(error),
     };
@@ -718,15 +722,8 @@ pub fn released_in(directory: &Path, is_entry: impl Fn(&str) -> bool) -> io::Res
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        let image = match entry.file_name().to_str() {
-            Some(name) if is_entry(name) => {
-                matches!(
-                    classify(&directory_fd, &c_name(name.as_bytes())?)?,
-                    Kind::Image { .. }
-                )
-            }
-            _ => false,
-        };
+        let image =
+            entry.file_name().to_str().is_some_and(&is_entry) && entry.file_type()?.is_file();
         if image {
             listing.entries.push(path);
         } else {
