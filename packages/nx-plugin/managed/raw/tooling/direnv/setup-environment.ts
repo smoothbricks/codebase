@@ -605,7 +605,7 @@ async function repairMissingPayload(requested: string): Promise<Error | undefine
     const metadata = await runSetupCommand(`bun info ${identity} dist --json`, $`bun info ${identity} dist --json`, {
       quiet: true,
     });
-    const dist: unknown = JSON.parse(metadata.stdout);
+    const dist: unknown = JSON.parse(new TextDecoder().decode(metadata.stdout));
     if (
       !payloadObject(dist) ||
       typeof dist.tarball !== 'string' ||
@@ -1340,13 +1340,10 @@ function declaresNativeTypeScript(root: string): boolean {
   const rootPackageJson = path.join(root, 'package.json');
   if (!existsSync(rootPackageJson)) return false;
   try {
-    const pkg = JSON.parse(readFileSync(rootPackageJson, 'utf8')) as {
-      devDependencies?: Record<string, string>;
-      dependencies?: Record<string, string>;
-    };
-    return (
-      typeof pkg.devDependencies?.['@typescript/native'] === 'string' ||
-      typeof pkg.dependencies?.['@typescript/native'] === 'string'
+    const pkg: unknown = JSON.parse(readFileSync(rootPackageJson, 'utf8'));
+    if (!payloadObject(pkg)) return false;
+    return [pkg.devDependencies, pkg.dependencies].some(
+      (dependencies) => payloadObject(dependencies) && typeof dependencies['@typescript/native'] === 'string',
     );
   } catch {
     return false;
@@ -1400,11 +1397,13 @@ function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): 
     throw new Error(`Missing ${typescriptRoot} after linking TypeScript ${TYPESCRIPT_API_VERSION} API package`);
   }
   const requireFromInstall = createRequire(path.join(typescriptRoot, 'package.json'));
-  const typed = requireFromInstall(typescriptRoot) as { version?: string; readConfigFile?: unknown };
-  if (typeof typed.readConfigFile !== 'function' || typed.version !== TYPESCRIPT_API_VERSION) {
+  const typed: unknown = requireFromInstall(typescriptRoot);
+  const api: Record<string, unknown> = payloadObject(typed) ? typed : {};
+  const version = typeof api.version === 'string' ? api.version : undefined;
+  if (typeof api.readConfigFile !== 'function' || version !== TYPESCRIPT_API_VERSION) {
     throw new Error(
       `${typescriptRoot} must export TypeScript ${TYPESCRIPT_API_VERSION} compiler API (readConfigFile). ` +
-        `Resolved version ${typed.version ?? 'unknown'} (expected link target ${expectedTarget}). ` +
+        `Resolved version ${version ?? 'unknown'} (expected link target ${expectedTarget}). ` +
         'Bun isolated linking races .bun/node_modules/typescript between typescript@6 and ' +
         "@typescript/native's TS7. See https://github.com/oven-sh/bun/issues/40355.",
     );

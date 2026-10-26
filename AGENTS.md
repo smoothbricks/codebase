@@ -136,7 +136,7 @@ is the host-installed CLI of `packages/cowshed`.
    inference → thread the precise type from input through storage to the returned value, and fix the source API, not the
    caller. No `as any`, `as unknown as`, or `JSON.parse(...) as T`; `as const`, `satisfies` and an `unknown` generic
    default that preserves inference are fine. _Enforced by: ESLint `@typescript-eslint/no-unsafe-type-assertion` on
-   `packages/*/src` (the inferred `lint` target)._
+   `packages/*/src` and every module of `tooling/` (each project's inferred `lint` target)._
 10. **Boundaries.** When you parse bytes, JSON, a fixture or a payload from another process, language or file → validate
     with code generated from the owning schema (Typia `validate`/`createValidate` for TypeScript envelopes and JSON, the
     owning generated codec or schema validator for wire and domain payloads, never a second validator) and return a

@@ -11,14 +11,8 @@
     "allowImportingTsExtensions": true,
     "types": ["bun"]
   },
-  "include": [
-    "direnv/**/*.test.ts",
-    "direnv/**/*.spec.ts",
-    "direnv/**/__tests__/**/*.ts",
-    "direnv/**/__tests__/**/*.tsx",
-    "*.test.ts",
-    "*.spec.ts"
-  ],
+  "include": ["**/*.ts", "**/*.mts"],
+  "exclude": ["node_modules", "npm-prune-versions.ts"],
   "references": [
     {
       "path": "../packages/cli/tsconfig.lib.json"
