@@ -358,10 +358,14 @@ describe('the producer receipts of this repository', () => {
   // A refusal is one stderr line beside a build that finished, so a declaration that makes a target's graph unprovable
   // breaks that target's receipts unseen. The repository's own declarations are judged here, on its own graph, by the
   // function the hooks call.
-  it('prove a bounded runtime source: every runtime input their task graphs plan is a recipe the generator owns', async () => {
+  it('prove a bounded runtime source and bind only regular files: every input their task graphs plan is one a receipt can sign', async () => {
     const proofs = await repositoryReceiptProofs();
     expect(proofs.map(({ target }) => target)).not.toEqual([]);
     expect(proofs.filter(({ runtimeSource }) => runtimeSource.kind === 'opaque')).toEqual([]);
+    // A receipt binds a symlink by its link text, never the bytes Nx hashed through it: a task that plans one cannot be signed.
+    expect(
+      proofs.filter(({ linked }) => linked.length !== 0).map(({ target, linked }) => ({ target, linked })),
+    ).toEqual([]);
   });
 });
 
@@ -371,10 +375,13 @@ interface RepositoryReceiptProof {
   readonly runtimeSource: ProviderInputProof['runtimeSource'];
   /** The runtime inputs each task of the target's graph plans, for the tasks that plan any. */
   readonly runtimes: Readonly<Record<string, readonly string[]>>;
+  /** The FILE inputs the target's tasks plan that are not regular files, or are gone. */
+  readonly linked: readonly string[];
 }
 
 const parseReceiptProofs = typia.json.createAssertParse<readonly RepositoryReceiptProof[]>();
-const RECEIPT_PROOFS_SCRIPT = `const { createWorkspaceNxRequire, parseTargetSelector, providerInputProof } = await import(${JSON.stringify(
+const RECEIPT_PROOFS_SCRIPT = `const { lstatSync } = await import('node:fs');
+const { createWorkspaceNxRequire, parseTargetSelector, providerInputProof } = await import(${JSON.stringify(
   fileURLToPath(new URL('./ensure-built.ts', import.meta.url)),
 )});
 const root = process.cwd();
@@ -388,11 +395,12 @@ const targets = (nxJson.plugins ?? []).flatMap((entry) =>
 const proofs = targets.map((target) => {
   const selector = parseTargetSelector(target);
   const taskGraph = createTaskGraph(projectGraph, {}, [selector.project], [selector.target], selector.configuration, {}, false);
-  const { inputs, runtimeSource } = providerInputProof(root, nxJson, projectGraph, taskGraph, load);
+  const { files, inputs, runtimeSource } = providerInputProof(root, nxJson, projectGraph, taskGraph, load);
   const runtimes = Object.fromEntries(
     Object.entries(inputs).filter(([, input]) => input.runtime.length > 0).map(([task, input]) => [task, input.runtime]),
   );
-  return { target, runtimeSource, runtimes };
+  const linked = files.filter((path) => lstatSync(path, { throwIfNoEntry: false })?.isFile() !== true);
+  return { target, runtimeSource, runtimes, linked };
 });
 process.stdout.write(JSON.stringify(proofs));`;
 

@@ -284,7 +284,9 @@ workspace's cached nextest archive hashes that variable too, because it contains
 build, and it is the step that compiles the test binaries ahead of the bounded runners; there is no separate uncached
 `cargo test --no-run` warm-up, since it compiled the same units the archive does. Cargo's own incremental cache avoids
 recompiling unchanged code. Nx never restores or collects shared Cargo build directories; lint and test **results**, and
-dedicated Wasm/N-API **outputs**, remain cacheable.
+dedicated Wasm/N-API **outputs**, remain cacheable. Being uncached, `cargo-fetch` keys nothing, and it names what it
+reads (the manifests, the lock and the Cargo configuration) so that a producer receipt binds those and not every file of
+its project, a repository-root project's symlinked managed files among them.
 
 Validation inputs include the crate's files, every file its sources compile in through a literal `include_str!` or
 `include_bytes!` path outside the crate's directory (a shipped skill or a shared corpus beside the crates), the crates

@@ -899,6 +899,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         commands: ['cargo fetch --locked'],
         cwd: 'packages/ferris',
       });
+      // It keys nothing (never cached), so its inputs are what a producer receipt binds it to. Left unnamed they are the
+      // project's every file, and a receipt binds no symlink: a repository-root project's managed files are links.
+      expect(targets['cargo-fetch']?.inputs).toEqual([
+        '{projectRoot}/**/Cargo.toml',
+        '{projectRoot}/**/Cargo.lock',
+        '{projectRoot}/**/.cargo/config.toml',
+        '!{projectRoot}/**/target/**',
+      ]);
       // Every frozen cargo command carries the edge: offline cargo fails at
       // resolution, so each one needs the locked graph downloaded before it runs.
       for (const name of ['cargo-test-archive', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
@@ -1490,6 +1498,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         commands: ['cargo fetch --locked'],
         cwd: '.',
       });
+      // A repository-root workspace's members belong to other projects, so its fetch reads from the repository root.
+      expect(root['cargo-fetch']?.inputs).toEqual([
+        '{workspaceRoot}/**/Cargo.toml',
+        '{workspaceRoot}/**/Cargo.lock',
+        '{workspaceRoot}/**/.cargo/config.toml',
+        '!{workspaceRoot}/**/target/**',
+      ]);
       // The root owns the one workspace clippy, run from the workspace root.
       expect(String(root['cargo-lint']?.options?.commands?.[1])).toContain('clippy --workspace');
       expect(root['cargo-lint']?.options?.cwd).toBe(root['cargo-test-archive']?.options?.cwd);

@@ -555,6 +555,16 @@ const CARGO_INPUTS = [
 const CARGO_OUTPUT_INPUTS = CARGO_INPUTS;
 /** The lockfiles of crates no resolved Cargo workspace claims, which have no lock-scope node. */
 const UNRESOLVED_CARGO_LOCK_INPUT = '{projectRoot}/**/Cargo.lock';
+/**
+ * What the uncached `cargo-fetch` reads: the manifests and the lock that name the crates, and the Cargo configuration
+ * that says where they come from. They key nothing; they are what a producer receipt binds the fetch to. Unnamed, Nx
+ * plans every file of the project, which for a repository-root project includes its symlinked managed files, and a
+ * receipt binds no symlink. That workspace's members belong to other projects, so its globs start at the repository root.
+ */
+function cargoFetchInputs(projectRoot: string): string[] {
+  const base = projectRoot === '.' ? '{workspaceRoot}' : '{projectRoot}';
+  return [`${base}/**/Cargo.toml`, `${base}/**/Cargo.lock`, `${base}/**/.cargo/config.toml`, `!${base}/**/target/**`];
+}
 /** A full cargo-mutants sweep's wall-clock backstop: a sweep takes hours, and a hung one must still end. */
 const MUTATION_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 // The toolchain half of a cargo task's identity lives in its own module
@@ -1696,6 +1706,7 @@ async function createProjectTargets(
       // would skip work a cold registry still needs. Nothing here is a
       // workspace output, so there is nothing for Nx to restore in its place.
       cache: false,
+      inputs: cargoFetchInputs(projectRoot),
       options: {
         // One fetch per manifest, independent of the others: Cargo's own
         // package-cache lock arbitrates the CARGO_HOME they share.
