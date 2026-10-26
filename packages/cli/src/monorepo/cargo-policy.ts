@@ -8,7 +8,11 @@ import {
   cargoProfileAssignment,
   cargoProfileTable,
 } from '@smoothbricks/nx-plugin/cargo-dev-profile';
-import { CARGO_TOOLCHAIN_NAMED_INPUT, isCargoToolchainInput } from '@smoothbricks/nx-plugin/cargo-toolchain-policy';
+import {
+  CARGO_TOOLCHAIN_NAMED_INPUT,
+  carriesCargoToolchain,
+  type ReachedInput,
+} from '@smoothbricks/nx-plugin/cargo-toolchain-policy';
 import typia from 'typia';
 import { type NxJson, type NxTargetOptions, parseNxJsonText, parsePackageJsonText } from '../lib/json.js';
 import type { ProjectTargets } from '../nx/index.js';
@@ -906,49 +910,54 @@ function commandsOf(options: NxTargetOptions | undefined): string {
 }
 
 /**
- * Every fileset one declared input list reaches: project definitions take precedence
- * over workspace definitions. An unresolved inference-owned `cargoToolchain` keeps
- * its name; an explicit definition is judged on the filesets it actually reaches.
+ * Every input one declared input list reaches, its named inputs resolved: project definitions take precedence over
+ * workspace definitions. A name with no definition stays as written, so an unresolved inference-owned `cargoToolchain`
+ * keeps its name, and an explicit definition is judged on what it holds, runtime inputs included. A `^name` entry is
+ * the DEPENDENCIES' input, never this target's own, so it reaches nothing here.
  */
-function resolveInputFilesets(
-  declared: readonly string[],
+function resolveReachedInputs(
+  declared: readonly (string | object)[],
   namedInputs: NonNullable<NxJson['namedInputs']>,
   projectNamedInputs: ProjectTargets['namedInputs'],
   seen: Set<string> = new Set(),
-): string[] {
-  const filesets: string[] = [];
+): ReachedInput[] {
+  const reached: ReachedInput[] = [];
   for (const entry of declared) {
-    const name = entry.startsWith('^') ? entry.slice(1) : entry;
-    const definition = projectNamedInputs?.[name] ?? namedInputs[name];
-    if (definition === undefined) {
-      filesets.push(entry);
+    if (typeof entry !== 'string') {
+      if ('runtime' in entry && typeof entry.runtime === 'string') reached.push({ runtime: entry.runtime });
       continue;
     }
-    if (seen.has(name)) continue;
-    seen.add(name);
-    const expanded = typeof definition === 'string' ? [definition] : definition;
-    filesets.push(
-      ...resolveInputFilesets(
-        expanded.filter((value): value is string => typeof value === 'string'),
+    if (entry.startsWith('^')) continue;
+    const definition = projectNamedInputs?.[entry] ?? namedInputs[entry];
+    if (definition === undefined) {
+      reached.push(entry);
+      continue;
+    }
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    reached.push(
+      ...resolveReachedInputs(
+        typeof definition === 'string' ? [definition] : definition,
         namedInputs,
         projectNamedInputs,
         seen,
       ),
     );
   }
-  return filesets;
+  return reached;
 }
 
 /**
  * A cached cargo target must hash the toolchain that compiled it.
  *
- * Inference attaches the pin to every cargo target it infers, but a repository
- * that DECLARES `inputs` for one replaces that list wholesale and silently
- * drops it — the target then survives a toolchain bump with a stale verdict,
- * and a pre-push cross-compile probe consults a cache entry that cannot
- * express the change it is probing for. Measured before this policy existed:
- * a one-byte bump to the declared pin left one repository's `cargo-lint-cross`
- * hash unchanged.
+ * Inference attaches the toolchain identity (the devenv pin and the programs the
+ * shell declares) to every cargo target it infers, but a repository that
+ * DECLARES `inputs` for one replaces that list wholesale and silently drops it,
+ * or restates the lock and drops the programs — the target then survives a
+ * toolchain change with a stale verdict, and a pre-push cross-compile probe
+ * consults a cache entry that cannot express the change it is probing for.
+ * Measured before this policy existed: a one-byte bump to the declared pin left
+ * one repository's `cargo-lint-cross` hash unchanged.
  *
  * This is a generated safety property removed by a local override, which no
  * amount of care at the override site will catch on its own, so it is checked
@@ -965,15 +974,11 @@ export function validateCargoToolchainInputs(root: string, projects: readonly Pr
       if (project.targetCache?.get(target) !== true) continue;
       if (!RUNS_CARGO.test(commandsOf(project.targetOptions?.get(target)))) continue;
       const declared = project.targetInputs?.get(target) ?? [];
-      if (
-        resolveInputFilesets(declared, namedInputs, project.namedInputs).some(
-          (input) => input === CARGO_TOOLCHAIN_NAMED_INPUT || isCargoToolchainInput(input),
-        )
-      )
-        continue;
+      const reached = resolveReachedInputs(declared, namedInputs, project.namedInputs);
+      if (carriesCargoToolchain(reached)) continue;
       failures += report(
         `${project.project}:${target}`,
-        `cached cargo target hashes no toolchain pin, so a toolchain bump cannot invalidate it. ${CARGO_TOOLCHAIN_FIX}.`,
+        `cached cargo target does not name the toolchain identity, so a change to the toolchain cannot invalidate it: a restated lock cannot carry the programs the shell declares. ${CARGO_TOOLCHAIN_FIX}.`,
       );
     }
   }

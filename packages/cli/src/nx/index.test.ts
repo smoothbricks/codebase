@@ -129,9 +129,7 @@ describe('Nx helper output formatting', () => {
           ['build', []],
         ]),
         targetExecutors: new Map([['test', '@smoothbricks/nx-plugin:bounded-exec']]),
-        // Object inputs carry no fileset a policy can read, so only the
-        // strings survive the projection.
-        targetInputs: new Map([['test', ['default']]]),
+        targetInputs: new Map([['test', ['default', { runtime: 'echo version' }]]]),
         targetOptions: new Map([['test', { command: 'bun test', timeoutMs: 120_000 }]]),
         targetOutputs: new Map([['build', ['{projectRoot}/dist/']]]),
         targetScripts: new Map(),

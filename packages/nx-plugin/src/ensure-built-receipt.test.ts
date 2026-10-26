@@ -8,7 +8,7 @@ import type { Task } from 'nx/src/config/task-graph';
 import { expandOutputs } from 'nx/src/native';
 import typia from 'typia';
 import { runInRepositoryNx } from './__tests__/repository-nx.js';
-import { cargoRuntimeInput } from './cargo-toolchain-policy.js';
+import { cargoRuntimeInput, cargoToolchainPathsInput } from './cargo-toolchain-policy.js';
 import type { EnsureBuiltProducerReceipt } from './ensure-built.js';
 import {
   boundedReceiptRuntimes,
@@ -340,6 +340,28 @@ describe('receipt runtime provenance', () => {
         true,
       ).kind,
     ).toBe('opaque');
+  });
+
+  it("admits the generator's declared-programs recipe beside the version recipe, and no other spelling of it", () => {
+    const versions = cargoRuntimeInput('packages/app', 'rustc -vV && cargo -V').runtime;
+    const programs = cargoToolchainPathsInput().runtime;
+    expect(
+      boundedReceiptRuntimes(
+        { [task.id]: { ...inputs, runtime: [versions, programs] } },
+        ['packages/app'],
+        ['devenv.lock'],
+        true,
+      ),
+    ).toEqual({ kind: 'bounded' });
+    const spelled = `${programs} --elsewhere`;
+    expect(
+      boundedReceiptRuntimes(
+        { [task.id]: { ...inputs, runtime: [versions, spelled] } },
+        ['packages/app'],
+        ['devenv.lock'],
+        true,
+      ),
+    ).toEqual({ kind: 'opaque', detail: `Unbounded runtime source closure: ${spelled}` });
   });
 
   it("refuses a declaration's own spelling of the toolchain versions: only the generator's recipe is one", () => {

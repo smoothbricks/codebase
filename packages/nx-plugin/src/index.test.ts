@@ -27,6 +27,8 @@ import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { CARGO_CLOSURE_INPUT, isCargoLockInput } from './cargo-closure-input.js';
 import { CARGO_PRODUCER_METADATA } from './cargo-retention-hook.js';
+import { NIX_STORE_ROOT } from './cargo-toolchain-paths.js';
+import { CARGO_TOOLCHAIN_NAMED_INPUT, cargoToolchainInputs } from './cargo-toolchain-policy.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
@@ -1796,6 +1798,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         if (!name.startsWith('napi-') || target.cache !== true) continue;
         expect(target.inputs).toContain(CARGO_CLOSURE_INPUT);
         expect(target.inputs).not.toContain('{workspaceRoot}/**/*.rs');
+        expect(target.inputs).toEqual(expect.arrayContaining(cargoToolchainInputs()));
       }
       const nativeClosure = projects.get('packages/native')?.namedInputs?.[CARGO_CLOSURE_INPUT] ?? [];
       expect(nativeClosure).toContain(
@@ -1806,11 +1809,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       expect(napiInputs).not.toContain('{workspaceRoot}/bun.lock');
       expect(napiInputs.some((input) => typeof input === 'string' && input.endsWith('/package.json'))).toBe(false);
-      // ... and on the toolchain pin, which it must state itself: `napi build`
+      // ... and on the toolchain identity, which it must state itself: `napi build`
       // compiles with the pinned rustc but never spells `cargo --frozen`, so
       // the sweep that gives every other cargo target its identity skips it.
-      expect(napiInputs).toContain('{workspaceRoot}/devenv.lock');
-      expect(napiInputs).toContain('{workspaceRoot}/tooling/direnv/devenv.lock');
+      expect(napiInputs).toEqual(expect.arrayContaining(cargoToolchainInputs()));
       expect(native['napi-debug']?.options).toMatchObject({
         cwd: '.',
         command:
@@ -1953,6 +1955,27 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  // The name a repository's declaration uses to reach the identity stands for exactly what inference attaches, and
+  // every cached cargo input list carries it: the cross archive and the lints as much as the host archive. One entry
+  // is a runtime input, which no fileset assertion would see go missing.
+  it('names the whole toolchain identity as cargoToolchain and carries it on every cached cargo target', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await writeCargoIdentityFixture(workspace);
+      const identity = cargoToolchainInputs();
+      expect(identity.some((entry) => typeof entry === 'object')).toBe(true);
+      const project = await inferProject(workspace, 'packages/ferris/package.json');
+      expect(project?.namedInputs?.[CARGO_TOOLCHAIN_NAMED_INPUT]).toEqual(identity);
+      const cached = cachedCargoTargets(project?.targets ?? {});
+      expect(cached.length).toBeGreaterThan(0);
+      for (const [name, target] of cached) {
+        expect({ name, inputs: target.inputs }).toMatchObject({ inputs: expect.arrayContaining(identity) });
+      }
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   // Without an `externalDependencies` input Nx keys a task whose executor is
   // not an `@nx/` one on every package in the lockfile, so a lockfile-only
   // commit re-ran every cargo verdict (measured in a consumer: every cargo-test-*
@@ -2003,6 +2026,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   // bare shell and inside a devenv profile, which made the pre-push
   // cross-compile probe unsatisfiable by construction.
   //
+  // A Nix store object is the one absolute path that is portable: it is named by the hash of everything it was
+  // built from, so one shell names the same object on every machine of a platform, bare or in a profile (the
+  // programs input of cargo-toolchain-paths.ts yields only these). Any other absolute path in a value is a machine's.
+  //
   // The runtime value AND its command declaration must be portable: Nx also
   // hashes the owning project's target configuration.
   it('hashes no machine-local value into a cached cargo target', async () => {
@@ -2029,7 +2056,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           if (input.runtime.includes(fileURLToPath(new URL('..', import.meta.url)))) {
             offenders.push(`${name}: runtime command names the plugin checkout`);
           }
-          const value = await runtimeInputValue(input.runtime, workspace.context.workspaceRoot);
+          const value = (await runtimeInputValue(input.runtime, workspace.context.workspaceRoot)).replaceAll(
+            STORE_OBJECT,
+            '',
+          );
           const rooted = PATH_OUTSIDE_WORKSPACE.exec(value);
           if (rooted) offenders.push(`${name}: runtime input yields ${rooted[0].trim()} — from ${input.runtime}`);
         }
@@ -3669,6 +3699,9 @@ const WORKSPACE_ANCHORED_INPUT = /^!?(?:\{(?:projectRoot|workspaceRoot)\}\/|\^?[
 
 /** A path rooted outside the workspace, wherever it appears in a hashed value. */
 const PATH_OUTSIDE_WORKSPACE = /(?:^|[^\w.\-~])(\/[\w.-]+\/[\w.-]+)/;
+
+/** A Nix store object: the store root, a 32-character hash, then the object's name. */
+const STORE_OBJECT = new RegExp(`${NIX_STORE_ROOT}/[0-9a-z]{32}-[^\\s/]+`, 'g');
 
 /**
  * One Cargo workspace producing every cached cargo target family inference can

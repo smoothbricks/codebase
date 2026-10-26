@@ -71,7 +71,7 @@ describe('cached targets name their inputs', () => {
           ['serve', false],
           ['test', true],
         ]),
-        // An all-object declaration (`[{ runtime: … }]`) projects to an empty list: still declared.
+        // An empty inputs list is still explicitly declared.
         targetInputs: new Map([
           ['build', ['default', '^default']],
           ['lint', []],

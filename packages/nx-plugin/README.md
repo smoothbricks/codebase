@@ -325,20 +325,36 @@ its project, a repository-root project's symlinked managed files among them.
 
 Validation inputs include the crate's files, every file its sources compile in through a literal `include_str!` or
 `include_bytes!` path outside the crate's directory (a shipped skill or a shared corpus beside the crates), the crates
-Cargo builds for its tests, governing manifests and configuration, the declared toolchain pin, and the toolchain's own
-reported versions. The pin is `devenv.lock`, hashed as an ordinary file input at both `{workspaceRoot}/devenv.lock` and
-`{workspaceRoot}/tooling/direnv/devenv.lock` — devenv resolves it into the rustc, cargo, linker, C toolchain and SDK
-every cargo command inherits, so bumping it invalidates every cached cargo target. Workspace test runners additionally
+Cargo builds for its tests, governing manifests and configuration, the declared toolchain identity, and the toolchain's
+own reported versions. The identity has two halves. The pin is `devenv.lock`, hashed as an ordinary file input at both
+`{workspaceRoot}/devenv.lock` and `{workspaceRoot}/tooling/direnv/devenv.lock` — devenv resolves it into the rustc,
+cargo, linker, C toolchain and SDK every cargo command inherits, so bumping it invalidates every cached cargo target.
+The lock names inputs, not what the shell builds from them: a patch to the linker moves no byte of the lock and no line
+of `rustc -vV`, yet it changes what links every unit. The other half is a runtime input, `smoo-nx-cargo-toolchain`, that
+names the Nix store object of each program the shell declares for Cargo to compile and link with: the linker of each
+target (`CARGO_TARGET_<TRIPLE>_LINKER`, which Cargo hashes into every unit) and the programs cc-rs runs for build
+scripts (`CC`, `CXX`, `AR` and `RANLIB`: generic, per target and in their `HOST_` and `TARGET_` forms, each declared
+`rerun-if-env-changed`). The wrapper devenv builds for a Linux linker names its clang and its lld, so one entry covers
+all three. The object moves when the toolchain moves, once, and nothing else in the shell moves it. The shell's Nix
+sources are not hashed instead: the managed module alone changed 43 times in the 30 days to 2026-10-26, and each edit
+would have rekeyed every cargo verdict; evaluated at those commits on Linux x86_64, the observed store objects did not
+change. rustc and cargo are not in the list on purpose. Cargo keys units on the output of rustc's version command, which
+is hashed beside this input, never on rustc's path. On a non-Linux host the default shell and its linux-cross profile
+carry different rust-std sets, so that path would split the pre-push probe from the cached cross-check verdict. Only a
+path in the Nix store counts; a path elsewhere is ignored. A linker named only by Cargo configuration is outside this
+environment probe: a target that runs one must name the script itself as an input. Workspace test runners additionally
 hash the manifest of every package the workspace build compiles inside the Nx workspace (a member's, and a path
 package's that reaches the build only as some crate's dev-dependency), because those affect unified features, and the
 nextest executable/configuration. While the build compiles a path package outside the Nx workspace, every runner also
-names `externalRustCrates`, which then must be declared: a runner's key does not follow the archive's outputs.
+names externalRustCrates, which then must be declared: a runner's key does not follow archive outputs.
 
-Nothing machine-local takes part. The ambient cargo environment and the global `$CARGO_HOME/config.toml` are
-deliberately not hashed: their values carry absolute store paths and per-checkout state directories, which would make
-every cache entry private to the machine that wrote it and make one target hash differently inside a devenv profile than
-outside it — enough to make a pre-push cross-compile probe unsatisfiable. Keep explicit inputs for arbitrary
-build-script reads or custom environment variables that Cargo metadata cannot name.
+Nothing machine-local takes part. The ambient cargo environment as a whole and the global `$CARGO_HOME/config.toml` are
+deliberately not hashed: their values carry per-checkout state directories (`CARGO_INSTALL_ROOT` moves under the active
+profile) and the home directory's configuration, which would make every cache entry private to the machine that wrote it
+and make one target hash differently inside a devenv profile than outside it — enough to make a pre-push cross-compile
+probe unsatisfiable. The one thing read from the environment is the Nix store objects of the shell's declared programs,
+above: an object agrees on every machine of a platform, and a path outside the store is ignored. Keep explicit inputs
+for arbitrary build-script reads or custom environment variables that Cargo metadata cannot name.
 
 Cargo itself keys a build script's run on every variable the script names with `rerun-if-env-changed` (cc-rs names
 `CC_<target>` and its kin), so an ambient value Nx does not hash still reruns the script and rebuilds everything that
@@ -352,10 +368,12 @@ build-script names) are not compared: a run that recorded one was started by a `
 `tooling/land-host.sh` calls it through `tooling/land-cargo-env.ts` before each gate (cowshed
 `specs/cowshed/16_build_volumes.md`, "One Cargo environment on every path").
 
-A target whose inputs a repository DECLARES replaces the inferred list, pin included. Name the two `devenv.lock` entries
-in that declaration, or in the named input it uses, or a toolchain bump will not invalidate it. The replaced list also
-held the target's `externalDependencies` entries described below; restate them (`[]` for a target that runs only cargo,
-and the lock-scope node of its crates), or every lockfile change re-keys the target.
+A target whose inputs a repository DECLARES replaces the inferred list, toolchain identity included. Name
+`cargoToolchain` in that declaration, or in the named input it uses: inference defines it, in every project that has
+cargo targets, as the whole identity. A restated lock is not enough, because the identity also holds the runtime input
+no fileset can state, and `smoo monorepo check` refuses a cached cargo target that does not reach the name. The replaced
+list also held the target's `externalDependencies` entries described below; restate them (`[]` for a target that runs
+only cargo, and the lock-scope node of its crates), or every lockfile change re-keys the target.
 
 Every cached cargo target names the npm packages its command runs as `externalDependencies`: none for cargo itself, and
 `@smoothbricks/nx-plugin` for a target that runs its executor or reads its installed files (the nextest tool config, the
@@ -703,8 +721,24 @@ project declares its own named input and names its directory:
         "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh smoo-nx-cargo-hash --include-workspace --closure packages/example"
       },
       "{workspaceRoot}/Cargo.lock",
+      "cargoToolchain"
+    ]
+  }
+}
+```
+
+Such a project has no inferred `cargoToolchain`, so the workspace's `nx.json` defines the name (Nx resolves a named
+input from the project first, so an inferred project keeps the plugin's definition):
+
+```json
+{
+  "namedInputs": {
+    "cargoToolchain": [
       "{workspaceRoot}/devenv.lock",
-      "{workspaceRoot}/tooling/direnv/devenv.lock"
+      "{workspaceRoot}/tooling/direnv/devenv.lock",
+      {
+        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-cargo-toolchain.js"
+      }
     ]
   }
 }

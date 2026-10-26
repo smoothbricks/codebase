@@ -14,7 +14,7 @@ import {
 import { isAbsolute, join, relative } from 'node:path';
 import type { Task } from 'nx/src/config/task-graph';
 import type { expandOutputs, HashInputs } from 'nx/src/native';
-import { CARGO_TOOLCHAIN_PIN_INPUTS, cargoRuntimeInput } from './cargo-toolchain-policy.js';
+import { CARGO_TOOLCHAIN_PIN_INPUTS, cargoRuntimeInput, cargoToolchainPathsInput } from './cargo-toolchain-policy.js';
 import type {
   EnsureBuiltOutputReceipt,
   EnsureBuiltProbeFailure,
@@ -448,7 +448,7 @@ export function providerReceipt(
     throw error;
   }
 }
-/** Admit only version recipes emitted by the owning generator and declared toolchain pins. */
+/** Admit only the recipes emitted by the owning generator: the version recipes, the declared-programs one, and declared toolchain pins. */
 export function boundedReceiptRuntimes(
   inputs: Readonly<Record<string, HashInputs>>,
   directories: readonly string[],
@@ -461,8 +461,8 @@ export function boundedReceiptRuntimes(
   const pins = CARGO_TOOLCHAIN_PIN_INPUTS.map((path) => path.replace('{workspaceRoot}/', ''));
   if (!pins.some((pin) => files.includes(pin)))
     return { kind: 'opaque', detail: 'Version runtime input has no declared toolchain FILE pin' };
-  const allowed = new Set(
-    directories.flatMap((directory) =>
+  const allowed = new Set([
+    ...directories.flatMap((directory) =>
       [
         'rustc -vV && cargo -V',
         'rustc -vV && cargo -V && cargo clippy -V',
@@ -470,7 +470,8 @@ export function boundedReceiptRuntimes(
         'rustc -vV && cargo -V && cargo nextest --version',
       ].map((command) => cargoRuntimeInput(directory, command).runtime),
     ),
-  );
+    cargoToolchainPathsInput().runtime,
+  ]);
   const opaque = runtimes.filter((runtime) => !allowed.has(runtime));
   return opaque.length === 0
     ? { kind: 'bounded' }

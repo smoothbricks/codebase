@@ -457,8 +457,9 @@ and, on a default-branch push, dispatches the managed-files workflow to heal the
 fails it, because nothing heals one. `diff` reports drift without writing files.
 
 The Cargo toolchain policy resolves each cached target's named inputs through its project definitions first, then
-workspace definitions. Nested aliases retain the toolchain pin; a local override that removes it is refused, including
-an override of `cargoToolchain` itself.
+workspace definitions. A cached target must reach `cargoToolchain`, the toolchain identity (the devenv pin and the Nix
+store objects of the programs the shell declares), directly or through a named input; restating the lock alone is
+refused. A local definition of `cargoToolchain` that drops the lock or the programs runtime input is refused as well.
 
 The generated publish workflow is canonical Prettier YAML. Running the repository formatter over
 `.github/workflows/publish.yml` is byte-stable and does not create managed-file drift.

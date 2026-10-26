@@ -37,11 +37,7 @@ import {
   resolveCargoClosureSource,
 } from './cargo-closure-input.js';
 import { CARGO_PRODUCER_METADATA, postTasksExecution as postCargoRetention } from './cargo-retention-hook.js';
-import {
-  CARGO_TOOLCHAIN_NAMED_INPUT,
-  CARGO_TOOLCHAIN_PIN_INPUTS,
-  cargoRuntimeInput,
-} from './cargo-toolchain-policy.js';
+import { CARGO_TOOLCHAIN_NAMED_INPUT, cargoRuntimeInput, cargoToolchainInputs } from './cargo-toolchain-policy.js';
 import {
   type AttributedCargoWorkspacePackage,
   attributeCargoWorkspacePackages,
@@ -574,9 +570,9 @@ function cargoFetchInputs(projectRoot: string): string[] {
 /** A full cargo-mutants sweep's wall-clock backstop: a sweep takes hours, and a hung one must still end. */
 const MUTATION_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 // The toolchain half of a cargo task's identity lives in its own module
-// because `smoo monorepo validate` reads the same two constants to refuse a
-// declaration that drops it. See cargo-toolchain-policy.ts for why it is the
-// declared pin and not the ambient environment.
+// because `smoo monorepo validate` reads the same entries to refuse a
+// declaration that drops any of them. See cargo-toolchain-policy.ts for why it
+// is the declared pin and the shell's declared programs, not the ambient environment.
 
 /** A runtime input that changes when the file's bytes do: the runtime hashes the file itself. */
 function fileHashInput(path: string): { runtime: string } {
@@ -613,14 +609,14 @@ function targetCommandText(target: TargetConfiguration): string {
   ].join('\n');
 }
 /**
- * The N-API build's inputs beyond the Cargo sources: the toolchain pin, the
- * package's `napi` block, which names the binary and the targets, and the
+ * The N-API build's inputs beyond the Cargo sources: the toolchain identity,
+ * the package's `napi` block, which names the binary and the targets, and the
  * resolved version of the npm package that drives the build (the napi CLI on
  * macOS; none on Linux, where devenv's zig and cargo-zigbuild are covered by
- * the pin). Neither the package version nor any other lockfile entry is part
+ * the identity). Neither the package version nor any other lockfile entry is part
  * of the artifact.
  *
- * The pin is stated here rather than inherited: neither `napi build` nor the
+ * The identity is stated here rather than inherited: neither `napi build` nor the
  * `cargo-zigbuild` executor spells `cargo --frozen`, which is how every other
  * cached cargo target acquires its toolchain identity. Without it a `.node`
  * linked against one toolchain hashed equal to the same sources linked against
@@ -638,7 +634,7 @@ function napiInputs(
     CARGO_CLOSURE_INPUT,
     '{projectRoot}/scripts/*.sh',
     ...(repoRooted ? ['{workspaceRoot}/scripts/*.sh'] : []),
-    ...CARGO_TOOLCHAIN_PIN_INPUTS,
+    ...cargoToolchainInputs(),
     runtimeInput(`bun -e 'console.log(JSON.stringify(require(${JSON.stringify(packageJson)}).napi ?? null))'`),
     { externalDependencies: [...externalDependencies] },
   ];
@@ -869,7 +865,7 @@ function createCargoCrossTestTargets(
       // the cross profile. For the same reason it names its npm packages here.
       inputs: [
         ...archiveInputs,
-        ...CARGO_TOOLCHAIN_PIN_INPUTS,
+        ...cargoToolchainInputs(),
         ...(cargo === undefined ? [] : [`{projectRoot}/${cargo}`]),
         cargoRuntimeInput(projectRoot, 'rustc -vV && cargo -V && cargo nextest --version'),
         { externalDependencies: cargoCommandNpmPackages({ executor: archiveExecutor }, archiveCommand) },
@@ -1984,7 +1980,7 @@ async function createProjectTargets(
     const lockDirectory = typeof cwd === 'string' ? cwd : projectRoot;
     target.inputs = [
       ...inputs,
-      ...CARGO_TOOLCHAIN_PIN_INPUTS,
+      ...cargoToolchainInputs(),
       cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
       ...(namesPackages ? [] : [{ externalDependencies: cargoCommandNpmPackages(target, text) }]),
       ...(namesLock
@@ -2242,10 +2238,10 @@ async function createProjectTargets(
 
   // A declared target REPLACES the inferred input list, pin included, so a
   // repository that hand-writes `inputs` for a cargo target silently loses its
-  // toolchain identity. Name the pin once here so such a declaration can
-  // reference it as `cargoToolchain` instead of restating two paths that could
+  // toolchain identity. Name the identity once here so such a declaration can
+  // reference it as `cargoToolchain` instead of restating entries that could
   // drift from the plugin; `smoo monorepo validate` refuses a cached cargo
-  // target whose resolved inputs reach neither. Defined only for projects that
+  // target that does not reach it. Defined only for projects that
   // HAVE cargo targets: a project's namedInputs definitions are hashed into
   // its configuration hash, so defining it everywhere would invalidate every
   // task in the repository to serve projects that can never reference it.
@@ -2257,7 +2253,7 @@ async function createProjectTargets(
           [VERSIONLESS_DEFAULT_INPUT]: ['default', ...versionlessProjectInputs],
         }),
     ...(Object.keys(targets).some((name) => name.startsWith('cargo-') || name.startsWith('napi-'))
-      ? { [CARGO_TOOLCHAIN_NAMED_INPUT]: [...CARGO_TOOLCHAIN_PIN_INPUTS] }
+      ? { [CARGO_TOOLCHAIN_NAMED_INPUT]: cargoToolchainInputs() }
       : {}),
   };
   // A custom Cargo target names this instead of a hand-kept crate list or a

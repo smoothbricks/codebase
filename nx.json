@@ -31,8 +31,7 @@
     ],
     "rustWorkspace": [
       "cargoClosure",
-      "{workspaceRoot}/devenv.lock",
-      "{workspaceRoot}/tooling/direnv/devenv.lock",
+      "cargoToolchain",
       "{workspaceRoot}/packages/cowshed/scripts/*.sh",
       "{workspaceRoot}/packages/lmao/src/lib/schema/systemSchema.ts",
       "{workspaceRoot}/packages/lmao/src/lib/capacityTuning.ts"

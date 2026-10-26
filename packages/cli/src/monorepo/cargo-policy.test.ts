@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { renderCargoDevProfiles } from '@smoothbricks/nx-plugin/cargo-dev-profile';
+import { CARGO_TOOLCHAIN_NAMED_INPUT, cargoToolchainPathsInput } from '@smoothbricks/nx-plugin/cargo-toolchain-policy';
 import { type ProjectTargets, projectTargetsFromNxProjects } from '../nx/index.js';
 import {
   applyCargoFeatureUnification,
@@ -496,33 +497,64 @@ describe('cargo toolchain identity policy', () => {
     targetOptions: new Map([['cargo-lint', { command: 'cargo --frozen clippy --workspace' }]]),
   });
 
+  const LOCK = '{workspaceRoot}/tooling/direnv/devenv.lock';
+  const PROGRAMS = cargoToolchainPathsInput();
+
   // The failure this policy exists for: a hand-written input list replaces the
-  // inferred one, so the target stops hashing the pin and a toolchain bump
-  // leaves its cached verdict standing.
-  it('refuses a cached cargo target whose declared inputs drop the pin', async () => {
+  // inferred one, so the target stops hashing the toolchain and a toolchain
+  // change leaves its cached verdict standing.
+  it('refuses a cached cargo target whose declared inputs drop the toolchain identity', async () => {
     const { failures } = await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['rustWorkspace'])]);
     expect(failures).toBe(1);
   });
 
-  it('accepts the pin reached directly, through a named input, or by the name inference defines', async () => {
+  it('accepts the identity reached by the name inference defines, directly or through a named input', async () => {
     const viaNamedInput = JSON.stringify({
-      namedInputs: { rustWorkspace: ['{workspaceRoot}/Cargo.toml', '{workspaceRoot}/tooling/direnv/devenv.lock'] },
+      namedInputs: { rustWorkspace: ['{workspaceRoot}/Cargo.toml', 'cargoToolchain'] },
     });
     expect(await checkToolchain({ 'nx.json': viaNamedInput }, [cargoLint(['rustWorkspace'])])).toMatchObject({
       failures: 0,
     });
-    expect(
-      await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['{workspaceRoot}/tooling/direnv/devenv.lock'])]),
-    ).toMatchObject({ failures: 0 });
     expect(await checkToolchain({ 'nx.json': '{}\n' }, [cargoLint(['cargoToolchain'])])).toMatchObject({
       failures: 0,
     });
   });
 
+  // The lock alone used to be the identity. It is now one half: the other, the programs the shell declares, is a
+  // runtime input no fileset states, so a list that restates the lock keeps a stale verdict through a linker patch.
+  it('refuses a restated lock, directly or through a named input, and says to name the identity', async () => {
+    const viaNamedInput = JSON.stringify({
+      namedInputs: { rustWorkspace: ['{workspaceRoot}/Cargo.toml', '{workspaceRoot}/tooling/direnv/devenv.lock'] },
+    });
+    for (const [files, inputs] of [
+      [{ 'nx.json': viaNamedInput }, ['rustWorkspace']],
+      [{ 'nx.json': '{}\n' }, ['{workspaceRoot}/tooling/direnv/devenv.lock']],
+    ] as const) {
+      const { failures, messages } = await checkToolchain(files, [cargoLint([...inputs])]);
+      expect(failures).toBe(1);
+      expect(messages.join('\n')).toContain('Add "cargoToolchain" to its inputs');
+    }
+  });
+
+  it.each([
+    { name: 'the direct lock and runtime identity', inputs: [LOCK, PROGRAMS], failures: 0 },
+    { name: 'a direct runtime without the lock', inputs: [PROGRAMS], failures: 1 },
+  ])('projects $name without losing runtime definitions', async ({ inputs, failures }) => {
+    const projects = projectTargetsFromNxProjects({
+      compiler: {
+        root: '.',
+        targets: {
+          build: { cache: true, inputs: [...inputs], options: { command: 'cargo build --release' } },
+        },
+      },
+    });
+    expect(await checkToolchain({ 'nx.json': '{}' }, projects)).toMatchObject({ failures });
+  });
+
   const projectInputCases: {
     name: string;
     inputs: string[];
-    workspace: Record<string, string[]>;
+    workspace: NonNullable<ProjectTargets['namedInputs']>;
     local: NonNullable<ProjectTargets['namedInputs']>;
     failures: number;
   }[] = [
@@ -533,7 +565,7 @@ describe('cargo toolchain identity policy', () => {
       local: {
         rustEditSources: ['nested'],
         nested: ['cargoToolchain'],
-        cargoToolchain: ['{workspaceRoot}/tooling/direnv/devenv.lock'],
+        cargoToolchain: [LOCK, PROGRAMS],
       },
       failures: 0,
     },
@@ -549,6 +581,65 @@ describe('cargo toolchain identity policy', () => {
       inputs: ['cargoToolchain'],
       workspace: { cargoToolchain: ['{workspaceRoot}/tooling/direnv/devenv.lock'] },
       local: { cargoToolchain: ['{projectRoot}/src/**/*.rs'] },
+      failures: 1,
+    },
+    {
+      name: 'a defined toolchain name that the declaration never reaches does not count',
+      inputs: ['rustEditSources'],
+      workspace: {},
+      local: {
+        rustEditSources: ['{workspaceRoot}/tooling/direnv/devenv.lock'],
+        cargoToolchain: ['{workspaceRoot}/tooling/direnv/devenv.lock'],
+      },
+      failures: 1,
+    },
+    {
+      name: 'a toolchain name defined as the lock alone does not carry the programs the shell declares',
+      inputs: [CARGO_TOOLCHAIN_NAMED_INPUT],
+      workspace: {},
+      local: { cargoToolchain: [LOCK] },
+      failures: 1,
+    },
+    {
+      name: 'a toolchain name defined as the programs alone carries no lock',
+      inputs: [CARGO_TOOLCHAIN_NAMED_INPUT],
+      workspace: {},
+      local: { cargoToolchain: [PROGRAMS] },
+      failures: 1,
+    },
+    {
+      name: 'a toolchain name defined through a nested lock list and the programs is whole',
+      inputs: [CARGO_TOOLCHAIN_NAMED_INPUT],
+      workspace: { locks: [LOCK] },
+      local: { cargoToolchain: ['locks', PROGRAMS] },
+      failures: 0,
+    },
+    {
+      name: 'a workspace definition of the name reaches a project that defines none',
+      inputs: [CARGO_TOOLCHAIN_NAMED_INPUT],
+      workspace: { cargoToolchain: [LOCK, PROGRAMS] },
+      local: {},
+      failures: 0,
+    },
+    {
+      name: 'a lock the same definition excludes is no lock',
+      inputs: [CARGO_TOOLCHAIN_NAMED_INPUT],
+      workspace: {},
+      local: { cargoToolchain: [LOCK, `!${LOCK}`, PROGRAMS] },
+      failures: 1,
+    },
+    {
+      name: 'a caret names the dependencies toolchain, never the target own',
+      inputs: [`^${CARGO_TOOLCHAIN_NAMED_INPUT}`],
+      workspace: {},
+      local: { cargoToolchain: [LOCK, PROGRAMS] },
+      failures: 1,
+    },
+    {
+      name: 'a caret on an alias reaches nothing either',
+      inputs: ['^rustEditSources'],
+      workspace: {},
+      local: { rustEditSources: [CARGO_TOOLCHAIN_NAMED_INPUT], cargoToolchain: [LOCK, PROGRAMS] },
       failures: 1,
     },
   ];

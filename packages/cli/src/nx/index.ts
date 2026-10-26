@@ -29,8 +29,8 @@ export interface ProjectTargets {
    */
   localTargetDependencies?: Map<string, string[]>;
   targetExecutors?: Map<string, string>;
-  /** Per-target string inputs; object inputs (`runtime`, `json`, …) are dropped. */
-  targetInputs?: Map<string, string[]>;
+  /** Per-target inputs, including runtime definitions needed by identity policies. */
+  targetInputs?: Map<string, NonNullable<NxTargetConfig['inputs']>>;
   /** Project-local named inputs override workspace definitions. */
   namedInputs?: NxProjectJson['namedInputs'];
   targetOptions?: Map<string, NxTargetOptions>;
@@ -169,8 +169,14 @@ export function targetOutputsFromNxProjectJson(value: NxProjectJson | null | und
   return targetStringArraysFromNxProjectJson(value, 'outputs');
 }
 
-export function targetInputsFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, string[]> {
-  return targetStringArraysFromNxProjectJson(value, 'inputs');
+export function targetInputsFromNxProjectJson(
+  value: NxProjectJson | null | undefined,
+): Map<string, NonNullable<NxTargetConfig['inputs']>> {
+  const inputs = new Map<string, NonNullable<NxTargetConfig['inputs']>>();
+  for (const [targetName, target] of Object.entries(value?.targets ?? {})) {
+    if (target.inputs !== undefined) inputs.set(targetName, target.inputs);
+  }
+  return inputs;
 }
 
 export function targetCacheFromNxProjectJson(value: NxProjectJson | null | undefined): Map<string, boolean> {
