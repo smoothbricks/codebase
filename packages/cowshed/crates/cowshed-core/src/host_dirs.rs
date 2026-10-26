@@ -213,6 +213,7 @@ mod install_wait_tests {
                 "--exact",
                 "host_dirs::install_wait_tests::install_waiter_helper",
                 "--nocapture",
+                "--quiet",
             ])
             .env(WAITER_SUPPORT_ENV, &*root)
             .stdin(Stdio::null())
@@ -220,11 +221,34 @@ mod install_wait_tests {
             .stderr(Stdio::piped())
             .spawn_locked()
             .expect("spawn the waiter helper");
+        let waiter_pid = i32::try_from(waiter.id()).expect("a pid fits pid_t");
         let mut said =
             std::io::BufReader::new(waiter.stderr.take().expect("the waiter helper's stderr"));
         let mut transcript = String::new();
         let waiting_on = lock.display().to_string();
         while !said_line(&mut said, &mut transcript).contains(&waiting_on) {}
+        // The announcement names the held slot the waiter observed, before it queues on
+        // it: released now, its first try could still win the race and answer "no
+        // install". A flock wait queue has no subscription to arm, so the waiter's
+        // kernel run state is the registration: after the announcement its only wait
+        // is the blocking shared lock, and once asleep there it stays asleep until
+        // the slot lets go -- the state is monotone until this test drops the lock.
+        loop {
+            use cowshed_os::process::RunState;
+            match cowshed_os::process::run_state(waiter_pid) {
+                RunState::Sleeping => break,
+                RunState::Running | RunState::Uninterruptible | RunState::Stopped => {
+                    std::thread::yield_now()
+                }
+                state @ (RunState::Gone | RunState::Zombie) => {
+                    panic!("the waiter answered without blocking ({state}); it said: {transcript}")
+                }
+                state @ RunState::Unread(_) => panic!(
+                    "the waiter pid {waiter_pid} state is unreadable ({state}); \
+                     it said: {transcript}"
+                ),
+            }
+        }
         drop(install);
         loop {
             match said_line(&mut said, &mut transcript).as_str() {
