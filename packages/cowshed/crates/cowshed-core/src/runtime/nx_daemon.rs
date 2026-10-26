@@ -582,6 +582,8 @@ pub(crate) enum Verdict {
     Keep,
     /// The shed has gone unused for its idle bound: none is to run, and the one that did is stopped.
     Release,
+    /// A mount census leaves a live daemon alone and starts none until the next use.
+    Hold,
 }
 
 impl NxDaemonKeeper {
@@ -773,11 +775,6 @@ impl NxDaemonKeeper {
         self.probes.reset_immediately();
     }
 
-    /// Whether a census stopped the keeper's starts ([`Self::stop_starts`]).
-    pub(crate) fn stopped(&self) -> bool {
-        self.stopped
-    }
-
     /// A job of the ledger other than the keeper's own start ended: the shed's idle interval
     /// starts now, not at the last probe that saw the job run, up to [`PROBE_INTERVAL`] earlier.
     pub(crate) fn job_ended(&mut self) {
@@ -828,9 +825,13 @@ impl NxDaemonKeeper {
         daemon: Probe,
     ) -> Verdict {
         let live = daemon == Probe::Live;
-        let idleness = self
-            .clock
-            .probe(Instant::now(), self.idle, working.is_some(), live);
+        let idleness = self.clock.probe(
+            Instant::now(),
+            self.idle,
+            working.is_some(),
+            live,
+            self.stopped,
+        );
         let kept_by = working.filter(|_| live);
         if let Some(using) = kept_by
             .as_ref()
@@ -843,6 +844,10 @@ impl NxDaemonKeeper {
         }
         self.kept_by = kept_by;
         match idleness {
+            Idleness::Suspended => {
+                self.settled = false;
+                Verdict::Hold
+            }
             Idleness::InUse => {
                 self.settled = false;
                 Verdict::Keep
@@ -918,6 +923,8 @@ enum Idleness {
     Settled,
     /// Unused for the bound and the daemon live: it is to be stopped.
     Stop,
+    /// A mount census owns the fence: neither stop nor start, and the clock is unchanged.
+    Suspended,
 }
 
 impl IdleClock {
@@ -929,7 +936,17 @@ impl IdleClock {
     /// One probe at `now`, whose ledger holds use when `working` and which found the daemon
     /// `live`, against the bound `idle`. A daemon that has just come up was asked for by someone:
     /// it gets a whole bound, however idle the shed looks.
-    fn probe(&mut self, now: Instant, idle: NxDaemonIdle, working: bool, live: bool) -> Idleness {
+    fn probe(
+        &mut self,
+        now: Instant,
+        idle: NxDaemonIdle,
+        working: bool,
+        live: bool,
+        suspended: bool,
+    ) -> Idleness {
+        if suspended {
+            return Idleness::Suspended;
+        }
         if working || (live && !self.daemon_was_live) {
             self.use_at(now);
         }
@@ -1187,12 +1204,12 @@ mod tests {
                             (true, true) => Idleness::Stop,
                             (true, false) => Idleness::Settled,
                         };
-                        let decided = clock.probe(now, idle, working, live);
+                        let decided = clock.probe(now, idle, working, live, false);
                         prop_assert_eq!(decided, expected);
                         if working {
                             prop_assert_eq!(decided, Idleness::InUse);
                         }
-                        let under_longer = longer_clock.probe(now, longer, working, live);
+                        let under_longer = longer_clock.probe(now, longer, working, live, false);
                         if decided == Idleness::InUse {
                             prop_assert_eq!(under_longer, Idleness::InUse);
                         }
@@ -1248,20 +1265,31 @@ mod tests {
                 Idleness::Settled,
             ),
         ] {
-            let mut clock = IdleClock {
-                last_use: used_at.map(|seconds| epoch + Duration::from_secs(seconds)),
-                daemon_was_live: live,
-            };
-            assert_eq!(
-                clock.probe(
-                    epoch + Duration::from_secs(completed_at),
-                    NxDaemonIdle::DEFAULT,
-                    working,
-                    live,
-                ),
-                expected,
-                "{label}",
-            );
+            for suspended in [false, true] {
+                let mut clock = IdleClock {
+                    last_use: used_at.map(|seconds| epoch + Duration::from_secs(seconds)),
+                    daemon_was_live: live,
+                };
+                let before = clock;
+                assert_eq!(
+                    clock.probe(
+                        epoch + Duration::from_secs(completed_at),
+                        NxDaemonIdle::DEFAULT,
+                        working,
+                        live,
+                        suspended,
+                    ),
+                    if suspended {
+                        Idleness::Suspended
+                    } else {
+                        expected
+                    },
+                    "{label}, suspended={suspended}",
+                );
+                if suspended {
+                    assert_eq!(clock, before, "a census changes no idle-clock fact");
+                }
+            }
         }
     }
 

@@ -6645,7 +6645,7 @@ fn nx_daemon_start(project: &Path) -> Vec<OsString> {
 }
 
 /// A held record read must not park the actor that answers the heartbeat round trip.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stalled_nx_record_read_leaves_the_supervisor_actor_responsive() {
     use std::io::Write as _;
 
@@ -6660,44 +6660,54 @@ async fn a_stalled_nx_record_read_leaves_the_supervisor_actor_responsive() {
     let record = supervisor_config
         .workspace_root
         .join(".nx/workspace-data/d/server-process.json");
-    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
-    std::fs::remove_file(fixture_node(&supervisor_config.workspace_root)).unwrap();
+    let mut daemon = LiveDaemon::start(&supervisor_config.workspace_root);
+    let record_bytes = std::fs::read(&record).unwrap();
+    let expected_authority = supervisor_config.authority.clone();
+    let h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    h.handle.nx_daemon_keeper().await.unwrap();
+    std::fs::remove_file(&record).unwrap();
     let name = std::ffi::CString::new(record.as_os_str().as_bytes()).unwrap();
     // SAFETY: the NUL-terminated path belongs to this test and outlives the call.
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    let expected_authority = supervisor_config.authority.clone();
-    let h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let writer_path = record.clone();
     // Opening the writer proves the real off-actor reader opened this FIFO. Holding it
     // without bytes keeps that same read pending, with no sleep or elapsed-time oracle.
-    let mut writer = tokio::task::spawn_blocking(move || {
+    let opening = tokio::task::spawn_blocking(move || {
         std::fs::OpenOptions::new()
             .write(true)
             .open(writer_path)
             .unwrap()
-    })
-    .await
-    .unwrap();
+    });
+    tokio::time::advance(cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT.get()).await;
+    let mut writer = opening.await.unwrap();
     assert_eq!(
         h.handle.current_authority().await.unwrap(),
         expected_authority
     );
-    let session = open_named(&h.handle, "build").await;
     assert!(
         h.spawned.is_empty(),
         "no result was invented for the held read"
     );
-    // The malformed result is consumed only after the actor has handled that session.
-    writer.write_all(b"not a daemon record").unwrap();
-    std::fs::remove_file(record).unwrap();
+    // The census is acknowledged while the read is held. Its completion must leave the
+    // already-live, now-idle daemon alone until new use explicitly resumes maintenance.
+    h.handle.stop_nx_keeper().await.unwrap();
+    writer.write_all(&record_bytes).unwrap();
+    std::fs::remove_file(&record).unwrap();
+    std::fs::write(&record, &record_bytes).unwrap();
     drop(writer);
     let state = h.handle.nx_daemon_keeper().await.unwrap().unwrap();
     assert!(matches!(
         state.held,
-        Some(cowshed_core::runtime::NxKeeperHold::Refused { .. })
+        Some(cowshed_core::runtime::NxKeeperHold::Stopped)
     ));
-    h.handle.close_session(session).await.unwrap();
-    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+    assert!(
+        daemon.running(),
+        "a completed live probe must not stop a census's daemon"
+    );
+    h.handle
+        .retire(NxDaemonRetirement::ControllerOwned)
+        .await
+        .unwrap();
 }
 
 /// Many of a keeper's probes, on a paused clock that skips the wait.

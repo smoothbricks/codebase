@@ -24,19 +24,17 @@ actor.
 The keeper owns one blocking probe task, polled as a branch of the supervisor actor's select. Other actor events leave
 that task intact: they never cancel, duplicate or fabricate its result. Completion is judged against the current ledger
 and idle clock; a result for a replaced Nx root is discarded. A lifecycle census uses the same probe before ending a
-keeper start, and a retirement transfers those waiters to the ordinary job conclusion. No silence bound, heartbeat
-authority or retry policy changes.
+keeper start, and a retirement transfers those waiters to the ordinary job conclusion. While the census fence stands,
+the pure keeper decision holds both starts and idle stops, without advancing the idle clock; only a new job or session
+resumes maintenance. No silence bound, heartbeat authority or retry policy changes.
 
 This follows specs/cowshed/04_sandbox.md, **devenv / Nix inside the sandbox** (Nx keeper), and
-specs/cowshed/05_gateway.md, **Deadlines**. Proof placement follows specs/cowshed/08_testing.md, **Unit tests**. The
-idle decision has a table test with injected times; the shell wiring test holds a real record read open while the actor
-answers its current-authority round trip and accepts a named session, then consumes the released read's actual result.
-
-The injected-clock table passed. The real stalled-read wiring test also passed through the normal sandboxed Nx target,
-with its fixture rooted under the already-granted runtime directory and capability discovery bound to its physical path.
-Earlier fixture attempts were refused before exercising the read: a global temporary root lacked write permission, the
-job TMPDIR put synthetic grants under protected host storage, and a literal runtime symlink did not match capability
-discovery's canonical workspace. None of those infrastructure refusals is counted as a behavioral red.
+specs/cowshed/05_gateway.md, **Deadlines**, and specs/cowshed/02_workspaces.md, **Holders cowshed does not run**. Proof
+placement follows specs/cowshed/08_testing.md, **Unit tests**. The table injects completion times with and without the
+census fence. The single shell wiring check observes a real live daemon, holds its next record read while advancing an
+injected clock past idle, gets an actor-authority round trip and census acknowledgement while that read is pending, then
+releases the live result and proves the fixture-owned daemon remains running. No named session or job renews its idle
+bound during that interleaving.
 
 ## Later incident: evidence limits
 

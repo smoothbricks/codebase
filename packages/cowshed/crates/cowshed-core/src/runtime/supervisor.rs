@@ -6354,14 +6354,10 @@ impl SupervisorActor {
                     .cloned()
                     .map(super::nx_daemon::Use::Session)
             });
-        if keeper.judge(&project_root, working, daemon).await == Verdict::Release {
+        if keeper.judge(&project_root, working, daemon).await != Verdict::Keep {
             return true;
         }
         if daemon == Probe::Live || running {
-            return true;
-        }
-        // A census of the mount stopped the keeper's starts until the shed's next use.
-        if keeper.stopped() {
             return true;
         }
         // The job's `node` is found as its own exec would find it: on the PATH it gets.
