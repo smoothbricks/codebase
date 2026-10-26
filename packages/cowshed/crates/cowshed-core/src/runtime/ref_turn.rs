@@ -136,7 +136,158 @@ fn seconds_since(unix_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// One blocking native watch on a land-turn queue directory: a ticket's creation
+    /// is a directory write there. Armed before the waiter is spawned, so no ticket
+    /// the following read could miss is lost between the read and the wait.
+    #[cfg(target_os = "macos")]
+    struct QueueWatch {
+        queue: std::os::fd::OwnedFd,
+        _directory: std::fs::File,
+    }
 
+    #[cfg(target_os = "macos")]
+    impl QueueWatch {
+        fn arm(directory: &Path) -> Self {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            let directory = std::fs::File::open(directory)
+                .unwrap_or_else(|error| panic!("open the queue directory: {error}"));
+            // SAFETY: `kqueue` takes no arguments; a negative answer is an error.
+            let queue = unsafe { libc::kqueue() };
+            assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
+            // SAFETY: `queue` is a fresh descriptor only this value owns.
+            let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+            // SAFETY: plain fcntl on an owned descriptor.
+            if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                panic!(
+                    "close the watch queue on exec: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let change = libc::kevent {
+                ident: usize::try_from(directory.as_raw_fd()).expect("a descriptor"),
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: libc::NOTE_WRITE,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: one valid change, no events requested back.
+            let added = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    &change,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(added == 0, "kevent: {}", std::io::Error::last_os_error());
+            Self {
+                queue,
+                _directory: directory,
+            }
+        }
+
+        fn wait(&self) {
+            use std::os::fd::AsRawFd as _;
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+            loop {
+                // SAFETY: room for one event; no timeout.
+                let ready = unsafe {
+                    libc::kevent(
+                        self.queue.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        event.as_mut_ptr(),
+                        1,
+                        std::ptr::null(),
+                    )
+                };
+                if ready == 1 {
+                    return;
+                }
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted,
+                    "kevent: {error}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct QueueWatch {
+        inotify: std::os::fd::OwnedFd,
+        _directory: std::fs::File,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl QueueWatch {
+        fn arm(directory: &Path) -> Self {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            let directory_file = std::fs::File::open(directory)
+                .unwrap_or_else(|error| panic!("open the queue directory: {error}"));
+            // SAFETY: inotify_init1 takes flags only; a negative answer is an error.
+            let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+            assert!(
+                raw >= 0,
+                "inotify_init1: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `raw` is a fresh descriptor only this value owns.
+            let inotify = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            // The watch names the opened directory itself, through its descriptor, so
+            // what is watched is what the open proved to exist.
+            let path =
+                std::ffi::CString::new(format!("/proc/self/fd/{}", directory_file.as_raw_fd()))
+                    .expect("a descriptor path");
+            // SAFETY: `path` is NUL-terminated and outlives the call.
+            let watch = unsafe {
+                libc::inotify_add_watch(
+                    inotify.as_raw_fd(),
+                    path.as_ptr(),
+                    libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_DELETE | libc::IN_MOVED_FROM,
+                )
+            };
+            assert!(
+                watch >= 0,
+                "inotify_add_watch {}: {}",
+                directory.display(),
+                std::io::Error::last_os_error()
+            );
+            Self {
+                inotify,
+                _directory: directory_file,
+            }
+        }
+
+        fn wait(&self) {
+            use std::os::fd::AsRawFd as _;
+            let mut buffer = [0_u8; 4096];
+            loop {
+                // SAFETY: `buffer` is writable for its full length; the descriptor is
+                // owned and blocking, so the read returns only with events or an error.
+                let read = unsafe {
+                    libc::read(
+                        self.inotify.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if read > 0 {
+                    return;
+                }
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted,
+                    "inotify read: {error}"
+                );
+            }
+        }
+    }
     fn queue() -> LandTurnName {
         LandTurnName::new("repo.ref").unwrap()
     }
@@ -167,19 +318,21 @@ mod tests {
             |_| panic!("the writer is first in the queue"),
         )
         .unwrap();
+        // The ticket is the event: the queue directory is watched before the land is
+        // spawned to queue, and each directory change earns exactly one ticket read.
+        let watch = QueueWatch::arm(&root.join("repo.ref"));
         let waiting = tokio::spawn({
             let root = root.to_path_buf();
             async move { RefTurn::acquire_in(&root, &queue(), "topic").await }
         });
         // The land queues behind the writer: two live tickets, the writer's first.
-        let mut tickets = Vec::new();
-        for _ in 0..200 {
-            tickets = land_turn::observe(&root.join("repo.ref")).unwrap();
+        let tickets = loop {
+            let tickets = land_turn::observe(&root.join("repo.ref")).unwrap();
             if tickets.len() == 2 {
-                break;
+                break tickets;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+            watch.wait();
+        };
         assert_eq!(
             tickets
                 .iter()
