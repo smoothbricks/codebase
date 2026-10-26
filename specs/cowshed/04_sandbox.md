@@ -1300,9 +1300,9 @@ the pinned 23.2.1; line numbers are those of commit `d2dc2aaef9`.
   alternative, `NX_DAEMON=false`, is forbidden for a normal run (`16_build_volumes.md:1277`).
 - **Racing starters.** Two clients that both find no daemon each start one. Stock Nx writes the record unconditionally
   and unlinks the socket path before it binds, and under `NX_SOCKET_DIR` every daemon of a workspace binds the same
-  `d.sock` (`daemon/tmp-dir.js:74-77`, `:276-278`). The later daemon takes the record, the displaced one stops, and its
-  shutdown unlinks the winner's socket: a new daemon every five seconds, and `EPIPE` on `RECORD_OUTPUTS_HASH_BATCH`
-  (`8b1716430f`, which makes the record a claim). Today only the keeper, one start in flight
+  `d.sock` (Nx's installed `daemon/tmp-dir.js`, lines 74-77 and 276-278). The later daemon takes the record, the
+  displaced one stops, and its shutdown unlinks the winner's socket: a new daemon every five seconds, and `EPIPE` on
+  `RECORD_OUTPUTS_HASH_BATCH` (`8b1716430f`, which makes the record a claim). Today only the keeper, one start in flight
   (`04_sandbox.md:1112-1113`), and host shells start; with every job able to, the race is the normal case.
 - **The idle stop.** Stock Nx stops a daemon after three hours without a request or a file event, the patched Nx after
   five minutes (`daemon/server/shutdown-utils.js`), and every file event of the tree restarts that timer, so a tree that
