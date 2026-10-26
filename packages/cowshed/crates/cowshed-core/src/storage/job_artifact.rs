@@ -6614,37 +6614,135 @@ mod tests {
         ArtifactStore::open(root, OwnedRepoIds::sole(repo()), incarnation(), config).unwrap()
     }
 
+    /// Names the lock file [`holds_the_records_lock_until_its_stdin_ends`] holds.
+    const HELD_RECORDS_LOCK: &str = "COWSHED_TEST_HELD_RECORDS_LOCK";
+
+    /// The libtest name of [`holds_the_records_lock_until_its_stdin_ends`], as the test binary's
+    /// module tree spells it.
+    const HOLDER_TEST: &str =
+        "storage::job_artifact::tests::holds_the_records_lock_until_its_stdin_ends";
+
+    /// What the process holding the lock says, alone on a line, once it holds it.
+    const LOCKED: &str = "COWSHED_TEST_RECORDS_LOCK_HELD";
+
+    /// Not a test: the process [`OtherProcessLock`] starts. It takes the exclusive `flock` of the
+    /// lock file [`HELD_RECORDS_LOCK`] names, says [`LOCKED`], and holds the lock until its
+    /// standard input ends.
+    #[test]
+    #[ignore = "helper process of a_held_records_lock_fails_its_wait_at_the_bound_naming_the_holder"]
+    fn holds_the_records_lock_until_its_stdin_ends() {
+        let Some(lock) = std::env::var_os(HELD_RECORDS_LOCK).map(PathBuf::from) else {
+            return;
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap_or_else(|error| panic!("open {}: {error}", lock.display()));
+        // The grant of a waiter, not a probe, proves the lock free: a release can lag its close by
+        // a concurrent spawn's teardown (`cowshed_os::fork_lock`).
+        let _held = cowshed_os::flock::exclusive(
+            file,
+            &lock,
+            &cowshed_os::deadline::start(
+                "records-lock-holder",
+                Bound::new(
+                    cowshed_os::deadline::LatencyClass::Control,
+                    cowshed_os::test_backstop::NO_PROGRESS,
+                ),
+            ),
+            crate::held_lock::holders,
+        )
+        .unwrap();
+        println!("{LOCKED}");
+        io::copy(&mut io::stdin(), &mut io::sink()).unwrap();
+    }
+
+    /// Another process holding the records lock, ended when dropped, whichever way the test that
+    /// started it ends.
+    struct OtherProcessLock {
+        process: std::process::Child,
+        /// Open until the process is reaped: the harness reports its verdict there as the process
+        /// ends, and a pipe nobody reads would fail that write, and the process's exit with it.
+        stdout: io::BufReader<std::process::ChildStdout>,
+    }
+
+    impl OtherProcessLock {
+        /// Start the process holding the lock file at `lock`, returning once it says it does. One
+        /// that ends first fails the test with its exit status.
+        fn hold(lock: &Path) -> Self {
+            use cowshed_os::fork_lock::Spawn as _;
+            use std::io::BufRead as _;
+
+            // `--nocapture`: the harness would keep the holder's line until the holder ended.
+            let program = std::env::current_exe().unwrap();
+            let mut process = std::process::Command::new(&program)
+                .args(["--exact", HOLDER_TEST, "--ignored", "--nocapture"])
+                .env(HELD_RECORDS_LOCK, lock)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn_locked()
+                .unwrap_or_else(|error| panic!("start {}: {error}", program.display()));
+            let stdout = io::BufReader::new(process.stdout.take().unwrap());
+            let mut other = Self { process, stdout };
+            let mut said = String::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if other.stdout.read_line(&mut line).unwrap() == 0 {
+                    let status = other.process.wait().unwrap();
+                    panic!(
+                        "the process ended before it held {}: {status}; it said {said:?}",
+                        lock.display()
+                    );
+                }
+                // The harness may print its own `test ... ` prefix on the same line.
+                if line.trim_end().ends_with(LOCKED) {
+                    return other;
+                }
+                said.push_str(&line);
+            }
+        }
+
+        fn id(&self) -> u32 {
+            self.process.id()
+        }
+
+        /// Let go of the lock: the process's input ends and it exits.
+        fn release(mut self) {
+            drop(self.process.stdin.take());
+            let status = self.process.wait().unwrap();
+            assert!(
+                status.success(),
+                "the process holding the lock failed: {status}"
+            );
+        }
+    }
+
+    impl Drop for OtherProcessLock {
+        fn drop(&mut self) {
+            // Whichever way the test ends, the process is reaped: killed first unless `release`
+            // already reaped it.
+            if let Err(error) = self.process.kill() {
+                cowshed_os::eprintln!("process {}: kill: {error}", self.process.id());
+            }
+            if let Err(error) = self.process.wait() {
+                cowshed_os::eprintln!("process {}: wait: {error}", self.process.id());
+            }
+        }
+    }
+
     /// A records lock another process holds is waited for within its bound: the wait ends naming the
     /// lock and the holder the census reads, never the holder; once the holder lets go, the lock
-    /// is free again, the one the abandoned wait took late included.
+    /// is free again, the one the abandoned wait took late included. The holder is this test binary
+    /// running [`holds_the_records_lock_until_its_stdin_ends`]: holding the lock needs no host tool.
     #[test]
     fn a_held_records_lock_fails_its_wait_at_the_bound_naming_the_holder() {
-        use cowshed_os::fork_lock::Spawn as _;
-        use std::io::BufRead as _;
-
         let root = temp_root("records-lock-held");
         drop(store_at(&root, ArtifactConfig::default()));
         let records = records_path(&root);
         let lock = records.with_file_name("records.lock");
-        let mut holder = std::process::Command::new("/usr/bin/perl")
-            .args([
-                "-e",
-                r#"use Fcntl qw(:flock);
-                open(my $h, '+<', $ARGV[0]) or die "open $ARGV[0]: $!";
-                flock($h, LOCK_EX) or die "flock $ARGV[0]: $!";
-                $| = 1; print "locked\n";
-                <STDIN>;"#,
-            ])
-            .arg(&lock)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn_locked()
-            .unwrap();
-        let mut locked = String::new();
-        std::io::BufReader::new(holder.stdout.take().unwrap())
-            .read_line(&mut locked)
-            .unwrap();
-        assert_eq!(locked, "locked\n");
+        let holder = OtherProcessLock::hold(&lock);
 
         let bound = Bound::new(
             cowshed_os::deadline::LatencyClass::Control,
@@ -6678,8 +6776,7 @@ mod tests {
         );
         assert!(message.contains(lock.to_str().unwrap()), "{message}");
 
-        drop(holder.stdin.take());
-        assert!(holder.wait().unwrap().success());
+        holder.release();
         let backstop = Bound::new(
             cowshed_os::deadline::LatencyClass::Control,
             cowshed_os::test_backstop::NO_PROGRESS,
