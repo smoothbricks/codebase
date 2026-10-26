@@ -1114,6 +1114,7 @@ mod driver_tests {
 
     use super::super::test_support::Fixture;
     use super::*;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     /// An executable file of the fixture, `relative` to its root.
     pub(super) fn executable(fixture: &Fixture, relative: &str, content: &str) {

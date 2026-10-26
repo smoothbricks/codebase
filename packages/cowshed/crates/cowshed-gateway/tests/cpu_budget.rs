@@ -6,7 +6,8 @@
 mod fixture_dir;
 
 use cowshed_os::test_backstop::{
-    AsyncChildBackstop as _, AsyncUnixStreamBackstop as _, ChildBackstop as _,
+    AsyncChildBackstop as _, AsyncCommandBackstop as _, AsyncUnixStreamBackstop as _,
+    ChildBackstop as _,
 };
 use std::io::{BufRead as _, BufReader as StdBufReader, Write as _};
 use std::num::NonZeroUsize;
@@ -205,7 +206,7 @@ impl Asker {
 
     /// One held request line on `socket`, and the first answer it hears.
     async fn open(socket: &Path, request: Value) -> (Self, Value) {
-        let stream = UnixStream::connect(socket).await.expect("connect");
+        let stream = UnixStream::connect_bounded(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         writer
             .write_all(format!("{request}\n").as_bytes())
@@ -298,7 +299,7 @@ async fn grant_handoff_and_selection_timings_need_no_environment_switch() {
             ])
             .env(CHILD, "1")
             .env_remove("COWSHED_TIMING")
-            .output()
+            .output_bounded()
             .await
             .expect("run timing proof");
         let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");

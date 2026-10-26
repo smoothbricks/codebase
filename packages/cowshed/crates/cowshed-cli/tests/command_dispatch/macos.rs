@@ -33,7 +33,8 @@ use cowshed_gateway::{
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::NO_PROGRESS;
 use cowshed_os::test_backstop::{
-    AsyncUnixStreamBackstop as _, ChildBackstop as _, FileBackstop as _, UnixStreamBackstop as _,
+    AsyncCommandBackstop as _, AsyncUnixStreamBackstop as _, ChildBackstop as _,
+    CommandBackstop as _, FileBackstop as _, UnixStreamBackstop as _,
 };
 use std::cell::Cell;
 use std::ffi::OsString;
@@ -426,7 +427,7 @@ fn git(directory: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output()
+        .output_bounded()
         .expect("git process");
     cowshed_os::eprintln!(
         "dispatch fixture git: {verb} done elapsed={:?} status={}",
@@ -1438,7 +1439,7 @@ impl HostProcesses {
         }
         let output = command
             .current_dir(cwd)
-            .output()
+            .output_bounded()
             .expect("start a host process");
         assert!(output.status.success(), "{output:?}");
         let pid = String::from_utf8(output.stdout)
@@ -2099,7 +2100,7 @@ fn repository_root() -> PathBuf {
 fn host_bun() -> PathBuf {
     let observed = Command::new("bun")
         .args(["--print", "process.execPath"])
-        .output()
+        .output_bounded()
         .expect("observe the actual pinned Bun executable");
     assert!(
         observed.status.success(),
@@ -2660,7 +2661,7 @@ async fn land_nx_project(
         Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&topic.mount)
-            .output()
+            .output_bounded()
             .unwrap()
             .stdout,
     )
@@ -2869,7 +2870,7 @@ fn directory_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycl
                 start.env_remove(key);
             }
         }
-        let output = start.output().expect("node runs");
+        let output = start.output_bounded().expect("node runs");
         assert!(
             output.status.success(),
             "nx daemon --start: {}",
@@ -3016,7 +3017,7 @@ fn write_cargo_workspace(checkout: &Path, rust: &RustToolchain) {
         .current_dir(checkout)
         .env("RUSTC", &rust.rustc)
         .env_remove("CARGO_TARGET_DIR")
-        .output()
+        .output_bounded()
         .expect("cargo generate-lockfile");
     assert!(
         lockfile.status.success(),
@@ -3159,7 +3160,7 @@ fn git_stdout(directory: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
         .current_dir(directory)
-        .output()
+        .output_bounded()
         .expect("git process");
     assert!(
         output.status.success(),
@@ -3968,7 +3969,7 @@ async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
             .unwrap(),
         )
         .env("CI", "true")
-        .output()
+        .output_bounded()
         .expect("host build of the relocated target");
     let host_warm = cargo_artifacts(&host.stdout);
     let started = Instant::now();
@@ -4119,7 +4120,7 @@ async fn directory_a_noop_cargo_build_stamps_the_units_it_uses_and_no_others_sub
                 ])
                 .unwrap(),
             )
-            .output()
+            .output_bounded()
             .expect("host cargo build");
         assert!(
             output.status.success(),
@@ -4484,7 +4485,7 @@ fn recorded_daemon(checkout: &Path) -> Option<libc::pid_t> {
 fn children_of(parent: libc::pid_t) -> Vec<libc::pid_t> {
     let listed = Command::new("/bin/ps")
         .args(["-Ao", "pid=,ppid="])
-        .output()
+        .output_bounded()
         .expect("list processes");
     String::from_utf8_lossy(&listed.stdout)
         .lines()
@@ -5165,7 +5166,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
             "--quiet",
         ])
         .env(CHILD, "1")
-        .output()
+        .output_bounded()
         .await
         .expect("run the APFS holder scenario in a child test process");
         let stdout = String::from_utf8(output.stdout).expect("child test stdout");
@@ -6851,7 +6852,9 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
         .env("NX_CACHE_DIRECTORY", state.join("cache"))
         .env("NX_WORKSPACE_DATA_DIRECTORY", &data)
         .env("NX_SOCKET_DIR", &socket);
-    let started = command.output().expect("start the standalone stock daemon");
+    let started = command
+        .output_bounded()
+        .expect("start the standalone stock daemon");
     assert!(
         started.status.success(),
         "{}",
@@ -6910,7 +6913,7 @@ async fn land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption(
         }
     }
     let stopped = stop
-        .output()
+        .output_bounded()
         .expect("stop the standalone stock daemon through its own Nx owner");
     assert!(
         stopped.status.success(),
@@ -7455,7 +7458,7 @@ async fn directory_managed_install_restores_developer_links_before_nx_and_cleans
     let installed = Command::new(&bun)
         .args(["install", "--ignore-scripts"])
         .current_dir(&fixture.checkout)
-        .output()
+        .output_bounded()
         .expect("generate the actual local-package lockfile");
     assert!(
         installed.status.success(),
@@ -7704,7 +7707,7 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
     let lockfile = Command::new(&bun)
         .args(["install", "--ignore-scripts", "--lockfile-only"])
         .current_dir(&fixture.checkout)
-        .output()
+        .output_bounded()
         .expect("generate the actual Bun lockfile");
     assert!(
         lockfile.status.success(),
@@ -7931,7 +7934,7 @@ impl LoadedHost {
         lease: &str,
     ) -> tokio::io::BufReader<tokio::net::UnixStream> {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-        let mut stream = tokio::net::UnixStream::connect(socket)
+        let mut stream = tokio::net::UnixStream::connect_bounded(socket)
             .await
             .expect("connect the gateway's control socket");
         request.push('\n');
@@ -8008,7 +8011,7 @@ async fn holds_no_cpu_pool(test: &str) -> bool {
         child.env_remove(name);
     }
     let status = child
-        .status()
+        .status_bounded()
         .await
         .expect("run the scenario in a child test process");
     assert!(

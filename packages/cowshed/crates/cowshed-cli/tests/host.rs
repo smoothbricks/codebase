@@ -2,7 +2,9 @@
 //! socketpair as its standard input, and the host operations called on the other end
 //! (07_api.md, "Host operations").
 
-use cowshed_os::test_backstop::{AsyncChildBackstop as _, ChildBackstop as _};
+use cowshed_os::test_backstop::{
+    AsyncChildBackstop as _, ChildBackstop as _, CommandBackstop as _,
+};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixStream;
@@ -58,7 +60,7 @@ async fn a_host_connection_answers_what_the_verb_computes_and_ends_with_its_peer
         .args(["--json", "--project"])
         .arg(&checkout)
         .arg("build-state")
-        .output()
+        .output_bounded()
         .unwrap();
     assert!(
         verb.status.success(),
@@ -363,7 +365,7 @@ mod real_apfs_host {
                 "--",
                 "info",
             ])
-            .output()
+            .output_bounded()
             .unwrap();
         assert_eq!(
             verb.status.code(),
@@ -488,7 +490,7 @@ fn serving(verb: &[&str]) -> (OwnedFd, tokio::process::Child) {
 async fn a_sccache_host_connection_serves_the_sccache_rows_and_no_other_role() {
     let verb = Command::new(cowshed())
         .args(["--json", "sccache", "status"])
-        .output()
+        .output_bounded()
         .unwrap();
 
     let printed: serde_json::Value = serde_json::from_slice(&verb.stdout).unwrap();
@@ -576,7 +578,7 @@ async fn a_host_disk_command_refuses_volume_renames_as_the_verb_does() {
         .args(["disk-command", "diskutil", "--", "renameVolume"])
         .arg(&target)
         .arg("renamed")
-        .output()
+        .output_bounded()
         .expect("run the disk-command verb");
     assert_eq!(verb.status.code(), Some(101), "{verb:?}");
     assert!(verb.stdout.is_empty(), "{verb:?}");

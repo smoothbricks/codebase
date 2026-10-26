@@ -6,7 +6,7 @@
 //! `Gateway` with one real nx-cache-server, the stock Nx client in two fixture checkouts, and no
 //! credential anywhere.
 use super::*;
-use cowshed_os::test_backstop::{AsyncChildBackstop as _, AsyncCommandBackstop as _};
+use cowshed_os::test_backstop::AsyncChildBackstop as _;
 
 use super::nx_outage::{executions, gateway_with, nx_events, run_text, scrub, write_workspace};
 use super::nx_process::{server_path, server_script};

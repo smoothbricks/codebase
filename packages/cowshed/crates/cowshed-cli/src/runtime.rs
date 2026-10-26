@@ -8106,6 +8106,7 @@ mod tests {
 
 #[cfg(test)]
 mod host_gate_environment_tests {
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     /// Exercise the real checkout's entry hooks with the operator environment the CLI carries,
     /// without treating the record projection as an execution allowlist.
@@ -8121,7 +8122,7 @@ mod host_gate_environment_tests {
         let activated = std::process::Command::new("direnv")
             .env_clear().envs(&forwarded).current_dir(root)
             .args(["exec", ".", "/bin/sh", "-c", "command -v cargo && command -v bun && command -v rustc && bun --version && rustc --version"])
-            .output().expect("run the real host activation");
+            .output_bounded().expect("run the real host activation");
         let mut names: Vec<&str> = forwarded.keys().map(String::as_str).collect();
         names.sort_unstable();
         cowshed_os::eprintln!("HostGate activation forwarded names: {}", names.join(", "));

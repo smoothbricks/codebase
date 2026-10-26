@@ -14,6 +14,7 @@ describe('WAIT-WHY', () => {
       `#[expect(clippy::disallowed_methods, reason = "fine")]\nfn lock(fd: i32) { unsafe { libc::flock(fd, 2) }; }`,
       `#![allow(dead_code, clippy::disallowed_methods)]\nfn hold(path: &Path) { UnixStream::connect(path); }`,
       `#[cfg_attr(test, allow(clippy::disallowed_methods))]\nfn reap(pid: i32) { libc::waitpid(pid, null_mut(), 0); }`,
+      `${allow}\nlet output = Command::new("git").arg("status").output()?;`,
       `// WHY unbounded:\n${allow}\nlet status = child.wait();`,
     ]) {
       expect(unexplainedWaitAllows(source), source).toEqual([
@@ -40,6 +41,7 @@ describe('WAIT-WHY', () => {
       `${allow}\nlet child = command.spawn();\nchild.wait();`,
       `fn f() {\n    ${allow}\n    command.spawn()\n}\nfn g() { child.wait(); }`,
       `// child.wait() in a comment calls nothing\n${allow}\nlet text = "flock";`,
+      `${allow}\nlet status = unsafe { libc::copyfile(from, to, state, flags) };\nif status == 0 { Ok(()) } else { Err(output) }`,
     ]) {
       expect(unexplainedWaitAllows(source), source).toEqual([]);
     }

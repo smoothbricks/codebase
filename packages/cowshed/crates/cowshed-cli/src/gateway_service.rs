@@ -4833,7 +4833,7 @@ mod tests {
         prove_one_requirement_across_two_setups(&keychain_home).await;
         let listed = std::process::Command::new(code_signing::SECURITY)
             .args(["list-keychains", "-d", "user"])
-            .output()
+            .output_bounded()
             .unwrap();
         let kept: Vec<String> = String::from_utf8_lossy(&listed.stdout)
             .lines()
@@ -4848,13 +4848,13 @@ mod tests {
         let restored = std::process::Command::new(code_signing::SECURITY)
             .args(["list-keychains", "-d", "user", "-s"])
             .args(&kept)
-            .status()
+            .status_bounded()
             .unwrap();
         assert!(restored.success());
         let _ = std::process::Command::new(code_signing::SECURITY)
             .arg("delete-keychain")
             .arg(keychain.path())
-            .status();
+            .status_bounded();
         fs::remove_dir_all(keychain_home).unwrap();
     }
 

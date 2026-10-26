@@ -45,6 +45,8 @@ mod native {
 
     type ProofResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+    // WHY unbounded: an operator-run proof of host tools; the operator's interrupt ends it.
+    #[allow(clippy::disallowed_methods)]
     fn tool(program: &str, args: &[&str]) -> ProofResult<Vec<u8>> {
         let output = Command::new(program).args(args).output()?;
         if !output.status.success() {

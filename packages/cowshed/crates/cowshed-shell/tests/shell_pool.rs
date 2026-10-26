@@ -9,7 +9,7 @@
 
 #![cfg(target_os = "macos")]
 
-use cowshed_os::test_backstop::AsyncChildBackstop as _;
+use cowshed_os::test_backstop::{AsyncChildBackstop as _, CommandBackstop as _};
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -1578,7 +1578,7 @@ async fn stderr_reaches(handle: &WorkspaceSupervisorHandle, job: JobId, marker: 
 fn process_state(pid: u32) -> char {
     let ps = std::process::Command::new("/bin/ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
+        .output_bounded()
         .expect("ps");
     String::from_utf8_lossy(&ps.stdout)
         .trim()
@@ -1800,7 +1800,7 @@ async fn host_controller_an_activation_ends_when_its_supervisor_process_does() {
             "--nocapture",
         ])
         .env(ORPHAN_HELPER, &workspace.root)
-        .status()
+        .status_bounded()
         .expect("run the controller helper");
     assert!(status.success(), "helper: {status}");
     let pid: i32 = std::fs::read_to_string(workspace.sandbox.exec_temp_dir.join("activation-pid"))

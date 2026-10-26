@@ -1,5 +1,5 @@
 use cowshed_cli::output::{Output, write_error_envelope, write_success_envelope};
-use cowshed_os::test_backstop::{ChildBackstop as _, FileBackstop as _};
+use cowshed_os::test_backstop::CommandBackstop as _;
 
 use cowshed_core::api::{EmptyResult, MountResult};
 use cowshed_core::metadata::WorkspaceName;
@@ -85,7 +85,7 @@ fn bare_streams_and_records_preserve_machine_bytes() {
 fn binary_entrypoint_returns_typed_json_usage_error() {
     let output = Command::new(cowshed())
         .args(["--json", "exec", "raven", "--unknown"])
-        .output()
+        .output_bounded()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
@@ -97,7 +97,7 @@ fn binary_entrypoint_returns_typed_json_usage_error() {
 
 #[test]
 fn binary_entrypoint_returns_usage_and_command_map() {
-    let output = Command::new(cowshed()).output().unwrap();
+    let output = Command::new(cowshed()).output_bounded().unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -120,7 +120,7 @@ fn child_argv_cannot_enable_cli_json_mode() {
             "--",
             "--json",
         ])
-        .output()
+        .output_bounded()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
@@ -150,7 +150,7 @@ fn skill_install_splits_tsv_stdout_from_guidance_and_hints_exactly_once() {
     let output = Command::new(cowshed())
         .args(["skill", "install"])
         .env("HOME", &home)
-        .output()
+        .output_bounded()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(0));
@@ -187,12 +187,12 @@ fn skill_install_is_idempotent_and_reports_unchanged() {
     let first = Command::new(cowshed())
         .args(["skill", "install"])
         .env("HOME", &home)
-        .output()
+        .output_bounded()
         .unwrap();
     let second = Command::new(cowshed())
         .args(["--json", "skill", "install"])
         .env("HOME", &home)
-        .output()
+        .output_bounded()
         .unwrap();
 
     assert!(String::from_utf8(first.stdout).unwrap().contains("written"));
@@ -227,7 +227,7 @@ fn skill_install_rejects_an_unknown_harness_before_writing_anything() {
     let output = Command::new(cowshed())
         .args(["skill", "install", "--harness", "nonesuch"])
         .env("HOME", &home)
-        .output()
+        .output_bounded()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));

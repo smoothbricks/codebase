@@ -23,6 +23,8 @@ use cowshed_cli::launchd::{
 use cowshed_os::deadline::{self, Bound, Deadline, LatencyClass, ReapError, RunError};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::process::RunState;
+#[cfg(target_os = "macos")]
+use cowshed_os::test_backstop::CommandBackstop as _;
 
 #[cfg(target_os = "macos")]
 use cowshed_apfs::{
@@ -1890,7 +1892,7 @@ mod descriptor_inheritance {
             if self.loaded {
                 match std::process::Command::new(LAUNCHCTL_EXECUTABLE)
                     .args(["bootout", &self.target])
-                    .output()
+                    .output_bounded()
                 {
                     Ok(output) if output.status.success() => {}
                     Ok(output) => cowshed_os::eprintln!(
@@ -1975,7 +1977,7 @@ mod descriptor_inheritance {
         let launched = std::process::Command::new(LAUNCHCTL_EXECUTABLE)
             .args(["bootstrap", &domain])
             .arg(&plist_path)
-            .output()
+            .output_bounded()
             .expect("launchctl bootstrap");
         assert!(
             launched.status.success(),

@@ -16,7 +16,7 @@
 //!   a waiter that did not signal keeps its place in the queue.
 #![cfg(unix)]
 
-use cowshed_os::test_backstop::{ChildBackstop as _, FileBackstop as _};
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _, FileBackstop as _};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
@@ -145,7 +145,7 @@ fn lock_holders(lock: &Path) -> Value {
     let output = Command::new(cowshed())
         .arg("lock-holders")
         .arg(lock)
-        .output()
+        .output_bounded()
         .expect("run cowshed lock-holders");
     assert!(
         output.status.success(),
@@ -1129,7 +1129,7 @@ fn a_command_holding_the_lock_receives_the_git_and_managed_nx_policies() {
             .arg("-C")
             .arg(&repo)
             .args(args)
-            .status()
+            .status_bounded()
             .expect("run git");
         assert!(status.success(), "git {args:?}");
     };
@@ -1156,7 +1156,7 @@ fn a_command_holding_the_lock_receives_the_git_and_managed_nx_policies() {
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "user.lockfixture")
         .env("GIT_CONFIG_VALUE_0", "kept")
-        .output()
+        .output_bounded()
         .expect("run cowshed lock");
     assert!(
         output.status.success(),
@@ -1229,7 +1229,7 @@ fn bsd_lockf_and_cowshed_lock_exclude_each_other_on_the_same_file() {
         .args(["-k", "-t", "0"])
         .arg(&lock)
         .arg("true")
-        .status()
+        .status_bounded()
         .expect("run lockf");
     assert!(!refused.success(), "lockf took a lock cowshed lock holds");
     release(&fifo);
@@ -1265,7 +1265,7 @@ fn assert_raw_lock_observation(name: &std::ffi::OsStr, path_wire: Value) {
             .current_dir(&dir.path)
             .arg("lock-holders")
             .arg(name)
-            .output()
+            .output_bounded()
             .expect("run lock-holders with a raw path");
         assert!(
             output.status.success(),

@@ -38,6 +38,9 @@ fn main() {
 }
 
 /// What `git <arguments>` prints in `directory`, trimmed; `None` when git is absent or refuses.
+// WHY unbounded: the build script's git reads this checkout's own repository (its HEAD and the
+// commit's time) and waits on no other process; the build that runs this script ends with it.
+#[allow(clippy::disallowed_methods)]
 fn git(directory: &PathBuf, arguments: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(arguments)

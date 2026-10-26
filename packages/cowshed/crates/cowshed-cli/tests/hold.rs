@@ -17,7 +17,7 @@
 //!   that left the group and still holds it, once the leader exited.
 #![cfg(unix)]
 
-use cowshed_os::test_backstop::ChildBackstop as _;
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead as _, BufReader, PipeReader, PipeWriter, Read as _, Write as _};
@@ -188,7 +188,7 @@ impl Hold {
 fn process_state(pid: i32) -> String {
     let shown = Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
+        .output_bounded()
         .expect("run ps");
     String::from_utf8(shown.stdout)
         .expect("ps prints ASCII")
@@ -203,7 +203,7 @@ fn named_in(pid: i32, descriptor: RawFd) -> HeldDescriptor {
     let listed = Command::new("/usr/sbin/lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", &descriptor.to_string()])
         .args(["-F", "d"])
-        .output()
+        .output_bounded()
         .expect("run lsof");
     let text = String::from_utf8(listed.stdout).expect("lsof prints ASCII");
     let device = text
@@ -603,7 +603,7 @@ fn fd_holders(name: HeldDescriptor) -> (serde_json::Value, std::time::Duration) 
     let began = std::time::Instant::now();
     let printed = Command::new(cowshed())
         .args(["fd-holders", option, &value])
-        .output()
+        .output_bounded()
         .expect("run cowshed fd-holders");
     let took = began.elapsed();
     assert!(
@@ -785,7 +785,7 @@ fn a_hold_runs_as_the_command_of_a_lock() {
     let waiter = i32::try_from(hold.child.id()).expect("a pid fits");
     let holder: i32 = Command::new("ps")
         .args(["-o", "ppid=", "-p", &leader.to_string()])
-        .output()
+        .output_bounded()
         .map(|shown| String::from_utf8_lossy(&shown.stdout).trim().parse())
         .expect("run ps")
         .expect("the leader's parent, the holder");

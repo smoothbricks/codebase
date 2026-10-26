@@ -4,7 +4,6 @@
 //! this test kills with SIGKILL. It proves that stream cut and nothing else: no restore or
 //! cutover claim.
 use super::*;
-use cowshed_os::test_backstop::CommandBackstop as _;
 
 use super::nx_process::{is_server_args, server_path, server_script};
 use cowshed_gateway::{AuditEvent, AuditStatus, GatewayTimeouts, NxCacheServiceConfig};

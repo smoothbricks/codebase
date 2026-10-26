@@ -2,6 +2,7 @@
 //! is checkout-local, and no exec of the coordinator route is reachable.
 #![cfg(target_os = "macos")]
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -44,7 +45,7 @@ fn job(config: &SandboxConfig, tools: &Path, argv: &[&str]) -> Output {
         .env("HOME", config.workspace_mount.join(".cowshed/home"))
         .env("TMPDIR", &config.exec_temp_dir)
         .env("PATH", tools)
-        .output()
+        .output_bounded()
         .expect("run executed-child profile")
 }
 
@@ -77,7 +78,7 @@ fn installed_cli_fixture(label: &str) -> (Scratch, SandboxConfig, PathBuf) {
     }
     let initialized = git_command_at(&checkout)
         .args(["init", "-q"])
-        .output()
+        .output_bounded()
         .unwrap();
     assert!(initialized.status.success());
     assert!(

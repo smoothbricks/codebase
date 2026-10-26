@@ -5,7 +5,7 @@
 //! guard kills that group and reaps it, so a failed assertion leaks neither it nor the tree.
 #![cfg(unix)]
 
-use cowshed_os::test_backstop::ChildBackstop as _;
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 use std::fs;
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::process::CommandExt as _;
@@ -111,7 +111,7 @@ fn holders(dir: &Path) -> Vec<Value> {
     let output = Command::new(cowshed())
         .arg("tree-holders")
         .arg(dir)
-        .output()
+        .output_bounded()
         .expect("run cowshed tree-holders");
     assert!(
         output.status.success(),

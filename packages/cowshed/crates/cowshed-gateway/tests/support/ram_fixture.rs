@@ -14,7 +14,7 @@
 //! is never asked.
 #![allow(dead_code)]
 
-use cowshed_os::test_backstop::UnixStreamBackstop as _;
+use cowshed_os::test_backstop::{CommandBackstop as _, UnixStreamBackstop as _};
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt as _;
@@ -219,7 +219,7 @@ pub struct RegisteredRamDisk {
 pub fn ram_disks() -> Vec<RegisteredRamDisk> {
     let output = Command::new("/usr/sbin/ioreg")
         .args(["-r", "-c", "IOHDIXHDDriveOutKernel", "-l", "-w0"])
-        .output()
+        .output_bounded()
         .expect("read the I/O Registry");
     assert!(output.status.success(), "ioreg: {output:?}");
     let registry = String::from_utf8(output.stdout).expect("ioreg prints UTF-8");

@@ -2,9 +2,7 @@
 //! process: its lock, its refusal frame, its death with the gateway, and its stdin-EOF drain. Raw
 //! bytes service and process integration only; no archive restore or cutover claim.
 use super::*;
-use cowshed_os::test_backstop::{
-    AsyncChildBackstop as _, AsyncCommandBackstop as _, CommandBackstop as _,
-};
+use cowshed_os::test_backstop::AsyncChildBackstop as _;
 
 use cowshed_os::fork_lock::Spawn as _;
 

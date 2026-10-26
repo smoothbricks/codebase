@@ -19,6 +19,10 @@ disallowed-methods = [
   { path = "libc::waitpid", reason = "reap within a bound: cowshed_os::deadline::reap (tests: test_backstop::waitpid)" },
   { path = "libc::waitid", reason = "wait for the exit within a bound: cowshed_os::process::ExitWatch::within (tests: test_backstop::waitid)" },
   { path = "libc::wait4", reason = "reap within a bound: cowshed_os::deadline::reap (tests: test_backstop::wait4)" },
+  { path = "std::process::Command::output", reason = "run within a bound: cowshed_os::deadline::output_within (tests: test_backstop::CommandBackstop)" },
+  { path = "std::process::Command::status", reason = "run within a bound: cowshed_os::deadline::output_within (tests: test_backstop::CommandBackstop)" },
+  { path = "tokio::process::Command::output", reason = "spawn, then reap within a bound: cowshed_os::deadline::reap_async (tests: test_backstop::AsyncCommandBackstop)" },
+  { path = "tokio::process::Command::status", reason = "spawn, then reap within a bound: cowshed_os::deadline::reap_async (tests: test_backstop::AsyncCommandBackstop)" },
 ]
 
 # Every stderr line is one write: cowshed processes share one stderr file, and std's macros write

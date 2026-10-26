@@ -1,7 +1,7 @@
 //! `cowshed controller` as an embedding process meets it: the binary started with one end of a
 //! socketpair as its standard input, and the controller protocol spoken on the other end.
 
-use cowshed_os::test_backstop::AsyncChildBackstop as _;
+use cowshed_os::test_backstop::{AsyncChildBackstop as _, CommandBackstop as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ fn a_standard_input_that_is_not_a_socket_is_refused_before_the_project_is_resolv
             "controller",
         ])
         .stdin(Stdio::null())
-        .output()
+        .output_bounded()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
@@ -106,7 +106,7 @@ fn checkout_root() -> PathBuf {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(crate_dir)
-        .output()
+        .output_bounded()
         .expect("git rev-parse");
     assert!(output.status.success(), "not inside a git checkout");
     PathBuf::from(String::from_utf8(output.stdout).expect("utf-8 path").trim())

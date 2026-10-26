@@ -16,6 +16,7 @@ use cowshed_core::api::JsonEnvelope;
 use cowshed_core::project_retirement::ProjectRetirementReport;
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, ErrorCode, Result};
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command as Process;
@@ -502,7 +503,7 @@ fn cowshed() -> PathBuf {
 fn the_binary_refuses_a_forget_without_abandon_and_names_the_command_that_confirms_it() {
     let output = Process::new(cowshed())
         .args(["forget", "acme/widget"])
-        .output()
+        .output_bounded()
         .expect("run cowshed forget");
 
     assert_eq!(output.status.code(), Some(2));
@@ -530,7 +531,7 @@ fn the_binary_refuses_a_malformed_repository_and_a_project_as_typed_usage_errors
     ] {
         let output = Process::new(cowshed())
             .args(argv)
-            .output()
+            .output_bounded()
             .expect("run cowshed forget");
 
         assert_eq!(output.status.code(), Some(2), "{argv:?}");

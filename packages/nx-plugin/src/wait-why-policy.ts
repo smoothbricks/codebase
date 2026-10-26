@@ -21,6 +21,10 @@ export const WAIT_METHODS = [
   'cowshed_os::fork_lock::Run::status_locked',
   'cowshed_os::fork_lock::RunAsync::output_locked',
   'cowshed_os::fork_lock::RunAsync::status_locked',
+  'std::process::Command::output',
+  'std::process::Command::status',
+  'tokio::process::Command::output',
+  'tokio::process::Command::status',
   'std::os::unix::net::UnixStream::connect',
   'tokio::net::UnixStream::connect',
   'libc::flock',
@@ -141,7 +145,10 @@ export function unexplainedWaitAllows(source: string): number[] {
     if (!suppressesDisallowedMethods(tokens.slice(open + 1, close))) continue;
     const [first, end] = inner ? enclosing(tokens, close + 1) : following(tokens, close + 1);
     const covered = tokens.slice(first, end);
-    if (!covered.some((token) => token.kind === 'ident' && WAIT_NAMES.has(token.text))) continue;
+    const calls = covered.some(
+      (token, at) => token.kind === 'ident' && WAIT_NAMES.has(token.text) && covered[at + 1]?.text === '(',
+    );
+    if (!calls) continue;
     const attributeLine = lineOf(tokens[index]?.offset ?? 0);
     const coveredLine = covered[0] === undefined ? attributeLine : lineOf(covered[0].offset);
     let above = attributeLine - 1;

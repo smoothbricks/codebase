@@ -97,6 +97,7 @@
     "src/executors/bounded-exec/ram-provenance.test.ts": 6,
     "src/executors/bounded-exec/run-cpu-pool.test.ts": 6,
     "src/managed-files/json-edit.test.ts": 6,
+    "src/wait-why-policy.test.ts": 5,
     "src/cargo-closure-input.property.test.ts": 4,
     "src/executors/clean-outputs/executor.test.ts": 4,
     "src/generators/bun-test-tracing/generator.test.ts": 4,

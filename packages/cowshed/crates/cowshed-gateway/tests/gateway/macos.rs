@@ -1,4 +1,5 @@
 use super::*;
+use cowshed_os::test_backstop::{AsyncCommandBackstop as _, CommandBackstop as _};
 #[path = "nx_land_publish.rs"]
 mod nx_land_publish;
 #[path = "nx_outage.rs"]
@@ -1018,7 +1019,7 @@ async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
                         &proxy,
                         &target,
                     ])
-                    .output()
+                    .output_bounded()
             })
             .await
             .expect("join curl")
@@ -1108,7 +1109,7 @@ async fn node_native_fetch_uses_the_workspace_proxy_environment() {
         .env_remove("NODE_TLS_REJECT_UNAUTHORIZED")
         .env_remove("NODE_OPTIONS")
         .kill_on_drop(true);
-    let output = command.output().await.expect("run real Node");
+    let output = command.output_bounded().await.expect("run real Node");
     assert!(
         output.status.success(),
         "native Node fetch failed: {}",
