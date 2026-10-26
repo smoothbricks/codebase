@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readdir, readFile, realpath, rm, stat, utimes } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { $ } from 'bun';
 
@@ -17,6 +17,16 @@ process.chdir(projectRoot);
  * and the project graph that plugin computed (`project-graph/nx-deps-cache.js`).
  */
 const pluginDerivedNxState = ['d', 'project-graph.json', 'file-map.json', 'source-maps.json'] as const;
+
+/**
+ * Where a package's shell entry records that its `dist` was last verified current: in the package's own tool state
+ * (`node_modules/.cache`, a build-volume path in a cowshed checkout), never under `dist`. The tsc-js target owns `dist`
+ * whole: its emit is not incremental, so it writes no TypeScript build info, and it removes from `dist` whatever it did
+ * not write, the build info this entry's own emit leaves there included. Nx restoring the target's cache artifact
+ * replaces `dist` the same way. A marker under `dist` would be gone after every build, and the next shell entry would
+ * rebuild a package that is current.
+ */
+const buildMarkerFile = 'node_modules/.cache/smoo/dist-verified';
 
 // devenv runs this hook twice per shell entry. First it captures the shell's environment: a pass that runs the shell
 // hook to read what the prologue exports, marked DEVENV_SKIP_TASKS (`capture_shell_environment` in cachix/devenv sets
@@ -100,10 +110,12 @@ async function bootstrapPackages(): Promise<string[]> {
 async function rebuildNxPluginIfStale(): Promise<void> {
   let rebuilt = false;
   for (const directory of await bootstrapPackages()) {
-    const buildMarker = path.join(directory, 'dist/tsconfig.lib.tsbuildinfo');
+    const buildMarker = path.join(directory, buildMarkerFile);
     const markerStat = await stat(buildMarker).catch(() => null);
-    // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the TS build marker.
-    if (markerStat && !(await hasFileNewerThanMarker(directory, markerStat.mtimeMs))) continue;
+    // The marker stands outside `dist`, so wiping `dist` leaves it behind: only a `dist` holding files can be current.
+    const built = (await readdir(path.join(directory, 'dist')).catch(() => [])).length > 0;
+    // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the build marker.
+    if (markerStat && built && !(await hasFileNewerThanMarker(directory, markerStat.mtimeMs))) continue;
     // Bootstrap must not call `nx`: the project graph loads this plugin and
     // `require('typescript').readConfigFile`. A cold macOS shell (publish) has
     // no prior graph cache, so `nx run nx-plugin:tsc-js` deadlocks on the plugin
@@ -112,14 +124,27 @@ async function rebuildNxPluginIfStale(): Promise<void> {
     // The marker records when dist was last VERIFIED current, not when tsc last
     // chose to write bytes. ttsc is content-incremental, so an mtime-only change —
     // a checkout, a revert, a formatter rewriting a file identically — makes it
-    // exit 0 emitting nothing and leaves the marker behind the sources forever.
-    // Without this touch the condition above never clears again, so every later
-    // shell entry and every direnv reload rebuilds and calls clearNxDaemonState,
-    // permanently destroying Nx's task cache for the whole repository.
-    await utimes(buildMarker, new Date(), new Date()).catch(() => {});
+    // exit 0 emitting nothing, so the entry stamps the marker itself after every
+    // successful emit. A marker left behind the sources would never clear the
+    // condition above again, so every later shell entry and every direnv reload
+    // would rebuild and call clearNxDaemonState, permanently destroying Nx's task
+    // cache for the whole repository.
+    await recordBuild(buildMarker);
     rebuilt = true;
   }
   if (rebuilt) await clearNxDaemonState();
+}
+
+/** Stamps `marker` with now. Failing only costs the next shell entry a rebuild, so it warns and lets the shell enter. */
+async function recordBuild(marker: string): Promise<void> {
+  try {
+    await mkdir(path.dirname(marker), { recursive: true });
+    await writeFile(marker, '');
+  } catch (error) {
+    console.error(
+      `! Could not record the build marker ${marker} (${error instanceof Error ? error.message : String(error)}); the next shell entry rebuilds that package.`,
+    );
+  }
 }
 
 async function clearNxDaemonState(): Promise<void> {

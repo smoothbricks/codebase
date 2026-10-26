@@ -901,7 +901,9 @@ Concrete targets come from concrete files:
   rustc's dep-info file through
   `smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <path under the target directory> --output <dir>`. The
   record is inside the target's outputs, so a cache hit restores it with them; a live developer link
-  (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by content.
+  (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by content. The shell entry
+  that bootstraps the plugin (`tooling/direnv/enter-shell.ts`) keeps its build marker under `node_modules/.cache`, not
+  under `outDir`, where the executor would remove it as a file its emit did not write.
 - `typecheck` is inferred from `tsconfig.lib.json` and runs the native compiler `SMOO_TYPECHECK_TSC` names (built by
   `devenv.smoo.nix` from a pinned TypeScript revision) as `-p tsconfig.lib.json --noEmit`, directly rather than through
   `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them.

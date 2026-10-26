@@ -17,10 +17,13 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { FileLock } from 'nx/src/native/index.js';
 
 const enterShell = join(import.meta.dir, 'enter-shell.ts');
+
+/** Where the shell entry records that a package's `dist` was verified current: outside `dist`, which tsc-js owns. */
+const buildMarker = 'node_modules/.cache/smoo/dist-verified';
 
 /**
  * A checkout whose plugin build is stale, with `.nx/workspace-data` linked onto a build volume as cowshed links it,
@@ -35,7 +38,8 @@ function staleCheckout() {
   writeFileSync(join(plugin, 'package.json'), '{}');
   writeFileSync(join(plugin, 'tsconfig.lib.json'), '{}');
   writeFileSync(join(plugin, 'src/index.ts'), 'export {};\n');
-  const marker = join(plugin, 'dist/tsconfig.lib.tsbuildinfo');
+  const marker = join(plugin, buildMarker);
+  mkdirSync(dirname(marker), { recursive: true });
   writeFileSync(marker, '');
   utimesSync(marker, new Date(0), new Date(0));
 
@@ -63,7 +67,7 @@ function staleCheckout() {
         GITHUB_ACTIONS: 'true',
       },
     });
-  return { volume, link, enter, dispose: () => rmSync(root, { recursive: true, force: true }) };
+  return { plugin, volume, link, enter, dispose: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 /**
@@ -189,57 +193,107 @@ it('the environment capture pass rebuilds nothing, the entry proper still does',
 
 /**
  * Loading the plugin imports the workspace packages it depends on at run time, so their `dist` must exist before the
- * plugin's graph can build them: the entry rebuilds a stale one first, found through the plugin's own
- * `node_modules` link, and leaves a current one alone.
+ * plugin's graph can build them: the entry rebuilds a stale one, and one whose `dist` is gone or empty, first, found
+ * through the plugin's own `node_modules` link, and leaves a current one alone. The marker it records stands outside
+ * `dist`, which the tsc-js build owns and empties of whatever its emit did not write, so a current package whose
+ * `dist` holds no build info is not rebuilt, and the markers one entry recorded still hold for the next.
  */
-it('a stale workspace dependency of the plugin is rebuilt before the plugin, a current one is not', () => {
+it('a stale, unbuilt or emptied dependency of the plugin is rebuilt before the plugin, a current one is not', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
   try {
-    const stalePackage = (directory: string, manifest: object) => {
+    // `verified` is when the package's marker says its `dist` was last current; `dist` lists the files that holds.
+    const packageAt = (directory: string, manifest: object, verified: Date, dist: string[] | null = ['index.js']) => {
       mkdirSync(join(directory, 'src'), { recursive: true });
-      mkdirSync(join(directory, 'dist'), { recursive: true });
+      if (dist !== null) mkdirSync(join(directory, 'dist'), { recursive: true });
+      for (const file of dist ?? []) writeFileSync(join(directory, 'dist', file), 'export {};\n');
       writeFileSync(join(directory, 'package.json'), JSON.stringify(manifest));
       writeFileSync(join(directory, 'tsconfig.lib.json'), '{}');
       writeFileSync(join(directory, 'src/index.ts'), 'export {};\n');
-      const marker = join(directory, 'dist/tsconfig.lib.tsbuildinfo');
+      const marker = join(directory, buildMarker);
+      mkdirSync(dirname(marker), { recursive: true });
       writeFileSync(marker, '');
-      utimesSync(marker, new Date(0), new Date(0));
-      return marker;
+      utimesSync(marker, verified, verified);
     };
+    const never = new Date(0);
+    const later = new Date(Date.now() + 60_000);
     const plugin = join(root, 'packages/nx-plugin');
     const tool = join(root, 'packages/tool');
-    const current = join(root, 'packages/current');
-    stalePackage(tool, {});
-    const currentMarker = stalePackage(current, {});
-    utimesSync(currentMarker, new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
-    stalePackage(plugin, {
-      dependencies: { '@fixture/tool': 'workspace:*', '@fixture/current': 'workspace:*', typia: '14.0.6' },
-    });
+    const kept = join(root, 'packages/kept');
+    const unbuilt = join(root, 'packages/unbuilt');
+    const wiped = join(root, 'packages/wiped');
+    packageAt(tool, {}, never);
+    packageAt(kept, {}, later);
+    // The marker outlives a deleted or emptied `dist`; it does not make one current.
+    packageAt(unbuilt, {}, later, null);
+    packageAt(wiped, {}, later, []);
+    packageAt(
+      plugin,
+      {
+        dependencies: {
+          '@fixture/tool': 'workspace:*',
+          '@fixture/kept': 'workspace:*',
+          '@fixture/unbuilt': 'workspace:*',
+          '@fixture/wiped': 'workspace:*',
+          typia: '14.0.6',
+        },
+      },
+      never,
+    );
     mkdirSync(join(plugin, 'node_modules/@fixture'), { recursive: true });
-    symlinkSync('../../../tool', join(plugin, 'node_modules/@fixture/tool'));
-    symlinkSync('../../../current', join(plugin, 'node_modules/@fixture/current'));
+    for (const name of ['tool', 'kept', 'unbuilt', 'wiped']) {
+      symlinkSync(`../../../${name}`, join(plugin, `node_modules/@fixture/${name}`));
+    }
     mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
 
     const bin = join(root, 'bin');
     mkdirSync(bin);
     const builds = join(root, 'ttsc-builds');
-    writeFileSync(join(bin, 'ttsc'), `#!/bin/sh\npwd >> '${builds}'\n`);
+    // A build makes its `dist` and an output, and leaves no TypeScript build info in it.
+    writeFileSync(
+      join(bin, 'ttsc'),
+      `#!/bin/sh\npwd >> '${builds}'\nmkdir -p dist\necho 'export {};' > dist/index.js\n`,
+    );
     chmodSync(join(bin, 'ttsc'), 0o755);
 
-    const entered = spawnSync('bun', [enterShell], {
-      cwd: root,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        DEVENV_ROOT: join(root, 'tooling/direnv'),
-        PATH: `${bin}:${process.env.PATH}`,
-        GITHUB_ACTIONS: 'true',
-      },
-    });
-    expect(entered.status, `${entered.stdout}${entered.stderr}`).toBe(0);
-    expect(readFileSync(builds, 'utf8').trim().split('\n')).toEqual([tool, plugin]);
+    const enter = () =>
+      spawnSync('bun', [enterShell], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          DEVENV_ROOT: join(root, 'tooling/direnv'),
+          PATH: `${bin}:${process.env.PATH}`,
+          GITHUB_ACTIONS: 'true',
+        },
+      });
+    for (const entry of ['first', 'second']) {
+      const entered = enter();
+      expect(entered.status, `${entry} entry: ${entered.stdout}${entered.stderr}`).toBe(0);
+      // The second entry rebuilds nothing: the markers the first recorded hold, with no build info in any `dist`.
+      expect(readFileSync(builds, 'utf8').trim().split('\n')).toEqual([tool, unbuilt, wiped, plugin]);
+    }
+    for (const directory of [tool, unbuilt, wiped, plugin]) {
+      expect(readdirSync(join(directory, 'dist'))).toEqual(['index.js']);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A marker only spares the next entry a rebuild, so one that cannot be recorded (here `node_modules` is a file) is
+ * said on stderr and the shell still enters.
+ */
+it('a build marker that cannot be recorded warns and still lets the shell enter', () => {
+  const { plugin, enter, dispose } = staleCheckout();
+  try {
+    rmSync(join(plugin, 'node_modules'), { recursive: true });
+    writeFileSync(join(plugin, 'node_modules'), '');
+    const entered = enter();
+    expect(entered.status, `${entered.stdout}${entered.stderr}`).toBe(0);
+    expect(entered.stderr).toContain(`Could not record the build marker ${join(plugin, buildMarker)}`);
+  } finally {
+    dispose();
   }
 });
 
