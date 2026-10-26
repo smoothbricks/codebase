@@ -71,8 +71,11 @@ file. `bun`, `nx` and `cargo` come from the repo's devenv: in a shed `cowshed ex
    one writer, one producer per checkout, the jobserver, the land turn. Anything else needs a maintainer's approval.
    _Enforced by: review._
 7. **Done.** When you implement something or call it done → search existing code and specs first, and keep one owner per
-   contract (no second copy). Update the spec in the same unit. Done means a production (non-test) call site plus a
-   smoke run that exercises it; otherwise wire it or delete it. _Enforced by: review._
+   contract (no second copy). A field list, key set, constant or count that mirrors another type, schema or manifest is
+   generated or derived from its owner, never retyped; a count or ratio is computed from what it counts when it is read,
+   never stored beside it (`specs/lmao/01b2_buffer_self_tuning.md`, "Buffer Statistics Logging"). Update the spec in the
+   same unit. Done means a production (non-test) call site plus a smoke run that exercises it; otherwise wire it or
+   delete it. _Enforced by: review._
 8. **Byproducts.** When you choose a data structure, a storage or wire format, a log or trace shape, or a pass over
    data, or when you are about to add a cache, an index, a copy or a second pass → among designs with the same
    performance, pick the one whose necessary work has the most other uses, then thread it through everywhere. That
@@ -82,14 +85,20 @@ file. `bun`, `nx` and `cargo` come from the repo's devenv: in a shed `cowshed ex
    is already columnar for offline analytics, span start and end times are already a profile, and the span result
    already holds the `Ok`/`Err` with its status and error code, so nothing is allocated or computed twice. Before adding
    a cache, name what your structure or pass already proves (order, an index, a checksum, a timing, a result) and use
-   it; then measure. Derived state (an index, an envelope, a checkpoint, a cache) is a byproduct, never a second store:
-   name its authoritative source and why no duplicate store exists. Refuse these second stores by name: a write ledger
-   beside the event log, a duplicate inventory beside the authoritative index, a retraction index kept apart from the
-   facts, a derivable-byte cache kept as an authoritative store, a parallel registry of what a manifest lists, a
-   checkpoint store duplicating live state, a summary table recomputable from its rows, a canonical copy beside the live
-   source, a shadow config beside the declared one. A cache stays basis-keyed, recomputable and disposable; if removing
-   the work needs an upstream fork or patch, prefer a boundary cache and record the upstream alternative and its
-   maintenance cost in the design record. _Enforced by: review._
+   it, and remove redundant passes, checks repeated below a boundary that already checked, re-parsing and duplicate
+   representations; then measure the uncached and the cached path. One fact has one authority: derived state (an index,
+   an envelope, a checkpoint, a queue, a cache) is a byproduct, never a second store. Before you write a record, ledger,
+   sidecar or cache, name the authority that already answers it (a directory listing, the filesystem, git, the kernel's
+   mount or process table, the event log) and read that instead (`specs/cowshed/01_storage.md`, "Runtime state: derived,
+   never stored" and "Tradeoffs"). Refuse these second stores by name: a write ledger beside the event log, a duplicate
+   inventory beside the authoritative index, a record of what a directory listing already holds, a retraction index kept
+   apart from the facts, a derivable-byte cache kept as an authoritative store, a parallel registry of what a manifest
+   lists, a checkpoint store duplicating live state, a summary table recomputable from its rows, a canonical copy beside
+   the live source, a shadow config beside the declared one, a second copy of a cache (move it instead;
+   `specs/cowshed/03_caches.md`, "Tradeoffs"). A cache stays basis-keyed, recomputable and disposable: a miss recomputes
+   or says why it cannot, never serves a stale copy. If removing the work needs an upstream fork or patch, prefer a
+   boundary cache and record the upstream alternative and its maintenance cost in the design record. _Enforced by:
+   review._
 9. **Types.** When you are about to write `as`, an `unknown` default or a sentinel value → thread the precise type
    instead. No `as any`, `as unknown as`, or `JSON.parse(...) as T`; `as const` and `satisfies` are fine. _Enforced by:
    ESLint `@typescript-eslint/no-unsafe-type-assertion` on `packages/*/src` (the inferred `lint` target)._
@@ -106,6 +115,15 @@ file. `bun`, `nx` and `cargo` come from the repo's devenv: in a shed `cowshed ex
     `smoo monorepo check-public-denylist` (`tooling/git-hooks`): commit-msg and pre-commit judge the home directory,
     sibling project names and the clone's configured patterns, pre-push the configured patterns; agent and session ids
     need a diff read._
+13. **Hot paths.** When you write a warmed path (an LMAO buffer write, a StateBus render or reduce, a columine kernel)
+    or claim a performance change → name the phase the claim covers (startup, setup, warmed write, slow path, flush). A
+    warmed path allocates nothing and stays monomorphic: capacity is fixed at creation, growth happens only on an
+    explicit slow path, and encoding, dictionaries and sorting wait for the flush. A performance claim compares against
+    a measured baseline and a reference with that work removed, under realistic input in the phase it names; it counts
+    effective memory (heap, external, WASM, Arrow, leases, caches), never `heapUsed` alone. No journal, trace or queue
+    is unbounded. Specs: `specs/lmao/00_package_architecture.md` ("Optimization Architecture Contract"),
+    `specs/lmao/01b1_buffer_performance_optimizations.md` ("Enforceable Performance and Measurement Contract"),
+    `specs/statebus/07_testing_and_performance.md` ("Benchmark matrix", "Allocation checks"). _Enforced by: review._
 
 ### Conduct
 
@@ -136,7 +154,9 @@ file. `bun`, `nx` and `cargo` come from the repo's devenv: in a shed `cowshed ex
   next land re-gates what the Markdown reaches. Conventional commits, no trailers.
 - **Build state:** cowshed owns Nx state paths and the Nx daemon. Declare restorable outputs as Nx outputs, one producer
   per checkout; never redirect state paths ad hoc. Infer targets and read their resolved graph rather than adding lint
-  or clean stubs.
+  or clean stubs. One `.nx/cache`, task database and daemon per checkout, never a private second one; use the cache,
+  never avoid it, and keep the task database (the cache's only index) when clearing graph state
+  (`specs/cowshed/16_build_volumes.md`, "Every checkout has exactly one Nx state").
 
 ## Read first
 
