@@ -502,10 +502,11 @@ pub(crate) struct Bounds {
 }
 
 impl Bounds {
-    fn limit(self, requested: Duration) -> Result<Duration, Unleased> {
+    /// `requested`, clipped to what `now` leaves of the SAFE command's total budget.
+    fn limit(self, requested: Duration, now: Instant) -> Result<Duration, Unleased> {
         match self.deadline {
             Some(deadline) => deadline
-                .remaining()
+                .remaining_at(now)
                 .map(|remaining| requested.min(remaining))
                 .ok_or(Unleased::BudgetExhausted),
             None => Ok(requested),
@@ -692,53 +693,134 @@ pub(crate) fn acquire(
         .map_err(|error| Unleased::Broken(io::Error::other(error)))?;
     line.push(b'\n');
     stream
-        .set_write_timeout(Some(bounds.limit(bounds.ack)?))
+        .set_write_timeout(Some(bounds.limit(bounds.ack, Instant::now())?))
         .map_err(Unleased::Broken)?;
     (&stream).write_all(&line).map_err(Unleased::Broken)?;
     let mut answers = BufReader::new(stream.try_clone().map_err(Unleased::Broken)?);
-    let ack = bounds.limit(bounds.ack)?;
-    match read_answer(&mut answers, ack, bounds.deadline) {
-        Ok(answer) => expect(answer, LeaseState::Queued).map_err(|unleased| match unleased {
-            Unleased::Refused { code, error }
-                if share == PhaseShare::Alone
-                    && code == "invalid-request"
-                    && error.ends_with(UNKNOWN_FIELD) =>
-            {
-                Unleased::Predates {
-                    what: Predates::Alone,
-                    error,
-                }
+    let mut ask = Ask::begin(bounds, Instant::now());
+    loop {
+        ask = match ask {
+            Ask::Read { awaiting, within } => {
+                let answer = read_answer(&mut answers, within, bounds.deadline);
+                Ask::answered(share, bounds, awaiting, within, answer, Instant::now())
             }
-            other => other,
-        })?,
-        Err(error) if timed_out(&error) => {
-            stream
-                .shutdown(std::net::Shutdown::Write)
-                .map_err(Unleased::Broken)?;
-            let after_close = bounds.limit(bounds.after_close)?;
-            let answer = read_answer(&mut answers, after_close, bounds.deadline)
-                .map_err(Unleased::Broken)?;
-            return Err(match answer {
-                DiskLeaseAnswer {
-                    ok: false, error, ..
-                } => Unleased::Predates {
-                    what: Predates::Leases,
-                    error: error.unwrap_or_default(),
-                },
-                DiskLeaseAnswer { .. } => Unleased::Slow,
-            });
+            Ask::HalfClose => Ask::half_closed(
+                bounds,
+                stream.shutdown(std::net::Shutdown::Write),
+                Instant::now(),
+            ),
+            Ask::Granted => {
+                return Ok(DiskLease {
+                    _connection: stream,
+                });
+            }
+            Ask::Unleased(unleased) => return Err(unleased),
+        };
+    }
+}
+
+/// What an ask waits for next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Awaiting {
+    /// The `queued` answer a lease-scheduling gateway sends at once.
+    Ack,
+    /// Any answer once the request was half-closed: a gateway that predates leases has been
+    /// waiting for exactly that EOF and now refuses.
+    AfterClose,
+    /// The grant, once queued.
+    Grant,
+}
+
+/// What the client side of one ask does next, its request already sent (05_gateway.md,
+/// "Disk-lifecycle lease"). The shell executes each instruction and answers with what it
+/// observed and the instant it observed it: each wait is its step's bound ([`Bounds`]) clipped to
+/// what that instant leaves of the SAFE command's one total budget, never restarted.
+#[derive(Debug)]
+enum Ask {
+    /// Read one answer within `within`, then [`Ask::answered`].
+    Read {
+        awaiting: Awaiting,
+        within: Duration,
+    },
+    /// No ack came in time: half-close the request, then [`Ask::half_closed`].
+    HalfClose,
+    Granted,
+    Unleased(Unleased),
+}
+
+impl Ask {
+    /// The first wait, at `now`.
+    fn begin(bounds: Bounds, now: Instant) -> Self {
+        Self::wait(Awaiting::Ack, bounds, now)
+    }
+
+    fn wait(awaiting: Awaiting, bounds: Bounds, now: Instant) -> Self {
+        let step = match awaiting {
+            Awaiting::Ack => bounds.ack,
+            Awaiting::AfterClose => bounds.after_close,
+            Awaiting::Grant => bounds.grant,
+        };
+        match bounds.limit(step, now) {
+            Ok(within) => Self::Read { awaiting, within },
+            Err(unleased) => Self::Unleased(unleased),
         }
-        Err(error) => return Err(Unleased::Broken(error)),
     }
-    let grant = bounds.limit(bounds.grant)?;
-    match read_answer(&mut answers, grant, bounds.deadline) {
-        Ok(answer) => expect(answer, LeaseState::Granted)?,
-        Err(error) if timed_out(&error) => return Err(Unleased::NotGranted(grant)),
-        Err(error) => return Err(Unleased::Broken(error)),
+
+    /// What a `Read { awaiting, within }` got, observed at `now`, for a request asking `share`.
+    fn answered(
+        share: PhaseShare,
+        bounds: Bounds,
+        awaiting: Awaiting,
+        within: Duration,
+        answer: io::Result<DiskLeaseAnswer>,
+        now: Instant,
+    ) -> Self {
+        match (awaiting, answer) {
+            (Awaiting::Ack, Ok(answer)) => match expect(answer, LeaseState::Queued) {
+                Ok(()) => Self::wait(Awaiting::Grant, bounds, now),
+                Err(Unleased::Refused { code, error })
+                    if share == PhaseShare::Alone
+                        && code == "invalid-request"
+                        && error.ends_with(UNKNOWN_FIELD) =>
+                {
+                    Self::Unleased(Unleased::Predates {
+                        what: Predates::Alone,
+                        error,
+                    })
+                }
+                Err(unleased) => Self::Unleased(unleased),
+            },
+            (Awaiting::Ack, Err(error)) if timed_out(&error) => Self::HalfClose,
+            (
+                Awaiting::AfterClose,
+                Ok(DiskLeaseAnswer {
+                    ok: false, error, ..
+                }),
+            ) => Self::Unleased(Unleased::Predates {
+                what: Predates::Leases,
+                error: error.unwrap_or_default(),
+            }),
+            (Awaiting::AfterClose, Ok(_)) => Self::Unleased(Unleased::Slow),
+            (Awaiting::Grant, Ok(answer)) => match expect(answer, LeaseState::Granted) {
+                Ok(()) => Self::Granted,
+                Err(unleased) => Self::Unleased(unleased),
+            },
+            (Awaiting::Grant, Err(error)) if timed_out(&error) => {
+                Self::Unleased(Unleased::NotGranted(within))
+            }
+            (Awaiting::Ack | Awaiting::AfterClose | Awaiting::Grant, Err(error)) => {
+                Self::Unleased(Unleased::Broken(error))
+            }
+        }
     }
-    Ok(DiskLease {
-        _connection: stream,
-    })
+
+    /// The half-close's outcome, observed at `now`.
+    fn half_closed(bounds: Bounds, closed: io::Result<()>, now: Instant) -> Self {
+        match closed {
+            Ok(()) => Self::wait(Awaiting::AfterClose, bounds, now),
+            Err(error) => Self::Unleased(Unleased::Broken(error)),
+        }
+    }
 }
 
 fn expect(answer: DiskLeaseAnswer, state: LeaseState) -> Result<(), Unleased> {
@@ -841,7 +923,15 @@ fn describe(program: &Path, args: &[impl AsRef<OsStr>]) -> String {
 }
 
 #[cfg(test)]
+#[path = "../../cowshed-core/tests/support/temp_parent.rs"]
+mod test_temp_parent;
+#[cfg(test)]
+#[path = "../../cowshed-core/tests/support/temp_root.rs"]
+mod test_temp_root;
+#[cfg(test)]
 mod tests {
+    use super::test_temp_parent::scratch_parent;
+    use super::test_temp_root::TempRoot;
     use super::*;
     use cowshed_os::namespace::TestNamespace;
     use cowshed_os::test_backstop::UnixStreamBackstop as _;
@@ -871,35 +961,28 @@ mod tests {
         deadline: None,
     };
 
-    /// A socket path in a private directory of its own under `/tmp`, which macOS links to
-    /// `/private/tmp` and every Linux host has: a bind path is capped at `sun_path`'s 104 bytes.
-    /// The directory, with every marker a test writes beside the socket, goes with the guard on
-    /// every exit path.
-    struct Socket(std::path::PathBuf);
+    /// A socket under the granted short runtime parent (08_testing.md, Fixtures),
+    /// with the shared named-owner guard reclaiming every path on normal teardown
+    /// and making a killed fixture claimable by the next scratch sweep.
+    struct Socket {
+        path: PathBuf,
+        _root: TempRoot,
+    }
 
     impl Socket {
         fn new() -> Self {
-            let directory = std::path::PathBuf::from(format!(
-                "/tmp/cowshed-dl-{}",
-                uuid::Uuid::new_v4().simple()
-            ));
-            std::fs::create_dir(&directory).expect("socket directory");
-            Self(directory.join("s.sock"))
-        }
-    }
-
-    impl Drop for Socket {
-        fn drop(&mut self) {
-            if let Some(directory) = self.0.parent() {
-                let _ = std::fs::remove_dir_all(directory);
+            let root = TempRoot::new_in(&scratch_parent(), "cowshed-dl");
+            Self {
+                path: root.join("s.sock"),
+                _root: root,
             }
         }
     }
 
     fn pair() -> (Socket, UnixListener, UnixStream) {
         let socket = Socket::new();
-        let listener = UnixListener::bind(&socket.0).expect("bind");
-        let client = UnixStream::connect_bounded(&socket.0).expect("connect");
+        let listener = UnixListener::bind(&socket.path).expect("bind");
+        let client = UnixStream::connect_bounded(&socket.path).expect("connect");
         (socket, listener, client)
     }
 
@@ -913,8 +996,8 @@ mod tests {
     #[test]
     fn a_full_control_backlog_is_bounded_and_expired_safe_admission_executes_no_payload() {
         let socket = Socket::new();
-        let marker = socket.0.with_extension("payload");
-        let listener = UnixListener::bind(&socket.0).expect("bind exact backlog fixture");
+        let marker = socket.path.with_extension("payload");
+        let listener = UnixListener::bind(&socket.path).expect("bind exact backlog fixture");
         // SAFETY: adjust only this fixture-owned listener's real kernel backlog.
         assert_eq!(
             unsafe { libc::listen(listener.as_raw_fd(), 1) },
@@ -924,7 +1007,7 @@ mod tests {
         );
         let mut queued = Vec::new();
         let refused = loop {
-            match connect(&socket.0, Some(CommandDeadline::new(NO_ANSWER))) {
+            match connect(&socket.path, Some(CommandDeadline::new(NO_ANSWER))) {
                 Ok(stream) => queued.push(stream),
                 Err(error) => break error,
             }
@@ -956,7 +1039,7 @@ mod tests {
             NO_ANSWER,
             |deadline, run| {
                 let deadline = deadline.expect("SAFE admission has the original budget");
-                let refused = connect(&socket.0, Some(deadline))
+                let refused = connect(&socket.path, Some(deadline))
                     .expect_err("the real kernel backlog remains full");
                 assert!(
                     matches!(
@@ -987,7 +1070,7 @@ mod tests {
         drop(queued);
         // A failed pending connect owns no background worker or retained descriptor. Once the
         // real queue is drained a new connection succeeds, and only that client is accepted.
-        let fresh = connect(&socket.0, Some(CommandDeadline::new(NO_ANSWER)))
+        let fresh = connect(&socket.path, Some(CommandDeadline::new(NO_ANSWER)))
             .expect("connect after draining the full backlog");
         let (accepted, _) = listener.accept().expect("accept the fresh owned client");
         drop(accepted);
@@ -1094,82 +1177,269 @@ mod tests {
         assert!(rest.is_empty(), "the client sends nothing after its line");
     }
 
-    #[test]
-    fn a_gateway_that_waits_for_eof_is_recognized_as_predating_leases() {
-        let (_socket, listener, client) = pair();
-        let server = std::thread::spawn(move || {
-            let (mut server, _) = listener.accept().expect("accept");
-            let mut request = Vec::new();
-            io::Read::read_to_end(&mut server, &mut request).expect("read to EOF");
-            server
-                .write_all(
-                    b"{\"ok\":false,\"code\":\"invalid-request\",\"error\":\"unknown gateway control operation\"}\n",
-                )
-                .expect("answer");
-        });
-        // The ack wait is the only one the clock may end; every later one waits for the old
-        // gateway's answer, which it writes on the half-close and nothing else.
-        let started = Instant::now();
-        let unleased = acquire(
-            client,
-            DiskClass::Storage,
-            PhaseShare::Shared,
-            "/usr/sbin/diskutil list",
-            Bounds {
-                ack: NO_ANSWER,
-                ..ANSWERED
-            },
-        )
-        .expect_err("an old gateway grants nothing");
-        let waited = started.elapsed();
-        server.join().expect("server");
-        assert!(
-            matches!(&unleased, Unleased::Predates { what: Predates::Leases, error } if error.contains("unknown")),
-            "{unleased}"
-        );
-        assert!(
-            waited >= NO_ANSWER,
-            "the client half-closed after {waited:?}, before its ack bound"
-        );
+    const QUEUED: &[u8] = b"{\"ok\":true,\"lease\":\"queued\"}\n";
+    const GRANTED: &[u8] = b"{\"ok\":true,\"lease\":\"granted\"}\n";
+    /// What a gateway from before disk leases answers once the request is half-closed.
+    const OLD_GATEWAY: &[u8] = b"{\"ok\":false,\"code\":\"invalid-request\",\"error\":\"unknown gateway control operation\"}\n";
+
+    /// An answer line as [`read_answer`] parses it.
+    fn answer(line: &[u8]) -> io::Result<DiskLeaseAnswer> {
+        serde_json::from_slice(line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
-    #[test]
-    fn a_refusal_and_a_grant_that_never_comes_both_run_unleased() {
-        let (_socket, listener, client) = pair();
-        let _server = answering(
-            &listener,
-            b"{\"ok\":false,\"code\":\"rejected\",\"error\":\"stopped\"}\n",
-        );
-        let refused = acquire(
-            client,
-            DiskClass::Storage,
-            PhaseShare::Shared,
-            "x",
-            ANSWERED,
-        );
-        assert!(
-            matches!(&refused, Err(Unleased::Refused { code, .. }) if code == "rejected"),
-            "{refused:?}"
-        );
+    /// A wait that ended at its bound, as [`read_answer`] reports it.
+    fn silent() -> io::Result<DiskLeaseAnswer> {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the disk-lease answer deadline expired",
+        ))
+    }
 
-        let (_socket, listener, client) = pair();
-        let mut server = answering(&listener, b"{\"ok\":true,\"lease\":\"queued\"}\n");
-        let ungranted = acquire(
-            client,
-            DiskClass::Storage,
-            PhaseShare::Shared,
-            "x",
-            Bounds {
-                grant: NO_ANSWER,
-                ..ANSWERED
-            },
-        );
-        assert!(
-            matches!(&ungranted, Err(Unleased::NotGranted(waited)) if *waited == NO_ANSWER),
-            "{ungranted:?}"
-        );
-        let mut rest = Vec::new();
-        io::Read::read_to_end(&mut server, &mut rest).expect("client closes");
+    /// A gateway that closed the connection, as [`read_answer`] reports it.
+    fn closed() -> io::Result<DiskLeaseAnswer> {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the gateway closed the lease connection",
+        ))
+    }
+
+    /// Each wait's read: how long it took on the clock, and what it answered.
+    type Script = Vec<(Duration, io::Result<DiskLeaseAnswer>)>;
+
+    /// One ask's instructions executed over `script`, on a clock only the script moves, starting
+    /// at `start`: each `Read` takes the script's next answer after the time it took, and each
+    /// half-close succeeds. Answers where the ask ended, the bound each wait was given, and how
+    /// often the request was half-closed. Every scripted answer is read, and the ask reads no more.
+    fn ask(
+        share: PhaseShare,
+        bounds: Bounds,
+        start: Instant,
+        script: Script,
+    ) -> (Ask, Vec<Duration>, usize) {
+        let mut now = start;
+        let mut script = script.into_iter();
+        let mut waits = Vec::new();
+        let mut half_closes = 0;
+        let mut ask = Ask::begin(bounds, now);
+        loop {
+            ask = match ask {
+                Ask::Read { awaiting, within } => {
+                    waits.push(within);
+                    let (took, answer) =
+                        script.next().expect("the ask reads only scripted answers");
+                    now += took;
+                    Ask::answered(share, bounds, awaiting, within, answer, now)
+                }
+                Ask::HalfClose => {
+                    half_closes += 1;
+                    Ask::half_closed(bounds, Ok(()), now)
+                }
+                Ask::Granted | Ask::Unleased(_) => {
+                    assert!(script.next().is_none(), "every scripted answer is read");
+                    return (ask, waits, half_closes);
+                }
+            };
+        }
+    }
+
+    type AdmissionRow = (
+        &'static str,
+        PhaseShare,
+        Bounds,
+        Duration,
+        Script,
+        fn(&Ask) -> bool,
+        Vec<Duration>,
+        usize,
+    );
+
+    /// The client's transitions over Ack, Refusal, EOF, Grant and the clock: a refusal or a broken
+    /// connection ends the ask unleased; no ack in time half-closes the request, and the answer to
+    /// that EOF tells a gateway that predates leases from a slow one; a grant that never comes is
+    /// named with its bound. A SAFE command's one total budget clips every wait, never restarts,
+    /// and once spent ends the ask before anything else is waited for.
+    #[test]
+    fn the_lease_client_moves_on_each_answer_and_its_one_budget() {
+        let ms = Duration::from_millis;
+        let none = Duration::ZERO;
+        let steps = Bounds::PRODUCTION;
+        let (ack, after_close, grant) = (steps.ack, steps.after_close, steps.grant);
+        let t0 = Instant::now();
+        let budget = |duration| Bounds {
+            deadline: Some(CommandDeadline {
+                started: t0,
+                duration,
+            }),
+            ..Bounds::PRODUCTION
+        };
+        let shared = PhaseShare::Shared;
+        let rows: [AdmissionRow; 15] = [
+            (
+                "queued then granted",
+                shared,
+                steps,
+                none,
+                vec![(ms(1), answer(QUEUED)), (ms(1), answer(GRANTED))],
+                |outcome| matches!(outcome, Ask::Granted),
+                vec![ack, grant],
+                0,
+            ),
+            (
+                "refused at once",
+                shared,
+                steps,
+                none,
+                vec![(
+                    ms(1),
+                    answer(b"{\"ok\":false,\"code\":\"rejected\",\"error\":\"stopped\"}\n"),
+                )],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::Refused { code, .. }) if code == "rejected"),
+                vec![ack],
+                0,
+            ),
+            (
+                "a gateway before leases answers only the half-close",
+                shared,
+                steps,
+                none,
+                vec![(ack, silent()), (ms(1), answer(OLD_GATEWAY))],
+                |outcome| {
+                    matches!(outcome, Ask::Unleased(Unleased::Predates { what: Predates::Leases, error })
+                        if error == "unknown gateway control operation")
+                },
+                vec![ack, after_close],
+                1,
+            ),
+            (
+                "alive but too slow to queue",
+                shared,
+                steps,
+                none,
+                vec![(ack, silent()), (ms(1), answer(QUEUED))],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::Slow)),
+                vec![ack, after_close],
+                1,
+            ),
+            (
+                "silent after the half-close too",
+                shared,
+                steps,
+                none,
+                vec![(ack, silent()), (after_close, silent())],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::Broken(error)) if error.kind() == io::ErrorKind::TimedOut),
+                vec![ack, after_close],
+                1,
+            ),
+            (
+                "closed before its ack",
+                shared,
+                steps,
+                none,
+                vec![(ms(1), closed())],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::Broken(error)) if error.kind() == io::ErrorKind::UnexpectedEof),
+                vec![ack],
+                0,
+            ),
+            (
+                "queued and never granted",
+                shared,
+                steps,
+                none,
+                vec![(ms(1), answer(QUEUED)), (grant, silent())],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::NotGranted(waited)) if *waited == DISK_CHILD_DEADLINE),
+                vec![ack, grant],
+                0,
+            ),
+            (
+                "closed while queued",
+                shared,
+                steps,
+                none,
+                vec![(ms(1), answer(QUEUED)), (ms(1), closed())],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::Broken(error)) if error.kind() == io::ErrorKind::UnexpectedEof),
+                vec![ack, grant],
+                0,
+            ),
+            (
+                "queued twice",
+                shared,
+                steps,
+                none,
+                vec![(ms(1), answer(QUEUED)), (ms(1), answer(QUEUED))],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::Broken(error)) if error.kind() == io::ErrorKind::InvalidData),
+                vec![ack, grant],
+                0,
+            ),
+            (
+                "alone refused by a gateway before share",
+                PhaseShare::Alone,
+                steps,
+                none,
+                vec![(ms(1), answer(UNKNOWN_SHARE))],
+                |outcome| {
+                    matches!(outcome, Ask::Unleased(Unleased::Predates { what: Predates::Alone, error })
+                        if error.ends_with(UNKNOWN_FIELD))
+                },
+                vec![ack],
+                0,
+            ),
+            (
+                "a shared ask names no share, so its refusal is only a refusal",
+                shared,
+                steps,
+                none,
+                vec![(ms(1), answer(UNKNOWN_SHARE))],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::Refused { code, .. }) if code == "invalid-request"),
+                vec![ack],
+                0,
+            ),
+            (
+                "the budget clips the grant wait",
+                shared,
+                budget(ms(200)),
+                none,
+                vec![(ms(10), answer(QUEUED)), (ms(190), silent())],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::NotGranted(waited)) if *waited == Duration::from_millis(190)),
+                vec![ms(200), ms(190)],
+                0,
+            ),
+            (
+                "the budget is spent on an old gateway's ack",
+                shared,
+                budget(ms(200)),
+                none,
+                vec![(ms(200), silent())],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::BudgetExhausted)),
+                vec![ms(200)],
+                1,
+            ),
+            (
+                "the budget clips the wait after the half-close",
+                shared,
+                budget(ms(2_100)),
+                none,
+                vec![(ack, silent()), (ms(100), silent())],
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::Broken(error)) if error.kind() == io::ErrorKind::TimedOut),
+                vec![ack, ms(100)],
+                1,
+            ),
+            (
+                "a budget spent before the ask waits for nothing",
+                shared,
+                budget(ms(200)),
+                ms(200),
+                Vec::new(),
+                |outcome| matches!(outcome, Ask::Unleased(Unleased::BudgetExhausted)),
+                Vec::new(),
+                0,
+            ),
+        ];
+        for (name, share, bounds, start, script, expected, waits, half_closes) in rows {
+            let (outcome, waited, closed) = ask(share, bounds, t0 + start, script);
+            assert!(expected(&outcome), "{name}: {outcome:?}");
+            assert_eq!((waited, closed), (waits, half_closes), "{name}");
+        }
     }
 
     /// What a lease-scheduling gateway from before `share` answers a request that names it.
@@ -1229,7 +1499,7 @@ mod tests {
     #[test]
     fn a_command_a_gateway_refuses_alone_is_asked_again_shared_and_runs_leased() {
         let socket = Socket::new();
-        let listener = UnixListener::bind(&socket.0).expect("bind");
+        let listener = UnixListener::bind(&socket.path).expect("bind");
         let gateway = std::thread::spawn(move || {
             let granted: &[u8] =
                 b"{\"ok\":true,\"lease\":\"queued\"}\n{\"ok\":true,\"lease\":\"granted\"}\n";
@@ -1250,7 +1520,7 @@ mod tests {
         });
         let said = std::cell::RefCell::new(Vec::new());
         let ran = lease_then(
-            &socket.0,
+            &socket.path,
             DiskClass::Storage,
             PhaseShare::Alone,
             "x",
@@ -1275,92 +1545,59 @@ mod tests {
         assert!(said[0].contains("predates alone disk leases"), "{said:?}");
     }
 
+    /// The real SAFE runner's one budget covers a queued admission the gateway never grants: the
+    /// grant wait ends with the budget, and the unleased run it falls back to spawns no child late.
     #[test]
-    fn total_safe_budget_covers_queued_legacy_and_alone_admission_without_late_spawn() {
-        enum Admission {
-            Queued,
-            Legacy,
-            Alone,
-        }
-        for admission in [Admission::Queued, Admission::Legacy, Admission::Alone] {
-            let socket = Socket::new();
-            let marker = socket.0.with_extension("spawned");
-            let listener = UnixListener::bind(&socket.0).expect("bind owned gateway");
-            let (finished, finish) = std::sync::mpsc::channel::<()>();
-            let legacy = matches!(admission, Admission::Legacy);
-            let alone = matches!(admission, Admission::Alone);
-            let gateway = std::thread::spawn(move || {
-                if alone {
-                    let (mut server, _) = listener.accept().expect("alone request");
-                    let mut request = String::new();
-                    BufReader::new(&server)
-                        .read_line(&mut request)
-                        .expect("read alone request");
-                    assert!(request.contains("\"share\":\"alone\""));
-                    server
-                        .write_all(UNKNOWN_SHARE)
-                        .expect("refuse only the old share field");
-                }
-                let (mut server, _) = listener.accept().expect("admission request");
-                let mut request = String::new();
-                BufReader::new(&server)
-                    .read_line(&mut request)
-                    .expect("read request");
-                if !legacy {
-                    server
-                        .write_all(b"{\"ok\":true,\"lease\":\"queued\"}\n")
-                        .expect("queue without grant");
-                }
-                let mut rest = Vec::new();
-                io::Read::read_to_end(&mut server, &mut rest)
-                    .expect("client closes or half-closes");
-                // The old gateway remains silent after EOF too, so its after-close read must
-                // also be clipped. Dropping the sender on any test failure releases this peer.
-                let _ = finish.recv();
-            });
-            let budget = if legacy {
-                Duration::from_millis(2100)
-            } else {
-                NO_ANSWER
-            };
-            let request = crate::CommandRequest::new(
-                "/bin/sh",
-                [
-                    std::ffi::OsString::from("-c"),
-                    std::ffi::OsString::from("printf spawned > \"$1\""),
-                    std::ffi::OsString::from("admission-child"),
-                    marker.clone().into_os_string(),
-                ],
-            );
-            let error = crate::SystemCommandRunner::new(test_namespace())
-                .run_within(&request, budget, |deadline, run| {
-                    assert!(
-                        deadline.is_some(),
-                        "the real SAFE runner supplies its budget"
-                    );
-                    lease_then(
-                        &socket.0,
-                        DiskClass::Storage,
-                        if alone {
-                            PhaseShare::Alone
-                        } else {
-                            PhaseShare::Shared
-                        },
-                        "owned-safe-stand-in",
-                        |_| {},
-                        deadline,
-                        run,
-                    )
-                })
-                .expect_err("admission exhausted the same total budget");
-            finished.send(()).expect("finish owned gateway");
-            gateway.join().expect("owned gateway");
-            assert!(
-                matches!(error.failure, crate::CommandRunFailure::Unspawned(deadline) if deadline == budget),
-                "{error:?}"
-            );
-            assert!(!marker.exists(), "an over-budget child must never start");
-        }
+    fn a_queued_admission_that_spends_the_safe_budget_spawns_no_late_child() {
+        let socket = Socket::new();
+        let marker = socket.path.with_extension("spawned");
+        let listener = UnixListener::bind(&socket.path).expect("bind owned gateway");
+        let (finished, finish) = std::sync::mpsc::channel::<()>();
+        let gateway = std::thread::spawn(move || {
+            let (mut server, _) = listener.accept().expect("admission request");
+            let mut request = String::new();
+            BufReader::new(&server)
+                .read_line(&mut request)
+                .expect("read request");
+            server.write_all(QUEUED).expect("queue without grant");
+            let mut rest = Vec::new();
+            io::Read::read_to_end(&mut server, &mut rest).expect("client closes");
+            // Dropping the sender on any test failure releases this peer.
+            let _ = finish.recv();
+        });
+        let request = crate::CommandRequest::new(
+            "/bin/sh",
+            [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("printf spawned > \"$1\""),
+                std::ffi::OsString::from("admission-child"),
+                marker.clone().into_os_string(),
+            ],
+        );
+        let error = crate::SystemCommandRunner::new(test_namespace())
+            .run_within(&request, NO_ANSWER, |deadline, run| {
+                assert!(
+                    deadline.is_some(),
+                    "the real SAFE runner supplies its budget"
+                );
+                lease_then(
+                    &socket.path,
+                    DiskClass::Storage,
+                    PhaseShare::Shared,
+                    "owned-safe-stand-in",
+                    |_| {},
+                    deadline,
+                    run,
+                )
+            })
+            .expect_err("admission exhausted the same total budget");
+        finished.send(()).expect("finish owned gateway");
+        gateway.join().expect("owned gateway");
+        assert!(
+            matches!(error.failure, crate::CommandRunFailure::Unspawned(deadline) if deadline == NO_ANSWER),
+            "{error:?}"
+        );
+        assert!(!marker.exists(), "an over-budget child must never start");
     }
 
     #[test]

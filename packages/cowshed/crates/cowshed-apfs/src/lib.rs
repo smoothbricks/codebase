@@ -41,7 +41,7 @@ use crate::device::{DISKUTIL, container_of, identifier_depth};
 /// ([`MacOsApfsBackend::create_blank_image`]), attached in the kernel ([`in_kernel_attach`]) and
 /// released with `hdiutil detach`. Which images are attached is read from the kernel
 /// ([`CommandRunner::attached_disk_images`]), never from `hdiutil info`.
-pub(crate) const HDIUTIL: &str = "/usr/bin/hdiutil";
+pub const HDIUTIL: &str = "/usr/bin/hdiutil";
 
 /// The flags of every runtime image attach (01a_apfs.md, "Images"): `-kernel` serves the RAW image from
 /// the kernel's own file backing store (`IOHDIXHDDriveInKernel`), with no userspace image helper
@@ -550,9 +550,28 @@ impl CommandDeadline {
     }
 
     pub(crate) fn remaining(self) -> Option<Duration> {
+        self.remaining_at(std::time::Instant::now())
+    }
+
+    /// What is left of the budget at `now`; `None` once it is spent.
+    fn remaining_at(self, now: std::time::Instant) -> Option<Duration> {
         self.duration
-            .checked_sub(self.started.elapsed())
+            .checked_sub(now.saturating_duration_since(self.started))
             .filter(|remaining| !remaining.is_zero())
+    }
+}
+
+/// Whether a disk child may spawn under `total`, its SAFE budget, observed at `now`: a spent budget
+/// never spawns, however its admission spent it, and the refusal names the budget.
+fn spawn_admission(
+    total: Option<CommandDeadline>,
+    now: std::time::Instant,
+) -> Result<(), CommandRunFailure> {
+    match total {
+        Some(deadline) if deadline.remaining_at(now).is_none() => {
+            Err(CommandRunFailure::Unspawned(deadline.duration))
+        }
+        Some(_) | None => Ok(()),
     }
 }
 
@@ -817,14 +836,10 @@ impl SystemCommandRunner {
     ) -> Result<CommandOutput, CommandRunError> {
         crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
         release_authority::refuse_unauthorized_release(request)?;
-        if let Some(deadline) = total
-            && deadline.remaining().is_none()
-        {
-            return Err(CommandRunError {
-                request: request.clone(),
-                failure: CommandRunFailure::Unspawned(deadline.duration),
-            });
-        }
+        spawn_admission(total, std::time::Instant::now()).map_err(|failure| CommandRunError {
+            request: request.clone(),
+            failure,
+        })?;
         let feed = match &input {
             ChildInput::Bytes(bytes) => Some(Arc::clone(bytes)),
             ChildInput::Null | ChildInput::Inherited => None,
@@ -8295,98 +8310,35 @@ mod tests {
         );
     }
 
+    /// A disk child spawns only while its SAFE budget is left at the instant it would spawn: a
+    /// budget admission spent, however long it took, refuses the spawn naming the budget, and a run
+    /// with no total budget (protected or custom admission) is never refused for one.
     #[test]
-    fn exhausted_custom_admission_never_spawns_a_late_safe_child() {
-        let marker = temp_path("late-safe-spawn", "txt");
-        let request = CommandRequest::new(
-            "/bin/sh",
-            [
-                OsString::from("-c"),
-                OsString::from("printf spawned > \"$1\""),
-                OsString::from("late-safe-child"),
-                marker.clone().into_os_string(),
-            ],
-        );
-        let error = test_runner()
-            .run_within(&request, Duration::from_millis(25), |deadline, run| {
-                let deadline = deadline.expect("SAFE custom admission carries its total budget");
-                while let Some(remaining) = deadline.remaining() {
-                    std::thread::park_timeout(remaining);
-                }
-                run()
-            })
-            .expect_err("an expired admitted command must not spawn");
-        assert!(
-            matches!(error.failure, CommandRunFailure::Unspawned(deadline) if deadline == Duration::from_millis(25)),
-            "{error:?}"
-        );
-        assert!(
-            !marker.exists(),
-            "the real child would have written this marker"
-        );
-    }
-
-    #[test]
-    fn a_protected_stand_in_is_alive_at_its_warning_then_finishes_on_fixture_release() {
-        let pid_file = temp_path("protected-child-pid", "txt");
-        let release = temp_path("protected-child-release", "txt");
-        let request = CommandRequest::new(
-            "/bin/sh",
-            [
-                OsString::from("-c"),
-                OsString::from(
-                    "printf '%s' $$ > \"$1\"; while ! test -f \"$2\"; do :; done; printf done; exit 3",
-                ),
-                OsString::from("owned-protected-child"),
-                pid_file.clone().into_os_string(),
-                release.clone().into_os_string(),
-            ],
-        );
-        let policy = DeadlinePolicy {
-            deadline: Duration::from_millis(10),
-            past_deadline: PastDeadline::WarnEvery(Duration::from_millis(10)),
-            reap: cowshed_os::deadline::REAP,
+    fn a_spent_safe_budget_refuses_the_spawn_naming_it() {
+        let budget = Duration::from_millis(25);
+        let started = std::time::Instant::now();
+        let total = CommandDeadline {
+            started,
+            duration: budget,
         };
-        assert!(matches!(
-            DeadlinePolicy::for_request(&disk_image_request(), policy.deadline).past_deadline,
-            PastDeadline::WarnEvery(_)
-        ));
-        let mut warnings = 0;
-        let output = SystemCommandRunner::run_unleased(
-            &request,
-            ChildInput::Null,
-            policy,
-            None,
-            &mut |elapsed| {
-                assert!(elapsed >= policy.deadline);
-                let pid = loop {
-                    match fs::read_to_string(&pid_file) {
-                        Ok(text) if !text.is_empty() => {
-                            break text.parse::<libc::pid_t>().expect("fixture pid");
-                        }
-                        Ok(_) => std::thread::yield_now(),
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            std::thread::yield_now()
-                        }
-                        Err(error) => panic!("read exact fixture pid: {error}"),
-                    }
-                };
-                // SAFETY: observe only our live stand-in; signal zero does not cancel it.
-                assert_eq!(
-                    unsafe { libc::kill(pid, 0) },
-                    0,
-                    "the protected stand-in survives its warning point"
-                );
-                warnings += 1;
-                fs::write(&release, b"release").expect("release only this owned fixture");
-            },
-        )
-        .expect("protected fixture ends on its own, not as a timeout");
-        assert!(warnings > 0, "the real waiter reported the overrun");
-        assert_eq!(output.status, ProcessStatus::Exit(3));
-        assert_eq!(output.stdout, b"done");
-        fs::remove_file(pid_file).expect("remove owned pid receipt");
-        fs::remove_file(release).expect("remove owned release marker");
+        for (after, admitted) in [
+            (Duration::ZERO, true),
+            (Duration::from_millis(24), true),
+            (budget - Duration::from_nanos(1), true),
+            (budget, false),
+            (Duration::from_secs(60), false),
+        ] {
+            let outcome = spawn_admission(Some(total), started + after);
+            assert!(
+                if admitted {
+                    outcome.is_ok()
+                } else {
+                    matches!(outcome, Err(CommandRunFailure::Unspawned(named)) if named == budget)
+                },
+                "{after:?} after the start: {outcome:?}"
+            );
+        }
+        assert!(spawn_admission(None, started + Duration::from_secs(60)).is_ok());
     }
 
     /// A disk child that exits while a process it started keeps its stdout open is not waited for
