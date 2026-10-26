@@ -513,23 +513,7 @@ impl AnchoredDirectory {
         manifest: &CStr,
         links: &[(N, &Path)],
     ) -> io::Result<()> {
-        validate_directory_leaf(manifest)?;
-        let mut current: Vec<&[u8]> = Vec::with_capacity(links.len());
-        for (name, _) in links {
-            let name = name.as_ref();
-            validate_directory_leaf(name)?;
-            let name = name.to_bytes();
-            if name == manifest.to_bytes() || current.contains(&name) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "link {} is the manifest or named twice",
-                        String::from_utf8_lossy(name)
-                    ),
-                ));
-            }
-            current.push(name);
-        }
+        let mut current = admitted_links(manifest, links.iter().map(|(name, _)| name.as_ref()))?;
         let encode = |names: &mut Vec<&[u8]>, prefix: &[u8]| {
             names.sort_unstable();
             names.dedup();
@@ -557,23 +541,7 @@ impl AnchoredDirectory {
                 return Ok(());
             }
         }
-        let mut prior: Vec<CString> = Vec::new();
-        for entry in recorded
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-        {
-            let name = CString::new(entry).expect("split entries contain no NUL");
-            validate_directory_leaf(&name).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "link manifest names {:?}, which is not one directory entry",
-                        String::from_utf8_lossy(entry)
-                    ),
-                )
-            })?;
-            prior.push(name);
-        }
+        let prior = recorded_links(&recorded)?;
         let mut union: Vec<&[u8]> = prior.iter().map(|name| name.to_bytes()).collect();
         union.extend(current.iter().copied());
         self.publish_file(manifest, &encode(&mut union, b"\0"))?;
@@ -721,6 +689,55 @@ impl AnchoredDirectory {
         io::Read::read_to_end(&mut file, &mut bytes)?;
         Ok(Some(bytes))
     }
+}
+
+/// The link names of one [`AnchoredDirectory::reconcile_links`] call, in the caller's order: each
+/// one directory entry, none the manifest's name, none named twice. Anything else is invalid
+/// input, refused before the directory is read or changed.
+fn admitted_links<'a>(
+    manifest: &CStr,
+    names: impl ExactSizeIterator<Item = &'a CStr>,
+) -> io::Result<Vec<&'a [u8]>> {
+    validate_directory_leaf(manifest)?;
+    let mut admitted: Vec<&[u8]> = Vec::with_capacity(names.len());
+    for name in names {
+        validate_directory_leaf(name)?;
+        let name = name.to_bytes();
+        if name == manifest.to_bytes() || admitted.contains(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "link {} is the manifest or named twice",
+                    String::from_utf8_lossy(name)
+                ),
+            ));
+        }
+        admitted.push(name);
+    }
+    Ok(admitted)
+}
+
+/// The link names a manifest's `recorded` bytes hold, whatever its pending or clean mark: each
+/// NUL-separated entry must be one directory entry, and a manifest naming anything else is
+/// invalid data, refused before any link changes.
+fn recorded_links(recorded: &[u8]) -> io::Result<Vec<CString>> {
+    recorded
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let name = CString::new(entry).expect("split entries contain no NUL");
+            validate_directory_leaf(&name).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "link manifest names {:?}, which is not one directory entry",
+                        String::from_utf8_lossy(entry)
+                    ),
+                )
+            })?;
+            Ok(name)
+        })
+        .collect()
 }
 
 fn validate_directory_leaf(name: &CStr) -> io::Result<()> {
@@ -1827,10 +1844,55 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A manifest naming anything but one directory entry is refused before any link changes,
-    /// as are duplicate names and a link named like the manifest.
+    /// The link set and a recorded manifest are admitted over names and bytes alone: one directory
+    /// entry each, the manifest never a link, no link named twice, whatever mark the manifest has.
     #[test]
-    fn an_invalid_manifest_or_link_set_is_refused_before_any_change() {
+    fn a_link_set_and_a_recorded_manifest_admit_only_single_distinct_entries() {
+        use std::io::ErrorKind::{InvalidData, InvalidInput};
+        for (manifest, names, admitted) in [
+            (
+                c".links",
+                vec![c"npm", c"node"],
+                Ok::<Vec<&[u8]>, io::ErrorKind>(vec![&b"npm"[..], &b"node"[..]]),
+            ),
+            (c".links", Vec::new(), Ok(Vec::new())),
+            (c".links", vec![c"npm", c"npm"], Err(InvalidInput)),
+            (c".links", vec![c".links"], Err(InvalidInput)),
+            (c".links", vec![c"../npm"], Err(InvalidInput)),
+            (c".links", vec![c"."], Err(InvalidInput)),
+            (c".links", vec![c".."], Err(InvalidInput)),
+            (c".links", vec![c""], Err(InvalidInput)),
+            (c"../.links", vec![c"npm"], Err(InvalidInput)),
+            (c"", Vec::new(), Err(InvalidInput)),
+        ] {
+            assert_eq!(
+                admitted_links(manifest, names.iter().copied()).map_err(|error| error.kind()),
+                admitted,
+                "{manifest:?} {names:?}"
+            );
+        }
+        for (recorded, names) in [
+            (&b""[..], Ok::<Vec<&CStr>, io::ErrorKind>(Vec::new())),
+            (&b"\0\0"[..], Ok(Vec::new())),
+            (&b"\0\0node\0npm\0"[..], Ok(vec![c"node", c"npm"])),
+            (&b"\0blocked\0first\0"[..], Ok(vec![c"blocked", c"first"])),
+            (&b"node\0"[..], Ok(vec![c"node"])),
+            (&b"../victim\0"[..], Err(InvalidData)),
+            (&b"\0\0a/b\0"[..], Err(InvalidData)),
+            (&b"\0..\0"[..], Err(InvalidData)),
+        ] {
+            assert_eq!(
+                recorded_links(recorded).map_err(|error| error.kind()),
+                names.map(|names| names.into_iter().map(CStr::to_owned).collect()),
+                "{recorded:?}"
+            );
+        }
+    }
+
+    /// A manifest naming anything but one directory entry is refused before any link changes:
+    /// nothing it names is unlinked and no requested link is made.
+    #[test]
+    fn an_invalid_recorded_manifest_is_refused_before_any_change() {
         let (root, bin, directory) = reconcile_fixture("invalid");
         let target = root.join("program");
         let outside = root.join("victim");
@@ -1841,22 +1903,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(&outside).unwrap(), b"untouched");
-        assert!(fs::symlink_metadata(bin.join("npm")).is_err());
-
-        fs::remove_file(bin.join(".links")).unwrap();
-        for links in [
-            vec![(c"npm", target.as_path()), (c"npm", target.as_path())],
-            vec![(c".links", target.as_path())],
-            vec![(c"../npm", target.as_path())],
-        ] {
-            assert_eq!(
-                directory
-                    .reconcile_links(c".links", &links)
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::InvalidInput
-            );
-        }
         assert!(fs::symlink_metadata(bin.join("npm")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
