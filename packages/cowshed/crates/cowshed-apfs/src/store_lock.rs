@@ -177,6 +177,10 @@ impl Drop for ImageLockGuard {
 }
 
 /// `flock` `file` with `operation`, again when a signal interrupts it.
+// WHY unbounded: a try (`LOCK_NB`) returns at once; the image-store wait has no deadline of its
+// own, the manager's start bound is its only one (07_api.md); a bounded flock is
+// cowshed_os::flock's.
+#[allow(clippy::disallowed_methods)]
 fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
     loop {
         // SAFETY: `file` owns the fd for the duration of the call; `flock` does not consume

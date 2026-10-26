@@ -16,15 +16,14 @@
 //! image is a deliberate registry entry, not an accident of a new test. The few tests that prove
 //! attach or detach behaviour itself drive the production host directly and name that in their
 //! docs. A later lane run detaches a previous run's pool images before attaching its own.
-//! Mount and unmount output capture uses the fork-safe `Run::output_locked` path, so fixture
-//! commands obey the same process-launch lock as production commands.
+//! Mount and unmount output capture uses the test backstop's `CommandBackstop::output_bounded`,
+//! which launches under the fork lock as production commands do and ends at the run's backstop.
 //!
 //! `#[path]`-included beside [`super::scratch_apfs`]. The template directory lies in `t`, beside no
 //! test namespace, and its name spells the template's label, so no sweep reclaims it and a template
 //! of another label is never found in it.
 
-// The pool's mount/umount run in the test process, not under a supervisor: no fork is in flight.
-#![allow(dead_code, clippy::disallowed_methods)]
+#![allow(dead_code)]
 
 use std::fs::{self, File};
 use std::os::unix::fs::FileExt as _;
@@ -32,8 +31,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use cowshed_os::fork_lock::Run as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_os::test_backstop::CommandBackstop as _;
 
 use super::scratch_apfs::{SCRATCH_PARENT, release_image};
 use super::{
@@ -251,7 +250,7 @@ fn disk_tool(
 ) -> std::process::Output {
     let program = Path::new(program);
     cowshed_apfs::disk_lease::leased(HostNamespace::Test(namespace), program, args, None, || {
-        Command::new(program).args(args).output_locked()
+        Command::new(program).args(args).output_bounded()
     })
     .unwrap_or_else(|error| panic!("run {}: {error}", program.display()))
 }

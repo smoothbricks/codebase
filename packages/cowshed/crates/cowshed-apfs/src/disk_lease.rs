@@ -844,6 +844,7 @@ fn describe(program: &Path, args: &[impl AsRef<OsStr>]) -> String {
 mod tests {
     use super::*;
     use cowshed_os::namespace::TestNamespace;
+    use cowshed_os::test_backstop::UnixStreamBackstop as _;
     use std::os::unix::net::UnixListener;
 
     /// A host namespace of the test's own: no test leases as production does, or names a volume
@@ -898,7 +899,7 @@ mod tests {
     fn pair() -> (Socket, UnixListener, UnixStream) {
         let socket = Socket::new();
         let listener = UnixListener::bind(&socket.0).expect("bind");
-        let client = UnixStream::connect(&socket.0).expect("connect");
+        let client = UnixStream::connect_bounded(&socket.0).expect("connect");
         (socket, listener, client)
     }
 

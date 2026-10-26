@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Once};
@@ -14,6 +13,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_os::test_backstop::FileBackstop as _;
 
 use super::{
     CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
@@ -365,16 +365,8 @@ pub(crate) fn lock_exclusive(path: &Path) -> std::io::Result<File> {
         .read(true)
         .write(true)
         .open(path)?;
-    loop {
-        // SAFETY: `flock` takes a descriptor `file` keeps open for the call and touches no memory.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(file);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
+    file.lock_bounded()?;
+    Ok(file)
 }
 
 /// The test namespace whose directory in the per-user root holds `path`, given that directory

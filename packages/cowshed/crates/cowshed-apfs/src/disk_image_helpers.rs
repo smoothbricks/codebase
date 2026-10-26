@@ -485,6 +485,8 @@ fn listed(count: libc::c_int) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::ChildBackstop as _;
 
     fn pids(pids: &[libc::pid_t]) -> BTreeSet<libc::pid_t> {
         pids.iter().copied().collect()
@@ -587,7 +589,7 @@ mod tests {
             .expect("read the stand-in")
             .expect("the stand-in runs");
         child.kill().expect("end the stand-in");
-        child.wait().expect("reap the stand-in");
+        child.wait_bounded().expect("reap the stand-in");
         assert_eq!(read.pid, pid);
         assert_eq!(read.command, "/bin/sleep 30");
         assert!(read.running >= Duration::from_secs(5), "{read:?}");

@@ -7130,6 +7130,7 @@ mod io_registry {
 mod tests {
     use super::*;
     use cowshed_os::namespace::TestNamespace;
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::cell::{Ref, RefCell};
     use std::collections::{BTreeMap, VecDeque};
     use std::ffi::OsStr;
@@ -7882,13 +7883,10 @@ mod tests {
         );
         assert!(report.contains("reaped with signal"), "{report}");
         let pid = libc::pid_t::try_from(pid).expect("a process id fits pid_t");
-        // SAFETY: waitpid only observes our already-reaped child, without waiting.
+        let reaped = cowshed_os::test_backstop::waitpid(pid, libc::WNOHANG)
+            .expect_err("the runner actually reaped its child");
         assert_eq!(
-            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
-            -1
-        );
-        assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
+            reaped.raw_os_error(),
             Some(libc::ECHILD),
             "the runner actually reaped its child"
         );
@@ -7927,7 +7925,7 @@ mod tests {
         let (mut child, files) =
             spawn_disk_child_as(&request, ChildInput::Null, true, None).expect("spawn detached");
         let directory = files.expect("a detached child writes files");
-        let status = child.wait().expect("reap the detached child");
+        let status = child.wait_bounded().expect("reap the detached child");
         assert!(status.success(), "{status:?}");
         assert_eq!(fs::read(directory.join("stdout")).unwrap(), b"done");
         assert_eq!(fs::read(directory.join("stderr")).unwrap(), b"err");
@@ -7946,7 +7944,7 @@ mod tests {
             "the child leads its session"
         );
         kill_disk_child_group(&mut child).expect("kill exact owned fixture group");
-        let status = child.wait().expect("reap exact owned fixture");
+        let status = child.wait_bounded().expect("reap exact owned fixture");
         assert_eq!(
             ProcessStatus::from(status),
             ProcessStatus::Signal(libc::SIGKILL)
@@ -7971,7 +7969,7 @@ mod tests {
         let (mut child, files) =
             spawn_disk_child_as(&request, ChildInput::Null, true, None).expect("spawn detached");
         let directory = files.expect("a detached child writes files");
-        let status = child.wait().expect("reap the detached child");
+        let status = child.wait_bounded().expect("reap the detached child");
         let stdout = fs::read_to_string(directory.join("stdout")).unwrap();
         fs::remove_dir_all(directory).unwrap();
         assert!(
@@ -8275,7 +8273,7 @@ mod tests {
             Err(failure) => (Some(failure), None),
             Ok((mut child, files)) => {
                 let status = child
-                    .wait()
+                    .wait_bounded()
                     .expect("reap any unexpectedly executed owned fixture");
                 if let Some(directory) = files {
                     fs::remove_dir_all(directory).expect("remove only the owned output files");
@@ -8483,7 +8481,9 @@ mod tests {
                 .write_all(b"passphrase\n")
                 .expect("write the passphrase");
         }
-        let output = child.wait_with_output().expect("reap the re-executed test");
+        let output = child
+            .wait_with_output_bounded()
+            .expect("reap the re-executed test");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{output:?}");
         assert!(
@@ -10385,12 +10385,10 @@ mod tests {
         }
 
         fn newest_pin_held(&self) -> bool {
-            use std::os::fd::AsRawFd as _;
             let newest = self.newest.borrow();
             let pin = newest.as_deref().expect("a pin was taken");
             let probe = File::open(pin).expect("open the pin's file");
-            // SAFETY: `probe` owns a live descriptor for the duration of the call.
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+            probe.try_lock().is_err()
         }
     }
 
@@ -10420,13 +10418,11 @@ mod tests {
             self.recorded.image_lease(identity)
         }
         fn pin_raw_device(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
-            use std::os::fd::AsRawFd as _;
             let pin = self.pins.join(format!("pin-{}", self.taken.get()));
             self.taken.set(self.taken.get() + 1);
             let file = File::create(&pin)?;
-            // SAFETY: `file` owns a live descriptor for the duration of the call.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(io::Error::last_os_error());
+            if let Err(error) = file.try_lock() {
+                return Err(error.into());
             }
             self.newest.replace(Some(pin));
             Ok(Some(Fenced::new(file)))

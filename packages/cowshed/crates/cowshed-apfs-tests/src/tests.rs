@@ -1,6 +1,7 @@
 use super::*;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_os::test_backstop::ChildBackstop as _;
 use scratch_apfs::ScratchRoot;
 use std::fs;
 use std::io;
@@ -39,12 +40,10 @@ fn assert_lease_excludes_another_descriptor(held: &fs::File) {
     let path = std::ffi::CStr::from_bytes_until_nul(&path).expect("the kernel terminates the path");
     let probe =
         fs::File::open(std::ffi::OsStr::from_bytes(path.to_bytes())).expect("reopen held lease");
-    // SAFETY: probe owns a live file descriptor; flock retains no pointers.
-    assert_eq!(
-        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        -1
-    );
-    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+    assert!(matches!(
+        probe.try_lock(),
+        Err(fs::TryLockError::WouldBlock)
+    ));
 }
 #[cfg(target_os = "macos")]
 struct RealImageCleanup<'a> {
@@ -770,7 +769,7 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
             child.kill().expect("kill the run mid-fixture");
         }
         lines.for_each(drop);
-        let status = child.wait().expect("reap the run");
+        let status = child.wait_bounded().expect("reap the run");
         assert!(
             !forwarded.join().expect("forward the run's stderr"),
             "the {ending} run's deliberate failure printed a panic"
@@ -895,13 +894,16 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             continue;
         };
         let announced: libc::pid_t = announced.parse().expect("announced hdiutil pid");
-        let mut status = 0;
-        // SAFETY: kill and waitpid only name the caller, this test's unreaped child;
+        // SAFETY: kill only names the caller, this test's unreaped child.
+        assert_eq!(
+            unsafe { libc::kill(caller, libc::SIGSTOP) },
+            0,
+            "stop the caller"
+        );
         // WUNTRACED returns once the stop has taken effect.
-        unsafe {
-            assert_eq!(libc::kill(caller, libc::SIGSTOP), 0, "stop the caller");
-            assert_eq!(libc::waitpid(caller, &mut status, libc::WUNTRACED), caller);
-        }
+        let (stopped, status) = cowshed_os::test_backstop::waitpid(caller, libc::WUNTRACED)
+            .expect("wait for the caller's stop");
+        assert_eq!(stopped, caller);
         assert!(libc::WIFSTOPPED(status), "the caller ended before its stop");
         let tree =
             crate::scratch_apfs::processes::processes_in(in_root).expect("list the caller's tree");
@@ -920,7 +922,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
     child.kill().expect("kill the caller mid-attach");
-    let _ = child.wait();
+    let _ = child.wait_bounded();
     lines.for_each(drop);
     // The detached attach, and anything else still working in the root, ends on its own:
     // wait for each one's exit event, then reconcile as the next invocation does.
