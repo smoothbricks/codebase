@@ -375,7 +375,8 @@ restarting daemon with the socket its clients were still writing to.
   variable it starts a daemon.
 
 Drop the hunk only when cowshed no longer ends a job's tree around a shared daemon, or upstream Nx has an equivalent
-setting; retain the regression.
+setting; retain the regression. Stock Nx starting the daemon is not enough; see
+[Can the daemon hunks be dropped?](#can-the-daemon-hunks-be-dropped).
 
 ## A lost daemon ends the command
 
@@ -535,6 +536,83 @@ with nowhere to put a probe must answer `cannot be proven current` and never ser
 under its parent repository's `*.txt`: a fresh walk indexes it, and the daemon must rebuild the target whose input it is
 once it changes. Drop these hunks only when the installed upstream watcher reports a stopped stream, retaining the
 regression.
+
+## Can the daemon hunks be dropped?
+
+No. Whether stock Nx could start the daemon itself, with cowshed only stopping the recorded pid at release, is answered
+in `specs/cowshed/04_sandbox.md`, "Why cowshed keeps the daemon, not the first client". Its seven reasons are
+containment (macOS and Linux), the untrusted record, land adoption, the sandbox profile, held-lock commands, racing
+starters and the idle stop. Each hunk below serves some of them or is independent of who starts the daemon. Only
+`--kept`, 11 of the patch's 3,809 changed lines, goes with the keeper. Were every kind of client allowed to start a
+daemon, about 78 lines (2%) could go: the never-start policy (65), `--kept` (11) and the `never` tag on two lost-daemon
+lines (`P:727`, `P:766`). A job whose daemon stops would then fail its command, as a host shell's does today
+(`loseDaemon`, `P:476-492`): a choice, not a free deletion.
+
+Every changed line (+3,133 −676, in 79 files) is counted once, under the purpose that decides whether it can go; a hunk
+that mixes purposes is split by function. `P:n` is line n of `patches/nx@23.2.1.patch` as last changed by `446e01de66`,
+and moves when the patch is regenerated.
+
+| Purpose                           | Changed     | Serves                                                    |
+| --------------------------------- | ----------- | --------------------------------------------------------- |
+| Never-start policy                | +63 −2      | containment, record, land, profile, held-lock commands    |
+| In-process continuation           | +99 −20     | the same, and the stopped watcher's reply to every client |
+| Lost-daemon handling              | +130 −7     | none: defects of stock 23.2.1 that any client has         |
+| Record claim and socket ownership | +326 −18    | racing starters                                           |
+| `LINKED_PLUGIN_CHANGED`           | +206 −6     | none: a graph-identity defect, whoever started the daemon |
+| Idle, refused stop and validity   | +741 −179   | idle stop, profile (refused stop)                         |
+| Unrelated                         | +1,568 −444 | none                                                      |
+
+- **Never-start policy** (`1b7475de52`, `9d44a660ef`): `nx daemon --start` refused (`P:78-92`); `enabled()` uses the
+  daemon only while the process its record names runs (`P:420-428`, `recordedDaemonRuns` `P:858-866`);
+  `startDaemonIfNecessary` never starts one (`P:609-619`); the tagged error `daemonStartForbidden()` and the tags on
+  lost connections (`P:903-917`, `P:688-693`).
+- **In-process continuation** (`cbf0b42671`): `orWithoutDaemon` and `continueWithoutDaemon` (`P:365-372`, `P:435-468`)
+  and their callers: task hashing (`P:2941-2949`, `P:2999-3007`, `P:3019-3039`), the pre and post tasks-execution hooks
+  (`P:3542-3556`), the project graph (`P:3583-3589`), output-hash record and compare (`P:4975-4987`), sync generators
+  (`P:5425-5444`) and workspace-context file queries (`P:5604-5665`). The stopped watcher's reply carries the same tag
+  to every client, host shells included (`P:1876`), so these stay whoever starts the daemon.
+- **Lost-daemon handling** (`90dd74cfb7`, `2ed1e18cf5`, `8151e1c16d`, `446e01de66`): `loseDaemon` and the gates that
+  read it (`P:411-412`, `P:476-492`, `P:627-629`, `P:700-703`, `P:735-737`); a failed reconnect or a version mismatch
+  ends the use (`P:711-727`); the per-request pid check and `daemonGone` (`P:402-403`, `P:745-779`, `P:867-895`); the
+  same check for watcher and graph-listener streams (`P:500`, `P:508-573`). They fix defects of stock 23.2.1 that any
+  client has: a client left `CONNECTING` for good after a failed reconnect, and a 20-minute keep-alive behind a listener
+  that outlived its daemon.
+- **Record claim and socket ownership** (`8b1716430f`): the record as an exclusive claim (`daemon/cache.{d.ts,js}`,
+  `P:124-149`, `P:159-344`; `claimDaemonOrDefer` and the reordered `startServer`, `P:1992-2025`, `P:2040`,
+  `P:2046-2051`); the pid that answered, reported to the client (`P:802-808`); the daemon's own socket and inode
+  (`P:2105`, `P:2836-2850`, `P:2862-2910`); a displaced or socketless daemon stopping itself (`P:1697-1706`,
+  `P:1728-1731`, `P:1755-1757`); a shutdown that leaves a socket another daemon rebound (`P:2236-2242`, `P:2263`,
+  `P:2268-2287`).
+- **`LINKED_PLUGIN_CHANGED`** (`31dfd0f614`, `a19f960832`, `90dd74cfb7`): the census and hash of a plugin linked from
+  outside the workspace (`P:1529-1687`) and its restart decision (`P:1741-1752`); the `daemonGraphChanged` notice to
+  every connected command (`P:2221-2235`, `P:2243-2262`, `P:2265-2267`); the client that fails at once on it
+  (`P:787-794`).
+- **Idle, refused stop and validity**:
+  - Idle (`a97f25840d`, `3becb87c55`): five minutes, and an open connection counts as activity (`P:1836-1838`,
+    `P:1929-1934`, `P:2118-2119`, `P:2162-2163`; +8 −4). A plugin worker, or the daemon as its own client, lets go of
+    its connection once its queue drains (`9646926b2c`, `40df71236d`; `P:636-680`, +30 −8). Both matter more once Nx's
+    own timer is the only idle stop.
+  - Refused stop (`3a4abc1969`): `DaemonClient.stop` throws on any refusal but `ESRCH` and keeps the socket, because
+    another job's stop gets `EPERM` (`P:816-850`, +22 −10).
+  - Event-driven validity (`90a278508e`): `restart-checks.{d.ts,js}` (`P:1443-1454`, `P:1461-1484`, `P:1491-1528`,
+    `P:1688-1696`, `P:1720-1727`, `P:1732-1740`, `P:1753-1754`, `P:1758-1762`, `P:1771-1774`, `P:1780-1785`), its
+    watcher-path check (`P:1412-1433`), its callers in `server.js` (`P:1794-1804`, `P:1828`, `P:1853-1857`,
+    `P:1942-1972`, `P:2026-2028`, `P:2056-2101`) and the installed-version owner (`P:5382-5413`); +157 −75.
+  - A workspace that has gone stops the daemon (`ee9c35a9fc`; `P:1707-1719`, `P:1980-1984`, +18).
+  - A restarting daemon's successor keeps its own copies of the log descriptors (`cbf0b42671`; `P:2131-2132`, `P:2152`,
+    `P:2160`, `P:2169-2177`, `P:2185-2207`, +25 −11): once the keeper is gone, Nx's own restart is the only restart.
+  - A stopped watcher stream is never served from (`b84e602d05`): one native watcher, probed before the daemon answers
+    from files (`watcher.{d.ts,js}`, `P:2308-2824`; `P:1763-1770`, `P:1844-1845`, `P:1861-1882`, `P:1906-1921`,
+    `P:2033-2034`, `P:2102-2104`, `P:2106-2107`, `P:2122-2123`, `P:2144-2145`, `P:2215-2220`, `P:2291-2296`); +470 −71.
+  - `--kept` (`822134f5b0`): `keptByLauncher` and its branch in `restartDaemon` (`P:1485-1490`, `P:1775-1779`, +11) make
+    a keeper-started daemon stop instead of spawning a successor no ledger can prove. It is the one hunk that exists for
+    the keeper, and serves containment and land adoption.
+- **Unrelated**: everything else, none of it about who starts the daemon: the output lease, the remote cache hunks,
+  environment graph identity, exit codes, error causes, the foreign workspace environment, task history on the client's
+  connection (`cea3107da8`: the daemon picks its database scope once, at startup), the daemon's resident graph plugin
+  workers (`2e204ae77c`), task-graph closure, the racy file-hash archive, dependency-cache identity, run information
+  after a pre-start failure, resolution from the workspace, root normalization, raw-input inspection, `NX_USE_LOCAL` and
+  Bun file packages.
 
 ## Canonical daemon workspace roots
 

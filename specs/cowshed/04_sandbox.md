@@ -1182,6 +1182,9 @@ shed went idle finds no daemon and starts one of its own, outside the sandbox, u
 daemon is stopped, never disabled: the next host Nx command, or the keeper once a job is admitted, starts one
 (16_build_volumes.md, "The Nx daemon stays on").
 
+The reasons the keeper starts the daemon, and no job's client does, are in
+[Why cowshed keeps the daemon, not the first client](#why-cowshed-keeps-the-daemon-not-the-first-client).
+
 Every stop of a daemon cowshed makes ends its plugin workers with it: the keeper's, a retirement's (02_workspaces.md)
 and a land's (16_build_volumes.md, Land 4). Nx forks each worker detached, leading its own session, so neither the job's
 group nor the daemon's session names it, and once the daemon exits launchd adopts it and nothing the kernel keeps names
@@ -1247,6 +1250,67 @@ clients), and the owned-block-only rule for in-sandbox clients: a workspace proc
 retained block ports, so service-to-service traffic inside a workspace must also ride owned block ports. On Linux the
 netns makes both moot: each workspace's loopback is private, no `COWSHED_PORT_BASE` exists, and package traffic uses the
 fixed connector address instead.
+
+### Why cowshed keeps the daemon, not the first client
+
+**Could stock Nx start its own daemon, with cowshed only stopping the recorded pid at release?** No. A stock client that
+finds no daemon starts one detached, in a session of its own (`DaemonClient.startInBackground`, pinned Nx 23.2.1), and
+the record names it. Containment, the untrusted record and land adoption would each need a new mechanism in cowshed; the
+sandbox profile and held-lock commands keep `NX_DAEMON_START=never` for some clients; racing starters and the idle stop
+keep the patch's claim hunks and the keeper's stop. Letting stock Nx start the daemon moves work into cowshed instead of
+removing any, and the patch keeps its daemon hunks (`patches/README.md`, "Can the daemon hunks be dropped?"). Code paths
+are relative to `packages/cowshed/crates/cowshed-core/src/`, specs to `specs/cowshed/` and Nx files to `dist/src/` of
+the pinned 23.2.1; line numbers are those of commit `d2dc2aaef9`.
+
+- **Containment.** On macOS a job owns its held leader's group plus every life its process fold holds running, in the
+  group or not (`runtime/process_events.rs:543-561`), and those lives "remain owned after setsid, reparenting, exec, or
+  leader release" (`runtime/job_groups.rs:15-18`). A daemon a job's client starts ends with that job: its end sends each
+  owned life SIGTERM, then a freeze and SIGKILL (`runtime/process_monitor.rs:1037-1056`). Only the keeper's daemon, a
+  resident job of its own, outlives another job (`runtime/nx_daemon.rs:410-428`; `11_shell.md:180-181`). Exempting such
+  a daemon needs a custody of cowshed's own, because the ledger holds a life's claim until its exit is proved
+  (`runtime/job_groups.rs:17-18`). On Linux a job's children are born into its `job-<id>` cgroup
+  (`runtime/job_cgroup.rs:21-24`) and its end writes `cgroup.kill`, which takes a process in another session or a
+  descendant cgroup too (`:831-832`, `:881-885`). The delegated root holds only `controller`, `ws-<incarnation>` and
+  `job-<id>` (`:13-19`), so an exempt daemon has no cgroup to move to before the kill: cowshed would need one, and a
+  migration of the daemon and every plugin worker under a frozen job cgroup.
+- **The record is untrusted.** Any job may write it: it lives in the build volume, which every job, read-only included,
+  can write (`04_sandbox.md:1077-1078`; `16_build_volumes.md:1285-1286`). Cowshed therefore takes it as the nomination
+  of a pid (`runtime/nx_daemon.rs:172-173`): land signals one only when the record is no older than the process's start,
+  the pid is sandboxed and the job ledger proves it the job's own (`runtime/nx_daemon.rs:272-307`), and "a daemon record
+  never enrolls a new process" (`16_build_volumes.md:1291-1292`). A containment exemption keyed on the record's pid lets
+  a job escape its end by writing its own pid there, so it needs that whole proof at every job end.
+- **Land adoption.** A land stops only a daemon the job ledger proves the job's own, as a member of a recorded job group
+  (`runtime/job_groups.rs:1608-1615`), and skips adopting the volume for any other (`LandingDaemonStayed`): "A daemon
+  started detached outside the ledger is that skip" (`16_build_volumes.md:622-629`; `runtime/nx_daemon.rs:282-307`). A
+  stock client's daemon leads a group of its own, so the ledger cannot prove it. Were it to outlive its job, each land
+  would skip adoption and discard the gate's whole Nx cache, as one did when a self-restarted successor ran outside the
+  keeper's job (`822134f5b0`).
+- **The sandbox profile.** A server a workspace spawns inherits that workspace's Seatbelt profile
+  (`03_caches.md:449-450`), and a daemon spawns its own successor (`startNewDaemonInBackground`,
+  `daemon/server/shutdown-utils.js`), so whichever client starts the daemon fixes its profile for its life. A read-only
+  job's profile grants no socket under the mount, where the daemon's socket lives, and no write to source
+  (`04_sandbox.md:71-77`, `:1077-1078`); a `--host` job runs outside the sandbox (`06_cli.md:593-594`), where the daemon
+  would run the shed's unsigned project-graph plugins (`04_sandbox.md:1107-1108`); and
+  `(allow signal (target same-sandbox))` (`04_sandbox.md:49`) leaves another job's `nx daemon --stop` with `EPERM`.
+  Linux has no sandbox in code ("Linux enforcement (ZFS substrate)"), so this reason is macOS's.
+- **Held-lock commands.** `cowshed lock` and `land-turn` hand their command the lock's descriptor, which the kernel
+  releases only once every process holding it has closed it (`held_lock.rs:12-15`). A client there that starts a daemon
+  holds the lock until the daemon and its workers end (`build_volume/nx.rs:2962-2980`), so a land turn waits on an idle
+  daemon. They run with `NX_DAEMON_START=never` (`held_lock.rs:232-259`; `02_workspaces.md:1815-1826`), because the
+  alternative, `NX_DAEMON=false`, is forbidden for a normal run (`16_build_volumes.md:1277`).
+- **Racing starters.** Two clients that both find no daemon each start one. Stock Nx writes the record unconditionally
+  and unlinks the socket path before it binds, and under `NX_SOCKET_DIR` every daemon of a workspace binds the same
+  `d.sock` (`daemon/tmp-dir.js:74-77`, `:276-278`). The later daemon takes the record, the displaced one stops, and its
+  shutdown unlinks the winner's socket: a new daemon every five seconds, and `EPIPE` on `RECORD_OUTPUTS_HASH_BATCH`
+  (`8b1716430f`, which makes the record a claim). Today only the keeper, one start in flight
+  (`04_sandbox.md:1112-1113`), and host shells start; with every job able to, the race is the normal case.
+- **The idle stop.** Stock Nx stops a daemon after three hours without a request or a file event, the patched Nx after
+  five minutes (`daemon/server/shutdown-utils.js`), and every file event of the tree restarts that timer, so a tree that
+  keeps changing never reaches it (`04_sandbox.md:1156-1158`). The keeper ends the daemon from its ledger once the shed
+  has gone its idle bound with no job and no session (`04_sandbox.md:1174-1178`); without it only that timer remains.
+
+`16_build_volumes.md:1291-1292` and the policy above (`04_sandbox.md:1039-1054`) say the opposite of what a
+client-started daemon needs, so a spec change would come first.
 
 ## The sccache daemon as trusted mediator
 
