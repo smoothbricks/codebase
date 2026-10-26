@@ -970,7 +970,11 @@ impl Fixture {
     /// free block the moment this one is released, so a refused bind says nothing of the verb.
     fn gateway_at_hello(&self, workspace: &str) -> GatewayAtHello {
         let workspace = name(workspace);
-        let socket = supervisor_socket::socket_path(self.storage.store(), &self.repo, &workspace);
+        let socket = cowshed_types::supervisor_socket::socket_path(
+            self.storage.store(),
+            &self.repo,
+            &workspace,
+        );
         fs::create_dir_all(socket.parent().expect("socket directory")).expect("run directory");
         let listener = tokio::net::UnixListener::bind(&socket).expect("stand at the socket");
         let image = self
@@ -1523,7 +1527,11 @@ async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
         .open_as_supervisor("served")
         .await
         .expect("the supervisor's opening waits on no lock another operation holds");
-    let socket = supervisor_socket::socket_path(fixture.storage.store(), &fixture.repo, &served);
+    let socket = cowshed_types::supervisor_socket::socket_path(
+        fixture.storage.store(),
+        &fixture.repo,
+        &served,
+    );
     fs::create_dir_all(socket.parent().expect("the socket directory")).expect("run directory");
     let published = tokio::task::spawn_blocking({
         let socket = socket.clone();
@@ -1887,7 +1895,11 @@ async fn a_supervisor_waits_for_the_holder_of_its_unsettled_workspace_lock() {
     let scratch = fixture.checkout.parent().expect("the scratch root");
     let holder = LockHolder::hold(scratch, fixture.storage.store(), &lock);
     let holder_pid = holder.child.id();
-    let socket = supervisor_socket::socket_path(fixture.storage.store(), &fixture.repo, &served);
+    let socket = cowshed_types::supervisor_socket::socket_path(
+        fixture.storage.store(),
+        &fixture.repo,
+        &served,
+    );
     fs::create_dir_all(socket.parent().expect("the socket directory")).expect("run directory");
     let mut supervisor =
         tokio::process::Command::new(std::env::current_exe().expect("this test binary"))

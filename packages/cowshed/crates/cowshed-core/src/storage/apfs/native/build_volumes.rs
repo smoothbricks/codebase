@@ -1626,7 +1626,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let socket = supervisor_socket::socket_path(
+        let socket = cowshed_types::supervisor_socket::socket_path(
             &root.path().join("store"),
             &RepoId::parse("acme/widget").unwrap(),
             &WorkspaceName::main(),
@@ -1769,7 +1769,7 @@ mod tests {
                     want: None,
                     scope: crate::api::dto::ExecScope::Workspace,
                 },
-                crate::runtime::supervisor_socket::AdmissionSource::Worker,
+                cowshed_types::supervisor_socket::AdmissionSource::Worker,
             )
             .await
             .expect("the replacement supervisor admits the shell after the mark");
@@ -2594,7 +2594,7 @@ mod tests {
                     want: None,
                     scope: crate::api::dto::ExecScope::Workspace,
                 },
-                crate::runtime::supervisor_socket::AdmissionSource::Worker,
+                cowshed_types::supervisor_socket::AdmissionSource::Worker,
             )
             .await
             .expect("admit the job");

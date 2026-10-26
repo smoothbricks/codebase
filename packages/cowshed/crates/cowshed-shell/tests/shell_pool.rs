@@ -29,7 +29,6 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
     WorkspaceSupervisorHandle,
 };
-use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
@@ -39,6 +38,7 @@ use cowshed_os::process::ExitWatch;
 use cowshed_types::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_types::paths::cpu_pool_directory;
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
+use cowshed_types::supervisor_socket::AdmissionSource;
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
 

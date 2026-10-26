@@ -23,7 +23,6 @@ use cowshed_core::api::{
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::runtime::job_groups::Birth;
-use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::apfs::Labelled;
 use cowshed_core::storage::job_artifact::{
@@ -34,6 +33,7 @@ use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_types::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
+use cowshed_types::supervisor_socket::AdmissionSource;
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
@@ -4335,7 +4335,7 @@ impl cowshed_core::runtime::supervisor_manager::SupervisorSpawner for InProcessS
         self.spawned
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(supervisor) = self.supervisor.clone() {
-            let path = supervisor_socket::socket_path(
+            let path = cowshed_types::supervisor_socket::socket_path(
                 &self.store_root,
                 &supervisor.snapshot().repo_id,
                 workspace,
@@ -4483,7 +4483,11 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
         .unwrap();
     let running_spawn = h.spawned.recv().await.unwrap();
     let store = manager_store();
-    let path = supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace);
+    let path = cowshed_types::supervisor_socket::socket_path(
+        &store,
+        &authority().repo_id,
+        &authority().workspace,
+    );
     let listener = supervisor_socket::bind(&path).await.unwrap();
     let (advances, mut requests) = mpsc::channel(1);
     tokio::spawn(supervisor_socket::serve(
@@ -4609,7 +4613,11 @@ async fn held_job_fixture(h: &mut Harness) -> (JobId, Spawned, SocketPath) {
     );
     let store = manager_store();
     let path = SocketPath {
-        path: supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace),
+        path: cowshed_types::supervisor_socket::socket_path(
+            &store,
+            &authority().repo_id,
+            &authority().workspace,
+        ),
         _directory: store,
     };
     let listener = supervisor_socket::bind(&path).await.unwrap();
@@ -4718,7 +4726,8 @@ async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor()
         )
         .await
         .unwrap();
-    let path = supervisor_socket::socket_path(&store, &read.repo_id, &read.workspace);
+    let path =
+        cowshed_types::supervisor_socket::socket_path(&store, &read.repo_id, &read.workspace);
     let listener = supervisor_socket::bind(&path).await.unwrap();
     tokio::spawn(supervisor_socket::serve(
         listener,
@@ -4776,7 +4785,11 @@ async fn an_ensure_is_refused_by_a_supervisor_of_another_incarnation() {
     use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
     let (h, _root) = harness(1, 1024, false, false);
     let store = manager_store();
-    let path = supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace);
+    let path = cowshed_types::supervisor_socket::socket_path(
+        &store,
+        &authority().repo_id,
+        &authority().workspace,
+    );
     let listener = supervisor_socket::bind(&path).await.unwrap();
     tokio::spawn(supervisor_socket::serve(
         listener,
@@ -8661,7 +8674,7 @@ fn native_process_fixture(
     }
     let ledger = root.join("supervisor.groups");
     config.membership_socket =
-        membership.map(cowshed_core::runtime::supervisor_socket::membership_socket_path);
+        membership.map(cowshed_types::supervisor_socket::membership_socket_path);
     config.group_ledger = Some(ledger.clone());
     let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
         Box::new(cowshed_core::storage::audit::NullAuditSink),

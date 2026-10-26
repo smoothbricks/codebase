@@ -11,7 +11,6 @@
 //! `0700` directory by the process that serves it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -49,41 +48,7 @@ use crate::error::{CowshedError, Result};
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::deadline::{self, Occupant, PeerStream, Progress, Silent, WaitError, occupant};
 use cowshed_os::fork_lock::Fenced;
-
-/// The identity of a cowshed build: the Mach-O `LC_UUID` the linker derives from the image's
-/// contents on macOS, the SHA-256 of the executable elsewhere. Two binaries share one only when
-/// they are the same build, so a supervisor started by another build — whatever changed, and
-/// whether or not anybody remembered to say so — is refused by name at `hello` and drained by the
-/// manager of a newly started daemon (11_shell.md "Draining a supervisor of another build").
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct BuildId(String);
-
-impl BuildId {
-    /// This process's build: read once, from the image this code was linked into.
-    pub fn current() -> Result<&'static Self> {
-        static CURRENT: std::sync::LazyLock<std::result::Result<BuildId, String>> =
-            std::sync::LazyLock::new(|| image_build_id().map(BuildId));
-        CURRENT.as_ref().map_err(|reason| {
-            CowshedError::internal(format!("cannot identify this cowshed build: {reason}"))
-        })
-    }
-
-    /// The build another process named on the wire.
-    pub(crate) fn named(build: &str) -> Self {
-        Self(build.to_owned())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for BuildId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
+use cowshed_types::supervisor_socket::{AdmissionSource, BuildId, membership_socket_path};
 
 /// The `LC_UUID` of the Mach-O image holding this function, as 32 lowercase hex digits.
 #[cfg(target_os = "macos")]
@@ -144,6 +109,15 @@ fn image_build_id() -> std::result::Result<String, String> {
     Ok(Sha256Digest::from_bytes(hasher.finalize().into()).to_hex())
 }
 
+/// This process's build: read once, from the image this code was linked into.
+pub fn current_build() -> Result<&'static BuildId> {
+    static CURRENT: std::sync::LazyLock<std::result::Result<BuildId, String>> =
+        std::sync::LazyLock::new(|| image_build_id().map(|build| BuildId::named(&build)));
+    CURRENT.as_ref().map_err(|reason| {
+        CowshedError::internal(format!("cannot identify this cowshed build: {reason}"))
+    })
+}
+
 /// How long a commitments read waits for one to arrive before answering empty.
 const COMMITMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -156,51 +130,6 @@ const MAX_BYTES_FRAME: usize = 64 * 1024 * 1024;
 const STREAM_CHUNK: usize = 64 * 1024;
 /// Bounded queue between a forwarded stdin stream and the job that reads it.
 const STREAM_DEPTH: usize = 4;
-
-/// Hex digits of the workspace digest that names a supervisor's socket ([`socket_path`]).
-const SOCKET_DIGEST_HEX: usize = 32;
-
-/// Where the supervisor of `workspace` in `repo_id` listens: the store's `run` directory, under
-/// a digest of the pair. Owner, repository and workspace names together can exceed the 104
-/// bytes a Unix socket path may hold on macOS; the digest keeps every path at 64.
-pub fn socket_path(
-    store_root: &Path,
-    repo_id: &cowshed_types::repository::RepoId,
-    workspace: &cowshed_types::metadata::WorkspaceName,
-) -> PathBuf {
-    let mut identity = Vec::with_capacity(repo_id.as_str().len() + workspace.as_str().len() + 1);
-    identity.extend_from_slice(repo_id.as_str().as_bytes());
-    // NUL is in neither name, so no two pairs share an identity.
-    identity.push(0);
-    identity.extend_from_slice(workspace.as_str().as_bytes());
-    let digest = Sha256Digest::compute(&identity).to_hex();
-    store_root
-        .join("run")
-        .join(format!("{}.sock", &digest[..SOCKET_DIGEST_HEX]))
-}
-
-/// Whether `name`, an entry of the store's `run` directory, is a workspace supervisor's socket:
-/// exactly the name [`socket_path`] gives one, its digest's first 32 lowercase hex digits and then
-/// `.sock`. Nothing else there is one: not the manager's `manager.sock`, not a supervisor's
-/// `<digest>.members.sock` membership endpoint ([`membership_socket_path`]), its `.groups`
-/// ledger or `.sock.lock` lease, nor a `.bind` listener still being published.
-pub fn is_socket_name(name: &OsStr) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
-    name.as_bytes()
-        .strip_suffix(b".sock")
-        .is_some_and(|digest| {
-            digest.len() == SOCKET_DIGEST_HEX
-                && digest
-                    .iter()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        })
-}
-/// Only the membership endpoint is exported to admitted children, never coordinator authority.
-pub const MEMBERSHIP_SOCKET_ENV: &str = "COWSHED_SUPERVISOR_SOCKET";
-
-pub fn membership_socket_path(supervisor: &Path) -> PathBuf {
-    supervisor.with_extension("members.sock")
-}
 
 /// This separate closed grammar is the endpoint's authority boundary. New coordinator methods
 /// cannot silently become callable by a sandbox job.
@@ -513,38 +442,22 @@ struct ExecWire {
     parent_jobserver: Option<super::job_cpu::InheritedJobserver>,
 }
 
-/// The controller route that admitted an exec. The route is the authority for the gate class and
-/// the host-gate scope (05_gateway.md "Classes", 07_api.md "Capability split"): no request
-/// field, environment value or caller claim selects it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AdmissionSource {
-    /// worker.exec: a workspace's own capability, which admits background, interactive and
-    /// resident work in its workspace sandbox only.
-    Worker,
-    /// coordinator.exec and the controller's own execs: the trusted coordinator, which may also
-    /// admit the gate class and the host-gate scope.
-    Coordinator,
-}
-
-impl AdmissionSource {
-    /// Whether this route may admit an exec of class in scope. A worker admits background,
-    /// interactive and either resident's work in the workspace sandbox and nothing else -- none of
-    /// them claims anything a worker may not -- and anything more is refused as the typed
-    /// class-not-permitted error, before any record or process exists.
-    pub fn admit(self, class: ExecClass, scope: ExecScope) -> Result<()> {
-        match (self, class, scope) {
-            (Self::Coordinator, _, _)
-            | (
-                Self::Worker,
-                ExecClass::Background
-                | ExecClass::Interactive
-                | ExecClass::Resident
-                | ExecClass::InteractiveResident,
-                ExecScope::Workspace,
-            ) => Ok(()),
-            (Self::Worker, _, _) => Err(CowshedError::class_not_permitted(class, scope)),
-        }
+/// Whether the route that admitted an exec may admit one of class in scope. A worker admits
+/// background, interactive and either resident's work in the workspace sandbox and nothing
+/// else -- none of them claims anything a worker may not -- and anything more is refused as
+/// the typed class-not-permitted error, before any record or process exists.
+pub(crate) fn admit(source: AdmissionSource, class: ExecClass, scope: ExecScope) -> Result<()> {
+    match (source, class, scope) {
+        (AdmissionSource::Coordinator, _, _)
+        | (
+            AdmissionSource::Worker,
+            ExecClass::Background
+            | ExecClass::Interactive
+            | ExecClass::Resident
+            | ExecClass::InteractiveResident,
+            ExecScope::Workspace,
+        ) => Ok(()),
+        (AdmissionSource::Worker, _, _) => Err(CowshedError::class_not_permitted(class, scope)),
     }
 }
 
@@ -1382,7 +1295,7 @@ pub async fn serve(
                     cowshed_os::eprintln!(
                         "cowshed: workspace supervisor {} of build {} retires after draining; {settled}",
                         socket_path.display(),
-                        BuildId::current().map_or("(unnamed)", BuildId::as_str),
+                        current_build().map_or("(unnamed)", BuildId::as_str),
                     );
                     match current.retire(NxDaemonRetirement::Recorded).await {
                         Ok(()) => {
@@ -2317,7 +2230,7 @@ async fn serve_call(
         Request::Hello => {
             let authority = supervisor.current_authority().await?;
             let value = to_value(&HelloWire {
-                build: BuildId::current()?.clone(),
+                build: current_build()?.clone(),
                 authority: (&authority).into(),
                 pid: std::process::id(),
             })?;
@@ -3057,7 +2970,7 @@ pub async fn hello_if_present(path: &Path) -> Result<Option<Hello>> {
 fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
     // Read the build before the rest: another build's hello may carry fields this one cannot
     // decode, and the build is what says why. A hello naming no build is another build's too.
-    let ours = BuildId::current()?;
+    let ours = current_build()?;
     let theirs = value.get("build").and_then(serde_json::Value::as_str);
     if theirs != Some(ours.as_str()) {
         let pid = value.get("pid").and_then(serde_json::Value::as_u64);
@@ -3935,12 +3848,15 @@ mod process_demand_tests {
 #[cfg(test)]
 mod socket_ownership_tests {
     use super::*;
+    use std::ffi::OsStr;
+
     use cowshed_os::fork_lock::Spawn as _;
     #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::UnixStreamBackstop as _;
     use cowshed_os::test_backstop::{
         AsyncChildBackstop as _, AsyncUnixStreamBackstop as _, ChildBackstop as _,
     };
+    use cowshed_types::supervisor_socket::{is_socket_name, socket_path};
 
     /// A supervisor's socket is recognized by exactly the name `socket_path` gives it; its
     /// membership twin and every other entry of `run` are not supervisor sockets.
@@ -4343,7 +4259,7 @@ mod admission_source_tests {
             ExecClass::InteractiveResident,
         ] {
             for scope in [ExecScope::Workspace, ExecScope::HostGate] {
-                let worker = AdmissionSource::Worker.admit(class, scope);
+                let worker = admit(AdmissionSource::Worker, class, scope);
                 if scope == ExecScope::Workspace && class != ExecClass::Gate {
                     worker.expect("a worker admits its workspace's non-gate work");
                 } else {
@@ -4354,8 +4270,7 @@ mod admission_source_tests {
                         Some(&CpuAdmissionRefusal::ClassNotPermitted { class, scope })
                     );
                 }
-                AdmissionSource::Coordinator
-                    .admit(class, scope)
+                admit(AdmissionSource::Coordinator, class, scope)
                     .expect("the coordinator admits every pairing");
             }
         }

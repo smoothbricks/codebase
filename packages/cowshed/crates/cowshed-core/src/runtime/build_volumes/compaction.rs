@@ -23,10 +23,11 @@ use crate::build_volume::{
     BuildVolumeId, BuildVolumeRecord, BuildVolumeRole, Registrant, Registration,
 };
 use crate::runtime::project::SEED_COMPACTION_VERB;
-use crate::runtime::supervisor_socket::BuildId;
+use crate::runtime::supervisor_socket::current_build;
 use crate::storage::apfs::native::{CompactedSeed, CompactionSource, SeedCatchUp, SeedCompaction};
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::supervisor_socket::BuildId;
 
 /// A seed holding this many extents is compacted. Measured 2026-10-25 on this host: a fork's
 /// first write costs 92 to 175 µs per extent of its seed's map (SmoothBricks' 880,639-extent
@@ -324,7 +325,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 "cowshed doctor --json",
             )
         })?;
-        Ok(held(recorded, at, BuildId::current()?))
+        Ok(held(recorded, at, current_build()?))
     }
 
     /// Record that a compaction by this build failed with `error`: no land of this build starts
@@ -335,7 +336,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         fs::create_dir_all(&directory)
             .map_err(|error| io("create the seed compaction directory", &directory, &error))?;
         let record = serde_json::to_vec(&Failure {
-            build: BuildId::current()?.clone(),
+            build: current_build()?.clone(),
             error: error.to_owned(),
         })
         .map_err(|error| {

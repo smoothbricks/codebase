@@ -48,7 +48,6 @@ use crate::runtime::job_progress::JobProgressStream;
 use crate::runtime::process_stream::JobProcessStream;
 #[cfg(target_os = "macos")]
 use crate::runtime::supervisor::{NxDaemonRetirement, RetireWhen};
-use crate::runtime::supervisor_socket::AdmissionSource;
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
@@ -58,6 +57,7 @@ use cowshed_types::paths::DEFAULT_LANDING_BRANCH;
 #[cfg(target_os = "macos")]
 use cowshed_types::repository::OwnedRepoIds;
 use cowshed_types::repository::{RepoId, RepositoryBinding};
+use cowshed_types::supervisor_socket::AdmissionSource;
 
 const ROUTER_CAPACITY: usize = 64;
 const STARTUP_LIFECYCLE_ATTEMPTS: usize = 8;
@@ -2063,7 +2063,7 @@ impl ProjectActor {
         upload: Option<Bytes>,
         demand: crate::media_room::AttachDemand,
     ) -> Result<JobId> {
-        source.admit(params.class, params.scope)?;
+        super::supervisor_socket::admit(source, params.class, params.scope)?;
         let (scope, session, exec) = exec_request(params, upload)?;
         self.require_scoped_workspace(authority, &scope.repo_id, &scope.workspace)
             .await?;
@@ -5889,12 +5889,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             main_mount,
             volumes.layout.grant(workspace, landing)?,
         )?;
-        let ledger =
-            crate::runtime::job_groups::ledger_path(&super::supervisor_socket::socket_path(
+        let ledger = crate::runtime::job_groups::ledger_path(
+            &cowshed_types::supervisor_socket::socket_path(
                 self.descriptor.storage.store(),
                 &self.descriptor.repo_id,
                 workspace,
-            ));
+            ),
+        );
         let state = crate::build_volume::BuildVolumeState::read(
             &landing.join(crate::build_volume::BUILD_LINK),
         )?;
@@ -9830,7 +9831,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // The effective revision covers the project's standing grants too, so a project grant
         // change advances its served revision exactly as a workspace grant change does.
         let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
-        let socket = super::supervisor_socket::socket_path(
+        let socket = cowshed_types::supervisor_socket::socket_path(
             self.descriptor.storage.store(),
             &self.descriptor.repo_id,
             name,
@@ -9963,7 +9964,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // use: a spare activated ahead of demand is the next command's warm shell.
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: Some(super::job_groups::ledger_path(&socket)),
-            membership_socket: Some(super::supervisor_socket::membership_socket_path(&socket)),
+            membership_socket: Some(cowshed_types::supervisor_socket::membership_socket_path(
+                &socket,
+            )),
             // Each job's span is sealed beside the controller's commitments.
             telemetry_root: Some(self.telemetry_root.clone()),
             // Filled from the lost predecessor's ledger once this process holds the socket.
@@ -10254,7 +10257,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// one left unresolved ([`super::job_groups`]): what any change to the workspace's substrate
     /// reads first to learn whether processes it cannot account for may still use it.
     fn job_group_ledger(&self, workspace: &WorkspaceName) -> PathBuf {
-        super::job_groups::ledger_path(&super::supervisor_socket::socket_path(
+        super::job_groups::ledger_path(&cowshed_types::supervisor_socket::socket_path(
             self.descriptor.storage.store(),
             &self.descriptor.repo_id,
             workspace,
@@ -10286,7 +10289,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let pid = if self.served.contains_key(workspace) {
             Some(std::process::id())
         } else {
-            let socket = super::supervisor_socket::socket_path(
+            let socket = cowshed_types::supervisor_socket::socket_path(
                 self.descriptor.storage.store(),
                 &self.descriptor.repo_id,
                 workspace,
@@ -10371,7 +10374,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let handle = match self.supervisors.get(workspace) {
             Some(handle) => handle.clone(),
             None => {
-                let socket = super::supervisor_socket::socket_path(
+                let socket = cowshed_types::supervisor_socket::socket_path(
                     self.descriptor.storage.store(),
                     &self.descriptor.repo_id,
                     workspace,
@@ -10410,7 +10413,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         when: RetireWhen,
         nx_daemon: NxDaemonRetirement,
     ) -> Result<super::supervisor_socket::BoundSocket> {
-        let socket = super::supervisor_socket::socket_path(
+        let socket = cowshed_types::supervisor_socket::socket_path(
             self.descriptor.storage.store(),
             &self.descriptor.repo_id,
             name,
@@ -10489,7 +10492,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let current = self.current(&name).await?;
         self.ensure_supervisor_for(current).await?;
         if !self.served.contains_key(&name) {
-            let socket = super::supervisor_socket::socket_path(
+            let socket = cowshed_types::supervisor_socket::socket_path(
                 self.descriptor.storage.store(),
                 &self.descriptor.repo_id,
                 &name,
@@ -19637,7 +19640,7 @@ mod removal_supervisor_tests {
                     want: Some(std::num::NonZeroUsize::MIN),
                     scope: crate::api::dto::ExecScope::Workspace,
                 },
-                super::super::supervisor_socket::AdmissionSource::Worker,
+                cowshed_types::supervisor_socket::AdmissionSource::Worker,
             )
             .await
             .expect("start job");

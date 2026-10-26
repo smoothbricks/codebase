@@ -33,12 +33,13 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use super::supervisor::WorkspaceAuthoritySnapshot;
 use super::supervisor_socket::{
-    self, AuthorityWire, BuildId, protocol_error, read_json, verify_peer, write_json,
+    self, AuthorityWire, current_build, protocol_error, read_json, verify_peer, write_json,
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::timing;
 use cowshed_types::metadata::WorkspaceName;
+use cowshed_types::supervisor_socket::BuildId;
 
 /// How long a started supervisor may take to open its project, mount its workspace and answer.
 const START_BOUND: Duration = Duration::from_secs(180);
@@ -361,7 +362,7 @@ impl SupervisorManager {
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|entry| supervisor_socket::is_socket_name(&entry.file_name()))
+            .filter(|entry| cowshed_types::supervisor_socket::is_socket_name(&entry.file_name()))
             .map(|entry| entry.path())
             .collect();
         self.recovering
@@ -427,7 +428,7 @@ impl SupervisorManager {
         project_root: &Path,
         authority: &WorkspaceAuthoritySnapshot,
     ) -> Result<Ensured> {
-        let socket = supervisor_socket::socket_path(
+        let socket = cowshed_types::supervisor_socket::socket_path(
             &self.store_root,
             &authority.repo_id,
             &authority.workspace,
@@ -1003,7 +1004,7 @@ async fn serve_ensure(mut stream: UnixStream, manager: &SupervisorManager) -> Re
 /// it without reading the sentence. Read before the rest of the request: another build's may carry
 /// fields this one cannot decode, and the build is what says why.
 fn same_build(request: &serde_json::Value) -> Result<()> {
-    let ours = BuildId::current()?;
+    let ours = current_build()?;
     let theirs = request.get("build").and_then(serde_json::Value::as_str);
     if theirs == Some(ours.as_str()) {
         return Ok(());
@@ -1071,7 +1072,7 @@ pub async fn ensure(
     write_json(
         &mut stream,
         &ManagerRequest::Ensure {
-            build: BuildId::current()?.clone(),
+            build: current_build()?.clone(),
             project_root: project_root.to_path_buf(),
             authority: authority.into(),
         },
@@ -1166,7 +1167,7 @@ pub async fn require_same_build(store_root: &Path) -> Result<()> {
     write_json(
         &mut stream,
         &ManagerRequest::SameBuild {
-            build: BuildId::current()?.clone(),
+            build: current_build()?.clone(),
         },
     )
     .await?;
@@ -1461,7 +1462,7 @@ mod tests {
         assert_eq!(
             error.other_build_source(),
             Some(&OtherBuild {
-                daemon: BuildId::current().expect("this build").clone(),
+                daemon: current_build().expect("this build").clone(),
                 caller: Some(serde_json::from_value(serde_json::json!("another build")).unwrap()),
             })
         );
@@ -1511,7 +1512,7 @@ mod tests {
         assert_eq!(
             error.other_build_source(),
             Some(&OtherBuild {
-                daemon: BuildId::current().expect("this build").clone(),
+                daemon: current_build().expect("this build").clone(),
                 caller: Some(serde_json::from_value(serde_json::json!("another build")).unwrap()),
             })
         );
@@ -1521,7 +1522,7 @@ mod tests {
 
     /// Where the supervisor of `workspace` of `acme/widget` listens in `store`.
     fn supervisor_socket_of(store: &Path, workspace: &str) -> PathBuf {
-        supervisor_socket::socket_path(
+        cowshed_types::supervisor_socket::socket_path(
             store,
             &cowshed_types::repository::RepoId::parse("acme/widget").expect("repo id"),
             &cowshed_types::metadata::WorkspaceName::new(workspace).expect("workspace"),
@@ -1743,8 +1744,11 @@ mod tests {
         let store = recovery_store("cowshed-members", &["raven"]);
         std::fs::write(manager_socket_path(&store), b"").expect("the manager's socket file");
         let raven = supervisor_socket_of(&store, "raven");
-        std::fs::write(supervisor_socket::membership_socket_path(&raven), b"")
-            .expect("raven's membership socket file");
+        std::fs::write(
+            cowshed_types::supervisor_socket::membership_socket_path(&raven),
+            b"",
+        )
+        .expect("raven's membership socket file");
         let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), healed());
         let recovery = manager.recovery();
         assert_eq!(
@@ -2029,8 +2033,11 @@ mod tests {
             grant_revision: 1,
             lifecycle_revision: 1,
         };
-        let socket =
-            supervisor_socket::socket_path(&store, &authority.repo_id, &authority.workspace);
+        let socket = cowshed_types::supervisor_socket::socket_path(
+            &store,
+            &authority.repo_id,
+            &authority.workspace,
+        );
         std::fs::create_dir_all(socket.parent().unwrap()).expect("run directory");
         // A live supervisor too busy to answer: it accepts and holds the connection, and says
         // nothing.

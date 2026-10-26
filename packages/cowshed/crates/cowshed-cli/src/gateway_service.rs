@@ -1471,7 +1471,7 @@ async fn read_scheduling(store: &Path) -> HostScheduling {
 
 /// The live jobs of every workspace supervisor serving in `store`, read from each supervisor's
 /// own job list: the store's `run` directory holds one socket per supervisor
-/// ([`supervisor_socket::socket_path`]). A socket nothing serves any more is no supervisor; one
+/// ([`cowshed_types::supervisor_socket::socket_path`]). A socket nothing serves any more is no supervisor; one
 /// that does not answer is named with why, and its jobs are in no count.
 async fn read_jobs(store: &Path) -> HostJobs {
     let run = store.join("run");
@@ -1519,7 +1519,7 @@ async fn read_jobs(store: &Path) -> HostJobs {
 }
 
 /// A workspace supervisor's own socket in the store's `run` directory: neither the membership
-/// socket beside it ([`supervisor_socket::membership_socket_path`]) nor the supervisor manager's
+/// socket beside it ([`cowshed_types::supervisor_socket::membership_socket_path`]) nor the supervisor manager's
 /// ([`supervisor_manager::manager_socket_path`]).
 fn is_supervisor_socket(store: &Path, path: &Path) -> bool {
     path.extension()
@@ -5303,7 +5303,7 @@ mod tests {
                 let workspace =
                     cowshed_types::metadata::WorkspaceName::new(*workspace).expect("workspace");
                 fs::write(
-                    supervisor_socket::socket_path(&store, &repo, &workspace),
+                    cowshed_types::supervisor_socket::socket_path(&store, &repo, &workspace),
                     b"",
                 )
                 .expect("a socket file");

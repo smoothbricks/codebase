@@ -14,6 +14,7 @@ pub mod lifecycle;
 pub mod metadata;
 pub mod paths;
 pub mod repository;
+pub mod supervisor_socket;
 pub mod trace_enum;
 pub mod vnodes;
 pub mod wait;

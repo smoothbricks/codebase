@@ -41,7 +41,6 @@ use cowshed_core::runtime::supervisor::{
     ProcessSpawnRequest, RunningProcess, SpawnSink, WorkspaceAuthoritySnapshot,
     WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
-use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::runtime::{
     ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost,
     ProjectSnapshots, RuntimeLogChunk, WorkspaceSnapshot,
@@ -51,6 +50,7 @@ use cowshed_types::metadata::{
     NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_types::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
+use cowshed_types::supervisor_socket::AdmissionSource;
 
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};

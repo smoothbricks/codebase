@@ -166,10 +166,10 @@ enum ColdRefusal {
 #[serde(rename_all = "camelCase")]
 pub struct OtherBuild {
     /// The build the daemon runs.
-    pub daemon: crate::runtime::supervisor_socket::BuildId,
+    pub daemon: cowshed_types::supervisor_socket::BuildId,
     /// The build the request named; `None` for a request that named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caller: Option<crate::runtime::supervisor_socket::BuildId>,
+    pub caller: Option<cowshed_types::supervisor_socket::BuildId>,
 }
 
 /// The structured source, or none when it names a reason this build does not know: version skew
@@ -570,7 +570,7 @@ impl CowshedError {
             other.daemon,
             other.caller.as_ref().map_or(
                 "(unnamed)",
-                crate::runtime::supervisor_socket::BuildId::as_str
+                cowshed_types::supervisor_socket::BuildId::as_str
             )
         );
         Self {
