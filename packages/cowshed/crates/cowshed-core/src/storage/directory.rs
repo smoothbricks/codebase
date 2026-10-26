@@ -41,8 +41,8 @@ use cowshed_apfs::{DetachIntent, MountAccess};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::image::is_image_path;
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION,

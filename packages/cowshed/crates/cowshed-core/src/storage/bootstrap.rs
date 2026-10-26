@@ -9,11 +9,13 @@ use async_trait::async_trait;
 use plist::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use toml::Spanned;
 
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::process::fmt_command_failure;
-use cowshed_types::capabilities::{CapabilityId, CapabilityOverride, DeclaredState};
+use cowshed_types::config::{
+    CowshedConfig, PoolNameError, SubstrateConfig, VOLUME_MARKER_FILE, parse_cowshed_config,
+    validate_pool_name,
+};
 
 use super::fstab::FstabPin;
 
@@ -27,7 +29,6 @@ pub use native::{
     execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
 
-pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
 pub const APFS_CACHES_VOLUME: &str = "cowshed.caches";
 use cowshed_gateway_types::STORE_ROOT;
@@ -300,258 +301,6 @@ pub(crate) use cowshed_apfs::device::DISKUTIL;
 const ZFS: &str = "/usr/sbin/zfs";
 const MARKER_VERSION: u32 = 1;
 
-/// Repository-owned settings accepted from `.cowshed.toml`.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CowshedConfig {
-    substrate: Option<SubstrateConfig>,
-    /// `[sandbox] deny`: workspace-relative paths no job may read or write. Trusted only from
-    /// main's checkout, which the operator owns; a workspace's copy is the agent's to edit.
-    sandbox_deny: Vec<PathBuf>,
-    /// `[caches] home`: HOME-relative cache directories the repository's own tooling places,
-    /// shared into every sandbox of the project. Trusted only from main's checkout, exactly like
-    /// `[sandbox] deny`.
-    caches_home: Vec<PathBuf>,
-    capabilities: std::collections::BTreeMap<
-        cowshed_types::capabilities::CapabilityId,
-        cowshed_types::capabilities::CapabilityOverride,
-    >,
-    /// `[build] capacity`: the capacity of the build volumes this project creates from nothing
-    /// (16_build_volumes.md, "Substrate"); a clone and a seed inherit their source's instead.
-    build_capacity: Option<cowshed_apfs::image::ImageCapacity>,
-    /// `[build] state`: build state the repository declares for tools no capability detects
-    /// (16_build_volumes.md, "Declared build state"), sorted, no spelling inside another.
-    build_state: Vec<cowshed_types::capabilities::DeclaredState>,
-    /// `[nx] daemon_idle`: how long a shed goes unused before its supervisor stops the Nx daemon
-    /// it keeps (04_sandbox.md, "The Nx daemon stays on").
-    nx_daemon_idle: Option<cowshed_types::config::NxDaemonIdle>,
-}
-
-impl CowshedConfig {
-    pub fn substrate(&self) -> Option<&SubstrateConfig> {
-        self.substrate.as_ref()
-    }
-
-    pub fn sandbox_deny(&self) -> &[PathBuf] {
-        &self.sandbox_deny
-    }
-
-    pub fn caches_home(&self) -> &[PathBuf] {
-        &self.caches_home
-    }
-
-    pub fn capabilities(
-        &self,
-    ) -> &std::collections::BTreeMap<
-        cowshed_types::capabilities::CapabilityId,
-        cowshed_types::capabilities::CapabilityOverride,
-    > {
-        &self.capabilities
-    }
-
-    /// The capacity a build volume created from nothing gets: `[build] capacity`, else
-    /// [`crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY`].
-    pub fn build_capacity(&self) -> cowshed_apfs::image::ImageCapacity {
-        self.build_capacity
-            .unwrap_or(crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY)
-    }
-
-    /// The entries `[build] state` declares; empty without it. Patterns are expanded against the
-    /// checkout at discovery.
-    pub fn build_state(&self) -> &[cowshed_types::capabilities::DeclaredState] {
-        &self.build_state
-    }
-
-    /// How long a shed goes unused before its supervisor stops its Nx daemon: `[nx] daemon_idle`,
-    /// else [`cowshed_types::config::NxDaemonIdle::DEFAULT`].
-    pub fn nx_daemon_idle(&self) -> cowshed_types::config::NxDaemonIdle {
-        self.nx_daemon_idle
-            .unwrap_or(cowshed_types::config::NxDaemonIdle::DEFAULT)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SubstrateConfig {
-    pool: String,
-}
-
-impl SubstrateConfig {
-    pub fn pool(&self) -> &str {
-        &self.pool
-    }
-}
-
-/// `.cowshed.toml` as TOML spells it: every section and key cowshed reads, and nothing else. The
-/// TOML parser refuses a duplicated key or table and serde an unknown one, so a setting cannot
-/// silently change project detection; the spans locate each value for the validation in
-/// [`parse_cowshed_config`].
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfigFile {
-    substrate: Option<SubstrateSection>,
-    sandbox: Option<SandboxSection>,
-    build: Option<BuildSection>,
-    caches: Option<CachesSection>,
-    nx: Option<NxSection>,
-    #[serde(default)]
-    capabilities: BTreeMap<CapabilityId, CapabilitySection>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NxSection {
-    daemon_idle: Spanned<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SubstrateSection {
-    kind: ExplicitSubstrate,
-    pool: Spanned<String>,
-}
-
-/// `[substrate] kind`: only an explicit ZFS pool overrides the filesystem evidence.
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ExplicitSubstrate {
-    Zfs,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SandboxSection {
-    deny: Vec<Spanned<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BuildSection {
-    capacity: Option<Spanned<String>>,
-    state: Option<Vec<Spanned<String>>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CachesSection {
-    home: Vec<Spanned<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CapabilitySection {
-    #[serde(default)]
-    disabled: bool,
-    directory: Option<Spanned<String>>,
-}
-
-/// Parse repository-owned storage, sandbox deny, build volume capacity and declared state,
-/// repository cache, the Nx daemon idle bound and convention-only capability overrides. Unknown or duplicated settings fail
-/// rather than silently changing project detection.
-pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
-    let file: ConfigFile = toml::from_str(input).map_err(|error| ConfigError::Malformed {
-        line: error.span().map(|span| line_at(input, span.start)),
-        message: error.message().to_owned(),
-    })?;
-    let substrate = match file.substrate {
-        Some(SubstrateSection {
-            kind: ExplicitSubstrate::Zfs,
-            pool,
-        }) => {
-            let pool = pool.into_inner();
-            validate_pool_name(&pool).map_err(ConfigError::InvalidPool)?;
-            Some(SubstrateConfig { pool })
-        }
-        None => None,
-    };
-    let sandbox_deny = match file.sandbox {
-        Some(section) => relative_paths(input, section.deny, "sandbox", "deny", "workspace")?,
-        None => Vec::new(),
-    };
-    let caches_home = match file.caches {
-        Some(section) => relative_paths(input, section.home, "caches", "home", "HOME")?,
-        None => Vec::new(),
-    };
-    let (build_capacity, build_state) = match file.build {
-        None => (None, Vec::new()),
-        Some(BuildSection {
-            capacity: None,
-            state: None,
-        }) => return Err(ConfigError::EmptySection("build")),
-        Some(BuildSection { capacity, state }) => (
-            capacity
-                .map(|capacity| {
-                    cowshed_apfs::image::ImageCapacity::parse(capacity.get_ref()).map_err(
-                        |reason| ConfigError::InvalidBuildCapacity {
-                            line: line_of(input, &capacity),
-                            reason,
-                        },
-                    )
-                })
-                .transpose()?,
-            match state {
-                Some(entries) => build_state(input, entries)?,
-                None => Vec::new(),
-            },
-        ),
-    };
-    let nx_daemon_idle = file
-        .nx
-        .map(|section| {
-            nx_daemon_idle(section.daemon_idle.get_ref()).ok_or_else(|| {
-                ConfigError::InvalidNxDaemonIdle {
-                    line: line_of(input, &section.daemon_idle),
-                    value: section.daemon_idle.get_ref().clone(),
-                }
-            })
-        })
-        .transpose()?;
-    let capabilities = file
-        .capabilities
-        .into_iter()
-        .map(|(id, section)| {
-            let directory = section
-                .directory
-                .map(|directory| {
-                    cowshed_types::capabilities::validate_override_directory(directory.get_ref())
-                        .map_err(|reason| ConfigError::InvalidCapabilityDirectory {
-                            section: id.section_name(),
-                            line: line_of(input, &directory),
-                            reason,
-                        })
-                })
-                .transpose()?;
-            Ok((
-                id,
-                CapabilityOverride {
-                    disabled: section.disabled,
-                    directory,
-                },
-            ))
-        })
-        .collect::<Result<_, ConfigError>>()?;
-    Ok(CowshedConfig {
-        substrate,
-        sandbox_deny,
-        caches_home,
-        capabilities,
-        build_capacity,
-        build_state,
-        nx_daemon_idle,
-    })
-}
-
-/// `[nx] daemon_idle`: a whole number of seconds, minutes or hours above zero (`"90s"`, `"5m"`,
-/// `"1h"`); `None` for anything else.
-fn nx_daemon_idle(text: &str) -> Option<cowshed_types::config::NxDaemonIdle> {
-    let (count, seconds) = [('s', 1), ('m', 60), ('h', 60 * 60)]
-        .into_iter()
-        .find_map(|(unit, seconds)| Some((text.strip_suffix(unit)?, seconds)))?;
-    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let seconds = count.parse::<u64>().ok()?.checked_mul(seconds)?;
-    cowshed_types::config::NxDaemonIdle::new(std::time::Duration::from_secs(seconds))
-}
-
 /// Main's `.cowshed.toml`, the only copy whose `[sandbox]` and `[caches]` sections are trusted:
 /// main's checkout is the operator's, while a workspace's copy is the agent's to edit. A missing
 /// file declares nothing; an unreadable or invalid one refuses rather than drop a deny or a cache.
@@ -575,158 +324,6 @@ pub fn main_cowshed_config(main_mount: &Path) -> crate::Result<CowshedConfig> {
             "fix main's .cowshed.toml, then retry",
         )
     })
-}
-
-/// The 1-based line `value` starts on in `input`.
-fn line_of<T>(input: &str, value: &Spanned<T>) -> usize {
-    line_at(input, value.span().start)
-}
-
-/// The 1-based line of byte `offset` in `input`.
-fn line_at(input: &str, offset: usize) -> usize {
-    input
-        .bytes()
-        .take(offset)
-        .filter(|&byte| byte == b'\n')
-        .count()
-        + 1
-}
-
-/// `[sandbox] deny` and `[caches] home`: paths, each relative to `base` (the workspace, or HOME)
-/// and a non-empty path of plain components — no root, no `.` or `..` — sorted and deduplicated.
-fn relative_paths(
-    input: &str,
-    entries: Vec<Spanned<String>>,
-    section: &'static str,
-    key: &'static str,
-    base: &'static str,
-) -> Result<Vec<PathBuf>, ConfigError> {
-    let mut paths = entries
-        .into_iter()
-        .map(|entry| {
-            let line = line_of(input, &entry);
-            let path = entry.into_inner();
-            let relative = Path::new(&path);
-            if path.is_empty()
-                || relative
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-            {
-                return Err(ConfigError::InvalidRelativePath {
-                    section,
-                    key,
-                    base,
-                    line,
-                    path,
-                });
-            }
-            Ok(relative.components().collect::<PathBuf>())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
-
-/// `[build] state`: checkout-relative paths or patterns, each a [`DeclaredState`], sorted and
-/// deduplicated, no spelling inside another: one inside another would link state through state.
-/// A pattern's expansion is checked again at discovery, where its matches are known.
-fn build_state(
-    input: &str,
-    entries: Vec<Spanned<String>>,
-) -> Result<Vec<DeclaredState>, ConfigError> {
-    let mut state = entries
-        .into_iter()
-        .map(|entry| {
-            let line = line_of(input, &entry);
-            let path = entry.into_inner();
-            DeclaredState::parse(&path)
-                .map(|declared| (declared, line))
-                .map_err(|reason| ConfigError::InvalidBuildState { line, path, reason })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    // Sorting by (entry, line) keeps a repeated entry's first line.
-    state.sort();
-    state.dedup_by(|later, earlier| later.0 == earlier.0);
-    let spellings: Vec<(PathBuf, usize)> = state
-        .iter()
-        .map(|(entry, line)| (entry.spelling(), *line))
-        .collect();
-    for (index, (outer, _)) in spellings.iter().enumerate() {
-        if let Some((inner, line)) = spellings
-            .iter()
-            .enumerate()
-            .find(|(other, (inner, _))| *other != index && inner.starts_with(outer))
-            .map(|(_, inner)| inner)
-        {
-            return Err(ConfigError::OverlappingBuildState {
-                line: *line,
-                outer: outer.clone(),
-                inner: inner.clone(),
-            });
-        }
-    }
-    Ok(state.into_iter().map(|(entry, _)| entry).collect())
-}
-
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum ConfigError {
-    /// Not TOML, or TOML that is not a `.cowshed.toml`: a syntax error, a duplicated or unknown
-    /// section or key, a missing key, or a value of the wrong type. `message` is the TOML
-    /// reader's own, which names what it expected.
-    #[error(
-        "malformed configuration{}: {message}",
-        line.map_or_else(String::new, |line| format!(" at line {line}"))
-    )]
-    Malformed {
-        line: Option<usize>,
-        message: String,
-    },
-    #[error(
-        "[{section}] {key} entry {path:?} at line {line} must be a non-empty {base}-relative path without `.` or `..`"
-    )]
-    InvalidRelativePath {
-        section: &'static str,
-        key: &'static str,
-        base: &'static str,
-        line: usize,
-        path: String,
-    },
-    #[error("[{section}] directory at line {line}: {reason}")]
-    InvalidCapabilityDirectory {
-        section: &'static str,
-        line: usize,
-        reason: &'static str,
-    },
-    #[error("[build] capacity at line {line}: {reason}")]
-    InvalidBuildCapacity {
-        line: usize,
-        reason: cowshed_apfs::image::ImageCapacityError,
-    },
-    #[error("[build] state entry {path:?} at line {line} {reason}")]
-    InvalidBuildState {
-        line: usize,
-        path: String,
-        reason: &'static str,
-    },
-    #[error(
-        "[build] state at line {line} declares {} inside {}; declare only the outer path",
-        inner.display(),
-        outer.display()
-    )]
-    OverlappingBuildState {
-        line: usize,
-        outer: PathBuf,
-        inner: PathBuf,
-    },
-    #[error(
-        "[nx] daemon_idle {value:?} at line {line} must be a whole number of seconds, minutes or hours above zero, such as \"5m\""
-    )]
-    InvalidNxDaemonIdle { line: usize, value: String },
-    #[error("the [{0}] section sets nothing")]
-    EmptySection(&'static str),
-    #[error("invalid ZFS pool: {0}")]
-    InvalidPool(PoolNameError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -902,26 +499,6 @@ pub enum SelectionError {
         configured: String,
         containing: String,
     },
-}
-
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum PoolNameError {
-    #[error("pool names must be one non-empty component without whitespace or traversal")]
-    InvalidPool,
-    #[error("invalid containing dataset {0:?}")]
-    InvalidDataset(String),
-}
-
-fn validate_pool_name(pool: &str) -> Result<(), PoolNameError> {
-    let mut chars = pool.chars();
-    let first = chars.next().ok_or(PoolNameError::InvalidPool)?;
-    if first.is_ascii_digit()
-        || !matches!(first, 'A'..='Z' | 'a'..='z' | '_')
-        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
-    {
-        return Err(PoolNameError::InvalidPool);
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2505,7 +2082,7 @@ mod tests {
 
     fn store_marker(root: &Path, version: u32) {
         std::fs::write(
-            root.join(super::VOLUME_MARKER_FILE),
+            root.join(cowshed_types::config::VOLUME_MARKER_FILE),
             format!(r#"{{"version":{version},"role":"store","substrate":"apfs"}}"#),
         )
         .expect("store marker");
@@ -2594,7 +2171,8 @@ mod tests {
         );
         assert!(!root.join("run").join(OWNER_MARKER_FILE).exists());
         let marker = VolumeMarker::from_json(
-            &std::fs::read(root.join(super::VOLUME_MARKER_FILE)).expect("store marker"),
+            &std::fs::read(root.join(cowshed_types::config::VOLUME_MARKER_FILE))
+                .expect("store marker"),
         )
         .expect("current marker");
         assert!(marker.is_current(), "{marker:?}");

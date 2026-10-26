@@ -9,7 +9,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::store_lock::LockMode;
 use cowshed_apfs::store_lock::verify_no_symlinks;
@@ -35,6 +34,7 @@ use cowshed_core::storage::{StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::lifecycle::CheckpointLabel;
 use cowshed_types::lifecycle::{
     LifecycleFact, LifecycleWorkspace, MountJoin, MountRefusalReason, MountState, Pin, Revision,

@@ -12,10 +12,10 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::api::held_lock::{LockHolding, LockOperation};
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
 use cowshed_os::timing::timed_async;
 use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 

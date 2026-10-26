@@ -22236,7 +22236,7 @@ mod retired_recovery_tests {
         fn grow_image(
             &self,
             image: &Path,
-            _: cowshed_apfs::image::ImageCapacity,
+            _: cowshed_types::image::ImageCapacity,
         ) -> std::io::Result<()> {
             panic!("reclaiming a detached retired image grew an image: {image:?}");
         }
@@ -22473,8 +22473,8 @@ fn native_restore_error(
 /// Read a capacity the way both image verbs spell it, refusing anything the tools would have to
 /// round or reinterpret before the caller's workspace is touched.
 #[cfg(target_os = "macos")]
-fn parse_capacity(value: &str) -> Result<cowshed_apfs::image::ImageCapacity> {
-    cowshed_apfs::image::ImageCapacity::parse(value).map_err(|error| {
+fn parse_capacity(value: &str) -> Result<cowshed_types::image::ImageCapacity> {
+    cowshed_types::image::ImageCapacity::parse(value).map_err(|error| {
         CowshedError::usage(
             error.to_string(),
             "use a capacity such as 100g, 200g, or 1t",
@@ -28747,7 +28747,7 @@ mod volume_labeller_tests {
         fn grow_image(
             &self,
             image: &Path,
-            _: cowshed_apfs::image::ImageCapacity,
+            _: cowshed_types::image::ImageCapacity,
         ) -> std::io::Result<()> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,

@@ -7,7 +7,6 @@ pub mod attach_budget;
 pub mod device;
 pub mod disk_image_helpers;
 pub mod disk_lease;
-pub mod image;
 pub mod media_cap;
 pub mod mounts;
 #[cfg(target_os = "macos")]
@@ -16,7 +15,6 @@ pub mod release_authority;
 pub mod store_lock;
 pub mod template;
 
-use crate::image::ImageCapacity;
 use crate::mounts::{NativeUnmountError, PostUnmountFd, UnmountEffect, UnmountMode};
 use cowshed_os::deadline::{Bound, LatencyClass};
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
@@ -24,6 +22,7 @@ use cowshed_os::host_load::HostLoad;
 use cowshed_os::namespace::HostNamespace;
 pub use cowshed_os::process::{CommandOutput, ProcessStatus};
 use cowshed_os::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::image::{IMAGE_EXTENSION, is_image_path};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -1168,7 +1167,7 @@ impl CommandRunner for SystemCommandRunner {
 /// there is no outer image header or allocation map to decode.
 #[cfg(target_os = "macos")]
 mod raw {
-    use crate::image::ImageCapacity;
+    use cowshed_types::image::ImageCapacity;
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -5403,7 +5402,7 @@ mod io_registry {
         ApfsMediaFacts, ApfsVolumeFacts, AttachedDiskImage, DiskImageSource, ImageMedia,
         RegisteredApfsContainer, project_registered_apfs,
     };
-    use crate::image::ImageCapacity;
+    use cowshed_types::image::ImageCapacity;
     use std::collections::BTreeMap;
     use std::collections::btree_map::Entry;
     use std::ffi::{CStr, c_char, c_void};
@@ -11405,22 +11404,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn capacities_round_trip_through_the_units_the_cli_accepts() {
-        assert_eq!(capacity("100g").bytes(), 107_374_182_400);
-        assert_eq!(capacity("1t").bytes(), 1_099_511_627_776);
-        assert_eq!(capacity("200G"), capacity("204800m"));
-        assert_eq!(capacity("100g").to_string(), "100g");
-        assert_eq!(capacity("1024g").to_string(), "1t");
-        assert_eq!(ImageCapacity::from_bytes(1_500_000).to_string(), "1500000");
-        for rejected in ["", "g", "100", "100k", "-1g", "1.5g", "100gb"] {
-            assert!(
-                ImageCapacity::parse(rejected).is_err(),
-                "{rejected} must not parse as a capacity"
-            );
-        }
     }
 
     #[test]

@@ -3,7 +3,6 @@ mod macos {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    use cowshed_apfs::image::ImageCapacity;
     use cowshed_apfs::{
         ApfsBackend, AttachedImage, CreateImageRequest, DetachIntent, MacOsApfsBackend,
         SystemCommandRunner,
@@ -11,6 +10,7 @@ mod macos {
     use cowshed_core::copy::copy_until_quiescent_blocking;
     use cowshed_os::namespace::HostNamespace;
     use cowshed_types::image::IMAGE_EXTENSION;
+    use cowshed_types::image::ImageCapacity;
 
     pub fn run() {
         let mut arguments = std::env::args_os();

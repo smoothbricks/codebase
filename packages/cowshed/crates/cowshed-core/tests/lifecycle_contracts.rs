@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::ThreadId;
 
 use async_trait::async_trait;
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_core::storage::lifecycle::*;
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::lifecycle::CheckpointLabel;
 use cowshed_types::lifecycle::*;
 use cowshed_types::metadata::{

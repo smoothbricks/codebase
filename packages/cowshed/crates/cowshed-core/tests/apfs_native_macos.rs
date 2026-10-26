@@ -10,7 +10,6 @@ mod kernel_unmount {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use cowshed_apfs::image::ImageCapacity;
     use cowshed_apfs::mounts::{
         FilesystemId, HeldMount, NativeUnmountError, PostUnmountFd, UnmountEffect, UnmountMode,
         hold_mount,
@@ -21,6 +20,7 @@ mod kernel_unmount {
         SystemCommandRunner,
     };
     use cowshed_os::fork_lock::Fenced;
+    use cowshed_types::image::ImageCapacity;
 
     use super::macos::{RealFixture, attached, kernel_mount_at};
 

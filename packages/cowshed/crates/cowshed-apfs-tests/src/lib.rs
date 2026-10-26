@@ -1,6 +1,5 @@
 #![cfg(all(test, target_os = "macos"))]
 
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::blank_template;
 use cowshed_apfs::{
@@ -10,6 +9,7 @@ use cowshed_apfs::{
     disk_image_helpers,
 };
 use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::image::ImageCapacity;
 
 #[path = "../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;

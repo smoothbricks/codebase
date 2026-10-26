@@ -36,9 +36,9 @@ use crate::storage::apfs::native::{
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
 use cowshed_apfs::SystemCommandRunner;
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::LockMode;
 use cowshed_types::capabilities::BuildStatePath;
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;

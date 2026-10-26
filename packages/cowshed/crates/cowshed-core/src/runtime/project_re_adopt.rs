@@ -681,7 +681,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .substrate
             .plan_adopt(crate::storage::lifecycle::AdoptRequest {
                 repo: self.descriptor.repo_id.clone(),
-                capacity: cowshed_apfs::image::ImageCapacity::from_bytes(main_capacity(&source)),
+                capacity: cowshed_types::image::ImageCapacity::from_bytes(main_capacity(&source)),
                 topology_revision: cowshed_types::lifecycle::Revision::new(0),
                 source_checkout: source.checkout.clone(),
                 handoff: handoff(&source),
@@ -1006,7 +1006,7 @@ fn published_build(
             MissingMainBuild::Kept(build) => (
                 build.kept.clone(),
                 build.record.clone(),
-                crate::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY.bytes(),
+                cowshed_types::build_volume::DEFAULT_BUILD_VOLUME_CAPACITY.bytes(),
             ),
         }),
     }

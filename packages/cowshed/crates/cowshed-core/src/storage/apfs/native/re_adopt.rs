@@ -19,8 +19,8 @@ use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX
 use crate::storage::recovery::{
     MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptMain, ReAdoptSource,
 };
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
+use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::append_suffix;
 
 /// The files beside a workspace image: its grants sidecar and its CA companion.

@@ -4,12 +4,12 @@ use std::path::Path;
 
 use super::{MacOsApfsExecutionHost, sync_parent_path};
 use crate::storage::apfs::ApfsStorageError;
-use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::template::blank_template;
 use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, MountAccess, apfs_step_leg,
     timed_apfs_step,
 };
+use cowshed_types::image::ImageCapacity;
 
 impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// Mint `image`, which must not exist: one `clonefile` of the store's template at `capacity`
