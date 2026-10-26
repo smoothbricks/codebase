@@ -19,9 +19,33 @@ actor.
 - Doctor separately reported healthy host/gateway/storage. That is not evidence that the supervisor actor answered or
   recovered. No process was signalled during this investigation.
 
-## Disposition
+## Repair
 
-The defect is the blocking file read on the actor loop. Move the probe's filesystem work off-loop, or give it a
-progress-bounded owner that leaves the actor responsive; do not hide the terminal error or retry the same invocation as
-a repair. Keep this repair out of the current integration batch. A future behavioral proof must stall the owned probe
-while demonstrating that the actor still serves its protocol and reports the probe's actual outcome.
+The keeper owns one blocking probe task, polled as a branch of the supervisor actor's select. Other actor events leave
+that task intact: they never cancel, duplicate or fabricate its result. Completion is judged against the current ledger
+and idle clock; a result for a replaced Nx root is discarded. A lifecycle census uses the same probe before ending a
+keeper start, and a retirement transfers those waiters to the ordinary job conclusion. No silence bound, heartbeat
+authority or retry policy changes.
+
+This follows specs/cowshed/04_sandbox.md, **devenv / Nix inside the sandbox** (Nx keeper), and
+specs/cowshed/05_gateway.md, **Deadlines**. Proof placement follows specs/cowshed/08_testing.md, **Unit tests**. The
+idle decision has a table test with injected times; the shell wiring test holds a real record read open while the actor
+answers its current-authority round trip and accepts a named session, then consumes the released read's actual result.
+
+The injected-clock table passed. The real stalled-read wiring test also passed through the normal sandboxed Nx target,
+with its fixture rooted under the already-granted runtime directory and capability discovery bound to its physical path.
+Earlier fixture attempts were refused before exercising the read: a global temporary root lacked write permission, the
+job TMPDIR put synthetic grants under protected host storage, and a literal runtime symlink did not match capability
+discovery's canonical workspace. None of those infrastructure refusals is counted as a behavioral red.
+
+## Later incident: evidence limits
+
+A later supervisor of the same installed build, PID 34175, failed a wait call after 15.0025485 s without progress. That
+is not a startup hello failure: the job had already been admitted. The canonical trace reader's errors/top/open queries
+over the UTC 20:30–20:40 window on 2026-10-26 found the workspace's job 132 admitted at 20:36:56.452035 and ending in
+error at 20:37:50.536054; job 133 was also admitted. The job's process trace shows bun nx reset --onlyDaemon (PID 8519)
+starting at 20:37:01.685158, running for 47.979 s and ending on SIGTERM; the later kept-daemon script was not reached.
+No retained wait segment names peer PID 34175. A later two-second process sample found that actor mostly in its event
+wait, with some artifact writes; it did not capture the original stall. Therefore the exact syscall in this later
+incident is not proven. The earlier sample above proves the actor-blocking read defect this repair removes; it does not
+prove that every later silence had the same syscall.

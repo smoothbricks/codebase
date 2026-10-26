@@ -1172,15 +1172,18 @@ session, and for the shed's idle bound after a job is admitted or ends, a sessio
 is main's `.cowshed.toml` `[nx] daemon_idle` (06_cli.md, "Configuration"), a whole number of seconds, minutes or hours
 above zero such as `"10m"`, read where the sandbox's repository policy is read, at the supervisor's start; without it
 the bound is five minutes. A job's end restarts the interval itself, rather than the last probe that saw the job run, so
-the bound is measured from the moment the shed fell idle. The ledger is the only source: no probe reads the process
-table or waits on another process's kernel state, because a probe runs inside the supervisor's actor, and a blocking
-call there stops every hello and exec the supervisor answers. Work that runs as no job of the supervisor's, such as a
-host shell's `direnv exec <ws> nx …` on the mount, is not use, and the keeper may stop the daemon under it; such work
-runs through `cowshed exec`, which the ledger records. Untracked work that shows up again is a defect in whatever let it
-run outside the ledger, never a reason to bring back a process walk. Measured 2026-10-21 at about 720 host processes and
-10.25k vnode descriptors: the keeper's former look, one descriptor query of every process every 30 s per shed, made
-12.2k `proc_info` calls and took 47-132 ms when nothing stalled it; one of those calls waited 51 s on the descriptor of
-a `cowshed fork` in uninterruptible sleep, and every supervisor that looked then stopped answering hello and exec
+the bound is measured from the moment the shed fell idle. The ledger is the only source of use: no probe walks the
+process table. The record read and native liveness probe run off the supervisor's actor, at most one in flight. Actor
+events never cancel or duplicate that read; its completion is judged against the current ledger and idle clock, and a
+result for a replaced Nx root is discarded. A lifecycle census uses that same probe before deciding whether to end a
+keeper start. A stalled filesystem read therefore cannot stop hello, exec or the actor round trips that prove heartbeat
+progress (05_gateway.md, "Deadlines"). Work that runs as no job of the supervisor's, such as a host shell's
+`direnv exec <ws> nx …` on the mount, is not use, and the keeper may stop the daemon under it; such work runs through
+`cowshed exec`, which the ledger records. Untracked work that shows up again is a defect in whatever let it run outside
+the ledger, never a reason to bring back a process walk. Measured 2026-10-21 at about 720 host processes and 10.25k
+vnode descriptors: the keeper's former look, one descriptor query of every process every 30 s per shed, made 12.2k
+`proc_info` calls and took 47-132 ms when nothing stalled it; one of those calls waited 51 s on the descriptor of a
+`cowshed fork` in uninterruptible sleep, and every supervisor that looked then stopped answering hello and exec
 (`did not answer within 10 seconds`; 2.6% of 3,528 hellos over 10 s, clustered on 13 of 21 supervisors at once). Agents
 then ran their work around `cowshed exec`, which made exactly the work the look had been written to see. Once the shed
 has gone its idle bound with no job and no session in the ledger the keeper stops the daemon as `nx daemon --stop` does

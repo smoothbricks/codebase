@@ -544,6 +544,8 @@ pub(crate) fn start_ending(job: Option<&JobInfo>) -> Option<String> {
 #[derive(Debug)]
 pub(crate) struct NxDaemonKeeper {
     probes: Interval,
+    /// One owned probe survives cancellation of the actor's select branch.
+    probing: Option<tokio::task::JoinHandle<(PathBuf, Probe)>>,
     /// The foreground daemon job admitted last, retained until a probe sees its terminal result.
     pub(super) starting: Option<JobId>,
     /// How long the shed may go unused before its daemon is stopped.
@@ -597,6 +599,7 @@ impl NxDaemonKeeper {
                 probes.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 Some(Self {
                     probes,
+                    probing: None,
                     starting: None,
                     idle,
                     clock: IdleClock::default(),
@@ -767,6 +770,7 @@ impl NxDaemonKeeper {
             );
         }
         self.stopped = true;
+        self.probes.reset_immediately();
     }
 
     /// Whether a census stopped the keeper's starts ([`Self::stop_starts`]).
@@ -814,11 +818,9 @@ impl NxDaemonKeeper {
     /// runs or a named session it holds. Stops the daemon once the shed has gone unused for its
     /// idle bound ([`IdleClock::probe`]).
     ///
-    /// The ledger is the only source of use. Work that runs as no job of the supervisor's is not
-    /// asked about, so no probe reads the process table or waits on another process's kernel
-    /// state: a probe runs inside the supervisor's actor, and a call that blocks there stops every
-    /// hello and exec the supervisor answers. A kept daemon is said on stderr with the job or
-    /// session that keeps it, each time that changes.
+    /// The ledger is the only source of use: no process-table walk looks for work outside it.
+    /// Record and liveness observations arrive from the owned off-actor probe. A kept daemon
+    /// is said on stderr with the job or session that keeps it, each time that changes.
     pub(crate) async fn judge(
         &mut self,
         project_root: &Path,
@@ -991,14 +993,34 @@ pub(crate) async fn release(project_root: &Path) {
     }
 }
 
-/// The next probe of `keeper`; never, for a supervisor that keeps no daemon.
-pub(crate) async fn next_probe(keeper: &mut Option<NxDaemonKeeper>) {
-    match keeper {
-        Some(keeper) => {
-            keeper.probes.tick().await;
-        }
-        None => std::future::pending().await,
+/// The next completed probe, with at most one blocking read in flight. Dropping this future
+/// leaves that read owned by the keeper, so another actor event never starts a duplicate.
+pub(crate) async fn next_probe(
+    keeper: &mut Option<NxDaemonKeeper>,
+    sandbox: &SandboxConfig,
+) -> Result<Option<(PathBuf, Probe)>> {
+    let Some(keeper) = keeper else {
+        return std::future::pending().await;
+    };
+    if keeper.probing.is_none() {
+        keeper.probes.tick().await;
+        let Some(project_root) = kept_project(sandbox).map(Path::to_path_buf) else {
+            return Ok(None);
+        };
+        keeper.probing = Some(tokio::task::spawn_blocking(move || {
+            let daemon = probe(&nx::daemon_record(&project_root));
+            (project_root, daemon)
+        }));
     }
+    let result = keeper
+        .probing
+        .as_mut()
+        .expect("the keeper owns its probe")
+        .await;
+    keeper.probing = None;
+    result.map(Some).map_err(|error| {
+        CowshedError::internal(format!("the Nx daemon probe did not finish: {error}"))
+    })
 }
 
 /// What stopping one ledger-owned landing daemon did. Every failure is a diagnostic here, never an
@@ -1177,6 +1199,69 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_delayed_probe_uses_the_current_ledger_and_idle_clock() {
+        let epoch = Instant::now();
+        for (label, used_at, completed_at, working, live, expected) in [
+            ("unused startup", None, 20, false, false, Idleness::Settled),
+            (
+                "admitted during read",
+                Some(19),
+                20,
+                false,
+                false,
+                Idleness::InUse,
+            ),
+            (
+                "job still running",
+                Some(0),
+                900,
+                true,
+                true,
+                Idleness::InUse,
+            ),
+            (
+                "just below idle",
+                Some(20),
+                319,
+                false,
+                true,
+                Idleness::InUse,
+            ),
+            (
+                "idle live daemon",
+                Some(20),
+                320,
+                false,
+                true,
+                Idleness::Stop,
+            ),
+            (
+                "idle absent daemon",
+                Some(20),
+                320,
+                false,
+                false,
+                Idleness::Settled,
+            ),
+        ] {
+            let mut clock = IdleClock {
+                last_use: used_at.map(|seconds| epoch + Duration::from_secs(seconds)),
+                daemon_was_live: live,
+            };
+            assert_eq!(
+                clock.probe(
+                    epoch + Duration::from_secs(completed_at),
+                    NxDaemonIdle::DEFAULT,
+                    working,
+                    live,
+                ),
+                expected,
+                "{label}",
+            );
         }
     }
 

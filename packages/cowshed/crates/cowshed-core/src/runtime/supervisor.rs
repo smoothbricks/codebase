@@ -3445,6 +3445,7 @@ impl WorkspaceSupervisor {
             retire_waiters: Vec::new(),
             retire_after_jobs: Vec::new(),
             nx_keeper_waiters: Vec::new(),
+            nx_keeper_stops: Vec::new(),
             command_lane_closed: false,
             nx_daemon,
             labelled_build: None,
@@ -4314,6 +4315,8 @@ struct SupervisorActor {
     /// Callers of [`WorkspaceSupervisorHandle::nx_daemon_keeper`], answered after the next
     /// probe, or with `None` once no keeper is left.
     nx_keeper_waiters: Vec<oneshot::Sender<Result<Option<super::NxKeeperState>>>>,
+    /// Census requests wait on the same probe, never another blocking read on the actor.
+    nx_keeper_stops: Vec<(JobId, oneshot::Sender<Result<()>>)>,
     command_lane_closed: bool,
     /// A shed's keeper of its sandboxed Nx daemon ([`super::nx_daemon`]); main keeps none.
     nx_daemon: Option<NxDaemonKeeper>,
@@ -4618,13 +4621,30 @@ impl SupervisorActor {
                 () = next_sample_tick(&mut self.sample_clock), if self.sample_clock.is_some() => {
                     self.sample_jobs();
                 }
-                () = super::nx_daemon::next_probe(&mut self.nx_daemon),
+                probed = super::nx_daemon::next_probe(
+                    &mut self.nx_daemon,
+                    self.policy.child(crate::api::dto::RunSandboxMode::ReadWrite).0,
+                ),
                     if self.nx_daemon.is_some()
                         && self.lifecycle == ActorLifecycle::Running
                         && !self.command_lane_closed =>
                 {
-                    self.keep_nx_daemon().await;
-                    self.answer_nx_keeper_waiters();
+                    match probed {
+                        Ok(probed) => {
+                            if self.keep_nx_daemon(probed).await {
+                                self.answer_nx_keeper_waiters();
+                            }
+                        }
+                        Err(error) => {
+                            cowshed_os::eprintln!("cowshed: {}", error.message);
+                            for (_, waiter) in self.nx_keeper_stops.drain(..) {
+                                let _ = waiter.send(Err(error.clone()));
+                            }
+                            for waiter in self.nx_keeper_waiters.drain(..) {
+                                let _ = waiter.send(Err(error.clone()));
+                            }
+                        }
+                    }
                 }
             }
             self.finish_ready_jobs().await;
@@ -6274,9 +6294,9 @@ impl SupervisorActor {
     /// again at each probe without a job; one that failed otherwise is tried again at the next
     /// probe, up to [`super::nx_daemon::START_ATTEMPTS`] in a row, then after each pause
     /// ([`super::nx_daemon::FIRST_PAUSE`] doubling to [`super::nx_daemon::PAUSE_CAP`]).
-    async fn keep_nx_daemon(&mut self) {
+    async fn keep_nx_daemon(&mut self, probed: Option<(PathBuf, Probe)>) -> bool {
         let Some(keeper) = &mut self.nx_daemon else {
-            return;
+            return false;
         };
         let (read_write, _) = self
             .policy
@@ -6284,10 +6304,29 @@ impl SupervisorActor {
         let Some(project_root) = super::nx_daemon::kept_project(read_write).map(Path::to_path_buf)
         else {
             keeper.settled = true;
-            return;
+            for (_, reply) in self.nx_keeper_stops.drain(..) {
+                let _ = reply.send(Ok(()));
+            }
+            return true;
         };
-        let daemon =
-            super::nx_daemon::probe(&crate::capabilities::nx::daemon_record(&project_root));
+        let Some((probed_root, daemon)) = probed else {
+            return false;
+        };
+        // A grant advance can change the Nx root while the read is in flight. Its result
+        // belongs only to the root it observed; the next probe reads the current authority.
+        if probed_root != project_root {
+            return false;
+        }
+        while let Some((job_id, reply)) = self.nx_keeper_stops.pop() {
+            if daemon == Probe::Live {
+                let _ = reply.send(Ok(()));
+            } else {
+                self.kill_answering(job_id, KillReason::Retire, reply);
+            }
+        }
+        let Some(keeper) = &mut self.nx_daemon else {
+            return false;
+        };
         let running = keeper
             .starting
             .is_some_and(|id| self.jobs.get(&id).is_some_and(|job| !job.terminal()));
@@ -6316,16 +6355,19 @@ impl SupervisorActor {
                     .map(super::nx_daemon::Use::Session)
             });
         if keeper.judge(&project_root, working, daemon).await == Verdict::Release {
-            return;
+            return true;
         }
         if daemon == Probe::Live || running {
-            return;
+            return true;
         }
         // A census of the mount stopped the keeper's starts until the shed's next use.
         if keeper.stopped() {
-            return;
+            return true;
         }
         // The job's `node` is found as its own exec would find it: on the PATH it gets.
+        let (read_write, _) = self
+            .policy
+            .child(crate::api::dto::RunSandboxMode::ReadWrite);
         let path = match read_write.capabilities.contribution.shell {
             Some(_) => None,
             None => match bootstrap_path(read_write) {
@@ -6336,7 +6378,7 @@ impl SupervisorActor {
                         project_root.display(),
                         error.message
                     ));
-                    return;
+                    return true;
                 }
             },
         };
@@ -6345,7 +6387,7 @@ impl SupervisorActor {
             super::nx_daemon::NodeSource::Path,
         );
         let Some(request) = keeper.start(&self.workspace_root, &project_root, node) else {
-            return;
+            return true;
         };
         let authority = self.authority.clone();
         let started = match self.current_build_volume_grant() {
@@ -6364,7 +6406,7 @@ impl SupervisorActor {
             Err(error) => Err(error),
         };
         let Some(keeper) = &mut self.nx_daemon else {
-            return;
+            return true;
         };
         match started {
             Ok(job_id) => {
@@ -6389,6 +6431,7 @@ impl SupervisorActor {
                 error.message
             )),
         }
+        true
     }
 
     /// Takes `bytes` as the job's input from byte `offset` on, answering once the pump wrote
@@ -6651,14 +6694,8 @@ impl SupervisorActor {
             .starting
             .filter(|id| self.jobs.get(id).is_some_and(|job| !job.terminal()));
         match in_flight {
-            Some(job_id)
-                if super::nx_daemon::probe(&crate::capabilities::nx::daemon_record(
-                    &project_root,
-                )) != Probe::Live =>
-            {
-                self.kill_answering(job_id, KillReason::Retire, reply);
-            }
-            _ => {
+            Some(job_id) => self.nx_keeper_stops.push((job_id, reply)),
+            None => {
                 let _ = reply.send(Ok(()));
             }
         }
@@ -7630,6 +7667,19 @@ impl SupervisorActor {
     }
 
     fn finish_lifecycle_waiters(&mut self) {
+        let mut next = 0;
+        while next < self.nx_keeper_stops.len() {
+            let job_id = self.nx_keeper_stops[next].0;
+            if self.lifecycle != ActorLifecycle::Running {
+                let (_, reply) = self.nx_keeper_stops.swap_remove(next);
+                self.kill_answering(job_id, KillReason::Retire, reply);
+            } else if self.jobs.get(&job_id).is_none_or(JobStateRecord::terminal) {
+                let (_, reply) = self.nx_keeper_stops.swap_remove(next);
+                let _ = reply.send(Ok(()));
+            } else {
+                next += 1;
+            }
+        }
         if self.has_running_jobs() {
             return;
         }

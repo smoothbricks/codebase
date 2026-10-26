@@ -6602,7 +6602,15 @@ async fn a_linux_job_s_sample_names_its_missing_accounting_source() {
 /// it, so its jobs' PATH is the bootstrap PATH, and the `node` there is the workspace's own shim
 /// ([`fixture_node`]), as a shed's keeper finds it (04_sandbox.md).
 fn nx_project(name: &str) -> (WorkspaceSupervisorConfig, TempRoot) {
-    let (mut supervisor_config, root) = isolated_config(&format!("nx-daemon-{name}"));
+    let (supervisor_config, root) = isolated_config(&format!("nx-daemon-{name}"));
+    nx_project_with_config(name, supervisor_config, root)
+}
+
+fn nx_project_with_config(
+    name: &str,
+    mut supervisor_config: WorkspaceSupervisorConfig,
+    root: TempRoot,
+) -> (WorkspaceSupervisorConfig, TempRoot) {
     supervisor_config.authority.workspace = WorkspaceName::new(name).unwrap();
     supervisor_config.default_cwd = None;
     std::fs::write(supervisor_config.workspace_root.join("nx.json"), "{}").unwrap();
@@ -6634,6 +6642,62 @@ fn nx_daemon_start(project: &Path) -> Vec<OsString> {
             .into_os_string(),
         OsString::from("--kept"),
     ]
+}
+
+/// A held record read must not park the actor that answers the heartbeat round trip.
+#[tokio::test]
+async fn a_stalled_nx_record_read_leaves_the_supervisor_actor_responsive() {
+    use std::io::Write as _;
+
+    let parent = std::fs::canonicalize(temp_parent::scratch_parent()).unwrap();
+    let root = TempRoot::new_in(&parent, "nx-record-read");
+    std::fs::create_dir(root.join("workspace")).unwrap();
+    let mut supervisor_config = config(&root);
+    supervisor_config.sandbox.home = root.join("home");
+    supervisor_config.sandbox.exec_temp_dir = root.join("tmp");
+    std::fs::create_dir_all(&supervisor_config.sandbox.store_root).unwrap();
+    let (supervisor_config, _root) = nx_project_with_config("record-read", supervisor_config, root);
+    let record = supervisor_config
+        .workspace_root
+        .join(".nx/workspace-data/d/server-process.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::remove_file(fixture_node(&supervisor_config.workspace_root)).unwrap();
+    let name = std::ffi::CString::new(record.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the NUL-terminated path belongs to this test and outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let expected_authority = supervisor_config.authority.clone();
+    let h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let writer_path = record.clone();
+    // Opening the writer proves the real off-actor reader opened this FIFO. Holding it
+    // without bytes keeps that same read pending, with no sleep or elapsed-time oracle.
+    let mut writer = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        h.handle.current_authority().await.unwrap(),
+        expected_authority
+    );
+    let session = open_named(&h.handle, "build").await;
+    assert!(
+        h.spawned.is_empty(),
+        "no result was invented for the held read"
+    );
+    // The malformed result is consumed only after the actor has handled that session.
+    writer.write_all(b"not a daemon record").unwrap();
+    std::fs::remove_file(record).unwrap();
+    drop(writer);
+    let state = h.handle.nx_daemon_keeper().await.unwrap().unwrap();
+    assert!(matches!(
+        state.held,
+        Some(cowshed_core::runtime::NxKeeperHold::Refused { .. })
+    ));
+    h.handle.close_session(session).await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// Many of a keeper's probes, on a paused clock that skips the wait.
