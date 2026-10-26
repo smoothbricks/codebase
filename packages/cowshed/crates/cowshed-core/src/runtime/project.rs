@@ -1243,8 +1243,8 @@ impl ProjectRuntime {
     }
 }
 
-fn startup_conflict_exhausted(conflict: &crate::storage::lifecycle::Conflict) -> CowshedError {
-    use crate::storage::lifecycle::Conflict;
+fn startup_conflict_exhausted(conflict: &cowshed_types::lifecycle::Conflict) -> CowshedError {
+    use cowshed_types::lifecycle::Conflict;
 
     let changing_fact = match conflict {
         Conflict::FactCount { expected, actual } => {
@@ -3843,9 +3843,9 @@ fn restorable_publications(
 
 #[cfg(any(test, target_os = "macos"))]
 fn verified_recovery_facts<'a>(
-    facts: &'a [crate::storage::lifecycle::StorageFact],
+    facts: &'a [cowshed_types::lifecycle::StorageFact],
     pending: &[crate::storage::apfs::PendingPublicationFact],
-) -> Vec<&'a crate::storage::lifecycle::StorageFact> {
+) -> Vec<&'a cowshed_types::lifecycle::StorageFact> {
     let pending_destinations = pending
         .iter()
         .map(|fact| fact.destination_incarnation.clone())
@@ -4222,7 +4222,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 && metadata.publication_state
                                     == cowshed_types::metadata::PublicationState::Active
                             {
-                                facts.push(crate::storage::lifecycle::StorageFact {
+                                facts.push(cowshed_types::lifecycle::StorageFact {
                                     workspace:
                                         crate::storage::apfs::native::metadata_workspace_ref(
                                             &metadata,
@@ -5350,7 +5350,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// before its first job.
     async fn conclude_adoption(
         &mut self,
-        workspace: &crate::storage::lifecycle::LifecycleWorkspace,
+        workspace: &cowshed_types::lifecycle::LifecycleWorkspace,
         first: super::build_volumes::FirstMint<H>,
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
@@ -5544,15 +5544,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 incarnation: workspace.derived.workspace.incarnation().clone(),
             });
             match workspace.derived.mount_state {
-                crate::storage::lifecycle::MountState::Mounted { .. } => {
+                cowshed_types::lifecycle::MountState::Mounted { .. } => {
                     if let Some(id) = volumes.layout.linked(&checkout)? {
                         links.volumes.insert(id);
                     }
                 }
                 // Neither checkout's link can be read: a detached one has no tree mounted, and an
                 // unproven one's tree is not proven the workspace's. Both defer what they link.
-                crate::storage::lifecycle::MountState::Detached
-                | crate::storage::lifecycle::MountState::Unproven(_) => {
+                cowshed_types::lifecycle::MountState::Detached
+                | cowshed_types::lifecycle::MountState::Unproven(_) => {
                     links.detached.insert(name.clone());
                 }
             }
@@ -6477,7 +6477,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let current = self.current(&main).await?;
         if !matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) {
             return Ok(MainLineage::Kept {
                 why: format!("{main} is detached, so its build link cannot be read"),
@@ -6660,7 +6660,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             if name == target
                 || !matches!(
                     workspace.derived.mount_state,
-                    crate::storage::lifecycle::MountState::Mounted { .. }
+                    cowshed_types::lifecycle::MountState::Mounted { .. }
                 )
             {
                 continue;
@@ -7138,11 +7138,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             image: workspace.image.clone(),
         };
         let mounted = match &workspace.derived.mount_state {
-            crate::storage::lifecycle::MountState::Mounted { .. } => true,
-            crate::storage::lifecycle::MountState::Detached => false,
+            cowshed_types::lifecycle::MountState::Mounted { .. } => true,
+            cowshed_types::lifecycle::MountState::Detached => false,
             // Neither copy is provably this workspace's to rewrite: its marker is not in reach and
             // its image may still be attached. The workspace's own failure, said with the others.
-            crate::storage::lifecycle::MountState::Unproven(refusal) => {
+            cowshed_types::lifecycle::MountState::Unproven(refusal) => {
                 return Err(native_storage_error(refusal.clone().into()));
             }
         };
@@ -7207,7 +7207,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let current = self.current(&main).await?;
         if !matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) {
             return Ok(());
         }
@@ -7413,7 +7413,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let main = self.current(&main_name()).await?;
         if matches!(
             main.derived.mount_state,
-            crate::storage::lifecycle::MountState::Detached
+            cowshed_types::lifecycle::MountState::Detached
         ) {
             return Err(CowshedError::conflict(
                 format!(
@@ -7439,8 +7439,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         let named = revision_target(revision);
         match &source.derived.mount_state {
-            crate::storage::lifecycle::MountState::Mounted { .. } => {}
-            crate::storage::lifecycle::MountState::Detached => {
+            cowshed_types::lifecycle::MountState::Mounted { .. } => {}
+            cowshed_types::lifecycle::MountState::Detached => {
                 return Err(CowshedError::conflict(
                     format!(
                         "--ref {named} is resolved in {source_name}'s repository, and {source_name} is detached"
@@ -7448,7 +7448,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     format!("cowshed attach {source_name}"),
                 ));
             }
-            crate::storage::lifecycle::MountState::Unproven(refusal) => {
+            cowshed_types::lifecycle::MountState::Unproven(refusal) => {
                 return Err(native_storage_error(refusal.clone().into()));
             }
         }
@@ -7657,7 +7657,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let mounted = |current: &NativeWorkspace| {
             matches!(
                 current.derived.mount_state,
-                crate::storage::lifecycle::MountState::Mounted { .. }
+                cowshed_types::lifecycle::MountState::Mounted { .. }
             )
         };
         if mounted(&self.current(workspace).await?) {
@@ -7707,7 +7707,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let workspace = current.derived.workspace.name().clone();
         if matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) {
             let mount = self.workspace_mount_path(&workspace)?;
             if let Err(busy) = check_checkout_nx(&workspace, &mount, nx_check).await? {
@@ -7839,7 +7839,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         if matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Detached
+            cowshed_types::lifecycle::MountState::Detached
         ) {
             match detached {
                 DetachedTarget::Attach => {
@@ -8219,7 +8219,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// forced and every carried ref is read back: a retained ref holding another tip refuses the
     /// restore rather than being overwritten. A `push` staging ref is transient and stays.
     async fn carry_cowshed_refs(&self, main: &NativeWorkspace, retained: &Path) -> Result<()> {
-        use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
+        use crate::storage::lifecycle::{MountIntent, Substrate};
+        use cowshed_types::lifecycle::MountState;
 
         if matches!(main.derived.mount_state, MountState::Detached) {
             self.substrate
@@ -8371,7 +8372,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 || name == into.name
                 || !matches!(
                     candidate.derived.mount_state,
-                    crate::storage::lifecycle::MountState::Mounted { .. }
+                    cowshed_types::lifecycle::MountState::Mounted { .. }
                 )
             {
                 continue;
@@ -8513,7 +8514,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         young: YoungPolicy,
         owner: LiveOwner,
     ) -> Result<RemoveReport> {
-        use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
+        use crate::storage::lifecycle::{MountIntent, Substrate};
+        use cowshed_types::lifecycle::MountState;
 
         if options.restore && options.force {
             return Err(CowshedError::usage(
@@ -9398,7 +9400,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             })?;
         let detached = matches!(
             workspace.derived.mount_state,
-            crate::storage::lifecycle::MountState::Detached
+            cowshed_types::lifecycle::MountState::Detached
         );
         if !pre_exists {
             if !detached {
@@ -9620,7 +9622,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         let port_lease = if matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) {
             Some(
                 self.stop_supervisor_if_idle(workspace)
@@ -9802,7 +9804,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         let was_detached = matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Detached
+            cowshed_types::lifecycle::MountState::Detached
         );
         // A supervisor's own start serves a settled mount without the workspace's image lock and
         // waits for that lock only to settle one (11_shell.md, "Supervisor"); every other caller
@@ -10723,7 +10725,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         metadata: cowshed_types::metadata::DetachedWorkspaceMetadata,
     ) -> Result<RemoveReport> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
-        use crate::storage::lifecycle::{MountIntent, MountState, OperationIdentity, Substrate};
+        use crate::storage::lifecycle::{MountIntent, OperationIdentity, Substrate};
+        use cowshed_types::lifecycle::MountState;
 
         if metadata.repo_id != self.descriptor.repo_id
             || metadata.workspace != *workspace
@@ -10986,7 +10989,7 @@ fn superseded_session(
 
 #[cfg(target_os = "macos")]
 struct NativeWorkspace {
-    derived: crate::storage::lifecycle::DerivedWorkspace,
+    derived: cowshed_types::lifecycle::DerivedWorkspace,
     metadata: cowshed_types::metadata::DetachedWorkspaceMetadata,
     image: PathBuf,
 }
@@ -11370,7 +11373,7 @@ enum ProjectRootValidation {
 
 #[cfg(target_os = "macos")]
 fn validate_workspace_controller_root(
-    derived: &crate::storage::lifecycle::DerivedWorkspace,
+    derived: &cowshed_types::lifecycle::DerivedWorkspace,
     metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
     project_root: &Path,
     validation: ProjectRootValidation,
@@ -11383,7 +11386,7 @@ fn validate_workspace_controller_root(
         ProjectRootValidation::AllowDetachedMainRelocation
     ) && matches!(
         derived.mount_state,
-        crate::storage::lifecycle::MountState::Detached
+        cowshed_types::lifecycle::MountState::Detached
     );
     let info = &metadata.info_snapshot;
     if !permits_relocated_root && !names_one_root(&info.project_root, project_root) {
@@ -13163,7 +13166,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             workspace.derived.workspace.name().is_main()
                 && matches!(
                     workspace.derived.mount_state,
-                    crate::storage::lifecycle::MountState::Detached
+                    cowshed_types::lifecycle::MountState::Detached
                 )
         });
         // A forming re-adoption validated the binding before it recorded itself, and the checkout
@@ -13200,14 +13203,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let mut listing = ProjectSnapshots::default();
         for workspace in self.authoritative().await? {
             match &workspace.derived.mount_state {
-                crate::storage::lifecycle::MountState::Unproven(refusal) => {
+                cowshed_types::lifecycle::MountState::Unproven(refusal) => {
                     let mount = self.workspace_mount_path(workspace.derived.workspace.name())?;
                     listing
                         .unproven
                         .push(crate::api::dto::UnprovenWorkspace::of(refusal, mount));
                 }
-                crate::storage::lifecycle::MountState::Mounted { .. }
-                | crate::storage::lifecycle::MountState::Detached => {
+                cowshed_types::lifecycle::MountState::Mounted { .. }
+                | cowshed_types::lifecycle::MountState::Detached => {
                     listing.workspaces.push(self.snapshot(&workspace)?);
                 }
             }
@@ -13320,7 +13323,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .plan_adopt(crate::storage::lifecycle::AdoptRequest {
                 repo: self.descriptor.repo_id.clone(),
                 capacity,
-                topology_revision: crate::storage::lifecycle::Revision::new(0),
+                topology_revision: cowshed_types::lifecycle::Revision::new(0),
                 source_checkout: self.descriptor.git_root.to_path_buf(),
                 handoff: crate::storage::lifecycle::AdoptHandoff::Checkout {
                     pre_cowshed_checkout: pre_cowshed,
@@ -13737,7 +13740,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .filter(|(_, workspace)| {
                 matches!(
                     workspace.derived.mount_state,
-                    crate::storage::lifecycle::MountState::Mounted { .. }
+                    cowshed_types::lifecycle::MountState::Mounted { .. }
                 )
             })
             .map(|(index, workspace)| {
@@ -14273,7 +14276,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             })?;
         let detached = matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Detached
+            cowshed_types::lifecycle::MountState::Detached
         );
         // A detached main has no repository at the recorded checkout path. Its persisted binding
         // was validated while opening from the session marker; querying Git here would turn the
@@ -14387,8 +14390,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     /// live half: refuse what must not proceed, get the volumes down, cross the fence, and bring the
     /// project back up under its new name.
     async fn change_repo_id(&mut self, new_repo_id: RepoId) -> Result<WorkspaceSnapshot> {
-        use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
+        use crate::storage::lifecycle::{MountIntent, Substrate};
         use crate::storage::recovery::{LifecycleIntentPhase, RepositoryIdentityIntent};
+        use cowshed_types::lifecycle::MountState;
 
         let old_repo_id = self.descriptor.repo_id.clone();
         if old_repo_id == new_repo_id {
@@ -14634,7 +14638,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let current = self.current(&workspace).await?;
         let was_detached = matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Detached
+            cowshed_types::lifecycle::MountState::Detached
         );
         if is_git_worktree(&current.metadata) {
             self.require_main_mounted_for_git_worktree(&workspace)
@@ -14685,7 +14689,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let mount = self.workspace_mount_path(&workspace)?;
         if matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) {
             self.require_mount_unheld_before_stop(&workspace, &mount)
                 .await?;
@@ -14693,7 +14697,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let _stopped = self.stop_supervisor(&workspace).await?;
         if matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) && let Err(busy) =
             check_checkout_nx(&workspace, &mount, CheckoutNxCheck::CloseRecorded).await?
         {
@@ -14736,7 +14740,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let current = self.current(&workspace).await?;
         let was_mounted = matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         );
         let outcome = match volume {
             crate::api::dto::ResizeVolume::Workspace => {
@@ -14827,7 +14831,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let current = self.current(&workspace).await?;
         let was_mounted = matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         );
         let stopped = self.stop_supervisor(&workspace).await?;
         let build_outcomes = self
@@ -14920,7 +14924,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let current = self.current(&workspace).await?;
         if !matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) {
             return Err(CowshedError::conflict(
                 format!("workspace {workspace} is detached, so its build link cannot be read"),
@@ -14955,7 +14959,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let current = self.current(&workspace).await?;
         if !matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) {
             return Err(CowshedError::conflict(
                 format!("workspace {workspace} is detached, so its build link cannot be read"),
@@ -15012,9 +15016,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 &current.derived.workspace,
                 label.clone(),
                 if options.keep || explicitly_labeled {
-                    crate::storage::lifecycle::Pin::Pinned
+                    cowshed_types::lifecycle::Pin::Pinned
                 } else {
-                    crate::storage::lifecycle::Pin::Automatic
+                    cowshed_types::lifecycle::Pin::Automatic
                 },
             )
             .map_err(native_integrity_error)?;
@@ -15067,11 +15071,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .await?;
         let stopped = self.stop_supervisor(&workspace).await?;
         require_lost_groups_released(&workspace, &stopped, "restore").await?;
-        let checkpoint_ref = crate::storage::lifecycle::CheckpointRef::new(
+        let checkpoint_ref = cowshed_types::lifecycle::CheckpointRef::new(
             current.derived.workspace.clone(),
             checkpoint.label.clone(),
             checkpoint.revision,
-            matches!(checkpoint.pin, crate::storage::lifecycle::Pin::Pinned),
+            matches!(checkpoint.pin, cowshed_types::lifecycle::Pin::Pinned),
         );
         let plan = self
             .substrate
@@ -15269,7 +15273,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         for workspace in self.authoritative().await? {
             if !matches!(
                 workspace.derived.mount_state,
-                crate::storage::lifecycle::MountState::Mounted { .. }
+                cowshed_types::lifecycle::MountState::Mounted { .. }
             ) {
                 continue;
             }
@@ -16332,7 +16336,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // attaches), so a detached workspace is refused rather than mounted behind its back.
         if !matches!(
             current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
+            cowshed_types::lifecycle::MountState::Mounted { .. }
         ) {
             return Err(CowshedError::conflict(
                 format!("workspace {workspace} is detached; its build link cannot be read"),
@@ -16603,7 +16607,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         }
                     };
                     match &workspace.derived.mount_state {
-                        crate::storage::lifecycle::MountState::Detached => {
+                        cowshed_types::lifecycle::MountState::Detached => {
                             findings.push(crate::api::dto::Finding {
                                 code: "mount".into(),
                                 severity: crate::api::dto::FindingSeverity::Info,
@@ -16628,7 +16632,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 });
                             }
                         }
-                        crate::storage::lifecycle::MountState::Unproven(refusal) => {
+                        cowshed_types::lifecycle::MountState::Unproven(refusal) => {
                             findings.push(crate::api::dto::Finding {
                                 code: "mount-identity".into(),
                                 severity: crate::api::dto::FindingSeverity::Error,
@@ -16639,7 +16643,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 path: Some(refusal.mount_point.clone()),
                             });
                         }
-                        crate::storage::lifecycle::MountState::Mounted { .. } => {
+                        cowshed_types::lifecycle::MountState::Mounted { .. } => {
                             let marker_path =
                                 expected_mount.join(crate::storage::WORKSPACE_MARKER_PATH);
                             let expected_repos = self.owned_repo_ids()?;
@@ -17752,7 +17756,7 @@ async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<Work
 fn validate_workspace_origin_against_inventory(
     origin: &WorkspaceOrigin,
     owned_repo_ids: &OwnedRepoIds,
-    facts: &[&crate::storage::lifecycle::StorageFact],
+    facts: &[&cowshed_types::lifecycle::StorageFact],
 ) -> Result<()> {
     if !owned_repo_ids.accepts(&origin.repo_id) {
         return Err(CowshedError::conflict(
@@ -21830,8 +21834,9 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
     repo_id: &RepoId,
     workspaces: Option<&std::collections::BTreeSet<WorkspaceName>>,
 ) -> Result<RetiredTrash> {
-    use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
+    use crate::storage::lifecycle::RetiredRef;
     use cowshed_types::image::{IMAGE_EXTENSION, is_image_path};
+    use cowshed_types::lifecycle::{LifecycleWorkspace, Revision};
     use cowshed_types::metadata::{DetachedWorkspaceMetadata, WorkspaceRole, sidecar_path};
 
     let trash = project_root
@@ -22033,7 +22038,7 @@ mod retired_recovery_tests {
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
             retired[0].resulting_revision(),
-            crate::storage::lifecycle::Revision::new(5)
+            cowshed_types::lifecycle::Revision::new(5)
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -22090,7 +22095,7 @@ mod retired_recovery_tests {
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
             retired[0].resulting_revision(),
-            crate::storage::lifecycle::Revision::new(5)
+            cowshed_types::lifecycle::Revision::new(5)
         );
         assert!(image.exists(), "recovery does not delete the image");
 
@@ -22183,7 +22188,7 @@ mod retired_recovery_tests {
         );
         assert_eq!(
             retired[0].resulting_revision(),
-            crate::storage::lifecycle::Revision::new(9)
+            cowshed_types::lifecycle::Revision::new(9)
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -23347,7 +23352,7 @@ fn slot_binding_error(error: crate::storage::StorageLayoutError) -> CowshedError
 fn require_mounted_source(source: &WorkspaceName, current: &NativeWorkspace) -> Result<()> {
     if matches!(
         current.derived.mount_state,
-        crate::storage::lifecycle::MountState::Detached
+        cowshed_types::lifecycle::MountState::Detached
     ) {
         return Err(CowshedError::conflict(
             format!("workspace {source} is detached: it has no checkout to read from"),
@@ -25328,7 +25333,7 @@ mod workspace_marker_reader_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod workspace_origin_tests {
     use super::*;
-    use crate::storage::lifecycle::{
+    use cowshed_types::lifecycle::{
         DerivedWorkspace, LifecycleWorkspace, MountState, Revision, StorageFact,
     };
     use cowshed_types::metadata::{
@@ -26500,7 +26505,7 @@ mod binding_tests {
     async fn startup_pending_restore_destination_is_absent_until_restore_fence() {
         use crate::runtime::supervisor::{CommitmentDraft, CommitmentPublisher, CommitmentSink};
         use crate::storage::apfs::PendingPublicationFact;
-        use crate::storage::lifecycle::{LifecycleWorkspace, Revision, StorageFact};
+        use cowshed_types::lifecycle::{LifecycleWorkspace, Revision, StorageFact};
         use cowshed_types::metadata::WorkspaceRole;
 
         let root = std::env::temp_dir().join(format!(
@@ -26582,7 +26587,7 @@ mod binding_tests {
     #[test]
     fn an_opening_activates_only_the_restores_whose_image_lock_it_holds() {
         use crate::storage::apfs::PendingPublicationFact;
-        use crate::storage::lifecycle::{LifecycleWorkspace, Revision};
+        use cowshed_types::lifecycle::{LifecycleWorkspace, Revision};
         use cowshed_types::metadata::WorkspaceRole;
 
         let store = PathBuf::from("/private/cowshed/store/acme/widget");

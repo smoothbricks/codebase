@@ -24,12 +24,13 @@ use cowshed_core::storage::apfs::{
     IncarnationSource, MetadataPolicy, TokioApfsBlockingLane,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptHandoff, AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent,
-    MountState, OperationIdentity, Pin, RestoreMode, Revision, StorageGcOptions, Substrate,
+    AdoptHandoff, AdoptRequest, Destination, LifecyclePlanner, MountIntent, OperationIdentity,
+    RestoreMode, StorageGcOptions, Substrate,
 };
 use cowshed_core::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_types::lifecycle::CheckpointLabel;
+use cowshed_types::lifecycle::{LifecycleWorkspace, MountState, Pin, Revision};
 use cowshed_types::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
     WorkspaceRole,

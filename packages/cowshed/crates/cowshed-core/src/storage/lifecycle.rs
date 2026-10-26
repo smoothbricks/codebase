@@ -7,197 +7,18 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use cowshed_apfs::image::ImageCapacity;
-use cowshed_types::metadata::{GrantSet, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use cowshed_types::metadata::{GrantSet, WorkspaceIncarnation, WorkspaceName};
 use cowshed_types::repository::RepoId;
 
-use cowshed_types::lifecycle::CheckpointLabel;
-
-/// A monotonic controller-visible revision.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Revision(u64);
-
-impl Revision {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Logical identity and the exact version a lifecycle plan was made against.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LifecycleWorkspace {
-    repo: RepoId,
-    name: WorkspaceName,
-    incarnation: WorkspaceIncarnation,
-    revision: Revision,
-    topology_revision: Revision,
-    role: WorkspaceRole,
-}
-
-impl LifecycleWorkspace {
-    pub fn new(
-        repo: RepoId,
-        name: WorkspaceName,
-        incarnation: WorkspaceIncarnation,
-        revision: Revision,
-        topology_revision: Revision,
-        role: WorkspaceRole,
-    ) -> Result<Self, PlanError> {
-        if name.is_main() != (role == WorkspaceRole::Main) {
-            return Err(PlanError::RoleNameMismatch { name, role });
-        }
-        Ok(Self {
-            repo,
-            name,
-            incarnation,
-            revision,
-            topology_revision,
-            role,
-        })
-    }
-    pub fn repo(&self) -> &RepoId {
-        &self.repo
-    }
-    pub fn name(&self) -> &WorkspaceName {
-        &self.name
-    }
-    pub fn incarnation(&self) -> &WorkspaceIncarnation {
-        &self.incarnation
-    }
-    pub const fn revision(&self) -> Revision {
-        self.revision
-    }
-    pub const fn topology_revision(&self) -> Revision {
-        self.topology_revision
-    }
-    pub const fn role(&self) -> WorkspaceRole {
-        self.role
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointRef {
-    workspace: LifecycleWorkspace,
-    label: CheckpointLabel,
-    revision: Revision,
-    pinned: bool,
-}
-
-impl CheckpointRef {
-    pub fn new(
-        workspace: LifecycleWorkspace,
-        label: CheckpointLabel,
-        revision: Revision,
-        pinned: bool,
-    ) -> Self {
-        Self {
-            workspace,
-            label,
-            revision,
-            pinned,
-        }
-    }
-    pub fn workspace(&self) -> &LifecycleWorkspace {
-        &self.workspace
-    }
-    pub fn label(&self) -> &CheckpointLabel {
-        &self.label
-    }
-    pub const fn revision(&self) -> Revision {
-        self.revision
-    }
-    pub const fn pinned(&self) -> bool {
-        self.pinned
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Pin {
-    Pinned,
-    Automatic,
-}
+use cowshed_types::lifecycle::{
+    CheckpointFact, CheckpointLabel, CheckpointRef, Conflict, DerivedWorkspace, LifecycleFact,
+    LifecycleWorkspace, MountJoin, MountState, Pin, Revision, StorageFact, revalidate,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreMode {
     Replace,
     VerifyOnly,
-}
-
-/// One authoritative lifecycle fact, whether a planner asserted it or a substrate observed it.
-///
-/// Expectation and observation are the same fact at two moments, so they are one type: a plan
-/// carries the facts it was made against, the substrate rereads the facts under exclusion, and
-/// revalidation is `==`. Two structurally identical enums made a mixed expected/observed pair
-/// representable, cost a 40-line field-by-field match to reject, and turned "add a field to one,
-/// forget the other" into a silent stale-plan miss.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LifecycleFact {
-    Exists {
-        repo: RepoId,
-        name: WorkspaceName,
-        incarnation: WorkspaceIncarnation,
-        revision: Revision,
-        topology_revision: Revision,
-        retired: bool,
-    },
-    Absent {
-        repo: RepoId,
-        name: WorkspaceName,
-        topology_revision: Revision,
-    },
-    Checkpoint {
-        repo: RepoId,
-        workspace: WorkspaceName,
-        label: CheckpointLabel,
-        revision: Revision,
-    },
-}
-
-impl LifecycleFact {
-    fn active(workspace: &LifecycleWorkspace) -> Self {
-        Self::Exists {
-            repo: workspace.repo.clone(),
-            name: workspace.name.clone(),
-            incarnation: workspace.incarnation.clone(),
-            revision: workspace.revision,
-            topology_revision: workspace.topology_revision,
-            retired: false,
-        }
-    }
-}
-
-/// A structured stale-plan refusal. Executors return this before mutation.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum Conflict {
-    #[error("authoritative state has {actual} facts, expected {expected}")]
-    FactCount { expected: usize, actual: usize },
-    #[error("authoritative fact {index} changed")]
-    Stale {
-        index: usize,
-        expected: Box<LifecycleFact>,
-        actual: Box<LifecycleFact>,
-    },
-}
-
-pub fn revalidate(expected: &[LifecycleFact], actual: &[LifecycleFact]) -> Result<(), Conflict> {
-    if expected.len() != actual.len() {
-        return Err(Conflict::FactCount {
-            expected: expected.len(),
-            actual: actual.len(),
-        });
-    }
-    for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-        if expected != actual {
-            return Err(Conflict::Stale {
-                index,
-                expected: Box::new(expected.clone()),
-                actual: Box::new(actual.clone()),
-            });
-        }
-    }
-    Ok(())
 }
 
 macro_rules! plan_type {
@@ -333,11 +154,8 @@ pub struct Destination {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PlanError {
-    #[error("workspace {name} does not match role {role:?}")]
-    RoleNameMismatch {
-        name: WorkspaceName,
-        role: WorkspaceRole,
-    },
+    #[error(transparent)]
+    RoleNameMismatch(#[from] cowshed_types::lifecycle::RoleNameMismatch),
     #[error("main is not a valid session destination")]
     MainDestination,
     #[error("source and destination repositories differ")]
@@ -390,7 +208,7 @@ fn destination_expected(
     if destination.name.is_main() {
         return Err(PlanError::MainDestination);
     }
-    if source.repo != destination.repo {
+    if source.repo() != &destination.repo {
         return Err(PlanError::RepositoryMismatch);
     }
     Ok(LifecycleFact::Absent {
@@ -441,7 +259,7 @@ impl LifecyclePlanner for PurePlanner {
         Ok(CreatePlan {
             expected: vec![LifecycleFact::active(from), absent],
             operation: Operation::Create {
-                source: from.name.clone(),
+                source: from.name().clone(),
                 destination: destination.name,
                 identity: destination.identity,
             },
@@ -456,7 +274,7 @@ impl LifecyclePlanner for PurePlanner {
         Ok(ForkPlan {
             expected: vec![LifecycleFact::active(from), absent],
             operation: Operation::Fork {
-                source: from.name.clone(),
+                source: from.name().clone(),
                 destination: destination.name,
                 identity: destination.identity,
             },
@@ -471,7 +289,7 @@ impl LifecyclePlanner for PurePlanner {
         Ok(CheckpointPlan {
             expected: vec![LifecycleFact::active(workspace)],
             operation: Operation::Checkpoint {
-                workspace: workspace.name.clone(),
+                workspace: workspace.name().clone(),
                 label,
                 pin,
             },
@@ -484,9 +302,9 @@ impl LifecyclePlanner for PurePlanner {
         mode: RestoreMode,
         identity: OperationIdentity,
     ) -> Result<RestorePlan, PlanError> {
-        if checkpoint.workspace.repo != workspace.repo
-            || checkpoint.workspace.name != workspace.name
-            || checkpoint.workspace.incarnation != workspace.incarnation
+        if checkpoint.workspace().repo() != workspace.repo()
+            || checkpoint.workspace().name() != workspace.name()
+            || checkpoint.workspace().incarnation() != workspace.incarnation()
         {
             return Err(PlanError::CheckpointMismatch);
         }
@@ -494,28 +312,28 @@ impl LifecyclePlanner for PurePlanner {
             expected: vec![
                 LifecycleFact::active(workspace),
                 LifecycleFact::Checkpoint {
-                    repo: workspace.repo.clone(),
-                    workspace: workspace.name.clone(),
-                    label: checkpoint.label.clone(),
-                    revision: checkpoint.revision,
+                    repo: workspace.repo().clone(),
+                    workspace: workspace.name().clone(),
+                    label: checkpoint.label().clone(),
+                    revision: checkpoint.revision(),
                 },
             ],
             operation: Operation::Restore {
-                workspace: workspace.name.clone(),
-                label: checkpoint.label.clone(),
+                workspace: workspace.name().clone(),
+                label: checkpoint.label().clone(),
                 mode,
                 identity,
             },
         })
     }
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
-        if workspace.name.is_main() {
+        if workspace.name().is_main() {
             return Err(PlanError::MainIsPermanent);
         }
         Ok(RetirePlan {
             expected: vec![LifecycleFact::active(workspace)],
             operation: Operation::Retire {
-                workspace: workspace.name.clone(),
+                workspace: workspace.name().clone(),
             },
         })
     }
@@ -563,15 +381,6 @@ impl RetiredRef {
     pub const fn resulting_revision(&self) -> Revision {
         self.resulting_revision
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointFact {
-    pub repo: RepoId,
-    pub workspace: WorkspaceName,
-    pub label: CheckpointLabel,
-    pub revision: Revision,
-    pub pin: Pin,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -811,20 +620,6 @@ pub struct SubstrateStats {
     pub pinned_checkpoint_bytes: u64,
 }
 
-/// Where a published workspace stands against the kernel mount table.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MountState {
-    Detached,
-    Mounted {
-        mount_id: u64,
-    },
-    /// Something is mounted at the workspace's mountpoint that does not prove itself the
-    /// workspace's (01a_apfs.md, "Ownership, identity, and the volume label"): enumeration refused
-    /// to join it. It is neither attached nor detached. Nothing acts on its absence, and an
-    /// operation that names it refuses with this refusal.
-    Unproven(Box<MountRefusal>),
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MountIntent {
     pub browse: bool,
@@ -888,124 +683,6 @@ pub struct DefragmentOutcome {
     pub bytes: u64,
 }
 
-/// Canonical persistent fact read from an image/dataset and its sidecar.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StorageFact {
-    pub workspace: LifecycleWorkspace,
-    pub volume_key: String,
-}
-
-/// A kernel mount-table fact supplied by the platform adapter.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelMountFact {
-    pub mount_id: u64,
-    pub volume_key: String,
-}
-
-/// What enumeration made of the mount at one published workspace's mountpoint. Joining is judged
-/// per workspace (01a_apfs.md, "Ownership, identity, and the volume label": joining a kernel mount
-/// into enumeration reads the marker and refuses when it does not name the expected workspace):
-/// one workspace's refusal is that workspace's fact, never a failure of every other workspace's
-/// enumeration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MountJoin {
-    Proven(KernelMountFact),
-    Refused {
-        volume_key: String,
-        refusal: Box<MountRefusal>,
-    },
-}
-
-impl MountJoin {
-    pub fn volume_key(&self) -> &str {
-        match self {
-            Self::Proven(fact) => &fact.volume_key,
-            Self::Refused { volume_key, .. } => volume_key,
-        }
-    }
-
-    /// The join an operation that names this one workspace may act on: a refusal fails exactly
-    /// the operation that names the refused workspace.
-    pub fn named(self) -> Result<KernelMountFact, Box<MountRefusal>> {
-        match self {
-            Self::Proven(fact) => Ok(fact),
-            Self::Refused { refusal, .. } => Err(refusal),
-        }
-    }
-}
-
-impl From<KernelMountFact> for MountJoin {
-    fn from(fact: KernelMountFact) -> Self {
-        Self::Proven(fact)
-    }
-}
-
-/// A mount at `mount_point`, the mountpoint of `workspace`, that enumeration refused to join.
-/// `mounted_from` is what the mount table or directory binding says is mounted there.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("{}", refusal_message(self))]
-pub struct MountRefusal {
-    pub workspace: LifecycleWorkspace,
-    pub mount_point: PathBuf,
-    pub mounted_from: String,
-    pub reason: MountRefusalReason,
-}
-
-/// Why a mount was not joined. The marker reasons are the identity authority's two answers: a
-/// marker that cannot be read is not ours, and one that reads names someone else.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MountRefusalReason {
-    /// The marker could not be read; the error is the one the read returned.
-    MarkerUnreadable(String),
-    /// The marker reads, and names another workspace or another incarnation.
-    MarkerNamesAnother {
-        repo: RepoId,
-        workspace: WorkspaceName,
-        incarnation: WorkspaceIncarnation,
-    },
-    /// The workspace's own volume is mounted ignoring owners.
-    NonCanonicalFlags(u64),
-    /// A directory payload whose binding names another directory than its mountpoint.
-    MountedElsewhere(PathBuf),
-}
-
-fn refusal_message(refusal: &MountRefusal) -> String {
-    let MountRefusal {
-        workspace,
-        mount_point,
-        mounted_from: source,
-        reason,
-    } = refusal;
-    let (repo, name, incarnation) = (workspace.repo(), workspace.name(), workspace.incarnation());
-    let at = mount_point.display();
-    match reason {
-        MountRefusalReason::MarkerUnreadable(error) => format!(
-            "workspace mount identity mismatch at {at}: the volume mounted from {source} carries no readable {repo}/{name} marker for incarnation {incarnation}: {error}"
-        ),
-        MountRefusalReason::MarkerNamesAnother {
-            repo: found_repo,
-            workspace: found,
-            incarnation: found_incarnation,
-        } => format!(
-            "workspace mount identity mismatch at {at}: the volume mounted from {source} carries the {found_repo}/{found} marker for incarnation {found_incarnation}, not {repo}/{name} for incarnation {incarnation}"
-        ),
-        MountRefusalReason::NonCanonicalFlags(flags) => format!(
-            "workspace mount has non-canonical flags at {at}: it ignores owners, which every workspace mount must honour; flags={flags:#x}"
-        ),
-        MountRefusalReason::MountedElsewhere(current) => format!(
-            "workspace mount identity mismatch: {source} is mounted at {}, its mountpoint is {at}, and the tree there must carry the {repo}/{name} marker for incarnation {incarnation}",
-            current.display()
-        ),
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DerivedWorkspace {
-    pub workspace: LifecycleWorkspace,
-    pub mount_state: MountState,
-    pub checkpoints: Vec<CheckpointFact>,
-}
-
 /// Derive enumeration from canonical storage, kernel mounts, and versioned checkpoint facts.
 ///
 /// A refused join derives its workspace [`MountState::Unproven`] and fails nothing: which
@@ -1020,10 +697,10 @@ pub fn derive_workspaces(
     let mut seen_workspaces = BTreeSet::new();
     let mut seen_volume_keys = BTreeSet::new();
     for fact in &storage {
-        let workspace_key = (&fact.workspace.repo, &fact.workspace.name);
+        let workspace_key = (fact.workspace.repo(), fact.workspace.name());
         if !seen_workspaces.insert(workspace_key) {
             return Err(DerivationError::DuplicateWorkspace(
-                fact.workspace.name.clone(),
+                fact.workspace.name().clone(),
             ));
         }
         if !seen_volume_keys.insert(fact.volume_key.as_str()) {
@@ -1073,7 +750,7 @@ pub fn derive_workspaces(
             .remove(&fact.volume_key)
             .unwrap_or(MountState::Detached);
         let mut checkpoints = checkpoints_by_workspace
-            .remove(&(fact.workspace.repo.clone(), fact.workspace.name.clone()))
+            .remove(&(fact.workspace.repo().clone(), fact.workspace.name().clone()))
             .unwrap_or_default();
         checkpoints.sort_by(|left, right| left.label.cmp(&right.label));
         result.push(DerivedWorkspace {
@@ -1082,7 +759,7 @@ pub fn derive_workspaces(
             checkpoints,
         });
     }
-    result.sort_by(|a, b| a.workspace.name.cmp(&b.workspace.name));
+    result.sort_by(|a, b| a.workspace.name().cmp(&b.workspace.name()));
     Ok(result)
 }
 

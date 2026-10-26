@@ -3,9 +3,9 @@ use crate::error::CowshedError;
 use crate::land_turn::Ticket;
 use crate::project_retirement::ProjectRetirementReport;
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
-use crate::storage::lifecycle::{DerivedWorkspace, MountRefusal, MountState, Pin as LifecyclePin};
 use base64::Engine;
 use bytes::Bytes;
+use cowshed_types::lifecycle::{DerivedWorkspace, MountRefusal, MountState, Pin as LifecyclePin};
 use cowshed_types::metadata::DetachedWorkspaceMetadata;
 pub use cowshed_types::metadata::{
     EgressMode, EgressRule, GrantSet, Platform, PortBlock, RepoRule, SimVerb, WorkspaceIncarnation,

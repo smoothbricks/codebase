@@ -342,10 +342,9 @@ mod native {
     use crate::storage::apfs::native::MacOsApfsExecutionHost;
     use crate::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
     use crate::storage::bootstrap::ValidatedHostStorage;
-    use crate::storage::lifecycle::{
-        LifecycleWorkspace, MountState, Substrate as _, dispatch_blocking,
-    };
+    use crate::storage::lifecycle::{Substrate as _, dispatch_blocking};
     use crate::{AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result};
+    use cowshed_types::lifecycle::{LifecycleWorkspace, MountState};
 
     type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 

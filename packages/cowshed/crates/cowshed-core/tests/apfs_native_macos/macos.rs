@@ -29,15 +29,16 @@ use cowshed_core::storage::apfs::{
 };
 use cowshed_core::storage::deletion_log::DELETION_LOG_FILE;
 use cowshed_core::storage::lifecycle::{
-    LifecycleFact, LifecycleWorkspace, MountJoin, MountRefusalReason, MountState,
-    OperationIdentity, Pin, RetiredRef, Revision, StorageGcOptions, StorageGcReason,
-    derive_workspaces,
+    OperationIdentity, RetiredRef, StorageGcOptions, StorageGcReason, derive_workspaces,
 };
 use cowshed_core::storage::{StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_types::lifecycle::CheckpointLabel;
+use cowshed_types::lifecycle::{
+    LifecycleFact, LifecycleWorkspace, MountJoin, MountRefusalReason, MountState, Pin, Revision,
+};
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
     PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
@@ -2137,7 +2138,7 @@ fn checkpoint_observation_reads_authoritative_detached_metadata() {
 
     assert!(matches!(
         observed.as_slice(),
-        [cowshed_core::storage::lifecycle::LifecycleFact::Checkpoint {
+        [cowshed_types::lifecycle::LifecycleFact::Checkpoint {
             repo: observed_repo,
             workspace,
             label: observed_label,

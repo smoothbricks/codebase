@@ -14,10 +14,10 @@ use thiserror::Error;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::storage::lifecycle::LifecycleWorkspace;
 use crate::workspace_environment::{
     EnvironmentMount, WorkspaceEnvironmentError, write_workspace_environment,
 };
+use cowshed_types::lifecycle::LifecycleWorkspace;
 use cowshed_types::metadata::{
     Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes,
 };
@@ -548,7 +548,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::storage::lifecycle::Revision;
+    use cowshed_types::lifecycle::Revision;
     use cowshed_types::metadata::WorkspaceRole;
 
     /// The tightest owned set for a workspace: exactly the identity it answers to.

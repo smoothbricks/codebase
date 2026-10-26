@@ -130,7 +130,7 @@ pub struct CowshedError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LocalCause {
     /// The exact stale lifecycle fact `execute_checked` found.
-    LifecycleConflict(crate::storage::lifecycle::Conflict),
+    LifecycleConflict(cowshed_types::lifecycle::Conflict),
     /// The image locks an operation taking them without waiting found held (01_storage.md,
     /// "Lock order").
     ImageLocksHeld(Box<[std::path::PathBuf]>),
@@ -520,7 +520,7 @@ impl CowshedError {
     }
 
     /// Preserve the structured CAS refusal while retaining the stable public error envelope.
-    pub fn lifecycle_conflict(conflict: crate::storage::lifecycle::Conflict) -> Self {
+    pub fn lifecycle_conflict(conflict: cowshed_types::lifecycle::Conflict) -> Self {
         Self {
             code: ErrorCode::Conflict,
             message: conflict.to_string(),
@@ -836,7 +836,7 @@ impl CowshedError {
     }
 
     /// The exact stale lifecycle fact, when this error came from `execute_checked`.
-    pub fn lifecycle_conflict_source(&self) -> Option<&crate::storage::lifecycle::Conflict> {
+    pub fn lifecycle_conflict_source(&self) -> Option<&cowshed_types::lifecycle::Conflict> {
         match self.local_cause.as_deref()? {
             LocalCause::LifecycleConflict(conflict) => Some(conflict),
             LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) => None,

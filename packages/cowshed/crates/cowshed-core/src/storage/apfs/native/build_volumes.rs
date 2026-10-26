@@ -1701,12 +1701,12 @@ mod tests {
             .await
             .expect("admission reopens after the mark");
         let defaults = WorkspaceSupervisorConfig::default();
-        let workspace = crate::storage::lifecycle::LifecycleWorkspace::new(
+        let workspace = cowshed_types::lifecycle::LifecycleWorkspace::new(
             defaults.authority.repo_id.clone(),
             defaults.authority.workspace.clone(),
             defaults.authority.workspace_incarnation.clone(),
-            crate::storage::lifecycle::Revision::new(defaults.authority.lifecycle_revision),
-            crate::storage::lifecycle::Revision::new(defaults.authority.grant_revision),
+            cowshed_types::lifecycle::Revision::new(defaults.authority.lifecycle_revision),
+            cowshed_types::lifecycle::Revision::new(defaults.authority.grant_revision),
             cowshed_types::metadata::WorkspaceRole::Main,
         )
         .unwrap();

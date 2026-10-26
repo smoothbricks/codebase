@@ -20,15 +20,17 @@ use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 use super::lifecycle::{
-    AdoptHandoff, AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef,
-    CreatePlan, DefragmentOutcome, DerivedWorkspace, Destination, ExecuteError, ForkPlan,
-    ImmutablePlan, LifecycleBackend, LifecycleFact, LifecyclePlanner, LifecycleReceipt,
-    LifecycleWorkspace, MountIntent, MountJoin, MountRefusal, MountRefusalReason, MountState,
-    Operation, OperationIdentity, Pin, PlanError, PurePlanner, ResizeOutcome, RestoreMode,
-    RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision, StorageFact, StorageGcOptions,
-    StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
+    AdoptHandoff, AdoptPlan, AdoptRequest, CheckpointPlan, CreatePlan, DefragmentOutcome,
+    Destination, ExecuteError, ForkPlan, ImmutablePlan, LifecycleBackend, LifecyclePlanner,
+    LifecycleReceipt, MountIntent, Operation, OperationIdentity, PlanError, PurePlanner,
+    ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef,
+    StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked,
 };
 use super::{StorageLayout, StorageLayoutError};
+use cowshed_types::lifecycle::{
+    CheckpointFact, CheckpointRef, DerivedWorkspace, LifecycleFact, LifecycleWorkspace, MountJoin,
+    MountRefusal, MountRefusalReason, MountState, Pin, Revision, StorageFact, revalidate,
+};
 use cowshed_types::lifecycle::{CheckpointLabel, PRE_RESTORE_PREFIX};
 
 pub const DEFAULT_IMAGE_CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(100);
@@ -917,7 +919,7 @@ pub enum ApfsStorageError {
     #[error("image locks are held by another operation: {}", held_locks(.held))]
     ImageLocksHeld { held: Vec<HeldImageLock> },
     #[error("lifecycle conflict: {0}")]
-    Conflict(#[from] super::lifecycle::Conflict),
+    Conflict(#[from] cowshed_types::lifecycle::Conflict),
     #[error("derived APFS state is inconsistent: {0}")]
     Derivation(#[from] super::lifecycle::DerivationError),
     #[error("workspace publication is pending its controller fence: {0}")]

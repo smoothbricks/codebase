@@ -287,12 +287,12 @@ pub fn rekey_workspace(
 
     // Fence step two: mint owns the companion's 0600 + fsync + parent-fsync
     // ordering and pairs the in-image certificate and token with the new key.
-    let lifecycle = crate::storage::lifecycle::LifecycleWorkspace::new(
+    let lifecycle = cowshed_types::lifecycle::LifecycleWorkspace::new(
         republished.repo_id.clone(),
         republished.workspace.clone(),
         republished.workspace_incarnation.clone(),
-        crate::storage::lifecycle::Revision::new(revision),
-        crate::storage::lifecycle::Revision::new(revision),
+        cowshed_types::lifecycle::Revision::new(revision),
+        cowshed_types::lifecycle::Revision::new(revision),
         role,
     )
     .map_err(|error| RekeyError::IdentityMismatch {

@@ -14,15 +14,17 @@ use cowshed_core::storage::apfs::{
     ResumableClone, ResumedMount, RetireExecutionError, StagedExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptHandoff, AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount,
-    KernelMountFact, LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountJoin,
-    MountState, OperationIdentity, Pin, PlanError, ResizeOutcome, RestoreMode, RetiredRef,
-    Revision, StorageFact, StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate,
-    SubstrateStats,
+    AdoptHandoff, AdoptRequest, DefragmentOutcome, Destination, ExtentCount, LifecyclePlanner,
+    MountIntent, OperationIdentity, PlanError, ResizeOutcome, RestoreMode, RetiredRef,
+    StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_types::image::is_image_path;
 use cowshed_types::lifecycle::CheckpointLabel;
+use cowshed_types::lifecycle::{
+    CheckpointFact, KernelMountFact, LifecycleFact, LifecycleWorkspace, MountJoin, MountState, Pin,
+    Revision, StorageFact,
+};
 use cowshed_types::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
     WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
@@ -2028,7 +2030,7 @@ async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
     let current = workspace("raven", 7);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+    let checkpoint = cowshed_types::lifecycle::CheckpointRef::new(
         current.clone(),
         CheckpointLabel::new("ready").expect("label"),
         Revision::new(8),
@@ -2070,7 +2072,7 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
     let current = workspace("raven", 7);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+    let checkpoint = cowshed_types::lifecycle::CheckpointRef::new(
         current.clone(),
         CheckpointLabel::new("ready").expect("label"),
         Revision::new(8),
@@ -2116,7 +2118,7 @@ async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() 
     let current = workspace("raven", 7);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+    let checkpoint = cowshed_types::lifecycle::CheckpointRef::new(
         current.clone(),
         CheckpointLabel::new("ready").expect("label"),
         Revision::new(8),
@@ -2464,7 +2466,7 @@ async fn repeated_restore_preserves_checkpoint_replaced_and_destination_identiti
     host.seed(&original);
     let substrate = substrate(host.clone(), CountingLane::default());
     let label = CheckpointLabel::new("retained-origin").expect("checkpoint label");
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+    let checkpoint = cowshed_types::lifecycle::CheckpointRef::new(
         original.clone(),
         label.clone(),
         Revision::new(8),
@@ -2494,7 +2496,7 @@ async fn repeated_restore_preserves_checkpoint_replaced_and_destination_identiti
         .await
         .expect("first restore");
 
-    let repeated_checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+    let repeated_checkpoint = cowshed_types::lifecycle::CheckpointRef::new(
         first.workspace.clone(),
         label,
         Revision::new(8),
@@ -3020,7 +3022,7 @@ async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
     let current = workspace("raven", 7);
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
+    let checkpoint = cowshed_types::lifecycle::CheckpointRef::new(
         current.clone(),
         CheckpointLabel::new("ready").expect("label"),
         Revision::new(8),

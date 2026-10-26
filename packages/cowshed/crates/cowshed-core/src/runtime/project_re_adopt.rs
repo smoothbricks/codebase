@@ -640,7 +640,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         &mut self,
         source: std::sync::Arc<ReAdoptSource>,
         lock: PathBuf,
-    ) -> Result<crate::storage::lifecycle::LifecycleWorkspace> {
+    ) -> Result<cowshed_types::lifecycle::LifecycleWorkspace> {
         use crate::storage::lifecycle::LifecyclePlanner;
         let main = main_name();
         // Main's own supervisor is retired again here, as on a replay. A missing main has none.
@@ -682,7 +682,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .plan_adopt(crate::storage::lifecycle::AdoptRequest {
                 repo: self.descriptor.repo_id.clone(),
                 capacity: cowshed_apfs::image::ImageCapacity::from_bytes(main_capacity(&source)),
-                topology_revision: crate::storage::lifecycle::Revision::new(0),
+                topology_revision: cowshed_types::lifecycle::Revision::new(0),
                 source_checkout: source.checkout.clone(),
                 handoff: handoff(&source),
                 identity,
@@ -743,7 +743,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             Ok(current) => ReplacedMain {
                 mounted: matches!(
                     current.derived.mount_state,
-                    crate::storage::lifecycle::MountState::Mounted { .. }
+                    cowshed_types::lifecycle::MountState::Mounted { .. }
                 ),
                 image: current.image,
                 metadata: current.metadata,

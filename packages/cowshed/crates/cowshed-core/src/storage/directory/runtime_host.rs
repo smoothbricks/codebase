@@ -17,10 +17,10 @@ use crate::runtime::build_volumes::Quiet;
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
 use crate::storage::apfs::{ApfsStorageError, Labelled};
-use crate::storage::lifecycle::DerivedWorkspace;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_types::lifecycle::DerivedWorkspace;
 use cowshed_types::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use cowshed_types::repository::RepoId;
 

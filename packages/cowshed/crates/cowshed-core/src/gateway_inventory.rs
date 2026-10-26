@@ -20,16 +20,16 @@ use crate::storage::apfs::{
 };
 use crate::storage::bootstrap::ValidatedHostStorage;
 use crate::storage::directory::DirectoryExecutionHost;
-use crate::storage::lifecycle::{
-    CheckpointFact, DerivationError, DerivedWorkspace, LifecycleWorkspace, MountJoin, MountState,
-    StorageFact, Substrate, derive_workspaces,
-};
+use crate::storage::lifecycle::{DerivationError, Substrate, derive_workspaces};
 use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
     GatewayWorkspaceCredentials, WorkspaceCredentialError, read_gateway_workspace_credentials,
 };
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::mounts::KernelMountSnapshot;
+use cowshed_types::lifecycle::{
+    CheckpointFact, DerivedWorkspace, LifecycleWorkspace, MountJoin, MountState, StorageFact,
+};
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, GrantSet, PortBlock, PublicationState, ReservedPortBlocks,
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
@@ -261,7 +261,7 @@ struct ProjectInventoryFacts {
 struct DerivedInventory {
     layout: StorageLayout,
     mount_paths: BTreeMap<String, PathBuf>,
-    derived: Vec<crate::storage::lifecycle::DerivedWorkspace>,
+    derived: Vec<cowshed_types::lifecycle::DerivedWorkspace>,
 }
 
 trait InventorySource: Send + Sync {
@@ -2725,7 +2725,7 @@ fn reject_duplicate_mount_facts(mounts: &[MountJoin]) -> Result<(), GatewayInven
 
 fn canonical_image_paths(
     layout: &StorageLayout,
-    workspace: &crate::storage::lifecycle::LifecycleWorkspace,
+    workspace: &cowshed_types::lifecycle::LifecycleWorkspace,
 ) -> Result<crate::storage::ImagePaths, GatewayInventoryError> {
     let result = layout.canonical_image(workspace.name());
     result.map_err(|error| GatewayInventoryError::InvalidMetadata {
@@ -2810,7 +2810,7 @@ fn verify_image_path(store_root: &Path, image: &Path) -> Result<(), GatewayInven
 pub fn read_current_metadata(
     store_root: &Path,
     image: &Path,
-    workspace: &crate::storage::lifecycle::LifecycleWorkspace,
+    workspace: &cowshed_types::lifecycle::LifecycleWorkspace,
 ) -> Result<DetachedWorkspaceMetadata, GatewayInventoryError> {
     verify_image_path(store_root, image)?;
     verify_no_symlinks(store_root, &sidecar_path(image)).map_err(|error| {
@@ -2888,10 +2888,10 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::storage::bootstrap::CanonicalRoots;
-    use crate::storage::lifecycle::{KernelMountFact, LifecycleWorkspace, Pin, Revision};
     use crate::workspace_credentials::mint_workspace_credentials;
     use cowshed_os::namespace::TestNamespace;
     use cowshed_types::lifecycle::CheckpointLabel;
+    use cowshed_types::lifecycle::{KernelMountFact, LifecycleWorkspace, Pin, Revision};
     use cowshed_types::metadata::{
         MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION, WorkspaceInfoSnapshot,
         WorkspaceRole, write_json,
@@ -3612,11 +3612,11 @@ mod tests {
             facts.mounts.push(if name == unproven {
                 MountJoin::Refused {
                     volume_key: mount.volume_key,
-                    refusal: Box::new(crate::storage::lifecycle::MountRefusal {
+                    refusal: Box::new(cowshed_types::lifecycle::MountRefusal {
                         workspace: storage.workspace.clone(),
                         mount_point: path,
                         mounted_from: "/dev/disk41s1".to_owned(),
-                        reason: crate::storage::lifecycle::MountRefusalReason::MarkerUnreadable(
+                        reason: cowshed_types::lifecycle::MountRefusalReason::MarkerUnreadable(
                             "No such file or directory (os error 2)".to_owned(),
                         ),
                     }),

@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 use cowshed_core::storage::apfs::rekey::{RekeyError, rekey_workspace};
-use cowshed_core::storage::lifecycle::{LifecycleWorkspace, Revision};
 use cowshed_core::workspace_credentials::{mint_workspace_credentials, validate_private_key};
+use cowshed_types::lifecycle::{LifecycleWorkspace, Revision};
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, MARKER_VERSION, NEW_PORT_BLOCK_SIZE,
     Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,

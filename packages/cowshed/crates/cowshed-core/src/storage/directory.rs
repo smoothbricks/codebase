@@ -66,12 +66,14 @@ use super::apfs::{
     ResumedMount, combine_cleanup, companion_path, layout, main_aware_mount_point, volume_key,
 };
 use super::lifecycle::{
-    CheckpointFact, DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact,
-    LifecycleWorkspace, MountJoin, MountRefusal, MountRefusalReason, MountState, OperationIdentity,
-    Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcOptions, StorageGcPlan,
-    StorageGcReport, SubstrateStats, derive_workspaces,
+    DefragmentOutcome, OperationIdentity, ResizeOutcome, RetiredRef, StorageGcOptions,
+    StorageGcPlan, StorageGcReport, SubstrateStats, derive_workspaces,
 };
 use super::{WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks};
+use cowshed_types::lifecycle::{
+    CheckpointFact, DerivedWorkspace, KernelMountFact, LifecycleFact, LifecycleWorkspace,
+    MountJoin, MountRefusal, MountRefusalReason, MountState, Pin, Revision, StorageFact,
+};
 use cowshed_types::lifecycle::{CheckpointLabel, PRE_RESTORE_PREFIX};
 
 /// The name every refusal of a physical-volume request gives this backend.

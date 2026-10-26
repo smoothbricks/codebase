@@ -34,12 +34,13 @@ use crate::storage::apfs::{
 };
 use crate::storage::deletion_log::{self, DeletionKind, DeletionOp};
 use crate::storage::lifecycle::{
-    RetiredRef, Revision, StorageGcCandidate, StorageGcDeferred, StorageGcOptions, StorageGcPlan,
+    RetiredRef, StorageGcCandidate, StorageGcDeferred, StorageGcOptions, StorageGcPlan,
     StorageGcReason, StorageGcReport, StorageGcRetained,
 };
 use crate::storage::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
 use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
 use cowshed_types::image::{IMAGE_EXTENSION, is_image_path};
+use cowshed_types::lifecycle::Revision;
 use cowshed_types::lifecycle::{CheckpointLabel, PRE_RESTORE_PREFIX};
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, PublicationState, WorkspaceIncarnation,

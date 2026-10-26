@@ -44,7 +44,7 @@ use cowshed_core::storage::host_config::{
 use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, records_lock_held, repair_workspace_record_sequences,
 };
-use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
+use cowshed_core::storage::lifecycle::{MountIntent, Substrate};
 use cowshed_core::storage::recovery::KeptAbandonBundles;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
@@ -53,6 +53,7 @@ use cowshed_core::{
 };
 use cowshed_gateway_types::STORE_ROOT;
 use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::lifecycle::{DerivedWorkspace, MountState, Pin};
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };

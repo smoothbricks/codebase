@@ -21,8 +21,9 @@ use cowshed_core::api::MountResult;
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
-use cowshed_core::storage::lifecycle::{MountIntent, MountState, Substrate};
+use cowshed_core::storage::lifecycle::{MountIntent, Substrate};
 use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
+use cowshed_types::lifecycle::MountState;
 use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, MetadataError, PublicationState, WorkspaceName, read_json,
 };

@@ -52,10 +52,10 @@ use cowshed_types::metadata::{
 use cowshed_types::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
 
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
-use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
 use cowshed_core::{Cowshed, CowshedError, ErrorCode, JobStream, Result, Retry};
 use cowshed_os::namespace::TestNamespace;
 use cowshed_os::timing::{timed, timed_async};
+use cowshed_types::lifecycle::{Conflict, LifecycleFact, Revision};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};

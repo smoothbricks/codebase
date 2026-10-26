@@ -41,11 +41,9 @@ use sha2::{Digest, Sha256};
 
 use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
-    CheckpointFact, DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact,
-    LifecycleWorkspace, MountJoin, MountRefusal, MountRefusalReason, MountState, OperationIdentity,
-    Pin, ResizeOutcome, RetiredRef, Revision, RootHeldMountpoint, StorageFact, StorageGcCandidate,
-    StorageGcDeferred, StorageGcOptions, StorageGcPlan, StorageGcReason, StorageGcReport,
-    StorageGcRetained, SubstrateStats, derive_workspaces,
+    DefragmentOutcome, OperationIdentity, ResizeOutcome, RetiredRef, RootHeldMountpoint,
+    StorageGcCandidate, StorageGcDeferred, StorageGcOptions, StorageGcPlan, StorageGcReason,
+    StorageGcReport, StorageGcRetained, SubstrateStats, derive_workspaces,
 };
 use super::super::{WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks};
 use super::{
@@ -55,6 +53,10 @@ use super::{
     recovery_staging_mount, retired_image_below, split_retired_stem, volume_key,
 };
 use cowshed_os::timing::timed;
+use cowshed_types::lifecycle::{
+    CheckpointFact, DerivedWorkspace, KernelMountFact, LifecycleFact, LifecycleWorkspace,
+    MountJoin, MountRefusal, MountRefusalReason, MountState, Pin, Revision, StorageFact,
+};
 use cowshed_types::lifecycle::{CheckpointLabel, PRE_RESTORE_PREFIX};
 use image_telemetry::{Image, ImageTelemetry};
 
