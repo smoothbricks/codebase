@@ -17,6 +17,7 @@
     {
       "path": "../packages/cli/tsconfig.lib.json"
     },
-    { "path": "../packages/failure-summary/tsconfig.lib.json" }
+    { "path": "../packages/failure-summary/tsconfig.lib.json" },
+    { "path": "../packages/validation/tsconfig.lib.json" }
   ]
 }
