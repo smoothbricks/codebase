@@ -219,6 +219,42 @@ fn behind_limit(total: usize) -> usize {
     (total.saturating_sub(1) / 2).max(usize::from(total >= 2))
 }
 
+/// What a holder's top-up ask hears (05_gateway.md "All at once"), with the ledger as it stood.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TopUp {
+    pub(crate) outcome: TopUpOutcome,
+    pub(crate) free: usize,
+    pub(crate) total: usize,
+    pub(crate) queued: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TopUpOutcome {
+    /// One more token is the holder's.
+    Granted,
+    /// The holder holds all it asked for, or holds nothing (it left, or still waits).
+    Settled,
+    /// No token is free.
+    Full,
+    /// Tokens are free, but a request waits: whatever keeps it waiting, the free tokens are its.
+    Waiting,
+    /// The holder is work behind the oldest gate job, and that work holds its floor's room
+    /// (05_gateway.md "Room for a gate").
+    Floor,
+}
+
+impl TopUpOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::Settled => "settled",
+            Self::Full => "full",
+            Self::Waiting => "waiting",
+            Self::Floor => "floor",
+        }
+    }
+}
+
 /// What a request queued by an admission transition hears: the queue it waits in, and why.
 #[derive(Debug)]
 pub(crate) struct Queued {
@@ -397,6 +433,91 @@ impl Ledger {
                 head,
             });
         }
+    }
+
+    /// One more token for holder `ticket`, whose grant is below its want (05_gateway.md "All at
+    /// once"): only a token no request waits for, and only within the floor beside gate work, so
+    /// a top-up never passes a waiter of any rank and never takes room the order gives another.
+    pub(crate) fn top_up(&mut self, ticket: Ticket) -> TopUp {
+        let queued = self
+            .checkouts
+            .values()
+            .map(|checkout| checkout.waiting.len())
+            .sum();
+        let outcome = self.grow(ticket, queued);
+        TopUp {
+            outcome,
+            free: self.free,
+            total: self.total,
+            queued,
+        }
+    }
+
+    fn grow(&mut self, ticket: Ticket, queued: usize) -> TopUpOutcome {
+        let Some(name) = self.tickets.get(&ticket) else {
+            return TopUpOutcome::Settled;
+        };
+        let checkout = &self.checkouts[name];
+        let Some(holder) = checkout
+            .running
+            .iter()
+            .find(|holder| holder.ticket == ticket)
+        else {
+            return TopUpOutcome::Settled;
+        };
+        if holder.tokens >= holder.want {
+            return TopUpOutcome::Settled;
+        }
+        if self.free == 0 {
+            return TopUpOutcome::Full;
+        }
+        if queued > 0 {
+            return TopUpOutcome::Waiting;
+        }
+        if let Some((_, head)) = self.queue_head()
+            && (holder.class == Class::Background || holder.job > head)
+            && !self.floor_open(head)
+        {
+            return TopUpOutcome::Floor;
+        }
+        let name = std::sync::Arc::clone(name);
+        let checkout = self
+            .checkouts
+            .get_mut(&name)
+            .expect("a known ticket's checkout is present");
+        let holder = checkout
+            .running
+            .iter_mut()
+            .find(|holder| holder.ticket == ticket)
+            .expect("the holder was found above");
+        holder.tokens += 1;
+        checkout.held += 1;
+        self.free -= 1;
+        TopUpOutcome::Granted
+    }
+
+    /// Holder `ticket` gives back one topped-up token it holds idle: it goes to the waiters, as
+    /// any returned token does. A holder never gives back below one token; a ticket the ledger
+    /// does not hold changes nothing.
+    pub(crate) fn give_back(&mut self, now: Instant, ticket: Ticket, grants: &mut Vec<Grant>) {
+        let Some(name) = self.tickets.get(&ticket) else {
+            return;
+        };
+        let checkout = self
+            .checkouts
+            .get_mut(name)
+            .expect("a known ticket's checkout is present");
+        let Some(holder) = checkout
+            .running
+            .iter_mut()
+            .find(|holder| holder.ticket == ticket && holder.tokens > 1)
+        else {
+            return;
+        };
+        holder.tokens -= 1;
+        checkout.held -= 1;
+        self.free += 1;
+        self.admit(now, grants);
     }
 
     /// Lend the probation token, while it is free, to the oldest waiter that may still take it
@@ -991,6 +1112,15 @@ enum Message {
         ticket: Ticket,
         released: Instant,
     },
+    /// A holder below its want asks for one more token ([`Ledger::top_up`]).
+    TopUp {
+        ticket: Ticket,
+        told: oneshot::Sender<TopUp>,
+    },
+    /// A holder gives back one topped-up token it holds idle ([`Ledger::give_back`]).
+    GiveBack {
+        ticket: Ticket,
+    },
     /// A CPU pool a gate job serves.
     GatePool {
         job: Ticket,
@@ -1046,6 +1176,14 @@ pub(crate) struct Stake {
 }
 
 impl Stake {
+    /// The handle a lent pool tops this stake's grant up through, and gives tokens back.
+    pub(crate) fn grower(&self) -> Grower {
+        Grower {
+            ticket: self.ticket,
+            messages: self.messages.clone(),
+        }
+    }
+
     /// The age of the job this stake admits, for the tasks it relays as [`Rank::GateTask`].
     pub(crate) fn job(&self) -> JobAge {
         JobAge(self.ticket)
@@ -1057,6 +1195,35 @@ impl Stake {
     pub(crate) fn probation_over(&self) {
         // An actor that is gone lends nothing.
         let _ = self.messages.send(Message::ProbationOver {
+            ticket: self.ticket,
+        });
+    }
+}
+
+/// A granted stake's top-up handle (05_gateway.md "All at once"). It owns nothing: the stake's
+/// leaving returns every token it holds, topped up or not.
+#[derive(Clone, Debug)]
+pub(crate) struct Grower {
+    ticket: Ticket,
+    messages: mpsc::UnboundedSender<Message>,
+}
+
+impl Grower {
+    /// Ask for one more token. The receiver errors when the budget is gone.
+    pub(crate) fn top_up(&self) -> oneshot::Receiver<TopUp> {
+        let (told, hearing) = oneshot::channel();
+        // A budget that is gone tops nothing up: the receiver says so.
+        let _ = self.messages.send(Message::TopUp {
+            ticket: self.ticket,
+            told,
+        });
+        hearing
+    }
+
+    /// Give back one topped-up token held idle.
+    pub(crate) fn give_back(&self) {
+        // A budget that is gone holds no token to return.
+        let _ = self.messages.send(Message::GiveBack {
             ticket: self.ticket,
         });
     }
@@ -1276,6 +1443,8 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             Message::Quiet { ticket, .. } => Some(("quiet", *ticket, None)),
             Message::GatePool { .. } => None,
             Message::Leave { ticket, released } => Some(("release", *ticket, Some(*released))),
+            Message::TopUp { .. } => None,
+            Message::GiveBack { ticket } => Some(("give-back", *ticket, None)),
             Message::ProbationOver { ticket } => Some(("probation-over", *ticket, None)),
             Message::Status { .. } | Message::CutOff { .. } => None,
         };
@@ -1363,6 +1532,10 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                     cut.left(ticket);
                 }
             }
+            Message::TopUp { ticket, told } => {
+                let _ = told.send(ledger.top_up(ticket));
+            }
+            Message::GiveBack { ticket } => ledger.give_back(Instant::now(), ticket, &mut effects),
             Message::ProbationOver { ticket } => ledger.probation_over(ticket),
             Message::Status { reply } => {
                 let _ = reply.send(ledger.status(Instant::now()));
@@ -1644,6 +1817,16 @@ mod tests {
                 CpuWaitCause::Quiet { gate } => ("quiet", Some(gate.job)),
                 CpuWaitCause::Tokens => ("tokens", None),
             }
+        }
+
+        fn top_up(&mut self, ticket: Ticket) -> TopUpOutcome {
+            self.ledger.top_up(ticket).outcome
+        }
+
+        fn give_back(&mut self, ms: u64, ticket: Ticket) -> Vec<(Ticket, usize)> {
+            let now = self.origin + Duration::from_millis(ms);
+            self.ledger.give_back(now, ticket, &mut self.effects);
+            self.grants()
         }
 
         /// Each grant as `(ticket, tokens)`; its wait is kept in `waited`.
@@ -2460,6 +2643,72 @@ mod tests {
         assert_eq!(clock.leave(8, 2), []);
         assert_eq!(clock.released(), [10]);
         assert!(clock.status(8).quiet.is_empty());
+        assert!(clock.balanced());
+    }
+
+    /// The measured starvation (2026-10-26, gate job 949): a land task granted 1 of the 18 it
+    /// asked while its siblings held the host keeps tokens flowing once they end. It tops up one
+    /// token at a time from tokens nobody waits for, up to its want, until the host is full, and
+    /// a token it gives back goes to a waiter first.
+    #[test]
+    fn a_task_granted_less_than_it_asked_tops_up_from_tokens_nobody_waits_for() {
+        let mut clock = Clock::new(18);
+        assert_eq!(clock.ask_land(0, 1, "land", 1), [(1, 1)]);
+        assert_eq!(clock.ask_task(1, 2, 1, "land", 16), [(2, 16)]);
+        assert_eq!(clock.ask_task(2, 3, 1, "land", 18), [(3, 1)]);
+        assert_eq!(clock.leave(3, 2), []);
+        assert_eq!(
+            clock.status(3).held,
+            2,
+            "nobody waits: the freed tokens sit"
+        );
+        for _ in 0..16 {
+            assert_eq!(clock.top_up(3), TopUpOutcome::Granted);
+        }
+        assert_eq!(clock.top_up(3), TopUpOutcome::Full);
+        assert_eq!(clock.status(3).held, 18);
+        assert!(clock.balanced());
+        // A waiter queued meanwhile takes the token given back, and no top-up passes it.
+        assert_eq!(clock.ask_task(4, 4, 1, "land", 2), []);
+        assert_eq!(clock.give_back(5, 3), [(4, 1)]);
+        assert_eq!(clock.give_back(6, 3), []);
+        assert_eq!(clock.top_up(3), TopUpOutcome::Granted);
+        assert_eq!(clock.leave(7, 3), []);
+        assert_eq!(
+            clock.status(7).held,
+            2,
+            "leaving returns every topped-up token"
+        );
+        assert!(clock.balanced());
+    }
+
+    /// A top-up takes only tokens no request waits for: a younger gate job of the same repository
+    /// waits with tokens free, and a background holder below its want tops up nothing past it;
+    /// once it leaves, the holder tops up as far as the floor beside the gate leaves room.
+    #[test]
+    fn no_top_up_passes_a_waiting_request_or_the_floor_beside_a_gate() {
+        let mut clock = Clock::new(18);
+        let gate = |repo: &str, job| (Class::Gate(Arc::from(repo)), job);
+        assert_eq!(clock.ask_as(0, 1, "a1", 1, gate("owner/a", 1)), [(1, 1)]);
+        assert_eq!(clock.ask(1, 10, "bg", 12), [(10, 1)]);
+        assert_eq!(clock.ask_as(2, 3, "a2", 1, gate("owner/a", 3)), []);
+        assert_eq!(clock.top_up(10), TopUpOutcome::Waiting);
+        assert_eq!(
+            clock.top_up(1),
+            TopUpOutcome::Settled,
+            "a holder at its want"
+        );
+        assert_eq!(clock.leave(3, 3), []);
+        for _ in 1..behind_limit(18) {
+            assert_eq!(clock.top_up(10), TopUpOutcome::Granted);
+        }
+        assert_eq!(clock.top_up(10), TopUpOutcome::Floor);
+        assert_eq!(clock.leave(4, 1), []);
+        assert_eq!(
+            clock.top_up(10),
+            TopUpOutcome::Granted,
+            "no gate work: no floor"
+        );
         assert!(clock.balanced());
     }
 

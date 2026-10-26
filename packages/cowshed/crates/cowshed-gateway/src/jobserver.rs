@@ -19,6 +19,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The byte a GNU make jobserver hands out as one token.
 const TOKEN_BYTE: u8 = b'+';
 
+/// How often a lent pool below its want looks at its fifo (05_gateway.md "All at once").
+const GROWTH_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long the ledger refuses a pool's asks, asked every check, before the pool says it starves.
+const STARVED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+/// The longest a pool waits to offer a token again after offered ones sat idle.
+const OFFER_BACK_OFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Whole-grant admission, never a request to resize a live FIFO. Neither class has an admission
 /// deadline: a request waits in the ledger's order until it is granted or its client leaves.
 /// These are the classes that hold tokens, so they are the ledger's; a resident holds none and
@@ -161,6 +168,12 @@ pub(crate) enum PoolSource {
     /// implicit token. A child asking the pool's socket takes from that same count ([`FifoTokens`]),
     /// so a Cargo reading the fifo and a nested runner holding a grant never count one token twice.
     Lent(std::num::NonZeroUsize),
+    /// A lent pool whose host grant is below what it asked: it tops up from the host ledger
+    /// ([`Growth`]).
+    Growing {
+        tokens: std::num::NonZeroUsize,
+        growing: Growing,
+    },
     /// A gate grant: each child asks the host budget itself, at gate class, for the gate's
     /// checkout, ranked by the gate job's own admission. A land's tasks therefore rank ahead of
     /// background work at every token any holder returns, and an older land's tasks ahead of a
@@ -187,6 +200,14 @@ pub(crate) enum PoolSource {
     /// token, which no child takes. [`CpuPool::grant_probation`] makes it the job's granted
     /// token, which the pool then lends as any lent pool of one does.
     Probation,
+}
+
+/// What a lent pool tops up through (05_gateway.md "All at once"): its host stake's grower, the
+/// count it asked for, and what names its job in a starvation.
+pub(crate) struct Growing {
+    pub(crate) grower: crate::cpu_budget::Grower,
+    pub(crate) want: usize,
+    pub(crate) named: String,
 }
 
 /// Where a pool serves, and the gate job it serves when it serves one: the directory every pool
@@ -239,9 +260,12 @@ impl CpuPool {
         // from the job's public id. Sandbox policy admits connect/metadata, never directory data;
         // of the fifo beside it, reads and writes of its tokens and nothing else.
         let fifo = match &source {
-            PoolSource::Lent(tokens) | PoolSource::Relay { tokens, .. } => Some(
-                JobserverFifo::make(directory.join(opaque_name()), tokens.get())?,
-            ),
+            PoolSource::Lent(tokens)
+            | PoolSource::Growing { tokens, .. }
+            | PoolSource::Relay { tokens, .. } => Some(JobserverFifo::make(
+                directory.join(opaque_name()),
+                tokens.get(),
+            )?),
             PoolSource::Probation => Some(JobserverFifo::make(directory.join(opaque_name()), 1)?),
             PoolSource::Resident { .. } => None,
         };
@@ -266,9 +290,23 @@ impl CpuPool {
         };
         let mut probation = None;
         let ledger = match source {
-            PoolSource::Lent(_) => PoolLedger::Fifo(FifoTokens::start(made(), true)?),
+            PoolSource::Lent(_) => PoolLedger::Fifo(FifoTokens::start(made(), true, None)?),
+            PoolSource::Growing { tokens, growing } => {
+                let shell = GrowthShell {
+                    growth: Growth::new(
+                        std::time::Instant::now(),
+                        growing.want.saturating_sub(tokens.get()),
+                    ),
+                    granted: tokens.get(),
+                    want: growing.want,
+                    grower: growing.grower,
+                    named: growing.named,
+                    pool: path.clone(),
+                };
+                PoolLedger::Fifo(FifoTokens::start(made(), true, Some(shell))?)
+            }
             PoolSource::Probation => {
-                let tokens = FifoTokens::start(made(), false)?;
+                let tokens = FifoTokens::start(made(), false, None)?;
                 probation = Some(tokens.clone());
                 PoolLedger::Fifo(tokens)
             }
@@ -529,7 +567,7 @@ impl FifoTokens {
     /// what is there. The holder's own token is lent too when `implicit` is free, and not while
     /// it is the probation token ([`Self::free_implicit`]). The lender runs while any handle or
     /// grant of it is alive.
-    fn start(path: &Path, implicit: bool) -> io::Result<Self> {
+    fn start(path: &Path, implicit: bool, growth: Option<GrowthShell>) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let file = OpenOptions::new()
             .read(true)
@@ -538,7 +576,7 @@ impl FifoTokens {
             .open(path)?;
         let fifo = tokio::io::unix::AsyncFd::with_interest(file, tokio::io::Interest::READABLE)?;
         let (messages, receiver) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(lend(fifo, receiver, messages.downgrade(), implicit));
+        tokio::spawn(lend(fifo, receiver, messages.downgrade(), implicit, growth));
         Ok(Self { messages })
     }
 
@@ -560,14 +598,220 @@ impl FifoTokens {
     }
 }
 
+/// A lent pool's top-up, decided from what each check sees (05_gateway.md "All at once"), at the
+/// instants it is given. Its fifo empty, it asks the host ledger for one token at a time up to its
+/// want; a token it added that sits in the fifo goes straight back. An offer that sat idle backs
+/// the next one off, doubling to [`OFFER_BACK_OFF_MAX`], and an offer a reader took resets that;
+/// a child queued on its socket is asked for at once. A refused ask is asked again every check, and
+/// a refusal that lasts [`STARVED_AFTER`] is said once a spell.
+#[derive(Debug)]
+struct Growth {
+    /// The tokens it may still add: its want less its grant.
+    room: usize,
+    /// The tokens it added and holds.
+    extra: usize,
+    /// A token added at the last ask, not yet seen taken or idle.
+    offered: bool,
+    back_off: std::time::Duration,
+    next_offer: std::time::Instant,
+    /// Since when the ledger has refused its asks, its fifo empty throughout.
+    refused_since: Option<std::time::Instant>,
+    /// Whether this refused spell's starvation was said.
+    starved: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum GrowthStep {
+    /// Give back up to this many added tokens, read out of the fifo.
+    GiveBack(usize),
+    /// Ask the host ledger for one token.
+    Ask,
+    Wait,
+}
+
+impl Growth {
+    fn new(now: std::time::Instant, room: usize) -> Self {
+        Self {
+            room,
+            extra: 0,
+            offered: false,
+            back_off: std::time::Duration::ZERO,
+            next_offer: now,
+            refused_since: None,
+            starved: false,
+        }
+    }
+
+    /// What to do, seeing `idle` token bytes in the fifo and `waiting` children queued on the
+    /// pool's socket.
+    fn step(&mut self, now: std::time::Instant, idle: usize, waiting: usize) -> GrowthStep {
+        if std::mem::take(&mut self.offered) {
+            self.back_off = if idle == 0 {
+                std::time::Duration::ZERO
+            } else {
+                (self.back_off * 2).clamp(GROWTH_CHECK, OFFER_BACK_OFF_MAX)
+            };
+            self.next_offer = now + self.back_off;
+        }
+        if idle > 0 {
+            self.refused_since = None;
+            self.starved = false;
+            return if self.extra > 0 {
+                GrowthStep::GiveBack(idle.min(self.extra))
+            } else {
+                GrowthStep::Wait
+            };
+        }
+        if self.extra < self.room && (waiting > 0 || now >= self.next_offer) {
+            GrowthStep::Ask
+        } else {
+            GrowthStep::Wait
+        }
+    }
+
+    /// `tokens` added tokens were read out of the fifo and given back.
+    fn gave_back(&mut self, tokens: usize) {
+        self.extra -= tokens;
+    }
+
+    /// What the ledger answered an ask at `now`: the refused spell's length once, when the
+    /// ledger has refused every ask for [`STARVED_AFTER`].
+    fn heard(
+        &mut self,
+        now: std::time::Instant,
+        outcome: crate::cpu_budget::TopUpOutcome,
+    ) -> Option<std::time::Duration> {
+        use crate::cpu_budget::TopUpOutcome;
+        match outcome {
+            TopUpOutcome::Granted => {
+                self.extra += 1;
+                self.offered = true;
+                self.refused_since = None;
+                self.starved = false;
+                None
+            }
+            TopUpOutcome::Settled => {
+                self.room = self.extra;
+                None
+            }
+            TopUpOutcome::Full | TopUpOutcome::Waiting | TopUpOutcome::Floor => {
+                // Refused: ask again at the next check, so the spell is measured asking.
+                self.back_off = std::time::Duration::ZERO;
+                self.next_offer = now;
+                let refused = now.saturating_duration_since(*self.refused_since.get_or_insert(now));
+                (!self.starved && refused >= STARVED_AFTER).then(|| {
+                    self.starved = true;
+                    refused
+                })
+            }
+        }
+    }
+}
+
+/// The lender's top-up: [`Growth`] over its fifo and its host stake, and what names it.
+struct GrowthShell {
+    growth: Growth,
+    granted: usize,
+    want: usize,
+    grower: crate::cpu_budget::Grower,
+    named: String,
+    pool: PathBuf,
+}
+
+impl GrowthShell {
+    /// One check; `false` once the pool can top up no more (its budget gone, or its fifo failed).
+    async fn check(&mut self, fifo: &File, waiting: usize) -> bool {
+        let now = std::time::Instant::now();
+        let idle = match idle_tokens(fifo) {
+            Ok(idle) => idle,
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: CPU pool {} cannot count its idle tokens and tops up no more: {error}",
+                    self.pool.display()
+                );
+                return false;
+            }
+        };
+        match self.growth.step(now, idle, waiting) {
+            GrowthStep::Wait => true,
+            GrowthStep::GiveBack(tokens) => match read_tokens(fifo, tokens) {
+                Ok(read) => {
+                    for _ in 0..read {
+                        self.grower.give_back();
+                    }
+                    self.growth.gave_back(read);
+                    true
+                }
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: CPU pool {} cannot read its idle tokens back and tops up no more: {error}",
+                        self.pool.display()
+                    );
+                    false
+                }
+            },
+            GrowthStep::Ask => {
+                let Ok(top_up) = self.grower.top_up().await else {
+                    return false;
+                };
+                if top_up.outcome == crate::cpu_budget::TopUpOutcome::Granted
+                    && let Err(error) = write_tokens(fifo, 1)
+                {
+                    self.grower.give_back();
+                    cowshed_os::eprintln!(
+                        "cowshed: CPU pool {} cannot add a token to its fifo and tops up no more: {error}",
+                        self.pool.display()
+                    );
+                    return false;
+                }
+                if let Some(refused) = self.growth.heard(now, top_up.outcome) {
+                    // A reader blocked on the fifo is invisible to the pool: the empty fifo stands
+                    // for it. Only a child queued on the pool's socket is counted.
+                    cowshed_os::eprintln!(
+                        "cowshed: cpu-pool STARVED pool={} job={:?} held={} want={} refused_ms={} socket_waiters={waiting} cause={} ledger_free={} ledger_total={} ledger_queued={}",
+                        self.pool.display(),
+                        self.named,
+                        self.granted + self.growth.extra,
+                        self.want,
+                        refused.as_millis(),
+                        top_up.outcome.as_str(),
+                        top_up.free,
+                        top_up.total,
+                        top_up.queued,
+                    );
+                }
+                true
+            }
+        }
+    }
+}
+
+/// The token bytes in `fifo` now, unread.
+fn idle_tokens(fifo: &File) -> io::Result<usize> {
+    let mut bytes: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int, through a pointer to this stack slot, about the
+    // descriptor this lender owns.
+    if unsafe { libc::ioctl(fifo.as_raw_fd(), libc::FIONREAD, &mut bytes) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(bytes).map_err(io::Error::other)
+}
+
 /// The lender: grants its queue's head from the fifo and the implicit token, takes returns, and
-/// waits for the fifo to become readable while its head finds nothing free.
+/// waits for the fifo to become readable while its head finds nothing free. A pool below its want
+/// checks its top-up every [`GROWTH_CHECK`].
 async fn lend(
     fifo: tokio::io::unix::AsyncFd<File>,
     mut messages: tokio::sync::mpsc::UnboundedReceiver<FifoMessage>,
     returns: tokio::sync::mpsc::WeakUnboundedSender<FifoMessage>,
     mut implicit: bool,
+    mut growth: Option<GrowthShell>,
 ) {
+    let mut checks = growth.as_ref().map(|_| {
+        let mut checks = tokio::time::interval(GROWTH_CHECK);
+        checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        checks
+    });
     let mut queue = std::collections::VecDeque::<(
         std::num::NonZeroUsize,
         tokio::sync::oneshot::Sender<FifoGrant>,
@@ -623,6 +867,21 @@ async fn lend(
                 Err(error) => {
                     cowshed_os::eprintln!("cowshed: CPU pool cannot wait on its jobserver fifo: {error}");
                     return;
+                }
+            },
+            _ = async {
+                match checks.as_mut() {
+                    Some(checks) => {
+                        checks.tick().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(shell) = growth.as_mut()
+                    && !shell.check(fifo.get_ref(), queue.len()).await
+                {
+                    growth = None;
+                    checks = None;
                 }
             },
         }
@@ -709,7 +968,7 @@ enum Admission {
 /// What a granted child holds until its connection ends: dropping it returns the tokens.
 enum Held {
     Fifo { _grant: FifoGrant },
-    Host { _stake: crate::cpu_budget::Stake },
+    Host { stake: crate::cpu_budget::Stake },
 }
 
 impl Admission {
@@ -723,7 +982,7 @@ impl Admission {
                 Ok((Held::Fifo { _grant: grant }, tokens))
             }
             Self::Host { stake, granted } => match granted.await {
-                Ok(tokens) => Ok((Held::Host { _stake: stake }, tokens)),
+                Ok(tokens) => Ok((Held::Host { stake }, tokens)),
                 Err(_) => Err(Some(stake)),
             },
         }
@@ -812,8 +1071,20 @@ async fn serve_pool(
         _ = reader.read(&mut byte) => return,
     };
     let pool = if children {
-        let tokens = std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero");
-        match CpuPool::start(scope, PoolSource::Lent(tokens)) {
+        let granted = std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero");
+        // A host grant below the ask tops up from the host ledger; a pool's own grant is final.
+        let source = match &held {
+            Held::Host { stake } if want.get() > tokens => PoolSource::Growing {
+                tokens: granted,
+                growing: Growing {
+                    grower: stake.grower(),
+                    want: want.get(),
+                    named: format!("child CPU pool of pid {pid:?}"),
+                },
+            },
+            _ => PoolSource::Lent(granted),
+        };
+        match CpuPool::start(scope, source) {
             Ok(pool) => Some(pool),
             Err(error) => {
                 let _ = pool_reply(reader.get_mut(), &serde_json::json!({"ok":false,"code":"rejected","error":format!("cannot serve child CPU pool: {error}")})).await;
@@ -1102,6 +1373,126 @@ mod tests {
             assert!(!endpoint.exists());
             assert!(!fifo.exists(), "retirement unlinks the pool's fifo");
         }
+    }
+
+    fn after(origin: std::time::Instant, seconds: u64) -> std::time::Instant {
+        origin + std::time::Duration::from_secs(seconds)
+    }
+
+    /// A pool granted less than it asked tops up while its fifo is empty and gives an added token
+    /// back once it sits idle; an offer a reader took is followed at once, an idle one backs off.
+    #[test]
+    fn a_pool_below_its_want_tops_up_while_empty_and_gives_back_what_sits_idle() {
+        use crate::cpu_budget::TopUpOutcome::Granted;
+        let origin = std::time::Instant::now();
+        let mut growth = Growth::new(origin, 3);
+        assert_eq!(growth.step(origin, 0, 0), GrowthStep::Ask);
+        assert_eq!(growth.heard(origin, Granted), None);
+        // A reader took it: the next is offered at once.
+        assert_eq!(growth.step(after(origin, 1), 0, 0), GrowthStep::Ask);
+        assert_eq!(growth.heard(after(origin, 1), Granted), None);
+        // This one sits idle: it goes back, and the next offer waits a check.
+        assert_eq!(growth.step(after(origin, 2), 1, 0), GrowthStep::GiveBack(1));
+        growth.gave_back(1);
+        assert_eq!(growth.extra, 1);
+        assert_eq!(growth.step(after(origin, 2), 0, 0), GrowthStep::Wait);
+        assert_eq!(growth.step(after(origin, 3), 0, 0), GrowthStep::Ask);
+        assert_eq!(growth.heard(after(origin, 3), Granted), None);
+        // Idle again: the back-off doubles, and a child queued on the socket overrides it.
+        assert_eq!(growth.step(after(origin, 4), 1, 0), GrowthStep::GiveBack(1));
+        growth.gave_back(1);
+        assert_eq!(growth.step(after(origin, 5), 0, 0), GrowthStep::Wait);
+        assert_eq!(growth.step(after(origin, 5), 0, 1), GrowthStep::Ask);
+        assert_eq!(growth.step(after(origin, 6), 0, 0), GrowthStep::Ask);
+        // Base tokens returned to the fifo give back only what was added.
+        assert_eq!(growth.heard(after(origin, 6), Granted), None);
+        assert_eq!(growth.step(after(origin, 7), 4, 0), GrowthStep::GiveBack(2));
+    }
+
+    /// Up to its want and no further; a ledger that says it is settled stops the asks.
+    #[test]
+    fn a_pool_tops_up_to_its_want_and_stops_once_settled() {
+        use crate::cpu_budget::TopUpOutcome::{Granted, Settled};
+        let origin = std::time::Instant::now();
+        let mut growth = Growth::new(origin, 1);
+        assert_eq!(growth.step(origin, 0, 0), GrowthStep::Ask);
+        assert_eq!(growth.heard(origin, Granted), None);
+        assert_eq!(growth.step(after(origin, 1), 0, 5), GrowthStep::Wait);
+        let mut settled = Growth::new(origin, 4);
+        assert_eq!(settled.step(origin, 0, 0), GrowthStep::Ask);
+        assert_eq!(settled.heard(origin, Settled), None);
+        assert_eq!(settled.step(after(origin, 1), 0, 1), GrowthStep::Wait);
+    }
+
+    /// A pool whose fifo stays empty while the ledger tops up nothing says it starves within
+    /// [`STARVED_AFTER`], once a spell, and again only after its fifo held a token.
+    #[test]
+    fn an_empty_pool_the_ledger_cannot_top_up_says_it_starves_once_a_spell() {
+        use crate::cpu_budget::TopUpOutcome::{Full, Waiting};
+        let origin = std::time::Instant::now();
+        let mut growth = Growth::new(origin, 17);
+        for second in 0..3 {
+            assert_eq!(growth.step(after(origin, second), 0, 0), GrowthStep::Ask);
+            assert_eq!(growth.heard(after(origin, second), Full), None);
+        }
+        assert_eq!(growth.step(after(origin, 3), 0, 0), GrowthStep::Ask);
+        assert_eq!(
+            growth.heard(after(origin, 3), Waiting),
+            Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(growth.step(after(origin, 4), 0, 0), GrowthStep::Ask);
+        assert_eq!(
+            growth.heard(after(origin, 4), Full),
+            None,
+            "said once a spell"
+        );
+        assert_eq!(growth.step(after(origin, 5), 1, 0), GrowthStep::Wait);
+        assert_eq!(growth.step(after(origin, 6), 0, 0), GrowthStep::Ask);
+        assert_eq!(growth.heard(after(origin, 8), Full), None, "a new spell");
+        assert_eq!(growth.heard(after(origin, 10), Full), None);
+        assert_eq!(
+            growth.heard(after(origin, 11), Full),
+            Some(std::time::Duration::from_secs(3))
+        );
+    }
+
+    /// The pool's own back-off is no refusal: an idle offer delays the next ask, and the spell a
+    /// starvation measures starts at the first refused ask, which is then asked every check.
+    #[test]
+    fn a_pools_back_off_never_counts_as_starving() {
+        use crate::cpu_budget::TopUpOutcome::{Full, Granted};
+        let origin = std::time::Instant::now();
+        let mut growth = Growth::new(origin, 4);
+        assert_eq!(growth.step(origin, 0, 0), GrowthStep::Ask);
+        assert_eq!(growth.heard(origin, Granted), None);
+        assert_eq!(growth.step(after(origin, 1), 1, 0), GrowthStep::GiveBack(1));
+        growth.gave_back(1);
+        for second in 1..2 {
+            assert_eq!(growth.step(after(origin, second), 0, 0), GrowthStep::Wait);
+        }
+        assert_eq!(growth.step(after(origin, 2), 0, 0), GrowthStep::Ask);
+        assert_eq!(growth.heard(after(origin, 2), Granted), None);
+        assert_eq!(growth.step(after(origin, 3), 1, 0), GrowthStep::GiveBack(1));
+        growth.gave_back(1);
+        for second in 3..5 {
+            assert_eq!(growth.step(after(origin, second), 0, 0), GrowthStep::Wait);
+        }
+        assert_eq!(growth.step(after(origin, 5), 0, 0), GrowthStep::Ask);
+        assert_eq!(
+            growth.heard(after(origin, 5), Full),
+            None,
+            "the first refusal"
+        );
+        assert_eq!(
+            growth.step(after(origin, 6), 0, 0),
+            GrowthStep::Ask,
+            "asked every check"
+        );
+        assert_eq!(growth.heard(after(origin, 7), Full), None);
+        assert_eq!(
+            growth.heard(after(origin, 8), Full),
+            Some(std::time::Duration::from_secs(3))
+        );
     }
 
     #[test]

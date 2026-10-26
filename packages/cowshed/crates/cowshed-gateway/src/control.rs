@@ -645,7 +645,7 @@ impl JobserverOptions {
     /// Whether this ask may be lent the probation token (05_gateway.md "A one-token job starts on
     /// probation"): a background ask for one token, for a job whose pool it asks for, naming no
     /// requester's pool, from a requester that can stop the job it starts. A larger ask's command
-    /// sizes its runners when it starts, and a grant never grows.
+    /// sizes its runners when it starts, and they keep that size.
     fn lendable(&self, want: NonZeroUsize) -> bool {
         self.probation
             && want == NonZeroUsize::MIN
@@ -1608,6 +1608,7 @@ async fn hold_jobserver<R, W>(
             unreachable!("an ask naming its requester's pool is never lent the probation token")
         }
     };
+    let named = job.clone();
     let source = options.pool_job.as_ref().map(|job| {
         // A gate's children rank as the gate job does, by its age, at every return; background
         // children share the grant they were lent.
@@ -1619,6 +1620,18 @@ async fn hold_jobserver<R, W>(
                 job: stake.job(),
                 tokens: std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
             },
+            // A grant below its ask tops up from the host ledger while tokens nobody waits for
+            // are free (05_gateway.md "All at once").
+            crate::cpu_budget::Class::Background if want.get() > tokens => {
+                crate::jobserver::PoolSource::Growing {
+                    tokens: std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
+                    growing: crate::jobserver::Growing {
+                        grower: stake.grower(),
+                        want: want.get(),
+                        named,
+                    },
+                }
+            }
             crate::cpu_budget::Class::Background => crate::jobserver::PoolSource::Lent(
                 std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
             ),
@@ -1637,8 +1650,8 @@ async fn hold_jobserver<R, W>(
     else {
         return;
     };
-    // Hold until the client closes. The fifo keeps the grant's `g − 1` bytes for the grant's
-    // whole life: nothing writes more.
+    // Hold until the client closes. The fifo holds the grant's `g − 1` bytes, and a growing
+    // pool's added ones while they are in use (05_gateway.md "All at once").
     while let Ok(read) = reader.read(&mut discard).await
         && read > 0
     {}

@@ -1272,32 +1272,32 @@ core count.
   parent's live pool, requests its own demand (the count is not a bound on the ask: the pool grants at most what it
   can), and holds one complete local grant on that connection. A background pool accounts for every holding sibling, so
   their sum never exceeds T. It serves its own FIFO queue, granting the head `min(requested, free)` once at least one
-  token is free; that count is final, not a partial holding awaiting more tokens. Queued siblings wait only for that
-  pool's own holders. Host checkout fairness remains the upstream ledger's concern. A gate job's pool is the exception:
-  it lends nothing of its own and relays each child's ask to the host ledger as a gate-class request for the gate's
-  checkout ("Gate admission" below). An admitted child serves its granted count as its own pool, and grandchildren draw
-  only from that pool: no holder waits for another grant from an ancestor or the host. The parent remains the owner of
-  its upstream grant. A child returns only its local allocation by closing its connection; it never releases the
-  parent's connection. Upstream loss revokes the downstream pool and its connections, so a dead parent cannot grant
-  tokens to a descendant. Revocation ends accounting, never work: a command whose borrowed or host grant closes while it
-  runs — the gateway restarting, which every install does, or the lending parent exiting — runs on over budget to its
-  own exit, says so on stderr (`cowshed: cpu-tokens grant ended: … it runs on over budget until it ends`), and is judged
-  by that exit alone, as "Crash safety by connection" below says of every runner across a gateway restart. A connection
-  is a ledger entry, not the work's owner; only a bound, a signal or the process that started the command stops it. A
-  grant loss is never a failure and starts no teardown. A bare or invalid count proves no allocation; an absent endpoint
-  follows normal host admission. Once connected to the parent, refusal, silence or protocol failure is an ordinary
-  admission failure, never a second host take while that parent may still hold its grant. A stale descriptor whose
-  endpoint no longer connects is treated as absent. Only the executor publishes its actual live pool; `options.env`
-  cannot inject either marker into a command. The span and `cpu.inherited: true` record identify a parent-pool grant and
-  its actual local wait. Pool setup or cleanup failure is an ordinary failure, never a successful unaccounted run.
-  Real-process default-runner proofs live in `executor-host.test.ts` under `test-host`, because the default macOS runner
-  acquires a real RAM volume. Node peers import the built executor artifact named by `executors.json`; the host target's
-  existing build dependency produces it, rather than compiling TypeScript inside a test's guard. Pure pool and executor
-  unit cases never attach images. **Known admission ambiguity:** a connect error is currently classified as an absent
-  endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent connection to a live pool, so
-  this classification does not yet prove that its parent has released the upstream grant. Distinguishing those cases
-  before any host fallback remains an admission follow-up; connected refusals and protocol errors already fail without a
-  second take.
+  token is free; that count is not a partial holding awaiting more tokens, and only a grant from the host ledger tops up
+  ("All at once"). Queued siblings wait only for that pool's own holders. Host checkout fairness remains the upstream
+  ledger's concern. A gate job's pool is the exception: it lends nothing of its own and relays each child's ask to the
+  host ledger as a gate-class request for the gate's checkout ("Gate admission" below). An admitted child serves its
+  granted count as its own pool, and grandchildren draw only from that pool: no holder waits for another grant from an
+  ancestor or the host. The parent remains the owner of its upstream grant. A child returns only its local allocation by
+  closing its connection; it never releases the parent's connection. Upstream loss revokes the downstream pool and its
+  connections, so a dead parent cannot grant tokens to a descendant. Revocation ends accounting, never work: a command
+  whose borrowed or host grant closes while it runs — the gateway restarting, which every install does, or the lending
+  parent exiting — runs on over budget to its own exit, says so on stderr
+  (`cowshed: cpu-tokens grant ended: … it runs on over budget until it ends`), and is judged by that exit alone, as
+  "Crash safety by connection" below says of every runner across a gateway restart. A connection is a ledger entry, not
+  the work's owner; only a bound, a signal or the process that started the command stops it. A grant loss is never a
+  failure and starts no teardown. A bare or invalid count proves no allocation; an absent endpoint follows normal host
+  admission. Once connected to the parent, refusal, silence or protocol failure is an ordinary admission failure, never
+  a second host take while that parent may still hold its grant. A stale descriptor whose endpoint no longer connects is
+  treated as absent. Only the executor publishes its actual live pool; `options.env` cannot inject either marker into a
+  command. The span and `cpu.inherited: true` record identify a parent-pool grant and its actual local wait. Pool setup
+  or cleanup failure is an ordinary failure, never a successful unaccounted run. Real-process default-runner proofs live
+  in `executor-host.test.ts` under `test-host`, because the default macOS runner acquires a real RAM volume. Node peers
+  import the built executor artifact named by `executors.json`; the host target's existing build dependency produces it,
+  rather than compiling TypeScript inside a test's guard. Pure pool and executor unit cases never attach images. **Known
+  admission ambiguity:** a connect error is currently classified as an absent endpoint. A full listen backlog or local
+  file-descriptor exhaustion can also prevent connection to a live pool, so this classification does not yet prove that
+  its parent has released the upstream grant. Distinguishing those cases before any host fallback remains an admission
+  follow-up; connected refusals and protocol errors already fail without a second take.
 - **Work a holder starts draws on its grant** (2026-10-19; first grant wins, 2026-10-20). The rule above, that no holder
   waits for another grant from an ancestor or the host, covers every way work starts under a holder, not only a nested
   runner. A holder exports its grant through two doors, its fifo and its pool socket, and work its command starts takes
@@ -1377,9 +1377,25 @@ core count.
   `(k + 1)·⌊N/2⌋`. Gate-class grants outrank background and do not count. The bound counts grants, never time, so no
   clock decides an order. A heavy checkout loses little fairness by it: an overdue head takes its least grant, and the
   next head of that checkout starts counting from zero.
-- **All at once.** A request is granted once and never holds part of a grant while waiting for more, so no two requests
-  can deadlock on each other's tokens. A grant never grows (2026-10-19, Danny: "Ok delete"): it runs with the count it
-  was granted until its connection closes, and a returned token goes only to a waiting request.
+- **All at once, then topped up from tokens nobody waits for** (top-up 2026-10-26, Danny tg#10924: "where are the
+  timeouts"). A request is granted once and never holds part of a grant while waiting for more, so no two requests can
+  deadlock on each other's tokens. A grant below its `want` then tops up its fifo. Measured 2026-10-26: a land's task
+  granted 1 of the 18 it asked while its siblings held the host ran its Cargo on that one token in jobserver acquire for
+  minutes after they ended, the ledger 17 tokens free and nothing queued. So a lent pool whose grant came from the host
+  ledger below its `want` looks at its fifo every second; while the fifo holds no token it asks the ledger for one more,
+  at its own rank, one token at a time up to its `want`, and at once when a child waits on its socket. The ledger gives
+  it only a token no request waits for, and, to work behind the oldest gate job, only within the floor ("Room for a
+  gate"); otherwise it refuses at once. A token the pool added that sits in its fifo goes straight back, as any returned
+  token does, first to a waiter; an offer that sat idle backs the next one off, doubling to 30 s, and one a reader took
+  is followed at once. The deadlock argument holds: a top-up is never waited for, granted or refused at once with no
+  queue place, and it never takes a token a waiting request could have. A refused ask is asked again every second, and a
+  pool the ledger refuses for 3 s, its fifo empty throughout, says so once a spell, naming the pool, the job and the
+  ledger:
+  `cowshed: cpu-pool STARVED pool=… job=… held=… want=… refused_ms=… socket_waiters=… cause=full|waiting|floor ledger_free=… ledger_total=… ledger_queued=…`.
+  A reader blocked on the fifo is invisible to the pool, so the empty fifo stands for it; `socket_waiters` counts the
+  children queued on the pool's socket. The pool's own back-off is not a refusal. A grant a pool lends its own children
+  ("Nested runners") does not top up: only the host ledger tops up. A runner sized when it starts keeps that size; only
+  a jobserver reader, Cargo, draws on the tokens a top-up adds.
   - **A one-token job starts on probation** (2026-10-25). A short command's cost is its wait, not its work: measured
     2026-10-25 on an 18-token host whose tokens other sheds' gates held, a coder drive's sandboxed
     `git ls-files -z -- specs` (6 ms of work) waited 177 s for its token, `git show` (30 ms) 62 s and `codegraph status`
@@ -1412,11 +1428,11 @@ core count.
   bounds start at their own grants, which its pool makes only after its own ("The bounds start at the grant").
 
   Only a one-token request is lent it. A larger ask's command sizes its runners when it starts — test threads,
-  `BOUNDED_EXEC_CPU_TOKENS` and the ceilings its children inherit — and a grant never grows, so a job started on one
-  token would run on one token for its life, which is the 21-minute `nx run-many` of "The task server owns the live
-  grant and nice". A requester that knows its command is brief asks one token, as a coordinator's sandboxed reads do. A
-  gate asks only its repository's queue and is never lent the token; neither is a request that draws on a requester's
-  pool, an activation stake, or a task a relay pool asks for, none of which a supervisor stops.
+  `BOUNDED_EXEC_CPU_TOKENS` and the ceilings its children inherit — and keeps that size ("All at once"), so a job
+  started on one token would run on one token for its life, which is the 21-minute `nx run-many` of "The task server
+  owns the live grant and nice". A requester that knows its command is brief asks one token, as a coordinator's
+  sandboxed reads do. A gate asks only its repository's queue and is never lent the token; neither is a request that
+  draws on a requester's pool, an activation stake, or a task a relay pool asks for, none of which a supervisor stops.
 
 - **Gate admission: oldest gate job first, ahead of background, never starving it** (2026-10-17, Danny tg#6693: "The
   gate class is served FIFO at highest priority over all other execs … When gate runs it needs more tickets than
@@ -1523,8 +1539,8 @@ core count.
   quiet replaced, such a run took up to `⌊N/2⌋` tokens beside the gate. The gateway holds the state itself: it begins
   with a gate's first gate-class request and ends when the gate's last gate-class request leaves, nobody announces it,
   and nobody can miss it. A background run started beside a gate starts at once on its one token and runs on it for its
-  life, since a grant never grows ("All at once"), so a long run is better started after the gate, which
-  `cowshed gateway status` shows; the probation token ("A one-token job starts on probation") still runs a short
+  life, since its runners keep the size they started at ("All at once"), so a long run is better started after the gate,
+  which `cowshed gateway status` shows; the probation token ("A one-token job starts on probation") still runs a short
   one-token command at once. A fork or attach of the gate's own repository waits for the gate's end ("A fork or attach
   waits for its repository's gate").
 

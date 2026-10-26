@@ -581,8 +581,8 @@ of gate for a one-line change).
   holder exports it"). While it exported 1, every Rust suite in every gate ran on one thread: `tokens=1/1` in each
   runner from 2026-10-20, and cowshed-cli's 487 tests summed to their 1225 s wall, the tail of a 24m55s gate for a
   three-file Rust change.
-- **A suite that outlasts the rest of the gate is sharded.** A runner's grant never grows, so one long runner finishes
-  on the tokens it started with while the host idles. cowshed-cli runs in eight hash partitions
+- **A suite that outlasts the rest of the gate is sharded.** A runner keeps the size its grant gave it at its start, so
+  one long runner finishes on the tokens it started with while the host idles. cowshed-cli runs in eight hash partitions
   (`[package.metadata.smoothbricks.test] shards = 8`), as cowshed-core does: 492 tests, the longest runner 95 s. The
   slow tests of both are named with their measured time in `.config/nextest-timings.json` and dealt onto their exception
   shards longest first; only the rest is hashed (nx-plugin README, cargo test targets), since a hash left cowshed-core's
