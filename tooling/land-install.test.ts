@@ -340,27 +340,28 @@ describe('setupOutcome', () => {
     expect(setupOutcome(0, 'not json')).toEqual({ kind: 'installed' });
   });
 
-  it('is a refusal when the typed error is a conflict', () => {
-    const envelope = JSON.stringify({
-      ok: false,
+  const typedErrors = [
+    {
+      name: 'a refusal when the typed error is a conflict',
+      status: 4,
       error: { code: 'conflict', message: 'the install would restart the gateway', hint: 'rerun' },
-    });
-    expect(setupOutcome(4, envelope)).toEqual({
       kind: 'refused',
-      why: 'setup exited 4: conflict: the install would restart the gateway',
-    });
-  });
-
-  it('is a failure for any other typed error, such as a dismissed dialog', () => {
-    const envelope = JSON.stringify({
-      ok: false,
+    },
+    {
+      name: 'a failure for any other typed error, such as a dismissed dialog',
+      status: 6,
       error: { code: 'sandbox-denied', message: 'administrator authorization was declined', hint: 'cowshed setup' },
-    });
-    expect(setupOutcome(6, envelope)).toEqual({
       kind: 'failed',
-      why: 'setup exited 6: sandbox-denied: administrator authorization was declined',
+    },
+  ] as const;
+  for (const { name, status, error, kind } of typedErrors) {
+    it(`is ${name}`, () => {
+      expect(setupOutcome(status, JSON.stringify({ ok: false, error }))).toEqual({
+        kind,
+        why: `setup exited ${status}: ${error.code}: ${error.message}`,
+      });
     });
-  });
+  }
 
   it('says so when a failure printed no error envelope', () => {
     expect(setupOutcome(70, '')).toEqual({ kind: 'failed', why: 'setup exited 70 without an error envelope' });
