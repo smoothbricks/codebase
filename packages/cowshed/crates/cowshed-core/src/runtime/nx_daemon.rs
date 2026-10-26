@@ -2484,14 +2484,137 @@ mod lifecycle_authority_tests {
         command
     }
 
+    /// What a started real daemon did next, as the queue of [`DaemonEvents`] reports it.
+    enum DaemonEvent {
+        RecordDirectoryChanged,
+        Forked,
+        Exited,
+    }
+
+    /// One kernel queue armed, before any readiness read, on the daemon's record
+    /// directory and on the daemon itself: the record appearing, a plugin worker
+    /// forking, or the daemon exiting each wake the one blocked wait, and readiness is
+    /// re-read once per wake. A daemon that dies first is noticed by its exit, never
+    /// by a clock.
+    struct DaemonEvents {
+        queue: std::os::fd::OwnedFd,
+        _record_dir: std::os::fd::OwnedFd,
+    }
+
+    impl DaemonEvents {
+        fn arm(record_dir: &Path, daemon: &std::process::Child) -> Self {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            use std::os::unix::ffi::OsStrExt as _;
+            // SAFETY: `kqueue` takes no arguments; a negative answer is an error.
+            let queue = unsafe { libc::kqueue() };
+            assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
+            // SAFETY: `queue` is a fresh descriptor only this value owns.
+            let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+            // SAFETY: plain fcntl on an owned descriptor; a negative answer is an error.
+            let sealed = unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+            assert!(
+                sealed >= 0,
+                "seal the event queue: {}",
+                std::io::Error::last_os_error()
+            );
+            let name = std::ffi::CString::new(record_dir.as_os_str().as_bytes())
+                .expect("a record directory path");
+            // SAFETY: `name` is NUL-terminated; a negative answer is an error.
+            let watched = unsafe { libc::open(name.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
+            assert!(
+                watched >= 0,
+                "open {}: {}",
+                record_dir.display(),
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `watched` is a fresh descriptor only this value owns.
+            let watched = unsafe { std::os::fd::OwnedFd::from_raw_fd(watched) };
+            for change in [
+                libc::kevent {
+                    ident: watched.as_raw_fd() as libc::uintptr_t,
+                    filter: libc::EVFILT_VNODE,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: libc::NOTE_WRITE,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                },
+                libc::kevent {
+                    ident: daemon.id() as libc::uintptr_t,
+                    filter: libc::EVFILT_PROC,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: libc::NOTE_FORK | libc::NOTE_EXIT,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                },
+            ] {
+                // SAFETY: one valid change, no events requested back.
+                let added = unsafe {
+                    libc::kevent(
+                        queue.as_raw_fd(),
+                        &raw const change,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null(),
+                    )
+                };
+                assert!(added == 0, "kevent: {}", std::io::Error::last_os_error());
+            }
+            Self {
+                queue,
+                _record_dir: watched,
+            }
+        }
+
+        fn next(&self) -> DaemonEvent {
+            use std::os::fd::AsRawFd as _;
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+            loop {
+                // SAFETY: room for one event; no timeout.
+                let ready = unsafe {
+                    libc::kevent(
+                        self.queue.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        event.as_mut_ptr(),
+                        1,
+                        std::ptr::null(),
+                    )
+                };
+                if ready == 1 {
+                    // SAFETY: the kernel wrote one event.
+                    let event = unsafe { event.assume_init() };
+                    return match event.filter {
+                        libc::EVFILT_VNODE => DaemonEvent::RecordDirectoryChanged,
+                        libc::EVFILT_PROC if event.fflags & libc::NOTE_EXIT != 0 => {
+                            DaemonEvent::Exited
+                        }
+                        libc::EVFILT_PROC => DaemonEvent::Forked,
+                        other => panic!("an unarmed daemon event filter {other}"),
+                    };
+                }
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted,
+                    "kevent: {error}"
+                );
+            }
+        }
+    }
+
+    // The real-daemon fixtures live under the process-aware scratch root: its sweep at
+    // the next process start ends whatever still works beneath a killed run's root,
+    // daemon and plugin workers included, before removing it, and its Drop does the
+    // same however a test ends. A plain directory guard would remove a live daemon's
+    // files from under it and leave the subtree running.
+
     #[tokio::test]
     async fn the_real_nx_daemon_is_stopped_only_through_the_ledger_proven_identity() {
         let (nx, node) = declared_nx();
-        let scratch = crate::temp_root::TempRoot::new_in(
-            &crate::temp_parent::canonical_parent(),
-            "nx-daemon-real-authority",
-        );
-        let root = scratch.join("workspace");
+        let scratch = crate::scratch_directory::ScratchRoot::new("nx-daemon-real-authority")
+            .expect("scratch root");
+        let root = scratch.path().join("workspace");
         std::fs::create_dir_all(&root).expect("workspace");
         std::fs::write(
             root.join("package.json"),
@@ -2504,21 +2627,27 @@ mod lifecycle_authority_tests {
         std::fs::create_dir_all(root.join("node_modules")).expect("node_modules");
         std::os::unix::fs::symlink(&nx, root.join("node_modules/nx"))
             .expect("the workspace's own nx");
+        std::fs::create_dir_all(root.join(".nx/workspace-data/d"))
+            .expect("the daemon's record directory");
         let mut daemon = real_daemon(&root, &node, &nx);
         let record_path = root.join(".nx/workspace-data/d/server-process.json");
+        let events = DaemonEvents::arm(
+            record_path.parent().expect("the record's directory"),
+            &daemon,
+        );
         // The record is the event; a daemon that dies first is noticed by its exit.
         while !record_path.is_file() {
-            if let Some(status) = daemon.try_wait().expect("poll the daemon") {
+            if let DaemonEvent::Exited = events.next() {
+                let status = daemon.wait_bounded().expect("reap the exited daemon");
                 let mut stderr = String::new();
                 if let Some(mut pipe) = daemon.stderr.take() {
                     std::io::Read::read_to_string(&mut pipe, &mut stderr).ok();
                 }
                 panic!("the real daemon exited before publishing its record ({status}): {stderr}");
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
         let leader = GroupLeader::observe(daemon.id()).expect("observe the daemon's group leader");
-        let ledger = scratch.join("supervisor.groups");
+        let ledger = scratch.path().join("supervisor.groups");
         Recorder::new(ledger.clone())
             .record(
                 [super::super::job_groups::JobGroupClaim::group(1, leader)].into_iter(),
@@ -2561,19 +2690,6 @@ mod lifecycle_authority_tests {
         daemon.wait_bounded().expect("reap the real daemon");
     }
 
-    /// Stops the daemon a `workspace-data` directory records when dropped, however the test ends.
-    struct StopsRecordedDaemon(PathBuf);
-
-    impl Drop for StopsRecordedDaemon {
-        fn drop(&mut self) {
-            match crate::build_volume::nx::stop_recorded_daemon(&self.0) {
-                Ok(Ok(_)) => {}
-                Ok(Err(busy)) => cowshed_os::eprintln!("the fixture's daemon did not stop: {busy}"),
-                Err(error) => cowshed_os::eprintln!("the fixture's daemon did not stop: {error}"),
-            }
-        }
-    }
-
     /// The keeper stops an idle shed's real kept daemon once the shed has gone its configured
     /// bound without use, and the plugin workers the daemon forked with it, although the daemon's
     /// own sandbox refuses it every signal to them; the next Nx call then starts a daemon, which
@@ -2583,11 +2699,9 @@ mod lifecycle_authority_tests {
     {
         use super::super::process_events::{Darwin, ProcessReads as _};
         let (nx, node) = declared_nx();
-        let scratch = crate::temp_root::TempRoot::new_in(
-            &crate::temp_parent::canonical_parent(),
-            "nx-daemon-idle-reap",
-        );
-        let root = scratch.join("workspace");
+        let scratch = crate::scratch_directory::ScratchRoot::new("nx-daemon-idle-reap")
+            .expect("scratch root");
+        let root = scratch.path().join("workspace");
         std::fs::create_dir_all(root.join("p")).expect("workspace");
         std::fs::write(
             root.join("package.json"),
@@ -2607,29 +2721,34 @@ mod lifecycle_authority_tests {
         std::os::unix::fs::symlink(&nx, root.join("node_modules/nx"))
             .expect("the workspace's own nx");
         let record = nx::daemon_record(&root);
-        let _stops = StopsRecordedDaemon(nx::workspace_data(&root));
+        std::fs::create_dir_all(record.parent().expect("the record's directory"))
+            .expect("the daemon's record directory");
         let mut daemon = real_daemon(&root, &node, &nx);
-        // The record, then the daemon's first fork, is the event; a daemon that dies first is
-        // noticed by its exit.
+        let events = DaemonEvents::arm(record.parent().expect("the record's directory"), &daemon);
+        // The record, then the daemon's first fork, is the event; a daemon that dies first
+        // is noticed by its exit. The child list is read once per wake that finds the
+        // record, which is the read the fork event earns.
         let workers = loop {
-            if let Some(status) = daemon.try_wait().expect("poll the daemon") {
+            if record.is_file() {
+                let children = Darwin
+                    .children(daemon.id())
+                    .expect("list the daemon's children");
+                if !children.is_empty() {
+                    break children
+                        .into_iter()
+                        .filter_map(|pid| {
+                            super::super::job_groups::Process::observe(
+                                i32::try_from(pid).expect("a pid fits i32"),
+                            )
+                            .expect("observe a plugin worker")
+                        })
+                        .collect::<Vec<_>>();
+                }
+            }
+            if let DaemonEvent::Exited = events.next() {
+                let status = daemon.wait_bounded().expect("reap the exited daemon");
                 panic!("the real daemon exited before it forked a plugin worker ({status})");
             }
-            let children = Darwin
-                .children(daemon.id())
-                .expect("list the daemon's children");
-            if record.is_file() && !children.is_empty() {
-                break children
-                    .into_iter()
-                    .filter_map(|pid| {
-                        super::super::job_groups::Process::observe(
-                            i32::try_from(pid).expect("a pid fits i32"),
-                        )
-                        .expect("observe a plugin worker")
-                    })
-                    .collect::<Vec<_>>();
-            }
-            std::thread::sleep(Duration::from_millis(100));
         };
         assert!(!workers.is_empty(), "the daemon forked its plugin workers");
 
