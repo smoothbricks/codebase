@@ -38,13 +38,18 @@ file. `bun`, `nx` and `cargo` come from the repo's devenv: in a shed `cowshed ex
 
 1. **Shared trees.** When you are about to reset, checkout, stash or commit in a tree another agent uses → coordinate
    with its owner first, and never reset, checkout or stash to "clean" it. Commit one defect or one contract change with
-   `git commit --only -- <paths>`, never the whole index. _Enforced by: review._
+   `git commit --only -- <paths>`, never the whole index. Commit your WIP before a disruptive host operation. _Enforced
+   by: review._
 2. **Landing.** When you land, retire a shed or claim something is landed → use the land command. "Landed" means the
-   commit is an ancestor of `main` (`git merge-base --is-ancestor`). Retire a shed only after its work is landed. A
-   failure that blocks more than one shed comes before local polish. _Enforced by: the land turn and
-   `tooling/land-host.sh`._
+   commit is an ancestor of `main` (`git merge-base --is-ancestor`). Retire a shed only after its work is landed. When
+   `cowshed rm` refuses, never add `--force` or `--abandon`: a shed whose content `main` already holds
+   (`cowshed ls --landing` counts its unlanded commits) is reset to `main` and removed with plain `cowshed rm`; a shed
+   with unlanded work is landed, or left to its owner. `--abandon` keeps every destroyed tip as a ref in `main`'s
+   `.git`; `--force` destroys the uncommitted tree. A failure that blocks more than one shed comes before local polish.
+   _Enforced by: the land turn and `tooling/land-host.sh`; `cowshed rm`'s containment refusal; review for the flags._
 3. **Edits.** When you are about to edit → work in your own shed (one owner per unit, no git worktrees, never a peer's
-   path until released). Markdown that belongs to no code unit goes straight to `main` with the doc commit (see
+   path until released). Use absolute workspace paths in filesystem and edit tools, so a session's cwd cannot redirect
+   an edit into `main`. Markdown that belongs to no code unit goes straight to `main` with the doc commit (see
    Commands). _Enforced by: review._
 4. **Diagnosis.** When you are about to rerun something, or to name a cause → read the evidence first: the run's LMAO
    spans, the Nx task history and prior verdicts (`.nx/workspace-data/bounded-exec/<task>/verdict.json`). Never decode
