@@ -29,6 +29,16 @@ and is consumed by `Cowshed::coordinator`. Environment text may identify the inh
 itself authority. Missing, reused, wrong-peer, malformed, or cross-project descriptors return a typed `CowshedError`;
 there is no fallback token, ambient singleton, filesystem token, or workspace-readable credential.
 
+**Controller handshake.** The client's hello is `{version, nonce}`. The controller answers with the nonce and the
+version the client sent: `{version, nonce, repoId, pid}` on a project connection, `{version, nonce, host, pid}` on a
+host connection. The current version is 2, and a controller accepts 1 and 2. A version 2 answer carries `pid`, the
+controller's own process id, and the connection carries heartbeats (05_gateway.md, "Deadlines"). A version 1 answer
+carries neither, so a client of an earlier build reads exactly the answer it always read. A version 2 client refuses an
+answer of another version, or one without `pid`. A new client is therefore refused at hello by a controller of an
+earlier build, while an old client keeps working against a new controller. The deploy order follows: install cowshed
+from SB main first, so the host's controller accepts version 2, and only then bump the cowshed pin of a program that
+links the client.
+
 All capability operations are messages to a single-owner controller/supervisor actor. Handles may clone an immutable
 sender, but they never share mutable authority state behind a mutex. `WorkspaceRef::attach` is deliberately safe,
 idempotent one-workspace attachment; only `Coordinator::detach` may detach because detachment affects running jobs and
@@ -2273,9 +2283,10 @@ A host row is served by exactly one route, a `cowshed host` connection, and noth
 refuses a host method before decoding it, the project router refuses one that reaches it, and a host connection refuses
 every method that is not a host row. `cowshed host` is the CLI binary serving one connection on the socket it inherits
 as standard input, with the controller's frames, handshake version and limits; its handshake answer is
-`{version, nonce, host: "host"}`, which a project client does not decode, and a project controller's answer does not
-decode as a host's. Every operation calls the function its CLI verb calls and answers with what that function computes;
-only rendering is the verb's. Guidance goes to `cowshed host`'s stderr; stdout is never written.
+`{version, nonce, host: "host", pid}` ("Controller handshake"), which a project client does not decode, and a project
+controller's answer does not decode as a host's. Every operation calls the function its CLI verb calls and answers with
+what that function computes; only rendering is the verb's. Guidance goes to `cowshed host`'s stderr; stdout is never
+written.
 
 TypeScript reaches it through `openHost(): Promise<Host>`: the addon makes a socketpair, starts the package launcher
 (`bin/cowshed host`, 06_cli.md "Launcher") with one end as its standard input and the caller's stdout and stderr, and

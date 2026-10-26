@@ -948,6 +948,18 @@ the handshake bound.
   s respawn throttle, counted from the old start) and 12.02 s at ET 12 s, a test agent ignoring SIGTERM. So it is
   bounded as that bootout and then one launchctl call. `codesign` signed a copy of the 48 MB gateway host in at most
   0.15 s and verified it in at most 0.06 s (three runs each).
+- **A controller connection heartbeats from handshake version 2.** While a call on a version 2 connection is unanswered
+  (an open stream counts), the controller writes `{"progress":n,"busy":{method,subject?,forMs}|null}` on it every 5 s.
+  `busy` is the op the project's router actor serves now: its method, the workspace it names, and how long it has run.
+  The actor publishes it as each route starts and clears it as the route ends; a heartbeat reads it without a lock, and
+  it is `null` while the actor serves nothing. The router is serial, so a call waits behind whatever op it is busy with,
+  and a call has no total bound, which would fail a call that is only queued. The client reads past the heartbeats under
+  the 15 s silence bound, measured from when the controller last owed it nothing. A controller silent that long fails
+  every waiting call `SILENT`, naming it as the socketpair peer with the pid its hello reported (the socketpair's
+  credentials name the process that made the pair, not the controller) and the busy op of its last heartbeat. A
+  heartbeat proves that the controller process and its connection serve, and names the op the actor is busy with. It
+  does not prove the actor is not deadlocked: an actor stuck inside one op keeps the heartbeats coming, and their
+  `forMs` keeps rising. A version 1 connection, an older client's, hears none (07_api.md, "Controller handshake").
 - **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
   with the failure's message.
 

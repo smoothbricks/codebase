@@ -19,7 +19,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-pub const HANDSHAKE_VERSION: u32 = 1;
+/// The handshake version a client of this build sends. A version 2 connection carries
+/// heartbeats (05_gateway.md "Deadlines"); a server also accepts version 1, an older client's,
+/// whose connection carries none.
+pub const HANDSHAKE_VERSION: u32 = 2;
+/// The version an older client sends: its connection never hears a heartbeat.
+const HANDSHAKE_VERSION_UNBEATEN: u32 = 1;
 pub const MAX_HANDSHAKE_BYTES: usize = 4096;
 pub const MAX_JSON_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BINARY_FRAME_BYTES: usize = 64 * 1024;
@@ -50,6 +55,10 @@ pub(crate) mod codec {
         version: u32,
         nonce: Cow<'a, str>,
         repo_id: Cow<'a, RepoId>,
+        /// The controller's own pid, in a version 2 answer only: a socketpair's credentials name
+        /// the process that made the pair, not the controller that inherited one end.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +67,9 @@ pub(crate) mod codec {
         version: u32,
         nonce: Cow<'a, str>,
         host: HostRole,
+        /// As [`ServerHelloFields::pid`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
     }
 
     /// One schema for both directions: a client frames its operation's pre-serialized params
@@ -243,11 +255,12 @@ pub(crate) mod codec {
     pub(crate) struct DecodedServerHello(ServerHelloFields<'static>);
 
     impl DecodedServerHello {
-        pub(crate) fn into_parts(self) -> (u32, String, RepoId) {
+        pub(crate) fn into_parts(self) -> (u32, String, RepoId, Option<u32>) {
             (
                 self.0.version,
                 self.0.nonce.into_owned(),
                 self.0.repo_id.into_owned(),
+                self.0.pid,
             )
         }
     }
@@ -296,12 +309,68 @@ pub(crate) mod codec {
     }
 
     /// What a client reads off the connection: one step of a call that asked for its steps, one
-    /// event of a stream-lane call, or a call's answer.
+    /// event of a stream-lane call, a heartbeat, or a call's answer.
     #[derive(Debug)]
     pub(crate) enum DecodedServerFrame {
         Step { id: u64, report: StepReport },
         Event { id: u64, event: Value },
+        Progress { seq: u64, busy: Option<Busy> },
         Response(DecodedRpcResponse),
+    }
+
+    /// A heartbeat of a version 2 connection: written every 5 s while a call on it is
+    /// unanswered, with what the router is busy with, or `null` (05_gateway.md "Deadlines").
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct RpcProgressFields<'a> {
+        progress: u64,
+        busy: Option<BusyFields<'a>>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct BusyFields<'a> {
+        method: Cow<'a, str>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<Cow<'a, str>>,
+        for_ms: u64,
+    }
+
+    /// The op a heartbeat says the router is serving: its method, the workspace it names, and
+    /// how long it has run.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Busy {
+        pub(crate) method: String,
+        pub(crate) subject: Option<String>,
+        pub(crate) for_ms: u64,
+    }
+
+    impl fmt::Display for Busy {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "router busy: {}", self.method)?;
+            if let Some(subject) = &self.subject {
+                write!(formatter, " {subject}")?;
+            }
+            write!(formatter, " for {} ms", self.for_ms)
+        }
+    }
+
+    /// `busy` is the router's op and how long it has run, in milliseconds.
+    pub(crate) fn encode_rpc_progress(
+        seq: u64,
+        busy: Option<(&super::RouteBusy, u64)>,
+    ) -> Result<Vec<u8>, WireCodecError> {
+        encode(
+            &RpcProgressFields {
+                progress: seq,
+                busy: busy.map(|(busy, for_ms)| BusyFields {
+                    method: Cow::Borrowed(busy.method),
+                    subject: busy.subject.as_deref().map(Cow::Borrowed),
+                    for_ms,
+                }),
+            },
+            MAX_JSON_FRAME_BYTES,
+        )
     }
 
     /// What a controller reads off the connection: a call, or a demand on a stream it opened.
@@ -325,15 +394,19 @@ pub(crate) mod codec {
         decode::<ClientHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES).map(DecodedClientHello)
     }
 
+    /// `pid` is the controller's own, sent on a version 2 connection only.
     pub(crate) fn encode_server_hello(
+        version: u32,
         nonce: &str,
         repo_id: &RepoId,
+        pid: Option<u32>,
     ) -> Result<Vec<u8>, WireCodecError> {
         encode(
             &ServerHelloFields {
-                version: HANDSHAKE_VERSION,
+                version,
                 nonce: Cow::Borrowed(nonce),
                 repo_id: Cow::Borrowed(repo_id),
+                pid,
             },
             MAX_HANDSHAKE_BYTES,
         )
@@ -345,16 +418,19 @@ pub(crate) mod codec {
 
     /// A host connection's answer names no project: its `host` role is what a client checks it
     /// reached the host connection it asked for and not a project controller, whose answer does
-    /// not decode as this.
+    /// not decode as this. `pid` is as [`encode_server_hello`]'s.
     pub(crate) fn encode_host_hello(
+        version: u32,
         nonce: &str,
         role: HostRole,
+        pid: Option<u32>,
     ) -> Result<Vec<u8>, WireCodecError> {
         encode(
             &HostHelloFields {
-                version: HANDSHAKE_VERSION,
+                version,
                 nonce: Cow::Borrowed(nonce),
                 host: role,
+                pid,
             },
             MAX_HANDSHAKE_BYTES,
         )
@@ -362,9 +438,15 @@ pub(crate) mod codec {
 
     pub(crate) fn decode_host_hello(
         bytes: &[u8],
-    ) -> Result<(u32, String, HostRole), WireCodecError> {
-        decode::<HostHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES)
-            .map(|hello| (hello.version, hello.nonce.into_owned(), hello.host))
+    ) -> Result<(u32, String, HostRole, Option<u32>), WireCodecError> {
+        decode::<HostHelloFields<'static>>(bytes, MAX_HANDSHAKE_BYTES).map(|hello| {
+            (
+                hello.version,
+                hello.nonce.into_owned(),
+                hello.host,
+                hello.pid,
+            )
+        })
     }
 
     /// `params` is the request already serialized by its declared operation, framed verbatim.
@@ -458,15 +540,25 @@ pub(crate) mod codec {
         )
     }
 
-    /// An answer decodes as one; only a frame that is not one is read as a step, then as an
-    /// event. No shape accepts another's fields, so no frame is two, and a frame that is none
-    /// reports why it is not an answer.
+    /// An answer decodes as one; only a frame that is not one is read as a step, then as a
+    /// heartbeat, then as an event. No shape accepts another's fields, so no frame is two, and a
+    /// frame that is none reports why it is not an answer.
     pub(crate) fn decode_server_frame(bytes: &[u8]) -> Result<DecodedServerFrame, WireCodecError> {
         let not_an_answer = match decode::<RpcResponseFields<'static>>(bytes, MAX_JSON_FRAME_BYTES)
         {
             Ok(response) => return Ok(DecodedServerFrame::Response(DecodedRpcResponse(response))),
             Err(not_an_answer) => not_an_answer,
         };
+        if let Ok(fields) = decode::<RpcProgressFields<'static>>(bytes, MAX_JSON_FRAME_BYTES) {
+            return Ok(DecodedServerFrame::Progress {
+                seq: fields.progress,
+                busy: fields.busy.map(|busy| Busy {
+                    method: busy.method.into_owned(),
+                    subject: busy.subject.map(Cow::into_owned),
+                    for_ms: busy.for_ms,
+                }),
+            });
+        }
         if let Ok(fields) = decode::<RpcStepFields<'static>>(bytes, MAX_JSON_FRAME_BYTES) {
             return Ok(DecodedServerFrame::Step {
                 id: fields.id,
@@ -501,12 +593,20 @@ pub(crate) mod codec {
                 (HANDSHAKE_VERSION, "nonce".into())
             );
 
-            let server = encode_server_hello("nonce", &repo()).expect("encode server hello");
+            let server = encode_server_hello(HANDSHAKE_VERSION, "nonce", &repo(), Some(4242))
+                .expect("encode server hello");
             assert_eq!(
                 decode_server_hello(&server)
                     .expect("decode server hello")
                     .into_parts(),
-                (HANDSHAKE_VERSION, "nonce".into(), repo())
+                (HANDSHAKE_VERSION, "nonce".into(), repo(), Some(4242))
+            );
+            let unbeaten = encode_server_hello(1, "nonce", &repo(), None)
+                .expect("encode a version 1 server hello");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&unbeaten).expect("hello JSON"),
+                serde_json::json!({ "version": 1, "nonce": "nonce", "repoId": "acme/widget" }),
+                "a version 1 answer has exactly the fields a version 1 client accepts"
             );
         }
 
@@ -518,6 +618,46 @@ pub(crate) mod codec {
                 }
                 DecodedServerFrame::Event { id, event } => {
                     panic!("call {id}'s answer decoded as event {event}")
+                }
+                DecodedServerFrame::Progress { seq, busy } => {
+                    panic!("an answer decoded as heartbeat {seq} ({busy:?})")
+                }
+            }
+        }
+
+        /// A heartbeat round-trips with and without a busy op, and its frame is no answer.
+        #[test]
+        fn a_heartbeat_decodes_as_progress() {
+            let busy = super::super::RouteBusy {
+                method: "coordinator.fork",
+                subject: Some("raven".to_owned()),
+                since: tokio::time::Instant::now(),
+            };
+            let beat = encode_rpc_progress(3, Some((&busy, 1500))).expect("encode heartbeat");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&beat).expect("heartbeat JSON"),
+                serde_json::json!({
+                    "progress": 3,
+                    "busy": { "method": "coordinator.fork", "subject": "raven", "forMs": 1500 },
+                })
+            );
+            for (frame, expected) in [
+                (
+                    beat,
+                    Some(Busy {
+                        method: "coordinator.fork".to_owned(),
+                        subject: Some("raven".to_owned()),
+                        for_ms: 1500,
+                    }),
+                ),
+                (
+                    encode_rpc_progress(4, None).expect("encode an idle heartbeat"),
+                    None,
+                ),
+            ] {
+                match decode_server_frame(&frame).expect("decode heartbeat") {
+                    DecodedServerFrame::Progress { busy, .. } => assert_eq!(busy, expected),
+                    other => panic!("a heartbeat decoded as {other:?}"),
                 }
             }
         }
@@ -900,16 +1040,76 @@ impl RouterReply {
     }
 }
 
+/// What the router actor is serving now: published when a route starts and cleared when it ends,
+/// so a connection's heartbeat names the op every call behind it waits on.
+#[derive(Debug)]
+pub struct RouteBusy {
+    pub method: &'static str,
+    /// The workspace the op names, when it names one.
+    pub subject: Option<String>,
+    pub since: tokio::time::Instant,
+}
+
+impl RouteBusy {
+    /// `request`'s op, starting now.
+    pub fn of(request: &RouterRequest) -> Self {
+        let subject = request.operation.params().ok().and_then(|params| {
+            params
+                .get("workspace")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        Self {
+            method: request.method(),
+            subject,
+            since: tokio::time::Instant::now(),
+        }
+    }
+}
+
+/// The router's one published [`RouteBusy`]: its actor swaps it at each route's start and end,
+/// and a heartbeat loads it without a lock.
+#[derive(Clone, Debug, Default)]
+pub struct BusySlot(Arc<arc_swap::ArcSwapOption<RouteBusy>>);
+
+impl BusySlot {
+    pub fn publish(&self, busy: Option<RouteBusy>) {
+        self.0.store(busy.map(Arc::new));
+    }
+
+    fn current(&self) -> Option<Arc<RouteBusy>> {
+        self.0.load_full()
+    }
+}
+
 /// Cloneable ingress for a single-owner router actor.
 #[derive(Clone, Debug)]
 pub struct RouterHandle {
     sender: mpsc::Sender<RouterCommand>,
+    busy: BusySlot,
 }
 
 impl RouterHandle {
     pub fn channel(capacity: NonZeroUsize) -> (Self, mpsc::Receiver<RouterCommand>) {
         let (sender, receiver) = mpsc::channel(capacity.get());
-        (Self { sender }, receiver)
+        let busy = BusySlot::default();
+        (Self { sender, busy }, receiver)
+    }
+
+    /// A handle whose calls a relay forwards to `upstream`: it publishes what `upstream`'s
+    /// actor is busy with.
+    pub fn relaying(
+        capacity: NonZeroUsize,
+        upstream: &RouterHandle,
+    ) -> (Self, mpsc::Receiver<RouterCommand>) {
+        let (sender, receiver) = mpsc::channel(capacity.get());
+        let busy = upstream.busy.clone();
+        (Self { sender, busy }, receiver)
+    }
+
+    /// Where this router's actor publishes the op it serves.
+    pub fn busy(&self) -> &BusySlot {
+        &self.busy
     }
 
     /// Route one call; `steps`, when present, hears its lifecycle steps as they run.
@@ -976,12 +1176,23 @@ pub async fn serve_controller_connection(
     stream.set_nonblocking(true).map_err(|error| {
         connection_error(format!("controller descriptor setup failed: {error}"))
     })?;
-    let mut stream = tokio::net::UnixStream::from_std(stream).map_err(|error| {
+    let stream = tokio::net::UnixStream::from_std(stream).map_err(|error| {
         connection_error(format!("controller descriptor setup failed: {error}"))
     })?;
+    let (reader, writer) = stream.into_split();
+    serve_connection(reader, writer, authority, router).await
+}
 
+/// [`serve_controller_connection`] past its descriptor's checks: the handshake, then the calls.
+/// It takes the connection's two halves, so a test drives it over an in-memory stream.
+pub(crate) async fn serve_connection<W: AsyncWrite + Unpin + Send + 'static>(
+    mut reader: impl AsyncRead + Unpin,
+    mut writer: W,
+    authority: ConnectionAuthority,
+    router: RouterHandle,
+) -> Result<()> {
     let hello = read_required_frame(
-        &mut stream,
+        &mut reader,
         MAX_HANDSHAKE_BYTES,
         "controller handshake request",
     )
@@ -991,12 +1202,16 @@ pub async fn serve_controller_connection(
     })?;
     let (version, nonce) = hello.into_parts();
     validate_hello(version, &nonce)?;
+    let beating = version == HANDSHAKE_VERSION;
+    // A version 1 client refuses a field it does not know; a version 2 one names the controller
+    // by this pid when it falls silent.
+    let pid = beating.then(std::process::id);
     let response = match &authority {
         ConnectionAuthority::Coordinator { repo_id }
         | ConnectionAuthority::Worker { repo_id, .. } => {
-            codec::encode_server_hello(&nonce, repo_id)
+            codec::encode_server_hello(version, &nonce, repo_id, pid)
         }
-        ConnectionAuthority::Host(role) => codec::encode_host_hello(&nonce, *role),
+        ConnectionAuthority::Host(role) => codec::encode_host_hello(version, &nonce, *role, pid),
     }
     .map_err(|error| {
         if error.is_too_large() {
@@ -1006,14 +1221,13 @@ pub async fn serve_controller_connection(
         }
     })?;
     write_frame(
-        &mut stream,
+        &mut writer,
         &response,
         MAX_HANDSHAKE_BYTES,
         "controller handshake response",
     )
     .await?;
 
-    let (reader, writer) = stream.into_split();
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let mut answers = tokio::task::JoinSet::new();
     // Where each open stream-lane call's demands go, by call id: a subset of `answers`, entered
@@ -1026,6 +1240,9 @@ pub async fn serve_controller_connection(
     // with the answer that reports it.
     let mut closing = false;
     let mut next_id = 1_u64;
+    // A version 2 connection's heartbeat, due every 5 s while a call on it is unanswered.
+    let mut beats = cowshed_os::deadline::beats();
+    let mut beat = 0_u64;
     loop {
         tokio::select! {
             (reader, frame) = incoming.as_mut(), if !closing => {
@@ -1114,6 +1331,11 @@ pub async fn serve_controller_connection(
                     None => start(&mut answers, &writer, &router, &authority, call),
                 }
             }
+            _ = beats.tick(), if beating && !answers.is_empty() => {
+                beat = beat.saturating_add(1);
+                let busy = router.busy().current();
+                write_rpc_progress(&mut *writer.lock().await, beat, busy.as_deref()).await?;
+            }
             Some(outcome) = answers.join_next() => {
                 let (id, outcome) = outcome.map_err(|error| {
                     CowshedError::internal(format!("controller RPC answer task failed: {error}"))
@@ -1148,9 +1370,9 @@ struct Admitted {
 }
 
 /// Routes `call` and writes its answer on a task of its own.
-fn start(
+fn start<W: AsyncWrite + Unpin + Send + 'static>(
     answers: &mut tokio::task::JoinSet<(u64, Result<()>)>,
-    writer: &ConnectionWriter,
+    writer: &ConnectionWriter<W>,
     router: &RouterHandle,
     authority: &ConnectionAuthority,
     call: Admitted,
@@ -1176,7 +1398,7 @@ const MAX_WAITING_REQUESTS: usize = 64;
 /// Stream-lane calls one connection may have open at once.
 const MAX_OPEN_STREAMS: usize = 64;
 
-type ConnectionWriter = Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>;
+type ConnectionWriter<W> = Arc<tokio::sync::Mutex<W>>;
 
 /// One frame a client sends: a request with its upload frame, or a demand on an open stream.
 enum ClientFrame {
@@ -1186,16 +1408,12 @@ enum ClientFrame {
 
 /// The next frame, or `None` at a clean disconnect. The reader comes back with it, so the
 /// connection can ask for the one after.
-async fn next_frame(
-    mut reader: tokio::net::unix::OwnedReadHalf,
-) -> (tokio::net::unix::OwnedReadHalf, Result<Option<ClientFrame>>) {
+async fn next_frame<R: AsyncRead + Unpin>(mut reader: R) -> (R, Result<Option<ClientFrame>>) {
     let frame = read_client_frame(&mut reader).await;
     (reader, frame)
 }
 
-async fn read_client_frame(
-    reader: &mut tokio::net::unix::OwnedReadHalf,
-) -> Result<Option<ClientFrame>> {
+async fn read_client_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Option<ClientFrame>> {
     let Some(frame) =
         read_optional_frame(reader, MAX_JSON_FRAME_BYTES, "controller RPC request").await?
     else {
@@ -1222,8 +1440,8 @@ async fn read_client_frame(
 }
 
 /// Answer one request with an error; `Err` ends the connection when the error is `fatal`.
-async fn refuse(
-    writer: ConnectionWriter,
+async fn refuse<W: AsyncWrite + Unpin + Send + 'static>(
+    writer: ConnectionWriter<W>,
     id: u64,
     error: CowshedError,
     fatal: bool,
@@ -1238,8 +1456,8 @@ async fn refuse(
 /// Route one request and write its answer -- for a stream-lane call, the events `demands` asks
 /// for, then its end; `Err` ends the connection.
 #[allow(clippy::too_many_arguments)]
-async fn answer(
-    writer: ConnectionWriter,
+async fn answer<W: AsyncWrite + Unpin + Send + 'static>(
+    writer: ConnectionWriter<W>,
     router: RouterHandle,
     authority: ConnectionAuthority,
     request_id: u64,
@@ -1312,8 +1530,8 @@ async fn answer(
 /// Answer each demand on a stream-lane call with its next event, or with the call's end: an
 /// empty result once the events ended or the caller closed the call, or the error that ended
 /// them. The request was the first demand. `Err` ends the connection.
-async fn stream_events(
-    writer: &ConnectionWriter,
+async fn stream_events<W: AsyncWrite + Unpin + Send + 'static>(
+    writer: &ConnectionWriter<W>,
     id: u64,
     mut source: Box<dyn EventSource>,
     mut demands: mpsc::UnboundedReceiver<Demand>,
@@ -1358,8 +1576,8 @@ async fn stream_events(
 /// Route a call that asked for its steps, writing each step as it is reported, so the steps reach
 /// the caller while the call runs and all of them precede its answer. `Err` is a failed write,
 /// which ends the connection.
-async fn route_reporting_steps(
-    writer: &ConnectionWriter,
+async fn route_reporting_steps<W: AsyncWrite + Unpin + Send + 'static>(
+    writer: &ConnectionWriter<W>,
     router: &RouterHandle,
     authority: ConnectionAuthority,
     request_id: u64,
@@ -1387,7 +1605,7 @@ async fn route_reporting_steps(
 }
 
 fn validate_hello(version: u32, nonce: &str) -> Result<()> {
-    if version != HANDSHAKE_VERSION {
+    if version != HANDSHAKE_VERSION && version != HANDSHAKE_VERSION_UNBEATEN {
         return Err(protocol_error(
             "controller handshake protocol version did not match",
         ));
@@ -1705,6 +1923,22 @@ async fn write_rpc_step(
     write_frame(stream, &frame, MAX_JSON_FRAME_BYTES, "controller RPC step").await
 }
 
+/// One heartbeat: its sequence number and what the router is busy with, if anything.
+async fn write_rpc_progress(
+    stream: &mut (impl AsyncWrite + Unpin),
+    seq: u64,
+    busy: Option<&RouteBusy>,
+) -> Result<()> {
+    let busy = busy.map(|busy| {
+        let for_ms = u64::try_from(busy.since.elapsed().as_millis()).unwrap_or(u64::MAX);
+        (busy, for_ms)
+    });
+    let frame = codec::encode_rpc_progress(seq, busy).map_err(|error| {
+        protocol_error(format!("controller heartbeat encoding failed: {error}"))
+    })?;
+    write_frame(stream, &frame, MAX_JSON_FRAME_BYTES, "controller heartbeat").await
+}
+
 fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
     frame::verify_peer(descriptor, |error| match error {
         PeerCredentialsError::SocketTypeSizeOverflow => {
@@ -1737,4 +1971,105 @@ fn authority_error(message: impl Into<String>) -> CowshedError {
         message,
         "use a capability bound to the requested repository and workspace incarnation",
     )
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use serde_json::json;
+
+    const NONCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    async fn send(stream: &mut (impl AsyncWrite + Unpin), value: &Value) {
+        let bytes = serde_json::to_vec(value).expect("frame JSON");
+        let length = u32::try_from(bytes.len()).expect("the frame fits the wire");
+        stream.write_u32(length).await.expect("frame header");
+        stream.write_all(&bytes).await.expect("frame body");
+    }
+
+    async fn receive(stream: &mut (impl AsyncRead + Unpin)) -> Value {
+        let length = stream.read_u32().await.expect("frame header");
+        let mut bytes = vec![0_u8; usize::try_from(length).expect("the frame fits memory")];
+        stream.read_exact(&mut bytes).await.expect("frame body");
+        serde_json::from_slice(&bytes).expect("frame JSON")
+    }
+
+    /// 05_gateway.md "Deadlines": while a call on a version 2 connection is unanswered, the
+    /// controller writes `{"progress":n,"busy":...}` every 5 s, naming the op its router publishes;
+    /// a version 1 connection, an older client's, hears none and its answer arrives as before.
+    /// Paused time runs over an in-memory stream only: the paused clock advances whenever no task
+    /// can run, which a socket's data in flight does not stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_call_hears_a_heartbeat_every_five_seconds_on_a_version_2_connection_only() {
+        let corpus: serde_json::Map<String, Value> =
+            serde_json::from_str(include_str!("operations.corpus.json")).expect("the corpus");
+        let status = corpus["job.status"].clone();
+        let repo_id = RepoId::parse("acme/widget").expect("repo id");
+        for (version, beating) in [
+            (HANDSHAKE_VERSION, true),
+            (HANDSHAKE_VERSION_UNBEATEN, false),
+        ] {
+            let (router, mut commands) = RouterHandle::channel(NonZeroUsize::MIN);
+            let busy = router.busy().clone();
+            let (release, released) = oneshot::channel::<()>();
+            let actor = tokio::spawn(async move {
+                let (request, reply) = commands.recv().await.expect("routed command").into_parts();
+                busy.publish(Some(RouteBusy::of(&request)));
+                let _ = released.await;
+                busy.publish(None);
+                let _ = reply.send(Ok(RouterResponse::json(json!({ "done": true }))));
+            });
+            let (mut client, server) = tokio::io::duplex(MAX_JSON_FRAME_BYTES);
+            let (reader, writer) = tokio::io::split(server);
+            let authority = ConnectionAuthority::Coordinator {
+                repo_id: repo_id.clone(),
+            };
+            let served = tokio::spawn(serve_connection(reader, writer, authority, router));
+            let opened = tokio::time::Instant::now();
+            send(&mut client, &json!({ "version": version, "nonce": NONCE })).await;
+            let hello = receive(&mut client).await;
+            assert_eq!(
+                hello["version"],
+                json!(version),
+                "the server answers the client's version"
+            );
+            send(
+                &mut client,
+                &json!({ "id": 1, "method": "job.status", "params": status, "binaryLength": null }),
+            )
+            .await;
+            if beating {
+                for seq in 1..=2_u64 {
+                    let beat = receive(&mut client).await;
+                    assert_eq!(
+                        beat,
+                        json!({
+                            "progress": seq,
+                            "busy": { "method": "job.status", "subject": "feature", "forMs": seq * 5000 },
+                        })
+                    );
+                    assert_eq!(
+                        opened.elapsed(),
+                        std::time::Duration::from_secs(5 * seq),
+                        "beat {seq} is due every 5 s"
+                    );
+                }
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+            }
+            release.send(()).expect("release the held call");
+            let answer = receive(&mut client).await;
+            assert_eq!(
+                (&answer["id"], &answer["ok"]),
+                (&json!(1), &json!(true)),
+                "the call's answer is the next frame on version {version}"
+            );
+            actor.await.expect("router joins");
+            drop(client);
+            served
+                .await
+                .expect("the connection joins")
+                .expect("a clean disconnect ends the connection");
+        }
+    }
 }

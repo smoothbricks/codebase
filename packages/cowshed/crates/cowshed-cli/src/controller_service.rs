@@ -99,7 +99,7 @@ pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
     let authority = ConnectionAuthority::Coordinator {
         repo_id: runtime.descriptor().repo_id.clone(),
     };
-    let (router, calls) = RouterHandle::channel(RELAY_CAPACITY);
+    let (router, calls) = RouterHandle::relaying(RELAY_CAPACITY, &runtime.router());
     let relay = tokio::spawn(relay(calls, runtime.router()));
     let served = serve_controller_connection(socket, authority, router).await;
     let relayed = relay

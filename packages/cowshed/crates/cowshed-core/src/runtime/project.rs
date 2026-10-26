@@ -39,8 +39,8 @@ use crate::api::operations::{
 use crate::api::process::JobProcessTree;
 use crate::api::resources::{JobResourceSample, SampleInterval};
 use crate::api::server::{
-    ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterReply, RouterRequest,
-    RouterResponse,
+    BusySlot, ConnectionAuthority, EventSource, RouteBusy, RouterCommand, RouterHandle,
+    RouterReply, RouterRequest, RouterResponse,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
@@ -1159,7 +1159,8 @@ impl ProjectRuntime {
         let capacity = NonZeroUsize::new(ROUTER_CAPACITY)
             .ok_or_else(|| CowshedError::internal("project router capacity is zero"))?;
         let (router, receiver) = RouterHandle::channel(capacity);
-        let actor = tokio::spawn(ProjectActor::new(Box::new(host), receiver).run());
+        let busy = router.busy().clone();
+        let actor = tokio::spawn(ProjectActor::new(Box::new(host), receiver, busy).run());
         Ok(Self {
             descriptor,
             router,
@@ -1262,11 +1263,21 @@ enum Routed {
 struct ProjectActor {
     host: Box<dyn ProjectRuntimeHost>,
     receiver: mpsc::Receiver<RouterCommand>,
+    /// Where the op this actor serves is published for the connections' heartbeats.
+    busy: BusySlot,
 }
 
 impl ProjectActor {
-    fn new(host: Box<dyn ProjectRuntimeHost>, receiver: mpsc::Receiver<RouterCommand>) -> Self {
-        Self { host, receiver }
+    fn new(
+        host: Box<dyn ProjectRuntimeHost>,
+        receiver: mpsc::Receiver<RouterCommand>,
+        busy: BusySlot,
+    ) -> Self {
+        Self {
+            host,
+            receiver,
+            busy,
+        }
     }
 
     async fn run(mut self) {
@@ -1286,6 +1297,7 @@ impl ProjectActor {
                     None => break,
                 },
             };
+            self.busy.publish(Some(RouteBusy::of(&request)));
             if !waited && self.authorize(&request).is_ok() {
                 let quiet = self.host.quiet_wait(request.operation()).await;
                 self.host.release_intent_leases();
@@ -1296,6 +1308,8 @@ impl ProjectActor {
                     pool,
                 }) = quiet
                 {
+                    // The request waits for its gate off the actor, which is busy with it no more.
+                    self.busy.publish(None);
                     let admit = admit.clone();
                     let mut reply = reply;
                     tokio::spawn(async move {
@@ -1320,6 +1334,7 @@ impl ProjectActor {
                 Some(steps) => cowshed_os::timing::reporting(steps, self.route(request)).await,
                 None => self.route(request).await,
             };
+            self.busy.publish(None);
             self.host.release_intent_leases();
             match routed {
                 Ok(Routed::Now(response)) => {

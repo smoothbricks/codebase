@@ -41,6 +41,9 @@ struct ServerHello {
     version: u32,
     nonce: String,
     repo_id: RepoId,
+    /// The controller's pid: a version 2 answer's, absent from a version 1 answer.
+    #[serde(default)]
+    pid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,7 +120,12 @@ impl TestClient {
             serde_json::from_slice(&client.read_frame().await).expect("a host hello");
         assert_eq!(
             hello,
-            json!({ "version": HANDSHAKE_VERSION, "nonce": NONCE, "host": role })
+            json!({
+                "version": HANDSHAKE_VERSION,
+                "nonce": NONCE,
+                "host": role,
+                "pid": std::process::id(),
+            })
         );
         (client, task)
     }
@@ -1004,6 +1012,51 @@ async fn malformed_connection_does_not_poison_a_concurrent_connection() {
         "project.list"
     );
     assert_clean_disconnect(good, good_server).await;
+}
+
+/// 07_api.md "Controller handshake": a version 2 client is answered as version 2 with the
+/// controller's pid; a version 1 client, an older build's, is answered exactly as before, with no
+/// pid, and its call is answered. (The heartbeats a version 2 connection hears are proved on paused
+/// time over an in-memory stream, in `api::server`'s tests.)
+#[tokio::test]
+async fn a_controller_answers_each_client_in_the_handshake_version_it_sent() {
+    for (version, pid) in [(2_u32, Some(std::process::id())), (1, None)] {
+        let (router, mut commands) =
+            RouterHandle::channel(NonZeroUsize::new(1).expect("nonzero router capacity"));
+        let actor = tokio::spawn(async move {
+            let command = commands.recv().await.expect("routed command");
+            let (_request, reply) = command.into_parts();
+            let _ = reply.send(Ok(RouterResponse::json(json!({ "done": true }))));
+        });
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        client.set_nonblocking(true).expect("nonblocking client");
+        let stream = tokio::net::UnixStream::from_std(client).expect("Tokio client stream");
+        let task = tokio::spawn(serve_controller_connection(
+            server.into(),
+            coordinator_authority(),
+            router,
+        ));
+        let mut client = TestClient { stream, next_id: 1 };
+        let hello = client.handshake(version, NONCE).await;
+        assert_eq!(
+            (hello.version, hello.pid),
+            (version, pid),
+            "the server answers the client's version, and names its pid on version 2 only"
+        );
+        client
+            .write_json(&json!({
+                "id": 1,
+                "method": "job.status",
+                "params": params("job.status"),
+                "binaryLength": null,
+            }))
+            .await;
+        let answer: RpcResponse =
+            serde_json::from_slice(&client.read_frame().await).expect("the call's answer");
+        assert_eq!((answer.id, answer.ok), (1, true), "version {version}");
+        actor.await.expect("router joins");
+        assert_clean_disconnect(client, task).await;
+    }
 }
 
 #[tokio::test]

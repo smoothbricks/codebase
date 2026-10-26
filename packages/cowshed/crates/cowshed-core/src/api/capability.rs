@@ -38,6 +38,8 @@ use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use crate::runtime::supervisor_socket::AdmissionSource;
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(unix)]
+use cowshed_os::deadline::{self, Idle, Peer, Progress, Silent};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::fmt;
@@ -1243,6 +1245,24 @@ fn handshake_error(message: impl Into<String>) -> CowshedError {
     )
 }
 
+/// The peer a version 2 hello answered from, named by the pid it reports. The socketpair's
+/// credentials cannot name it: they name the process that made the pair, not the controller that
+/// inherited one end.
+#[cfg(unix)]
+fn paired_peer(role: &'static str, pid: Option<u32>) -> Result<Peer> {
+    let pid = pid.ok_or_else(|| {
+        handshake_error(format!(
+            "the {role} answered handshake version 2 without its pid"
+        ))
+    })?;
+    let pid = i32::try_from(pid).map_err(|_| {
+        handshake_error(format!(
+            "the {role} answered handshake version 2 with pid {pid}, which no process has"
+        ))
+    })?;
+    Ok(Peer::paired(role, pid))
+}
+
 #[cfg(unix)]
 fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
     frame::verify_peer(descriptor, |error| match error {
@@ -1416,14 +1436,15 @@ async fn read_binary_frame(
 /// behind this connection can start nothing in a workspace, whichever call met it.
 #[cfg(unix)]
 fn spawn_controller_actor(
-    stream: tokio::net::UnixStream,
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    writer: impl AsyncWrite + Unpin + Send + 'static,
+    controller: Peer,
 ) -> (
     Arc<dyn ControllerRuntime>,
     watch::Receiver<Option<OtherBuild>>,
 ) {
     let (sender, receiver) = mpsc::channel::<ActorMessage>(32);
     let (closes, closed) = mpsc::unbounded_channel();
-    let (reader, writer) = stream.into_split();
     let (answers, answer_receiver) = mpsc::unbounded_channel();
     let (other_build, refused) = watch::channel(None);
     let downloads = Downloads::default();
@@ -1436,6 +1457,7 @@ fn spawn_controller_actor(
     tokio::spawn(run_controller_actor(
         receiver,
         closed,
+        controller,
         writer,
         downloads,
         answer_receiver,
@@ -1458,17 +1480,93 @@ struct Answer {
 }
 
 /// What the reader takes off the connection for the actor: one step of a call that asked for
-/// its steps, one event of a stream-lane call, or a call's answer.
+/// its steps, one event of a stream-lane call, a heartbeat, or a call's answer.
 #[cfg(unix)]
 enum Inbound {
     Step { id: u64, report: StepReport },
     Event { id: u64, event: Value },
+    Progress { seq: u64, busy: Option<codec::Busy> },
     Answer(Answer),
 }
 
 #[cfg(unix)]
+impl Inbound {
+    /// What this frame shows of the controller: every frame is progress.
+    const fn progress(&self) -> Progress {
+        match self {
+            Self::Step { .. } => Progress::State("step"),
+            Self::Event { .. } => Progress::State("event"),
+            Self::Progress { seq, .. } => Progress::Heartbeat { seq: *seq },
+            Self::Answer(_) => Progress::State("answer"),
+        }
+    }
+}
+
+/// The op a controller call's silence is measured for (05_gateway.md "Deadlines").
+#[cfg(unix)]
+const CONTROLLER_CALL: &str = "controller call";
+
+/// Whether the controller owes an answer: a call sent and unanswered, or a demand on an open
+/// stream.
+#[cfg(unix)]
+fn outstanding<T>(
+    pending: &std::collections::HashMap<u64, T>,
+    streams: &std::collections::HashMap<u64, OpenStream>,
+) -> bool {
+    !pending.is_empty() || streams.values().any(|stream| stream.waiting.is_some())
+}
+
+/// The controller a silent call waited on, and the op its last heartbeat said its router serves.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct ControllerHolder {
+    peer: Peer,
+    busy: Option<codec::Busy>,
+}
+
+#[cfg(unix)]
+impl fmt::Display for ControllerHolder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.peer)?;
+        match &self.busy {
+            Some(busy) => write!(formatter, ", {busy}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The controller's silence since it last owed nothing, and the op its last heartbeat in that
+/// span named.
+#[cfg(unix)]
+struct ControllerSilence {
+    idle: Idle,
+    busy: Option<codec::Busy>,
+}
+
+#[cfg(unix)]
+impl ControllerSilence {
+    /// The controller now owes an answer it did not owe before: its silence starts now.
+    fn start() -> Self {
+        Self {
+            idle: deadline::idle(CONTROLLER_CALL, deadline::HEARTBEAT_SILENCE),
+            busy: None,
+        }
+    }
+}
+
+/// A controller that heard a call and then said nothing for the heartbeat silence, as every
+/// waiting caller's error. Nothing was stopped.
+#[cfg(unix)]
+fn silent_controller(silent: &Silent<ControllerHolder>) -> CowshedError {
+    CowshedError::environment_missing(
+        silent.to_string(),
+        "the controller is alive and not answering on its connection; nothing was stopped, and its pid is named above",
+    )
+}
+
+#[cfg(unix)]
 async fn read_answers(
-    mut reader: tokio::net::unix::OwnedReadHalf,
+    mut reader: impl AsyncRead + Unpin,
     downloads: Downloads,
     answers: mpsc::UnboundedSender<Result<Inbound>>,
     other_build: watch::Sender<Option<OtherBuild>>,
@@ -1499,7 +1597,7 @@ async fn read_answers(
 /// Read and check one frame. `Err` means the connection cannot be read past it.
 #[cfg(unix)]
 async fn read_inbound(
-    reader: &mut tokio::net::unix::OwnedReadHalf,
+    reader: &mut (impl AsyncRead + Unpin),
     downloads: &Downloads,
 ) -> Result<Inbound> {
     let frame = read_rpc_frame(reader).await?;
@@ -1507,6 +1605,7 @@ async fn read_inbound(
         CowshedError::internal(format!("controller RPC response decoding failed: {error}"))
     })? {
         codec::DecodedServerFrame::Step { id, report } => Ok(Inbound::Step { id, report }),
+        codec::DecodedServerFrame::Progress { seq, busy } => Ok(Inbound::Progress { seq, busy }),
         codec::DecodedServerFrame::Event { id, event } => Ok(Inbound::Event { id, event }),
         codec::DecodedServerFrame::Response(response) => read_answer(reader, downloads, response)
             .await
@@ -1518,7 +1617,7 @@ async fn read_inbound(
 /// against its declaration before its bytes are read.
 #[cfg(unix)]
 async fn read_answer(
-    reader: &mut tokio::net::unix::OwnedReadHalf,
+    reader: &mut (impl AsyncRead + Unpin),
     downloads: &Downloads,
     response: codec::DecodedRpcResponse,
 ) -> Result<Answer> {
@@ -1608,7 +1707,8 @@ struct OpenStream {
 async fn run_controller_actor(
     mut messages: mpsc::Receiver<ActorMessage>,
     mut closes: mpsc::UnboundedReceiver<u64>,
-    mut writer: tokio::net::unix::OwnedWriteHalf,
+    controller: Peer,
+    mut writer: impl AsyncWrite + Unpin,
     downloads: Downloads,
     mut answers: mpsc::UnboundedReceiver<Result<Inbound>>,
 ) {
@@ -1621,8 +1721,19 @@ async fn run_controller_actor(
     let mut streams = std::collections::HashMap::<u64, OpenStream>::new();
     let mut next_id = 1_u64;
     let mut closing = None;
+    // The controller's silence while it owes an answer, and the op its last heartbeat named.
+    let mut stalled = ControllerSilence::start();
     let failure = loop {
+        let owed = outstanding(&pending, &streams);
+        let silence = stalled
+            .idle
+            .remaining(deadline::clock())
+            .unwrap_or(std::time::Duration::ZERO);
         let call = tokio::select! {
+            () = tokio::time::sleep(silence), if owed => {
+                let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.take() };
+                break silent_controller(&stalled.idle.silent(holder, deadline::clock()));
+            }
             () = std::future::ready(()),
                 if pending.len() < MAX_IN_FLIGHT_REQUESTS && !waiting.is_empty() => {
                 waiting.pop_front().expect("the enabled admission branch has a queued call")
@@ -1647,6 +1758,9 @@ async fn run_controller_actor(
                             break error;
                         }
                         // The request is the stream's first demand.
+                        if !outstanding(&pending, &streams) {
+                            stalled = ControllerSilence::start();
+                        }
                         streams.insert(id, OpenStream { waiting: Some(first), closing: false });
                         let _ = opened.send(Ok(id));
                         continue;
@@ -1659,6 +1773,7 @@ async fn run_controller_actor(
                         );
                     }
                     ActorMessage::Next { id, reply } => {
+                        let quiet = !outstanding(&pending, &streams);
                         let Some(stream) = streams
                             .get_mut(&id)
                             .filter(|stream| stream.waiting.is_none() && !stream.closing)
@@ -1673,6 +1788,9 @@ async fn run_controller_actor(
                             break error;
                         }
                         stream.waiting = Some(reply);
+                        if quiet {
+                            stalled = ControllerSilence::start();
+                        }
                         continue;
                     }
                 }
@@ -1689,8 +1807,15 @@ async fn run_controller_actor(
                 continue;
             }
             inbound = answers.recv() => {
+                if let Some(Ok(frame)) = &inbound {
+                    stalled.idle.observe(frame.progress(), deadline::clock());
+                }
                 let answer = match inbound {
                     Some(Ok(Inbound::Answer(answer))) => answer,
+                    Some(Ok(Inbound::Progress { busy, .. })) => {
+                        stalled.busy = busy;
+                        continue;
+                    }
                     Some(Ok(Inbound::Step { id, report })) => {
                         let Some(listener) = listeners.get(&id) else {
                             break CowshedError::internal(
@@ -1778,6 +1903,9 @@ async fn run_controller_actor(
             let _ = reply.send(Err(error.clone()));
             break error;
         }
+        if !outstanding(&pending, &streams) {
+            stalled = ControllerSilence::start();
+        }
         pending.insert(id, reply);
         if let Some(steps) = steps {
             listeners.insert(id, steps);
@@ -1822,7 +1950,7 @@ async fn run_controller_actor(
 /// Write one demand on the open stream `id`. Any failure leaves the connection unusable.
 #[cfg(unix)]
 async fn send_demand(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
     id: u64,
     demand: codec::Demand,
 ) -> Result<()> {
@@ -1836,7 +1964,7 @@ async fn send_demand(
 /// unusable: the stream may hold part of a frame.
 #[cfg(unix)]
 async fn send_call(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
     id: u64,
     method: &str,
     params: &RawValue,
@@ -1885,13 +2013,15 @@ async fn acquire_coordinator_token(descriptor: OwnedFd) -> Result<(Cowshed, Coor
             "coordinator handshake response is invalid: {error}"
         ))
     })?;
-    let (version, response_nonce, repo_id) = response.into_parts();
+    let (version, response_nonce, repo_id, pid) = response.into_parts();
     if version != HANDSHAKE_VERSION || response_nonce != nonce {
         return Err(handshake_error(
             "coordinator handshake nonce or protocol version did not match",
         ));
     }
-    let (runtime, other_build) = spawn_controller_actor(stream);
+    let controller = paired_peer("cowshed controller", pid)?;
+    let (reader, writer) = stream.into_split();
+    let (runtime, other_build) = spawn_controller_actor(reader, writer, controller);
     let token = CoordinatorToken {
         repo_id,
         channel: AuthenticatedControllerChannel {
@@ -1980,7 +2110,7 @@ async fn connect_host(descriptor: OwnedFd, role: HostRole) -> Result<Arc<dyn Con
         .map_err(|error| handshake_error(format!("host handshake encoding failed: {error}")))?;
     write_frame(&mut stream, &hello).await?;
     let response = read_frame(&mut stream).await?;
-    let (version, response_nonce, answered) = codec::decode_host_hello(&response)
+    let (version, response_nonce, answered, pid) = codec::decode_host_hello(&response)
         .map_err(|error| handshake_error(format!("host handshake response is invalid: {error}")))?;
     if version != HANDSHAKE_VERSION || response_nonce != nonce {
         return Err(handshake_error(
@@ -1992,7 +2122,13 @@ async fn connect_host(descriptor: OwnedFd, role: HostRole) -> Result<Arc<dyn Con
             "asked for a {role:?} host connection, but the peer serves {answered:?}"
         )));
     }
-    let (runtime, _other_build) = spawn_controller_actor(stream);
+    let role_name = match role {
+        HostRole::Host => "cowshed host",
+        HostRole::Sccache => "cowshed sccache host",
+    };
+    let controller = paired_peer(role_name, pid)?;
+    let (reader, writer) = stream.into_split();
+    let (runtime, _other_build) = spawn_controller_actor(reader, writer, controller);
     Ok(runtime)
 }
 
@@ -3089,10 +3225,17 @@ mod tests {
         value
     }
 
+    /// The pid a test controller's hello reports: no process's, so a failure that names it names
+    /// the hello's word, never the socket's credentials.
+    #[cfg(unix)]
+    const CONTROLLER_PID: u32 = 4_000_042;
+
+    /// Answers one client hello as a version 2 controller that reports `pid`.
     #[cfg(unix)]
     async fn handshake_server(
         stream: std::os::unix::net::UnixStream,
         echo_nonce: bool,
+        pid: Option<u32>,
     ) -> Result<()> {
         stream.set_nonblocking(true).unwrap();
         let mut stream = tokio::net::UnixStream::from_std(stream).unwrap();
@@ -3104,19 +3247,36 @@ mod tests {
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         };
         let repo_id = RepoId::parse("acme/widget").unwrap();
-        let response = codec::encode_server_hello(nonce, &repo_id).unwrap();
+        let response = codec::encode_server_hello(HANDSHAKE_VERSION, nonce, &repo_id, pid).unwrap();
         write_frame(&mut stream, &response).await
     }
 
     #[cfg(unix)]
     fn actor_pair() -> (Arc<dyn ControllerRuntime>, tokio::net::UnixStream) {
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
-        let (runtime, _) = spawn_controller_actor(client);
+        let (reader, writer) = client.into_split();
+        let (runtime, _) = spawn_controller_actor(reader, writer, controller());
+        (runtime, server)
+    }
+
+    /// The actor over an in-memory stream, the only kind a paused-time test may use: tokio's
+    /// paused clock advances whenever no task can run, which a socket's data in flight does not
+    /// stop.
+    #[cfg(unix)]
+    fn actor_in_memory() -> (Arc<dyn ControllerRuntime>, tokio::io::DuplexStream) {
+        let (client, server) = tokio::io::duplex(MAX_RPC_BYTES);
+        let (reader, writer) = tokio::io::split(client);
+        let (runtime, _) = spawn_controller_actor(reader, writer, controller());
         (runtime, server)
     }
 
     #[cfg(unix)]
-    async fn read_rpc_request(stream: &mut tokio::net::UnixStream) -> (Vec<u8>, Value) {
+    fn controller() -> Peer {
+        Peer::paired("cowshed controller", CONTROLLER_PID.cast_signed())
+    }
+
+    #[cfg(unix)]
+    async fn read_rpc_request(stream: &mut (impl AsyncRead + Unpin)) -> (Vec<u8>, Value) {
         let bytes = read_rpc_frame(stream).await.unwrap();
         let value = serde_json::from_slice(&bytes).unwrap();
         (bytes, value)
@@ -3138,7 +3298,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn write_raw_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) {
+    async fn write_raw_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) {
         stream.write_u32(bytes.len() as u32).await.unwrap();
         stream.write_all(bytes).await.unwrap();
     }
@@ -3160,6 +3320,96 @@ mod tests {
         let mut call = Box::pin(async move { runtime.call(method, empty_params()).await });
         poll_pending(call.as_mut()).await;
         call
+    }
+
+    /// 05_gateway.md "Deadlines": a controller that takes a call and then says nothing for the
+    /// heartbeat silence (15 s) fails the call SILENT, naming the controller's end of the
+    /// socketpair and its pid. The wait ends; the controller is left as it is.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_controller_that_takes_a_call_and_falls_silent_fails_it_silent() {
+        let (runtime, mut server) = actor_in_memory();
+        let started = tokio::time::Instant::now();
+        let call = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let _ = read_rpc_request(&mut server).await;
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(3600), call)
+            .await
+            .expect("a silent controller fails the call within its silence bound")
+            .expect("the call task joins")
+            .expect_err("a silent controller's call fails");
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_secs(15)
+                && waited < std::time::Duration::from_secs(16),
+            "SILENT at the silence bound: {waited:?}"
+        );
+        let controller = format!(
+            "SILENT: controller call: cowshed controller on a socketpair (pid {CONTROLLER_PID})"
+        );
+        assert!(
+            failure.message.starts_with(&controller),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("(idle bound 15s)"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("last progress: nothing"),
+            "{}",
+            failure.message
+        );
+        drop(server);
+    }
+
+    /// 05_gateway.md "Deadlines": a controller that heartbeats keeps a slow call waiting however
+    /// long its router is busy, and each beat names what the router is busy with. When the beats
+    /// stop, the call fails SILENT naming the last busy op and the last beat.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeating_controller_keeps_a_slow_call_waiting_and_its_silence_names_the_busy_op()
+    {
+        let (runtime, mut server) = actor_in_memory();
+        let call = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let _ = read_rpc_request(&mut server).await;
+        for seq in 1..=12_u64 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let beat = json!({
+                "progress": seq,
+                "busy": { "method": "coordinator.fork", "subject": "raven", "forMs": seq * 5000 },
+            });
+            write_raw_frame(&mut server, beat.to_string().as_bytes()).await;
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            !call.is_finished(),
+            "a minute of heartbeats keeps the call waiting"
+        );
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(3600), call)
+            .await
+            .expect("the call fails once the beats stop")
+            .expect("the call task joins")
+            .expect_err("a controller that stops beating fails the call");
+        for named in [
+            "SILENT: controller call: cowshed controller on a socketpair",
+            "router busy: coordinator.fork raven for 60000 ms",
+            "last progress: heartbeat 12",
+        ] {
+            assert!(
+                failure.message.contains(named),
+                "{named:?}: {}",
+                failure.message
+            );
+        }
+        drop(server);
     }
 
     #[cfg(unix)]
@@ -3582,7 +3832,7 @@ mod tests {
     #[tokio::test]
     async fn inherited_socket_handshake_binds_actor_and_repo() {
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-        let server = tokio::spawn(handshake_server(server, true));
+        let server = tokio::spawn(handshake_server(server, true, Some(CONTROLLER_PID)));
         let descriptor: OwnedFd = client.into();
         let (cowshed, token) = Cowshed::connect(descriptor).await.unwrap();
         assert_eq!(token.repo_id.as_str(), "acme/widget");
@@ -3594,11 +3844,46 @@ mod tests {
     #[tokio::test]
     async fn inherited_socket_handshake_rejects_wrong_nonce() {
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-        let server = tokio::spawn(handshake_server(server, false));
+        let server = tokio::spawn(handshake_server(server, false, Some(CONTROLLER_PID)));
         let descriptor: OwnedFd = client.into();
         let error = Cowshed::connect(descriptor).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::EnvironmentMissing);
         assert!(error.message.contains("nonce"));
+        server.await.unwrap().unwrap();
+    }
+
+    /// The controller a version 2 hello answered from is named by the pid that hello reported;
+    /// an answer without one, or with a pid no process has, names nobody and is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_version_2_hellos_pid_names_the_controller() {
+        assert_eq!(
+            paired_peer("cowshed controller", Some(CONTROLLER_PID)).unwrap(),
+            controller()
+        );
+        for (pid, refusal) in [
+            (None, "without its pid"),
+            (Some(u32::MAX), "which no process has"),
+        ] {
+            let error = paired_peer("cowshed controller", pid).unwrap_err();
+            assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+            assert!(error.message.contains(refusal), "{}", error.message);
+        }
+    }
+    /// A version 2 controller names its pid in its hello, so a hello without one is refused
+    /// before any call: a silent controller could not be named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_socket_handshake_refuses_a_version_2_hello_without_its_pid() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = tokio::spawn(handshake_server(server, true, None));
+        let error = Cowshed::connect(client.into()).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+        assert!(
+            error.message.contains("without its pid"),
+            "{}",
+            error.message
+        );
         server.await.unwrap().unwrap();
     }
 
@@ -4539,7 +4824,8 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_of_the_controllers_build_marks_its_connection() {
         let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
-        let (runtime, other_build) = spawn_controller_actor(client);
+        let (reader, writer) = client.into_split();
+        let (runtime, other_build) = spawn_controller_actor(reader, writer, controller());
         let coordinator = coordinator_over(runtime, other_build);
         let refused = OtherBuild {
             daemon: crate::runtime::supervisor_socket::BuildId::current()
