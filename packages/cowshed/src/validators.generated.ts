@@ -1068,6 +1068,12 @@ export const assertLogsRequestList = typia.createAssertEquals<readonly Api.LogsR
 export const parseLogsRequestList = (json: string): readonly Api.LogsRequest[] =>
   assertLogsRequestList(JSON.parse(json));
 
+export const assertMainLineage = typia.createAssertEquals<Api.MainLineage>();
+export const parseMainLineage = (json: string): Api.MainLineage => assertMainLineage(JSON.parse(json));
+export const assertMainLineageList = typia.createAssertEquals<readonly Api.MainLineage[]>();
+export const parseMainLineageList = (json: string): readonly Api.MainLineage[] =>
+  assertMainLineageList(JSON.parse(json));
+
 export const assertMirrorInfo = typia.createAssertEquals<Api.MirrorInfo>();
 export const parseMirrorInfo = (json: string): Api.MirrorInfo => assertMirrorInfo(JSON.parse(json));
 export const assertMirrorInfoList = typia.createAssertEquals<readonly Api.MirrorInfo[]>();
@@ -1568,6 +1574,12 @@ export const parseSealedJobRef = (json: string): Api.SealedJobRef => assertSeale
 export const assertSealedJobRefList = typia.createAssertEquals<readonly Api.SealedJobRef[]>();
 export const parseSealedJobRefList = (json: string): readonly Api.SealedJobRef[] =>
   assertSealedJobRefList(JSON.parse(json));
+
+export const assertSeedCatchUp = typia.createAssertEquals<Api.SeedCatchUp>();
+export const parseSeedCatchUp = (json: string): Api.SeedCatchUp => assertSeedCatchUp(JSON.parse(json));
+export const assertSeedCatchUpList = typia.createAssertEquals<readonly Api.SeedCatchUp[]>();
+export const parseSeedCatchUpList = (json: string): readonly Api.SeedCatchUp[] =>
+  assertSeedCatchUpList(JSON.parse(json));
 
 export const assertSeedCompactionReport = typia.createAssertEquals<Api.SeedCompactionReport>();
 export const parseSeedCompactionReport = (json: string): Api.SeedCompactionReport =>

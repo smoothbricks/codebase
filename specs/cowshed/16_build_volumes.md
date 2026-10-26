@@ -484,8 +484,9 @@ fast-forward performs no output restoration or adoption.
 A seed is detached and immutable, so rewriting it into contiguous space stops no live shell. A land into main that froze
 main's seed starts the compaction when the seed holds at least **500,000 extents**, no compaction of the project has
 succeeded in the last **24 hours**, and no compaction by the land's own cowshed build has failed since (Failures). No
-timer starts it. A compaction that finds its seed replaced, or cannot tell whether a gate or a land runs, is started
-again by the next land that freezes main's seed.
+timer starts it. A seed that replaces the copied one while the copy runs does not stop it: the copy is caught up to the
+new seed (Catch-up). A compaction that cannot tell whether a gate or a land runs, or whose seed keeps being replaced
+faster than it catches up, is started again by the next land that freezes main's seed.
 
 - **Why 500,000.** A fork's first write costs 0.1 to 0.2 ms per extent of its seed's map, and every fork pays it twice
   (its volume, then its own seed's capture), so 500,000 extents cost a fork about 140 s. A compaction writes the whole
@@ -507,52 +508,90 @@ again by the next land that freezes main's seed.
   land starts nothing and reports `held`, so a cause that does not change is not met again at every land. A land of
   another build starts a compaction as usual, since a new build is how a fix ships.
   `cowshed __compact-seed <project-root>` run by hand does not read the record, and any success removes it. A compaction
-  that finds its seed replaced, cannot tell whether a gate or a land runs, or finds another one running has not failed.
+  that cannot tell whether a gate or a land runs, gives up catching up, or finds another one running has not failed.
 - **One at a time.** The process takes the project's compaction lock (`build/.compacting/lock`) without waiting and
   exits if another process holds it. It reads the last success (the modification time of `build/.compacting/succeeded`)
   and the bound again. It then refreshes main's seed exactly as a fork of main does (Fork step 2), under main's image
   lock. The copy then holds what main's live volume holds, so the next fork's reseed keeps the compacted seed instead of
   replacing it with a capture of a volume written after the seed.
-- **Only the refresh, the clone and the publication hold main's image lock.** Still under the lock that the refresh
-  took, the seed is cloned to `build/.compacting/source.dmg` (milliseconds; the clone is never written, so a land or
+- **Only the refreshes, the clones and the publication hold main's image lock.** Still under the lock that the refresh
+  took, the seed is cloned to `build/.compacting/<seed>.dmg` (milliseconds; the clone is never written, so a land or
   reseed that retires the seed meanwhile changes nothing it reads). With no lock held, the clone's data is copied with
   plain `pread`/`pwrite` into `build/.compacting/copy.dmg`, keeping holes, as `defrag` copies (01a_apfs.md, "Images").
   The copy runs at normal disk priority and past the cache (`F_NOCACHE` on both descriptors): it holds for every gate
   and land (below), so between them the disk is its to use, and it passes each byte once, so caching it would only evict
   the working set of the rest of the host. Measured 2026-10-25 on this host: throttled (`IOPOL_THROTTLE`), a 367 GB seed
-  copied at 26 MB/s, about four hours; at normal priority one copied 209 GB in 440 s. The clone is then released in
-  bounded steps at normal priority, because a throttled free holds the container's work (Garbage collection). Forks and
-  lands of main proceed throughout the copy and clone the seed as it stands.
-- **It holds for gates and lands.** After its first chunk and every GiB after that, the copy checks whether main's
-  latest seed is still the one it copies, then asks whether any gate job holds or waits for CPU tokens (`cpu-budget`)
-  and whether a land holds or waits for any repository's turn (05_gateway.md, "Land turns"). A land's gate can run as
-  plain host work the CPU ledger does not count, and a land that starts the compaction still holds its own turn. While
-  either runs, the copy holds where it is, says once in its log what it waits for, and checks both again every **15 s**;
-  it says how long it waited when it goes on. If the seed was replaced, or the gateway's answer or the land turns cannot
-  be read, the copy stops and is removed. The seed is left as it was. A gateway that is not running runs no gate.
-- **Publication.** Under main's image lock again, the copy is published only if the seed it copied is still main's
-  latest. The copy is registered as a new seed of main at the copied seed's tree before its image exists, renamed into
-  place, and given the copied seed's freshness mark (its bytes are that seed's, so they are no newer). It is proven
-  forkable and published, as a captured seed is. Every older seed is then committed to `build/.deleting`, as a fork's
-  seed refresh retires the seeds it replaces. If a land or reseed replaced the seed meanwhile, the copy is released. A
-  publication records the success.
-- **Main's live volume is not rewritten.** It is mounted and written, and the next land replaces it with a landing
-  volume. Forks made after the compacted seed is published start compact, and their lands carry the compact lineage into
-  main.
-- **Leftovers.** `build/.compacting` is read by no enumeration of images, records or `build/.deleting`. An interrupted
-  compaction's clone and copy are released, in bounded steps, by the next compaction once it holds the compaction lock
-  and before it takes main's image lock: freeing a whole seed's extent map takes minutes, and no fork or land waits on
-  it.
-- The process reports one line on stderr: running elsewhere, recent, below the bound, no seed, stopped and why,
-  superseded, or compacted with both extent counts, the bytes copied and the time taken.
+  copied at 26 MB/s, about four hours; at normal priority one copied 209 GB in 440 s. The clone stays until the copy is
+  published, for a catch-up to read which blocks a newer seed still shares with it. Forks and lands of main proceed
+  throughout the copy and clone the seed as it stands.
+- **It holds for gates and lands.** After its first chunk and every GiB after that, the copy, and a catch-up's writes
+  and its punches of at most 8 MiB alike, ask whether any gate job holds or waits for CPU tokens (`cpu-budget`) and
+  whether a land holds or waits for any repository's turn (05_gateway.md, "Land turns"). A land's gate can run as plain
+  host work the CPU ledger does not count, and a land that starts the compaction still holds its own turn. While either
+  runs, the writer holds where it is, says once in its log what it waits for, and checks both again every **15 s**; it
+  says how long it waited when it goes on. If the gateway's answer or the land turns cannot be read, it stops, and the
+  copy is removed. The seed is left as it was. A gateway that is not running runs no gate.
+- **Publication.** Under main's image lock again, main's seed is refreshed once more exactly as a fork of main refreshes
+  it, so a write main's live volume took during the copy reaches the seed now rather than at the next fork. The copy is
+  published only if the seed it holds is still main's latest. It is registered as a new seed of main at that seed's tree
+  before its image exists, renamed into place, and given that seed's freshness mark (its bytes are that seed's, so they
+  are no newer). It is proven forkable and published, as a captured seed is. Every older seed is then claimed under the
+  lock and committed to `build/.deleting` once the compaction lets the lock go, as a fork's seed refresh retires the
+  seeds it replaces (Garbage collection). A publication records the success.
+- **Catch-up.** When a land, a fork's reseed or the publication's own refresh replaced the seed the copy holds, the new
+  latest seed is cloned aside under the same lock, and the lock is let go. With no lock held, the copy is made to hold
+  the new seed's bytes: wherever the new seed's data sits on the same device blocks as the old seed's clone at the same
+  offset (`F_LOG2PHYS_EXT`; a clone shares its source's blocks until either is written), the copy is left as it is;
+  every other data range of the new seed is written into the copy in place, past the cache, and whatever data the copy
+  holds where the new seed has a hole is punched. The copy takes the new seed's length. Writing in place keeps the
+  copy's runs (measured 2026-10-26 on the store volume: sixteen 1 MiB overwrites of a contiguous 64 MiB file left its 8
+  runs, the same writes into a clone of it made 87). The old clone is then released in bounded steps, and publication is
+  tried again under the lock, refresh first. Each catch-up writes only what main's seed changed since the last, so it
+  takes the time of one land's delta, not of the whole seed; each says on stderr the seeds, the bytes written and
+  punched, and the time taken. After **8** catch-ups the seed is replaced faster than the copy follows it, and the
+  compaction stops. A copy already under way finishes the seed it started rather than switching to the new one: it reads
+  one immutable clone in one pass and takes no lock, a switch would still need the catch-up for the part already copied,
+  and finishing writes at most the new seed's changes to the remaining part twice.
+- **Main's live volume moves onto the compacted seed.** After a publication, with main's image lock let go, main's live
+  build volume is replaced by a clone of the compacted seed through the workspace reseed of main from main (Workspace
+  reseed: both participants are main, so its image lock and lifecycle lease are each taken once). It moves only when it
+  holds no write the seed lacks: under the reseed's exclusive claim, with main's Nx daemon stopped, its volume is
+  flushed and its image's modification time compared with the seed's mark (Targets and seeds, "Behind is one comparison
+  of two modification times"), before the replacement is cloned and again once it is cloned, immediately before main's
+  volume is sealed, since a host process the claim does not fence can write while the clone is made. The comparison
+  cannot follow the seal: the unmount writes the image itself (measured 2026-10-26: a volume nothing wrote read 5,188 ms
+  behind its mark once sealed), so it would refuse every move. Between the last comparison and the unmount only a host
+  process outside any cowshed job can write, since the exclusive build hold taken before the first comparison and held
+  through the seal refuses every job admission and the daemon keeper's restart, and that is acceptable because it is the
+  writer no capture fences either (Targets and seeds: the guarantee "is not a kernel-wide filesystem-writer barrier");
+  one still holding a file open refuses the unforced seal. A later write refuses the move and releases the replacement.
+  A job's hold, an Nx holder, a file open on the volume (a Cargo build included), a detached main, a later write, a seed
+  replaced in between, or a failure of the move leaves main's volume as it is, and the report says why; the compaction
+  has still succeeded, and nothing is killed. Main then writes on in contiguous space, so the seeds later captured from
+  it stay compact; without the move, the next fork's reseed would replace the compacted seed with a capture of main's
+  fragmented volume as soon as main is written. Forks made after the compacted seed is published start compact either
+  way, and their lands carry the compact lineage into main.
+- **Leftovers.** `build/.compacting` is read by no enumeration of images, records or `build/.deleting`. Every `.dmg` in
+  it, the clones and the copy, is released in bounded steps by the compaction itself before it answers, and an
+  interrupted compaction's by the next one once it holds the compaction lock and before it takes main's image lock:
+  freeing a whole seed's extent map takes minutes, and no fork or land waits on it.
+- The process reports one line on stderr: running elsewhere, recent, below the bound, no seed, stopped and why, or
+  compacted with both extent counts, the bytes written, the time taken, each catch-up, and whether main's volume moved
+  or why it was kept.
 - **Enforced by**: unit tests of the decision (a seed under the bound is left alone; one at the bound is due; a success
   within the interval, or one dated after the clock, is recent without counting extents) and of the hold (a failure of
   the land's build holds it; another build's does not); a test in which the first start, with no `build/.compacting`,
   starts a process that holds none of the land's descriptors; a held copy asks again until it may go on; a copy that a
-  stop interrupts removes its copy and leaves the source unchanged; and a real-APFS test in which a fragmented seed is
-  cloned, copied and published as main's latest seed, with at least ten times fewer extents, the same data and holes,
-  and the copied seed's freshness mark, while the old seed is committed to `build/.deleting`, and in which a copy whose
-  seed was replaced is released instead of published.
+  stop interrupts removes its copy and leaves the source unchanged; a real-APFS test of the catch-up writing nothing for
+  a plain clone of the copied seed and, for a clone with a range rewritten, data written into a hole and a range
+  punched, exactly its unshared data, admitting the last write and every punch, after which the copy holds the new
+  seed's bytes and holes; a real-APFS test in which a fragmented seed is cloned, copied and published as main's latest
+  seed, with at least ten times fewer extents, the same data and holes, and the copied seed's freshness mark, while the
+  old seed is committed to `build/.deleting`, and in which a seed a land publishes between the copy and its publication,
+  or during the copy, is caught up to, writing only what the land changed, and published with that seed's bytes and
+  mark; and a real-APFS test in which main moves onto a clone of its seed only once its volume holds no write after the
+  seed's mark, and a write made while the replacement is cloned refuses the move, is kept, and leaves no replacement
+  behind.
 
 ### Workspace reseed
 

@@ -386,6 +386,151 @@ fn copy_data<Stop>(
     Ok(Copied::Complete { bytes: copied })
 }
 
+/// What catching a copy up to a newer image did ([`catch_up`]).
+#[derive(Debug, Eq, PartialEq)]
+pub enum CaughtUp<Stop> {
+    /// The copy holds `next`'s bytes and holes: `written` data bytes were written where `next`
+    /// does not share `base`'s blocks, and `punched` bytes the copy held where `next` has a hole
+    /// were punched.
+    Complete { written: u64, punched: u64 },
+    /// `keep_going` broke with `why` once `bytes` were written or punched; the copy holds part of
+    /// each.
+    Stopped { bytes: u64, why: Stop },
+}
+
+/// Make `copy`, which holds `base`'s bytes and holes, hold `next`'s, writing only where they
+/// differ (16_build_volumes.md, "Seed compaction"). `base` and `next` are never-written clones,
+/// so where `next`'s data sits on the device blocks `base` has at the same offset
+/// (`F_LOG2PHYS_EXT`: a clone shares its source's blocks until either is written), it holds
+/// `base`'s bytes and the copy is left as it is. Every other data range of `next` is written into
+/// `copy` in place with `pread`/`pwrite` past the cache: an overwrite of a file's own unshared
+/// blocks keeps its runs (measured 2026-10-26 on the store volume: sixteen 1 MiB overwrites of a
+/// contiguous 64 MiB file left its 8 runs, the same writes into a clone of it made 87), so the
+/// copy stays contiguous. Then whatever data the copy holds where `next` has a hole is punched:
+/// `base`'s data there, and any hole APFS filled with zeros beside a write. The copy takes
+/// `next`'s length. `keep_going` is asked after every chunk written and before every punch of at
+/// most a chunk, with the bytes written and punched so far; a break leaves the copy holding part
+/// of each, for the caller to discard.
+pub fn catch_up<Stop>(
+    base: &Path,
+    next: &Path,
+    copy: &Path,
+    mut keep_going: impl FnMut(u64) -> ControlFlow<Stop>,
+) -> Result<CaughtUp<Stop>, ApfsStorageError> {
+    let open = |path: &Path| {
+        let file = File::open(path)
+            .map_err(|error| io_error("open a seed to catch up from", path, error))?;
+        let length = file
+            .metadata()
+            .map_err(|error| io_error("inspect a seed to catch up from", path, error))?
+            .len();
+        Ok::<_, ApfsStorageError>((file, length))
+    };
+    let (base_file, base_length) = open(base)?;
+    let (next_file, length) = open(next)?;
+    let writer = OpenOptions::new()
+        .write(true)
+        .open(copy)
+        .map_err(|error| io_error("open the copy to catch up", copy, error))?;
+    bypass_cache(&next_file).map_err(|error| io_error("bypass the cache reading", next, error))?;
+    bypass_cache(&writer).map_err(|error| io_error("bypass the cache writing", copy, error))?;
+    writer
+        .set_len(length)
+        .map_err(|error| io_error("size the copy to its new seed", copy, error))?;
+    let mut buffer = vec![0_u8; buffer_len(COPY_CHUNK_BYTES)?];
+    let mut written = 0_u64;
+    let mut offset = 0;
+    while let Some((start, end)) = next_data_region(&next_file, offset, length)
+        .map_err(|error| io_error("find the new seed's data", next, error))?
+    {
+        let mut position = start;
+        while position < end {
+            let theirs = physical_run(&next_file, position, end - position)
+                .map_err(|error| io_error("map the new seed's extents", next, error))?;
+            let (step, shared) = match next_data_region(&base_file, position, base_length)
+                .map_err(|error| io_error("find the old seed's data", base, error))?
+            {
+                Some((base_start, base_end)) if base_start <= position => {
+                    let ours =
+                        physical_run(&base_file, position, theirs.bytes.min(base_end - position))
+                            .map_err(|error| io_error("map the old seed's extents", base, error))?;
+                    (ours.bytes, ours.device == theirs.device)
+                }
+                // A hole in the old seed here, up to its next data: nothing it could share.
+                Some((base_start, _)) => (theirs.bytes.min(base_start - position), false),
+                None => (theirs.bytes, false),
+            };
+            if !shared {
+                let until = position + step;
+                let mut at = position;
+                while at < until {
+                    let bytes = (until - at).min(COPY_CHUNK_BYTES);
+                    let chunk = &mut buffer[..buffer_len(bytes)?];
+                    next_file
+                        .read_exact_at(chunk, at)
+                        .map_err(|error| io_error("read the new seed's data", next, error))?;
+                    writer
+                        .write_all_at(chunk, at)
+                        .map_err(|error| io_error("write the copy's catch-up", copy, error))?;
+                    at += bytes;
+                    written += bytes;
+                    if let ControlFlow::Break(why) = keep_going(written) {
+                        return Ok(CaughtUp::Stopped {
+                            bytes: written,
+                            why,
+                        });
+                    }
+                }
+            }
+            position += step;
+        }
+        offset = end;
+    }
+    // A write still in the kernel's cache has no blocks yet: place them before the copy's
+    // allocation is read.
+    writer
+        .sync_all()
+        .map_err(|error| io_error("flush the copy's catch-up", copy, error))?;
+    let mut punched = 0_u64;
+    let mut hole = 0;
+    while hole < length {
+        let (hole_end, data_end) = next_data_region(&next_file, hole, length)
+            .map_err(|error| io_error("find the new seed's holes", next, error))?
+            .unwrap_or((length, length));
+        let mut at = hole;
+        while let Some((start, end)) = next_data_region(&writer, at, hole_end)
+            .map_err(|error| io_error("find the copy's data", copy, error))?
+        {
+            if start >= hole_end {
+                break;
+            }
+            // Bounded punches, each admitted as a write is: a punch frees the copy's blocks,
+            // which is disk work a gate or a land waits on as much as a write.
+            let mut from = start;
+            while from < end {
+                if let ControlFlow::Break(why) = keep_going(written + punched) {
+                    return Ok(CaughtUp::Stopped {
+                        bytes: written + punched,
+                        why,
+                    });
+                }
+                let bytes = (end - from).min(COPY_CHUNK_BYTES);
+                punch_hole(&writer, from, bytes).map_err(|error| {
+                    io_error("punch the new seed's hole in the copy", copy, error)
+                })?;
+                punched += bytes;
+                from += bytes;
+            }
+            at = end;
+        }
+        hole = data_end;
+    }
+    writer
+        .sync_all()
+        .map_err(|error| io_error("flush the caught-up copy", copy, error))?;
+    Ok(CaughtUp::Complete { written, punched })
+}
+
 fn buffer_len(bytes: u64) -> Result<usize, ApfsStorageError> {
     usize::try_from(bytes)
         .map_err(|_| ApfsStorageError::InvalidPlan("rewrite chunk exceeds the address space"))
@@ -831,6 +976,105 @@ pub(crate) mod tests {
             super::count_extents_to(&image, 3).expect("bounded").get(),
             3,
             "a bounded count stops at its bound"
+        );
+    }
+
+    /// A catch-up (16_build_volumes.md, "Seed compaction") writes only what the next seed does
+    /// not share with the copied one: nothing for a plain clone of it; for a clone with a range
+    /// rewritten, data written into a hole and a data range punched, exactly its unshared data,
+    /// after which the copy holds the next seed's bytes and holes and keeps its few extents.
+    #[test]
+    fn compaction_catch_up_writes_only_what_the_next_seed_changed() {
+        use std::ops::ControlFlow;
+        let root = scratch("catch-up");
+        let (base, _) = fragmented_sparse_file(&root.0);
+        let copy = root.0.join("copy.dmg");
+        assert_eq!(
+            super::copy_contiguously(&base, &copy, |_| ControlFlow::<()>::Continue(()))
+                .expect("copy"),
+            super::Copied::Complete { bytes: 8 * MIB }
+        );
+        let compact = count_extents(&copy).expect("count the copy");
+        let clone = |name: &str| {
+            let path = root.0.join(name);
+            assert!(
+                std::process::Command::new("/bin/cp")
+                    .arg("-c")
+                    .arg(&base)
+                    .arg(&path)
+                    .status_locked()
+                    .expect("cp -c")
+                    .success()
+            );
+            path
+        };
+        let unchanged = clone("unchanged.dmg");
+        assert_eq!(
+            super::catch_up(
+                &base,
+                &unchanged,
+                &copy,
+                |_| ControlFlow::<()>::Continue(())
+            )
+            .expect("catch up to a plain clone"),
+            super::CaughtUp::Complete {
+                written: 0,
+                punched: 0
+            },
+            "a clone shares every block"
+        );
+
+        let next = clone("next.dmg");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&next)
+            .expect("open the next seed");
+        let mib = usize::try_from(MIB).expect("MiB");
+        file.write_all_at(&vec![0xa5; mib], 2 * MIB)
+            .expect("rewrite a data range");
+        file.write_all_at(&vec![0x5a; mib], 6 * MIB)
+            .expect("write into a hole");
+        punch_hole(&file, 13 * MIB, MIB).expect("punch a data range");
+        file.sync_all().expect("flush the next seed");
+        drop(file);
+        let data: u64 = data_regions(&next)
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum();
+        let shared = super::shared_bytes(&base, &next).expect("shared bytes");
+        let mut asked = Vec::new();
+        let caught = super::catch_up(&base, &next, &copy, |bytes| {
+            asked.push(bytes);
+            ControlFlow::<()>::Continue(())
+        })
+        .expect("catch up");
+        let super::CaughtUp::Complete { written, punched } = caught else {
+            panic!("nothing stops the catch-up: {caught:?}");
+        };
+        assert_eq!(written, data - shared, "only the unshared data is written");
+        assert!(
+            written >= 2 * MIB && written * 2 < data,
+            "the shared ranges are skipped: {written} of {data} bytes written"
+        );
+        assert!(punched >= MIB, "the punched range is punched: {punched}");
+        assert!(
+            asked.iter().filter(|bytes| **bytes >= written).count()
+                > usize::try_from(punched.div_ceil(8 * MIB)).expect("punches"),
+            "the last write and every punch of at most a chunk are admitted: {asked:?}"
+        );
+        assert_eq!(
+            data_regions(&copy),
+            data_regions(&next),
+            "holes as the next seed's"
+        );
+        assert!(
+            fs::read(&copy).expect("read the copy") == fs::read(&next).expect("read the next seed"),
+            "the copy holds the next seed's bytes"
+        );
+        let after = count_extents(&copy).expect("count the caught-up copy");
+        assert!(
+            after.get() <= compact.get() + 4,
+            "in place, the copy keeps its runs: {compact} extents became {after}"
         );
     }
 }

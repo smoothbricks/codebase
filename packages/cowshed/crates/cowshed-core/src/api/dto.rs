@@ -4004,22 +4004,58 @@ pub enum SeedCompactionReport {
     },
     /// The seed holds `extents`, under the bound: left as it is.
     Below { extents: u64 },
-    /// Main has no published seed, or its backend keeps no extent map.
+    /// Main has no published seed, none any more once the copy was done, or its backend keeps no
+    /// extent map.
     NoSeed,
-    /// The copy stopped once `bytes` were copied, because `why`; the seed is as it was.
+    /// The copy, or a catch-up of it, stopped once `bytes` were written, because `why`; the seed
+    /// is as it was.
     Stopped { bytes: u64, why: String },
-    /// A land or a reseed replaced `seed` while it was copied; the copy was released.
-    Superseded { seed: String },
-    /// `replacement`, a contiguous copy of `seed`, is main's seed now.
+    /// `replacement`, a contiguous copy of `seed`, is main's seed now: `bytes` were written into
+    /// it, its catch-ups' included.
     Compacted {
         seed: String,
         replacement: String,
+        /// The extents of the seed first copied: `caughtUp[0].from`, or `seed` when nothing was
+        /// caught up.
         before: u64,
+        /// The extents of `replacement`.
         after: u64,
         bytes: u64,
         #[serde(rename = "elapsedMs")]
         elapsed_ms: u64,
+        /// Each catch-up of the copy, in order, to a seed that replaced the one it held: the
+        /// first one's `from` is the seed copied, the last one's `to` is `seed`.
+        #[serde(rename = "caughtUp")]
+        caught_up: Vec<SeedCatchUp>,
+        main: MainLineage,
     },
+}
+
+/// One catch-up of a seed compaction's copy (16_build_volumes.md, "Seed compaction"): the copy
+/// held seed `from`'s bytes and holds `to`'s, which replaced it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SeedCatchUp {
+    pub from: String,
+    pub to: String,
+    /// Data bytes written where `to` does not share `from`'s blocks.
+    pub written: u64,
+    /// Bytes the copy held where `to` has a hole, punched.
+    pub punched: u64,
+    pub elapsed_ms: u64,
+}
+
+/// What a seed compaction did with main's live build volume once the compacted seed was
+/// published (16_build_volumes.md, "Seed compaction").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum MainLineage {
+    /// Main's build volume `previous` was replaced by `volume`, a clone of the compacted seed:
+    /// main writes on in contiguous space, and the seeds captured from it stay compact.
+    Moved { previous: String, volume: String },
+    /// Main's build volume was left as it is, because `why`: it holds a write the seed lacks, a
+    /// job, an Nx holder or an open file holds it, main is detached, or its seed changed first.
+    Kept { why: String },
 }
 
 impl std::fmt::Display for SeedCompactionReport {
@@ -4041,11 +4077,7 @@ impl std::fmt::Display for SeedCompactionReport {
             Self::NoSeed => formatter.write_str("there is no seed with an extent map to compact"),
             Self::Stopped { bytes, why } => write!(
                 formatter,
-                "stopped after copying {bytes} bytes: {why}; the seed is as it was"
-            ),
-            Self::Superseded { seed } => write!(
-                formatter,
-                "seed {seed} was replaced while it was copied; the copy was released"
+                "stopped after writing {bytes} bytes: {why}; the seed is as it was"
             ),
             Self::Compacted {
                 seed,
@@ -4054,10 +4086,37 @@ impl std::fmt::Display for SeedCompactionReport {
                 after,
                 bytes,
                 elapsed_ms,
-            } => write!(
-                formatter,
-                "seed {seed} ({before} extents) is replaced by {replacement} ({after} extents): {bytes} bytes copied in {elapsed_ms} ms"
-            ),
+                caught_up,
+                main,
+            } => {
+                let copied = caught_up.first().map_or(seed, |first| &first.from);
+                write!(
+                    formatter,
+                    "seed {copied} ({before} extents) is copied into {replacement} ({after} extents), which replaces seed {seed}: {bytes} bytes written in {elapsed_ms} ms"
+                )?;
+                for SeedCatchUp {
+                    from,
+                    to,
+                    written,
+                    punched,
+                    elapsed_ms,
+                } in caught_up
+                {
+                    write!(
+                        formatter,
+                        "; caught up from seed {from} to {to}: {written} bytes written and {punched} punched in {elapsed_ms} ms"
+                    )?;
+                }
+                match main {
+                    MainLineage::Moved { previous, volume } => write!(
+                        formatter,
+                        "; main's build volume {previous} is replaced by {volume}, a clone of the compacted seed"
+                    ),
+                    MainLineage::Kept { why } => {
+                        write!(formatter, "; main's build volume is kept: {why}")
+                    }
+                }
+            }
         }
     }
 }

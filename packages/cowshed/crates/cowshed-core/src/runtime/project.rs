@@ -6238,15 +6238,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// `coordinator.compactSeed` (16_build_volumes.md, "Seed compaction"). Under the project's
-    /// compaction turn, once main's seed is due: refresh main's seed as a fork of main does, so
-    /// the copy holds what main's volume holds and the next fork's reseed keeps it; clone it
-    /// aside under main's image lock; copy it with no lock held, checking at every GiB and holding
-    /// while a gate job or a land runs; and publish the copy under the lock again, unless a land or a reseed
-    /// replaced the seed meanwhile.
+    /// compaction turn, once main's seed is due: [`Self::compact_due_seed`], then whatever the run
+    /// left in `build/.compacting` (the seeds' clones, a copy it did not publish) is released in
+    /// bounded steps with no lock held, as the next run would release an interrupted one's.
     async fn compact_main_seed(&mut self) -> Result<crate::api::dto::SeedCompactionReport> {
-        use super::build_volumes::{CompactionDue, Owner, Published};
+        use super::build_volumes::{CompactionDue, Owner};
         use crate::api::dto::SeedCompactionReport;
-        use crate::storage::apfs::native::SeedCompaction;
         let started = std::time::Instant::now();
         self.validate_binding().await?;
         let volumes = self.build_volumes()?;
@@ -6272,6 +6269,43 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             CompactionDue::NoSeed => return Ok(SeedCompactionReport::NoSeed),
         }
         volumes.release_compaction_leftovers().await?;
+        let compacted = self.compact_due_seed(&volumes, owner, &turn, started).await;
+        let released = volumes.release_compaction_leftovers().await;
+        match (compacted, released) {
+            (compacted, Ok(())) => compacted,
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(mut primary), Err(cleanup)) => {
+                primary.message = format!(
+                    "{}; releasing what it left in build/.compacting failed too: {}",
+                    primary.message, cleanup.message
+                );
+                Err(primary)
+            }
+        }
+    }
+
+    /// Main's due seed, compacted (16_build_volumes.md, "Seed compaction"). Under main's image
+    /// lock, main's seed is refreshed as a fork of main refreshes it and cloned aside; the clone is
+    /// copied with no lock held, holding while a gate job or a land runs. Under the lock again the
+    /// seed is refreshed once more, and the copy is published when the seed it holds is still
+    /// main's latest. When a land, a fork's reseed or that refresh replaced it, the latest is
+    /// cloned aside and the copy caught up to it with no lock held, writing only what it changed,
+    /// at most [`SEED_COMPACTION_CATCH_UPS`] times. The copy of the first seed is finished rather
+    /// than switched to the newer one: it reads one immutable clone in one pass and takes no lock,
+    /// a switch would still need the catch-up over the part already copied, and finishing writes
+    /// at most the newer seed's changes to the remaining part twice. A publication records the
+    /// success and moves main's live volume onto the compacted seed ([`Self::move_main_onto`]).
+    async fn compact_due_seed(
+        &self,
+        volumes: &super::build_volumes::BuildVolumes<H>,
+        owner: super::build_volumes::Owner,
+        turn: &super::build_volumes::CompactionTurn,
+        started: std::time::Instant,
+    ) -> Result<crate::api::dto::SeedCompactionReport> {
+        use super::build_volumes::{Published, SEED_COMPACTION_CATCH_UPS};
+        use crate::api::dto::{SeedCatchUp, SeedCompactionReport};
+        use crate::storage::apfs::native::{SeedCatchUp as CatchUp, SeedCompaction};
+        let main = owner.name.clone();
         let main_mount = self.workspace_mount_path(&main)?;
         let lock = self
             .layout
@@ -6283,30 +6317,19 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             crate::api::held_lock::LockOperation::Defragment,
             &main,
         );
-        let aim = self.seed_aim(&main, &main_mount, None).await?;
-        let locked = match volumes
-            .try_lock_target(owner.clone(), lock.clone(), holding.clone())
-            .await?
-        {
-            Ok(locked) => locked,
-            Err(contended) => contended.wait().await?,
-        };
-        let mut refreshed = volumes
-            .refresh_seed(owner.clone(), main_mount, aim, holding.clone())
+        let (locked, superseded) = self
+            .lock_refreshed(volumes, &owner, &main_mount, &lock, &holding)
             .await?;
-        super::build_volumes::say_refresh(&main, &main, &refreshed);
-        let superseded = refreshed.superseded.take();
         let staged = volumes.stage_compaction(&locked).await;
         drop(locked);
-        // The seeds the refresh replaced are claimed under the lock and retired once it is let go.
         if let Some(superseded) = superseded {
             volumes.retire_superseded(superseded).await;
         }
         let Some(source) = staged? else {
             return Ok(SeedCompactionReport::NoSeed);
         };
-        let compacted = match self
-            .copy_between_gates(&volumes, owner.clone(), source)
+        let mut compacted = match self
+            .between_gates(|admit| volumes.copy_compaction(source, admit))
             .await?
         {
             SeedCompaction::Stopped { bytes, why } => {
@@ -6314,63 +6337,218 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
             SeedCompaction::Copied(compacted) => compacted,
         };
-        let (before, after, bytes) = (
-            compacted.before.get(),
-            compacted.after.get(),
-            compacted.bytes,
-        );
-        let locked = match volumes.try_lock_target(owner, lock, holding).await? {
+        let mut caught_up = Vec::new();
+        loop {
+            let (before, after, bytes) = (
+                compacted.before.get(),
+                compacted.after.get(),
+                compacted.bytes,
+            );
+            let (locked, refreshed) = self
+                .lock_refreshed(volumes, &owner, &main_mount, &lock, &holding)
+                .await?;
+            let published = volumes.publish_compaction(&locked, compacted).await;
+            drop(locked);
+            if let Some(superseded) = refreshed {
+                volumes.retire_superseded(superseded).await;
+            }
+            let (behind, next) = match published? {
+                Published::Replaced {
+                    seed,
+                    replacement,
+                    superseded,
+                } => {
+                    volumes.retire_superseded(superseded).await;
+                    turn.succeeded()?;
+                    let lineage = self.move_main_onto(volumes, &replacement).await?;
+                    return Ok(SeedCompactionReport::Compacted {
+                        seed: seed.to_string(),
+                        replacement: replacement.to_string(),
+                        before,
+                        after,
+                        bytes,
+                        elapsed_ms: u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        caught_up,
+                        main: lineage,
+                    });
+                }
+                Published::Seedless => return Ok(SeedCompactionReport::NoSeed),
+                Published::Behind { compacted, next } => (compacted, next),
+            };
+            if caught_up.len() == SEED_COMPACTION_CATCH_UPS {
+                return Ok(SeedCompactionReport::Stopped {
+                    bytes,
+                    why: format!(
+                        "main's seed was replaced {SEED_COMPACTION_CATCH_UPS} times while the copy was caught up to it, and is {} now",
+                        next.seed()
+                    ),
+                });
+            }
+            let round = std::time::Instant::now();
+            let (from, to) = (behind.seed().to_string(), next.seed().to_string());
+            compacted = match self
+                .between_gates(|admit| volumes.catch_up_compaction(behind, next, admit))
+                .await?
+            {
+                CatchUp::Stopped { bytes, why } => {
+                    return Ok(SeedCompactionReport::Stopped { bytes, why });
+                }
+                CatchUp::Caught {
+                    compacted,
+                    written,
+                    punched,
+                } => {
+                    let elapsed_ms = u64::try_from(round.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    cowshed_os::eprintln!(
+                        "cowshed: seed compaction: caught up from seed {from} to {to}: {written} bytes written and {punched} punched in {elapsed_ms} ms"
+                    );
+                    caught_up.push(SeedCatchUp {
+                        from,
+                        to,
+                        written,
+                        punched,
+                        elapsed_ms,
+                    });
+                    compacted
+                }
+            };
+        }
+    }
+
+    /// Main's image lock for a seed compaction, waited for, with main's seed refreshed under it
+    /// exactly as a fork of main refreshes it (Fork step 2): the seed then holds what main's live
+    /// volume holds, so the next fork's reseed keeps a seed compacted from it, and main's volume
+    /// holds no write that seed lacks when it is published. Beside the lock, the seeds the refresh
+    /// replaced, claimed: the caller retires them once it lets the lock go.
+    async fn lock_refreshed(
+        &self,
+        volumes: &super::build_volumes::BuildVolumes<H>,
+        owner: &super::build_volumes::Owner,
+        main_mount: &Path,
+        lock: &Path,
+        holding: &crate::api::held_lock::LockHolding,
+    ) -> Result<(
+        super::build_volumes::TargetLock<H>,
+        Option<super::build_volumes::SupersededSeeds>,
+    )> {
+        let aim = self.seed_aim(&owner.name, main_mount, None).await?;
+        let locked = match volumes
+            .try_lock_target(owner.clone(), lock.to_owned(), holding.clone())
+            .await?
+        {
             Ok(locked) => locked,
             Err(contended) => contended.wait().await?,
         };
-        let published = volumes.publish_compaction(&locked, compacted).await?;
-        drop(locked);
-        Ok(match published {
-            Published::Superseded { seed } => SeedCompactionReport::Superseded {
-                seed: seed.to_string(),
-            },
-            Published::Replaced {
-                seed,
-                replacement,
-                superseded,
-            } => {
-                volumes.retire_superseded(superseded).await;
-                turn.succeeded()?;
-                SeedCompactionReport::Compacted {
-                    seed: seed.to_string(),
-                    replacement: replacement.to_string(),
-                    before,
-                    after,
-                    bytes,
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                }
+        let mut refreshed = volumes
+            .refresh_seed(owner.clone(), main_mount.to_owned(), aim, holding.clone())
+            .await?;
+        super::build_volumes::say_refresh(&owner.name, &owner.name, &refreshed);
+        Ok((locked, refreshed.superseded.take()))
+    }
+
+    /// Seed compaction's lineage (16_build_volumes.md, "Seed compaction"): move main's live build
+    /// volume onto a clone of `seed`, the compacted seed just published, through the workspace
+    /// reseed of main from main ("Workspace reseed"), with no lock held by the compaction (the
+    /// reseed takes main's image lock itself, and both of its participants are main, so it takes
+    /// it once). The reseed refuses when the volume holds a write the seed lacks. Held, behind,
+    /// detached, with another seed latest by then, or failing, main's volume is kept and the
+    /// answer says why: nothing is stopped but its own Nx daemon, which every capture of it
+    /// stops too.
+    async fn move_main_onto(
+        &self,
+        volumes: &super::build_volumes::BuildVolumes<H>,
+        seed: &crate::build_volume::BuildVolumeId,
+    ) -> Result<crate::api::dto::MainLineage> {
+        use crate::api::dto::MainLineage;
+        let main = main_name();
+        let current = self.current(&main).await?;
+        if !matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            return Ok(MainLineage::Kept {
+                why: format!("{main} is detached, so its build link cannot be read"),
+            });
+        }
+        let workspace =
+            self.reseed_participant(main, current.derived.workspace.incarnation().clone())?;
+        let moved = match volumes.preview_reseed(workspace.clone(), workspace).await {
+            Ok(plan) if plan.seed() == seed => volumes.move_onto_seed(plan).await,
+            Ok(plan) => {
+                return Ok(MainLineage::Kept {
+                    why: format!(
+                        "main's seed is {} by now, not the compacted {seed}",
+                        plan.seed()
+                    ),
+                });
             }
+            Err(error) => Err(error),
+        };
+        match moved {
+            Ok(moved) => moved
+                .replacement_volume
+                .map(|volume| MainLineage::Moved {
+                    previous: moved.previous_volume,
+                    volume,
+                })
+                .ok_or_else(|| {
+                    CowshedError::internal("a reseed that ran answered no replacement volume")
+                }),
+            // The seed is compacted and published whatever happens here: a move that cannot be
+            // made is said in the report, never a failed compaction that would hold back lands.
+            Err(error) => Ok(MainLineage::Kept {
+                why: format!("{} ({})", error.message, error.hint),
+            }),
+        }
+    }
+
+    /// A workspace as the workspace reseed names it (16_build_volumes.md, "Workspace reseed").
+    fn reseed_participant(
+        &self,
+        name: WorkspaceName,
+        incarnation: WorkspaceIncarnation,
+    ) -> Result<super::build_volumes::ReseedWorkspace> {
+        use crate::storage::recovery::INTENT_LEASE_SUFFIX;
+        Ok(super::build_volumes::ReseedWorkspace {
+            checkout: self.workspace_mount_path(&name)?,
+            image: self
+                .layout
+                .canonical_image(&name)
+                .map_err(native_integrity_error)?,
+            intent_lease: self
+                .layout
+                .project()
+                .sessions
+                .join(format!("{name}{INTENT_LEASE_SUFFIX}")),
+            owner: super::build_volumes::Owner { name, incarnation },
         })
     }
 
-    /// The compaction's copy, whose every check asks this controller, on its own task, whether to
-    /// go on: an answer, not a timer, so the copy is asked exactly as often as it checks. While a
-    /// gate job or a land runs, the controller says why once in the compaction's log, holds
-    /// [`SEED_COMPACTION_WAIT`] and answers `Wait`; the copy checks its seed and asks again.
-    async fn copy_between_gates(
+    /// A compaction's copy or catch-up, `work`, whose every check asks this controller, on its own
+    /// task, whether to go on: an answer, not a timer, so the work is asked exactly as often as it
+    /// checks. While a gate job or a land runs, the controller says why once in the compaction's
+    /// log, holds [`SEED_COMPACTION_WAIT`] and answers `Wait`; the work asks again.
+    async fn between_gates<T, Work>(
         &self,
-        volumes: &super::build_volumes::BuildVolumes<H>,
-        owner: super::build_volumes::Owner,
-        source: crate::storage::apfs::native::CompactionSource,
-    ) -> Result<crate::storage::apfs::native::SeedCompaction> {
+        work: impl FnOnce(Box<dyn FnMut() -> super::build_volumes::Admission + Send>) -> Work,
+    ) -> Result<T>
+    where
+        Work: std::future::Future<Output = Result<T>>,
+    {
         use super::build_volumes::{Admission, SEED_COMPACTION_WAIT};
         type Answer = tokio::sync::oneshot::Sender<Admission>;
         let (asks, mut asked) = tokio::sync::mpsc::channel::<Answer>(1);
         let unanswered =
             || Admission::Stop("nothing answers whether a gate job or a land runs".to_owned());
-        let admit = Box::new(move || {
+        let admit: Box<dyn FnMut() -> Admission + Send> = Box::new(move || {
             let (reply, answer) = tokio::sync::oneshot::channel();
             if asks.blocking_send(reply).is_err() {
                 return unanswered();
             }
             answer.blocking_recv().unwrap_or_else(|_| unanswered())
         });
-        let copying = volumes.copy_compaction(owner, source, admit);
+        let copying = work(admit);
         tokio::pin!(copying);
         let mut waiting: Option<(std::time::Instant, String)> = None;
         loop {
@@ -14739,9 +14917,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         from: WorkspaceName,
         dry_run: bool,
     ) -> Result<crate::api::dto::ReseedResult> {
-        use super::build_volumes::{Owner, ReseedWorkspace};
-        use crate::storage::recovery::INTENT_LEASE_SUFFIX;
-
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         if !matches!(
@@ -14754,26 +14929,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             ));
         }
         let target = self.current(&from).await?;
-        let participant = |name: WorkspaceName, incarnation| -> Result<ReseedWorkspace> {
-            Ok(ReseedWorkspace {
-                checkout: self.workspace_mount_path(&name)?,
-                image: self
-                    .layout
-                    .canonical_image(&name)
-                    .map_err(native_integrity_error)?,
-                intent_lease: self
-                    .layout
-                    .project()
-                    .sessions
-                    .join(format!("{name}{INTENT_LEASE_SUFFIX}")),
-                owner: Owner { name, incarnation },
-            })
-        };
         let volumes = self.build_volumes()?;
         let plan = volumes
             .preview_reseed(
-                participant(workspace, current.derived.workspace.incarnation().clone())?,
-                participant(from, target.derived.workspace.incarnation().clone())?,
+                self.reseed_participant(
+                    workspace,
+                    current.derived.workspace.incarnation().clone(),
+                )?,
+                self.reseed_participant(from, target.derived.workspace.incarnation().clone())?,
             )
             .await?;
         if dry_run {

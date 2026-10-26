@@ -290,7 +290,7 @@ where
         layout: &BuildVolumeLayout,
         compacted: CompactedSeed,
         destination: &BuildVolumeId,
-        registration: &Registration,
+        registration: Registration,
     ) -> Result<(), ApfsStorageError> {
         MacOsApfsExecutionHost::publish_seed_compaction(
             self,
@@ -301,7 +301,12 @@ where
         )
     }
 
-    fn discard_seed_compaction(&self, compacted: CompactedSeed) -> Result<(), ApfsStorageError> {
-        MacOsApfsExecutionHost::discard_seed_compaction(self, compacted)
+    fn catch_up_seed_compaction(
+        &self,
+        compacted: CompactedSeed,
+        next: CompactionSource,
+        keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
+    ) -> Result<SeedCatchUp, ApfsStorageError> {
+        MacOsApfsExecutionHost::catch_up_seed_compaction(self, compacted, next, keep_going)
     }
 }

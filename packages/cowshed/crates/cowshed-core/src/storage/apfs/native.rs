@@ -64,8 +64,8 @@ mod image_telemetry;
 #[cfg(target_os = "macos")]
 mod re_adopt;
 pub use build_volumes::{
-    Claim as BuildVolumeClaim, CompactedSeed, Compaction as SeedCompaction, CompactionSource,
-    Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease,
+    CatchUp as SeedCatchUp, Claim as BuildVolumeClaim, CompactedSeed, Compaction as SeedCompaction,
+    CompactionSource, Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease,
 };
 use cowshed_apfs::mounts::{KernelMountSnapshot, kernel_mounts};
 use cowshed_apfs::store_lock::{ImageLockGuard, acquire_image_locks};

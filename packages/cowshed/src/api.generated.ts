@@ -2435,6 +2435,19 @@ export type LogsRequest = {
   readonly offset: number & tags.Type<'uint64'>;
 };
 
+/**
+ * What a seed compaction did with main's live build volume once the compacted seed was
+ * published (16_build_volumes.md, "Seed compaction").
+ */
+export type MainLineage =
+  | ({ readonly kind: 'moved' } & {
+      readonly previous: string;
+      readonly volume: string;
+    })
+  | ({ readonly kind: 'kept' } & {
+      readonly why: string;
+    });
+
 export type MirrorInfo = {
   readonly url: string;
   readonly mirror: string;
@@ -3268,6 +3281,24 @@ export type SealedJobRef = {
 };
 
 /**
+ * One catch-up of a seed compaction's copy (16_build_volumes.md, "Seed compaction"): the copy
+ * held seed `from`'s bytes and holds `to`'s, which replaced it.
+ */
+export type SeedCatchUp = {
+  readonly from: string;
+  readonly to: string;
+  /**
+   * Data bytes written where `to` does not share `from`'s blocks.
+   */
+  readonly written: number & tags.Type<'uint64'>;
+  /**
+   * Bytes the copy held where `to` has a hole, punched.
+   */
+  readonly punched: number & tags.Type<'uint64'>;
+  readonly elapsedMs: number & tags.Type<'uint64'>;
+};
+
+/**
  * What one seed compaction did (16_build_volumes.md, "Seed compaction"): the result of the
  * internal `coordinator.compactSeed`, which the process a land starts runs.
  */
@@ -3284,16 +3315,26 @@ export type SeedCompactionReport =
       readonly bytes: number & tags.Type<'uint64'>;
       readonly why: string;
     })
-  | ({ readonly kind: 'superseded' } & {
-      readonly seed: string;
-    })
   | ({ readonly kind: 'compacted' } & {
       readonly seed: string;
       readonly replacement: string;
+      /**
+       * The extents of the seed first copied: `caughtUp[0].from`, or `seed` when nothing was
+       * caught up.
+       */
       readonly before: number & tags.Type<'uint64'>;
+      /**
+       * The extents of `replacement`.
+       */
       readonly after: number & tags.Type<'uint64'>;
       readonly bytes: number & tags.Type<'uint64'>;
       readonly elapsedMs: number & tags.Type<'uint64'>;
+      /**
+       * Each catch-up of the copy, in order, to a seed that replaced the one it held: the
+       * first one's `from` is the seed copied, the last one's `to` is `seed`.
+       */
+      readonly caughtUp: ReadonlyArray<SeedCatchUp>;
+      readonly main: MainLineage;
     });
 
 export type SessionRequest = {

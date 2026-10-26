@@ -2,8 +2,9 @@
 //! past [`SEED_COMPACTION_EXTENTS`] and no compaction has succeeded within
 //! [`SEED_COMPACTION_INTERVAL`], the land starts a background process
 //! ([`SEED_COMPACTION_VERB`]) that copies the seed into contiguous space and publishes the copy
-//! in its place. Only the refresh, the clone and the publication take the target's image lock; the copy holds
-//! nothing a fork or a land waits on, and it waits while a gate job or a land runs and stops when the seed is replaced. A
+//! in its place. Only the refreshes, the clones and the publication take the target's image lock;
+//! the copy holds nothing a fork or a land waits on, and it waits while a gate job or a land runs.
+//! A seed that replaces the copied one meanwhile is caught up to, writing only what it changed. A
 //! compaction that fails is recorded, and no land of the build that failed starts another until
 //! one succeeds.
 use std::fs::{self, File, OpenOptions};
@@ -22,7 +23,7 @@ use crate::build_volume::{
     BuildVolumeId, BuildVolumeRecord, BuildVolumeRole, Registrant, Registration,
 };
 use crate::runtime::supervisor_socket::BuildId;
-use crate::storage::apfs::native::{CompactedSeed, CompactionSource, SeedCompaction};
+use crate::storage::apfs::native::{CompactedSeed, CompactionSource, SeedCatchUp, SeedCompaction};
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Fenced;
 
@@ -44,6 +45,13 @@ pub(crate) const SEED_COMPACTION_INTERVAL: Duration = Duration::from_secs(24 * 6
 
 /// How many bytes a compaction copies between asking whether to go on.
 const CHECK_EVERY_BYTES: u64 = 1 << 30;
+
+/// How many times a compaction's copy is caught up to a seed that replaced the one it holds
+/// before the compaction gives up. A catch-up writes only what main's seed changed since the last
+/// one, so each takes the time of one land's or one refresh's delta, not of the whole seed; a
+/// seed replaced this often while such deltas are written is replaced faster than the copy can
+/// follow, and the next land's compaction starts again.
+pub(crate) const SEED_COMPACTION_CATCH_UPS: usize = 8;
 
 /// How long a compaction's copy holds before it checks again while a gate job or a land runs.
 pub(crate) const SEED_COMPACTION_WAIT: Duration = Duration::from_secs(15);
@@ -226,7 +234,7 @@ pub(crate) struct CompactionTurn {
 
 impl CompactionTurn {
     /// Record a success: the interval starts now, and no land holds back for an earlier failure.
-    pub fn succeeded(self) -> Result<()> {
+    pub fn succeeded(&self) -> Result<()> {
         let succeeded = self.directory.join(SUCCEEDED);
         OpenOptions::new()
             .create(true)
@@ -248,18 +256,47 @@ impl CompactionTurn {
     }
 }
 
+/// The copy's and a catch-up's `keep_going`: from the first chunk on, every
+/// [`CHECK_EVERY_BYTES`] written, what `admit` answers; while it answers [`Admission::Wait`]
+/// the writer holds where it is and asks again.
+fn between_checks(
+    mut admit: Box<dyn FnMut() -> Admission + Send>,
+) -> impl FnMut(u64) -> ControlFlow<String> {
+    let mut next = 0_u64;
+    move |bytes| {
+        if bytes < next {
+            return ControlFlow::Continue(());
+        }
+        next = bytes + CHECK_EVERY_BYTES;
+        loop {
+            match admit() {
+                Admission::Copy => return ControlFlow::Continue(()),
+                Admission::Wait => {}
+                Admission::Stop(why) => return ControlFlow::Break(why),
+            }
+        }
+    }
+}
+
 /// What publishing a compacted copy did.
 #[derive(Debug)]
 pub(crate) enum Published {
-    /// `replacement` is the target's seed now, and `seed` and every older seed are claimed in
-    /// `superseded`, for [`BuildVolumes::retire_superseded`] once the target's image lock is let go.
+    /// `replacement` is the target's seed now, holding `seed`'s bytes, and `seed` and every older
+    /// seed are claimed in `superseded`, for [`BuildVolumes::retire_superseded`] once the target's
+    /// image lock is let go.
     Replaced {
         seed: BuildVolumeId,
         replacement: BuildVolumeId,
         superseded: SupersededSeeds,
     },
-    /// `seed` was no longer the target's latest; the copy was released.
-    Superseded { seed: BuildVolumeId },
+    /// `compacted`'s seed is no longer the target's latest: `next`, a clone of the latest, was
+    /// staged under the lock for the copy's catch-up.
+    Behind {
+        compacted: CompactedSeed,
+        next: CompactionSource,
+    },
+    /// The target has no seed any more.
+    Seedless,
 }
 
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
@@ -374,9 +411,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
-    /// Release what an interrupted compaction left in `build/.compacting`, under the project's
-    /// compaction turn and before the target's image lock is taken: the free takes minutes, and
-    /// no fork or land waits on it.
+    /// Release what a compaction left in `build/.compacting`, under the project's compaction turn
+    /// and with no image lock held: an interrupted run's, before the target's image lock is first
+    /// taken, and this run's, before it answers. The free takes minutes, and no fork or land waits
+    /// on it.
     pub async fn release_compaction_leftovers(&self) -> Result<()> {
         self.blocking(move |host, layout| {
             host.release_seed_compaction_leftovers(layout)
@@ -402,54 +440,32 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
-    /// Copy `source` contiguously with no lock held, asking every [`CHECK_EVERY_BYTES`], from
-    /// the first chunk on, whether `target`'s latest seed is still the one copied and what
-    /// `admit` answers; while it answers [`Admission::Wait`] the copy holds where it is and asks
-    /// both again.
+    /// Copy `source` contiguously with no lock held, asking every [`CHECK_EVERY_BYTES`], from the
+    /// first chunk on, what `admit` answers ([`between_checks`]). A seed that replaces `source`'s
+    /// meanwhile does not stop it: publication finds it and the copy is caught up to it.
     pub async fn copy_compaction(
         &self,
-        target: Owner,
         source: CompactionSource,
-        mut admit: Box<dyn FnMut() -> Admission + Send>,
+        admit: Box<dyn FnMut() -> Admission + Send>,
     ) -> Result<SeedCompaction> {
-        self.blocking(move |host, layout| {
-            let seed = source.seed().clone();
-            let mut next = 0_u64;
-            let mut keep_going = |bytes: u64| {
-                if bytes < next {
-                    return ControlFlow::Continue(());
-                }
-                next = bytes + CHECK_EVERY_BYTES;
-                loop {
-                    match layout.seed_of(&target.name, &target.incarnation) {
-                        Ok(Some((latest, _))) if latest == seed => {}
-                        Ok(Some((latest, _))) => {
-                            return ControlFlow::Break(format!(
-                                "{} took seed {latest} in place of {seed}",
-                                target.name
-                            ));
-                        }
-                        Ok(None) => {
-                            return ControlFlow::Break(format!(
-                                "{} has no seed any more",
-                                target.name
-                            ));
-                        }
-                        Err(error) => {
-                            return ControlFlow::Break(format!(
-                                "{}'s seed cannot be read: {}",
-                                target.name, error.message
-                            ));
-                        }
-                    }
-                    match admit() {
-                        Admission::Copy => return ControlFlow::Continue(()),
-                        Admission::Wait => {}
-                        Admission::Stop(why) => return ControlFlow::Break(why),
-                    }
-                }
-            };
-            host.copy_seed_compaction(source, &mut keep_going)
+        self.blocking(move |host, _| {
+            host.copy_seed_compaction(source, &mut between_checks(admit))
+                .map_err(storage)
+        })
+        .await
+    }
+
+    /// Catch `compacted` up to `next`, staged by [`Self::publish_compaction`], with no lock held:
+    /// only what `next` does not share with the seed the copy holds is written, asking `admit`
+    /// as the copy does.
+    pub async fn catch_up_compaction(
+        &self,
+        compacted: CompactedSeed,
+        next: CompactionSource,
+        admit: Box<dyn FnMut() -> Admission + Send>,
+    ) -> Result<SeedCatchUp> {
+        self.blocking(move |host, _| {
+            host.catch_up_seed_compaction(compacted, next, &mut between_checks(admit))
                 .map_err(storage)
         })
         .await
@@ -457,8 +473,9 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 
     /// Under `locked`: when `compacted`'s seed is still the target's latest, the copy becomes
     /// its seed at the same tree and every older seed is claimed for its retirement once the lock
-    /// is let go, as a fork's seed refresh claims the seeds it replaces; otherwise the copy is
-    /// released.
+    /// is let go, as a fork's seed refresh claims the seeds it replaces. When another seed is the
+    /// latest, it is cloned aside for the copy's catch-up. Nothing in `build/.compacting` is
+    /// released here: the caller releases it with no lock held.
     pub async fn publish_compaction(
         &self,
         locked: &TargetLock<H>,
@@ -466,14 +483,13 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     ) -> Result<Published> {
         let target = locked.target.clone();
         self.blocking(move |host, layout| {
-            let seed = compacted.seed().clone();
-            let Some((_, record)) = layout
-                .seed_of(&target.name, &target.incarnation)?
-                .filter(|(latest, _)| *latest == seed)
-            else {
-                host.discard_seed_compaction(compacted).map_err(storage)?;
-                return Ok(Published::Superseded { seed });
+            let Some((seed, record)) = layout.seed_of(&target.name, &target.incarnation)? else {
+                return Ok(Published::Seedless);
             };
+            if seed != *compacted.seed() {
+                let next = host.stage_seed_compaction(layout, &seed).map_err(storage)?;
+                return Ok(Published::Behind { compacted, next });
+            }
             let previous = seeds_of(layout, &target)?;
             let replacement = BuildVolumeId::mint();
             let registration = Registration::new(
@@ -488,7 +504,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     incarnation: target.incarnation.clone(),
                 },
             );
-            host.publish_seed_compaction(layout, compacted, &replacement, &registration)
+            host.publish_seed_compaction(layout, compacted, &replacement, registration)
                 .map_err(storage)?;
             let superseded = claim_superseded(host, layout, &target, previous)?;
             Ok(Published::Replaced {

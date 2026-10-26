@@ -295,15 +295,17 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _layout: &BuildVolumeLayout,
         _compacted: crate::storage::apfs::native::CompactedSeed,
         _destination: &BuildVolumeId,
-        _registration: &crate::build_volume::Registration,
+        _registration: crate::build_volume::Registration,
     ) -> Result<(), ApfsStorageError> {
         Err(unsupported("compacting a seed"))
     }
 
-    fn discard_seed_compaction(
+    fn catch_up_seed_compaction(
         &self,
         _compacted: crate::storage::apfs::native::CompactedSeed,
-    ) -> Result<(), ApfsStorageError> {
+        _next: crate::storage::apfs::native::CompactionSource,
+        _keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
+    ) -> Result<crate::storage::apfs::native::SeedCatchUp, ApfsStorageError> {
         Err(unsupported("compacting a seed"))
     }
 }

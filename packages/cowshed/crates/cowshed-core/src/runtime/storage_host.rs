@@ -14,7 +14,7 @@ use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::repository::RepoId;
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, CompactedSeed, CompactionSource,
-    SeedCompaction,
+    SeedCatchUp, SeedCompaction,
 };
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, Labelled};
 use crate::storage::lifecycle::DerivedWorkspace;
@@ -229,7 +229,12 @@ pub(crate) trait RuntimeStorageHost:
         layout: &BuildVolumeLayout,
         compacted: CompactedSeed,
         destination: &BuildVolumeId,
-        registration: &Registration,
+        registration: Registration,
     ) -> Result<(), ApfsStorageError>;
-    fn discard_seed_compaction(&self, compacted: CompactedSeed) -> Result<(), ApfsStorageError>;
+    fn catch_up_seed_compaction(
+        &self,
+        compacted: CompactedSeed,
+        next: CompactionSource,
+        keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
+    ) -> Result<SeedCatchUp, ApfsStorageError>;
 }

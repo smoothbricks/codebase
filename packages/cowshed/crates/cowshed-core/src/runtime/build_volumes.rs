@@ -48,7 +48,8 @@ mod nx_clear;
 mod reseed;
 pub use compaction::SEED_COMPACTION_VERB;
 pub(crate) use compaction::{
-    Admission, CompactionDue, Published, SEED_COMPACTION_WAIT, seconds_since, start_compaction,
+    Admission, CompactionDue, CompactionTurn, Published, SEED_COMPACTION_CATCH_UPS,
+    SEED_COMPACTION_WAIT, seconds_since, start_compaction,
 };
 pub(crate) use reseed::ReseedWorkspace;
 
@@ -8351,13 +8352,17 @@ fn main() {
     }
 
     /// Seed compaction (16_build_volumes.md, "Seed compaction") over a real fragmented seed: a
-    /// stop removes the copy and leaves the seed; a held copy asks again until it may go on; a copy publishes as main's latest seed with far
-    /// fewer extents, the same bytes and holes and the copied seed's freshness mark, and the old
-    /// seed goes to the build journal; a copy whose seed a land replaced meanwhile is released.
+    /// stop removes the copy and leaves the seed; a held copy asks again until it may go on; a
+    /// copy publishes as main's latest seed with far fewer extents, the same bytes and holes and
+    /// the copied seed's freshness mark, and the old seed goes to the build journal. A seed a land
+    /// publishes between the copy and its publication, or during the copy, is caught up to:
+    /// only what it changed is written, and the copy is published in its place with its mark.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_a_fragmented_seed_is_compacted_and_a_replaced_one_is_not() {
-        use crate::storage::apfs::native::SeedCompaction;
+    async fn real_apfs_seed_compaction_publishes_a_fragmented_seed_and_catches_a_replaced_one_up() {
+        use crate::storage::apfs::native::{SeedCatchUp, SeedCompaction};
+        use cowshed_os::fork_lock::Run as _;
+        const MIB: u64 = 1024 * 1024;
         let scratch = Scratch::new("seed-compaction");
         let target = owner("main", '0');
         let seed_registration = |tree: char| {
@@ -8391,10 +8396,13 @@ fn main() {
             .unwrap();
         let compacting = scratch.layout.compacting();
         let left = || {
-            ["source.dmg", "copy.dmg"]
-                .into_iter()
-                .filter(|name| compacting.join(name).exists())
-                .collect::<Vec<_>>()
+            let mut left = fs::read_dir(&compacting)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.ends_with(".dmg"))
+                .collect::<Vec<_>>();
+            left.sort();
+            left
         };
         let stage = || async {
             let locked = scratch.lock(&target).await;
@@ -8409,7 +8417,6 @@ fn main() {
         let stopped = scratch
             .volumes
             .copy_compaction(
-                target.clone(),
                 stage().await,
                 Box::new(|| super::Admission::Stop("gate jobs run: job 7 in /w".to_owned())),
             )
@@ -8421,9 +8428,15 @@ fn main() {
         );
         assert_eq!(
             left(),
-            Vec::<&str>::new(),
-            "a stopped compaction leaves nothing"
+            [format!("{seed}.dmg")],
+            "a stop removes the copy; the seed's clone stays for the caller to release"
         );
+        scratch
+            .volumes
+            .release_compaction_leftovers()
+            .await
+            .unwrap();
+        assert_eq!(left(), Vec::<String>::new());
         assert_eq!(
             scratch
                 .layout
@@ -8439,7 +8452,6 @@ fn main() {
         let SeedCompaction::Copied(compacted) = scratch
             .volumes
             .copy_compaction(
-                target.clone(),
                 stage().await,
                 Box::new(move || {
                     // Held twice, as while a gate job or a land runs, then let go on.
@@ -8489,6 +8501,16 @@ fn main() {
             .unwrap();
         assert_eq!(latest, replacement);
         assert!(record.is_published());
+        assert_eq!(
+            record.extents,
+            Some(
+                crate::storage::apfs::extents::prove_forkable(&scratch.layout.image(&replacement))
+                    .unwrap()
+                    .extents()
+                    .get()
+            ),
+            "the compacted seed's record keeps its extent count, for its release"
+        );
         assert_eq!(record.tree, Some(GitOid::new("a".repeat(40)).unwrap()));
         let image = scratch.layout.image(&replacement);
         assert!(
@@ -8511,10 +8533,20 @@ fn main() {
             "the old seed is retired"
         );
         assert!(scratch.layout.read_record_present(&seed).unwrap().is_none());
-        assert_eq!(left(), Vec::<&str>::new());
+        assert_eq!(
+            left(),
+            [format!("{seed}.dmg")],
+            "the copied seed's clone stays for the caller to release"
+        );
+        scratch
+            .volumes
+            .release_compaction_leftovers()
+            .await
+            .unwrap();
+        assert_eq!(left(), Vec::<String>::new());
 
-        // A land publishes main's next seed: `tree` names it, `bytes` fill it.
-        let land = |tree: char| {
+        // A land publishes main's next seed: `tree` names it, `fill` makes its image.
+        let land = |tree: char, fill: &dyn Fn(&Path)| {
             let landed = BuildVolumeId::mint();
             // Records name whole seconds, so a land in the same second as the compaction's
             // publication would tie it: date the land's seed after it.
@@ -8531,61 +8563,239 @@ fn main() {
                 },
             );
             let creating = scratch.layout.register(&landed, &registration).unwrap();
-            fs::write(scratch.layout.image(&landed), vec![7_u8; 4096]).unwrap();
+            fill(&scratch.layout.image(&landed));
             scratch.layout.publish(&landed, &registration).unwrap();
             drop(creating);
-            landed
+            let image = scratch.layout.image(&landed);
+            let written = fs::metadata(&image).unwrap().modified().unwrap();
+            (landed, fs::read(&image).unwrap(), written)
+        };
+        // Publication finds `landed` main's latest, the copy is caught up to it, writing
+        // `written` bytes, and published in its place with its bytes and freshness mark.
+        let catch_up = |compacted: crate::storage::apfs::native::CompactedSeed,
+                        landed: BuildVolumeId,
+                        bytes: Vec<u8>,
+                        mark: std::time::SystemTime,
+                        written: u64| {
+            let (scratch, target, left) = (&scratch, &target, &left);
+            async move {
+                let locked = scratch.lock(target).await;
+                let Published::Behind { compacted, next } = scratch
+                    .volumes
+                    .publish_compaction(&locked, compacted)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("a land replaced the copied seed");
+                };
+                drop(locked);
+                assert_eq!(next.seed(), &landed);
+                let SeedCatchUp::Caught {
+                    compacted,
+                    written: caught,
+                    ..
+                } = scratch
+                    .volumes
+                    .catch_up_compaction(compacted, next, Box::new(|| super::Admission::Copy))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("nothing stops the catch-up");
+                };
+                assert_eq!(caught, written, "only what the land changed is written");
+                let locked = scratch.lock(target).await;
+                let Published::Replaced {
+                    seed: replaced,
+                    replacement,
+                    superseded,
+                } = scratch
+                    .volumes
+                    .publish_compaction(&locked, compacted)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("the land's seed is still main's latest");
+                };
+                drop(locked);
+                scratch.volumes.retire_superseded(superseded).await;
+                assert_eq!(replaced, landed);
+                let image = scratch.layout.image(&replacement);
+                assert!(
+                    fs::read(&image).unwrap() == bytes,
+                    "the copy holds the land's bytes"
+                );
+                assert_eq!(
+                    fs::metadata(&image).unwrap().modified().unwrap(),
+                    mark,
+                    "the land's seed's freshness mark"
+                );
+                assert!(
+                    !scratch.layout.image(&landed).exists(),
+                    "the land's seed is retired"
+                );
+                scratch
+                    .volumes
+                    .release_compaction_leftovers()
+                    .await
+                    .unwrap();
+                assert_eq!(left(), Vec::<String>::new());
+                replacement
+            }
         };
 
-        // Between the copy and its publication: the copy is released, not published.
+        // Between the copy and its publication: a land whose seed shares all but one MiB.
         let SeedCompaction::Copied(compacted) = scratch
             .volumes
-            .copy_compaction(
-                target.clone(),
-                stage().await,
-                Box::new(|| super::Admission::Copy),
-            )
+            .copy_compaction(stage().await, Box::new(|| super::Admission::Copy))
             .await
             .unwrap()
         else {
             panic!("nothing stops the copy");
         };
-        let landed = land('b');
-        let locked = scratch.lock(&target).await;
-        let published = scratch
+        let (landed, bytes, mark) = land('b', &|image| {
+            assert!(
+                std::process::Command::new("/bin/cp")
+                    .arg("-c")
+                    .arg(scratch.layout.image(&replacement))
+                    .arg(image)
+                    .status_locked()
+                    .expect("cp -c")
+                    .success()
+            );
+            let file = fs::OpenOptions::new().write(true).open(image).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(&file, &vec![0xa5; 1024 * 1024], 0).unwrap();
+        });
+        catch_up(compacted, landed, bytes, mark, MIB).await;
+
+        // During the copy: it is not stopped, and catches up to a land that shares nothing.
+        let source = stage().await;
+        let (landed, bytes, mark) = land('c', &|image| fs::write(image, vec![7_u8; 4096]).unwrap());
+        let SeedCompaction::Copied(compacted) = scratch
             .volumes
-            .publish_compaction(&locked, compacted)
+            .copy_compaction(source, Box::new(|| super::Admission::Copy))
+            .await
+            .unwrap()
+        else {
+            panic!("a land does not stop the copy");
+        };
+        catch_up(compacted, landed, bytes, mark, 4096).await;
+        scratch.release_all();
+    }
+
+    /// Seed compaction's lineage (16_build_volumes.md, "Seed compaction"): main moves onto a clone
+    /// of its own seed through the workspace reseed of main from main, which takes main's image
+    /// lock once, only while main's volume holds no write after the seed's mark; a later write,
+    /// made before the move or while its replacement is cloned, before the seal, refuses the
+    /// move as a conflict, keeps the volume and the write, and releases the replacement.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_compaction_moves_main_onto_its_seed_only_without_a_newer_write() {
+        let scratch = Scratch::new("compaction-lineage");
+        let main = owner("main", '0');
+        let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+        fs::write(mount.join("in-seed"), b"captured").unwrap();
+        let seed = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &live,
+                &seed,
+                &registered(BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: main.name.clone(),
+                        incarnation: main.incarnation.clone(),
+                    },
+                )),
+            )
+            .unwrap();
+        fs::write(mount.join("after-seed"), b"live work").unwrap();
+        let workspace = reseed_workspace(&scratch, main, checkout.clone());
+        let plan = scratch
+            .volumes
+            .preview_reseed(workspace.clone(), workspace.clone())
             .await
             .unwrap();
-        drop(locked);
+        assert_eq!(plan.seed(), &seed);
+        let refusal = scratch.volumes.move_onto_seed(plan).await.unwrap_err();
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
         assert!(
-            matches!(&published, Published::Superseded { seed } if *seed == replacement),
-            "{published:?}"
+            refusal.message.contains("after the seed's mark"),
+            "{refusal}"
         );
         assert_eq!(
-            scratch
-                .layout
-                .seed_of(&target.name, &target.incarnation)
-                .unwrap()
-                .unwrap()
-                .0,
-            landed
+            scratch.layout.linked(&checkout).unwrap(),
+            Some(live.clone())
         );
-        assert_eq!(left(), Vec::<&str>::new());
+        assert!(mount.join("after-seed").exists(), "the write is kept");
 
-        // During the copy: its own check stops it at the first chunk.
-        let source = stage().await;
-        let landed = land('c');
-        let compaction = scratch
+        // A write while the replacement is cloned, after the first comparison.
+        let mark = |scratch: &Scratch| {
+            let written = scratch
+                .host
+                .build_volume_written(&scratch.layout, &live)
+                .unwrap();
+            scratch
+                .host
+                .mark_seed_written(&scratch.layout, &seed, written)
+                .unwrap();
+        };
+        mark(&scratch);
+        let plan = scratch
             .volumes
-            .copy_compaction(target.clone(), source, Box::new(|| super::Admission::Copy))
+            .preview_reseed(workspace.clone(), workspace.clone())
             .await
             .unwrap();
+        let racing = mount.join("during-clone");
+        let write = racing.clone();
+        let refusal = scratch
+            .volumes
+            .move_onto_seed_racing(plan, move || fs::write(write, b"raced").unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
         assert!(
-            matches!(&compaction, SeedCompaction::Stopped { why, .. } if why.contains(landed.as_str())),
-            "{compaction:?}"
+            refusal.message.contains("after the seed's mark"),
+            "{refusal}"
         );
-        assert_eq!(left(), Vec::<&str>::new());
+        assert_eq!(
+            scratch.layout.linked(&checkout).unwrap(),
+            Some(live.clone())
+        );
+        assert_eq!(
+            fs::read(&racing).unwrap(),
+            b"raced",
+            "the raced write is kept"
+        );
+        let mut left = scratch.layout.list().unwrap();
+        left.sort();
+        let mut expected = vec![live.clone(), seed.clone()];
+        expected.sort();
+        assert_eq!(left, expected, "the unpublished replacement is released");
+
+        // The seed holds every write once its mark is the live volume's last.
+        mark(&scratch);
+        let plan = scratch
+            .volumes
+            .preview_reseed(workspace.clone(), workspace)
+            .await
+            .unwrap();
+        let moved = scratch.volumes.move_onto_seed(plan).await.unwrap();
+        let volume = BuildVolumeId::parse(moved.replacement_volume.as_ref().unwrap()).unwrap();
+        assert_eq!(moved.previous_volume, live.to_string());
+        assert_eq!(
+            scratch.layout.linked(&checkout).unwrap(),
+            Some(volume.clone())
+        );
+        assert_eq!(
+            fs::read(scratch.layout.mount(&volume).join("in-seed")).unwrap(),
+            b"captured"
+        );
+        assert!(
+            !scratch.layout.image(&live).exists(),
+            "main's old volume is released"
+        );
         scratch.release_all();
     }
 }
