@@ -267,6 +267,7 @@ mod tests {
                 "--exact",
                 "runtime::land_lease::tests::lease_holder_helper",
                 "--nocapture",
+                "--quiet",
             ])
             .env(HELD_LEASE_ENV, &sessions)
             .stdin(Stdio::piped())
