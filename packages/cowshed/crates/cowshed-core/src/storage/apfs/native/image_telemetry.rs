@@ -1137,8 +1137,7 @@ mod tests {
     #[test]
     fn image_telemetry_native_seed_clone_and_release_are_all_wired() {
         use crate::build_volume::{
-            BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, Registrant,
-            Registration,
+            BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, Registrant, Registration,
         };
         use crate::storage::apfs::{ApfsSubstrateConfig, native::MacOsApfsExecutionHost};
         use cowshed_os::namespace::{HostNamespace, TestNamespace};
@@ -1160,9 +1159,9 @@ mod tests {
             ApfsSubstrateConfig::new(namespace, &fixture.0, fixture.0.join("checkout")),
         )
         .unwrap();
-        let source = BuildVolumeId::mint();
-        let seed = BuildVolumeId::mint();
-        let clone = BuildVolumeId::mint();
+        let source = crate::build_volume::mint_build_volume_id();
+        let seed = crate::build_volume::mint_build_volume_id();
+        let clone = crate::build_volume::mint_build_volume_id();
         fs::write(layout.image(&source), [0x5a; 8192]).unwrap();
         layout
             .write_record(

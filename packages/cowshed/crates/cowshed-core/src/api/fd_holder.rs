@@ -9,7 +9,7 @@ use cowshed_os::process::DescriptorName;
 
 use super::held_lock::DecimalU64;
 use super::hold::KernelAddress;
-use crate::build_volume::nx::{ObjectCensus, ObjectHold};
+use cowshed_types::build_volume::{ObjectCensus, ObjectHold};
 
 /// One kernel object, as `lsof -F di` and `hold`'s `started.output` name it
 /// ([`super::hold::HeldDescriptor`]): a Darwin pipe end or socket by its address, anything else,

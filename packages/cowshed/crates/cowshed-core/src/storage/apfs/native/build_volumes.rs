@@ -12,13 +12,14 @@ use std::time::SystemTime;
 
 use super::{Image, MacOsApfsExecutionHost, io_error};
 use crate::build_volume::{
-    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
-    CapturedBuildVolume, LinkResolution, Registrant, Registration, ReleaseClaim, link,
+    BuildVolumeHold, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, CapturedBuildVolume,
+    LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
 use crate::storage::apfs::ApfsStorageError;
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, mount_is_in_progress};
 use cowshed_os::process::Holder;
+use cowshed_types::build_volume::BuildVolumeId;
 use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 use std::ops::ControlFlow;
@@ -531,7 +532,7 @@ where
         self.capture_build_volume_under_hold(
             layout,
             seed,
-            &BuildVolumeId::mint(),
+            &crate::build_volume::mint_build_volume_id(),
             registration,
             None,
             Observed::UnderSourceLock,
@@ -1469,7 +1470,7 @@ mod tests {
     #[test]
     fn real_apfs_build_seed_live_capture_is_fresh_until_an_admitted_job_writes() {
         let root = crate::scratch_apfs::ScratchRoot::new("seed-admission-clock").unwrap();
-        let source = BuildVolumeId::mint();
+        let source = crate::build_volume::mint_build_volume_id();
         let (system, layout) = fixture(root.namespace(), root.path());
         crate::blank_image::blank_image(root.namespace(), &layout.image(&source));
         let mount = system.mount_build_volume(&layout, &source).unwrap();
@@ -1498,7 +1499,7 @@ mod tests {
                 denied: Arc::clone(&denied),
             },
         );
-        let seed = BuildVolumeId::mint();
+        let seed = crate::build_volume::mint_build_volume_id();
         host.clone_build_volume(&layout, &source, &seed, &registered(record.clone()))
             .unwrap();
         assert!(denied.load(Ordering::SeqCst));
@@ -1527,7 +1528,7 @@ mod tests {
         let admitted = layout
             .admit(&source)
             .expect("job admission after capture hold release");
-        let refused_seed = BuildVolumeId::mint();
+        let refused_seed = crate::build_volume::mint_build_volume_id();
         let me = i32::try_from(std::process::id()).expect("pid");
         let refused =
             host.clone_build_volume(&layout, &source, &refused_seed, &registered(record.clone()));
@@ -1569,7 +1570,7 @@ mod tests {
             live > seeded,
             "the admitted job's write must make the seed behind"
         );
-        let inspection = BuildVolumeId::mint();
+        let inspection = crate::build_volume::mint_build_volume_id();
         host.clone_build_volume(
             &layout,
             &seed,
@@ -1599,7 +1600,7 @@ mod tests {
         use crate::runtime::supervisor_socket;
 
         let root = crate::scratch_apfs::ScratchRoot::new("seed-quiet-admission").unwrap();
-        let source = BuildVolumeId::mint();
+        let source = crate::build_volume::mint_build_volume_id();
         let (system, layout) = fixture(root.namespace(), root.path());
         let checkout = root.path().join("checkout");
         fs::create_dir_all(checkout.join(".cowshed")).unwrap();
@@ -1652,7 +1653,7 @@ mod tests {
             },
         );
         let host = Arc::new(host);
-        let seed = BuildVolumeId::mint();
+        let seed = crate::build_volume::mint_build_volume_id();
         let record = BuildVolumeRecord::new(
             None,
             BuildVolumeRole::Seed {
@@ -1795,7 +1796,7 @@ mod tests {
         drop(handle);
         drop(replacement);
         drop(landing_hold);
-        let inspection = BuildVolumeId::mint();
+        let inspection = crate::build_volume::mint_build_volume_id();
         host.clone_build_volume(
             &layout,
             &seed,
@@ -1859,7 +1860,7 @@ mod tests {
                 .expect("attach and mount the workspace");
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
 
-            let build_id = BuildVolumeId::mint();
+            let build_id = crate::build_volume::mint_build_volume_id();
             crate::blank_image::blank_image(namespace, &layout.image(&build_id));
             let build_mount = host
                 .mount_build_volume(layout, &build_id)
@@ -1924,7 +1925,7 @@ mod tests {
 
         let root = crate::scratch_apfs::ScratchRoot::new("claimed-build-detach").unwrap();
         let (host, layout) = fixture(root.namespace(), root.path());
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         let image = layout.image(&id);
         crate::blank_image::blank_image(root.namespace(), &image);
         let mount = host.mount_build_volume(&layout, &id).unwrap();
@@ -1994,7 +1995,7 @@ mod tests {
     fn real_apfs_build_volumes_clone_with_mtimes_and_release_unless_a_job_holds_them() {
         let root = crate::scratch_apfs::ScratchRoot::new("build-volume").expect("scratch root");
         let (host, layout) = fixture(root.namespace(), root.path());
-        let source = BuildVolumeId::mint();
+        let source = crate::build_volume::mint_build_volume_id();
         // Creation is proven by first touch (build_volume::migrate) and adoption; this test's
         // source is a clone of the run's blank image, mounted the way a fork's volume is.
         crate::blank_image::blank_image(root.namespace(), &layout.image(&source));
@@ -2034,7 +2035,7 @@ mod tests {
         );
         drop(claim);
 
-        let clone = BuildVolumeId::mint();
+        let clone = crate::build_volume::mint_build_volume_id();
         let started = Instant::now();
         host.clone_build_volume(&layout, &source, &clone, &registered(linked("topic")))
             .expect("clone the build volume");

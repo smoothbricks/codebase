@@ -23,77 +23,7 @@ pub const RUN_SUMMARY: &str = "run.json";
 pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
 use cowshed_os::process::{DescriptorName, Holder};
-
-/// Processes, each as `pid <n> (<argv>)`, joined by `; `.
-pub struct Holders<'a>(pub &'a [Holder]);
-
-impl std::fmt::Display for Holders<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, holder) in self.0.iter().enumerate() {
-            if index > 0 {
-                formatter.write_str("; ")?;
-            }
-            write!(formatter, "{holder}")?;
-        }
-        Ok(())
-    }
-}
-
-/// What a process holds inside a tree: the first hold the census found, cheapest first. A
-/// process can hold a tree several ways at once; one is proof enough that it holds it, and
-/// naming one keeps the census to one look per process.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Hold {
-    /// Its working directory is in the tree.
-    WorkingDirectory(PathBuf),
-    /// Its root directory (`chroot`) is in the tree.
-    RootDirectory(PathBuf),
-    /// It runs an executable from the tree.
-    Executable(PathBuf),
-    /// It has a file of the tree open. Event-only opens (`O_EVTONLY`) hold nothing.
-    OpenFile(PathBuf),
-    /// It maps a file of the tree (procfs `maps`; Darwin's census reads no mappings).
-    MappedFile(PathBuf),
-}
-
-impl Hold {
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::WorkingDirectory(path)
-            | Self::RootDirectory(path)
-            | Self::Executable(path)
-            | Self::OpenFile(path)
-            | Self::MappedFile(path) => path,
-        }
-    }
-}
-
-impl std::fmt::Display for Hold {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WorkingDirectory(path) => {
-                write!(formatter, "working directory {}", path.display())
-            }
-            Self::RootDirectory(path) => write!(formatter, "root directory {}", path.display()),
-            Self::Executable(path) => write!(formatter, "executable {}", path.display()),
-            Self::OpenFile(path) => write!(formatter, "open file {}", path.display()),
-            Self::MappedFile(path) => write!(formatter, "mapped file {}", path.display()),
-        }
-    }
-}
-
-/// A process holding a tree, with the hold that shows it: `pid <n> (<argv>), <hold>`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TreeHold {
-    pub holder: Holder,
-    pub hold: Hold,
-}
-
-impl std::fmt::Display for TreeHold {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}, {}", self.holder, self.hold)
-    }
-}
+use cowshed_types::build_volume::{Hold, ObjectCensus, ObjectHold, TreeHold};
 
 /// Every process holding anything inside the directory tree at `root` ([`tree_holds`]),
 /// without what it holds.
@@ -725,28 +655,6 @@ pub(crate) fn inode_holders(identity: (u64, u64)) -> io::Result<Vec<(Holder, Vec
         }
     }
     Ok(holders)
-}
-
-/// One process holding a kernel object a census asked about ([`object_holders`]): the process,
-/// the kernel's identity of its life ([`crate::runtime::job_groups::life_of`]), and each of its
-/// descriptors on one of the objects, in descriptor order, with the caller's key for that object.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObjectHold<K> {
-    pub holder: Holder,
-    pub life: u64,
-    pub descriptors: Vec<(i32, K)>,
-}
-
-/// What a census of descriptor holders found ([`object_holders`]).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObjectCensus<K> {
-    /// Every process it read that holds one of the objects, in pid listing order.
-    pub holds: Vec<ObjectHold<K>>,
-    /// The processes whose descriptors were not read: those the kernel withheld from this user
-    /// (another user's, unless the census runs as root) and, on Darwin, those a cowshed lifecycle
-    /// operation runs in, which the census never asks. Any of them may hold an object, so they are
-    /// counted, never reported as holding none.
-    pub uninspected: u32,
 }
 
 /// Every process with a descriptor on one of `objects`, each named as

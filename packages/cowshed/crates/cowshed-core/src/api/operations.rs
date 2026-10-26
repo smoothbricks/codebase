@@ -32,10 +32,10 @@ use super::process::{JobProcessEvent, JobProcessTree, JobSubtreeHandle, JobSubtr
 use super::reader::{Projected, project};
 use super::resources::{JobResourceSample, SampleInterval};
 use super::tree_holder::TreeHolder;
-use crate::build_volume::BuildStateRefresh;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::project_policy::ProjectGrants;
 use crate::project_retirement::ProjectRetirementReport;
+use cowshed_types::build_volume::BuildStateRefresh;
 use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::{RepoId, RepositoryBinding};
 use serde::de::DeserializeOwned;

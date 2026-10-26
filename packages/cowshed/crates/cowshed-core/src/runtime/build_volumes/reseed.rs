@@ -10,14 +10,15 @@ use std::time::SystemTime;
 use super::{BuildVolumes, Owner, RuntimeStorageHost, io, storage};
 use crate::api::dto::ReseedResult;
 use crate::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
-    Registrant, Registration, link, nx,
+    BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState, Registrant,
+    Registration, link, nx,
 };
 use crate::storage::ImagePaths;
 use crate::storage::apfs::native::BuildVolumeClaim;
 use crate::storage::recovery::{LIFECYCLE_INTENTS_FILE, LifecycleIntentJournal};
 use crate::{CowshedError, Result};
 use cowshed_apfs::store_lock::LockMode;
+use cowshed_types::build_volume::BuildVolumeId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReseedWorkspace {
@@ -185,7 +186,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             if let Discard::Nothing = discard {
                 require_no_newer_write(host, layout, &plan)?;
             }
-            let replacement = BuildVolumeId::mint();
+            let replacement = crate::build_volume::mint_build_volume_id();
             let creating = layout.hold_new(&replacement)
                 .map_err(|error| io("hold the reseed replacement", &layout.hold_path(&replacement), &error))?;
             let prepared: Result<(u64, u64)> = (|| {

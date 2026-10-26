@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::build_volume::{
-    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration,
-    ReleaseClaim,
+    BuildVolumeHold, BuildVolumeLayout, CapturedBuildVolume, Registration, ReleaseClaim,
 };
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, CompactedSeed, CompactionSource,
@@ -18,6 +17,7 @@ use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, Labelled};
 use crate::storage::lifecycle::ExtentCount;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
+use cowshed_types::build_volume::BuildVolumeId;
 use cowshed_types::image::ImageCapacity;
 use cowshed_types::lifecycle::DerivedWorkspace;
 use cowshed_types::metadata::{DetachedWorkspaceMetadata, WorkspaceName};

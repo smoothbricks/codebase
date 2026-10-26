@@ -23,9 +23,9 @@ use crate::api::dto::{
 use crate::api::held_lock::{LockHolding, LockOperation};
 use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
-    BuildStateRefresh, BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord,
-    BuildVolumeRole, BuildVolumeStage, BuildVolumeState, CapturedBuildVolume, Registrant,
-    Registration, ReleaseClaim, TrackedBuildStateRefusal, cargo, link, nx,
+    BuildVolumeHold, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeStage,
+    BuildVolumeState, CapturedBuildVolume, Registrant, Registration, ReleaseClaim,
+    TrackedBuildStateRefusal, cargo, link, nx,
 };
 #[cfg(test)]
 use crate::storage::apfs::ApfsExecutionHost;
@@ -37,6 +37,7 @@ use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::store_lock::LockMode;
+use cowshed_types::build_volume::{BuildStateRefresh, BuildVolumeId};
 use cowshed_types::capabilities::BuildStatePath;
 use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
@@ -900,7 +901,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                         host.clone_build_volume(
                             layout,
                             &id,
-                            &BuildVolumeId::mint(),
+                            &crate::build_volume::mint_build_volume_id(),
                             &Registration::new(
                                 BuildVolumeRecord::new(
                                     None,
@@ -977,7 +978,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let minted = may_mint(&source).and_then(|capacity| {
                 capacity
                     .map(|capacity| {
-                        let id = BuildVolumeId::mint();
+                        let id = crate::build_volume::mint_build_volume_id();
                         // Main has no incarnation until the adopt publishes it, so the volume is
                         // registered by the adopt's intent and held by its exact id, by the slot,
                         // until its release takes it: never by main's name.
@@ -1119,7 +1120,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             return Ok(None);
         };
         self.blocking(move |host, layout| {
-            let own_seed = BuildVolumeId::mint();
+            let own_seed = crate::build_volume::mint_build_volume_id();
             let registration = Registration::new(
                 BuildVolumeRecord::new(
                     tree,
@@ -1662,7 +1663,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                                 if open.is_empty() {
                                     String::new()
                                 } else {
-                                    format!(" (open in {})", nx::Holders(&open))
+                                    format!(" (open in {})", cowshed_types::build_volume::Holders(&open))
                                 },
                                 owner.name,
                             ),
@@ -2102,7 +2103,7 @@ impl std::fmt::Display for Deferral {
                     "a job admitted on it still runs, or a land or clone making it someone's still holds it",
                 )?;
                 if !open.is_empty() {
-                    write!(formatter, ", open in {}", nx::Holders(open))?;
+                    write!(formatter, ", open in {}", cowshed_types::build_volume::Holders(open))?;
                 }
                 Ok(())
             }
@@ -2522,7 +2523,12 @@ fn seal(
     })? {
         return Ok(Err(skip(busy, Side::Landing)));
     }
-    match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), registration) {
+    match host.clone_quiet_build_volume(
+        layout,
+        quiet,
+        &crate::build_volume::mint_build_volume_id(),
+        registration,
+    ) {
         Ok(()) => Ok(Ok(Freeze::Frozen {
             superseded: claim_superseded(host, layout, target, previous)?,
         })),
@@ -2668,7 +2674,7 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
             refused: Some(BuildVolumeRefusal { open, forced }),
         } => cowshed_os::eprintln!(
             "cowshed: {whose} build volume {id} was open in {} when its unforced unmount was refused; {}",
-            nx::Holders(open),
+            cowshed_types::build_volume::Holders(open),
             outcome(*forced)
         ),
         BuildVolumeRelease::Held { open } if open.is_empty() => cowshed_os::eprintln!(
@@ -2676,7 +2682,7 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
         ),
         BuildVolumeRelease::Held { open } => cowshed_os::eprintln!(
             "cowshed: {whose} build volume {id} stays while a job admitted on it runs (open in {}); the next rm, land or gc after it ends reclaims it",
-            nx::Holders(open)
+            cowshed_types::build_volume::Holders(open)
         ),
     }
 }
@@ -2944,7 +2950,7 @@ fn capture(
     match host.clone_claimed_build_volume(
         layout,
         &claim,
-        &BuildVolumeId::mint(),
+        &crate::build_volume::mint_build_volume_id(),
         &Registration::new(
             BuildVolumeRecord::new(
                 tree,
@@ -3159,7 +3165,7 @@ mod tests {
         }
 
         fn image(&self) -> BuildVolumeId {
-            let id = BuildVolumeId::mint();
+            let id = crate::build_volume::mint_build_volume_id();
             fs::write(self.layout.image(&id), vec![7u8; 8192]).unwrap();
             id
         }
@@ -3300,13 +3306,13 @@ mod tests {
 
     fn age(live: (Nearness, SystemTime), seed: Option<(Nearness, SystemTime)>) -> SeedAge {
         SeedAge {
-            live: BuildVolumeId::mint(),
+            live: crate::build_volume::mint_build_volume_id(),
             tree: None,
             nearness: live.0,
             placed: Placed::Elsewhere(GitOid::new("e".repeat(40)).unwrap()),
             written: live.1,
             seed: seed.map(|(nearness, written)| Frozen {
-                id: BuildVolumeId::mint(),
+                id: crate::build_volume::mint_build_volume_id(),
                 tree: None,
                 nearness,
                 written,
@@ -3738,7 +3744,7 @@ mod tests {
         let scratch = Scratch::directory("build-corrupt-record");
         let topic = owner("topic", '1');
         let (checkout, live, _) = scratch.linked_checkout("topic", 1);
-        let corrupt = BuildVolumeId::mint();
+        let corrupt = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -3799,7 +3805,7 @@ mod tests {
         let scratch = Scratch::directory("build-claimed-seed");
         let topic = owner("topic", '1');
         let (checkout, live, _) = scratch.linked_checkout("topic", 1);
-        let seed = BuildVolumeId::mint();
+        let seed = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -3910,7 +3916,7 @@ mod tests {
             .clone_build_volume(
                 &scratch.layout,
                 &main_live,
-                &BuildVolumeId::mint(),
+                &crate::build_volume::mint_build_volume_id(),
                 &registered(BuildVolumeRecord::new(
                     None,
                     BuildVolumeRole::Seed {
@@ -4020,7 +4026,7 @@ mod tests {
         let corrupt = store.image();
         fs::write(store.layout.record(&corrupt), b"{not json").unwrap();
         // An image whose size cannot be read: a link to nothing.
-        let sizeless = BuildVolumeId::mint();
+        let sizeless = crate::build_volume::mint_build_volume_id();
         std::os::unix::fs::symlink(store.root.join("gone"), store.layout.image(&sizeless)).unwrap();
         store
             .layout
@@ -4064,7 +4070,7 @@ mod tests {
     #[test]
     fn an_absent_image_releases_its_record_and_an_unreadable_present_one_defers() {
         let store = Store::new();
-        let absent = BuildVolumeId::mint();
+        let absent = crate::build_volume::mint_build_volume_id();
         let record = BuildVolumeRecord::new(
             None,
             BuildVolumeRole::Linked {
@@ -4073,7 +4079,7 @@ mod tests {
         );
         store.layout.write_record(&absent, &record).unwrap();
         // Present, as a link, but its size is unreadable: the link names nothing.
-        let sizeless = BuildVolumeId::mint();
+        let sizeless = crate::build_volume::mint_build_volume_id();
         std::os::unix::fs::symlink(store.root.join("gone"), store.layout.image(&sizeless)).unwrap();
         store
             .layout
@@ -4172,7 +4178,7 @@ mod tests {
         let main_checkout = checkout("main");
 
         // Main's volume at 1 GiB, linked from its checkout, with a seed cloned from it.
-        let live = BuildVolumeId::mint();
+        let live = crate::build_volume::mint_build_volume_id();
         let registration = Registration::new(
             BuildVolumeRecord::new(None, linked("main")),
             Registrant::Workspace {
@@ -4217,7 +4223,7 @@ mod tests {
         host.clone_build_volume(
             &layout,
             &live,
-            &BuildVolumeId::mint(),
+            &crate::build_volume::mint_build_volume_id(),
             &registered(BuildVolumeRecord::new(
                 None,
                 BuildVolumeRole::Seed {
@@ -4413,7 +4419,7 @@ mod tests {
         fn linked_checkout(&self, name: &str, gib: u64) -> (PathBuf, BuildVolumeId, PathBuf) {
             let checkout = self.root.path().join(name);
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
-            let id = BuildVolumeId::mint();
+            let id = crate::build_volume::mint_build_volume_id();
             let registration = registered(BuildVolumeRecord::new(None, linked(name)));
             let creating = self.layout.register(&id, &registration).unwrap();
             let mount = (self.mint)(&self.host, &self.layout, &id, gib, &registration);
@@ -4652,7 +4658,7 @@ mod tests {
         let topic = owner("topic", '1');
         let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
         fs::write(main_mount.join("from-seed"), b"landed incremental state").unwrap();
-        let seed = BuildVolumeId::mint();
+        let seed = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -4677,7 +4683,7 @@ mod tests {
             .unwrap();
         let (checkout, old, old_mount) = scratch.linked_checkout("topic", 1);
         fs::write(old_mount.join("accumulated"), vec![7_u8; 262_144]).unwrap();
-        let own_seed = BuildVolumeId::mint();
+        let own_seed = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -4874,7 +4880,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, crate::ErrorCode::NotFound, "{error}");
         assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old.clone()));
-        let seed = BuildVolumeId::mint();
+        let seed = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -5321,7 +5327,7 @@ mod tests {
                 seeds_of(&scratch.layout, &target).unwrap().as_slice(),
                 std::slice::from_ref(&seed)
             );
-            let fork = BuildVolumeId::mint();
+            let fork = crate::build_volume::mint_build_volume_id();
             scratch
                 .host
                 .clone_build_volume(
@@ -5393,7 +5399,7 @@ mod tests {
     #[tokio::test]
     async fn real_apfs_gc_collects_an_imageless_seed_sidecar_and_rechecks_its_image() {
         let scratch = Scratch::new("seed-sidecar-gc");
-        let seed = BuildVolumeId::mint();
+        let seed = crate::build_volume::mint_build_volume_id();
         let record = BuildVolumeRecord::new(
             None,
             BuildVolumeRole::Seed {
@@ -6068,7 +6074,7 @@ fn main() {
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("lint-cache")).unwrap();
         let target = owner("main", '0');
-        let previous = BuildVolumeId::mint();
+        let previous = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -6136,7 +6142,7 @@ fn main() {
         let scratch = Scratch::directory("refresh-journals-seed");
         let (_, live, _) = scratch.linked_checkout("main", 1);
         let target = owner("main", '0');
-        let previous = BuildVolumeId::mint();
+        let previous = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -6283,7 +6289,7 @@ fn main() {
             .clone_build_volume(
                 &scratch.layout,
                 &main_live,
-                &BuildVolumeId::mint(),
+                &crate::build_volume::mint_build_volume_id(),
                 &registered(BuildVolumeRecord::new(
                     Some(behind),
                     BuildVolumeRole::Seed {
@@ -6472,7 +6478,7 @@ fn main() {
             .clone_build_volume(
                 &scratch.layout,
                 &main_live,
-                &BuildVolumeId::mint(),
+                &crate::build_volume::mint_build_volume_id(),
                 &registered(BuildVolumeRecord::new(
                     Some(before.clone()),
                     BuildVolumeRole::Seed {
@@ -6695,7 +6701,7 @@ fn main() {
         state.write(&mount).unwrap();
         let data = mount.join("nx/workspace-data");
         fs::create_dir_all(data.join(nx::DAEMON_DIRECTORY)).unwrap();
-        let previous = BuildVolumeId::mint();
+        let previous = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -6814,7 +6820,7 @@ fn main() {
         let scratch = Scratch::directory("reseed-admitted");
         let (_, live, _) = scratch.linked_checkout("w1", 1);
         let target = owner("w1", '1');
-        let previous = BuildVolumeId::mint();
+        let previous = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -7623,7 +7629,7 @@ fn main() {
         let scratch = Scratch::directory("build-land-new");
         let main = owner("main", '0');
         let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
-        let first_seed = BuildVolumeId::mint();
+        let first_seed = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(
@@ -7744,7 +7750,7 @@ fn main() {
                 &registered(BuildVolumeRecord::new(record.tree.clone(), linked("lane"))),
             )
             .expect("the new captures the seed it read under main's image lock");
-        let own_seed = BuildVolumeId::mint();
+        let own_seed = crate::build_volume::mint_build_volume_id();
         let (live, mount) = scratch
             .host
             .ready_fork_build_volume(
@@ -7822,7 +7828,7 @@ fn main() {
             DELETION_LOG_FILE, DeletionKind, DeletionLogEntry, DeletionOp,
         };
         let scratch = Scratch::directory("imageless-record-gc");
-        let absent = BuildVolumeId::mint();
+        let absent = crate::build_volume::mint_build_volume_id();
         fs::create_dir_all(scratch.layout.images()).unwrap();
         scratch
             .layout
@@ -7898,7 +7904,7 @@ fn main() {
         let main = owner("main", '0');
         let (_, live, _) = scratch.linked_checkout("main", 1);
         let clone = |role: BuildVolumeRole| {
-            let id = BuildVolumeId::mint();
+            let id = crate::build_volume::mint_build_volume_id();
             scratch
                 .host
                 .clone_build_volume(
@@ -8074,7 +8080,7 @@ fn main() {
         let topic = owner("topic", '1');
         let (checkout, live, _) = scratch.linked_checkout("topic", 1);
         let clone = |role: BuildVolumeRole| {
-            let id = BuildVolumeId::mint();
+            let id = crate::build_volume::mint_build_volume_id();
             scratch
                 .host
                 .clone_build_volume(
@@ -8098,7 +8104,7 @@ fn main() {
             target: topic.name.clone(),
             incarnation: WorkspaceIncarnation::new("2".repeat(32)).unwrap(),
         });
-        let unfinished = BuildVolumeId::mint();
+        let unfinished = crate::build_volume::mint_build_volume_id();
         drop(
             scratch
                 .layout
@@ -8175,7 +8181,7 @@ fn main() {
             incarnation: main.incarnation.clone(),
         };
         // A capture that died after its bytes and before its publication.
-        let capture = BuildVolumeId::mint();
+        let capture = crate::build_volume::mint_build_volume_id();
         let capture_registration = registration(
             seed_role.clone(),
             Registrant::Workspace {
@@ -8190,7 +8196,7 @@ fn main() {
         fs::create_dir(scratch.layout.image(&capture)).unwrap();
         fs::write(scratch.layout.image(&capture).join("partial"), b"torn").unwrap();
         // A registration that died before any byte.
-        let bare = BuildVolumeId::mint();
+        let bare = crate::build_volume::mint_build_volume_id();
         drop(
             scratch
                 .layout
@@ -8198,7 +8204,7 @@ fn main() {
                 .unwrap(),
         );
         // An earlier crashed fork of a name a later fork now forms: the name is no authority.
-        let forming = BuildVolumeId::mint();
+        let forming = crate::build_volume::mint_build_volume_id();
         drop(
             scratch
                 .layout
@@ -8207,7 +8213,7 @@ fn main() {
         );
         // An unfinished re-adoption's journaled build id, and a creation still running, which
         // holds its own: each keeps its exact id.
-        let journaled = BuildVolumeId::mint();
+        let journaled = crate::build_volume::mint_build_volume_id();
         drop(
             scratch
                 .layout
@@ -8217,12 +8223,12 @@ fn main() {
                 )
                 .unwrap(),
         );
-        let running = BuildVolumeId::mint();
+        let running = crate::build_volume::mint_build_volume_id();
         let still_creating = scratch
             .layout
             .register(&running, &registration(seed_role, Registrant::Intent))
             .unwrap();
-        let unregistered = BuildVolumeId::mint();
+        let unregistered = crate::build_volume::mint_build_volume_id();
         fs::create_dir(scratch.layout.image(&unregistered)).unwrap();
 
         let registered = scratch.volumes.registered().await.unwrap();
@@ -8304,7 +8310,7 @@ fn main() {
     fn directory_a_clone_refused_after_registration_leaves_nothing_registered() {
         let scratch = Scratch::directory("build-clone-refused");
         let (_, live, _) = scratch.linked_checkout("main", 1);
-        let destination = BuildVolumeId::mint();
+        let destination = crate::build_volume::mint_build_volume_id();
         // Its bytes would predate their owner: the registration itself refuses.
         fs::create_dir(scratch.layout.image(&destination)).unwrap();
         let error = scratch
@@ -8326,9 +8332,9 @@ fn main() {
         );
         fs::remove_dir(scratch.layout.image(&destination)).unwrap();
         // A source with no owner record refuses before anything is registered.
-        let ownerless = BuildVolumeId::mint();
+        let ownerless = crate::build_volume::mint_build_volume_id();
         fs::create_dir(scratch.layout.image(&ownerless)).unwrap();
-        let target = BuildVolumeId::mint();
+        let target = crate::build_volume::mint_build_volume_id();
         assert!(
             scratch
                 .host
@@ -8380,7 +8386,7 @@ fn main() {
                 },
             )
         };
-        let seed = BuildVolumeId::mint();
+        let seed = crate::build_volume::mint_build_volume_id();
         let registration = seed_registration('a');
         let creating = scratch.layout.register(&seed, &registration).unwrap();
         let fragmenting = scratch.root.path().join("fragmenting");
@@ -8538,7 +8544,7 @@ fn main() {
 
         // A land publishes main's next seed: `tree` names it, `fill` makes its image.
         let land = |tree: char, fill: &dyn Fn(&Path)| {
-            let landed = BuildVolumeId::mint();
+            let landed = crate::build_volume::mint_build_volume_id();
             // Records name whole seconds, so a land in the same second as the compaction's
             // publication would tie it: date the land's seed after it.
             let registration = Registration::new(
@@ -8685,7 +8691,7 @@ fn main() {
         let main = owner("main", '0');
         let (checkout, live, mount) = scratch.linked_checkout("main", 1);
         fs::write(mount.join("in-seed"), b"captured").unwrap();
-        let seed = BuildVolumeId::mint();
+        let seed = crate::build_volume::mint_build_volume_id();
         scratch
             .host
             .clone_build_volume(

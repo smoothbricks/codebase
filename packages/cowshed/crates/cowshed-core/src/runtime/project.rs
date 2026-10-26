@@ -341,7 +341,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
     async fn refresh_build_state(
         &mut self,
         _workspace: WorkspaceName,
-    ) -> Result<crate::build_volume::BuildStateRefresh> {
+    ) -> Result<cowshed_types::build_volume::BuildStateRefresh> {
         Err(CowshedError::internal(
             "build volumes are unavailable for this runtime host",
         ))
@@ -1201,7 +1201,7 @@ impl ProjectRuntime {
     pub async fn refresh_build_state(
         &self,
         workspace: &WorkspaceName,
-    ) -> Result<crate::build_volume::BuildStateRefresh> {
+    ) -> Result<cowshed_types::build_volume::BuildStateRefresh> {
         self.router
             .call::<operations::CoordinatorRefreshBuildState>(
                 self.coordinator(),
@@ -3319,7 +3319,7 @@ fn move_terminal_release(
     std::fs::create_dir_all(target).map_err(|error| release_failed("create", target, error))?;
     let moved = target.join(format!(
         "{}.{}",
-        crate::build_volume::BuildVolumeId::mint(),
+        crate::build_volume::mint_build_volume_id(),
         cowshed_types::image::IMAGE_EXTENSION
     ));
     match std::fs::rename(image, &moved) {
@@ -5505,7 +5505,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn build_volume_links(
         &self,
     ) -> Result<(
-        Vec<crate::build_volume::BuildVolumeId>,
+        Vec<cowshed_types::build_volume::BuildVolumeId>,
         super::build_volumes::Links,
     )> {
         let volumes = self.build_volumes()?;
@@ -6470,7 +6470,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn move_main_onto(
         &self,
         volumes: &super::build_volumes::BuildVolumes<H>,
-        seed: &crate::build_volume::BuildVolumeId,
+        seed: &cowshed_types::build_volume::BuildVolumeId,
     ) -> Result<crate::api::dto::MainLineage> {
         use crate::api::dto::MainLineage;
         let main = main_name();
@@ -6791,7 +6791,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         current: &NativeWorkspace,
         mount: &Path,
         lent: super::build_volumes::Lent,
-    ) -> Result<crate::build_volume::BuildStateRefresh> {
+    ) -> Result<cowshed_types::build_volume::BuildStateRefresh> {
         use super::build_volumes::Discovered;
         let name = current.derived.workspace.name().clone();
         let volumes = self.build_volumes()?;
@@ -16329,7 +16329,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     async fn refresh_build_state(
         &mut self,
         workspace: WorkspaceName,
-    ) -> Result<crate::build_volume::BuildStateRefresh> {
+    ) -> Result<cowshed_types::build_volume::BuildStateRefresh> {
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         // Mounting is the supervisor's (it advances the gateway revision of a workspace it
@@ -20642,8 +20642,8 @@ impl CheckedLandChecks {
         let mut unattributed = Vec::new();
         let before = self.runs.len();
         for path in &state.paths {
-            if crate::build_volume::BuildStateTool::of(path)
-                != crate::build_volume::BuildStateTool::Nx
+            if cowshed_types::build_volume::BuildStateTool::of(path)
+                != cowshed_types::build_volume::BuildStateTool::Nx
                 || path.checkout.as_path().file_name() != Some(std::ffi::OsStr::new("cache"))
             {
                 continue;
@@ -25358,7 +25358,6 @@ mod workspace_origin_tests {
     #[tokio::test]
     async fn doctor_names_seed_tree_drift_and_keeps_a_nearer_landed_seed() {
         use super::super::build_volumes::{Frozen, Nearness, Placed, SeedAge};
-        use crate::build_volume::BuildVolumeId;
         let store = crate::temp_root::FixtureStore::new();
         let store_root = store.shared();
         let root = temp_directory("seed-tree-doctor");
@@ -25405,13 +25404,13 @@ mod workspace_origin_tests {
         let current = commit("after").await;
         let frozen = std::time::SystemTime::UNIX_EPOCH;
         let mut age = SeedAge {
-            live: BuildVolumeId::mint(),
+            live: crate::build_volume::mint_build_volume_id(),
             tree: Some(previous.clone()),
             nearness: Nearness::Paths(1),
             placed: Placed::Elsewhere(previous.clone()),
             written: frozen + std::time::Duration::from_secs(1),
             seed: Some(Frozen {
-                id: BuildVolumeId::mint(),
+                id: crate::build_volume::mint_build_volume_id(),
                 tree: Some(previous),
                 nearness: Nearness::Paths(1),
                 written: frozen,

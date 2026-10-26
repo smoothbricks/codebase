@@ -1175,7 +1175,7 @@ impl Projected for crate::api::dto::BuildStateListing {
     const READER: &'static Reader = &BUILD_STATE_LISTING;
 }
 
-impl Projected for crate::build_volume::BuildStateRefresh {
+impl Projected for cowshed_types::build_volume::BuildStateRefresh {
     const READER: &'static Reader = &LEAF;
 }
 

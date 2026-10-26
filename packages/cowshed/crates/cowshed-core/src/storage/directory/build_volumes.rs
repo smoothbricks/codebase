@@ -20,8 +20,8 @@ use super::{
     observed_payload_root, unbind, unsupported,
 };
 use crate::build_volume::{
-    BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
-    CapturedBuildVolume, LinkResolution, Registrant, Registration, ReleaseClaim, link,
+    BuildVolumeHold, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, CapturedBuildVolume,
+    LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
 use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{
@@ -32,6 +32,7 @@ use crate::storage::apfs::release::Drained;
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_os::fsio::AnchoredDirectory;
 use cowshed_os::process::Holder;
+use cowshed_types::build_volume::BuildVolumeId;
 use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 
@@ -576,7 +577,12 @@ impl DirectoryExecutionHost {
         registration: &Registration,
     ) -> Result<CapturedBuildVolume, ApfsStorageError> {
         self.require_store_image(&layout.image(seed))?;
-        self.capture_build_volume_under_hold(layout, seed, &BuildVolumeId::mint(), registration)
+        self.capture_build_volume_under_hold(
+            layout,
+            seed,
+            &crate::build_volume::mint_build_volume_id(),
+            registration,
+        )
     }
 
     /// The captured live volume published, then `own_seed`, when one is asked for, copied from it
@@ -1109,8 +1115,8 @@ mod journal_tests {
     #[test]
     fn a_retry_never_confirms_a_foreign_tree_after_the_journal_path_is_swapped() {
         let (root, host, layout) = swap_fixture();
-        let ours = BuildVolumeId::mint();
-        let theirs = BuildVolumeId::mint();
+        let ours = crate::build_volume::mint_build_volume_id();
+        let theirs = crate::build_volume::mint_build_volume_id();
         fs::create_dir(layout.released(&ours)).unwrap();
         let foreign = root.join("foreign");
         fs::create_dir_all(foreign.join(format!("{theirs}.dmg"))).unwrap();
@@ -1138,8 +1144,8 @@ mod journal_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (root, host, layout) = swap_fixture();
-        let ours = BuildVolumeId::mint();
-        let theirs = BuildVolumeId::mint();
+        let ours = crate::build_volume::mint_build_volume_id();
+        let theirs = crate::build_volume::mint_build_volume_id();
         let image = layout.released(&ours);
         fs::create_dir_all(image.join("sealed/nested")).unwrap();
         fs::write(image.join("sealed/nested/warm"), b"owned build bytes").unwrap();
@@ -1180,7 +1186,7 @@ mod journal_tests {
         let (root, _host, layout) = swap_fixture();
         let images = held_images(&layout).unwrap();
         let journal = held_journal(&layout).unwrap().unwrap();
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         let image = layout.image(&id);
         fs::create_dir(&image).unwrap();
         fs::write(image.join("warm"), b"unsynced seed").unwrap();
@@ -1209,7 +1215,7 @@ mod journal_tests {
     #[test]
     fn a_drain_counts_real_self_holds_but_not_its_own_observation() {
         let (root, host, layout) = swap_fixture();
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         let entry = layout.released(&id);
         fs::create_dir(&entry).unwrap();
         fs::write(entry.join("warm"), b"held seed").unwrap();
@@ -1251,7 +1257,7 @@ mod journal_tests {
         )
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         let image = layout.image(&id);
         fs::create_dir_all(&image).unwrap();
         fs::write(image.join("warm"), b"superseded seed\n").unwrap();
@@ -1268,7 +1274,10 @@ mod journal_tests {
             )
             .unwrap();
         let foreign = root.join("foreign");
-        let foreign_child = foreign.join(format!("{}.dmg", BuildVolumeId::mint()));
+        let foreign_child = foreign.join(format!(
+            "{}.dmg",
+            crate::build_volume::mint_build_volume_id()
+        ));
         fs::create_dir_all(&foreign_child).unwrap();
         fs::write(foreign_child.join("kept"), b"not the store's").unwrap();
         std::os::unix::fs::symlink(&foreign, layout.deleting()).unwrap();
@@ -1348,7 +1357,7 @@ mod detach_tests {
         )
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         let image = layout.image(&id);
         fs::create_dir_all(&image).unwrap();
         fs::write(image.join("warm"), b"old build state\n").unwrap();

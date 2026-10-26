@@ -1036,7 +1036,8 @@ async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
 #[tokio::test]
 async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
     let root = workspace_root("build-volume");
-    use cowshed_core::build_volume::{BuildVolumeId, BuildVolumeLayout};
+    use cowshed_core::build_volume::BuildVolumeLayout;
+    use cowshed_types::build_volume::BuildVolumeId;
     use cowshed_types::repository::ProjectPaths;
 
     let mut supervisor_config = config(&root);
@@ -7352,9 +7353,8 @@ async fn a_shed_supervisor_is_idle_only_once_its_nx_daemon_is_gone() {
 /// admitted since a land. Restarting the daemon must not reuse the previous job's grant.
 #[tokio::test(start_paused = true)]
 async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
-    use cowshed_core::build_volume::{
-        BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link,
-    };
+    use cowshed_core::build_volume::{BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link};
+    use cowshed_types::build_volume::BuildVolumeId;
     use cowshed_types::capabilities::{BuildStatePath, RelPath};
     use cowshed_types::repository::ProjectPaths;
 

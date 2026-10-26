@@ -19,7 +19,7 @@ use super::release::{DELETING_DIRECTORY, Left, Listing, Why, released_in};
 
 /// `<store>/.deleting`: where a project's final unbinding moves the released images its tree still
 /// holds, so the tree goes at once and the gateway's cleanup frees them. Entries are named
-/// `<fresh id>.dmg` ([`crate::build_volume::BuildVolumeId`]).
+/// `<fresh id>.dmg` ([`cowshed_types::build_volume::BuildVolumeId`]).
 pub fn store_deleting(store: &Path) -> PathBuf {
     store.join(DELETING_DIRECTORY)
 }
@@ -116,7 +116,7 @@ mod tests {
     fn volume(store: &Path) -> PathBuf {
         store.join(format!(
             "acme/widget/build/.deleting/{}.dmg",
-            crate::build_volume::BuildVolumeId::mint()
+            crate::build_volume::mint_build_volume_id()
         ))
     }
 
@@ -157,7 +157,7 @@ mod tests {
             volume(&store),
             store.join(format!(
                 ".deleting/{}.dmg",
-                crate::build_volume::BuildVolumeId::mint()
+                crate::build_volume::mint_build_volume_id()
             )),
             store.join(format!(
                 "acme/widget/sessions/.deleting/topic-{}.dmg",
@@ -165,7 +165,7 @@ mod tests {
             )),
             store.join(format!(
                 ".retired-projects/0123/build/.deleting/{}.dmg",
-                crate::build_volume::BuildVolumeId::mint()
+                crate::build_volume::mint_build_volume_id()
             )),
         ];
         for entry in &left {
@@ -177,7 +177,7 @@ mod tests {
         fs::write(store.join(".retired-projects/0123.json"), b"{}").expect("archive record");
         let legacy = store.join(format!(
             "acme/widget/build/.releasing/{}.dmg",
-            crate::build_volume::BuildVolumeId::mint()
+            crate::build_volume::mint_build_volume_id()
         ));
         released(&legacy);
 

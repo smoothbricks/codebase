@@ -12,14 +12,15 @@ use std::path::{Path, PathBuf};
 
 use super::{MacOsApfsExecutionHost, allocated_file_bytes, io_error, sync_parent_path};
 use crate::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, RECORD_SUFFIX,
-    Registrant, Registration, ReleaseClaim,
+    BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, RECORD_SUFFIX, Registrant, Registration,
+    ReleaseClaim,
 };
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
 use crate::storage::recovery::{
     MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptMain, ReAdoptSource,
 };
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
+use cowshed_types::build_volume::BuildVolumeId;
 use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::append_suffix;
 
@@ -502,7 +503,7 @@ where
             self.mount_build_volume(layout, claim.id())?;
             return Ok(());
         }
-        let destination = BuildVolumeId::mint();
+        let destination = crate::build_volume::mint_build_volume_id();
         let registration = Registration::new(
             BuildVolumeRecord::new(
                 owner.tree.clone(),

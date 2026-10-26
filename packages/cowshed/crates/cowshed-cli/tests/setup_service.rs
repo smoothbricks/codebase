@@ -22,7 +22,6 @@ use cowshed_cli::setup_service::{
     SccacheInstall, WorkspaceCensus, dispatch as setup_dispatch,
 };
 use cowshed_core::AdoptedProject;
-use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::caches_retirement::{
     CacheOutcome, Leftover, LeftoverReason, Merge, Owner, Placement, RetirementReport,
 };
@@ -32,6 +31,7 @@ use cowshed_core::storage::bootstrap::{
     UninstallServiceOutcome, VolumeOutcome, VolumeRole, VolumeState,
 };
 use cowshed_core::{CowshedError, ErrorCode, Result, UnreachableMain};
+use cowshed_types::build_volume::BuildStateRefresh;
 use cowshed_types::repository::RepoId;
 use std::path::PathBuf;
 
@@ -2611,7 +2611,7 @@ fn build_state_result(repo: &str, result: Result<BuildStateRefresh>) -> ProjectB
 
 #[tokio::test]
 async fn build_state_migration_reports_each_main_and_rebuild_only_findings() {
-    use cowshed_core::build_volume::{BuildStateTool, BuildVolumeId, DisplacedBuildStateFinding};
+    use cowshed_types::build_volume::{BuildStateTool, BuildVolumeId, DisplacedBuildStateFinding};
     use cowshed_types::capabilities::{BuildStateFinding, CargoDiscoveryPhase};
     let volume = BuildVolumeId::parse("0123456789abcdef0123456789abcdef").unwrap();
     let mut host = FakeHost {

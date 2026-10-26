@@ -7439,8 +7439,9 @@ fn recovering_an_unmounted_attachment_mounts_its_pinned_volume_without_reattachi
 
 mod build_mount_races {
     use super::*;
-    use cowshed_core::build_volume::{BuildVolumeId, BuildVolumeLayout};
+    use cowshed_core::build_volume::BuildVolumeLayout;
     use cowshed_os::process::ProcessStatus;
+    use cowshed_types::build_volume::BuildVolumeId;
     use parking_lot::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -7597,7 +7598,7 @@ mod build_mount_races {
     fn build(fixture: &Fixture, recorded: &RecordingRunner) -> (BuildVolumeLayout, BuildVolumeId) {
         let storage = StorageLayout::new(&fixture.root, &repo()).unwrap();
         let layout = BuildVolumeLayout::new(storage.project()).unwrap();
-        let id = BuildVolumeId::mint();
+        let id = cowshed_core::build_volume::mint_build_volume_id();
         let image = layout.image(&id);
         std::fs::create_dir_all(image.parent().unwrap()).unwrap();
         std::fs::write(&image, b"ordinary file, never a real attached image").unwrap();

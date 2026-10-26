@@ -8,9 +8,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::build_volume::nx::{self, TreeHold};
+use crate::build_volume::nx::{self};
 use crate::error::CowshedError;
 use crate::runtime::job_groups;
+use cowshed_types::build_volume::TreeHold;
 use cowshed_types::metadata::WorkspaceName;
 
 /// How many holders a refusal names; the rest are counted.
@@ -133,6 +134,7 @@ mod tests {
     use super::*;
     use cowshed_os::fork_lock::Spawn as _;
     use cowshed_os::test_backstop::ChildBackstop as _;
+    use cowshed_types::build_volume::Hold;
     use std::fs;
 
     fn scratch(label: &str) -> PathBuf {
@@ -228,9 +230,9 @@ mod tests {
         };
         assert_eq!(
             hold_of(pids[0]),
-            Some(nx::Hold::WorkingDirectory(packages.clone()))
+            Some(Hold::WorkingDirectory(packages.clone()))
         );
-        assert_eq!(hold_of(pids[1]), Some(nx::Hold::OpenFile(lock.clone())));
+        assert_eq!(hold_of(pids[1]), Some(Hold::OpenFile(lock.clone())));
         assert_eq!(
             hold_of(pids[2]),
             None,
@@ -307,7 +309,7 @@ mod tests {
                     pid: 100 + pid,
                     command: "nx run-many -t test".into(),
                 },
-                hold: nx::Hold::WorkingDirectory(mount.join("packages")),
+                hold: Hold::WorkingDirectory(mount.join("packages")),
             })
             .collect();
         let refusal = MountHeld {

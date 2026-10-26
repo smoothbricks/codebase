@@ -1099,7 +1099,7 @@ fn held_by(holds: &[cowshed_os::process::Holder]) -> String {
     if holds.is_empty() {
         "nothing this user can see".to_owned()
     } else {
-        crate::build_volume::nx::Holders(holds).to_string()
+        cowshed_types::build_volume::Holders(holds).to_string()
     }
 }
 
@@ -1116,12 +1116,12 @@ fn build_volume_held(
         (false, _) => format!(
             "build volume {image} is held by a job admitted on it: {} is held by {}{}",
             hold.display(),
-            crate::build_volume::nx::Holders(holds),
+            cowshed_types::build_volume::Holders(holds),
             open_in(open)
         ),
         (true, false) => format!(
             "build volume {image} is in use: it is open in {}",
-            crate::build_volume::nx::Holders(open)
+            cowshed_types::build_volume::Holders(open)
         ),
         (true, true) => format!(
             "build volume {image} is in use, but no process of this user holds {} or has the volume open",
@@ -1140,11 +1140,11 @@ pub(crate) fn build_volume_held_hint(
     match (holds.is_empty(), open.is_empty()) {
         (false, _) => format!(
             "wait for the job holding it ({}) to finish, or end it, then retry",
-            crate::build_volume::nx::Holders(holds)
+            cowshed_types::build_volume::Holders(holds)
         ),
         (true, false) => format!(
             "end {} or wait for it to exit, then retry",
-            crate::build_volume::nx::Holders(open)
+            cowshed_types::build_volume::Holders(open)
         ),
         (true, true) => "no process of this user holds it: another user's process (Spotlight's \
              `mds`) or the kernel does, and `sudo lsof +f -- <its mountpoint>` is the next look; \
@@ -1159,7 +1159,7 @@ fn open_in(open: &[cowshed_os::process::Holder]) -> String {
     } else {
         format!(
             "; its volume is open in {}",
-            crate::build_volume::nx::Holders(open)
+            cowshed_types::build_volume::Holders(open)
         )
     }
 }

@@ -761,8 +761,7 @@ mod tests {
         paths: &[cowshed_types::capabilities::BuildStatePath],
     ) -> PathBuf {
         use crate::build_volume::{
-            BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
-            link,
+            BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState, link,
         };
         let checkout = &store.raven_mount;
         let init = crate::git::git_command_at(checkout)
@@ -771,7 +770,7 @@ mod tests {
             .expect("git init");
         assert!(init.status.success(), "git init: {init:?}");
         let layout = BuildVolumeLayout::new(store.layout.project()).expect("build layout");
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         let volume = layout.mount(&id);
         std::fs::create_dir_all(&volume).expect("volume");
         std::fs::create_dir_all(layout.images()).expect("images");

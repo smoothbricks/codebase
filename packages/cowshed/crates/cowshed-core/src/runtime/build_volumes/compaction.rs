@@ -19,14 +19,13 @@ use super::{
     BuildVolumes, Owner, RuntimeStorageHost, SupersededSeeds, TargetLock, claim_superseded, io,
     seeds_of, storage,
 };
-use crate::build_volume::{
-    BuildVolumeId, BuildVolumeRecord, BuildVolumeRole, Registrant, Registration,
-};
+use crate::build_volume::{BuildVolumeRecord, BuildVolumeRole, Registrant, Registration};
 use crate::runtime::project::SEED_COMPACTION_VERB;
 use crate::runtime::supervisor_socket::BuildId;
 use crate::storage::apfs::native::{CompactedSeed, CompactionSource, SeedCatchUp, SeedCompaction};
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::build_volume::BuildVolumeId;
 
 /// A seed holding this many extents is compacted. Measured 2026-10-25 on this host: a fork's
 /// first write costs 92 to 175 µs per extent of its seed's map (SmoothBricks' 880,639-extent
@@ -456,7 +455,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 return Ok(Published::Behind { compacted, next });
             }
             let previous = seeds_of(layout, &target)?;
-            let replacement = BuildVolumeId::mint();
+            let replacement = crate::build_volume::mint_build_volume_id();
             let registration = Registration::new(
                 BuildVolumeRecord::new(
                     record.tree,

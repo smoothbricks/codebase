@@ -353,7 +353,7 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
     write(&checkout, "source.rs", "source stays");
     git(&checkout, &["add", "source.rs"]);
     let (host, layout) = host(root.path());
-    let id = BuildVolumeId::mint();
+    let id = crate::build_volume::mint_build_volume_id();
     let (mount, creating) = host
         .create_build_volume(
             &layout,

@@ -17,7 +17,6 @@ use super::{
 use super::{WorkspaceSnapshot, native_staged_error, native_storage_error};
 use crate::api::dto::AdoptOptions;
 use crate::api::operations::ReAdoption;
-use crate::build_volume::BuildVolumeId;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::storage::apfs::COMPANION_SUFFIX;
@@ -27,6 +26,7 @@ use crate::storage::recovery::{
     ReAdoptEmptyBuild, ReAdoptImage, ReAdoptKeptBuild, ReAdoptMain, ReAdoptMissingMain,
     ReAdoptRetained, ReAdoptSource, STAGING_NAMESPACE,
 };
+use cowshed_types::build_volume::BuildVolumeId;
 use cowshed_types::image::IMAGE_EXTENSION;
 use cowshed_types::metadata::WorkspaceName;
 

@@ -12,9 +12,7 @@ use cowshed_core::api::dto::{
     Adoption, AdoptionSkip, DatabaseHolder, ExpectedRefHead, GcReport, GitOid, LandReport,
     LandSeed, LandedReport, RebaseReport,
 };
-use cowshed_core::build_volume::{
-    BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
-};
+use cowshed_core::build_volume::{BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx};
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::runtime::land_lease::{self, Holding};
 use cowshed_core::storage::apfs::native::{
@@ -33,6 +31,7 @@ use cowshed_os::test_backstop::{
     AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _, FileBackstop as _,
     UnixStreamBackstop as _,
 };
+use cowshed_types::build_volume::BuildVolumeId;
 use cowshed_types::image::ImageCapacity;
 use cowshed_types::metadata::{PortBlock, WorkspaceName};
 use cowshed_types::repository::RepoId;
@@ -6136,7 +6135,7 @@ async fn prove_missing_main_keeps_surviving_build(fixture: &mut Fixture) {
     let host = fixture.controller_host();
     host.detach_existing_image(&layout.image(&recorded), DetachIntent::WhenIdle)
         .expect("detach main's build volume without force");
-    let surviving = BuildVolumeId::mint();
+    let surviving = cowshed_core::build_volume::mint_build_volume_id();
     for (from, to) in [
         (layout.image(&recorded), layout.image(&surviving)),
         (layout.record(&recorded), layout.record(&surviving)),

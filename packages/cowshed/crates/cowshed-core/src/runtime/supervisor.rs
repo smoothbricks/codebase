@@ -118,12 +118,16 @@ type BuildVolumeReleaseFuture = std::pin::Pin<Box<dyn Future<Output = Result<()>
 /// record keeps naming its owner; nothing is left for a later collection.
 #[derive(Clone)]
 pub struct BuildVolumeReleased(
-    Arc<dyn Fn(crate::build_volume::BuildVolumeId) -> BuildVolumeReleaseFuture + Send + Sync>,
+    Arc<
+        dyn Fn(cowshed_types::build_volume::BuildVolumeId) -> BuildVolumeReleaseFuture
+            + Send
+            + Sync,
+    >,
 );
 
 impl BuildVolumeReleased {
     pub fn new<F>(
-        released: impl Fn(crate::build_volume::BuildVolumeId) -> F + Send + Sync + 'static,
+        released: impl Fn(cowshed_types::build_volume::BuildVolumeId) -> F + Send + Sync + 'static,
     ) -> Self
     where
         F: Future<Output = Result<()>> + Send + 'static,
@@ -131,7 +135,7 @@ impl BuildVolumeReleased {
         Self(Arc::new(move |volume| Box::pin(released(volume))))
     }
 
-    async fn release(&self, volume: crate::build_volume::BuildVolumeId) -> Result<()> {
+    async fn release(&self, volume: cowshed_types::build_volume::BuildVolumeId) -> Result<()> {
         (self.0)(volume).await
     }
 }
@@ -4034,7 +4038,7 @@ struct JobStateRecord {
     /// ends: while it lives, no release unmounts that volume, whatever moved the checkout's link
     /// meanwhile (16_build_volumes.md, "Process lifetime across a swap").
     build_hold: Option<(
-        crate::build_volume::BuildVolumeId,
+        cowshed_types::build_volume::BuildVolumeId,
         crate::build_volume::BuildVolumeHold,
     )>,
     /// Where the job stands with its admission.
@@ -6113,7 +6117,7 @@ impl SupervisorActor {
         grant: Option<&Path>,
     ) -> Result<
         Option<(
-            crate::build_volume::BuildVolumeId,
+            cowshed_types::build_volume::BuildVolumeId,
             crate::build_volume::BuildVolumeHold,
         )>,
     > {

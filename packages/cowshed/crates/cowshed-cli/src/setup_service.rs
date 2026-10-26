@@ -35,7 +35,6 @@ use crate::path_entry::PathEntryOutcome;
 use crate::probe::{GitIdentityGap, probe_project};
 use async_trait::async_trait;
 use cowshed_core::AdoptedProject;
-use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::caches_retirement::{
     self, LeftoverReason, Merge, Owner, RetirementError, RetirementLayout, RetirementReport,
 };
@@ -53,6 +52,7 @@ use cowshed_core::{
     CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
     validate_existing_host_storage,
 };
+use cowshed_types::build_volume::BuildStateRefresh;
 use cowshed_types::config::VOLUME_MARKER_FILE;
 use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::RepoId;

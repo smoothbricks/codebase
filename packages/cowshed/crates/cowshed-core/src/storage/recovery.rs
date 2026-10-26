@@ -143,7 +143,7 @@ pub struct ReAdoptImage {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReAdoptBuild {
-    pub id: crate::build_volume::BuildVolumeId,
+    pub id: cowshed_types::build_volume::BuildVolumeId,
     pub image: ReAdoptImage,
     pub owner_record: crate::build_volume::BuildVolumeRecord,
     /// Where the replacement volume is minted and copied, outside the build images collection
@@ -241,7 +241,7 @@ pub enum MissingMainBuild {
 
 impl MissingMainBuild {
     /// The build volume main's build link names.
-    pub fn id(&self) -> &crate::build_volume::BuildVolumeId {
+    pub fn id(&self) -> &cowshed_types::build_volume::BuildVolumeId {
         match self {
             Self::Empty(build) => &build.id,
             Self::Kept(build) => &build.kept,
@@ -254,7 +254,7 @@ impl MissingMainBuild {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReAdoptKeptBuild {
-    pub kept: crate::build_volume::BuildVolumeId,
+    pub kept: cowshed_types::build_volume::BuildVolumeId,
     pub record: crate::build_volume::BuildVolumeRecord,
 }
 
@@ -263,7 +263,7 @@ pub struct ReAdoptKeptBuild {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReAdoptEmptyBuild {
-    pub id: crate::build_volume::BuildVolumeId,
+    pub id: cowshed_types::build_volume::BuildVolumeId,
     pub record: crate::build_volume::BuildVolumeRecord,
     pub capacity_bytes: u64,
 }
@@ -433,7 +433,7 @@ impl ReAdoptSource {
                 .original
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .and_then(crate::build_volume::BuildVolumeId::parse);
+                .and_then(cowshed_types::build_volume::BuildVolumeId::parse);
             let valid = id.is_some_and(|id| {
                 retained_at(
                     &seed.original,

@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::server::MAX_JSON_FRAME_BYTES;
 
-use crate::build_volume::nx::{Hold, TreeHold};
+use cowshed_types::build_volume::{Hold, TreeHold};
 
 /// How a process holds the tree: the first hold the census found, cheapest first.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

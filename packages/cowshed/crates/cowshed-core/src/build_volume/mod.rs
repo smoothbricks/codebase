@@ -33,6 +33,7 @@ use crate::api::dto::GitOid;
 use crate::storage::StorageLayoutError;
 use crate::storage::apfs::release::{Listing, released_in_store};
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::build_volume::{BuildStateTool, BuildVolumeId};
 use cowshed_types::capabilities::BuildStatePath;
 use cowshed_types::image::IMAGE_EXTENSION;
 use cowshed_types::metadata::{
@@ -59,50 +60,13 @@ const COMPACTING_DIRECTORY: &str = ".compacting";
 pub const STATE_FILE: &str = "cowshed-build-state.json";
 pub(crate) const RECORD_VERSION: u32 = 1;
 
-/// A build volume's identity: 32 lowercase hex digits, minted once and never reused.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct BuildVolumeId(String);
-
-impl BuildVolumeId {
-    pub fn mint() -> Self {
-        Self(uuid::Uuid::new_v4().simple().to_string())
-    }
-
-    /// The id `value` spells, or `None` for anything else: a name in a build directory that is
-    /// not exactly an id is never a build volume.
-    pub fn parse(value: &str) -> Option<Self> {
-        (value.len() == 32
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-        .then(|| Self(value.to_owned()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+/// A fresh build volume identity, minted once and never reused: a random
+/// 32-lowercase-hex-digit name no existing volume answers to. Minting reads OS
+/// randomness, so it stays with this shell; the value lives in cowshed-types.
+pub fn mint_build_volume_id() -> BuildVolumeId {
+    BuildVolumeId::parse(&uuid::Uuid::new_v4().simple().to_string())
+        .expect("a uuid simple form is 32 lowercase hex digits")
 }
-
-impl std::fmt::Display for BuildVolumeId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl Serialize for BuildVolumeId {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for BuildVolumeId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(&value)
-            .ok_or_else(|| serde::de::Error::custom(format!("invalid build volume id {value:?}")))
-    }
-}
-
 /// What a build volume is to the project. Every role names the workspace that owns the volume,
 /// so no record ever describes an image nobody answers for.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -470,65 +434,6 @@ fn overlapping(path: &Path, left: &BuildStatePath, right: &BuildStatePath) -> cr
     )
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BuildStateTool {
-    Cargo,
-    Nx,
-    /// `.cowshed.toml` `[build] state`: a tool no capability detects.
-    Declared,
-}
-
-impl BuildStateTool {
-    /// The tool whose state `path` is: declared state by its own volume namespace, Nx's
-    /// directories under `.nx`, and otherwise a Cargo target directory.
-    pub fn of(path: &BuildStatePath) -> Self {
-        let checkout = path.checkout.as_path();
-        if path.is_declared() {
-            Self::Declared
-        } else if checkout
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == ".nx")
-        {
-            Self::Nx
-        } else {
-            Self::Cargo
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DisplacedBuildStateFinding {
-    pub path: PathBuf,
-    pub likely_tool: BuildStateTool,
-}
-
-impl std::fmt::Display for DisplacedBuildStateFinding {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let tool = match self.likely_tool {
-            BuildStateTool::Cargo => "cargo clean or another Cargo command",
-            BuildStateTool::Nx => "an Nx reset or cache command",
-            BuildStateTool::Declared => {
-                return write!(
-                    formatter,
-                    "discarded the real directory {} that .cowshed.toml [build] state declares \
-                     and linked it onto the build volume; declared state is rebuildable, so \
-                     re-run whatever reconstructs it once, and from then on it lives on the \
-                     volume and every fork inherits it warm",
-                    self.path.display()
-                );
-            }
-        };
-        write!(
-            formatter,
-            "discarded the real build-state directory {} and restored its volume link; {tool} may have displaced it; the next build rebuilds what is missing",
-            self.path.display()
-        )
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackedBuildStateRefusal {
@@ -598,21 +503,6 @@ pub(crate) fn tracked_source(
         }
     }
     Ok(None)
-}
-
-/// What refreshing a checkout's build state did (16_build_volumes.md, "One link per checkout"):
-/// the volume it links afterwards, whether that volume was created now (the checkout's first
-/// touch), the build-state paths linked for the first time, the real directories a tool left
-/// where a link belongs, and what discovery could not decide.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BuildStateRefresh {
-    pub volume: Option<BuildVolumeId>,
-    pub created: bool,
-    /// Checkout-relative.
-    pub added: Vec<PathBuf>,
-    pub displaced: Vec<DisplacedBuildStateFinding>,
-    pub findings: Vec<cowshed_types::capabilities::BuildStateFinding>,
 }
 
 /// What a checkout's build link should become before its volume is mounted.
@@ -1362,7 +1252,7 @@ mod tests {
 
     #[test]
     fn ids_are_exactly_32_lowercase_hex_digits() {
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         assert_eq!(BuildVolumeId::parse(id.as_str()), Some(id));
         for invalid in [
             "",
@@ -1410,7 +1300,7 @@ mod tests {
         let layout = BuildVolumeLayout::new(&project).unwrap();
         fs::create_dir_all(layout.mounts()).unwrap();
         symlink(&physical, &alias).unwrap();
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         let target = layout.mount(&id);
         fs::create_dir(&target).unwrap();
         let alias_target = alias.join(".build/acme/widget").join(id.as_str());
@@ -1544,7 +1434,7 @@ mod tests {
             Registrant::Intent,
         );
 
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         let creating = layout.register(&id, &registration).unwrap();
         assert!(!layout.image(&id).exists(), "registration makes no image");
         assert_eq!(
@@ -1572,7 +1462,7 @@ mod tests {
         layout.publish(&id, &registration).unwrap();
         assert!(layout.read_record(&id).unwrap().is_published());
 
-        let bare = BuildVolumeId::mint();
+        let bare = crate::build_volume::mint_build_volume_id();
         fs::write(layout.image(&bare), b"bytes nobody registered").unwrap();
         let error = layout.register(&bare, &registration).unwrap_err();
         assert!(error.message.contains("predate their owner"), "{error:?}");
@@ -1581,7 +1471,7 @@ mod tests {
         // A re-adoption registers under the exclusive claim it already holds: a fresh shared
         // hold on the same file is refused while that claim lives, and the claim alone keeps
         // every release out.
-        let claimed = BuildVolumeId::mint();
+        let claimed = crate::build_volume::mint_build_volume_id();
         let claim = layout.claim_release(&claimed).unwrap().unwrap();
         layout.register_claimed(&claim, &registration).unwrap();
         assert_eq!(
@@ -1619,7 +1509,7 @@ mod tests {
         let main = WorkspaceName::main();
         let incarnation = WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef").unwrap();
         let seed = |created_at: &str, target: &WorkspaceName| {
-            let id = BuildVolumeId::mint();
+            let id = crate::build_volume::mint_build_volume_id();
             fs::write(layout.image(&id), b"").unwrap();
             let mut record = BuildVolumeRecord::new(
                 None,
@@ -1637,7 +1527,7 @@ mod tests {
         let latest = seed("2026-10-05T00:00:01Z", &main);
         seed("2026-10-05T00:00:02Z", &WorkspaceName::new("lane").unwrap());
         // A seed still registered may be partial: it is no seed of anyone until published.
-        let forming = BuildVolumeId::mint();
+        let forming = crate::build_volume::mint_build_volume_id();
         fs::write(layout.image(&forming), b"").unwrap();
         let mut record = BuildVolumeRecord::new(
             None,
@@ -1744,7 +1634,7 @@ mod tests {
         fs::create_dir_all(layout.images()).unwrap();
         let topic = WorkspaceName::new("topic").unwrap();
         let volume = |role: BuildVolumeRole| {
-            let id = BuildVolumeId::mint();
+            let id = crate::build_volume::mint_build_volume_id();
             fs::write(layout.image(&id), b"").unwrap();
             layout
                 .write_record(&id, &BuildVolumeRecord::new(None, role))
@@ -1757,7 +1647,7 @@ mod tests {
         let own = volume(linked(&topic));
         // A first touch the link names, registered and not yet finished: the next refresh
         // finishes it, so the link stays.
-        let touching = BuildVolumeId::mint();
+        let touching = crate::build_volume::mint_build_volume_id();
         fs::write(layout.image(&touching), b"").unwrap();
         layout
             .write_record(
@@ -1771,10 +1661,10 @@ mod tests {
                 .registered(),
             )
             .unwrap();
-        let unregistered = BuildVolumeId::mint();
+        let unregistered = crate::build_volume::mint_build_volume_id();
         fs::write(layout.image(&unregistered), b"").unwrap();
         let adopted = volume(linked(&WorkspaceName::main()));
-        let collected = BuildVolumeId::mint();
+        let collected = crate::build_volume::mint_build_volume_id();
         assert_eq!(
             layout.resolve_link(&topic, &own).unwrap(),
             LinkResolution::Keep
@@ -1800,7 +1690,7 @@ mod tests {
         // A `land --no-retire` that stopped after main adopted the orphan's volume and before
         // the orphan's refork: the orphan reforks from main's latest seed instead of refusing.
         let seed = |created_at: &str| {
-            let id = BuildVolumeId::mint();
+            let id = crate::build_volume::mint_build_volume_id();
             fs::write(layout.image(&id), b"").unwrap();
             layout
                 .write_record(
@@ -1877,7 +1767,7 @@ mod tests {
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
         fs::create_dir_all(layout.images()).unwrap();
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         fs::write(layout.image(&id), b"").unwrap();
         let hold = layout.admit(&id).unwrap();
         assert!(layout.held(&id).unwrap());
@@ -1934,7 +1824,7 @@ mod tests {
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
         fs::create_dir_all(layout.images()).unwrap();
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         fs::write(layout.image(&id), b"").unwrap();
 
         let kept = hold_behind_claim(&layout, &id, || {});
@@ -2030,7 +1920,7 @@ mod tests {
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
         fs::create_dir_all(layout.images()).unwrap();
-        let id = BuildVolumeId::mint();
+        let id = crate::build_volume::mint_build_volume_id();
         fs::write(layout.image(&id), vec![7_u8; 64 * 1024]).unwrap();
         fs::write(layout.record(&id), b"retained ownership").unwrap();
 
@@ -2082,9 +1972,10 @@ mod tests {
         .unwrap();
         let layout = BuildVolumeLayout::new(&project).unwrap();
         fs::create_dir_all(layout.deleting()).unwrap();
-        let image = layout
-            .deleting()
-            .join(format!("{}.dmg", BuildVolumeId::mint()));
+        let image = layout.deleting().join(format!(
+            "{}.dmg",
+            crate::build_volume::mint_build_volume_id()
+        ));
         fs::write(&image, vec![7_u8; 64 * 1024]).unwrap();
         let stray = layout.deleting().join("notes.txt");
         fs::write(&stray, b"not an image").unwrap();
@@ -2101,7 +1992,7 @@ mod tests {
         );
 
         // A dangling entry is not a regular image and is never followed or listed.
-        let refused = layout.released(&BuildVolumeId::mint());
+        let refused = layout.released(&crate::build_volume::mint_build_volume_id());
         std::os::unix::fs::symlink(&stray, &refused).unwrap();
         let listing = released_build_volumes(&store);
         assert_eq!(listing.entries, [image]);
@@ -2152,7 +2043,7 @@ mod tests {
         let topic = WorkspaceName::new("topic").unwrap();
         let other = WorkspaceName::new("other").unwrap();
         let volume = |role: Option<BuildVolumeRole>| {
-            let id = BuildVolumeId::mint();
+            let id = crate::build_volume::mint_build_volume_id();
             fs::write(layout.image(&id), b"").unwrap();
             if let Some(role) = role {
                 layout

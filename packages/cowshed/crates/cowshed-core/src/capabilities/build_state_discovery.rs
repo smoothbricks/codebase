@@ -655,7 +655,7 @@ fn declare(
                      state capability detection already keeps on the build volume",
                     path.display(),
                     tool.checkout.as_path().display(),
-                    crate::build_volume::BuildStateTool::of(tool),
+                    cowshed_types::build_volume::BuildStateTool::of(tool),
                 ),
                 format!(
                     "remove {} from [build] state: declare only tool state no capability detects",

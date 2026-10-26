@@ -10,11 +10,12 @@ use std::io;
 use std::path::Path;
 
 use super::{
-    BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeState, DisplacedBuildStateFinding,
-    Registration, TrackedBuildStateRefusal, discard, link, nx, tracked_source,
+    BuildVolumeLayout, BuildVolumeState, Registration, TrackedBuildStateRefusal, discard, link, nx,
+    tracked_source,
 };
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::{CowshedError, Result};
+use cowshed_types::build_volume::{BuildStateTool, BuildVolumeId, DisplacedBuildStateFinding};
 use cowshed_types::capabilities::BuildStatePath;
 use cowshed_types::image::ImageCapacity;
 
@@ -96,7 +97,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
                 MintedBeside::Volume(minted) if minted.capacity == capacity => (minted.id, None),
                 MintedBeside::Failed(error) => return Err(error),
                 MintedBeside::Nothing | MintedBeside::Volume(_) => {
-                    let id = BuildVolumeId::mint();
+                    let id = crate::build_volume::mint_build_volume_id();
                     let (_, creating) = host
                         .create_build_volume(layout, &id, capacity, &registration)
                         .map_err(storage_error)?;
