@@ -46,7 +46,9 @@ use cowshed_core::storage::bootstrap::{
 use cowshed_core::storage::host_config::{
     RETIRED_LAYOUT_HINT, RetiredLayoutRecord, retired_layout_paths,
 };
-use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_record_sequences};
+use cowshed_core::storage::job_artifact::{
+    ArtifactConfig, ArtifactError, records_lock_held, repair_workspace_record_sequences,
+};
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
 use cowshed_core::storage::recovery::KeptAbandonBundles;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
@@ -5456,11 +5458,12 @@ async fn repair_project_artifacts(project_root: &Path) -> Result<Vec<Finding>> {
         })
         .await
         .map_err(|error| CowshedError::internal(format!("artifact repair task failed: {error}")))?
-        .map_err(|error| {
-            CowshedError::integrity(
+        .map_err(|error| match error {
+            ArtifactError::LockExpired(expired) => records_lock_held(&expired),
+            error => CowshedError::integrity(
                 error.to_string(),
                 "the log was not replaced; create a fresh store if record ordering failed",
-            )
+            ),
         })?;
     }
     Ok(Vec::new())

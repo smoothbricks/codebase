@@ -9004,10 +9004,9 @@ pub(super) fn map_artifact_error(error: ArtifactError) -> CowshedError {
         ArtifactError::HistoryUnprovable { set_aside } => {
             CowshedError::admission_refusal(AdmissionRefusal::Unprovable { set_aside })
         }
-        ArtifactError::LockExpired(_) => CowshedError::environment_missing(
-            error.to_string(),
-            "the process the message names holds the job records lock and was not signalled; cowshed lock-holders names it again",
-        ),
+        ArtifactError::LockExpired(expired) => {
+            crate::storage::job_artifact::records_lock_held(&expired)
+        }
         error => CowshedError::integrity(error.to_string(), "cowshed doctor --json"),
     }
 }

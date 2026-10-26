@@ -40,6 +40,7 @@ use crate::api::resources::{
     ResourceUnitError, StorageIoBytes, StorageIoTotals, StreamBytes, StreamLines,
     UsageReconciliation, VolumeUsage, WallMicros,
 };
+use crate::error::CowshedError;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::{OwnedRepoIds, RepoId};
 use cowshed_os::deadline::{Bound, CONTROL, Expired};
@@ -332,6 +333,16 @@ fn io_error(path: &Path, source: io::Error) -> ArtifactError {
         path: path.to_owned(),
         message: source.to_string(),
     }
+}
+
+/// A records lock another process held past its bound, as every caller reports it: a wait on the
+/// process the census names, which was not signalled, never damage to the store (05_gateway.md,
+/// "Deadlines").
+pub fn records_lock_held(expired: &Expired<LockHolder>) -> CowshedError {
+    CowshedError::environment_missing(
+        expired.to_string(),
+        "the process the message names holds the job records lock and was not signalled; cowshed lock-holders names it again",
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -22287,7 +22287,12 @@ fn workspace_lineage(
             current,
             retained_recovery_budget_bytes,
         )
-        .map_err(|error| CowshedError::integrity(error.to_string(), "cowshed doctor --json"))?;
+        .map_err(|error| match error {
+            crate::storage::job_artifact::ArtifactError::LockExpired(expired) => {
+                crate::storage::job_artifact::records_lock_held(&expired)
+            }
+            error => CowshedError::integrity(error.to_string(), "cowshed doctor --json"),
+        })?;
         marker.lineage = Some(recorded.into_iter().collect());
         marker
             .validate()

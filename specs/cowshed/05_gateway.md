@@ -910,16 +910,17 @@ the handshake bound.
     child, and whatever holds its pipe, is left as it is. Every disk child's run takes both waits
     (`SystemCommandRunner`).
 - **A short lock is a request.** A lock taken for one short critical section is waited for within its class's bound. The
-  job records lock (11_shell.md, "Job control") is held for work the retained recovery budget (64 MiB of records)
-  bounds: an open's recovery of the records, a refresh, one record-sequence allocation and its append, and a
-  checkpoint's hash of the records and its manifest append. Its wait is therefore control class. A free lock is taken
+  job records lock (11_shell.md, "Job control") is held for an open's recovery of the records and its scan of the job
+  directories that stay, a refresh, one record-sequence allocation and its append, and a checkpoint's hash of the
+  records and its manifest append. An open refuses records past the retained recovery budget (64 MiB) and its scan reads
+  one directory entry per job that stays, so each hold is short and its wait is control class. A free lock is taken
   without blocking. A held one is waited for on a helper thread that blocks in `flock(2)` and hands the locked
   descriptor back, so nothing polls. At the bound the wait fails `TIMEOUT`, naming the lock path and its holders as the
-  held-lock census reads them then (02_workspaces.md, "Held locks"); a supervisor answers it as a wait on another
-  process, never as damage to the store. The holder is never signalled, and a lock the helper takes after its waiter
-  left is released at once. The image lease is held for one disk-image command's run, so its wait is class `ffi` bounded
-  by that command's own deadline, 120 s (`DISK_CHILD_DEADLINE`), and it names the pid its holder recorded. The shell is
-  `cowshed-os::flock::exclusive`.
+  held-lock census reads them then (02_workspaces.md, "Held locks"); every caller (the supervisor, doctor's repair, a
+  workspace's lineage read) answers it as a wait on another process, never as damage to the store. The holder is never
+  signalled, and a lock the helper takes after its waiter left is released at once. The image lease is held for one
+  disk-image command's run, so its wait is class `ffi` bounded by that command's own deadline, 120 s
+  (`DISK_CHILD_DEADLINE`), and it names the pid its holder recorded. The shell is `cowshed-os::flock::exclusive`.
 - **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
   with the failure's message.
 
