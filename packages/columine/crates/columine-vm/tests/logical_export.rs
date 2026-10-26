@@ -193,13 +193,13 @@ fn borrowed_text_import_matches_owned_without_a_text_allocation() {
     borrowed.rows.push(row(
         LogicalValue::Text(Cow::Borrowed(&key)),
         vec![Some(LogicalValue::Text(Cow::Borrowed(&value)))],
-        None,
+        Some(13.0),
     ));
     let mut owned = base_slot(0, SlotType::HashMap);
     owned.rows.push(row(
         LogicalValue::Text(Cow::Owned(key.clone())),
         vec![Some(LogicalValue::Text(Cow::Owned(value.clone())))],
-        None,
+        Some(13.0),
     ));
     let mut borrowed_image = fresh_image(&prog);
     let mut owned_image = fresh_image(&prog);
@@ -212,8 +212,9 @@ fn borrowed_text_import_matches_owned_without_a_text_allocation() {
             assert_eq!(text.as_ptr(), key.as_ptr());
             std::hint::black_box(copy);
         }
-        import_slot(&mut borrowed_image, &borrowed, &enc, &mut interner).expect("borrowed import");
-    });
+        import_slot(&mut borrowed_image, &borrowed, &enc, &mut interner)
+    })
+    .expect("borrowed import");
     import_slot(&mut owned_image, &owned, &enc, &mut interner).expect("owned import");
     assert_eq!(borrowed_image, owned_image);
     assert_eq!(
