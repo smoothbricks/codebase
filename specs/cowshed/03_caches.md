@@ -201,13 +201,14 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   reach the personal session); personal-session devices appear as explicitly-named remote targets and route through the
   gateway's `/sim/` endpoint (05_gateway.md) under the `sim` grant axis (04_sandbox.md). Tools that hardcode
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
-- **Cargo reads its budget from its holder, never from a `cargo` of cowshed's** (2026-10-19, Danny: why need cargo
-  wrappers, rather than configure it properly; tg#6787). `cargo` in the managed environment is the project toolchain's
-  own; nothing installed answers to the name, and an install removes the `cargo` link earlier installs planted
-  (05_gateway.md, "The installed cowshed"). A CPU grant reaches Cargo as the variables Cargo already reads, exported by
-  the process that holds the grant: `CARGO_MAKEFLAGS` and `MAKEFLAGS` naming the grant's make jobserver fifo, and
-  `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its count where unset (05_gateway.md, "Cargo reads its holder's
-  jobserver"). A Cargo no holder started — a host shell's, rust-analyzer's — runs exactly as Cargo does unconfigured.
+- **Cargo reads its budget from its holder, never from a `cargo` of cowshed's** (2026-10-19, after the owner asked on
+  2026-10-17 why cargo wrappers are needed, rather than configuring it properly). `cargo` in the managed environment is
+  the project toolchain's own; nothing installed answers to the name, and an install removes the `cargo` link earlier
+  installs planted (05_gateway.md, "The installed cowshed"). A CPU grant reaches Cargo as the variables Cargo already
+  reads, exported by the process that holds the grant: `CARGO_MAKEFLAGS` and `MAKEFLAGS` naming the grant's make
+  jobserver fifo, and `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its count where unset (05_gateway.md, "Cargo
+  reads its holder's jobserver"). A Cargo no holder started — a host shell's, rust-analyzer's — runs exactly as Cargo
+  does unconfigured.
 - **Tool homes stay where the tool keeps them.** Every layer-3 cache lives at its tool's own default location in the
   host user's HOME, the one place the host's own tools already use without configuration, and cowshed shares that exact
   path into the sandbox of every project whose detector names the tool (15_capabilities.md). There is no cache volume,
@@ -240,7 +241,7 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   Restoration classifies a developer's package links against these same roots, and grants nothing for them: the
   controller derives each root from the host home (`BUN_HOME` and `PNPM_HOME` through `host_path`), and a job's wrapper
   reads the variables the sandbox was given. A link into a root is the installer's own entry, and a link to a real
-  directory outside every root, such as a sibling checkout's package at `~/Dev/pnpm/store/pkg`, stays a developer
+  directory outside every root, such as a sibling checkout's package at `<checkouts>/pnpm/store/pkg`, stays a developer
   binding. An unset variable leaves its root inactive, and a present root that is empty or relative is refused.
 
   **Repository-placed caches.** A cache that no detector names — one a repository's own tooling places, such as a
@@ -476,13 +477,13 @@ to that backend. A hash in one project cannot name another project's archive.
 The gateway service owns the backend lifecycle, outside every workspace sandbox, using an installed copy of the
 package's server bundle rather than a workspace's source files. The package ships that bundle as one
 platform-independent JavaScript file, `dist/server/nx-cache-server.js`, and no compiled executables; cowshed bundles no
-interpreter (tg#7504). Setup installs a content-addressed copy of the bundle and records where its invoker's `PATH`
-finds `bun`, named as a devenv or nix profile and never as a store path (05_gateway.md), so that `bun` is the one the
-gateway runs. One process exclusively owns each entries directory, and binds loopback only; its configuration is
-host-owned, and no repository, workspace child environment, or sandbox receives a filesystem grant to the store. Every
-checkout reads its project's results. Only a land publishes: after its gate passes it stores every task result its gate
-attributed, local hits included, without rebuilding (05_gateway.md, "Publication"). There is no scratch store, and a
-shed's read-only Nx client builds no archive and sends no `PUT`.
+interpreter (the owner's ruling, 2026-10-18). Setup installs a content-addressed copy of the bundle and records where
+its invoker's `PATH` finds `bun`, named as a devenv or nix profile and never as a store path (05_gateway.md), so that
+`bun` is the one the gateway runs. One process exclusively owns each entries directory, and binds loopback only; its
+configuration is host-owned, and no repository, workspace child environment, or sandbox receives a filesystem grant to
+the store. Every checkout reads its project's results. Only a land publishes: after its gate passes it stores every task
+result its gate attributed, local hits included, without rebuilding (05_gateway.md, "Publication"). There is no scratch
+store, and a shed's read-only Nx client builds no archive and sends no `PUT`.
 
 The installed gateway starts the backend as `bun <installed bundle> --exit-on-stdin-eof`, `bun` resolved on that
 recorded `PATH` at each start (none found is a start failure said as one), and retains the write end of its stdin pipe
@@ -553,8 +554,8 @@ toolchain inputs. With a warm cache holding a valid entry for each key, a land g
 landed commits (or a changed runtime or toolchain input) changed, plus the targets that state `"cache": false`, each for
 a reason its configuration names; a re-gate of an unchanged tree runs those uncached targets alone. A cold, evicted or
 unreachable entry runs its task again, as a cache degrade does (Nx accepted-task artifact service, above). Six rules
-keep the key no wider than what a task observes, each learned from a measured miss (2026-10-22, tg#9675: twenty minutes
-of gate for a one-line change).
+keep the key no wider than what a task observes, each learned from a measured miss (2026-10-22, the owner's report:
+twenty minutes of gate for a one-line change).
 
 - **A target split from a cached target states its own cache.** Nx caches a target only when its own configuration or a
   `targetDefaults` entry for its exact name says so; `targetDefaults.test` keys the target named `test` and no other.
@@ -575,7 +576,7 @@ of gate for a one-line change).
   key on `cargoClosure`. `smoo monorepo validate` refuses a `production` entry beneath `{projectRoot}/crates`, ending in
   `.rs` or naming a `Cargo.toml`, and `smoo monorepo update` removes it. While a consumer workspace's `production` named
   `{projectRoot}/crates/**/*`, one Rust integration test (`crates/<crate>/tests/*.rs`) re-keyed 237 TypeScript tasks,
-  the lint, typecheck, test and tsc-js of about 31 projects, in one land (2026-10-23, tg#9767).
+  the lint, typecheck, test and tsc-js of about 31 projects, in one land (2026-10-23, the owner's report).
 - **A gate's runners size their own test threads.** The gate's orchestrator holds one CPU token and its pool relays
   every runner's ask to the host, so it exports no `RUST_TEST_THREADS`/`NEXTEST_TEST_THREADS` (05_gateway.md, "The
   holder exports it"). While it exported 1, every Rust suite in every gate ran on one thread: `tokens=1/1` in each

@@ -3702,7 +3702,7 @@ impl JobCpuAdmission for ShareCpu {
 /// attachment"). One that names no want resolves to the background share of whichever
 /// supervisor admits it, and that share may differ from one supervisor to the next, so a replay
 /// that names none is the same request and answers its one job; a replay that names the share
-/// the first admission resolved to is another request. Measured in train j's land gate: a
+/// the first admission resolved to is another request. Measured in a land gate: a
 /// replay compared by its resolved want was refused as a want change.
 #[tokio::test]
 async fn a_keyed_exec_that_names_no_want_answers_its_one_job_whatever_share_each_supervisor_has() {
@@ -9772,7 +9772,7 @@ fn native_process_fixture(
 /// drops it: the draining window the test asserts in is the test's, not the retirement grace's.
 /// Retirement sends the child TERM and, a grace later, KILL; a child the host does not schedule
 /// within that grace never answers the TERM, so the answer is optional and the child's end -- its
-/// socket closing -- is the event the test waits for. In train 5's gate the test, then requiring
+/// socket closing -- is the event the test waits for. In a land gate the test, then requiring
 /// the answer, read `early eof`: the child had ended at the KILL without answering. `starved`
 /// makes that order certain: the child blocks SIGTERM, so the TERM stays pending and the KILL ends
 /// it unanswered. Stopping the child instead is no starvation: once the leader exits, the kernel
@@ -10031,7 +10031,7 @@ async fn cancellation_reaps_a_descendant_that_started_a_new_session() {
     terminal_descendant_reproduction(true, true, false, false).await;
 }
 
-/// Train 5's gate order: the host does not run the fixture child again before retirement's KILL.
+/// The land gate's order: the host does not run the fixture child again before retirement's KILL.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn terminal_reaps_a_descendant_the_host_does_not_run_within_the_grace() {

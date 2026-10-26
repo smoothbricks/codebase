@@ -5708,9 +5708,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             checked.capture(source_mount, check, spawned, exited)?;
         }
         // A passed gate is the project Nx cache's only writer (05_gateway.md "`/nx/v1/cache/{hash}`";
-        // Danny tg#1782): each attributed run's task results go from this checkout's own cache to
-        // the project's store. The cache never blocks a land, so a failed publish is said, and the
-        // land goes on.
+        // the owner's ruling, 2026-10-10): each attributed run's task results go from this checkout's
+        // own cache to the project's store. The cache never blocks a land, so a failed publish is
+        // said, and the land goes on.
         for run in &checked.runs {
             match publish_nx_run(&handle, build_volume.clone(), source_mount, run).await {
                 Ok(published) => cowshed_os::eprintln!(

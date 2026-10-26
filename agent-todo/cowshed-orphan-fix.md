@@ -1,7 +1,7 @@
 # Cowshed orphan fix: parked NACK
 
 Review custody: coder shed `cowshed-orphan-fix`, fix `f1691b0fb4940dd46cbf9ed9d8f7b3301db85789` on original `54a42b051`,
-base `65597b49a`. Main parks this unit; it is not accepted for landing. No repair is made by this note.
+base `65597b49a`. The lead parks this unit; it is not accepted for landing. No repair is made by this note.
 
 1. **Known non-APFS volumes are missed.** `packages/cowshed/crates/cowshed-core/src/orphaned_project.rs:49–55`
    implements `SystemVolumes::registered` using only `registered_apfs_containers`. A system-known but unmounted
@@ -18,11 +18,11 @@ base `65597b49a`. Main parks this unit; it is not accepted for landing. No repai
    `specs/cowshed/02_workspaces.md` §`cowshed rm <ws>`, lines977–979 (attachment under any alias refuses), and
    `specs/cowshed/01a_apfs.md` §Mounts, the per-image lease paragraph (exact image identity and leases).
 
-3. **`project_runtime` behavioral proof is outstanding.** The fixer's report (`history://OrphanFix2Opus`) records all
-   nine selected tests failing before test code because the exec sandbox denies `/private/tmp`.
+3. **`project_runtime` behavioral proof is outstanding.** The fixer's report records all nine selected tests failing
+   before test code because the exec sandbox denies `/private/tmp`.
    `packages/cowshed/crates/cowshed-core/tests/support/temp_root.rs:5–24` fixes the parent to `/tmp`; changing TMPDIR
-   cannot redirect it. The known failure is not rerun. Per Main's ruling, this proof runs host-side through its owning
-   Nx bounded-exec target, not raw host Cargo or another sandbox-denied attempt. Governing authority:
+   cannot redirect it. The known failure is not rerun. Per the lead's ruling, this proof runs host-side through its
+   owning Nx bounded-exec target, not raw host Cargo or another sandbox-denied attempt. Governing authority:
    `specs/cowshed/08_testing.md` §Host-controller authority, lines94–136; `specs/cowshed/04_sandbox.md` §Layered
    Sandbox, lines3–9 (an inner profile cannot widen the enclosing supervisor). No host-side run is performed in this
    review.

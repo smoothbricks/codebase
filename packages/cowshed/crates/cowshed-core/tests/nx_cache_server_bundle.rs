@@ -1,5 +1,5 @@
-//! The nx-cache-server ships as one bundle that Bun runs from PATH (tg#7504), and the manifest
-//! guard reads the repository at runtime rather than at compile time.
+//! The nx-cache-server ships as one bundle that Bun runs from PATH (the owner's ruling, 2026-10-18),
+//! and the manifest guard reads the repository at runtime rather than at compile time.
 
 use cowshed_os::test_backstop::CommandBackstop as _;
 use std::path::{Path, PathBuf};
@@ -76,10 +76,10 @@ fn read_manifest(path: &Path) -> Value {
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
-/// The server ships as one platform-independent bundle that Bun runs from `PATH` (tg#7504): the
-/// nx-cache-server package publishes `dist/server` and no `dist/bin`, and no cowshed CLI build
-/// depends on, hashes, or copies an nx-cache-server artifact. All four platforms are checked; a
-/// single target is not enough.
+/// The server ships as one platform-independent bundle that Bun runs from `PATH` (the owner's
+/// ruling, 2026-10-18): the nx-cache-server package publishes `dist/server` and no `dist/bin`, and
+/// no cowshed CLI build depends on, hashes, or copies an nx-cache-server artifact. All four
+/// platforms are checked; a single target is not enough.
 #[test]
 fn cli_targets_carry_no_nx_cache_server_and_the_server_ships_its_bundle() {
     let root = repository_root();

@@ -55,7 +55,7 @@ export function pathspecFiles(workspaceRoot: string, pathspecs: readonly string[
 /**
  * The workspace files a Cargo dep-info file names, workspace-relative. Dep-info paths are absolute in whichever
  * checkout compiled the artifact, which for a target directory cloned with its checkout is a sibling clone (measured:
- * a shed's `target/` naming `sb-train-20261020f` paths), and may climb out of a crate (`src/../../../package.json`).
+ * a shed's `target/` naming another shed's paths), and may climb out of a crate (`src/../../../package.json`).
  * So each path is normalized and split into a clone root and the longest tracked path it ends with, and only paths
  * under the clone root most paths share are taken: a registry file whose tail happens to match a tracked path is not.
  * Paths outside the clone (the registry, the toolchain) are not inputs this checkout can change and are left to

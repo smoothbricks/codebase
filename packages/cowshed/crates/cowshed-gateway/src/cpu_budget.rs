@@ -1721,14 +1721,14 @@ mod tests {
         assert!(clock.balanced());
     }
 
-    /// Danny tg#9527, measured 2026-10-22: no gate job ran, background was capped at 9 of 18 tokens,
-    /// one shed held all 9, and three other sheds waited while 9 tokens idled. Background now takes
-    /// every token while no gate-class work holds or waits. The trade: a grant made then cannot
-    /// shrink, so a gate that arrives later is no longer granted in its own ask, as it was under the
-    /// half cap (2026-10-19: a lone `cargo nextest run` granted 17 of 18 sat at 0% CPU for 50
-    /// minutes beside a land's gate on one token). It takes back its share from the returned tokens:
-    /// each goes to gate-class work first, background keeping only its floor token, with no kill and
-    /// no timer.
+    /// The owner's ruling, 2026-10-22, from a measurement: no gate job ran, background was capped at
+    /// 9 of 18 tokens, one shed held all 9, and three other sheds waited while 9 tokens idled.
+    /// Background now takes every token while no gate-class work holds or waits. The trade: a grant
+    /// made then cannot shrink, so a gate that arrives later is no longer granted in its own ask, as
+    /// it was under the half cap (2026-10-19: a lone `cargo nextest run` granted 17 of 18 sat at 0%
+    /// CPU for 50 minutes beside a land's gate on one token). It takes back its share from the
+    /// returned tokens: each goes to gate-class work first, background keeping only its floor
+    /// token, with no kill and no timer.
     #[test]
     fn a_gate_arriving_after_background_filled_the_host_takes_the_returned_tokens_first() {
         let mut clock = Clock::new(18);
@@ -2182,7 +2182,7 @@ mod tests {
         assert!(clock.balanced());
     }
 
-    /// Measured 2026-10-26 on the train-6 install: one gate job holding 1 token, asking nothing
+    /// Measured 2026-10-26 on the installed build: one gate job holding 1 token, asking nothing
     /// more, left 17 background asks queued with 9 of 18 tokens free. With no gate ask queued,
     /// background takes the free tokens it wants beside the gate; a gate ask that queues is served
     /// first from the returned tokens.
@@ -2376,12 +2376,12 @@ mod tests {
 
     proptest! {
         /// Admission is work-conserving and serves gates first (05_gateway.md "Room for a gate",
-        /// Danny tg#9527, tg#11040). Over any host size and sequence of background asks, gate asks
-        /// and departures: a gate-class request never waits beside a free token, so a gate that
-        /// arrives after background filled the host takes the next returned one; and a token stays
-        /// free while background waits only when two or more checkouts wait and a waiting request
-        /// wants more than the free tokens, whether or not gate work holds tokens, so background
-        /// may hold every token no gate ask waits for.
+        /// the owner's rulings, 2026-10-22 and 2026-10-26). Over any host size and sequence of
+        /// background asks, gate asks and departures: a gate-class request never waits beside a free
+        /// token, so a gate that arrives after background filled the host takes the next returned
+        /// one; and a token stays free while background waits only when two or more checkouts wait
+        /// and a waiting request wants more than the free tokens, whether or not gate work holds
+        /// tokens, so background may hold every token no gate ask waits for.
         #[test]
         fn background_takes_every_free_token_without_gate_work_and_a_waiting_gate_takes_them_first(
             total in 1..13usize,

@@ -51,11 +51,11 @@ needed selector:
 
 Prefer these smaller files beneath `$EVIDENCE_ROOT`:
 
-- `shed-orphan-axe2-20261014.json` (15 KB): structured recovery dispositions; query with `jq '.counts'` or `jq '.sheds'`
+- `shed-orphan-*-20261014.json` (15 KB): structured recovery dispositions; query with `jq '.counts'` or `jq '.sheds'`
   rather than reading whole.
 - `orphan-rest-held-20261014.json` (55 KB): held remainder; query `jq '.sheds'`.
-- `sb-orphan-recovery-sol-20261014.md` (13 KB): all 27 source dispositions.
-- `sb-orphan-dependency-plans-sol-20261014.md` (337 KB): exact prerequisite/conflict quotations; grep the requested shed
+- `sb-orphan-recovery-*-20261014.md` (13 KB): all 27 source dispositions.
+- `sb-orphan-dependency-plans-*-20261014.md` (337 KB): exact prerequisite/conflict quotations; grep the requested shed
   and read that section, not the whole file.
 
 The split’s §§Method and meaning of labels, Self-contained y/n, ORPHAN TABLE and ordered lists govern classification.

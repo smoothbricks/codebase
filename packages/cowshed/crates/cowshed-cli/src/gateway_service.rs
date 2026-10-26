@@ -1223,8 +1223,8 @@ pub fn gateway_launch_agent(
 
 /// The `bun` this invocation's `PATH` provides, for the gateway agent's `PATH`, named as a profile
 /// nix or devenv keeps ([`BunDirectory`]). No `bun`, or one only a bare store path names, is a setup
-/// error refused before anything is installed: cowshed bundles no interpreter (tg#7504), and keeps
-/// no store path alive for one.
+/// error refused before anything is installed: cowshed bundles no interpreter (the owner's ruling,
+/// 2026-10-18), and keeps no store path alive for one.
 fn invoking_bun() -> Result<BunDirectory> {
     BunDirectory::on_path(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -2277,7 +2277,8 @@ pub enum Downgrade {
 }
 
 /// Where `@smoothbricks/nx-cache-server` keeps its server: one JavaScript bundle (its `bundle`
-/// target), the same on every platform, run by the gateway's `bun` (tg#7504).
+/// target), the same on every platform, run by the gateway's `bun` (the owner's ruling,
+/// 2026-10-18).
 const NX_CACHE_SERVER_BUNDLE: &str =
     "node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js";
 
@@ -2290,7 +2291,7 @@ const NX_CACHE_SERVER_BUNDLE: &str =
 /// ancestor. That covers an isolated Bun store, a hoisted install and a checkout's workspace link
 /// alike. Neither package carries a compiled server: four `bun build --compile` binaries put
 /// cowshed's tarball over npm's ceiling (Publish run 39150196802), and an interpreter is the
-/// shell's to provide (tg#6789).
+/// shell's to provide (the owner's ruling, 2026-10-17).
 fn packaged_nx_cache_server(
     installed: &HostStableExecutable,
     cowshed_source: &Path,
@@ -5276,7 +5277,7 @@ mod tests {
         }
 
         /// The count reports background holding the whole host as held 18/18, and names no cap
-        /// (Danny tg#9527).
+        /// (the owner's ruling, 2026-10-22).
         #[test]
         fn the_count_reports_background_holding_the_whole_host() {
             let GatewayCpuBudget::Ledger(mut ledger) =

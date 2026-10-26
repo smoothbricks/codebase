@@ -52,7 +52,7 @@ source or the public IOKit implementation. We neither claim it does nor kill hel
 
 ## Exact post-reboot run
 
-From the existing `nx-error-cause-sol` shed, with other disk-image test lanes stopped:
+From an existing shed, with other disk-image test lanes stopped:
 
 ```sh
 python3 packages/cowshed/scripts/disk-image-control.py "$PWD/target/debug/cowshed" "$PWD/.cache"

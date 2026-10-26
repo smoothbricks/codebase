@@ -7,8 +7,8 @@ exact-head/task-hash landing eligibility belong to `05_gateway.md` and `16_build
 
 ## Start and supervise
 
-`nx-cache-server` runs the published `dist/ts/main.js` with Bun. The package ships no standalone executables (tg#7504):
-its `bundle` target, part of the release `build`, writes one platform-independent file,
+`nx-cache-server` runs the published `dist/ts/main.js` with Bun. The package ships no standalone executables (the
+owner's ruling, 2026-10-18): its `bundle` target, part of the release `build`, writes one platform-independent file,
 `dist/server/nx-cache-server.js`, which runs as `bun dist/server/nx-cache-server.js` with the `bun` found on `PATH`.
 Cowshed's setup installs a content-addressed copy of that bundle, and its gateway runs the copy with the `bun` on the
 `PATH` that setup recorded, so supervision uses the installed artifact, not a workspace source path. One process owns

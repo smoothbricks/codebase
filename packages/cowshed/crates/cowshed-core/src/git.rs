@@ -5543,7 +5543,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn config_include_paths_follow_git_syntax() {
-        let config = "[core]\n\tpath = not-an-include\n[include]\n\tpath = ../tooling/a.gitconfig ; comment\n[Include] PATH = \"b c.gitconfig\"\n[includeIf \"gitdir:~/Dev/]x\"]\n\tpath = ~/work.gitconfig\n\tother = d\n[user]\n\tname = x\n";
+        let config = "[core]\n\tpath = not-an-include\n[include]\n\tpath = ../tooling/a.gitconfig ; comment\n[Include] PATH = \"b c.gitconfig\"\n[includeIf \"gitdir:~/src/]x\"]\n\tpath = ~/work.gitconfig\n\tother = d\n[user]\n\tname = x\n";
         assert_eq!(
             super::config_include_paths(config),
             [

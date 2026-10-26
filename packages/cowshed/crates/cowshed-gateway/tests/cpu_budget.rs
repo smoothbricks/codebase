@@ -615,10 +615,11 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
     gateway.drain().await.expect("drain");
 }
 
-/// Danny tg#9527 over the socket (05_gateway.md "Room for a gate"): with no gate work a background
-/// run takes the whole host, so a land's gate job that arrives then queues, since no grant
-/// shrinks. When the run returns its tokens, the background checkout holding nothing keeps its
-/// floor token and the gate job and its task take all the rest, with no kill and no timer.
+/// The owner's ruling of 2026-10-22 over the socket (05_gateway.md "Room for a gate"): with no
+/// gate work a background run takes the whole host, so a land's gate job that arrives then queues,
+/// since no grant shrinks. When the run returns its tokens, the background checkout holding
+/// nothing keeps its floor token and the gate job and its task take all the rest, with no kill and
+/// no timer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gate_arriving_after_background_filled_the_host_takes_the_returned_tokens_first() {
     let (gateway, _root, socket) = gateway(8).await;

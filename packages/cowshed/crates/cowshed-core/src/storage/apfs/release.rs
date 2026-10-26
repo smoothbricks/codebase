@@ -83,7 +83,7 @@ pub const STEP_FLOOR: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(6
 /// How long one cut of the gateway's cleanup may hold the store's container before the next cut
 /// is made smaller ([`next_cut`]).
 ///
-/// Measured 2026-10-26 on the train-6 install, the cleanup draining 99 released images (18.2 TB
+/// Measured 2026-10-26 on the installed build, the cleanup draining 99 released images (18.2 TB
 /// allocated) back to back at 1,024 runs a cut: 206 cuts in 45 s, most 0.07 to 0.2 s, five of
 /// 1.05 to 5.49 s, while build-volume mounts sat over 120 s in `mount(2)` and forks failed at
 /// them. A fixed run count bounds reclamation work, not how long one call holds the container.

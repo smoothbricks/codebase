@@ -23,11 +23,11 @@ pub const TASK_TERMINAL_OP: &str = "task-terminal";
 /// The control operation that reports the scheduler's queue.
 pub const TASK_QUEUE_OP: &str = "task-queue";
 
-/// What a work unit runs as: one row of specs/cowshed/05_gateway.md "Bands" (Danny tg#6693).
-/// Interactive is work a person or model is waiting on; gate is the land's gate job and the work
-/// it relays, the land turn's holder included; background is every other unit. Gate-class work is
-/// ordered first for CPU; interactive and background work wait behind it while the host is busy
-/// and run at parity when it is not.
+/// What a work unit runs as: one row of specs/cowshed/05_gateway.md "Bands" (the owner's ruling,
+/// 2026-10-17). Interactive is work a person or model is waiting on; gate is the land's gate job and
+/// the work it relays, the land turn's holder included; background is every other unit. Gate-class
+/// work is ordered first for CPU; interactive and background work wait behind it while the host is
+/// busy and run at parity when it is not.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskClass {

@@ -53,7 +53,8 @@ pub const LAUNCHD_DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// shell puts its own profile on `PATH` as the immutable store path it evaluated
 /// (`DEVENV_PROFILE`), and that entry becomes the profile link devenv re-points on activation and
 /// roots with the shell (`$DEVENV_DOTFILE/profile`, see [`DevenvProfile`]). Any other store entry
-/// is refused by name. cowshed carries no interpreter of its own (tg#7504, tg#6789).
+/// is refused by name. cowshed carries no interpreter of its own (the owner's rulings, 2026-10-17
+/// and 2026-10-18).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BunDirectory(PathBuf);
 

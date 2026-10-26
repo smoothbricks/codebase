@@ -632,9 +632,9 @@ impl Ledger {
     }
 }
 
-/// The order's class rank (05_gateway.md "Bands", Danny tg#6693: "the gate class is served FIFO
-/// at highest priority over all other execs"): gate-class work first, interactive and background
-/// work behind it while the host is busy and at parity when it is not.
+/// The order's class rank (05_gateway.md "Bands", the owner's ruling, 2026-10-17: "the gate class
+/// is served FIFO at highest priority over all other execs"): gate-class work first, interactive
+/// and background work behind it while the host is busy and at parity when it is not.
 fn order_band(facts: &TaskFacts, busy: bool) -> u8 {
     match facts.class {
         TaskClass::Gate => 0,
@@ -1074,11 +1074,11 @@ mod tests {
         assert_eq!(busy.ready(0, BUSY), ["z-gate", "a-bg"]);
     }
 
-    /// The band regression (05_gateway.md "Bands", Danny tg#6693: interactive above gate above
-    /// regular exec, the gate first for CPU). The wrong results it rules out: a background unit
-    /// reported in the gate's band on a quiet host, the land turn's holder reported foreground
-    /// above work a person or model is waiting on, and an interactive unit ordered for CPU ahead
-    /// of gate work on a busy host.
+    /// The band regression (05_gateway.md "Bands", the owner's ruling, 2026-10-17: interactive
+    /// above gate above regular exec, the gate first for CPU). The wrong results it rules out: a
+    /// background unit reported in the gate's band on a quiet host, the land turn's holder reported
+    /// foreground above work a person or model is waiting on, and an interactive unit ordered for
+    /// CPU ahead of gate work on a busy host.
     #[test]
     fn every_unit_runs_in_its_class_band_and_gate_work_is_ordered_first() {
         let mut clock = Clock::new(30_000);

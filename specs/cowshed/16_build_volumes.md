@@ -1408,13 +1408,13 @@ the same unit-identity environment. Concretely:
   dev shell disables devenv's C tools, uses a compiler-free stdenv, and removes only the Rust toolchain's propagated Nix
   compiler while retaining the pinned components and their runtime dependencies. Linux retains its existing C tools,
   stdenv and toolchain propagation.
-- **Two profiles.** `dev`, which includes unit tests, and `release`, for a released binary. `test` inherits `dev`.
-  Danny, 2026-09-30: "BUILD EVERYTHING ONCE. CARGO ALREADY TRACKS CHANGES AND REBUILDS WHAT HAS CHANGED"; "You have
-  realistically 2 profiles: dev (which includes unit testing) and release". 03_caches.md states the profile rule.
+- **Two profiles.** `dev`, which includes unit tests, and `release`, for a released binary. `test` inherits `dev`. The
+  owner's ruling, 2026-09-30: "BUILD EVERYTHING ONCE. CARGO ALREADY TRACKS CHANGES AND REBUILDS WHAT HAS CHANGED"; "You
+  have realistically 2 profiles: dev (which includes unit testing) and release". 03_caches.md states the profile rule.
 - **sccache is for dependencies and CI, never dev targets.** Incremental workspace units are not cacheable by sccache;
-  the wrapper does not change fingerprints either way. Danny, 2026-09-30: "sccache is for CI and stable crates, not for
-  dev targets". Host shells receive the detector's exact pinned client, endpoints and request bases through
-  `.cowshed/env`, matching supervisor children; absent pinned clients unset stale wrapper settings.
+  the wrapper does not change fingerprints either way. The owner's ruling, 2026-09-30: "sccache is for CI and stable
+  crates, not for dev targets". Host shells receive the detector's exact pinned client, endpoints and request bases
+  through `.cowshed/env`, matching supervisor children; absent pinned clients unset stale wrapper settings.
 - **Every use of a unit is recorded.** `CARGO_UNSTABLE_MTIME_ON_USE=true` (`-Zmtime-on-use`) makes a build stamp the
   fingerprint hash file of every unit it uses, `Fresh` ones included. Cargo output retention
   (`packages/nx-plugin/README.md`, "Cargo Workspace Layouts") reads that stamp as the unit's last use; without it a

@@ -11,7 +11,7 @@ Base: `c0e3d162fb20d5835ae90bbd29844d24e2a26b01`. Changed paths:
 - `specs/cowshed/16_build_volumes.md`: document the bound and existing manifest-fingerprint cache. No new
   service/schema; carry holds, journal identity, and failure fences remain unchanged.
 
-Recovery patch: `local://astra-carry-discovery-source.patch`. Do not reapply it over the edited shed.
+Recovery patch: held in the blocked session's record, not in this repository. Do not reapply it over the edited shed.
 
 - **85 manifests: 6.433s serial → 2.619s changed driver**, same activated environment, byte-identical answers.
 - Nine-query driver regression **passed**: concurrent execution, reordered completion, failure reporting, and partial
@@ -19,9 +19,8 @@ Recovery patch: `local://astra-carry-discovery-source.patch`. Do not reapply it 
 - Real `rustfmt --edition 2024` and repository Prettier **passed**. Native edits followed two icm formatter refusals
   caused by missing child `HOME`; no icm publication or hook bypass is claimed.
 
-Evidence files: `local://astra-carry-driver-proof.json`, `local://astra-carry-discovery-steady.json`,
-`local://astra-carry-metadata-proof.json`, and `local://astra-carry-activation-before.json`. icm refusals:
-`artifact://290335`, `artifact://290388`.
+Evidence files (the driver proof, the steady-state discovery run, the metadata proof and the activation before) and the
+two icm refusals are held in the same session record.
 
 Parallel discovery alone is not proved to fix the original 300s carry timeout. No cross-checkout shell-export cache was
 added; the current cache-isolation contract forbids replaying another checkout's executable environment.
@@ -30,14 +29,14 @@ added; the current cache-isolation contract forbids replaying another checkout's
 
 Fork publication timed out during build-image attachment. The mounted clone still has its inherited main build link, as
 expected before `finish_fork`; the normal commit hook then failed with `ENOENT` under `.cache/ttsc/plugins`. No commit
-was produced and no Cargo build ran against that inherited volume. Doctor record: `artifact://289969`.
+was produced and no Cargo build ran against that inherited volume. The doctor record is held in the same session record.
 
 Retain both pending roots, neither contained nor safe to remove:
 
 - `<source-shed>`: mounted source clone holding the two edited paths.
 - `<carry-probe-shed>` in the consumer project: scratch fork request; no completed workspace reported.
 
-Exact root identities and custody: `local://carry-discovery-custody.json`.
+Exact root identities and custody: held in the same session record.
 
 ## Resume only after the lifecycle hold is released
 

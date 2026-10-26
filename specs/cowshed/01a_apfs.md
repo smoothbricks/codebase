@@ -1074,7 +1074,7 @@ instead frees at normal disk priority and cuts from the end with `ftruncate(2)`,
 cut**, then unlinks the empty file. The gateway's cleanup starts each entry at 1,024 runs and sizes each next cut by the
 time the one before it takes: past 100 ms (`CUT_TARGET`) the next cut is halved, down to 64 runs (`STEP_FLOOR`), and
 under 50 ms it is doubled, up to 1,024 (`next_cut`), so a cut that holds the container long is followed by smaller ones.
-Measured 2026-10-26 on the train-6 install, draining 99 released images back to back at a fixed 1,024 runs a cut: 206
+Measured 2026-10-26 on the installed build, draining 99 released images back to back at a fixed 1,024 runs a cut: 206
 cuts in 45 s, most 0.07 to 0.2 s, five of 1.05 to 5.49 s, while build-volume mounts sat over 120 s in `mount(2)` and
 forks failed at them. The run count bounds reclamation work, **not a wall-time bound**: no size bounds one call's wall
 time. The file length remains the restart journal (16_build_volumes.md, "Garbage collection"). That bounded release runs

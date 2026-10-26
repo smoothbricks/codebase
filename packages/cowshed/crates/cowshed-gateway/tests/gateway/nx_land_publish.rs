@@ -1,10 +1,10 @@
-//! A land's publish end to end (05_gateway.md "`/nx/v1/cache/{hash}`"; Danny tg#1782, tg#10456).
-//! Shed A's stock Nx reads the project's cache and never stores to it. The land of A then runs
-//! the publish `cowshed land` runs after its gate passed: the same script, `node - <root>
-//! <hashes>`, over the task hashes `attribute` gives the land for A's run. Shed B of the project,
-//! at the same inputs, then restores the task from the cache and executes nothing. One real
-//! `Gateway` with one real nx-cache-server, the stock Nx client in two fixture checkouts, and no
-//! credential anywhere.
+//! A land's publish end to end (05_gateway.md "`/nx/v1/cache/{hash}`"; the owner's rulings,
+//! 2026-10-10 and 2026-10-25). Shed A's stock Nx reads the project's cache and never stores to it.
+//! The land of A then runs the publish `cowshed land` runs after its gate passed: the same script,
+//! `node - <root> <hashes>`, over the task hashes `attribute` gives the land for A's run. Shed B of
+//! the project, at the same inputs, then restores the task from the cache and executes nothing. One
+//! real `Gateway` with one real nx-cache-server, the stock Nx client in two fixture checkouts, and
+//! no credential anywhere.
 use super::*;
 use cowshed_os::test_backstop::AsyncChildBackstop as _;
 

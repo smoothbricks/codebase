@@ -182,7 +182,7 @@ Nx 23.2.1's native self-hosted cache client (`HttpRemoteCache`) sets no timeout 
 `Failed to send request: …`; the task runner awaits it unguarded, so an unreachable cache failed the whole run and a
 server that accepts and never answers held it forever. Measured 2026-10-22: every Nx run in the affected sheds exited 1
 with `Failed to send request … http://127.0.0.1:<port>/nx/v1/cache/<hash>` while a host-wide APFS stall held the
-gateway's cache server. Cache downtime must never stop work (Danny tg#6894, tg#6926, tg#6940;
+gateway's cache server. Cache downtime must never stop work (the owner's ruling, 2026-10-17;
 `specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`", `specs/cowshed/03_caches.md` "Nx accepted-task artifact
 service").
 
@@ -218,11 +218,12 @@ unreachable cache as a miss ([nrwl/nx#36651](https://github.com/nrwl/nx/pull/366
 
 Stock Nx 23.2.1 has no read-only self-hosted cache: its `store` builds the gzip archive before the PUT. Every cowshed
 workspace's environment sets `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true` beside `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`
-(`specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`"; Danny tg#1780, tg#1782, tg#10456). `getHttpCache` then wraps the
-guard in `ReadOnlyRemoteCache` (`tasks-runner/remote-cache-outage.js`), whose `store` answers false before building
-anything. Only a land publishes, with the native client directly. The test "a run that reads the remote cache and never
-stores" in `packages/nx-plugin/src/nx-remote-cache-outage.test.ts` runs a cacheable task against a server that answers
-404 and requires only GETs, no PUT. Drop the hunk once upstream Nx has a read-only self-hosted option.
+(`specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`"; the owner's rulings, 2026-10-10 and 2026-10-25). `getHttpCache`
+then wraps the guard in `ReadOnlyRemoteCache` (`tasks-runner/remote-cache-outage.js`), whose `store` answers false
+before building anything. Only a land publishes, with the native client directly. The test "a run that reads the remote
+cache and never stores" in `packages/nx-plugin/src/nx-remote-cache-outage.test.ts` runs a cacheable task against a
+server that answers 404 and requires only GETs, no PUT. Drop the hunk once upstream Nx has a read-only self-hosted
+option.
 
 ## Non-workspace file packages
 
