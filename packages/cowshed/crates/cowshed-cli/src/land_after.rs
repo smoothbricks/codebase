@@ -85,7 +85,8 @@ fn run(request: &AfterRequest) {
             request.branch.clone(),
         ];
         let log = directory.join(format!("{head}.push.log"));
-        let (event, detail) = match execute("after-land push", request, &argv, &log) {
+        let Executed { ran, unretired } = execute("after-land push", request, &argv, &log);
+        let (event, detail) = match ran {
             Ok(status) if status.success() => (
                 LandEvent::Pushed,
                 format!("{} {}", remote.as_str(), request.branch),
@@ -103,11 +104,12 @@ fn run(request: &AfterRequest) {
             ),
             Err(error) => (LandEvent::PushFailed, error),
         };
-        note(request, event, detail);
+        note(request, event, beside(unretired, detail));
     }
     for (index, argv) in request.after.iter().enumerate() {
         let log = directory.join(format!("{head}.after{}.log", index + 1));
-        let detail = match execute("after-land command", request, argv, &log) {
+        let Executed { ran, unretired } = execute("after-land command", request, argv, &log);
+        let detail = match ran {
             Ok(status) => format!(
                 "{} {}; output in {}",
                 argv.join(" "),
@@ -116,50 +118,73 @@ fn run(request: &AfterRequest) {
             ),
             Err(error) => format!("{}: {error}", argv.join(" ")),
         };
-        note(request, LandEvent::AfterExited, detail);
+        note(request, LandEvent::AfterExited, beside(unretired, detail));
     }
 }
 
+/// One command's run: its own outcome, and why its cgroup leaf could not be retired when it could
+/// not (Linux), said beside that outcome and never in its place.
+struct Executed {
+    ran: std::result::Result<std::process::ExitStatus, String>,
+    unretired: Option<String>,
+}
+
+/// `detail`, with the leaf's retirement failure after it when there was one.
+fn beside(unretired: Option<String>, detail: String) -> String {
+    match unretired {
+        Some(unretired) => format!("{detail}; its cgroup leaf was not retired: {unretired}"),
+        None => detail,
+    }
+}
 /// Run one command, `role`, in main's pure environment, its output appended to `log` as it comes
 /// and its silence bounded by [`SILENCE`]. Its members are its own process group on Darwin, and on
 /// Linux a cgroup leaf of its own inside this after-land job's cgroup, named for its log and
 /// retired once it ends, so nothing an earlier command left behind is counted as this one's.
-fn execute(
-    role: &'static str,
-    request: &AfterRequest,
-    argv: &[String],
-    log: &Path,
-) -> std::result::Result<std::process::ExitStatus, String> {
+fn execute(role: &'static str, request: &AfterRequest, argv: &[String], log: &Path) -> Executed {
+    let ran = |ran| Executed {
+        ran,
+        unretired: None,
+    };
     let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
     let environment: Vec<(OsString, OsString)> = request
         .environment
         .iter()
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
         .collect();
-    let output =
-        File::create(log).map_err(|error| format!("cannot open {}: {error}", log.display()))?;
-    let mut command = crate::declared_land::declared_command(&request.main, &argv, &environment)
-        .map_err(|error| error.message)?;
+    let output = match File::create(log) {
+        Ok(output) => output,
+        Err(error) => return ran(Err(format!("cannot open {}: {error}", log.display()))),
+    };
+    let mut command =
+        match crate::declared_land::declared_command(&request.main, &argv, &environment) {
+            Ok(command) => command,
+            Err(error) => return ran(Err(error.message)),
+        };
     #[cfg(target_os = "macos")]
-    return cowshed_os::deadline::run_to_log(
+    return ran(cowshed_os::deadline::run_to_log(
         role,
         &mut command,
         cowshed_os::deadline::Members::OwnGroup,
         output,
         SILENCE,
     )
-    .map_err(|error| error.to_string());
+    .map_err(|error| error.to_string()));
     #[cfg(target_os = "linux")]
     {
-        let own = cowshed_os::process::own_cgroup().map_err(|error| error.to_string())?;
+        let own = match cowshed_os::process::own_cgroup() {
+            Ok(own) => own,
+            Err(error) => return ran(Err(error.to_string())),
+        };
         let name = format!(
             "after-{}",
             log.file_name()
                 .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
         );
-        let leaf = cowshed_core::runtime::job_cgroup::RunCgroup::inside(&own, &name)
-            .map_err(|error| error.to_string())?;
-        let ran = cowshed_os::deadline::run_to_log(
+        let leaf = match cowshed_core::runtime::job_cgroup::RunCgroup::inside(&own, &name) {
+            Ok(leaf) => leaf,
+            Err(error) => return ran(Err(error.to_string())),
+        };
+        let outcome = cowshed_os::deadline::run_to_log(
             role,
             &mut command,
             cowshed_os::deadline::Members::Leaf {
@@ -170,12 +195,12 @@ fn execute(
             SILENCE,
         )
         .map_err(|error| error.to_string());
-        match (ran, leaf.retire(cowshed_os::deadline::REAP)) {
-            (ran, Ok(())) => ran,
-            (Ok(_), Err(unretired)) => Err(format!("its cgroup leaf was not retired: {unretired}")),
-            (Err(failed), Err(unretired)) => Err(format!(
-                "{failed}; and its cgroup leaf was not retired: {unretired}"
-            )),
+        Executed {
+            ran: outcome,
+            unretired: leaf
+                .retire(cowshed_os::deadline::REAP)
+                .err()
+                .map(|error| error.to_string()),
         }
     }
 }

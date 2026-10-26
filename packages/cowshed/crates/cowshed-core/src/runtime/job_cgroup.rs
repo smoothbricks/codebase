@@ -705,8 +705,9 @@ impl IncarnationCgroups {
             match RunCgroup::open(entry.path()) {
                 Ok(stale) => stale.retire(reap)?,
                 // Another run of this incarnation retired it first.
-                Err(CgroupError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                }
+                Err(CgroupError::Missing { .. }) => {}
+                Err(CgroupError::KillUnavailable { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
