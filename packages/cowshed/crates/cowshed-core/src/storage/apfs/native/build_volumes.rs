@@ -24,7 +24,7 @@ use cowshed_os::process::Holder;
 use std::ops::ControlFlow;
 
 use crate::storage::apfs::extents::{self, CaughtUp, Copied};
-use crate::storage::apfs::release::{Released, STEP_EXTENTS, release_file};
+use crate::storage::apfs::release::{DELETING_DIRECTORY, commit_release};
 use crate::storage::lifecycle::ExtentCount;
 
 /// The compaction's contiguous copy, until it is published or released. Each seed it copies or
@@ -1118,10 +1118,9 @@ where
         extents::count_extents_to(&image, stop_at)
     }
 
-    /// Release what a compaction left in [`BuildVolumeLayout::compacting`], every seed's clone and
-    /// the copy, in bounded steps (16_build_volumes.md, "Seed compaction", "Leftovers"). The
-    /// caller holds the project's compaction lock, so they are garbage, and no image lock:
-    /// freeing a whole seed's extent map takes minutes.
+    /// Hand what a compaction left in [`BuildVolumeLayout::compacting`], every seed's clone and
+    /// the copy, to the gateway's cleanup (16_build_volumes.md, "Seed compaction", "Leftovers").
+    /// The caller holds the project's compaction lock, so they are garbage, and no image lock.
     pub fn release_seed_compaction_leftovers(
         &self,
         layout: &BuildVolumeLayout,
@@ -1134,7 +1133,7 @@ where
                 .map_err(|error| io_error("list the seed compaction directory", &directory, error))?
                 .path();
             if path.extension().is_some_and(|extension| extension == "dmg") {
-                release_compaction_file(&path)?;
+                self.hand_off_compaction_file(&path)?;
             }
         }
         Ok(())
@@ -1193,7 +1192,7 @@ where
     /// (16_build_volumes.md, "Seed compaction"): the copy is written in place where `next`'s data
     /// does not share the older clone's blocks and punched where `next` has a hole
     /// ([`extents::catch_up`]), asking `keep_going` as the copy does. Then the older clone is
-    /// released in bounded steps, and the copy holds `next`'s bytes. No lock is held. A stop
+    /// handed to the gateway's cleanup, and the copy holds `next`'s bytes. No lock is held. A stop
     /// leaves both clones and the half-caught copy for the caller to release.
     pub fn catch_up_seed_compaction(
         &self,
@@ -1217,7 +1216,7 @@ where
                 why,
             }),
             CaughtUp::Complete { written, punched } => {
-                release_compaction_file(&source.clone)?;
+                self.hand_off_compaction_file(&source.clone)?;
                 Ok(CatchUp::Caught {
                     compacted: CompactedSeed {
                         after: extents::count_extents(&copy)?,
@@ -1255,7 +1254,7 @@ where
                 return crate::storage::apfs::combine_cleanup(
                     "release a compacted copy whose seed could not be registered",
                     host_error(error),
-                    release_compaction_file(&compacted.copy),
+                    self.hand_off_compaction_file(&compacted.copy),
                 );
             }
         };
@@ -1290,18 +1289,32 @@ where
         drop(creating);
         Ok(())
     }
-}
 
-/// Release one of a seed compaction's files in bounded steps (16_build_volumes.md, "Garbage
-/// collection"): a clone whose seed was retired meanwhile owns that seed's whole extent map.
-fn release_compaction_file(path: &Path) -> Result<(), ApfsStorageError> {
-    match release_file(path, STEP_EXTENTS) {
-        Ok(Released::Freed { .. } | Released::Absent) => Ok(()),
-        Ok(Released::Busy) => Err(ApfsStorageError::Host(format!(
-            "{} is being released by another process, but only the compaction holding its project's compaction lock touches it",
-            path.display()
-        ))),
-        Err(error) => Err(io_error("release a seed compaction's file", path, error)),
+    /// Hand one of a seed compaction's files to the gateway's cleanup (16_build_volumes.md, "Seed
+    /// compaction", "Leftovers"): one rename into the project's `build/.deleting` under a fresh
+    /// id, made durable, and a nudge. The gateway's cleanup is the only cutter on the container:
+    /// measured 2026-10-26, a compaction freeing its old seed's clone beside the cleanup took
+    /// 67.98 s for its first cut and 1 to 14 s for later ones, the cleanup's cuts beside it 14 and
+    /// 17 s, and unrelated opens waited up to 49 s. A file already gone needs nothing.
+    fn hand_off_compaction_file(&self, path: &Path) -> Result<(), ApfsStorageError> {
+        let deleting = path
+            .parent()
+            .and_then(Path::parent)
+            .map(|images| images.join(DELETING_DIRECTORY))
+            .ok_or_else(|| {
+                ApfsStorageError::Host(format!(
+                    "{} is no file of a build/.compacting directory",
+                    path.display()
+                ))
+            })?;
+        let entry = deleting.join(format!("{}.dmg", BuildVolumeId::mint()));
+        let released = commit_release(path, &entry).map_err(|error| {
+            io_error("hand a seed compaction's file to the cleanup", path, error)
+        })?;
+        if released {
+            self.nudge_cleanup(&entry);
+        }
+        Ok(())
     }
 }
 

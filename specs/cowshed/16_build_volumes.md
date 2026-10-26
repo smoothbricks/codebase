@@ -545,13 +545,13 @@ faster than it catches up, is started again by the next land that freezes main's
   every other data range of the new seed is written into the copy in place, past the cache, and whatever data the copy
   holds where the new seed has a hole is punched. The copy takes the new seed's length. Writing in place keeps the
   copy's runs (measured 2026-10-26 on the store volume: sixteen 1 MiB overwrites of a contiguous 64 MiB file left its 8
-  runs, the same writes into a clone of it made 87). The old clone is then released in bounded steps, and publication is
-  tried again under the lock, refresh first. Each catch-up writes only what main's seed changed since the last, so it
-  takes the time of one land's delta, not of the whole seed; each says on stderr the seeds, the bytes written and
-  punched, and the time taken. After **8** catch-ups the seed is replaced faster than the copy follows it, and the
-  compaction stops. A copy already under way finishes the seed it started rather than switching to the new one: it reads
-  one immutable clone in one pass and takes no lock, a switch would still need the catch-up for the part already copied,
-  and finishing writes at most the new seed's changes to the remaining part twice.
+  runs, the same writes into a clone of it made 87). The old clone is then handed to the gateway's cleanup (Leftovers),
+  and publication is tried again under the lock, refresh first. Each catch-up writes only what main's seed changed since
+  the last, so it takes the time of one land's delta, not of the whole seed; each says on stderr the seeds, the bytes
+  written and punched, and the time taken. After **8** catch-ups the seed is replaced faster than the copy follows it,
+  and the compaction stops. A copy already under way finishes the seed it started rather than switching to the new one:
+  it reads one immutable clone in one pass and takes no lock, a switch would still need the catch-up for the part
+  already copied, and finishing writes at most the new seed's changes to the remaining part twice.
 - **Main's live volume moves onto the compacted seed.** After a publication, with main's image lock let go, main's live
   build volume is replaced by a clone of the compacted seed through the workspace reseed of main from main (Workspace
   reseed: both participants are main, so its image lock and lifecycle lease are each taken once). It moves only when it
@@ -572,9 +572,12 @@ faster than it catches up, is started again by the next land that freezes main's
   fragmented volume as soon as main is written. Forks made after the compacted seed is published start compact either
   way, and their lands carry the compact lineage into main.
 - **Leftovers.** `build/.compacting` is read by no enumeration of images, records or `build/.deleting`. Every `.dmg` in
-  it, the clones and the copy, is released in bounded steps by the compaction itself before it answers, and an
-  interrupted compaction's by the next one once it holds the compaction lock and before it takes main's image lock:
-  freeing a whole seed's extent map takes minutes, and no fork or land waits on it.
+  it, the clones and the copy, is handed to the gateway's cleanup by the compaction itself before it answers, and an
+  interrupted compaction's by the next one once it holds the compaction lock and before it takes main's image lock: one
+  rename into `build/.deleting` under a fresh id, made durable, and a nudge (05_gateway.md, "Deleting released images").
+  The compaction cuts nothing: the gateway's cleanup is the only cutter on the store's container. Measured 2026-10-26, a
+  compaction that freed its old seed's clone itself beside the cleanup took 67.98 s for its first cut and 1 to 14 s for
+  later ones, the cleanup's cuts beside it 14 and 17 s, and unrelated opens on the host waited up to 49 s.
 - The process reports one line on stderr: running elsewhere, recent, below the bound, no seed, stopped and why, or
   compacted with both extent counts, the bytes written, the time taken, each catch-up, and whether main's volume moved
   or why it was kept.

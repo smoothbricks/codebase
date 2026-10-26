@@ -6243,8 +6243,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// `coordinator.compactSeed` (16_build_volumes.md, "Seed compaction"). Under the project's
     /// compaction turn, once main's seed is due: [`Self::compact_due_seed`], then whatever the run
-    /// left in `build/.compacting` (the seeds' clones, a copy it did not publish) is released in
-    /// bounded steps with no lock held, as the next run would release an interrupted one's.
+    /// left in `build/.compacting` (the seeds' clones, a copy it did not publish) is handed to the
+    /// gateway's cleanup with no lock held, as the next run would hand over an interrupted one's.
     async fn compact_main_seed(&mut self) -> Result<crate::api::dto::SeedCompactionReport> {
         use super::build_volumes::{CompactionDue, Owner};
         use crate::api::dto::SeedCompactionReport;

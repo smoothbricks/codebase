@@ -8433,12 +8433,22 @@ fn main() {
             [format!("{seed}.dmg")],
             "a stop removes the copy; the seed's clone stays for the caller to release"
         );
+        let clone_length = fs::metadata(compacting.join(format!("{seed}.dmg")))
+            .unwrap()
+            .len();
         scratch
             .volumes
             .release_compaction_leftovers()
             .await
             .unwrap();
         assert_eq!(left(), Vec::<String>::new());
+        // The gateway's cleanup is the only cutter on the container: the compaction renames its
+        // leftover into build/.deleting, whole, and frees none of it.
+        let handed: Vec<u64> = fs::read_dir(scratch.layout.deleting())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .collect();
+        assert_eq!(handed, [clone_length], "handed off whole, never cut");
         assert_eq!(
             scratch
                 .layout

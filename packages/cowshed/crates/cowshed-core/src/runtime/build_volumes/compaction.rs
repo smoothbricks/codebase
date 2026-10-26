@@ -417,10 +417,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
-    /// Release what a compaction left in `build/.compacting`, under the project's compaction turn
-    /// and with no image lock held: an interrupted run's, before the target's image lock is first
-    /// taken, and this run's, before it answers. The free takes minutes, and no fork or land waits
-    /// on it.
+    /// Hand what a compaction left in `build/.compacting` to the gateway's cleanup, under the
+    /// project's compaction turn and with no image lock held: an interrupted run's, before the
+    /// target's image lock is first taken, and this run's, before it answers. Each is one rename
+    /// into `build/.deleting` and a nudge; the gateway frees it.
     pub async fn release_compaction_leftovers(&self) -> Result<()> {
         self.blocking(move |host, layout| {
             host.release_seed_compaction_leftovers(layout)
