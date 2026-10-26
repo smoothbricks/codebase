@@ -499,6 +499,13 @@ impl DiscardWatch {
         assert!(queue >= 0, "kqueue: {}", io::Error::last_os_error());
         // SAFETY: `queue` is a fresh descriptor only this value owns.
         let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) };
+        // SAFETY: plain fcntl on an owned descriptor.
+        if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            panic!(
+                "close the watch queue on exec: {}",
+                io::Error::last_os_error()
+            );
+        }
         let change = libc::kevent {
             ident: usize::try_from(directory.as_raw_fd()).expect("a descriptor"),
             filter: libc::EVFILT_VNODE,
@@ -552,23 +559,27 @@ impl DiscardWatch {
 #[cfg(target_os = "linux")]
 struct DiscardWatch {
     inotify: std::os::fd::OwnedFd,
+    _directory: fs::File,
 }
 
 #[cfg(target_os = "linux")]
 impl DiscardWatch {
     fn arm(directory: &Path) -> Option<Self> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
-        use std::os::unix::ffi::OsStrExt as _;
-        if !directory.exists() {
-            return None;
-        }
+        let directory_file = match fs::File::open(directory) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("open the discard directory: {error}"),
+        };
         // SAFETY: inotify_init1 takes flags only; a negative answer is an error.
         let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
         assert!(raw >= 0, "inotify_init1: {}", io::Error::last_os_error());
         // SAFETY: `raw` is a fresh descriptor only this value owns.
         let inotify = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        let path =
-            std::ffi::CString::new(directory.as_os_str().as_bytes()).expect("a directory path");
+        // The watch names the opened directory itself, through its descriptor, so what
+        // is watched is what the open proved to exist.
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{}", directory_file.as_raw_fd()))
+            .expect("a descriptor path");
         // SAFETY: `path` is NUL-terminated and outlives the call.
         let watch = unsafe {
             libc::inotify_add_watch(
@@ -583,7 +594,10 @@ impl DiscardWatch {
             directory.display(),
             io::Error::last_os_error()
         );
-        Some(Self { inotify })
+        Some(Self {
+            inotify,
+            _directory: directory_file,
+        })
     }
 
     fn wait(&self) {
