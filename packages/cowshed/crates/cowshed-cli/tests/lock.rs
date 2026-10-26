@@ -417,7 +417,13 @@ fn a_missing_executable_reports_failed_without_acquired() {
     };
     assert!(reason.contains("cannot run"), "{reason}");
     assert!(reason.contains("no-such-executable"), "{reason}");
-    assert!(!held(&dir.lock()), "failed spawn retained the lock");
+    // Darwin clones the process before a spawn looks its program up and tears a failed try down
+    // after the call returned (held_lock.rs, granted), so its descriptor copy can outlive the
+    // waiter by a moment: the release is the kernel's grant, waited for under the backstop.
+    File::open(dir.lock())
+        .expect("open the lock")
+        .lock_bounded()
+        .expect("the failed spawn released the lock");
 }
 
 #[test]
