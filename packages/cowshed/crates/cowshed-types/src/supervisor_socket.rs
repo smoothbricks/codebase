@@ -93,3 +93,7 @@ pub enum AdmissionSource {
     /// admit the gate class and the host-gate scope.
     Coordinator,
 }
+/// How long a served supervisor stays idle (no named session, no running job, and its keeper
+/// holds no Nx daemon) before it retires; the next command starts another. A draining supervisor
+/// whose ended jobs nobody reads gives up on them after as long with no client call.
+pub const SUPERVISOR_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);

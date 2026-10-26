@@ -47,7 +47,9 @@ use crate::error::{CowshedError, Result};
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::deadline::{self, Occupant, PeerStream, Progress, Silent, WaitError, occupant};
 use cowshed_os::fork_lock::Fenced;
-use cowshed_types::supervisor_socket::{AdmissionSource, BuildId, membership_socket_path};
+use cowshed_types::supervisor_socket::{
+    AdmissionSource, BuildId, SUPERVISOR_IDLE, membership_socket_path,
+};
 
 /// The `LC_UUID` of the Mach-O image holding this function, as 32 lowercase hex digits.
 #[cfg(target_os = "macos")]
@@ -1290,7 +1292,7 @@ pub async fn serve(
                         return report.stuck("wait for its running jobs", &error);
                     }
                     owed.reading(&report);
-                    let settled = owed.settle(super::project::SUPERVISOR_IDLE).await;
+                    let settled = owed.settle(SUPERVISOR_IDLE).await;
                     cowshed_os::eprintln!(
                         "cowshed: workspace supervisor {} of build {} retires after draining; {settled}",
                         socket_path.display(),
@@ -1339,7 +1341,7 @@ enum DrainWait {
         ended: Vec<RequesterGone>,
     },
     /// A process these jobs are owed to, to read their ends or exit, or
-    /// [`super::project::SUPERVISOR_IDLE`] with no read of them.
+    /// [`SUPERVISOR_IDLE`] with no read of them.
     Reads {
         unread: Vec<JobId>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1386,7 +1388,7 @@ impl DrainWait {
                  or every process they are owed to has exited, or {} minutes pass with no read \
                  of them{}",
                 jobs(unread),
-                super::project::SUPERVISOR_IDLE.as_secs() / 60,
+                SUPERVISOR_IDLE.as_secs() / 60,
                 ended(gone)
             ),
             Self::Stuck { step, error } => format!(

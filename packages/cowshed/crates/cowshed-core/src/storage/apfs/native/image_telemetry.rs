@@ -11,13 +11,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow_array::RecordBatch;
 use uuid::Uuid;
 
-use crate::runtime::job_spans::PROCESS_SEAL_INTERVAL;
 use crate::storage::apfs::extents;
 use crate::storage::trace_columns::{I64, Optional, Required, U32, U64, Utf8, trace_columns};
 use crate::storage::trace_segment::{
     EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, TraceSegmentError,
     seal_segment, trace_batch,
 };
+use cowshed_types::spans::PROCESS_SEAL_INTERVAL;
 
 // The observed 435,459-extent / 281 GB image spent 60.8 s in first write. These are
 // early-warning budgets, not a linear latency model: 100k is 23% of that count and

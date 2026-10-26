@@ -55,7 +55,7 @@ use cowshed_types::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use cowshed_types::repository::OwnedRepoIds;
 use cowshed_types::repository::{RepoId, RepositoryBinding};
-use cowshed_types::supervisor_socket::AdmissionSource;
+use cowshed_types::supervisor_socket::{AdmissionSource, SUPERVISOR_IDLE};
 
 const ROUTER_CAPACITY: usize = 64;
 const STARTUP_LIFECYCLE_ATTEMPTS: usize = 8;
@@ -2695,11 +2695,6 @@ enum SupervisorHome {
 /// How long a lost supervisor's jobs get between TERM and KILL.
 #[cfg(target_os = "macos")]
 const LOST_JOB_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// How long a served supervisor stays idle (no named session, no running job, and its keeper
-/// holds no Nx daemon) before it retires; the next command starts another. A draining supervisor
-/// whose ended jobs nobody reads gives up on them after as long with no client call.
-pub(crate) const SUPERVISOR_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// A port-block change asked of a workspace that runs jobs: its supervisor is left serving them.
 #[cfg(target_os = "macos")]

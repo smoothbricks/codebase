@@ -30,7 +30,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
 use thiserror::Error;
@@ -56,6 +56,7 @@ use crate::storage::trace_segment::{
 };
 use cowshed_types::metadata::WorkspaceIncarnation;
 use cowshed_types::repository::RepoId;
+use cowshed_types::spans::PROCESS_SEAL_INTERVAL;
 
 /// The span name both rows of a job span carry.
 pub const JOB_SPAN_MESSAGE: &str = "cowshed.job";
@@ -66,16 +67,6 @@ pub const JOB_SPAN_ID: u32 = 1;
 /// admissions and terminals far beyond what a workspace's actor queue admits at once. A full queue
 /// refuses segments rather than delaying the actor.
 const QUEUE_CAPACITY: usize = 256;
-
-/// How long a writer gathers process rows before it seals them as one segment. A process fold
-/// batch is not a durability event: sealing one is a full-drive flush of the segment and of its
-/// directory (`Durability::PowerLoss`), and one seal per fold batch made 26 seals and about 52
-/// `F_FULLFSYNC`s a second host-wide, 5-8 s of flushing per wall second at 0.10-0.16 s each,
-/// which saturated the drive under every other process on it (measured 2026-10-21). So the writer
-/// seals on this interval, and the durability of each seal is unchanged. Rows still waiting
-/// when the process dies are lost, as the gateway's one-batch audit window is (13_telemetry.md,
-/// "Process segments").
-pub const PROCESS_SEAL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The most process rows a writer gathers in one interval. A row past it is refused and counted
 /// in the trace health, never sealed early: the interval is the seal rate and this bound is only
@@ -634,6 +625,7 @@ fn job_span_batch(row: &JobSpanRow, timestamp_ns: i64) -> Result<RecordBatch, Jo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn only_a_clean_zero_exit_ends_a_span_ok() {
