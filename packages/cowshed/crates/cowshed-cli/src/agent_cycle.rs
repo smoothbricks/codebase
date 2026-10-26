@@ -155,8 +155,9 @@ pub fn bootout_progress(
 pub enum Held {
     /// launchd does not hold the agent: `kickstart` would answer "Could not find service".
     Absent,
-    /// launchd holds the agent and runs it.
-    Loaded,
+    /// launchd holds the agent and runs it, as `launchctl print` read it: a kickstart of it waits
+    /// for that process's exit up to its exit timeout.
+    Loaded(LoadedAgent),
     /// A bootout of the agent went overdue and launchd still tears it down.
     TearingDown(Remains),
 }
@@ -165,7 +166,7 @@ pub enum Held {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reload {
     Bootstrap,
-    Kickstart,
+    Kickstart(LoadedAgent),
     /// Nothing can load it until launchd has let go of it: a kickstart of a job in teardown is
     /// launchctl 37, "operation already in progress", and a bootstrap of it collides.
     Blocked(Remains),
@@ -174,7 +175,7 @@ pub enum Reload {
 pub const fn reload(held: Held) -> Reload {
     match held {
         Held::Absent => Reload::Bootstrap,
-        Held::Loaded => Reload::Kickstart,
+        Held::Loaded(agent) => Reload::Kickstart(agent),
         Held::TearingDown(remains) => Reload::Blocked(remains),
     }
 }
@@ -357,9 +358,9 @@ mod tests {
         /// A restore bootstraps an agent launchd does not hold and kickstarts only one it holds and
         /// runs; one still in teardown is never kickstarted (launchctl 37) nor bootstrapped.
         #[test]
-        fn a_restore_kickstarts_only_a_loaded_agent(remains in remains()) {
+        fn a_restore_kickstarts_only_a_loaded_agent(remains in remains(), agent in agent()) {
             prop_assert_eq!(reload(Held::Absent), Reload::Bootstrap);
-            prop_assert_eq!(reload(Held::Loaded), Reload::Kickstart);
+            prop_assert_eq!(reload(Held::Loaded(agent)), Reload::Kickstart(agent));
             prop_assert_eq!(reload(Held::TearingDown(remains)), Reload::Blocked(remains));
         }
 

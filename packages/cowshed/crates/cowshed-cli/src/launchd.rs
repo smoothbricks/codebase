@@ -4,8 +4,9 @@
 //! command adapters so callers can keep one mutable, actor-owned executor while
 //! tests remain entirely host-independent.
 
+use crate::agent_cycle::{self, LoadedAgent};
 use cowshed_apfs::image::ImageCapacity;
-use cowshed_os::fork_lock::Run as _;
+use cowshed_os::deadline::{self, Bound, Deadline, LatencyClass, RunError};
 use cowshed_os::namespace::HostNamespace;
 use std::error::Error;
 use std::ffi::OsString;
@@ -1452,13 +1453,28 @@ pub enum ControlAction {
     Print,
 }
 
+impl ControlAction {
+    /// The op a call of this action is bounded and named under (05_gateway.md "Deadlines").
+    pub const fn op(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "launchctl bootstrap",
+            Self::Bootout => "launchctl bootout",
+            Self::Kickstart => "launchctl kickstart",
+            Self::Print => "launchctl print",
+        }
+    }
+}
+
+/// One `launchctl` call and the bound it runs to its end within (05_gateway.md "Deadlines", ffi).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlPlan {
     action: ControlAction,
     arguments: Vec<OsString>,
+    bound: Bound,
 }
 
 impl ControlPlan {
+    /// launchd answers a bootstrap from its own state, within [`deadline::LAUNCHCTL`].
     pub fn bootstrap(uid: u32, target: &LaunchAgentTarget) -> Self {
         Self {
             action: ControlAction::Bootstrap,
@@ -1467,20 +1483,29 @@ impl ControlPlan {
                 OsString::from(gui_domain(uid)),
                 target.plist_path().as_os_str().to_owned(),
             ],
+            bound: deadline::LAUNCHCTL,
         }
     }
 
-    pub fn bootout(uid: u32, target: &LaunchAgentTarget) -> Self {
+    /// A bootout of `agent`, as `launchctl print` read it. The call may wait for the agent's
+    /// process up to its exit timeout, so it is bounded by launchd's own deadline for the bootout
+    /// ([`agent_cycle::bootout_deadline`]), never by a number of its own.
+    pub fn bootout(uid: u32, target: &LaunchAgentTarget, agent: LoadedAgent) -> Self {
         Self {
             action: ControlAction::Bootout,
             arguments: vec![
                 OsString::from("bootout"),
                 OsString::from(service_target(uid, target.label())),
             ],
+            bound: Bound::new(LatencyClass::Ffi, agent_cycle::bootout_deadline(agent)),
         }
     }
 
-    pub fn kickstart(uid: u32, target: &LaunchAgentTarget) -> Self {
+    /// A `kickstart -k` of `agent`, as `launchctl print` read it. It returns only once the old
+    /// process has gone and the new one has started: 9.03 s at an exit timeout of 2 s (launchd's
+    /// 10 s respawn throttle from the old start) and 12.02 s at one of 12 s. So it is bounded as
+    /// the bootout of the old process and then one launchctl call.
+    pub fn kickstart(uid: u32, target: &LaunchAgentTarget, agent: LoadedAgent) -> Self {
         Self {
             action: ControlAction::Kickstart,
             arguments: vec![
@@ -1488,9 +1513,14 @@ impl ControlPlan {
                 OsString::from("-k"),
                 OsString::from(service_target(uid, target.label())),
             ],
+            bound: Bound::new(
+                LatencyClass::Ffi,
+                agent_cycle::bootout_deadline(agent).saturating_add(deadline::LAUNCHCTL.within),
+            ),
         }
     }
 
+    /// launchd answers a print from its own state, within [`deadline::LAUNCHCTL`].
     pub fn print(uid: u32, target: &LaunchAgentTarget) -> Self {
         Self {
             action: ControlAction::Print,
@@ -1498,11 +1528,17 @@ impl ControlPlan {
                 OsString::from("print"),
                 OsString::from(service_target(uid, target.label())),
             ],
+            bound: deadline::LAUNCHCTL,
         }
     }
 
     pub fn action(&self) -> ControlAction {
         self.action
+    }
+
+    /// The bound this call runs to its end within.
+    pub fn bound(&self) -> Bound {
+        self.bound
     }
 
     pub fn executable(&self) -> &Path {
@@ -1562,16 +1598,35 @@ impl LaunchctlOutput {
     }
 }
 
+/// Runs one system tool (`launchctl`, `codesign`) to its end within `deadline`, its output
+/// collected (05_gateway.md "Deadlines", ffi). The deadline's op names the call: `<tool> <verb>`.
 pub trait LaunchctlCommand {
-    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput>;
+    fn run(
+        &mut self,
+        executable: &Path,
+        arguments: &[OsString],
+        deadline: &Deadline,
+    ) -> Result<LaunchctlOutput, RunError>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeLaunchctlCommand;
 
 impl LaunchctlCommand for NativeLaunchctlCommand {
-    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput> {
-        let output = Command::new(executable).args(arguments).output_locked()?;
+    /// Past its bound the call fails `TIMEOUT` naming the tool's pid and the state the kernel
+    /// shows it in. The tool is left as it is: a launchctl blocked on launchd is not ended by
+    /// giving up on it.
+    fn run(
+        &mut self,
+        executable: &Path,
+        arguments: &[OsString],
+        deadline: &Deadline,
+    ) -> Result<LaunchctlOutput, RunError> {
+        // The child's role is its tool, the op's first word.
+        let op = deadline.op();
+        let role = op.split_once(' ').map_or(op, |(tool, _)| tool);
+        let output =
+            deadline::output_within(role, Command::new(executable).args(arguments), deadline)?;
         let status = if output.status.success() {
             CommandStatus::Success
         } else if let Some(code) = output.status.code() {
@@ -1609,9 +1664,11 @@ pub enum LaunchdServiceStatus {
 
 #[derive(Debug)]
 pub enum ControlExecutionError {
+    /// launchctl did not run to its end: it could not start, outlived its bound, or its output
+    /// could not be read. Its message names the call.
     Unavailable {
         action: ControlAction,
-        source: io::Error,
+        source: RunError,
     },
     Rejected {
         action: ControlAction,
@@ -1627,8 +1684,8 @@ pub enum ControlExecutionError {
 impl fmt::Display for ControlExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unavailable { action, source } => {
-                write!(formatter, "launchctl {action:?} could not start: {source}")
+            Self::Unavailable { source, .. } => {
+                write!(formatter, "{source}")
             }
             Self::Rejected { action, status, .. } => {
                 write!(formatter, "launchctl {action:?} failed with {status:?}")
@@ -1683,10 +1740,14 @@ impl<F, C: LaunchctlCommand> LaunchdExecutor<F, C> {
         path: &Path,
         identity: crate::code_signing::SigningIdentity,
     ) -> io::Result<bool> {
-        let output = self.command.run(
-            Path::new(crate::code_signing::CODESIGN),
-            &identity.verify_arguments(path),
-        )?;
+        let output = self
+            .command
+            .run(
+                Path::new(crate::code_signing::CODESIGN),
+                &identity.verify_arguments(path),
+                &deadline::start("codesign --verify", deadline::CODESIGN),
+            )
+            .map_err(io::Error::other)?;
         crate::code_signing::verification(output.status, &output.stderr).map_err(io::Error::other)
     }
 }
@@ -1816,7 +1877,9 @@ impl<F: LaunchdFilesystem, C: LaunchctlCommand> LaunchdExecutor<F, C> {
                         .run(
                             Path::new(crate::code_signing::CODESIGN),
                             &identity.sign_arguments(path),
+                            &deadline::start("codesign --sign", deadline::CODESIGN),
                         )
+                        .map_err(io::Error::other)
                         .and_then(|output| match output.status {
                             CommandStatus::Success => Ok(()),
                             status => Err(io::Error::other(format!(
@@ -1903,7 +1966,11 @@ impl<F, C: LaunchctlCommand> LaunchdExecutor<F, C> {
     ) -> Result<ControlOutcome, ControlExecutionError> {
         let output = self
             .command
-            .run(plan.executable(), plan.arguments())
+            .run(
+                plan.executable(),
+                plan.arguments(),
+                &deadline::start(plan.action().op(), plan.bound()),
+            )
             .map_err(|source| ControlExecutionError::Unavailable {
                 action: plan.action(),
                 source,
@@ -1937,7 +2004,11 @@ impl<F, C: LaunchctlCommand> LaunchdExecutor<F, C> {
         }
         let output = self
             .command
-            .run(plan.executable(), plan.arguments())
+            .run(
+                plan.executable(),
+                plan.arguments(),
+                &deadline::start(plan.action().op(), plan.bound()),
+            )
             .map_err(|source| ControlExecutionError::Unavailable {
                 action: ControlAction::Print,
                 source,

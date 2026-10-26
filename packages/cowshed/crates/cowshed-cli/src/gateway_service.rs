@@ -590,11 +590,9 @@ where
     if plist == InstallOutcome::Changed {
         boot_out(executor, uid, target)?;
     }
-    let held =
-        match launch_agent_is_loaded(executor, uid, target).map_err(ActivationError::Failed)? {
-            true => Held::Loaded,
-            false => Held::Absent,
-        };
+    let held = loaded_agent(executor, uid, target)
+        .map_err(ActivationError::Failed)?
+        .map_or(Held::Absent, Held::Loaded);
     load(executor, uid, target, agent_cycle::reload(held))
 }
 
@@ -620,8 +618,8 @@ where
             }
             Ok(())
         }
-        Reload::Kickstart => executor
-            .execute_control(&crate::launchd::ControlPlan::kickstart(uid, target))
+        Reload::Kickstart(agent) => executor
+            .execute_control(&crate::launchd::ControlPlan::kickstart(uid, target, agent))
             .map(|_| ())
             .map_err(|error| ActivationError::Failed(launchd_error(error))),
         Reload::Blocked(remains) => {
@@ -687,7 +685,8 @@ where
             .map(|watch| (pid, watch)),
         None => None,
     };
-    let booted_out = executor.execute_control(&crate::launchd::ControlPlan::bootout(uid, target));
+    let booted_out =
+        executor.execute_control(&crate::launchd::ControlPlan::bootout(uid, target, agent));
     let started = std::time::Instant::now();
     let mut running = exit.as_ref().map(|(pid, _)| *pid);
     loop {
@@ -2977,12 +2976,8 @@ where
 {
     let held = match failure {
         ActivationError::BootoutOverdue { remains, .. } => Ok(Held::TearingDown(*remains)),
-        ActivationError::Failed(_) => {
-            launch_agent_is_loaded(executor, uid, target).map(|loaded| match loaded {
-                true => Held::Loaded,
-                false => Held::Absent,
-            })
-        }
+        ActivationError::Failed(_) => loaded_agent(executor, uid, target)
+            .map(|agent| agent.map_or(Held::Absent, Held::Loaded)),
     };
     match held.map(agent_cycle::reload) {
         Ok(step) => match load(executor, uid, target, step) {
@@ -3780,11 +3775,13 @@ mod tests {
             &mut self,
             executable: &Path,
             arguments: &[std::ffi::OsString],
-        ) -> io::Result<crate::launchd::LaunchctlOutput> {
+            deadline: &cowshed_os::deadline::Deadline,
+        ) -> std::result::Result<crate::launchd::LaunchctlOutput, cowshed_os::deadline::RunError>
+        {
             if executable == Path::new(code_signing::CODESIGN) {
                 self.codesign.push(arguments.to_vec());
                 if self.real_codesign {
-                    return NativeLaunchctlCommand.run(executable, arguments);
+                    return NativeLaunchctlCommand.run(executable, arguments, deadline);
                 }
                 return Ok(crate::launchd::LaunchctlOutput {
                     status: if self.unsatisfied && arguments[0] == "--verify" {
@@ -4449,7 +4446,9 @@ mod tests {
                 &mut self,
                 _: &Path,
                 arguments: &[std::ffi::OsString],
-            ) -> io::Result<crate::launchd::LaunchctlOutput> {
+                _: &cowshed_os::deadline::Deadline,
+            ) -> std::result::Result<crate::launchd::LaunchctlOutput, cowshed_os::deadline::RunError>
+            {
                 if arguments[0] == "bootstrap" && !self.saw_candidate {
                     assert_eq!(executable_digest(&self.stable).unwrap(), self.candidate);
                     assert!(
@@ -4542,7 +4541,9 @@ mod tests {
                 &mut self,
                 executable: &Path,
                 arguments: &[std::ffi::OsString],
-            ) -> io::Result<crate::launchd::LaunchctlOutput> {
+                _: &cowshed_os::deadline::Deadline,
+            ) -> std::result::Result<crate::launchd::LaunchctlOutput, cowshed_os::deadline::RunError>
+            {
                 // The gateway host's signature is not launchd's business.
                 if executable == Path::new(code_signing::CODESIGN) {
                     return Ok(crate::launchd::LaunchctlOutput::success());
@@ -5760,6 +5761,60 @@ mod tests {
             assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
 
             daemon.gateway.drain().await.expect("drain the gateway");
+        }
+
+        /// A gateway that takes the connection and never answers fails each status probe on its
+        /// silence bound (05_gateway.md "Deadlines"), so `gateway start`'s ceiling fires and
+        /// names the wait instead of waiting on one probe forever.
+        #[tokio::test(start_paused = true)]
+        async fn a_silent_gateway_fails_the_start_ceiling() {
+            let support = gateway_root("csinstsilent");
+            let slot = InstallSlot::take(&support).await.expect("the slot");
+            let root = gateway_root("csinstsilent-gw");
+            let socket = root.join("gateway.sock");
+            // Bound and listening; nothing accepts a connection, reads a request or answers one.
+            let _listener =
+                tokio::net::UnixListener::bind(&socket).expect("the silent gateway's socket");
+            let client = GatewayControlClient::new(socket.clone()).expect("client");
+            let mut executor = LaunchdExecutor::new(
+                NativeFilesystem::new(),
+                RecordingGatewayLaunchctl::default(),
+            );
+            let target =
+                LaunchAgentTarget::new(Path::new("/tmp"), "dev.cowshed.gateway").expect("target");
+            let mut output = Output::new(Vec::new(), Vec::new(), false);
+            let started = tokio::time::Instant::now();
+            let error = await_healthy(
+                &mut output,
+                &slot,
+                &client,
+                &socket,
+                "aa",
+                &mut executor,
+                &target,
+            )
+            .await
+            .expect_err("a silent gateway never becomes healthy");
+            let waited = started.elapsed();
+            assert!(
+                error
+                    .message
+                    .contains("gateway did not become healthy within 180s of starting"),
+                "{}",
+                error.message
+            );
+            // The ceiling fires at the first probe that ends past it: within one probe's silence
+            // bound of it.
+            assert!(waited >= START_DEADLINE, "{waited:?}");
+            assert!(
+                waited < START_DEADLINE + Duration::from_secs(65),
+                "{waited:?}"
+            );
+            let (_, launchctl) = executor.into_parts();
+            assert!(
+                launchctl.argv.is_empty(),
+                "nothing restarts a gateway that never answered"
+            );
         }
 
         /// The measured failure: `setup` restarted the gateway and released the install slot at

@@ -623,11 +623,29 @@ fn mount_service_files(
     pins.as_deref().map(desired_mount_service).transpose()
 }
 
-fn mount_service_loaded() -> bool {
-    Command::new(LAUNCHCTL)
-        .args(["print", MOUNT_SERVICE_TARGET])
-        .output_locked()
-        .is_ok_and(|output| output.status.success())
+/// Whether launchd holds the mount service, as `launchctl print` answers within its bound
+/// (05_gateway.md "Deadlines", ffi). An exit status is the answer (113: not loaded). A launchctl
+/// that could not run, outlived its bound or ended by a signal gave none, and is a failure, never
+/// "not loaded".
+fn mount_service_loaded() -> Result<bool, HostError> {
+    let deadline = cowshed_os::deadline::start("launchctl print", cowshed_os::deadline::LAUNCHCTL);
+    let output = cowshed_os::deadline::output_within(
+        "launchctl",
+        Command::new(LAUNCHCTL).args(["print", MOUNT_SERVICE_TARGET]),
+        &deadline,
+    )
+    .map_err(|error| {
+        HostError::new(format!(
+            "cannot read whether launchd holds {MOUNT_SERVICE_TARGET}: {error}"
+        ))
+    })?;
+    match output.status.code() {
+        Some(code) => Ok(code == 0),
+        None => Err(HostError::new(format!(
+            "launchctl print {MOUNT_SERVICE_TARGET} ended by {}",
+            output.status
+        ))),
+    }
 }
 
 fn root_owned_path_has_mode(path: &Path, directory: bool, mode: u32) -> bool {
@@ -653,18 +671,21 @@ fn mount_service_contents_are_current(
     script == Some(files.script.as_slice()) && plist == Some(files.plist.as_slice()) && loaded
 }
 
-fn mount_service_is_current(files: &MountServiceFiles) -> bool {
+fn mount_service_is_current(files: &MountServiceFiles) -> Result<bool, HostError> {
     let script = fs::read(MOUNT_SERVICE_SCRIPT).ok();
     let plist = fs::read(MOUNT_SERVICE_PLIST).ok();
-    root_owned_path_has_mode(Path::new(MOUNT_SERVICE_DIRECTORY), true, 0o755)
+    if !(root_owned_path_has_mode(Path::new(MOUNT_SERVICE_DIRECTORY), true, 0o755)
         && root_owned_path_has_mode(Path::new(MOUNT_SERVICE_SCRIPT), false, 0o755)
-        && root_owned_path_has_mode(Path::new(MOUNT_SERVICE_PLIST), false, 0o644)
-        && mount_service_contents_are_current(
-            files,
-            script.as_deref(),
-            plist.as_deref(),
-            mount_service_loaded(),
-        )
+        && root_owned_path_has_mode(Path::new(MOUNT_SERVICE_PLIST), false, 0o644))
+    {
+        return Ok(false);
+    }
+    Ok(mount_service_contents_are_current(
+        files,
+        script.as_deref(),
+        plist.as_deref(),
+        mount_service_loaded()?,
+    ))
 }
 
 fn volume_passwords_are_current(
@@ -690,7 +711,7 @@ fn volume_passwords_are_current(
 
 fn add_mount_service_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBootstrapError> {
     if let Some(files) = mount_service_files(snapshot)?
-        && (!mount_service_is_current(&files)
+        && (!mount_service_is_current(&files).map_err(NativeBootstrapError::Host)?
             || !volume_passwords_are_current(snapshot, &SystemBootstrapHost)
                 .map_err(NativeBootstrapError::Host)?)
     {
@@ -1635,7 +1656,7 @@ async fn install_mount_service(
             })?;
             keychain::ensure_uuid_volume_password(host.as_ref(), label, &uuid, password.as_str())?;
         }
-        if mount_service_is_current(&files) { return Ok(()); }
+        if mount_service_is_current(&files)? { return Ok(()); }
         install_mount_service_with(host.as_ref(), &files)
     })
         .await
@@ -1958,10 +1979,13 @@ pub async fn execute_host_setup(
     }
 }
 
-fn mount_service_artifacts_present() -> bool {
-    fs::symlink_metadata(MOUNT_SERVICE_SCRIPT).is_ok()
+fn mount_service_artifacts_present() -> Result<bool, HostError> {
+    if fs::symlink_metadata(MOUNT_SERVICE_SCRIPT).is_ok()
         || fs::symlink_metadata(MOUNT_SERVICE_PLIST).is_ok()
-        || mount_service_loaded()
+    {
+        return Ok(true);
+    }
+    mount_service_loaded()
 }
 fn volume_keychain_item_present(label: &str) -> Result<bool, HostError> {
     let command = HostCommand::new(
@@ -2027,7 +2051,9 @@ fn host_uninstall_plan(home: &Path) -> Result<HostUninstallPlan, NativeBootstrap
             volume_keychain_item_present(label).map(|present| found || present)
         })
         .map_err(NativeBootstrapError::Host)?;
-    plan.requires_authorization |= mount_service_artifacts_present() || has_keychain_items;
+    plan.requires_authorization |= mount_service_artifacts_present()
+        .map_err(NativeBootstrapError::Host)?
+        || has_keychain_items;
     Ok(plan)
 }
 
@@ -2072,7 +2098,8 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
                 services: Vec::new(),
             });
         }
-        let remove_service = mount_service_artifacts_present();
+        let remove_service = mount_service_artifacts_present()
+            .map_err(|error| existing_host_storage_error(NativeBootstrapError::Host(error)))?;
         let remove_fstab = !plan.pins_to_remove.is_empty();
         let removed_keychain_labels = tokio::task::spawn_blocking(move || {
             let mut keychain_labels = Vec::new();

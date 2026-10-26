@@ -34,6 +34,10 @@ pub const CONTROL: Bound = Bound::new(LatencyClass::Control, Duration::from_secs
 pub const HANDSHAKE: Bound = Bound::new(LatencyClass::Handshake, Duration::from_secs(10));
 /// A child's exit once its pipes closed or it was killed.
 pub const REAP: Bound = Bound::new(LatencyClass::Reap, Duration::from_secs(5));
+/// One `launchctl` call launchd answers from its own state (`print`, `bootstrap`).
+pub const LAUNCHCTL: Bound = Bound::new(LatencyClass::Ffi, Duration::from_secs(10));
+/// One `codesign` signature or verification of a binary cowshed installs.
+pub const CODESIGN: Bound = Bound::new(LatencyClass::Ffi, Duration::from_secs(10));
 /// How often a holder says it is still there on a connection it holds open for a long wait.
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
 /// The resolution of the timers that wake a wait.

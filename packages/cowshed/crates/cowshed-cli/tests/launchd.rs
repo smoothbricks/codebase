@@ -4,8 +4,10 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_cli::agent_cycle::LoadedAgent;
 use cowshed_cli::code_signing::{CODESIGN, CertificateHash, SigningIdentity};
 use cowshed_cli::launchd::{
     BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, CommandStatus, ControlAction,
@@ -13,12 +15,14 @@ use cowshed_cli::launchd::{
     ExistingPlist, FilesystemOperation, HostStableExecutable, InstallOutcome, InstallState,
     InstalledExecutable, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput,
     LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, Mutation,
-    NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME,
-    STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram, plan_cargo_link_removal,
-    plan_executable_install, plan_executable_remove, plan_gateway_host_install, plan_install,
-    plan_remove, replace_symlink,
+    NativeFilesystem, NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE,
+    SCCACHE_BINARY_NAME, STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram,
+    plan_cargo_link_removal, plan_executable_install, plan_executable_remove,
+    plan_gateway_host_install, plan_install, plan_remove, replace_symlink,
 };
+use cowshed_os::deadline::{self, Bound, Deadline, LatencyClass, ReapError, RunError};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_os::process::RunState;
 
 #[cfg(target_os = "macos")]
 use cowshed_apfs::{
@@ -750,11 +754,13 @@ struct CommandInvocation {
 #[derive(Debug, Default)]
 struct FakeCommand {
     invocations: Vec<CommandInvocation>,
-    outputs: VecDeque<io::Result<LaunchctlOutput>>,
+    /// The bound each call ran within.
+    bounds: Vec<Bound>,
+    outputs: VecDeque<Result<LaunchctlOutput, RunError>>,
 }
 
 impl FakeCommand {
-    fn with_outputs(outputs: impl IntoIterator<Item = io::Result<LaunchctlOutput>>) -> Self {
+    fn with_outputs(outputs: impl IntoIterator<Item = Result<LaunchctlOutput, RunError>>) -> Self {
         Self {
             outputs: outputs.into_iter().collect(),
             ..Self::default()
@@ -763,14 +769,37 @@ impl FakeCommand {
 }
 
 impl LaunchctlCommand for FakeCommand {
-    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput> {
+    fn run(
+        &mut self,
+        executable: &Path,
+        arguments: &[OsString],
+        deadline: &Deadline,
+    ) -> Result<LaunchctlOutput, RunError> {
         self.invocations.push(CommandInvocation {
             executable: executable.to_path_buf(),
             arguments: arguments.to_vec(),
         });
+        self.bounds.push(deadline.bound());
         self.outputs
             .pop_front()
             .expect("test must provide one output per command")
+    }
+}
+
+/// A loaded agent as `launchctl print` reads one: running, with the gateway's exit timeout.
+fn loaded_agent() -> LoadedAgent {
+    LoadedAgent {
+        pid: Some(812),
+        exit_timeout: Duration::from_secs(30),
+    }
+}
+
+/// launchctl missing: its spawn failed.
+fn launchctl_missing(op: &'static str) -> RunError {
+    RunError::Spawn {
+        op,
+        role: "launchctl",
+        source: io::Error::new(io::ErrorKind::NotFound, "launchctl missing"),
     }
 }
 
@@ -940,13 +969,17 @@ fn remove_execution_is_durable_and_absent_remove_is_idempotent() {
     );
 }
 
+/// Each call runs within its own bound: a bootstrap within launchctl's, a bootout within the loaded
+/// agent's exit timeout and the unload grace (launchd's own deadline for it), and a kickstart
+/// within that and one launchctl call, since `kickstart -k` waits for the old process to go.
 #[test]
 fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
     let spec = gateway();
+    let agent = loaded_agent();
     let plans = [
         ControlPlan::bootstrap(501, spec.target()),
-        ControlPlan::bootout(501, spec.target()),
-        ControlPlan::kickstart(501, spec.target()),
+        ControlPlan::bootout(501, spec.target(), agent),
+        ControlPlan::kickstart(501, spec.target(), agent),
     ];
     let outputs = [
         Ok(LaunchctlOutput {
@@ -980,6 +1013,9 @@ fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
     );
 
     let (_, command) = executor.into_parts();
+    let ffi = |seconds| Bound::new(LatencyClass::Ffi, Duration::from_secs(seconds));
+    assert_eq!(command.bounds, [ffi(10), ffi(30 + 1), ffi(30 + 1 + 10)]);
+    assert_eq!(deadline::LAUNCHCTL, ffi(10));
     assert_eq!(
         command.invocations,
         [
@@ -1020,7 +1056,7 @@ fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
 #[test]
 fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying() {
     let spec = gateway();
-    let plan = ControlPlan::kickstart(502, spec.target());
+    let plan = ControlPlan::kickstart(502, spec.target(), loaded_agent());
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
         FakeCommand::with_outputs([Ok(LaunchctlOutput {
@@ -1043,16 +1079,13 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
 
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
-        FakeCommand::with_outputs([Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "launchctl missing",
-        ))]),
+        FakeCommand::with_outputs([Err(launchctl_missing("launchctl bootstrap"))]),
     );
     assert!(matches!(
         executor.execute_control(&ControlPlan::bootstrap(502, spec.target())),
         Err(ControlExecutionError::Unavailable {
             action: ControlAction::Bootstrap,
-            source,
+            source: RunError::Spawn { source, .. },
         }) if source.kind() == io::ErrorKind::NotFound
     ));
 
@@ -1065,7 +1098,7 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
         })]),
     );
     assert!(matches!(
-        executor.execute_control(&ControlPlan::bootout(502, spec.target())),
+        executor.execute_control(&ControlPlan::bootout(502, spec.target(), loaded_agent())),
         Err(ControlExecutionError::Rejected {
             action: ControlAction::Bootout,
             status: CommandStatus::Terminated,
@@ -1151,16 +1184,13 @@ fn print_status_keeps_signal_and_spawn_failures_operationally_typed() {
 
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
-        FakeCommand::with_outputs([Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "launchctl missing",
-        ))]),
+        FakeCommand::with_outputs([Err(launchctl_missing("launchctl print"))]),
     );
     assert!(matches!(
         executor.execute_status(&plan),
         Err(ControlExecutionError::Unavailable {
             action: ControlAction::Print,
-            source,
+            source: RunError::Spawn { source, .. },
         }) if source.kind() == io::ErrorKind::NotFound
     ));
 }
@@ -1692,6 +1722,49 @@ fn executable_removal_removes_the_named_files_in_order_and_nothing_when_none() {
         ]
     );
     assert!(plan_executable_remove(&executable, &[]).is_noop());
+}
+
+/// launchd wedged: a `launchctl` that never answers. The call is a bounded wait (05_gateway.md
+/// "Deadlines", ffi): past its bound it fails `TIMEOUT` naming the child's pid and the state the
+/// kernel shows it in, and the child is left as it is.
+#[test]
+fn a_launchctl_that_never_answers_fails_its_bound_naming_the_child() {
+    let root = scratch("never-answers");
+    let launchctl = root.join("launchctl");
+    fs::write(&launchctl, "#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let bound = Bound::new(LatencyClass::Ffi, Duration::from_millis(500));
+    let error = NativeLaunchctlCommand
+        .run(
+            &launchctl,
+            &[OsString::from("print")],
+            &deadline::start("launchctl print", bound),
+        )
+        .expect_err("a launchctl that never answers fails its bound");
+    assert_eq!(error.code(), "TIMEOUT", "{error}");
+    let RunError::Reap(ReapError::Expired(expired)) = &error else {
+        panic!("expected the bound's expiry, got {error}");
+    };
+    assert_eq!(expired.op, "launchctl print");
+    assert_eq!(expired.peer.role, "launchctl");
+    assert_eq!(expired.bound, bound.within);
+    assert!(expired.elapsed < Duration::from_secs(5), "{error}");
+    assert!(
+        matches!(expired.peer.state, RunState::Sleeping | RunState::Running),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("launchctl pid {}", expired.peer.pid)),
+        "{message}"
+    );
+    // The expiry left the child as it was: it still runs, and the test ends it.
+    let killed = std::process::Command::new("/bin/kill")
+        .args(["-KILL", &expired.peer.pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success(), "the child outlived the expiry");
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn scratch(label: &str) -> PathBuf {

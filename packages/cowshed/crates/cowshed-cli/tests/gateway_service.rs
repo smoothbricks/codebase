@@ -18,6 +18,7 @@ use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
     CpuWaiter,
 };
+use cowshed_os::deadline::{Deadline, RunError};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 use std::collections::VecDeque;
@@ -28,6 +29,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 #[test]
 fn gateway_parser_is_strict_and_accepts_status_json_after_action() {
@@ -50,23 +52,33 @@ fn gateway_parser_is_strict_and_accepts_status_json_after_action() {
 
 #[derive(Default)]
 struct RecordingLaunchctl {
-    outputs: VecDeque<io::Result<LaunchctlOutput>>,
+    outputs: VecDeque<std::result::Result<LaunchctlOutput, RunError>>,
     argv: Vec<Vec<OsString>>,
+    /// The bound each call ran within.
+    bounds: Vec<Duration>,
 }
 
 impl RecordingLaunchctl {
-    fn new(outputs: impl IntoIterator<Item = io::Result<LaunchctlOutput>>) -> Self {
+    fn new(
+        outputs: impl IntoIterator<Item = std::result::Result<LaunchctlOutput, RunError>>,
+    ) -> Self {
         Self {
             outputs: outputs.into_iter().collect(),
-            argv: Vec::new(),
+            ..Self::default()
         }
     }
 }
 
 impl LaunchctlCommand for RecordingLaunchctl {
-    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput> {
+    fn run(
+        &mut self,
+        executable: &Path,
+        arguments: &[OsString],
+        deadline: &Deadline,
+    ) -> std::result::Result<LaunchctlOutput, RunError> {
         assert_eq!(executable, Path::new("/bin/launchctl"));
         self.argv.push(arguments.to_vec());
+        self.bounds.push(deadline.bound().within);
         self.outputs
             .pop_front()
             .expect("one fake output per launchctl call")
@@ -114,10 +126,17 @@ fn launch_agent_activation_bootstraps_only_when_not_loaded() {
     assert_eq!(command.argv[1][0], "bootstrap");
 }
 
+/// A loaded agent is kickstarted within its exit timeout, as `launchctl print` read it, the unload
+/// grace and one launchctl call: `kickstart -k` waits for the old process to go.
 #[test]
 fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
     let command = RecordingLaunchctl::new([
-        Ok(LaunchctlOutput::success()),
+        Ok(LaunchctlOutput {
+            status: CommandStatus::Success,
+            stdout: b"gui/501/dev.cowshed.gateway = {\n\tstate = running\n\tpid = 812\n\texit timeout = 30\n}\n"
+                .to_vec(),
+            stderr: Vec::new(),
+        }),
         Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
@@ -132,11 +151,16 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
     assert_eq!(command.argv.len(), 2);
     assert_eq!(command.argv[0][0], "print");
     assert_eq!(command.argv[1][0], "kickstart");
+    assert_eq!(
+        command.bounds,
+        [Duration::from_secs(10), Duration::from_secs(30 + 1 + 10)]
+    );
 
-    let command = RecordingLaunchctl::new([Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "launchctl missing",
-    ))]);
+    let command = RecordingLaunchctl::new([Err(RunError::Spawn {
+        op: "launchctl print",
+        role: "launchctl",
+        source: io::Error::new(io::ErrorKind::NotFound, "launchctl missing"),
+    })]);
     let mut executor = LaunchdExecutor::new((), command);
     assert!(
         activate_launch_agent(
