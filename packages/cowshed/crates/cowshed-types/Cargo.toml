@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 cowshed-os = { path = "../cowshed-os" }
+base64 = "0.22"
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 thiserror = "2"

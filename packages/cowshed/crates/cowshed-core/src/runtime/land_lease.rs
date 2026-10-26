@@ -22,9 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{CowshedError, Result};
-
-/// Suffix of the per-workspace land lease beside the project's session images.
-pub const LAND_LEASE_SUFFIX: &str = ".land.lock";
+use cowshed_types::paths::LAND_LEASE_SUFFIX;
 
 /// The lease file of `workspace` in the project's session directory.
 pub fn lease_path(sessions: &Path, workspace: &str) -> PathBuf {

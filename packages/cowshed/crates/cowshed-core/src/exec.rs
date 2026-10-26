@@ -15,7 +15,7 @@ mod macos;
 mod other;
 mod profile_file;
 
-pub use profile_file::{ProfileFile, ProfileLaunch, collect_profiles, profile_directory};
+pub use profile_file::{ProfileFile, ProfileLaunch, collect_profiles};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 

@@ -404,8 +404,9 @@ fn a_retired_workspaces_read_only_compile_cache_is_reclaimed_with_its_temp_dir()
     use crate::capabilities::CapabilityContribution;
     use crate::workspace_environment::{
         EnvironmentMount, NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV,
-        WORKSPACE_ENVIRONMENT_PATH, write_workspace_environment,
+        write_workspace_environment,
     };
+    use cowshed_types::paths::WORKSPACE_ENVIRONMENT_PATH;
 
     fn files_under(root: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -546,8 +547,9 @@ fn reclaiming_a_retained_image_removes_the_whole_exec_temp_tree() {
     use crate::capabilities::CapabilityContribution;
     use crate::workspace_environment::{
         EnvironmentMount, NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV,
-        WORKSPACE_ENVIRONMENT_PATH, write_workspace_environment,
+        write_workspace_environment,
     };
+    use cowshed_types::paths::WORKSPACE_ENVIRONMENT_PATH;
 
     const COMPILE: &str = r#"const m = require("node:module");
 m.enableCompileCache();

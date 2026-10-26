@@ -15,6 +15,7 @@ use crate::api::dto::{GitOid, UnlandedChange, UnlandedPath};
 use crate::error::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 use cowshed_os::timing::timed_async;
+use cowshed_types::paths::WORKSPACE_GIT_IDENTITY_CONFIG_PATH;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteUrl {
@@ -133,9 +134,6 @@ pub struct CowshedUpstream {
 /// root. Inside the image, so it is on the workspace's own volume and gone before the mount is
 /// published; under `.cowshed/` because that subtree is already cowshed's and not the repository's.
 const WORKTREE_STAGING: &str = ".cowshed/worktree-staging";
-
-/// Private identity-only global Git config for one workspace, never shared .git state.
-pub const WORKSPACE_GIT_IDENTITY_CONFIG_PATH: &str = ".cowshed/git-identity.inc";
 
 /// The workspace's private identity config, when the controller has published one.
 ///
@@ -5903,11 +5901,12 @@ mod tests {
             .await
             .expect("controller Git runs for the fixture's store");
         assert_eq!(head.as_str().len(), 40);
-        let profiles: Vec<PathBuf> = fs::read_dir(crate::exec::profile_directory(store.shared()))
-            .expect("the served store holds the profile directory")
-            .map(|entry| entry.expect("profile entry").path())
-            .filter(|path| path.extension() == Some(std::ffi::OsStr::new("sb")))
-            .collect();
+        let profiles: Vec<PathBuf> =
+            fs::read_dir(cowshed_types::paths::profile_directory(store.shared()))
+                .expect("the served store holds the profile directory")
+                .map(|entry| entry.expect("profile entry").path())
+                .filter(|path| path.extension() == Some(std::ffi::OsStr::new("sb")))
+                .collect();
         assert_eq!(
             profiles.len(),
             1,

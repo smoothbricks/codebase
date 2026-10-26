@@ -39,11 +39,6 @@ use crate::api::dto::{ExitStatus, JobId};
 /// The argument that turns the `cowshed` binary into an exec host.
 pub const SHELL_HOST_ARGUMENT: &str = "--cowshed-shell-host";
 
-/// Where the supervisor stages the host executable inside the workspace. Every sandbox
-/// profile denies writes beneath it, like the other controller-published files, so no job can
-/// replace the program every later command's host runs as.
-pub const SHELL_HOST_DIRECTORY: &str = ".cowshed/shell-host";
-
 /// The descriptor the supervisor installs the host's end of the control socket at.
 pub const CONTROL_DESCRIPTOR: RawFd = 3;
 
@@ -608,7 +603,7 @@ pub fn registered() -> Option<ShellHostProgram> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DroppedHostEnd {
     /// SIGBUS: the kernel could not supply a page the host touched. The host runs its program
-    /// from the workspace mount ([`SHELL_HOST_DIRECTORY`]) and keeps SIGBUS at its default
+    /// from the workspace mount ([`cowshed_types::paths::SHELL_HOST_DIRECTORY`]) and keeps SIGBUS at its default
     /// disposition, so this is how it ends once that mount is gone from under it: the next code
     /// it runs that is not resident cannot be paged in (11_shell.md, "Exec hosts").
     PageUnavailable { core_dumped: bool },

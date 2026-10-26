@@ -5,7 +5,7 @@
 //! constant count: the host's cores, or the job's smaller want. Nothing here waits on another
 //! job; the one wait is a background start's for host memory pressure to drop.
 //!
-//! The fifo is the job's own, in the workspace's pool directory ([`cpu_pool_directory`]), which
+//! The fifo is the job's own, in the workspace's pool directory ([`cowshed_types::paths::cpu_pool_directory`]), which
 //! the job's sandbox opens for FIFOs alone (04_sandbox.md). The supervisor makes it mode `0600`,
 //! keeps its own read-write descriptor, so the token bytes survive while no reader has it open,
 //! writes `tokens − 1` bytes (the command holds the implicit first token, as make's protocol has
@@ -25,7 +25,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::api::dto::{ExecClass, JobId};
 use crate::error::{CowshedError, CpuAdmissionRefusal, Result};
 use crate::host_pressure::{Decision, RECHECK_EVERY, may_start, read_memory_pressure};
-use cowshed_types::metadata::WorkspaceIncarnation;
 
 /// The count a job's command reads beside its fifo (05_gateway.md "Cargo reads its holder's
 /// jobserver").
@@ -36,34 +35,6 @@ pub(crate) const JOBSERVER_FIFO_FLAGS: &str = "-j --jobserver-auth=fifo:";
 
 /// One token: any byte is one to make and Cargo.
 const TOKEN_BYTE: u8 = b'+';
-
-/// The workspace's pool directory, `<store>/run/cpu/<incarnation as base64url>`: the one
-/// directory its sandbox opens for FIFOs, where its jobs' jobserver fifos live. Sibling
-/// workspaces' directories sit beside it, and no sandbox can list `run/cpu`.
-pub fn cpu_pool_directory(store: &Path, incarnation: &WorkspaceIncarnation) -> PathBuf {
-    use base64::Engine as _;
-    // A validated incarnation is 32 lowercase hex digits: 16 bytes.
-    let digit = |byte: u8| {
-        if byte <= b'9' {
-            byte - b'0'
-        } else {
-            byte - b'a' + 10
-        }
-    };
-    let mut identity = [0_u8; 16];
-    for (slot, pair) in identity
-        .iter_mut()
-        .zip(incarnation.as_str().as_bytes().as_chunks::<2>().0)
-    {
-        *slot = digit(pair[0]) * 16 + digit(pair[1]);
-    }
-    let mut encoded = [0_u8; 22];
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode_slice(identity, &mut encoded)
-        .expect("22 bytes hold a complete base64url 128-bit incarnation");
-    let name = std::str::from_utf8(&encoded).expect("base64url is ASCII");
-    store.join("run/cpu").join(name)
-}
 
 /// The host's cores: the count every jobserver holds unless its job wants fewer.
 pub fn host_cores() -> NonZeroUsize {

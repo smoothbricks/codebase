@@ -7,8 +7,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use cowshed_types::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
-
-pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
+use cowshed_types::paths::WORKSPACE_ENVIRONMENT_PATH;
 
 /// The variable `.cowshed/env` restores `NX_PARALLEL` from after a devenv shell sets its own: a
 /// job's Nx fan-out, its jobserver count (05_gateway.md "Parallelism inside a job").

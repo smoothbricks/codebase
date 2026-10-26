@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{CowshedError, Result};
 use crate::sandbox::SandboxConfig;
+use cowshed_types::paths::WORKSPACE_GIT_FETCH_CONFIG_PATH;
 use cowshed_types::repository::RepositoryBinding;
-
-pub const WORKSPACE_GIT_FETCH_CONFIG_PATH: &str = ".cowshed/git-fetch.inc";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GitFetchMapping {

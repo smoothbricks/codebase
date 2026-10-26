@@ -30,12 +30,12 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
-use super::shell_host::SHELL_HOST_DIRECTORY;
 use super::shell_watch::{
     ActivationEvidence, CertifyError, Content, Contents, Snapshot, WatchEntry, certify,
     encode_direnv_watches,
 };
 use crate::sandbox::{EgressGrant, SandboxGrants};
+use cowshed_types::paths::SHELL_HOST_DIRECTORY;
 
 /// The record's file in the workspace's host directory, which every job profile denies writes to.
 pub const RECORD_FILE: &str = "activation.json";

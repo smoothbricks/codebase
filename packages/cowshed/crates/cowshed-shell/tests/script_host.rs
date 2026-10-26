@@ -1473,11 +1473,12 @@ fn linux_refused_cgroup_placement_never_runs_the_command() {
 /// export carries `LOCAL_TOKEN`; `tail_supplies_token` decides whether the checkouts' own
 /// `.envrc-local` sets it. Returns the clone and the adoption request.
 fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>) {
-    use cowshed_core::runtime::shell_host::{Inherited, SHELL_HOST_DIRECTORY};
+    use cowshed_core::runtime::shell_host::Inherited;
     use cowshed_core::runtime::shell_inherit::{
         Certification, Origin, Placement, record_path, verify, write_record,
     };
     use cowshed_core::runtime::shell_watch::{WatchEntry, certify};
+    use cowshed_types::paths::SHELL_HOST_DIRECTORY;
 
     let origin = host.directory.join("origin");
     let witness = host.directory.join("witness");

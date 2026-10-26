@@ -34,8 +34,8 @@ use super::shell_host::{
     REPLY_ACTIVATED, REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_ADOPTION_REFUSED,
     REPLY_APPROVED, REPLY_EXITED, REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX,
     REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_ADOPT, REQUEST_APPROVE,
-    REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus,
-    SHELL_HOST_DIRECTORY, ShellHostProgram, dropped_host_end, send_with_descriptors,
+    REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus, ShellHostProgram,
+    dropped_host_end, send_with_descriptors,
 };
 use super::shell_inherit::{self, Placement, VerifiedActivation};
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
@@ -54,6 +54,7 @@ use crate::exec::{
 };
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::fork_lock::Spawn as _;
+use cowshed_types::paths::SHELL_HOST_DIRECTORY;
 
 /// Everything that makes one warm shell interchangeable with another: the same profile (mode
 /// and grants) bound to the same build volume, the same sandbox environment, the same `.envrc`
@@ -1947,9 +1948,10 @@ mod tests {
     /// also holds the activation record clones inherit.
     #[test]
     fn staging_sweeps_only_superseded_programs() {
-        use super::super::shell_host::{SHELL_HOST_DIRECTORY, ShellHostProgram};
+        use super::super::shell_host::ShellHostProgram;
         use super::super::shell_inherit::RECORD_FILE;
         use super::{is_staged_name, stage_host_executable};
+        use cowshed_types::paths::SHELL_HOST_DIRECTORY;
 
         assert!(is_staged_name("1000010-5133953f-2bce010-6ad85d6c.19a6f68b"));
         assert!(!is_staged_name(RECORD_FILE));

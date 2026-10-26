@@ -21,8 +21,8 @@
 
 use crate::build_record::{BuildRecord, lost_commits_refusal, unproven_refusal};
 use cowshed_core::git::GitRepository;
-use cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH;
 use cowshed_core::{CowshedError, Result};
+use cowshed_types::paths::DEFAULT_LANDING_BRANCH;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt as _;
