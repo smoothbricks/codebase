@@ -137,6 +137,12 @@ pub(crate) fn installed_nx_read_paths(nx: &Path, owned_checkout: Option<&Path>) 
     );
     reads.extend(namespaces);
     reads.extend(bindings);
+    // A genuine sibling is a workspace root, and Node reads its manifest when it resolves from that
+    // root (`trySelf`, the nearest parent package.json). Node 24.21.0 and 26.11.1 refuse an
+    // unreadable one with ERR_INVALID_PACKAGE_CONFIG; 26.7.0 skipped it, which hid the missing read.
+    if let Some(checkout) = owned_checkout {
+        reads.insert(checkout.join("package.json"));
+    }
     // Local packages already belong to the workspace's read authority. External grants must
     // never intersect that protected workspace; only shared cache payloads need added reads.
     reads

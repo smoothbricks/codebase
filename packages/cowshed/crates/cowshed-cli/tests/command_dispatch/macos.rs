@@ -2114,6 +2114,16 @@ fn host_bun() -> PathBuf {
     executable
 }
 
+/// Install `program` as `name` in the fixture user's Nix profile, the first installation
+/// directory cowshed's bootstrap searches (15_capabilities.md, "Bootstrap executables"), so the
+/// fixture's workspaces run the program the test selected. A program the host happens to have
+/// installed answers nothing: a hosted CI runner may have none, or another version.
+fn install_in_fixture_profile(fixture: &Fixture, name: &str, program: &Path) {
+    let profile = fixture.storage.home().join(".nix-profile/bin");
+    fs::create_dir_all(&profile).unwrap();
+    std::os::unix::fs::symlink(program, profile.join(name)).unwrap();
+}
+
 /// The installed dependency closure of `nx`, walked through the repository's own Bun store:
 /// each package's dependencies resolve to the sibling Bun linked beside it in the same store
 /// entry, so the walk yields the exact instances the repository runs, platform binaries for
@@ -7656,11 +7666,9 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
     );
     git(&fixture.checkout, &["commit", "-q", "-m", "declared bun"]);
     let direnv = path_program("direnv");
-    let profile = fixture.storage.home().join(".nix-profile/bin");
-    fs::create_dir_all(&profile).unwrap();
-    std::os::unix::fs::symlink(&direnv, profile.join("direnv")).unwrap();
+    install_in_fixture_profile(&fixture, "direnv", &direnv);
     let pinned_bun = host_bun();
-    std::os::unix::fs::symlink(&pinned_bun, profile.join("bun")).unwrap();
+    install_in_fixture_profile(&fixture, "bun", &pinned_bun);
     let mut service = serve_project(&mut fixture, &[]).await;
     succeed(&mut service, ["fork", "managed"]).await;
 
@@ -7792,6 +7800,7 @@ async fn directory_managed_install_restores_developer_links_before_nx_and_cleans
         "name": "fixture", "private": true, "dependencies": { "nx": "file:./fixture-registry-nx" }
     })).unwrap()).unwrap();
     let bun = host_bun();
+    install_in_fixture_profile(&fixture, "bun", &bun);
     let installed = Command::new(&bun)
         .args(["install", "--ignore-scripts"])
         .current_dir(&fixture.checkout)
@@ -8040,6 +8049,7 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
     // Bun's own lockfile, written without running any lifecycle script, so `bun.lock` is real and
     // Bun detection (capabilities/bun.rs) activates on it. Resolved as the managed-install test does.
     let bun = host_bun();
+    install_in_fixture_profile(&fixture, "bun", &bun);
     let lockfile = Command::new(&bun)
         .args(["install", "--ignore-scripts", "--lockfile-only"])
         .current_dir(&fixture.checkout)
