@@ -123,6 +123,7 @@ export async function loadWasmBytes(
 ): Promise<ArrayBuffer | undefined> {
   if (customPath) {
     try {
+      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the package's own wasm artifact at a caller-given path: a local file read under Bun and Node, or a static asset of the page's own origin in a browser, loaded the way its scripts are; a hung page load ends with the page
       const response = await fetch(customPath);
       if (response.ok) {
         return await response.arrayBuffer();
@@ -140,6 +141,7 @@ export async function loadWasmBytes(
 
   for (const path of defaultPaths) {
     try {
+      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the package's own wasm artifact beside this module: a local file read under Bun and Node, or a static asset of the page's own origin in a browser, loaded the way its scripts are; a hung page load ends with the page
       const response = await fetch(path);
       if (response.ok) {
         return await response.arrayBuffer();
