@@ -763,7 +763,8 @@ mod tests {
     }
 
     #[test]
-    fn image_telemetry_large_native_extent_delta_emits_warning() {
+    #[ignore = "requires host-controller authority: run nx run cowshed:host-controller-test"]
+    fn host_controller_image_telemetry_large_native_extent_delta_emits_warning() {
         let fixture = Fixture::new();
         let image = fixture.0.join("image.dmg");
         let mut file = OpenOptions::new()
@@ -1135,7 +1136,8 @@ mod tests {
     }
 
     #[test]
-    fn image_telemetry_native_seed_clone_and_release_are_all_wired() {
+    #[ignore = "requires host-controller authority: run nx run cowshed:host-controller-test"]
+    fn host_controller_image_telemetry_native_seed_clone_and_release_are_all_wired() {
         use crate::build_volume::{
             BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, Registrant,
             Registration,

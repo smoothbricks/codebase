@@ -217,6 +217,13 @@ socket below the fixture past Darwin's 104-byte `sun_path`. A fixture that holds
 such as a test `HOME`, takes the granted `TMPDIR`. An invalid requested alias fails loudly; it never falls through to a
 global or temp directory.
 
+Fixtures constructing a nested supervisor configuration and its workspace grants instead select the workspace-owned
+scratch parent for their filesystem workspace root. The existing workspace fixture constructor canonicalizes that parent
+for capability containment; separate socket fixtures still retain their short literal aliases. The exec's TMPDIR can be
+under the protected controller store, where granting a nested workspace or HOME is correctly refused. This changes no
+grant or protected-path policy. In-process supervisor/store tests remain ordinary; fixtures that actually run an
+independently confined controller use the host-controller lane below.
+
 RAM host fixtures own a test namespace (01_storage.md, "Host namespace") and derive everything from it: their root
 `/private/var/folders/cowshed/<uid>/<ns>`, the fixture gateway's control socket `<root>/gateway.sock`, the volume paths
 (`<root>/ram3`, `<root>/ram3-new`), the volume name `smoo-ram3-<uid>-<ns>`, the lock, and the exact attached registry
