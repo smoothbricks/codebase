@@ -3129,11 +3129,11 @@ pub(super) fn io(operation: &str, path: &Path, error: &std::io::Error) -> Cowshe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::{ProjectPaths, RepoId};
     use cowshed_os::test_backstop::{
         AsyncChildBackstop as _, AsyncCommandBackstop as _, ChildBackstop as _,
         CommandBackstop as _,
     };
+    use cowshed_types::repository::{ProjectPaths, RepoId};
     use std::fs;
 
     struct Store {
@@ -4500,7 +4500,7 @@ mod tests {
             volumes
                 .layout
                 .project_root()
-                .join(crate::repository::REPOSITORY_BINDING_FILE),
+                .join(cowshed_types::repository::REPOSITORY_BINDING_FILE),
             b"retained fixture binding",
         )
         .unwrap();

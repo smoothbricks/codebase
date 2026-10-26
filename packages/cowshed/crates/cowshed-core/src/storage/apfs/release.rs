@@ -749,7 +749,7 @@ fn holds_projects(path: &Path) -> bool {
 fn is_encoded_entry(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(crate::repository::is_encoded_component)
+        .is_some_and(cowshed_types::repository::is_encoded_component)
 }
 
 /// [`released_in`] the directory `<project>/<images>/<namespace>` of every project in the store at

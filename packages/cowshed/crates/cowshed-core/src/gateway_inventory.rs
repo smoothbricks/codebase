@@ -16,7 +16,6 @@ use crate::metadata::{
     DetachedWorkspaceMetadata, GrantSet, PortBlock, PublicationState, ReservedPortBlocks,
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
-use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
 use crate::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
@@ -35,6 +34,7 @@ use crate::workspace_credentials::{
 };
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::mounts::KernelMountSnapshot;
+use cowshed_types::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
 
 pub(crate) const MAX_BINDING_BYTES: u64 = 1024 * 1024;
 const UNRESOLVED_CHECKOUT_PATH: &str = ".unresolved-main-mount";
@@ -2349,7 +2349,7 @@ pub(crate) fn discover_owned_identities(
             {
                 continue;
             }
-            let binding_path = project.join(crate::repository::REPOSITORY_BINDING_FILE);
+            let binding_path = project.join(cowshed_types::repository::REPOSITORY_BINDING_FILE);
             // Unreadable is "not a project"; only a binding that is present and readable is held
             // to the project contract.
             if !binding_path_exists(&binding_path).unwrap_or(false) {
@@ -2887,12 +2887,12 @@ mod tests {
         MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION, WorkspaceInfoSnapshot,
         WorkspaceRole, write_json,
     };
-    use crate::repository::{BoundIdentity, RepositoryBinding};
     use crate::storage::CheckpointLabel;
     use crate::storage::bootstrap::CanonicalRoots;
     use crate::storage::lifecycle::{KernelMountFact, LifecycleWorkspace, Pin, Revision};
     use crate::workspace_credentials::mint_workspace_credentials;
     use cowshed_os::namespace::TestNamespace;
+    use cowshed_types::repository::{BoundIdentity, RepositoryBinding};
 
     use super::*;
 

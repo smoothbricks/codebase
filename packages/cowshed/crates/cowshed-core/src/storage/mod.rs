@@ -12,8 +12,8 @@ use crate::metadata::{
     CheckoutRootRecord, MetadataError, SlotBindings, SlotBindingsRecord, WorkspaceName,
     append_suffix, sidecar_path,
 };
-use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 use cowshed_apfs::image::IMAGE_EXTENSION;
+use cowshed_types::repository::{PathLayoutError, ProjectPaths, RepoId};
 
 pub mod apfs;
 pub mod audit;
@@ -489,7 +489,7 @@ pub fn verify_no_symlinks(root: &Path, candidate: &Path) -> Result<(), StorageLa
     // A non-canonical root voids the lexical containment below (`..` in the root lets a candidate
     // strip-prefix cleanly while resolving elsewhere), so it is refused the same way
     // `is_lexically_contained` in repository.rs refuses it.
-    if !crate::repository::is_lexically_canonical(root) {
+    if !cowshed_types::repository::is_lexically_canonical(root) {
         return Err(StorageLayoutError::EscapesStoreRoot);
     }
     let relative = candidate
@@ -1038,7 +1038,7 @@ mod tests {
             repo in "[A-Za-z0-9][A-Za-z0-9._-]{0,31}",
         ) {
             let remote = format!("https://user:secret@example.com//{owner}///{repo}.git?x=1#fragment");
-            let first = crate::repository::normalize_remote_url(&remote).unwrap();
+            let first = cowshed_types::repository::normalize_remote_url(&remote).unwrap();
             let reparsed = RepoId::parse(first.as_str()).unwrap();
             prop_assert_eq!(first, reparsed);
         }

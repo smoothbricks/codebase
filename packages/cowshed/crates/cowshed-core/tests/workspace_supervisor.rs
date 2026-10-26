@@ -23,7 +23,6 @@ use cowshed_core::api::{
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
-use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
@@ -34,6 +33,7 @@ use cowshed_core::storage::job_artifact::{
 };
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::repository::{OwnedRepoIds, RepoId};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
@@ -1037,7 +1037,7 @@ async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
 async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
     let root = workspace_root("build-volume");
     use cowshed_core::build_volume::{BuildVolumeId, BuildVolumeLayout};
-    use cowshed_core::repository::ProjectPaths;
+    use cowshed_types::repository::ProjectPaths;
 
     let mut supervisor_config = config(&root);
     let project = ProjectPaths::with_mount_root(
@@ -2553,7 +2553,7 @@ async fn quiesce_does_not_wait_for_background_volume_labels() {
 #[tokio::test]
 async fn a_build_volume_label_request_cannot_name_a_host_mount_outside_its_layout() {
     use cowshed_core::build_volume::{BuildVolumeLayout, link};
-    use cowshed_core::repository::ProjectPaths;
+    use cowshed_types::repository::ProjectPaths;
 
     struct RecordingLabeller(mpsc::UnboundedSender<PathBuf>);
     impl VolumeLabeller for RecordingLabeller {
@@ -7356,7 +7356,7 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
         BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link,
     };
     use cowshed_core::capabilities::{BuildStatePath, RelPath};
-    use cowshed_core::repository::ProjectPaths;
+    use cowshed_types::repository::ProjectPaths;
 
     let (mut supervisor_config, root) = nx_project("raven");
     let checkout = supervisor_config.workspace_root.clone();

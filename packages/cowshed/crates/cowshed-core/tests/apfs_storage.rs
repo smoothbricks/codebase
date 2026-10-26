@@ -11,7 +11,6 @@ use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
     WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, Alongside, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError,
@@ -27,6 +26,7 @@ use cowshed_core::storage::lifecycle::{
     SubstrateStats,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::repository::RepoId;
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]

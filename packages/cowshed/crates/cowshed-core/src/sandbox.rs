@@ -1427,7 +1427,7 @@ fn validate_path(path: &Path) -> Result<(), SandboxError> {
             reason: "path is not absolute",
         });
     }
-    if !crate::repository::is_lexically_canonical(path) {
+    if !cowshed_types::repository::is_lexically_canonical(path) {
         return Err(SandboxError::InvalidPath {
             path: path.to_path_buf(),
             reason: "path is not canonical",

@@ -13,7 +13,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_ipc::reader::StreamReader;
 use cowshed_core::api::{ControllerCommitment, JobId, WorkspaceIncarnation};
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{CommitmentPublisher, CommitmentSink};
 use cowshed_core::storage::audit::{
     ArrowAuditSink, AuditSink, AuditSinkEnvironment, AuditSinkError, CommitmentDraft,
@@ -23,6 +22,7 @@ use cowshed_core::storage::job_artifact::{
     controller_commitment_schema, decode_controller_commitments,
 };
 use cowshed_core::storage::trace_segment::TelemetryDate;
+use cowshed_types::repository::RepoId;
 use parking_lot::Mutex;
 
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";

@@ -33,7 +33,6 @@ use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule};
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor_socket::JobHold;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
@@ -57,6 +56,7 @@ use cowshed_core::{
     JobHandle, NativeGatewayInventory, Result, UnreachableMain, validate_existing_host_storage,
 };
 use cowshed_gateway_types::STORE_ROOT;
+use cowshed_types::repository::RepoId;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -5932,7 +5932,7 @@ mod tests {
         };
         use cowshed_core::api::server::{RouterHandle, RouterResponse};
         use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
-        use cowshed_core::repository::{BoundIdentity, RepositoryBinding};
+        use cowshed_types::repository::{BoundIdentity, RepositoryBinding};
         use serde_json::{Value, json};
         use std::num::NonZeroUsize;
 
@@ -7778,7 +7778,7 @@ mod tests {
     #[tokio::test]
     async fn real_unix_controller_connection_shuts_down_every_actor() {
         use cowshed_core::api::server::RouterHandle;
-        use cowshed_core::repository::RepoId;
+        use cowshed_types::repository::RepoId;
         use std::num::NonZeroUsize;
 
         let repo_id = RepoId::parse("acme/widget").unwrap();
@@ -7810,7 +7810,7 @@ mod tests {
     /// a checkout the user cannot open would be the one verdict doctor must never give.
     #[test]
     fn an_unmounted_main_is_a_critical_doctor_finding() {
-        use cowshed_core::repository::RepoId;
+        use cowshed_types::repository::RepoId;
 
         let main = UnreachableMain {
             repo_id: RepoId::parse("acme/widget").expect("repo"),

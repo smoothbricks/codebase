@@ -26,13 +26,13 @@ use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::caches_retirement::{
     CacheOutcome, Leftover, LeftoverReason, Merge, Owner, Placement, RetirementReport,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::storage::bootstrap::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
     UninstallServiceOutcome, VolumeOutcome, VolumeRole, VolumeState,
 };
 use cowshed_core::{CowshedError, ErrorCode, Result, UnreachableMain};
+use cowshed_types::repository::RepoId;
 use std::path::PathBuf;
 
 /// A host whose every answer is canned, recording the order it was asked.

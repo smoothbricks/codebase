@@ -17,7 +17,6 @@ use cowshed_core::api::server::ConnectionAuthority;
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, PortBlock, PublicationState, WorkspaceIncarnation, WorkspaceName,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope, supervisor_socket};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
@@ -31,6 +30,7 @@ use cowshed_core::storage::recovery::{
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::TestNamespace;
+use cowshed_types::repository::RepoId;
 use serde_json::{Value, json};
 
 #[path = "../support/refusing_gateway.rs"]

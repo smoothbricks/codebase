@@ -13,6 +13,7 @@ base64 = "0.22"
 bytes = "1"
 # The shared trace-segment writer remains in core; process fences live in cowshed-os.
 cowshed-core.workspace = true
+cowshed-types.workspace = true
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 cowshed-os = { path = "../cowshed-os" }
 http = "1"

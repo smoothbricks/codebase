@@ -477,7 +477,7 @@ mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
     use crate::metadata::WorkspaceName;
-    use crate::repository::RepoId;
+    use cowshed_types::repository::RepoId;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -498,14 +498,15 @@ mod tests {
         fs::create_dir_all(store).expect("store root");
         layout.provision_project().expect("project root");
         let paths = layout.project().clone();
-        let binding =
-            crate::repository::RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = cowshed_types::repository::RepositoryBinding::new(vec![
+            cowshed_types::repository::BoundIdentity {
                 repo_id,
                 remote_name: None,
                 remote_url: None,
                 primary: true,
-            }])
-            .expect("repository binding");
+            },
+        ])
+        .expect("repository binding");
         crate::metadata::write_json(&paths.repository_binding, &binding).expect("binding file");
         paths.project_root
     }

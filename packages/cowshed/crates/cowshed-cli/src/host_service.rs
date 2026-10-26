@@ -304,7 +304,7 @@ impl EventSource for DiskEvents {
 
 /// A store-wide mount that changed the store but whose gateway view could not follow says so on
 /// stderr, exactly as the verb does: the work completed, so it is no failure, and no silence.
-fn report_stale(stale: &[(cowshed_core::repository::RepoId, CowshedError)]) -> Result<()> {
+fn report_stale(stale: &[(cowshed_types::repository::RepoId, CowshedError)]) -> Result<()> {
     let mut output = Output::new(std::io::sink(), Blocking::new(std::io::stderr()), false);
     crate::runtime::report_stale_gateway_views(&mut output, stale)
 }

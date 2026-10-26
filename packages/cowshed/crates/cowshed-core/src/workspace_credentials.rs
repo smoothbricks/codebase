@@ -17,11 +17,11 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::metadata::{
     Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes,
 };
-use crate::repository::{OwnedRepoIds, RepoId};
 use crate::storage::lifecycle::LifecycleWorkspace;
 use crate::workspace_environment::{
     EnvironmentMount, WorkspaceEnvironmentError, write_workspace_environment,
 };
+use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 pub const CA_CERTIFICATE_PATH: &str = ".cowshed/ca.pem";
 pub const WORKSPACE_TOKEN_PATH: &str = ".cowshed/token";

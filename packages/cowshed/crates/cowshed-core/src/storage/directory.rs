@@ -43,12 +43,12 @@ use crate::metadata::{
     WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
     sidecar_path,
 };
-use crate::repository::{OwnedRepoIds, RepoId};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
 use cowshed_apfs::image::{ImageCapacity, is_image_path};
 use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
+use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 use super::apfs::native::{
     CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, RESTORE_RECOVERY_FACT_VERSION,
@@ -564,7 +564,7 @@ impl DirectoryExecutionHost {
     /// directory reached through no symlink; it is created when it does not exist yet.
     pub fn new(config: ApfsSubstrateConfig) -> Result<Self, ApfsStorageError> {
         let root = &config.store_root;
-        if !root.is_absolute() || !crate::repository::is_lexically_canonical(root) {
+        if !root.is_absolute() || !cowshed_types::repository::is_lexically_canonical(root) {
             return Err(ApfsStorageError::Layout(
                 super::StorageLayoutError::EscapesStoreRoot,
             ));
@@ -1148,7 +1148,7 @@ impl DirectoryExecutionHost {
             &store
                 .join(owner)
                 .join(repo)
-                .join(crate::repository::SESSIONS_DIRECTORY),
+                .join(cowshed_types::repository::SESSIONS_DIRECTORY),
             &name,
             &incarnation,
         ))

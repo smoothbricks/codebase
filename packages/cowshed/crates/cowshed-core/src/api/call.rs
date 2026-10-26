@@ -24,8 +24,8 @@ use super::operations::{
 };
 use crate::error::{CowshedError, Result};
 use crate::metadata::WorkspaceName;
-use crate::repository::RepoId;
 use bytes::Bytes;
+use cowshed_types::repository::RepoId;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;

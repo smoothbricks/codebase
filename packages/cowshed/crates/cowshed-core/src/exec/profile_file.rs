@@ -261,7 +261,7 @@ mod tests {
     fn supervisor_socket(store: &Path, workspace: &str) -> PathBuf {
         crate::runtime::supervisor_socket::socket_path(
             store,
-            &crate::repository::RepoId::parse("acme/widget").unwrap(),
+            &cowshed_types::repository::RepoId::parse("acme/widget").unwrap(),
             &crate::metadata::WorkspaceName::new(workspace).unwrap(),
         )
     }

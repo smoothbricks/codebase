@@ -217,6 +217,7 @@ impl Scratch {
         for crate_source in [
             "crates/cowshed-core/src",
             "crates/cowshed-gateway-types/src",
+            "crates/cowshed-types/src",
         ] {
             copy_tree(&project.join(crate_source), &root.join(crate_source));
         }

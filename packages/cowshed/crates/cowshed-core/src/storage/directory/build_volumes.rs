@@ -1076,8 +1076,8 @@ mod clock_tests {
 #[cfg(test)]
 mod journal_tests {
     use super::*;
-    use crate::repository::{ProjectPaths, RepoId};
     use crate::storage::apfs::ApfsSubstrateConfig;
+    use cowshed_types::repository::{ProjectPaths, RepoId};
 
     fn swap_fixture() -> (PathBuf, DirectoryExecutionHost, BuildVolumeLayout) {
         use cowshed_os::namespace::{HostNamespace, TestNamespace};
@@ -1321,8 +1321,8 @@ mod journal_tests {
 #[cfg(test)]
 mod detach_tests {
     use super::*;
-    use crate::repository::{ProjectPaths, RepoId};
     use crate::storage::apfs::ApfsSubstrateConfig;
+    use cowshed_types::repository::{ProjectPaths, RepoId};
 
     #[test]
     fn claimed_build_detach_refuses_holders_and_preserves_payload_metadata_and_claim() {

@@ -44,9 +44,6 @@ use crate::api::server::{
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
-#[cfg(target_os = "macos")]
-use crate::repository::OwnedRepoIds;
-use crate::repository::{RepoId, RepositoryBinding};
 use crate::runtime::job_progress::JobProgressStream;
 use crate::runtime::process_stream::JobProcessStream;
 #[cfg(target_os = "macos")]
@@ -56,6 +53,9 @@ use crate::runtime::supervisor_socket::AdmissionSource;
 use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
 use cowshed_os::timing::timed_async;
+#[cfg(target_os = "macos")]
+use cowshed_types::repository::OwnedRepoIds;
+use cowshed_types::repository::{RepoId, RepositoryBinding};
 
 const ROUTER_CAPACITY: usize = 64;
 const STARTUP_LIFECYCLE_ATTEMPTS: usize = 8;
@@ -3243,7 +3243,7 @@ const TERMINAL_DELETING: [DeletingDirectory; 2] = [
         is_entry: crate::build_volume::is_image_name,
     },
     DeletingDirectory {
-        tree: crate::repository::SESSIONS_DIRECTORY,
+        tree: cowshed_types::repository::SESSIONS_DIRECTORY,
         directory: crate::storage::apfs::release::DELETING_DIRECTORY,
         is_entry: crate::storage::apfs::is_deleting_image_name,
     },
@@ -3363,15 +3363,15 @@ const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
         ReleasedFirst::Nothing,
     ),
     (
-        crate::repository::SESSIONS_DIRECTORY,
+        cowshed_types::repository::SESSIONS_DIRECTORY,
         ReleasedFirst::Deleting,
     ),
     (
-        crate::repository::CHECKPOINTS_DIRECTORY,
+        cowshed_types::repository::CHECKPOINTS_DIRECTORY,
         ReleasedFirst::MainsOwn,
     ),
     (
-        crate::repository::EXEC_TEMP_DIRECTORY,
+        cowshed_types::repository::EXEC_TEMP_DIRECTORY,
         ReleasedFirst::MainsOwn,
     ),
     (
@@ -3387,7 +3387,7 @@ const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
 #[cfg(target_os = "macos")]
 fn require_no_recovery_image(project_root: &Path) -> Result<()> {
     let trash = project_root
-        .join(crate::repository::SESSIONS_DIRECTORY)
+        .join(cowshed_types::repository::SESSIONS_DIRECTORY)
         .join(crate::storage::recovery::TRASH_NAMESPACE);
     let failed = |error: std::io::Error| {
         CowshedError::environment_missing(
@@ -3543,11 +3543,11 @@ pub(crate) enum UnbindCheckpoint {
 /// Created only after this transaction has synced the binding's absence.
 #[cfg(target_os = "macos")]
 struct DurablyUnboundProject<'a> {
-    paths: &'a crate::repository::ProjectPaths,
+    paths: &'a cowshed_types::repository::ProjectPaths,
 }
 
 #[cfg(target_os = "macos")]
-fn remove_project_mount_trees(paths: &crate::repository::ProjectPaths) -> Result<()> {
+fn remove_project_mount_trees(paths: &cowshed_types::repository::ProjectPaths) -> Result<()> {
     let build =
         crate::build_volume::BuildVolumeLayout::new(paths).map_err(native_integrity_error)?;
     for tree in [paths.mount_root.as_path(), build.mounts()] {
@@ -3562,7 +3562,7 @@ fn remove_project_mount_trees(paths: &crate::repository::ProjectPaths) -> Result
 /// The real restore finisher, also used when a retry finds the binding already absent.
 #[cfg(target_os = "macos")]
 pub(crate) fn finish_restored_project_unbinding(
-    paths: &crate::repository::ProjectPaths,
+    paths: &cowshed_types::repository::ProjectPaths,
     expected: &RepositoryBinding,
     cleanup: Option<&Path>,
     observe: &mut impl FnMut(UnbindCheckpoint) -> Result<()>,
@@ -11110,7 +11110,7 @@ fn apply_identity_change(
     converge_binding_identity(
         &intent
             .new_project_root
-            .join(crate::repository::REPOSITORY_BINDING_FILE),
+            .join(cowshed_types::repository::REPOSITORY_BINDING_FILE),
         &intent.old_repo_id,
         &intent.new_repo_id,
     )?;
@@ -16247,7 +16247,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.validate_binding().await?;
         self.current(&workspace).await?;
         let root = crate::host_dirs::repo_mirrors(&self.home).join(
-            crate::repository::encode_component(url.as_str()).map_err(native_integrity_error)?,
+            cowshed_types::repository::encode_component(url.as_str())
+                .map_err(native_integrity_error)?,
         );
         if tokio::fs::try_exists(&root).await.map_err(|error| {
             CowshedError::environment_missing(error.to_string(), "check cache permissions")
@@ -17432,7 +17433,7 @@ fn binding_from_remotes(
                 "retry adoption with --repo-id owner/repo",
             )
         })?;
-        return RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        return RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id,
             remote_name: None,
             remote_url: None,
@@ -17452,7 +17453,7 @@ fn binding_from_remotes(
         match remote
             .url
             .to_str()
-            .map(crate::repository::normalize_remote_url)
+            .map(cowshed_types::repository::normalize_remote_url)
         {
             Some(Ok(repo_id)) => candidates.push((remote, repo_id)),
             Some(Err(error)) => unusable.push(format!("{} ({error})", remote.name)),
@@ -17470,7 +17471,7 @@ fn binding_from_remotes(
                 "retry adoption with --repo-id owner/repo",
             )
         })?;
-        return RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        return RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id,
             remote_name: None,
             remote_url: None,
@@ -17535,7 +17536,7 @@ fn binding_from_remotes(
 
     let remote_url = persistable_remote_url(&selected.url)
         .ok_or_else(|| CowshedError::internal("normalized repository URL cannot be persisted"))?;
-    RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+    RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
         repo_id: selected_repo_id,
         remote_name: Some(selected.name.clone()),
         remote_url: Some(remote_url),
@@ -17786,7 +17787,7 @@ fn names_one_root(recorded: &Path, observed: &Path) -> bool {
 
 /// Reconciles a loaded binding's recorded remote URLs with the checkout's Git configuration.
 ///
-/// Identity is the owner/repo ([`crate::repository::normalize_remote_url`] strips the host on
+/// Identity is the owner/repo ([`cowshed_types::repository::normalize_remote_url`] strips the host on
 /// purpose); the URL is only transport. So a recorded remote whose current URL still derives the
 /// same identity has merely moved servers, and the recorded transport follows it — the healed
 /// binding is returned for the caller to persist. A current URL deriving a *different* identity is
@@ -17827,7 +17828,7 @@ fn reconcile_binding_with_remotes(
         match remote
             .url
             .to_str()
-            .map(crate::repository::normalize_remote_url)
+            .map(cowshed_types::repository::normalize_remote_url)
         {
             Some(Ok(derived)) if derived == identity.repo_id => {
                 // Same identity, new transport: follow the move. The persistable form is what
@@ -17885,7 +17886,10 @@ fn bind_remote(
     remotes: &[crate::git::RemoteUrl],
     remote_name: &str,
     others: &[(RepoId, RepositoryBinding)],
-) -> Result<(crate::repository::BoundIdentity, Option<RepositoryBinding>)> {
+) -> Result<(
+    cowshed_types::repository::BoundIdentity,
+    Option<RepositoryBinding>,
+)> {
     let remote = remotes
         .iter()
         .find(|remote| remote.name == remote_name)
@@ -17908,7 +17912,7 @@ fn bind_remote(
             "bind a remote whose URL names a hosted repository",
         )
     })?;
-    let repo_id = crate::repository::normalize_remote_url(url).map_err(|error| {
+    let repo_id = cowshed_types::repository::normalize_remote_url(url).map_err(|error| {
         CowshedError::usage(
             format!("remote {remote_name} ({url}) names no owner/repo identity: {error}"),
             "bind a remote whose URL names a hosted repository",
@@ -17942,7 +17946,7 @@ fn bind_remote(
             ));
         }
     }
-    let identity = crate::repository::BoundIdentity {
+    let identity = cowshed_types::repository::BoundIdentity {
         repo_id,
         remote_name: Some(remote_name.to_owned()),
         remote_url: Some(recorded),
@@ -21135,7 +21139,7 @@ fn resolve_grant_path(path: &Path) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn require_canonical_grant_path(original: &Path, real: PathBuf) -> Result<PathBuf> {
-    if !crate::repository::is_lexically_canonical(&real) {
+    if !cowshed_types::repository::is_lexically_canonical(&real) {
         return Err(grant_path_usage(
             original,
             format!("resolved to non-canonical {}", real.display()),
@@ -24267,7 +24271,7 @@ fn quarantine_and_companion_findings_blocking(
         let quarantine_root = layout
             .project()
             .project_root
-            .join(crate::repository::QUARANTINE_DIRECTORY);
+            .join(cowshed_types::repository::QUARANTINE_DIRECTORY);
         match std::fs::read_dir(&quarantine_root) {
             Ok(entries) => {
                 for entry in entries.flatten() {
@@ -24483,7 +24487,7 @@ mod doctor_hint_tests {
     fn marker(project_root: &str, workspace: &str) -> WorkspaceMarker {
         WorkspaceMarker {
             version: MARKER_VERSION,
-            repo_id: crate::repository::RepoId::parse("acme/widget").expect("repo"),
+            repo_id: cowshed_types::repository::RepoId::parse("acme/widget").expect("repo"),
             project_root: PathBuf::from(project_root),
             workspace: WorkspaceName::new(workspace).expect("workspace"),
             workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
@@ -24499,12 +24503,12 @@ mod doctor_hint_tests {
     }
 
     fn expected() -> (
-        crate::repository::RepoId,
+        cowshed_types::repository::RepoId,
         WorkspaceName,
         WorkspaceIncarnation,
     ) {
         (
-            crate::repository::RepoId::parse("acme/widget").expect("repo"),
+            cowshed_types::repository::RepoId::parse("acme/widget").expect("repo"),
             WorkspaceName::new("raven").expect("workspace"),
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("incarnation"),
         )
@@ -24980,12 +24984,12 @@ mod doctor_hint_tests {
         ));
         let store = root.join("store");
         std::fs::create_dir_all(&store).expect("store dir");
-        let repo = crate::repository::RepoId::parse("acme/widget").expect("repo");
+        let repo = cowshed_types::repository::RepoId::parse("acme/widget").expect("repo");
         let layout = crate::storage::StorageLayout::new(&store, &repo).expect("layout");
         let quarantine = layout
             .project()
             .project_root
-            .join(crate::repository::QUARANTINE_DIRECTORY);
+            .join(cowshed_types::repository::QUARANTINE_DIRECTORY);
         std::fs::create_dir_all(&quarantine).expect("quarantine dir");
 
         // A held workspace: the tombstone names it, with no live files the scan could
@@ -25533,7 +25537,7 @@ mod workspace_origin_tests {
         let layout = crate::storage::StorageLayout::new(&store, &repo_id).expect("layout");
         std::fs::create_dir_all(&store).expect("store");
         layout.provision_project().expect("project store");
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id.clone(),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://example.test/acme/widget.git".to_owned()),
@@ -25584,20 +25588,21 @@ mod workspace_origin_tests {
                 .expect("layout");
         std::fs::create_dir_all(&store).expect("store");
         layout.provision_project().expect("project store");
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id.clone(),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://example.test/acme/widget.git".to_owned()),
             primary: true,
         }])
         .expect("binding");
-        let mismatched_binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
-            repo_id: RepoId::parse("other/widget").expect("other repo"),
-            remote_name: Some("origin".to_owned()),
-            remote_url: Some("https://example.test/other/widget.git".to_owned()),
-            primary: true,
-        }])
-        .expect("mismatched binding");
+        let mismatched_binding =
+            RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
+                repo_id: RepoId::parse("other/widget").expect("other repo"),
+                remote_name: Some("origin".to_owned()),
+                remote_url: Some("https://example.test/other/widget.git".to_owned()),
+                primary: true,
+            }])
+            .expect("mismatched binding");
         crate::metadata::write_json(&layout.project().repository_binding, &mismatched_binding)
             .expect("persist mismatched binding");
         project_binding_from_workspace_origin(&store, &session, Some(&origin))
@@ -25911,7 +25916,7 @@ mod binding_heal_persistence_tests {
         let layout = crate::storage::StorageLayout::new(&store, &repo_id).expect("layout");
         std::fs::create_dir_all(&store).expect("store");
         layout.provision_project().expect("project store");
-        let recorded = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let recorded = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id.clone(),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://github.com/acme/widget.git".to_owned()),
@@ -25968,7 +25973,7 @@ mod binding_tests {
 
     #[test]
     fn a_transport_move_heals_the_recorded_remote_url() {
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id("acme/widget"),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://github.com/acme/widget.git".to_owned()),
@@ -26046,7 +26051,7 @@ mod binding_tests {
     }
 
     fn adopted_widget() -> RepositoryBinding {
-        RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id("acme/widget"),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://github.com/acme/widget.git".to_owned()),
@@ -26074,7 +26079,7 @@ mod binding_tests {
         let updated = updated.expect("the forge remote is newly bound");
         assert_eq!(
             identity,
-            crate::repository::BoundIdentity {
+            cowshed_types::repository::BoundIdentity {
                 repo_id: repo_id("forge/widget"),
                 remote_name: Some("forge".to_owned()),
                 remote_url: Some("ssh://git@forge.example.test:2223/forge/widget.git".to_owned()),
@@ -26107,7 +26112,7 @@ mod binding_tests {
     /// A fetch URL routes to exactly one clone, in each of its SSH spellings.
     #[test]
     fn identity_add_refuses_a_url_another_project_already_binds() {
-        let other = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let other = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id("forge/widget"),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("ssh://forge.example.test:2223/forge/widget.git".to_owned()),
@@ -26151,7 +26156,7 @@ mod binding_tests {
 
     #[test]
     fn an_identity_move_refuses_and_names_the_rebind_verb() {
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id("acme/widget"),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://github.com/acme/widget.git".to_owned()),
@@ -26184,7 +26189,7 @@ mod binding_tests {
 
     #[test]
     fn the_identity_change_open_tolerates_a_moved_remote() {
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id("acme/widget"),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://github.com/acme/widget.git".to_owned()),
@@ -26213,7 +26218,7 @@ mod binding_tests {
     /// refused all three and made `mv … --repo-id` unreachable on a live host.)
     #[test]
     fn the_identity_change_mode_outranks_every_refusal_arm() {
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id("acme/widget"),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://github.com/acme/widget.git".to_owned()),
@@ -26246,7 +26251,7 @@ mod binding_tests {
 
     #[test]
     fn a_matching_or_absent_remote_pairing_reconciles_to_nothing_or_refuses() {
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id("acme/widget"),
             remote_name: Some("origin".to_owned()),
             remote_url: Some("https://example.test/acme/widget.git".to_owned()),
@@ -26287,7 +26292,7 @@ mod binding_tests {
         let binding = binding_from_remotes(&[], Some(&requested)).expect("local-only binding");
         assert_eq!(
             binding.primary().expect("primary"),
-            &crate::repository::BoundIdentity {
+            &cowshed_types::repository::BoundIdentity {
                 repo_id: requested,
                 remote_name: None,
                 remote_url: None,
@@ -26391,7 +26396,7 @@ mod binding_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn matching_repository_identity_with_a_renamed_remote_is_a_binding_mismatch() {
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id("smoothbricks/codebase"),
             remote_name: Some("codebase".to_owned()),
             remote_url: Some("https://github.com/smoothbricks/codebase.git".to_owned()),
@@ -26624,10 +26629,10 @@ mod port_reservation_tests {
         PortAllocation, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
         WorkspaceName,
     };
-    use crate::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use crate::storage::StorageLayout;
     use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
     use cowshed_os::namespace::TestNamespace;
+    use cowshed_types::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
@@ -27473,8 +27478,8 @@ mod terminal_project_cleanup_tests {
         UnbindCheckpoint, clean_terminal_project_storage, finish_restored_project_unbinding,
         require_terminal_storage,
     };
-    use crate::repository::{BoundIdentity, ProjectPaths, RepoId, RepositoryBinding};
     use cowshed_os::test_backstop::CommandBackstop as _;
+    use cowshed_types::repository::{BoundIdentity, ProjectPaths, RepoId, RepositoryBinding};
 
     fn root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -28622,7 +28627,7 @@ mod session_reopen_tests {
     use super::super::supervisor::{SessionToken, WorkspaceAuthoritySnapshot};
     use super::superseded_session;
     use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
-    use crate::repository::RepoId;
+    use cowshed_types::repository::RepoId;
 
     fn token(identity: u64) -> SessionToken {
         SessionToken::remote(
@@ -28739,8 +28744,8 @@ mod volume_labeller_tests {
         )
         .expect("native APFS host");
         let labeller = ApfsLabeller(std::sync::Arc::new(host));
-        let repo =
-            crate::repository::RepoId::parse("fixture/intents").expect("repository identity");
+        let repo = cowshed_types::repository::RepoId::parse("fixture/intents")
+            .expect("repository identity");
         let slotted = crate::storage::StorageLayout::new(&store, &repo)
             .expect("layout")
             .canonical_image(

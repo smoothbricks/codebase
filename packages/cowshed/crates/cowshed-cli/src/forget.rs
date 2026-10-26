@@ -12,8 +12,8 @@
 
 use async_trait::async_trait;
 use cowshed_core::project_retirement::ProjectRetirementReport;
-use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
+use cowshed_types::repository::RepoId;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 

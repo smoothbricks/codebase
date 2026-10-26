@@ -1,0 +1,12 @@
+[package]
+name = "cowshed-types"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# Canonical value declarations with no ambient effects and no dependency on storage,
+# runtime or the API client; cowshed-gateway-types owns repository-id validation.
+[dependencies]
+cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+serde = { workspace = true, features = ["rc"] }
+thiserror = "2"

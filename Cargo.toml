@@ -18,6 +18,7 @@ repository = "https://github.com/smoothbricks/smoothbricks"
 columine-types = { path = "packages/columine/crates/columine-types" }
 columine-vm = { path = "packages/columine/crates/columine-vm" }
 cowshed-core = { path = "packages/cowshed/crates/cowshed-core" }
+cowshed-types = { path = "packages/cowshed/crates/cowshed-types" }
 lmao-core = { path = "packages/lmao/crates/lmao-core" }
 lmao-arena = { path = "packages/lmao/crates/lmao-arena" }
 # bitmosaic is this repository's public compressed bitmap package: the

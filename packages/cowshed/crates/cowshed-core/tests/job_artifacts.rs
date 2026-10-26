@@ -15,7 +15,6 @@ use cowshed_core::api::{
     OutputStorage, ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo,
     TerminalCommitment, WorkspaceIncarnation, WorkspacePath,
 };
-use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, JobArtifactToken, JobScheduling, OutputTargets,
     ProtectedRecord, PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
@@ -23,6 +22,7 @@ use cowshed_core::storage::job_artifact::{
     encode_controller_commitment, open_stream_reader, protected_record_schema, read_stream,
     recover_records, recover_records_with_budget,
 };
+use cowshed_types::repository::{OwnedRepoIds, RepoId};
 use proptest::prelude::*;
 
 struct TempRoot(PathBuf);

@@ -17,7 +17,6 @@ use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
 use cowshed_core::metadata::{PortBlock, WorkspaceName};
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::runtime::land_lease::{self, Holding};
 use cowshed_core::storage::apfs::native::{
@@ -36,6 +35,7 @@ use cowshed_os::test_backstop::{
     AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _, FileBackstop as _,
     UnixStreamBackstop as _,
 };
+use cowshed_types::repository::RepoId;
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;

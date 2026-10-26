@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CowshedError, Result};
-use crate::repository::RepositoryBinding;
 use crate::sandbox::SandboxConfig;
+use cowshed_types::repository::RepositoryBinding;
 
 pub const WORKSPACE_GIT_FETCH_CONFIG_PATH: &str = ".cowshed/git-fetch.inc";
 
@@ -29,7 +29,7 @@ fn failure(message: impl Into<String>) -> CowshedError {
 /// Paths are resolved before this predicate, against canonical controller grants. Do not
 /// canonicalize a grant here: retargeting a granted symlink must not retarget its authority.
 fn is_read_authorized(path: &Path, sandbox: &SandboxConfig) -> bool {
-    crate::repository::is_lexically_canonical(path)
+    cowshed_types::repository::is_lexically_canonical(path)
         && sandbox
             .grants
             .read
@@ -47,7 +47,7 @@ fn authorized_path(path: &Path, sandbox: &SandboxConfig) -> Option<PathBuf> {
 
 fn safe_url(url: &str) -> bool {
     if url.len() > 2048
-        || crate::repository::normalize_remote_url(url).is_err()
+        || cowshed_types::repository::normalize_remote_url(url).is_err()
         || url
             .bytes()
             .any(|b| b.is_ascii_whitespace() || b < 0x20 || b == 0x7f || matches!(b, b'"' | b'\\'))

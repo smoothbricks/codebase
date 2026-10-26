@@ -32,11 +32,11 @@ use serde::{Deserialize, Serialize};
 use crate::api::dto::GitOid;
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
-use crate::repository::ProjectPaths;
 use crate::storage::StorageLayoutError;
 use crate::storage::apfs::release::{Listing, released_in_store};
 use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::repository::ProjectPaths;
 
 pub use link::BUILD_LINK;
 
@@ -1351,7 +1351,7 @@ fn io_error(operation: &str, path: &Path, error: &io::Error) -> crate::CowshedEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::RepoId;
+    use cowshed_types::repository::RepoId;
 
     fn layout() -> BuildVolumeLayout {
         let project = ProjectPaths::with_mount_root(

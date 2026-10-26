@@ -675,7 +675,7 @@ pub struct ProjectPaths {
     pub host_mount_root: PathBuf,
     pub project_root: PathBuf,
     pub repository_binding: PathBuf,
-    /// Where the checkout was when main was last removed; see [`crate::metadata::CheckoutRootRecord`].
+    /// Where the checkout was when main was last removed; see the metadata checkout-root record.
     pub checkout_root: PathBuf,
     pub slot_bindings: PathBuf,
     pub policy: PathBuf,

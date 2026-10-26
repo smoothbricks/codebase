@@ -14,7 +14,6 @@ use crate::build_volume::{
     ReleaseClaim,
 };
 use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
-use crate::repository::RepoId;
 use crate::runtime::build_volumes::Quiet;
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
@@ -23,6 +22,7 @@ use crate::storage::lifecycle::DerivedWorkspace;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_types::repository::RepoId;
 
 impl RuntimeStorageHost for DirectoryExecutionHost {
     fn canonical_metadata(

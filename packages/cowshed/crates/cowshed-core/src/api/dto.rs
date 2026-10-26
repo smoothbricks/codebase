@@ -7,11 +7,11 @@ pub use crate::metadata::{
     WorkspaceName, WorkspaceRole,
 };
 use crate::project_retirement::ProjectRetirementReport;
-use crate::repository::{BoundIdentity, RepoId};
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use crate::storage::lifecycle::{DerivedWorkspace, MountRefusal, MountState, Pin as LifecyclePin};
 use base64::Engine;
 use bytes::Bytes;
+use cowshed_types::repository::{BoundIdentity, RepoId};
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

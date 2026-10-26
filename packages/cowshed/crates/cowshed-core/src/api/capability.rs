@@ -34,12 +34,12 @@ use super::server::{
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
 use crate::metadata::WorkspaceName;
-use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use crate::runtime::supervisor_socket::AdmissionSource;
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(unix)]
 use cowshed_os::deadline::{self, Idle, Peer, Progress, Silent};
+use cowshed_types::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::fmt;
@@ -3648,7 +3648,7 @@ mod tests {
         other_build: watch::Receiver<Option<OtherBuild>>,
     ) -> Coordinator {
         let repo_id = RepoId::parse("acme/widget").unwrap();
-        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = RepositoryBinding::new(vec![cowshed_types::repository::BoundIdentity {
             repo_id: repo_id.clone(),
             remote_name: None,
             remote_url: None,

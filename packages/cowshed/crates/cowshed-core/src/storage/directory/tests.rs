@@ -892,7 +892,7 @@ fn a_recovery_image_moves_out_of_the_store_with_its_companions_and_a_manifest() 
     let (host, image, metadata) = published_directory(&scratch, "selected", 1);
     // Every recovery below names the fixture host as its backend environment owner.
     let recover = |storage: &crate::storage::StorageLayout,
-                   repo: &crate::repository::RepoId,
+                   repo: &cowshed_types::repository::RepoId,
                    image: &Path,
                    to: &Path| {
         crate::storage::recovery_image::recover(storage, repo, image, to, &host)

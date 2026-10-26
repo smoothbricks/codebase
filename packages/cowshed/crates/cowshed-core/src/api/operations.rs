@@ -37,7 +37,7 @@ use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
 use crate::project_policy::ProjectGrants;
 use crate::project_retirement::ProjectRetirementReport;
-use crate::repository::{RepoId, RepositoryBinding};
+use cowshed_types::repository::{RepoId, RepositoryBinding};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

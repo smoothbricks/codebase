@@ -33,10 +33,10 @@ use crate::api::dto::GitOid;
 use crate::metadata::{
     DetachedWorkspaceMetadata, PublicationState, WorkspaceMarker, WorkspaceName, sidecar_path,
 };
-use crate::repository::RepoId;
 use crate::runtime::supervisor::{WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle};
 use crate::runtime::supervisor_socket::{self, Hello};
 use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
+use cowshed_types::repository::RepoId;
 
 /// Git's own discovery honours these; a caller that sets one is answered by Git, through the
 /// controller, rather than by a walk that would not.
@@ -352,7 +352,7 @@ pub async fn resolve(
 /// is the workspace's live volume and it is mounted. A link the controller would re-point, or a
 /// volume it would mount, declines.
 fn build_volume_grant(
-    project: &crate::repository::ProjectPaths,
+    project: &cowshed_types::repository::ProjectPaths,
     workspace: &WorkspaceName,
     mount: &Path,
     probe: &impl LiveProbe,

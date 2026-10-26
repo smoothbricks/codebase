@@ -24,7 +24,6 @@ use cowshed_core::metadata::{
     PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
     WorkspaceRole, sidecar_path,
 };
-use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource, RestoreFailpoint,
     SystemKernelMountSource,
@@ -43,6 +42,7 @@ use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;

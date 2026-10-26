@@ -32,7 +32,6 @@ pub mod metadata;
 pub mod port_zero;
 pub mod project_policy;
 pub mod project_retirement;
-pub mod repository;
 pub mod resident;
 pub mod runtime;
 pub mod sandbox;

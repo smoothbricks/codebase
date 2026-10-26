@@ -25,7 +25,6 @@ use cowshed_core::host_dirs::support_directory;
 use cowshed_core::land_turn as turns;
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor_manager::{
     self, ProgramSpawner, SocketPeers, SupervisorManager,
 };
@@ -45,6 +44,7 @@ use cowshed_gateway_types::host_status::{LoadReading, MemoryPressureReading, Swa
 use cowshed_os::deadline::WaitError;
 use cowshed_os::namespace::HostNamespace;
 use cowshed_os::stdio::Blocking;
+use cowshed_types::repository::RepoId;
 use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
 use std::fs;
@@ -5297,7 +5297,7 @@ mod tests {
         ) -> Daemon {
             let store = root.join("store");
             fs::create_dir_all(store.join("run")).expect("run directory");
-            let repo = cowshed_core::repository::RepoId::parse("acme/widget").expect("repo id");
+            let repo = cowshed_types::repository::RepoId::parse("acme/widget").expect("repo id");
             for workspace in workspaces {
                 let workspace =
                     cowshed_core::metadata::WorkspaceName::new(*workspace).expect("workspace");

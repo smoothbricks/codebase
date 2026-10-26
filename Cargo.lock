@@ -876,6 +876,7 @@ dependencies = [
  "cowshed-gateway-types",
  "cowshed-os",
  "cowshed-shell",
+ "cowshed-types",
  "libc",
  "proptest",
  "rcgen",
@@ -905,6 +906,7 @@ dependencies = [
  "cowshed-apfs",
  "cowshed-gateway-types",
  "cowshed-os",
+ "cowshed-types",
  "getrandom 0.3.4",
  "libc",
  "miniz_oxide 0.8.9",
@@ -941,6 +943,7 @@ dependencies = [
  "cowshed-core",
  "cowshed-gateway-types",
  "cowshed-os",
+ "cowshed-types",
  "http",
  "http-body",
  "http-body-util",
@@ -995,6 +998,7 @@ dependencies = [
  "cowshed-cli",
  "cowshed-core",
  "cowshed-os",
+ "cowshed-types",
  "libc",
  "napi",
  "napi-build",
@@ -1028,11 +1032,21 @@ dependencies = [
  "cowshed-gateway",
  "cowshed-gateway-types",
  "cowshed-os",
+ "cowshed-types",
  "libc",
  "serde",
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "cowshed-types"
+version = "0.1.0"
+dependencies = [
+ "cowshed-gateway-types",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

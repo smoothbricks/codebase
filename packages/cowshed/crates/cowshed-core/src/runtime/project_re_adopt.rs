@@ -887,7 +887,7 @@ fn require_checkout_of(
     root: &Path,
     checkout: &Path,
     remotes: &[crate::git::RemoteUrl],
-    repo: &crate::repository::RepoId,
+    repo: &cowshed_types::repository::RepoId,
 ) -> Result<()> {
     if root != checkout {
         return Err(CowshedError::conflict(
@@ -901,7 +901,7 @@ fn require_checkout_of(
     }
     let names_repo = remotes.iter().any(|remote| {
         matches!(
-            remote.url.to_str().map(crate::repository::normalize_remote_url),
+            remote.url.to_str().map(cowshed_types::repository::normalize_remote_url),
             Some(Ok(derived)) if derived == *repo
         )
     });
@@ -1121,7 +1121,7 @@ mod tests {
     use super::require_checkout_of;
     use crate::error::ErrorCode;
     use crate::git::RemoteUrl;
-    use crate::repository::RepoId;
+    use cowshed_types::repository::RepoId;
 
     fn remote(name: &str, url: &str) -> RemoteUrl {
         RemoteUrl {

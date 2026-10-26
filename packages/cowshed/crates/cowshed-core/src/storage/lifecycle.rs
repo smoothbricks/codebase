@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::metadata::{GrantSet, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
-use crate::repository::RepoId;
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_types::repository::RepoId;
 
 use super::CheckpointLabel;
 

@@ -164,7 +164,7 @@ const SOCKET_DIGEST_HEX: usize = 32;
 /// bytes a Unix socket path may hold on macOS; the digest keeps every path at 64.
 pub fn socket_path(
     store_root: &Path,
-    repo_id: &crate::repository::RepoId,
+    repo_id: &cowshed_types::repository::RepoId,
     workspace: &crate::metadata::WorkspaceName,
 ) -> PathBuf {
     let mut identity = Vec::with_capacity(repo_id.as_str().len() + workspace.as_str().len() + 1);
@@ -252,7 +252,7 @@ struct HelloWire {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct AuthorityWire {
-    repo_id: crate::repository::RepoId,
+    repo_id: cowshed_types::repository::RepoId,
     workspace: crate::metadata::WorkspaceName,
     workspace_incarnation: crate::metadata::WorkspaceIncarnation,
     grant_revision: u64,
@@ -3947,7 +3947,7 @@ mod socket_ownership_tests {
     fn only_the_name_socket_path_gives_is_a_supervisor_socket() {
         let socket = socket_path(
             Path::new("/store"),
-            &crate::repository::RepoId::parse("acme/widget").expect("repo id"),
+            &cowshed_types::repository::RepoId::parse("acme/widget").expect("repo id"),
             &crate::metadata::WorkspaceName::new("raven").expect("workspace"),
         );
         let named = |path: &Path| is_socket_name(path.file_name().expect("a file name"));
@@ -4445,7 +4445,8 @@ mod drain_read_tests {
             supervisor: connect(
                 PathBuf::from("/nonexistent/cowshed-drain-test.sock"),
                 WorkspaceAuthoritySnapshot {
-                    repo_id: crate::repository::RepoId::parse("acme/widget").expect("a repo"),
+                    repo_id: cowshed_types::repository::RepoId::parse("acme/widget")
+                        .expect("a repo"),
                     workspace: crate::metadata::WorkspaceName::main(),
                     workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(
                         "0".repeat(32),

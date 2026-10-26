@@ -124,7 +124,7 @@ impl GatewayControlClient {
     /// and names that work.
     pub async fn clear_nx_cache(
         &self,
-        repo_id: &cowshed_core::repository::RepoId,
+        repo_id: &cowshed_types::repository::RepoId,
     ) -> Result<cowshed_core::api::NxStoreClearResult, ControlError> {
         self.send(&ControlRequest::NxCacheClear {
             repo_id: repo_id.clone(),
@@ -425,7 +425,7 @@ enum ControlRequest {
     /// Clear one project's Nx accepted-task store.
     NxCacheClear {
         #[serde(rename = "repoId")]
-        repo_id: cowshed_core::repository::RepoId,
+        repo_id: cowshed_types::repository::RepoId,
     },
     /// Detach the RAM disk `registry_entry` registers as `device` (05_gateway.md, "RAM disks").
     RamDetach {

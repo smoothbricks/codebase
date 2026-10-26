@@ -1,12 +1,12 @@
 use super::*;
 use crate::build_volume::{BuildVolumeRecord, BuildVolumeRole, Registrant};
 use crate::metadata::WorkspaceName;
-use crate::repository::{ProjectPaths, RepoId};
 use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 use crate::storage::apfs::ApfsSubstrateConfig;
 use crate::storage::directory::DirectoryExecutionHost;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::CommandBackstop as _;
+use cowshed_types::repository::{ProjectPaths, RepoId};
 use std::path::PathBuf;
 
 struct Scratch(PathBuf);

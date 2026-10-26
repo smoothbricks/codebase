@@ -14,12 +14,12 @@ use cowshed_core::gateway_sessions::{
 use cowshed_core::metadata::{
     EgressMode, EgressRule, GrantSet, WorkspaceIncarnation, WorkspaceName,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, HeldWorkspace, Result};
 use cowshed_gateway_types::{
     CanonicalTarget, DaemonStatus, EgressMode as GatewayEgressMode, SessionStatus, TargetScheme,
     WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
+use cowshed_types::repository::RepoId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};

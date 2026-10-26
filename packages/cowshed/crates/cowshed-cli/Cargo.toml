@@ -24,6 +24,7 @@ cowshed-apfs = { path = "../cowshed-apfs" }
 cowshed-os = { path = "../cowshed-os" }
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 cowshed-core.workspace = true
+cowshed-types.workspace = true
 cowshed-shell = { path = "../cowshed-shell" }
 cowshed-gateway = { path = "../cowshed-gateway" }
 clap.workspace = true

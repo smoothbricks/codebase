@@ -22,9 +22,6 @@ use crate::metadata::{
     PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
     WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
 };
-use crate::repository::{
-    CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY,
-};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
@@ -35,6 +32,9 @@ use cowshed_apfs::{
 };
 #[cfg(target_os = "macos")]
 use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_types::repository::{
+    CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1851,7 +1851,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or_default();
-        let quarantine_root = project.join(crate::repository::QUARANTINE_DIRECTORY);
+        let quarantine_root = project.join(cowshed_types::repository::QUARANTINE_DIRECTORY);
         let workspace = metadata.workspace.as_str();
         let mut directory = quarantine_root.join(format!("{workspace}-{now}"));
         let mut ordinal = 2_u64;
@@ -8157,7 +8157,7 @@ mod tests {
         std::fs::create_dir_all(&project).expect("project fixture");
         std::fs::create_dir_all(&foreign).expect("foreign fixture");
         std::fs::write(
-            foreign.join(crate::repository::REPOSITORY_BINDING_FILE),
+            foreign.join(cowshed_types::repository::REPOSITORY_BINDING_FILE),
             b"{}",
         )
         .expect("foreign binding");

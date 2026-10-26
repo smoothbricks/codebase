@@ -122,7 +122,7 @@ pub(crate) fn running_lifecycle() -> BTreeSet<libc::pid_t> {
     for store in stores() {
         for owner in directories(&store) {
             for project in directories(&owner) {
-                for lease in leases(&project.join(crate::repository::SESSIONS_DIRECTORY)) {
+                for lease in leases(&project.join(cowshed_types::repository::SESSIONS_DIRECTORY)) {
                     let Ok(bytes) = fs::read(&lease) else {
                         continue;
                     };

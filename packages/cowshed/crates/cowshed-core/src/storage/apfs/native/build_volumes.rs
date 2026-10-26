@@ -1389,12 +1389,12 @@ mod tests {
     use crate::api::resources::JobAccounting;
     use crate::build_volume::BuildVolumeRole;
     use crate::metadata::WorkspaceName;
-    use crate::repository::{ProjectPaths, RepoId};
     use crate::storage::apfs::ApfsSubstrateConfig;
     use cowshed_apfs::mounts::KernelMountSnapshot;
     use cowshed_apfs::{CommandRequest, SystemCommandRunner};
     use cowshed_os::namespace::{HostNamespace, TestNamespace};
     use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
+    use cowshed_types::repository::{ProjectPaths, RepoId};
     use std::io::Read;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

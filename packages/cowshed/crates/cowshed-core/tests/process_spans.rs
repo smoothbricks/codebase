@@ -22,7 +22,6 @@ use cowshed_core::api::{
     ProtectedOutput, Sha256Digest, SpanId, StdinInfo, StdinKind, StreamInfo, TraceContext, TraceId,
     UtcTimestamp, WorkspaceIncarnation, WorkspacePath,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, job_span_thread};
 use cowshed_core::runtime::process_spans::{
     ProcessSpanProjection, RetainedProcessEvent, process_custom_fields,
@@ -32,6 +31,7 @@ use cowshed_core::runtime::process_tree::{
     BirthToken, ProcessIdentity, ProcessImage, ProcessObservation, ProcessTreeFold,
 };
 use cowshed_core::runtime::process_usage::{StartStamp, UsageReading};
+use cowshed_types::repository::RepoId;
 
 #[path = "support/accounting_fixture.rs"]
 mod accounting_fixture;

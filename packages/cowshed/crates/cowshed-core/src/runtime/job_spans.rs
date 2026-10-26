@@ -42,7 +42,6 @@ use crate::api::dto::{ExitStatus, JobId, JobInfo, JobState, TraceContext};
 use crate::api::resources::{ChargedMemoryUsage, HostLoadSample, VolumeUsedBytesDelta};
 use crate::error::CowshedError;
 use crate::metadata::WorkspaceIncarnation;
-use crate::repository::RepoId;
 use crate::runtime::job_span_facts::{HostColumnError, HostColumns, SpanFacts};
 use crate::runtime::job_unattributed::{
     AccountingSource, CoverageKind, JOB_UNATTRIBUTED_MESSAGE, UnattributedUsage,
@@ -56,6 +55,7 @@ use crate::storage::trace_segment::{
     EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, TraceSegmentError,
     seal_segment, trace_batch,
 };
+use cowshed_types::repository::RepoId;
 
 /// The span name both rows of a job span carry.
 pub const JOB_SPAN_MESSAGE: &str = "cowshed.job";

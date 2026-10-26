@@ -18,10 +18,10 @@ use cowshed_core::api::{
     TraceId, UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage,
     VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation, WorkspacePath,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_spans::{
     JobSpanEdge, JobSpanPublisher, job_fields, job_span_thread,
 };
+use cowshed_types::repository::RepoId;
 
 #[path = "support/accounting_fixture.rs"]
 mod accounting_fixture;

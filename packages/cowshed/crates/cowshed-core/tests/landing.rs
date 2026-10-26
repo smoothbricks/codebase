@@ -21,7 +21,7 @@ use cowshed_core::api::{
     WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspaceRole, WorkspaceState,
 };
 use cowshed_core::landing::{annotate_listing, measure, resolve_target, unmatched_commits};
-use cowshed_core::repository::RepoId;
+use cowshed_types::repository::RepoId;
 
 #[path = "support/temp_parent.rs"]
 mod temp_parent;

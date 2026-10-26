@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RemoveReport, RevisionTarget};
 use crate::error::{CowshedError, Result as CowshedResult};
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
-use crate::repository::RepoId;
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::repository::RepoId;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
 pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";

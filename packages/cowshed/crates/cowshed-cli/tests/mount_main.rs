@@ -19,10 +19,10 @@ use cowshed_core::metadata::{
     WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, read_json,
     write_json,
 };
-use cowshed_core::repository::{BoundIdentity, RepoId, RepositoryBinding};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::lifecycle::MountIntent;
 use cowshed_core::{ErrorCode, Result};
+use cowshed_types::repository::{BoundIdentity, RepoId, RepositoryBinding};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

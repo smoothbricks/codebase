@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 bytes = "1"
 cowshed-core.workspace = true
+cowshed-types.workspace = true
 cowshed-os = { path = "../cowshed-os" }
 libc = "0.2"
 napi = { workspace = true, features = ["serde-json"] }

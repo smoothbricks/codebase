@@ -42,10 +42,10 @@ use crate::api::resources::{
 };
 use crate::error::CowshedError;
 use crate::metadata::WorkspaceIncarnation;
-use crate::repository::{OwnedRepoIds, RepoId};
 use cowshed_os::deadline::{Bound, CONTROL, Expired};
 use cowshed_os::flock::{LockError, LockHolder};
 use cowshed_os::fsio::Durability;
+use cowshed_types::repository::{OwnedRepoIds, RepoId};
 mod publication;
 use crate::storage::verify_no_symlinks;
 
@@ -10400,14 +10400,15 @@ mod tests {
         let root = temp_root("former-repo-id");
         append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
         let first = repo();
-        let binding =
-            crate::repository::RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+        let binding = cowshed_types::repository::RepositoryBinding::new(vec![
+            cowshed_types::repository::BoundIdentity {
                 repo_id: first.clone(),
                 remote_name: None,
                 remote_url: None,
                 primary: true,
-            }])
-            .unwrap();
+            },
+        ])
+        .unwrap();
         let binding = binding
             .rename_primary(RepoId::parse("acme/renamed").unwrap())
             .unwrap()

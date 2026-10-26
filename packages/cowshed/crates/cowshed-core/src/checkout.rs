@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use crate::metadata::{
     DetachedWorkspaceMetadata, MetadataError, WorkspaceMarker, sidecar_path, write_json,
 };
-use crate::repository::RepoId;
 use crate::storage::WORKSPACE_MARKER_PATH;
+use cowshed_types::repository::RepoId;
 
 /// Where one project's recorded checkout path is durably held.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,7 +172,7 @@ mod tests {
         MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
         WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
     };
-    use crate::repository::RepoId;
+    use cowshed_types::repository::RepoId;
 
     struct TempDirectory(PathBuf);
 

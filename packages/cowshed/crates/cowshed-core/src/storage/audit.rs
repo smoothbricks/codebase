@@ -41,9 +41,9 @@ use crate::api::dto::{
     WorkspaceIntroducedCommitment, WorkspaceRetiredCommitment,
 };
 use crate::metadata::WorkspaceIncarnation;
-use crate::repository::RepoId;
 use crate::storage::job_artifact::write_controller_commitments;
 use crate::storage::trace_segment::TelemetryDate;
+use cowshed_types::repository::RepoId;
 
 use cowshed_os::fsio::{
     Durability, TemporaryAt, create_private_file_at, open_directory_nofollow,

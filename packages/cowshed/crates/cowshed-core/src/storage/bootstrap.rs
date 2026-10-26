@@ -274,7 +274,7 @@ pub fn mark_project_owners(store_root: &Path) -> Result<Vec<PathBuf>, OwnerScanE
             }
             let binding = child
                 .path()
-                .join(crate::repository::REPOSITORY_BINDING_FILE);
+                .join(cowshed_types::repository::REPOSITORY_BINDING_FILE);
             if std::fs::symlink_metadata(&binding).is_ok_and(|metadata| metadata.is_file()) {
                 write_owner_marker(&owner).map_err(io("mark", &owner))?;
                 marked.push(owner);
@@ -2522,7 +2522,7 @@ mod tests {
             let project = root.join(repo);
             std::fs::create_dir_all(&project).expect("project fixture");
             std::fs::write(
-                project.join(crate::repository::REPOSITORY_BINDING_FILE),
+                project.join(cowshed_types::repository::REPOSITORY_BINDING_FILE),
                 b"{}",
             )
             .expect("binding fixture");
@@ -2567,7 +2567,7 @@ mod tests {
         let bound = root.join("acme/widget");
         std::fs::create_dir_all(&bound).expect("project fixture");
         std::fs::write(
-            bound.join(crate::repository::REPOSITORY_BINDING_FILE),
+            bound.join(cowshed_types::repository::REPOSITORY_BINDING_FILE),
             b"{}",
         )
         .expect("binding fixture");
@@ -2579,7 +2579,7 @@ mod tests {
         std::fs::create_dir_all(root.join("run/widget")).expect("reserved fixture");
         std::fs::write(
             root.join("run/widget")
-                .join(crate::repository::REPOSITORY_BINDING_FILE),
+                .join(cowshed_types::repository::REPOSITORY_BINDING_FILE),
             b"{}",
         )
         .expect("reserved binding");

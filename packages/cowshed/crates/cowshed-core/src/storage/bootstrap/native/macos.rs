@@ -2505,7 +2505,7 @@ fn guard_absent_volume_globally(
 }
 
 fn require_canonical(path: &Path) -> Result<(), NativeBootstrapError> {
-    if crate::repository::is_lexically_canonical(path) {
+    if cowshed_types::repository::is_lexically_canonical(path) {
         Ok(())
     } else {
         Err(NativeBootstrapError::NonCanonicalPath(path.to_owned()))
@@ -8415,7 +8415,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 }
 
 fn require_host_canonical(path: &Path) -> Result<(), HostError> {
-    if crate::repository::is_lexically_canonical(path) {
+    if cowshed_types::repository::is_lexically_canonical(path) {
         Ok(())
     } else {
         Err(HostError::new(format!(

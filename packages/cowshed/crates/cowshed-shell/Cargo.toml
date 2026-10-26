@@ -36,4 +36,5 @@ async-trait = "0.1"
 bytes = "1"
 cowshed-gateway = { path = "../cowshed-gateway" }
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+cowshed-types.workspace = true
 uuid = { version = "1", features = ["v4"] }

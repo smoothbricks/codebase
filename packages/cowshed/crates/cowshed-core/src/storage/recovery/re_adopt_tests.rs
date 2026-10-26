@@ -27,8 +27,8 @@ use crate::metadata::{
     PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
     WorkspaceRole, sidecar_path,
 };
-use crate::repository::RepoId;
 use crate::temp_root::TempRoot;
+use cowshed_types::repository::RepoId;
 
 use super::{
     LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentJournal,

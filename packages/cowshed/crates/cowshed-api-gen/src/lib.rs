@@ -40,7 +40,6 @@ pub fn collect_api(project: &Path) -> Result<ir::Api, String> {
     parse_module(&error_path, &module, false, &mut api)?;
     for name in [
         "metadata.rs",
-        "repository.rs",
         "project_policy.rs",
         "land_turn.rs",
         "build_volume/mod.rs",
@@ -53,6 +52,11 @@ pub fn collect_api(project: &Path) -> Result<ir::Api, String> {
     for name in ["host_status.rs", "status.rs"] {
         let source = project.join("crates/cowshed-gateway-types/src").join(name);
         let module = module_of("cowshed_gateway_types", name)?;
+        parse_module(&source, &module, true, &mut api)?;
+    }
+    for name in ["repository.rs"] {
+        let source = project.join("crates/cowshed-types/src").join(name);
+        let module = module_of("cowshed_types", name)?;
         parse_module(&source, &module, true, &mut api)?;
     }
     Ok(api)

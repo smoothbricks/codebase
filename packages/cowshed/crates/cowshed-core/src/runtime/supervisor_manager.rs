@@ -1523,7 +1523,7 @@ mod tests {
     fn supervisor_socket_of(store: &Path, workspace: &str) -> PathBuf {
         supervisor_socket::socket_path(
             store,
-            &crate::repository::RepoId::parse("acme/widget").expect("repo id"),
+            &cowshed_types::repository::RepoId::parse("acme/widget").expect("repo id"),
             &crate::metadata::WorkspaceName::new(workspace).expect("workspace"),
         )
     }
@@ -2020,7 +2020,7 @@ mod tests {
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         let authority = WorkspaceAuthoritySnapshot {
-            repo_id: crate::repository::RepoId::parse("acme/widget").unwrap(),
+            repo_id: cowshed_types::repository::RepoId::parse("acme/widget").unwrap(),
             workspace: WorkspaceName::new("raven").unwrap(),
             workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(
                 "0198f2c0b7e34dc795f17b238b331c80",

@@ -44,7 +44,6 @@ use crate::exec::{
     prepare_child_descriptors,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
-use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{
     SandboxConfig, SandboxProfileRole, SeatbeltProfile, sandbox_runtime_dir, sandbox_runtime_link,
     seatbelt_profile, shared_daemon_runtime_dir, shared_daemon_runtime_link,
@@ -55,6 +54,7 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 use crate::runtime::child_fence::ChildFence;
 use crate::runtime::job_cpu::Jobserver;

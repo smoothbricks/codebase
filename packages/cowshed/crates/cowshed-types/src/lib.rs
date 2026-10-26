@@ -1,0 +1,8 @@
+//! Canonical cowshed value declarations, starting with repository identity and binding.
+//!
+//! `cowshed-core`, the CLI, the gateway and the addon consume these values directly.
+//! The crate performs no ambient effects; its one in-workspace dependency is
+//! `cowshed-gateway-types`, which owns repository-id character validation. Shells
+//! construct these values where they live.
+
+pub mod repository;

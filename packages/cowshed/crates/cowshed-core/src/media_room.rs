@@ -24,7 +24,7 @@ use cowshed_apfs::media_cap::{MEDIA_PER_IMAGE, MediaReading};
 
 use crate::api::operations::OperationRequest;
 use crate::metadata::WorkspaceName;
-use crate::repository::RepoId;
+use cowshed_types::repository::RepoId;
 
 /// Why an attached workspace keeps its images.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -385,7 +385,7 @@ mod native {
         }
         let inventory =
             NativeSessionInventory::with_backend(storage.clone(), GatewayStoreBackend::Native);
-        let repos: std::collections::BTreeSet<&crate::repository::RepoId> =
+        let repos: std::collections::BTreeSet<&cowshed_types::repository::RepoId> =
             made.detached.iter().map(|(repo, _)| repo).collect();
         for repo in repos {
             if let Err(error) = reconcile_project(gateway, &inventory, repo, effective_uid()).await
@@ -491,7 +491,7 @@ mod native {
         storage: &ValidatedHostStorage,
         demand: &Demand,
     ) -> Result<(
-        BTreeMap<crate::repository::RepoId, Project>,
+        BTreeMap<cowshed_types::repository::RepoId, Project>,
         Vec<Candidate<Key>>,
         BTreeMap<Key, Attached>,
     )> {
@@ -666,7 +666,7 @@ mod native {
     }
 
     fn unreleased(
-        repo: &crate::repository::RepoId,
+        repo: &cowshed_types::repository::RepoId,
         name: &crate::metadata::WorkspaceName,
         error: &dyn Display,
     ) -> Busy {
@@ -923,7 +923,7 @@ mod tests {
             WorkspaceAttachRequest, WorkspaceRequest,
         };
         use crate::metadata::WorkspaceName;
-        use crate::repository::RepoId;
+        use cowshed_types::repository::RepoId;
 
         use super::{AttachDemand, attach_demand};
 

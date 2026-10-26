@@ -18,7 +18,6 @@ use cowshed_core::api::{ExitStatus, JobId};
 use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{
     ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess, SandboxPolicy, SpawnSink,
     SystemSpawnSink, WorkspaceAuthoritySnapshot,
@@ -31,6 +30,7 @@ use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_core::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV};
 use cowshed_gateway_types::WorkspaceToken;
+use cowshed_types::repository::RepoId;
 
 #[path = "support/nx_reads.rs"]
 mod nx_dependencies;

@@ -8,8 +8,8 @@ use cowshed_core::api::server::{
     MAX_JSON_FRAME_BYTES, RouterHandle, RouterResponse, serve_controller_connection,
 };
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
-use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, ErrorCode};
+use cowshed_types::repository::RepoId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;

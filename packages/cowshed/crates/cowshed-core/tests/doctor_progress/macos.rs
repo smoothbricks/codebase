@@ -6,12 +6,12 @@ use std::process::Command;
 use cowshed_core::api::dto::AdoptOptions;
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_os::namespace::TestNamespace;
 use cowshed_os::timing::{Step, StepSink};
+use cowshed_types::repository::RepoId;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 

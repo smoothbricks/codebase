@@ -51,12 +51,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::dto::Sha256Digest;
-use crate::repository::{
+use crate::storage::bootstrap::{RETIRED_PROJECTS_NAMESPACE, RETIREMENTS_NAMESPACE};
+use crate::{CowshedError, Result};
+use cowshed_types::repository::{
     REPOSITORY_BINDING_FILE, RepoId, RepositoryBinding, encode_component, encode_layout_owner,
     is_lexically_canonical,
 };
-use crate::storage::bootstrap::{RETIRED_PROJECTS_NAMESPACE, RETIREMENTS_NAMESPACE};
-use crate::{CowshedError, Result};
 
 pub mod native;
 

@@ -20,12 +20,12 @@ mod macos {
         ProjectRetirementReport, RetirementIntent, RetirementPhase, acquire_collector,
         acquire_retirement_run,
     };
-    use crate::repository::{RepoId, SESSIONS_DIRECTORY};
     use crate::runtime::{project::require_lost_groups_released, supervisor_socket};
     use crate::storage::bootstrap::ValidatedHostStorage;
     use crate::storage::lifecycle::dispatch_blocking;
     use crate::storage::recovery::{IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntentJournal};
     use crate::{CowshedError, ErrorCode, Result};
+    use cowshed_types::repository::{RepoId, SESSIONS_DIRECTORY};
 
     const DRAIN_BOUND: Duration = Duration::from_secs(30);
 
@@ -535,7 +535,7 @@ pub use macos::forget_project;
 #[cfg(not(target_os = "macos"))]
 pub async fn forget_project(
     _storage: crate::storage::bootstrap::ValidatedHostStorage,
-    _repo_id: crate::repository::RepoId,
+    _repo_id: cowshed_types::repository::RepoId,
 ) -> crate::Result<super::ProjectRetirementReport> {
     Err(crate::CowshedError::environment_missing(
         "record-driven project retirement requires the native macOS image substrate",
@@ -549,7 +549,7 @@ pub async fn resume_retirements(
     storage: crate::storage::bootstrap::ValidatedHostStorage,
 ) -> crate::Result<
     Vec<(
-        crate::repository::RepoId,
+        cowshed_types::repository::RepoId,
         crate::Result<super::ProjectRetirementReport>,
     )>,
 > {

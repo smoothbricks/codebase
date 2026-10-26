@@ -1141,9 +1141,9 @@ mod tests {
             Registration,
         };
         use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
-        use crate::repository::{ProjectPaths, RepoId};
         use crate::storage::apfs::{ApfsSubstrateConfig, native::MacOsApfsExecutionHost};
         use cowshed_os::namespace::{HostNamespace, TestNamespace};
+        use cowshed_types::repository::{ProjectPaths, RepoId};
 
         let fixture = Fixture::new();
         let project = ProjectPaths::with_mount_root(

@@ -13,10 +13,10 @@ use thiserror::Error;
 
 use crate::api::held_lock::{LockHolding, LockOperation};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
-use crate::repository::{OwnedRepoIds, RepoId};
 use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 use cowshed_apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
 use cowshed_os::timing::timed_async;
+use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 use super::lifecycle::{
     AdoptHandoff, AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef,
@@ -108,7 +108,7 @@ impl ApfsSubstrateConfig {
         let Ok(layout) = StorageLayout::new(&self.store_root, current) else {
             return OwnedRepoIds::sole(current.clone());
         };
-        let Ok(binding) = crate::metadata::read_json::<crate::repository::RepositoryBinding>(
+        let Ok(binding) = crate::metadata::read_json::<cowshed_types::repository::RepositoryBinding>(
             &layout.project().repository_binding,
         ) else {
             return OwnedRepoIds::sole(current.clone());
@@ -4173,7 +4173,7 @@ fn undo_image(
 }
 
 /// `<sessions>/<TRASH_NAMESPACE>/<name>-<incarnation>.dmg`. `sessions` is
-/// [`crate::repository::ProjectPaths::sessions`]; this helper does not name that directory.
+/// [`cowshed_types::repository::ProjectPaths::sessions`]; this helper does not name that directory.
 ///
 /// The `-` between name and incarnation is the separator [`split_retired_stem`] reverses; the two
 /// live side by side so the pair cannot drift. Incarnations are fixed-width lowercase hex, which
@@ -4222,7 +4222,7 @@ pub(crate) fn is_deleting_image_name(name: &str) -> bool {
 pub fn released_sessions(store: &Path) -> release::Listing {
     release::released_in_store(
         store,
-        crate::repository::SESSIONS_DIRECTORY,
+        cowshed_types::repository::SESSIONS_DIRECTORY,
         release::DELETING_DIRECTORY,
         is_deleting_image_name,
     )

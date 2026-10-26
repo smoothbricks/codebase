@@ -9,8 +9,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::Command;
 
-fn repo() -> cowshed_core::repository::RepoId {
-    cowshed_core::repository::RepoId::parse("acme/widget").expect("repo id")
+fn repo() -> cowshed_types::repository::RepoId {
+    cowshed_types::repository::RepoId::parse("acme/widget").expect("repo id")
 }
 
 fn workspace() -> WorkspaceName {

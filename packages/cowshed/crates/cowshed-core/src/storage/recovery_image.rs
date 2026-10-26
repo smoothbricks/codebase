@@ -26,7 +26,6 @@ use crate::error::{CowshedError, Result};
 use crate::metadata::{
     DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
-use crate::repository::RepoId;
 use crate::storage::StorageLayout;
 use crate::storage::apfs::native::{checkpoint_fact_path, restore_recovery_fact_path};
 use crate::storage::apfs::{companion_path, split_retired_stem};
@@ -34,6 +33,7 @@ use crate::storage::deletion_log::{self, DeletionKind};
 use crate::storage::recovery::{ABANDON_BUNDLE_EXTENSION, TRASH_NAMESPACE};
 use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_apfs::store_lock::{LockMode, acquire_image_locks};
+use cowshed_types::repository::RepoId;
 /// Backend-owned ephemeral cleanup under recovery's held workspace lifecycle lock.
 pub trait RecoveryEnvironment {
     fn reclaim_recovery_environment(

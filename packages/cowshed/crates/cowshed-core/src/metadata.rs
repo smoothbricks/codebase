@@ -1,5 +1,5 @@
-use crate::repository::RepoId;
 use cowshed_gateway_types::{is_macos_port_block, is_port_block};
+use cowshed_types::repository::RepoId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;

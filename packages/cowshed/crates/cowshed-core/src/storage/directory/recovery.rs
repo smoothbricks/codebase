@@ -22,9 +22,6 @@ use crate::metadata::{
     DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, PublicationState, WorkspaceIncarnation,
     WorkspaceMarker, WorkspaceName, sidecar_path,
 };
-use crate::repository::{
-    CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, QUARANTINE_DIRECTORY, RepoId, SESSIONS_DIRECTORY,
-};
 use crate::storage::apfs::native::{
     CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, HeldScope, QuarantineTombstone,
     RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire, abandon_bundles,
@@ -47,6 +44,9 @@ use crate::storage::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
 use crate::storage::{CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH};
 use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
 use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
+use cowshed_types::repository::{
+    CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, QUARANTINE_DIRECTORY, RepoId, SESSIONS_DIRECTORY,
+};
 
 /// Whether a retirement may collect the artifacts keyed on its workspace name - its checkpoint
 /// directory, exec temp directory and mountpoint - which re-minting the name hands the next

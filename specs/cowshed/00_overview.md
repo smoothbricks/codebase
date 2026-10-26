@@ -132,15 +132,16 @@ or ordinary on-disk text log.
 
 ## Crate map
 
-| Crate                   | Kind                         | Responsibility                                                                                                      |
-| ----------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `cowshed-core`          | lib (+ bin `apfs-benchmark`) | Image/volume lifecycle, clonefile, marker & grant files, Seatbelt profile generation, env wiring, supervisors, exec |
-| `cowshed-cli`           | bin `cowshed`                | Self-driving CLI over cowshed-core, and the host daemon it runs; stdout machine-readable, stderr guidance           |
-| `cowshed-gateway`       | lib                          | Actor-owned, host-only egress gateway: registry and repository mirrors, TLS interception, CONNECT tunnel, audit     |
-| `cowshed-gateway-types` | lib                          | The gateway's control-plane data model (sessions, endpoints, tokens, CA material, egress policy), with no daemon    |
-| `cowshed-helper`        | bin `cowshed-helper`         | Linux: the minimal root binary with a fixed verb set through which ZFS substrate mutations go (09_substrates.md)    |
-| `cowshed-napi`          | cdylib                       | napi-rs bindings exposing cowshed-core to Bun/Node                                                                  |
-| `cowshed-shell`         | bin `cowshed-shell-host`     | The warm exec host: holds an activated workspace shell and runs each command from it (11_shell.md)                  |
+| Crate                   | Kind                         | Responsibility                                                                                                        |
+| ----------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `cowshed-core`          | lib (+ bin `apfs-benchmark`) | Image/volume lifecycle, clonefile, marker & grant files, Seatbelt profile generation, env wiring, supervisors, exec   |
+| `cowshed-cli`           | bin `cowshed`                | Self-driving CLI over cowshed-core, and the host daemon it runs; stdout machine-readable, stderr guidance             |
+| `cowshed-gateway`       | lib                          | Actor-owned, host-only egress gateway: registry and repository mirrors, TLS interception, CONNECT tunnel, audit       |
+| `cowshed-gateway-types` | lib                          | The gateway's control-plane data model (sessions, endpoints, tokens, CA material, egress policy), with no daemon      |
+| `cowshed-helper`        | bin `cowshed-helper`         | Linux: the minimal root binary with a fixed verb set through which ZFS substrate mutations go (09_substrates.md)      |
+| `cowshed-napi`          | cdylib                       | napi-rs bindings exposing cowshed-core to Bun/Node                                                                    |
+| `cowshed-shell`         | bin `cowshed-shell-host`     | The warm exec host: holds an activated workspace shell and runs each command from it (11_shell.md)                    |
+| `cowshed-types`         | lib                          | Canonical repository identity/binding values consumed by core, the CLI, the gateway and the addon; no ambient effects |
 
 ## Consumers
 

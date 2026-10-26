@@ -35,7 +35,6 @@ use cowshed_core::error::CpuAdmissionRefusal;
 use cowshed_core::metadata::{
     NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
-use cowshed_core::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
 use cowshed_core::runtime::job_groups::Birth;
 #[cfg(target_os = "macos")]
 use cowshed_core::runtime::supervisor::NxDaemonRetirement;
@@ -50,6 +49,7 @@ use cowshed_core::runtime::{
     ProjectSnapshots, RuntimeLogChunk, WorkspaceSnapshot,
 };
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
+use cowshed_types::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
 
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};

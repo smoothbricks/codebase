@@ -8,9 +8,9 @@ use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
     WorkspaceRole,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::lifecycle::*;
+use cowshed_types::repository::RepoId;
 use proptest::prelude::*;
 
 fn repo() -> RepoId {

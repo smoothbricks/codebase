@@ -26,8 +26,8 @@ use cowshed_core::metadata::{
     SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
     WorkspaceRole, write_json,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
+use cowshed_types::repository::RepoId;
 
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
 

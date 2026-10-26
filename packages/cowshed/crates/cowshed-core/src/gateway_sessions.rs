@@ -31,9 +31,9 @@ use crate::gateway_inventory::{
 use crate::metadata::{
     EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation, WorkspaceName,
 };
-use crate::repository::RepoId;
 use crate::runtime::wait_spans::WaitFailure;
 use crate::storage::bootstrap::{FixturePortClaims, ValidatedHostStorage};
+use cowshed_types::repository::RepoId;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReconcileReport {

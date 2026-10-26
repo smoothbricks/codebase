@@ -48,8 +48,8 @@ use crate::metadata::{
     WorkspaceName, WorkspaceRole, image_from_sidecar_path, read_json, sidecar_path,
     validate_image_path,
 };
-use crate::repository::RepoId;
 use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
+use cowshed_types::repository::RepoId;
 
 use super::ApfsStorageError;
 
@@ -377,7 +377,7 @@ fn locate_source(
 /// names this workspace. Fixed-width unix timestamps sort lexicographically,
 /// with the `-ordinal` collision suffix sorting after its base.
 fn newest_quarantine_entry(
-    project: &crate::repository::ProjectPaths,
+    project: &cowshed_types::repository::ProjectPaths,
     workspace: &WorkspaceName,
 ) -> Result<Option<PathBuf>, RekeyError> {
     let entries = match fs::read_dir(&project.quarantine) {
