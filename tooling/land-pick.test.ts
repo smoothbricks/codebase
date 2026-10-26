@@ -9,6 +9,7 @@ import {
   lockEntries,
   type Member,
   owningMember,
+  parseCargoMetadata,
   pick,
   previewRefusal,
   previewSeed,
@@ -265,6 +266,37 @@ describe('previewRefusal', () => {
   });
 });
 
+describe('parseCargoMetadata', () => {
+  const document = {
+    version: 1,
+    workspace_root: '/w',
+    workspace_members: ['a'],
+    packages: [{ id: 'a', name: 'a', manifest_path: '/w/a/Cargo.toml', source: null }],
+    resolve: { nodes: [{ id: 'a', deps: [{ name: 'b', pkg: 'b', dep_kinds: [] }] }], root: null },
+    target_directory: '/w/target',
+  } as const;
+  it('reads the fields the pick uses and keeps what else the document holds', () => {
+    expect(parseCargoMetadata(JSON.stringify(document))).toEqual(document);
+  });
+
+  it.each([
+    ['text that is not JSON', 'cargo: not json'],
+    ['no output', ''],
+    ['another format version', JSON.stringify({ ...document, version: 2 })],
+    ['no resolve graph', JSON.stringify({ ...document, resolve: null })],
+    [
+      'a package without a name',
+      JSON.stringify({ ...document, packages: [{ id: 'a', manifest_path: '/w/a/Cargo.toml' }] }),
+    ],
+    ['a member list holding a number', JSON.stringify({ ...document, workspace_members: [1] })],
+    [
+      'a dependency without its package',
+      JSON.stringify({ ...document, resolve: { nodes: [{ id: 'a', deps: [{ name: 'b' }] }] } }),
+    ],
+  ])('refuses %s', (_name, text) => {
+    expect(parseCargoMetadata(text)).toBeUndefined();
+  });
+});
 describe('readUnitTimes', () => {
   const T = 1_700_000_000;
   /** Writes a fingerprint generation's files, each at its own modification time in seconds. */

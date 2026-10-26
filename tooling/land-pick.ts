@@ -15,6 +15,7 @@
 import { spawnSync } from 'node:child_process';
 import { lstatSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs';
 import { basename, dirname, join, relative } from 'node:path';
+import { isRecord } from './land-publish.ts';
 
 /** Paths whose change makes Cargo's configuration differ for every unit: their effect on unit identity is not computed. */
 const CONFIG_FILES = ['Cargo.toml', 'rust-toolchain', 'rust-toolchain.toml'];
@@ -256,7 +257,7 @@ export function pick(own: Price, seed: Price, timedUnits: number): Pick {
   return { pick: seed.seconds < own.seconds ? 'seed' : 'own', basis: 'cargo' };
 }
 
-/** A cowshed `--json` envelope, or undefined when the text is not JSON. */
+/** Text read as JSON, or undefined when it is not JSON: a cowshed `--json` envelope, or `cargo metadata`'s output. */
 function envelope(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -283,6 +284,40 @@ export function previewRefusal(preview: string): string | undefined {
   return typeof error.code === 'string' ? error.code : undefined;
 }
 
+/** The fields of `cargo metadata --format-version 1` the pick reads; Cargo documents the format as stable. */
+export interface CargoMetadata {
+  readonly version: 1;
+  readonly workspace_root: string;
+  readonly workspace_members: readonly string[];
+  readonly packages: readonly { readonly id: string; readonly name: string; readonly manifest_path: string }[];
+  readonly resolve: {
+    readonly nodes: readonly { readonly id: string; readonly deps: readonly { readonly pkg: string }[] }[];
+  };
+}
+
+const isString = (value: unknown): value is string => typeof value === 'string';
+const everyItem = <T>(value: unknown, guard: (item: unknown) => item is T): value is readonly T[] =>
+  Array.isArray(value) && value.every(guard);
+const isPackage = (value: unknown): value is CargoMetadata['packages'][number] =>
+  isRecord(value) && isString(value.id) && isString(value.name) && isString(value.manifest_path);
+const isDependency = (value: unknown): value is { readonly pkg: string } => isRecord(value) && isString(value.pkg);
+const isNode = (value: unknown): value is CargoMetadata['resolve']['nodes'][number] =>
+  isRecord(value) && isString(value.id) && everyItem(value.deps, isDependency);
+const isCargoMetadata = (value: unknown): value is CargoMetadata =>
+  isRecord(value) &&
+  value.version === 1 &&
+  isString(value.workspace_root) &&
+  everyItem(value.workspace_members, isString) &&
+  everyItem(value.packages, isPackage) &&
+  isRecord(value.resolve) &&
+  everyItem(value.resolve.nodes, isNode);
+
+/** `cargo metadata --format-version 1` output read as the fields the pick uses, or undefined when it is not that. */
+export function parseCargoMetadata(text: string): CargoMetadata | undefined {
+  const parsed = envelope(text);
+  return isCargoMetadata(parsed) ? parsed : undefined;
+}
+
 // ---- the shell: everything below reads the world and hands plain values to the decisions above ----
 
 function fail(message: string): never {
@@ -306,24 +341,11 @@ function treeFile(checkout: string, tree: string, path: string): string | undefi
   return run('git', ['-C', checkout, 'cat-file', 'blob', blob], checkout);
 }
 
-/** The fields of `cargo metadata --format-version 1` the pick reads; Cargo documents the format as stable. */
-interface CargoMetadata {
-  readonly version: 1;
-  readonly workspace_root: string;
-  readonly workspace_members: readonly string[];
-  readonly packages: readonly { readonly id: string; readonly name: string; readonly manifest_path: string }[];
-  readonly resolve: {
-    readonly nodes: readonly { readonly id: string; readonly deps: readonly { readonly pkg: string }[] }[];
-  };
-}
-
 /** The gate tree's workspace members from `cargo metadata`, with their dependents and reachable registry packages. */
 function readMembers(checkout: string): Member[] {
-  const parsed: unknown = JSON.parse(run('cargo', ['metadata', '--format-version', '1', '--frozen'], checkout));
-  if (typeof parsed !== 'object' || parsed === null || !('version' in parsed) || parsed.version !== 1) {
-    fail('cargo metadata is not format version 1');
-  }
-  const metadata = parsed as CargoMetadata;
+  const text = run('cargo', ['metadata', '--format-version', '1', '--frozen'], checkout);
+  const metadata = parseCargoMetadata(text);
+  if (metadata === undefined) fail(`cargo metadata is not the format version 1 this pick reads: ${text.slice(0, 200)}`);
   const memberIds = new Set(metadata.workspace_members);
   const nameOf = new Map(metadata.packages.map((pkg) => [pkg.id, pkg.name]));
   const dirOf = new Map(

@@ -619,7 +619,7 @@ class Resolver {
     return result;
   }
 
-  #resolve(from: string, spec: string): string[] {
+  #resolve(from: string, spec: string): readonly string[] {
     if (spec.startsWith('./') || spec.startsWith('../') || spec === '.' || spec === '..')
       return this.sources(posix.join(posix.dirname(from), spec));
     const bare = spec.startsWith('node:') ? undefined : spec;
