@@ -74,6 +74,9 @@ impl From<LockError> for io::Error {
 
 /// `flock(2)` `file` with `operation`, again when a signal interrupts it. Private: a blocking
 /// operation here would be an unbounded wait; callers take [`try_exclusive`] or [`exclusive`].
+// WHY unbounded: a `LOCK_NB` try returns at once; the blocking lock runs on `exclusive`'s helper
+// thread, whose answer the caller's deadline bounds.
+#[allow(clippy::disallowed_methods)]
 fn flock(file: &impl AsFd, operation: libc::c_int) -> io::Result<()> {
     loop {
         // SAFETY: `file` owns the descriptor for the whole call; `flock` does not consume it.

@@ -1,5 +1,6 @@
 use super::*;
 use crate::fork_lock::Spawn as _;
+use crate::test_backstop::{ChildBackstop as _, FileBackstop as _};
 use std::fs::{File, FileTimes};
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::process::Command;
@@ -40,7 +41,7 @@ fn dead_pid() -> u32 {
         .spawn_locked()
         .unwrap();
     let pid = child.id();
-    assert!(child.wait().unwrap().success());
+    assert!(child.wait_bounded().unwrap().success());
     pid
 }
 
@@ -275,7 +276,7 @@ fn a_surviving_socket_holder_keeps_a_dead_creators_directory() {
     let fixture = Fixture::new();
     let path = fixture.scratch("cowshed-sock-held", dead_pid());
     let lock = crate::fork_lock::Fenced::new(File::open(path.join("s.sock.lock")).unwrap());
-    lock.lock().expect("hold socket lease");
+    lock.lock_bounded().expect("hold socket lease");
     let report = fixture.reaper().sweep(&fixture.store(), false);
     assert!(path.exists());
     assert!(report.findings.iter().any(|finding| matches!(&finding.disposition, Disposition::Kept(reason) if reason.contains("socket lease is held"))));

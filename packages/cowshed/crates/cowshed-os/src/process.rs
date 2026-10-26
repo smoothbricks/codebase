@@ -1667,6 +1667,9 @@ impl fmt::Display for Holder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_backstop::ChildBackstop as _;
+    #[cfg(target_os = "macos")]
+    use crate::test_backstop::CommandBackstop as _;
 
     /// The state a process is read in follows its life: a live child is running, in an
     /// uninterruptible wait or asleep, an exited and unreaped one is a zombie, a reaped one is
@@ -1690,7 +1693,7 @@ mod tests {
         child.kill().expect("kill sleep");
         exit.wait().expect("sleep exits");
         let exited = run_state(pid);
-        child.wait().expect("reap sleep");
+        child.wait_bounded().expect("reap sleep");
         let reaped = run_state(pid);
         assert!(
             matches!(
@@ -1742,12 +1745,10 @@ mod tests {
     /// `i` fields, `None` where lsof prints none.
     #[cfg(target_os = "macos")]
     fn lsof_name(descriptor: std::os::fd::RawFd) -> (Option<String>, Option<String>) {
-        use crate::fork_lock::Run as _;
-
         let listed = std::process::Command::new("/usr/sbin/lsof")
             .args(["-a", "-p", &std::process::id().to_string()])
             .args(["-d", &descriptor.to_string(), "-F", "di"])
-            .output_locked()
+            .output_bounded()
             .expect("run lsof");
         let text = String::from_utf8(listed.stdout).expect("lsof prints ASCII");
         let field = |tag: char| {
@@ -1868,7 +1869,7 @@ mod tests {
         };
         assert_eq!(descriptor_names(pid, none).expect("read"), Ok(Vec::new()));
         drop(child.stdin.take());
-        child.wait().expect("reap the child");
+        child.wait_bounded().expect("reap the child");
         assert_eq!(descriptor_names(pid, all).expect("read"), Err(Unread::Gone));
         // SAFETY: geteuid has no failure and touches no memory.
         let root = unsafe { libc::geteuid() } == 0;
@@ -1966,7 +1967,7 @@ mod tests {
                 "{path}"
             );
             drop(stdin);
-            assert!(child.wait().unwrap().success());
+            assert!(child.wait_bounded().unwrap().success());
         }
     }
 
@@ -1980,19 +1981,12 @@ mod tests {
         )
         .expect("spawn");
         let pid = libc::pid_t::try_from(child.id()).expect("pid");
-        // SAFETY: an all-zero `siginfo_t` is a valid value of the plain C struct.
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        // Block until the child has exited, leaving it unreaped.
-        // SAFETY: `info` is a valid out-pointer; WNOWAIT leaves the child waitable.
-        let waited = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid.cast_unsigned(),
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        assert_eq!(waited, 0, "{}", io::Error::last_os_error());
+        crate::test_backstop::waitid(
+            libc::P_PID,
+            pid.cast_unsigned(),
+            libc::WEXITED | libc::WNOWAIT,
+        )
+        .expect("wait for the exit, leaving the child unreaped");
         // SAFETY: signal 0 only checks existence.
         assert_eq!(
             unsafe { libc::kill(pid, 0) },
@@ -2000,7 +1994,7 @@ mod tests {
             "the zombie answers the null signal"
         );
         assert!(!running(pid).unwrap(), "a zombie has exited");
-        child.wait().expect("reap");
+        child.wait_bounded().expect("reap");
         assert!(!running(pid).unwrap(), "a reaped pid has exited");
         assert!(running(libc::pid_t::try_from(std::process::id()).unwrap()).unwrap());
         // Launchd's: not this user's to inspect, and running.

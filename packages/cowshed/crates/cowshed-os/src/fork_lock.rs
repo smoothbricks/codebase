@@ -120,6 +120,9 @@ impl Spawn for tokio::process::Command {
 }
 
 /// `std`'s `output` and `status`, spawning under the fork lock and waiting outside it.
+/// The wait has no bound: every cowshed crate's `clippy.toml` refuses these, and a caller that
+/// keeps one says what ends its run (specs/cowshed/05_gateway.md, "Deadlines", Enforcement); a
+/// bounded run is `crate::deadline::output_within`.
 pub trait Run: Spawn {
     /// Like `output`: stdin is null and stdout and stderr are collected. Unlike `output`, which
     /// applies those only to streams the command left unset, they replace whatever was set.
@@ -129,6 +132,8 @@ pub trait Run: Spawn {
     fn status_locked(&mut self) -> io::Result<ExitStatus>;
 }
 
+// WHY unbounded: `Run` is itself disallowed, so each caller's allow says what ends its run.
+#[allow(clippy::disallowed_methods)]
 impl Run for std::process::Command {
     fn output_locked(&mut self) -> io::Result<Output> {
         self.stdin(Stdio::null())
@@ -153,6 +158,8 @@ pub trait RunAsync: Spawn {
     fn status_locked(&mut self) -> impl Future<Output = io::Result<ExitStatus>> + Send;
 }
 
+// WHY unbounded: `RunAsync` is itself disallowed, so each caller's allow says what ends its run.
+#[allow(clippy::disallowed_methods)]
 impl RunAsync for tokio::process::Command {
     fn output_locked(&mut self) -> impl Future<Output = io::Result<Output>> + Send {
         let child = self
@@ -293,6 +300,7 @@ pub mod in_flight {
     use std::process::Command;
 
     use super::Spawn as _;
+    use crate::test_backstop::ChildBackstop as _;
 
     /// A spawn held in flight: its child is parked in `pre_exec`, after the fork and before the
     /// `exec`, holding a copy of every descriptor of this process, until [`InFlight::finish`].
@@ -340,7 +348,7 @@ pub mod in_flight {
         pub fn finish(mut self) {
             self.go.write_all(&[0]).unwrap();
             let mut child = self.spawn.join().unwrap().unwrap();
-            assert!(child.wait().unwrap().success());
+            assert!(child.wait_bounded().unwrap().success());
         }
     }
 }
@@ -354,6 +362,7 @@ mod tests {
 
     use super::in_flight::InFlight;
     use super::*;
+    use crate::test_backstop::CommandBackstop as _;
 
     fn lease_path() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -413,7 +422,7 @@ mod tests {
             ])
             .env(ALONE, "1")
             .stdout(Stdio::null())
-            .status_locked()
+            .status_bounded()
             .unwrap();
         assert!(status.success());
     }

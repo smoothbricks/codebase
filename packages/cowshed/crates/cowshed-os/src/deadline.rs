@@ -245,6 +245,53 @@ impl WaitError {
     }
 }
 
+/// For a caller whose failures are `io::Error`: the kind it matches on is kept (an absent peer's
+/// `NotFound`, a refusal's `ConnectionRefused`, an expiry's `TimedOut`), and the message is the
+/// typed failure's, naming the op, the peer and the time waited.
+impl From<WaitError> for io::Error {
+    fn from(failure: WaitError) -> Self {
+        let kind = match &failure {
+            WaitError::Expired(_) | WaitError::Silent(_) => io::ErrorKind::TimedOut,
+            WaitError::PeerLost { .. } => io::ErrorKind::UnexpectedEof,
+            WaitError::Absent { source, .. } | WaitError::Io { source, .. } => source.kind(),
+        };
+        io::Error::new(kind, failure)
+    }
+}
+/// For a caller whose failures are `io::Error`: an expiry is `TimedOut`, a failed wait keeps its
+/// own kind, and the message is the typed failure's, naming the child and its state.
+impl From<ReapError> for io::Error {
+    fn from(failure: ReapError) -> Self {
+        let kind = match &failure {
+            ReapError::Expired(_) => io::ErrorKind::TimedOut,
+            ReapError::Wait { source, .. } => source.kind(),
+        };
+        io::Error::new(kind, failure)
+    }
+}
+
+/// As [`ReapError`]'s: a held pipe is `TimedOut`, a failed read keeps its own kind.
+impl From<OutputError> for io::Error {
+    fn from(failure: OutputError) -> Self {
+        let kind = match &failure {
+            OutputError::Held { .. } => io::ErrorKind::TimedOut,
+            OutputError::Read { source, .. } => source.kind(),
+        };
+        io::Error::new(kind, failure)
+    }
+}
+
+/// As [`ReapError`]'s; a spawn's failure is the spawn's own error, as the unbounded run gave it.
+impl From<RunError> for io::Error {
+    fn from(failure: RunError) -> Self {
+        match failure {
+            RunError::Spawn { source, .. } => source,
+            RunError::Reap(failure) => failure.into(),
+            RunError::Output(failure) => failure.into(),
+        }
+    }
+}
+
 /// What bounds a [`PeerStream`]'s waits.
 #[derive(Debug, Clone, Copy)]
 enum Bounding {
@@ -308,10 +355,30 @@ impl PeerStream<UnixStream> {
         deadline: Deadline,
     ) -> Result<Self, WaitError> {
         let peer = Peer::unix(role, socket);
-        let io = establish(&deadline, &peer, UnixStream::connect(socket)).await?;
+        let io = connect_unix(&deadline, &peer, socket).await?;
         let peer = peer.credited(&io);
         Ok(Self::connected(io, peer, deadline))
     }
+}
+
+/// Connect to `peer`'s unix socket at `socket` within `deadline`: the one unix-socket connect of
+/// a cowshed process (each crate's `clippy.toml` refuses the raw ones). Darwin makes a socket in
+/// two steps, socket then close-on-exec, so each poll of the connect runs under the fork lock's
+/// creation fence ([`crate::fork_lock::create`]): no child spawned meanwhile keeps the
+/// connection past its `exec`, where the peer would never see it close.
+pub async fn connect_unix(
+    deadline: &Deadline,
+    peer: &Peer,
+    socket: &Path,
+) -> Result<UnixStream, WaitError> {
+    // WHY unbounded: `establish` ends it at `deadline`.
+    #[allow(clippy::disallowed_methods)]
+    let mut connect = std::pin::pin!(UnixStream::connect(socket));
+    let fenced = std::future::poll_fn(|context| {
+        crate::fork_lock::create(|| Ok(connect.as_mut().poll(context)))
+            .expect("polling the connection runs an infallible closure")
+    });
+    establish(deadline, peer, fenced).await
 }
 
 /// Run `connect` to `peer` within `deadline`: a peer whose address does not exist is absent, and
@@ -419,11 +486,50 @@ impl ReapError {
     }
 }
 
+/// Wait for the child at `pid`, `role` to this process, to exit within what is left of
+/// `deadline`, leaving it unreaped for its owner to collect at once: the expiry names its pid and
+/// the state the kernel shows it in, with `last` the last thing this process did to it (the signal
+/// that should have ended it, or nothing). `pid` is the caller's own unreaped child, so it names no
+/// other process. The exit is watched (`ExitWatch`), never polled. Expiry ends the wait, never the
+/// child: one stuck in an uninterruptible kernel call stays as it is, named.
+pub fn await_exit(
+    role: &'static str,
+    pid: u32,
+    deadline: &Deadline,
+    last: Progress,
+) -> Result<(), ReapError> {
+    let failed = |source| ReapError::Wait {
+        op: deadline.op(),
+        role,
+        pid,
+        elapsed: deadline.elapsed(clock()),
+        source,
+    };
+    // No watch is a child that has exited (Darwin refuses to watch a zombie).
+    if let Some(watch) = ExitWatch::of(pid).map_err(failed)? {
+        loop {
+            // A spent budget still looks once: an exited child answers.
+            match watch.within(deadline.remaining(clock()).unwrap_or_default()) {
+                Ok(true) => break,
+                Ok(false) => {
+                    return Err(ReapError::Expired(Box::new(deadline.expired(
+                        ChildPeer::observed(role, pid),
+                        last,
+                        clock(),
+                    ))));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(failed(error)),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Wait for `child`, `role` to this process, to exit within what is left of `deadline`: its
-/// status, or the expiry naming its pid and the state the kernel shows it in, with `last` the
-/// last thing this process did to it (the signal that should have ended it, or nothing). The exit
-/// is watched (`ExitWatch`), never polled. Expiry ends the wait, never the child: one stuck in
-/// an uninterruptible kernel call stays as it is, named.
+/// status, or [`await_exit`]'s expiry naming it.
+// WHY unbounded: `await_exit` has seen the child exit, so its status is collected at once.
+#[allow(clippy::disallowed_methods)]
 pub fn reap(
     role: &'static str,
     child: &mut std::process::Child,
@@ -438,41 +544,23 @@ pub fn reap(
         elapsed: deadline.elapsed(clock()),
         source,
     };
-    let expired = || {
-        ReapError::Expired(Box::new(deadline.expired(
-            ChildPeer::observed(role, pid),
-            last,
-            clock(),
-        )))
-    };
     // A child already collected, or exited and collected now, answers before any watch, so a pid
     // that was freed and reused is never watched.
     if let Some(status) = child.try_wait().map_err(failed)? {
         return Ok(status);
     }
-    // No watch is a child that exited since (Darwin refuses to watch a zombie).
-    if let Some(watch) = ExitWatch::of(pid).map_err(failed)? {
-        loop {
-            // A spent budget still looks once: an exited child answers its status.
-            match watch.within(deadline.remaining(clock()).unwrap_or_default()) {
-                Ok(true) => break,
-                Ok(false) => return Err(expired()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(failed(error)),
-            }
-        }
-    }
-    // WHY unbounded: the child has exited, so its status is collected at once.
+    await_exit(role, pid, deadline, last)?;
     child.wait().map_err(failed)
 }
 
 /// Hand `child`, whose wait expired, to a thread that collects its exit whenever it comes and
 /// says so, so a child that leaves an uninterruptible kernel call late is reaped, never left a
 /// zombie for the life of this process. Nothing waits for that thread.
+// WHY unbounded: nothing waits on this thread; it only collects the exit when it comes.
+#[allow(clippy::disallowed_methods)]
 pub fn collect_later(role: &'static str, mut child: std::process::Child) {
     std::thread::spawn(move || {
         let pid = child.id();
-        // WHY unbounded: nothing waits on this thread; it only collects the exit when it comes.
         match child.wait() {
             Ok(status) => {
                 crate::eprintln!("cowshed: {role} pid {pid} ended after its wait expired: {status}")
@@ -550,7 +638,10 @@ pub async fn reap_async(
     };
     // A spent budget still polls the child once before the timer: an exited child answers.
     let remaining = deadline.remaining(clock()).unwrap_or_default();
-    match tokio::time::timeout(remaining, child.wait()).await {
+    // WHY unbounded: the timeout around it ends it at the deadline.
+    #[allow(clippy::disallowed_methods)]
+    let waited = tokio::time::timeout(remaining, child.wait()).await;
+    match waited {
         Ok(status) => status.map_err(failed),
         Err(_) => Err(expired()),
     }
@@ -1549,6 +1640,77 @@ mod tests {
         };
         assert_eq!(expired.peer.role, "probe command");
         assert_eq!(failure.code(), "TIMEOUT");
+    }
+    #[test]
+    fn a_raw_child_not_exited_at_the_bound_expires_naming_it_and_stays_unreaped() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn_locked()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let failure = await_exit(
+            "probe child",
+            pid,
+            &start("exit probe", SHORT_REAP),
+            Progress::Nothing,
+        )
+        .expect_err("sleep 600 does not exit within 50 ms");
+        let ReapError::Expired(expired) = &failure else {
+            panic!("expected TIMEOUT, got {failure}");
+        };
+        assert_eq!((expired.op, expired.peer.pid), ("exit probe", pid));
+        child.kill().expect("kill sleep");
+        await_exit(
+            "probe child",
+            pid,
+            &start("exit probe", REAP),
+            Progress::Signalled {
+                signal: libc::SIGKILL,
+            },
+        )
+        .expect("a killed child exits");
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = child
+            .try_wait()
+            .expect("read the exit")
+            .expect("the exit await_exit saw is still there to collect");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[tokio::test]
+    async fn a_unix_connect_answers_the_listener_or_names_its_absence() {
+        // A short path: a unix socket's address holds about a hundred bytes.
+        let directory =
+            SocketDirectory(std::env::temp_dir().join(format!("cowshed-c-{}", std::process::id())));
+        std::fs::create_dir(&directory.0).expect("create the socket directory");
+        let socket = directory.0.join("s.sock");
+        let peer = Peer::unix("probe daemon", &socket);
+        let absent = connect_unix(&start("connect probe", CONTROL), &peer, &socket)
+            .await
+            .expect_err("nothing listens yet");
+        assert_eq!(absent.code(), "BLOCKED", "{absent}");
+        assert_eq!(io::Error::from(absent).kind(), io::ErrorKind::NotFound);
+        let _listener = tokio::net::UnixListener::bind(&socket).expect("listen");
+        let connected = connect_unix(&start("connect probe", CONTROL), &peer, &socket)
+            .await
+            .expect("the listener takes the connection");
+        assert_eq!(
+            peer.clone().credited(&connected).pid,
+            PeerPid::Known(libc::pid_t::try_from(std::process::id()).expect("a pid"))
+        );
+    }
+
+    /// The socket's directory, removed on every exit path.
+    struct SocketDirectory(std::path::PathBuf);
+
+    impl Drop for SocketDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                panic!("remove {}: {error}", self.0.display());
+            }
+        }
     }
 
     #[test]
