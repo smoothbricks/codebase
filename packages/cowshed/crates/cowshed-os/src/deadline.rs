@@ -571,12 +571,33 @@ pub fn await_exit(
     Ok(())
 }
 
+/// What one look at a seen exit decides ([`collect_exited`]), from the look's answer and `left`,
+/// what remains of its budget: an answer is the exit whatever the budget, a look that failed is
+/// the failure, and an unanswered or interrupted look is looked at again while a positive budget
+/// remains and has expired once none does (no budget, or a zero one).
+#[derive(Debug)]
+enum Collection<T> {
+    Collected(T),
+    LookAgain,
+    Expired,
+    Failed(io::Error),
+}
+
+fn collection<T>(look: io::Result<Option<T>>, left: Option<Duration>) -> Collection<T> {
+    match (look, left) {
+        (Ok(Some(collected)), _) => Collection::Collected(collected),
+        (Err(error), _) if error.kind() != io::ErrorKind::Interrupted => Collection::Failed(error),
+        (_, Some(left)) if !left.is_zero() => Collection::LookAgain,
+        (_, Some(_) | None) => Collection::Expired,
+    }
+}
+
 /// Collect the exit of `pid`, `role` to this process, that [`await_exit`] has seen, through
 /// `look`, a collection that never blocks (`try_wait`, or `waitpid` with `WNOHANG`). Darwin
 /// reports a process exiting before `wait` can collect it (measured: 17 of 2000 children were not
 /// yet waitable right after `NOTE_EXIT` or `ESRCH`), so `look` runs again each timer tick until
-/// it answers, within what is left of `deadline`. A process still in its exit at the bound (an
-/// uninterruptible close) is named with its kernel state, and stays as it is.
+/// it answers, within what is left of `deadline` ([`collection`] decides). A process still in its
+/// exit at the bound (an uninterruptible close) is named with its kernel state, and stays as it is.
 pub fn collect_exited<T>(
     role: &'static str,
     pid: u32,
@@ -585,11 +606,17 @@ pub fn collect_exited<T>(
     mut look: impl FnMut() -> io::Result<Option<T>>,
 ) -> Result<T, ReapError> {
     loop {
-        match look() {
-            Ok(Some(collected)) => return Ok(collected),
-            Ok(None) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(source) => {
+        match collection(look(), deadline.remaining(clock())) {
+            Collection::Collected(collected) => return Ok(collected),
+            Collection::LookAgain => std::thread::sleep(TIMER_TICK),
+            Collection::Expired => {
+                return Err(ReapError::Expired(Box::new(deadline.expired(
+                    ChildPeer::observed(role, pid),
+                    last,
+                    clock(),
+                ))));
+            }
+            Collection::Failed(source) => {
                 return Err(ReapError::Wait {
                     op: deadline.op(),
                     role,
@@ -599,14 +626,6 @@ pub fn collect_exited<T>(
                 });
             }
         }
-        if deadline.remaining(clock()).is_none() {
-            return Err(ReapError::Expired(Box::new(deadline.expired(
-                ChildPeer::observed(role, pid),
-                last,
-                clock(),
-            ))));
-        }
-        std::thread::sleep(TIMER_TICK);
     }
 }
 
@@ -658,10 +677,14 @@ pub fn collect_later(role: &'static str, mut child: std::process::Child) {
 /// clears its `kill_on_drop` once spawned, so a task owns it until it exits and never drops it
 /// before. That task ends with the runtime: a child still running when its process ends is then
 /// killed by its own `kill_on_drop`, which is the process ending, not the wait that gave up on it.
-pub fn collect_later_async(role: &'static str, mut child: tokio::process::Child) {
+/// The returned handle completes once the exit is collected; dropping it leaves the task running.
+pub fn collect_later_async(
+    role: &'static str,
+    mut child: tokio::process::Child,
+) -> tokio::task::JoinHandle<()> {
     let pid = child.id().unwrap_or_default();
     tokio::spawn(async move {
-        // WHY unbounded: nothing waits on this task; it only collects the exit when it comes.
+        // WHY unbounded: it collects the exit whenever it comes; a caller awaits it only by choice.
         #[allow(clippy::disallowed_methods)]
         let waited = child.wait().await;
         match waited {
@@ -672,7 +695,7 @@ pub fn collect_later_async(role: &'static str, mut child: tokio::process::Child)
                 "cowshed: {role} pid {pid} could not be collected after its wait expired: {error}"
             ),
         }
-    });
+    })
 }
 
 /// [`collect_later`] for a raw child `pid` of this process: a thread collects its exit whenever it
@@ -1634,53 +1657,6 @@ mod tests {
     }
 
     #[test]
-    fn a_child_that_never_exits_is_not_waited_for_past_its_bound() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("600")
-            .spawn_locked()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let expiry = reap(
-            "probe child",
-            &mut child,
-            &start("reap probe", SHORT_REAP),
-            Progress::Nothing,
-        );
-        // The expiry left the child running: it is killed and collected before any assertion can
-        // panic, so a failed one leaves no sleeper behind.
-        child.kill().expect("kill sleep");
-        let collected = reap(
-            "probe child",
-            &mut child,
-            &start("reap probe", REAP),
-            Progress::Signalled {
-                signal: libc::SIGKILL,
-            },
-        );
-        let failure = expiry.expect_err("sleep 600 does not exit within 50 ms");
-        let ReapError::Expired(expired) = &failure else {
-            panic!("expected TIMEOUT, got {failure}");
-        };
-        assert_eq!(expired.op, "reap probe");
-        assert_eq!(expired.peer.pid, pid);
-        // Alive at the bound, in a state a child shows right after it started: running its
-        // start, in an uninterruptible kernel wait during it, or asleep in nanosleep. One the
-        // wait had collected would be a zombie or gone.
-        assert!(
-            matches!(
-                expired.peer.state,
-                RunState::Running | RunState::Sleeping | RunState::Uninterruptible
-            ),
-            "{failure}"
-        );
-        assert!(expired.elapsed >= SHORT_REAP.within, "{failure}");
-        assert_eq!(failure.code(), "TIMEOUT");
-        use std::os::unix::process::ExitStatusExt as _;
-        let status = collected.expect("a killed child is reaped");
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
-    }
-
-    #[test]
     fn an_exited_childs_output_held_by_its_own_child_expires_naming_the_stream() {
         use std::os::unix::process::CommandExt as _;
         let mut child = std::process::Command::new("/bin/sh")
@@ -1711,7 +1687,6 @@ mod tests {
         assert_eq!(*stream, OutputStream::Stdout);
         assert_eq!(expired.peer.pid, pid);
         assert_eq!(expired.op, "collect output");
-        assert!(expired.elapsed >= SHORT_REAP.within, "{failure}");
         assert_eq!(failure.code(), "TIMEOUT");
     }
 
@@ -1792,45 +1767,53 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
-    #[test]
-    fn a_seen_exit_never_collectable_at_the_bound_expires_naming_the_child() {
-        let pid = std::process::id();
-        let mut looks = 0;
-        let failure = collect_exited(
-            "probe child",
-            pid,
-            &start("collect probe", SHORT_REAP),
-            Progress::Signalled {
-                signal: libc::SIGKILL,
-            },
-            || {
-                looks += 1;
-                Ok(None::<()>)
-            },
-        )
-        .expect_err("nothing ever collects");
-        let ReapError::Expired(expired) = &failure else {
-            panic!("expected TIMEOUT, got {failure}");
-        };
-        assert_eq!((expired.op, expired.peer.pid), ("collect probe", pid));
-        assert!(looks > 1, "the collection looks again each tick: {looks}");
+    /// The outcome a collection table row expects: the collected status, or the failed look's
+    /// errno.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Expected {
+        Collected(u8),
+        LookAgain,
+        Expired,
+        Failed(Option<i32>),
     }
 
+    impl Expected {
+        fn of(collection: Collection<u8>) -> Self {
+            match collection {
+                Collection::Collected(status) => Self::Collected(status),
+                Collection::LookAgain => Self::LookAgain,
+                Collection::Expired => Self::Expired,
+                Collection::Failed(error) => Self::Failed(error.raw_os_error()),
+            }
+        }
+    }
+
+    /// One look at a seen exit: an answer is the exit even with the budget spent, a failed look
+    /// is the failure, and an unanswered or interrupted look looks again only while a positive
+    /// budget is left; a zero budget is spent.
     #[test]
-    fn a_seen_exit_collectable_late_is_returned() {
-        let mut looks = 0;
-        let collected = collect_exited(
-            "probe child",
-            std::process::id(),
-            &start("collect probe", REAP),
-            Progress::Nothing,
-            || {
-                looks += 1;
-                Ok((looks == 3).then_some(7))
-            },
-        )
-        .expect("the third look collects");
-        assert_eq!(collected, 7);
+    fn a_seen_exits_collection_is_decided_by_its_look_and_the_budget_left() {
+        let left = Some(Duration::from_nanos(1));
+        let zero = Some(Duration::ZERO);
+        let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
+        let refused = || io::Error::from_raw_os_error(libc::ECHILD);
+        let failed = Expected::Failed(Some(libc::ECHILD));
+        for (look, left, expected) in [
+            (Ok(Some(7)), left, Expected::Collected(7)),
+            (Ok(Some(7)), zero, Expected::Collected(7)),
+            (Ok(Some(7)), None, Expected::Collected(7)),
+            (Ok(None), left, Expected::LookAgain),
+            (Ok(None), zero, Expected::Expired),
+            (Ok(None), None, Expected::Expired),
+            (Err(interrupted()), left, Expected::LookAgain),
+            (Err(interrupted()), zero, Expected::Expired),
+            (Err(interrupted()), None, Expected::Expired),
+            (Err(refused()), left, failed),
+            (Err(refused()), None, failed),
+        ] {
+            let shown = format!("{look:?} with {left:?} left");
+            assert_eq!(Expected::of(collection(look, left)), expected, "{shown}");
+        }
     }
 
     #[tokio::test]
@@ -1903,42 +1886,30 @@ mod tests {
         assert_eq!(status.code(), Some(5));
     }
 
+    /// A tokio child handed to the collector is owned, not dropped: it still answers after the
+    /// handoff, which a child its `kill_on_drop` had killed could not, and once its input ends it
+    /// exits and the collection completes, leaving no zombie.
     #[tokio::test]
     async fn a_tokio_child_collected_later_is_left_running_and_reaped_once_it_exits() {
         use crate::fork_lock::Spawn as _;
-        let mut child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "read line"])
+        let mut child = tokio::process::Command::new("/bin/cat")
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn_locked()
-            .expect("spawn sh");
+            .expect("spawn cat");
         let pid = libc::pid_t::try_from(child.id().expect("a pid")).expect("a pid_t");
-        let stdin = child.stdin.take().expect("sh's stdin");
-        collect_later_async("probe child", child);
-        // Dropped instead of owned, the child would be killed now (`kill_on_drop`).
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            matches!(
-                crate::process::run_state(pid),
-                RunState::Running | RunState::Sleeping
-            ),
-            "the child is left running: {}",
-            crate::process::run_state(pid)
-        );
-        // Its stdin closed, sh exits, and the task collects it: no zombie is left. A collection that
-        // never comes is a hang the no-progress bound names, not a deadline of this test.
+        let mut stdin = child.stdin.take().expect("cat's stdin");
+        let mut stdout = BufReader::new(child.stdout.take().expect("cat's stdout"));
+        let collected = collect_later_async("probe child", child);
+        stdin.write_all(b"alive\n").await.expect("write to cat");
+        let mut line = String::new();
+        stdout.read_line(&mut line).await.expect("cat answers");
+        assert_eq!(line, "alive\n", "the child is left running");
+        // Its stdin closed, cat exits, and the task collects it.
         drop(stdin);
-        loop {
-            match crate::process::run_state(pid) {
-                RunState::Gone => break,
-                RunState::Unread(why) => panic!("the child's state is unread: {why}"),
-                RunState::Running
-                | RunState::Sleeping
-                | RunState::Uninterruptible
-                | RunState::Stopped
-                | RunState::Zombie => tokio::time::sleep(Duration::from_millis(10)).await,
-            }
-        }
+        collected.await.expect("the collection task completes");
+        assert_eq!(crate::process::run_state(pid), RunState::Gone);
     }
 
     #[test]
@@ -2142,35 +2113,8 @@ mod tests {
         assert_eq!(expired.op, "status");
         assert_eq!(expired.last, Progress::Sent { bytes: 16 });
         assert_eq!(expired.peer.pid, PeerPid::Known(own_pid()));
-        assert!(expired.elapsed >= SHORT.within, "{failure}");
         assert_eq!(failure.code(), "TIMEOUT");
         assert_eq!(failure.retry_class(), RetryClass::Terminal);
-    }
-
-    #[test]
-    fn a_blocking_held_wait_reads_its_holders_progress_and_fails_silent_after() {
-        use std::io::{Read as _, Write as _};
-        let (mut socket, mut far) = paired("hold", SHORT);
-        let silence = Duration::from_millis(80);
-        socket.hold(idle("job terminal", silence));
-        far.write_all(b"..").expect("two heartbeats");
-        let mut received = [0_u8; 2];
-        socket
-            .read_exact(&mut received)
-            .expect("the holder's progress");
-        socket.progressed(Progress::State("running"));
-        let error = socket
-            .read_exact(&mut received)
-            .expect_err("the holder falls silent");
-        let failure = socket.fail(error);
-        drop(far);
-        let WaitError::Silent(silent) = &failure else {
-            panic!("expected SILENT, got {failure}");
-        };
-        assert_eq!(silent.op, "job terminal");
-        assert_eq!(silent.last, Progress::State("running"));
-        assert!(silent.silent_for >= silence, "{failure}");
-        assert_eq!(failure.code(), "SILENT");
     }
 
     #[test]

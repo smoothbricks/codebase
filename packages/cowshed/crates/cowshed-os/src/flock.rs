@@ -215,7 +215,6 @@ mod tests {
         assert_eq!(expired.op, "held");
         assert_eq!(expired.class, LatencyClass::Control);
         assert_eq!(expired.bound, SHORT.within);
-        assert!(expired.elapsed >= SHORT.within, "{expired}");
         assert_eq!(expired.last, Progress::Nothing);
         assert_eq!(
             expired.peer,

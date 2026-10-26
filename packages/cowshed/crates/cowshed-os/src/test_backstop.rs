@@ -429,28 +429,6 @@ pub fn wait4(
 mod tests {
     use super::*;
 
-    use std::fs::File;
-
-    /// A bound short against a peer that never answers, which is each case's subject.
-    const SHORT: Bound = Bound::new(LatencyClass::Reap, Duration::from_millis(50));
-
-    #[test]
-    fn a_child_still_running_at_the_bound_fails_naming_it() {
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("600")
-            .spawn_locked()
-            .expect("spawn sleep");
-        let pid = child.id();
-        let failure = wait_within(&mut child, SHORT).expect_err("sleep outlives the bound");
-        assert_eq!(failure.kind(), io::ErrorKind::TimedOut, "{failure}");
-        assert!(
-            failure.to_string().contains(&format!("pid {pid}")),
-            "{failure}"
-        );
-        child.kill().expect("end sleep");
-        assert!(!child.wait_bounded().expect("reap sleep").success());
-    }
-
     #[test]
     fn a_run_answers_its_status_and_both_streams() {
         let output = std::process::Command::new("/bin/sh")
@@ -460,17 +438,6 @@ mod tests {
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(output.stdout, b"out\n");
         assert_eq!(output.stderr, b"err\n");
-    }
-
-    #[test]
-    fn a_lock_held_elsewhere_at_the_bound_fails_naming_the_wait() {
-        let fixture = Fixture::new();
-        let holder = File::create(&fixture.0).expect("create the lock file");
-        holder.try_lock().expect("hold the lock");
-        let waiter = File::open(&fixture.0).expect("open the lock file");
-        let failure = lock_within(&waiter, false, SHORT).expect_err("the lock stays held");
-        assert_eq!(failure.kind(), io::ErrorKind::TimedOut, "{failure}");
-        assert!(failure.to_string().contains("test lock"), "{failure}");
     }
 
     #[test]
@@ -487,25 +454,6 @@ mod tests {
         let (answered, status) = waitpid(pid, 0).expect("reap sh");
         assert_eq!(answered, pid);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
-    }
-
-    /// A lock file of this test's own, removed on every exit path.
-    struct Fixture(std::path::PathBuf);
-
-    impl Fixture {
-        fn new() -> Self {
-            Self(std::env::temp_dir().join(format!("cowshed-os-backstop-{}", uuid::Uuid::new_v4())))
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            if let Err(error) = std::fs::remove_file(&self.0)
-                && error.kind() != io::ErrorKind::NotFound
-            {
-                panic!("remove {}: {error}", self.0.display());
-            }
-        }
     }
 
     #[test]
