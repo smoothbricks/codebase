@@ -5,6 +5,11 @@
 //! `new_in` creates a private child without changing the selected parent's runtime alias.
 //! Independent sandbox fixtures explicitly select the canonical `/tmp` parent because their
 //! profiles cannot grant protected store paths inherited through TMPDIR. This guard adds no grant.
+//!
+//! Drop handles every return and panic, but not a killed process: that run's root is reclaimed by
+//! the shared-temp sweep, which claims a directory only when its pid-bearing name opens with
+//! `cowshed-` or `cs-` (cowshed-os `scratch::named_owner`). The constructor therefore names every
+//! root claimably itself, whatever prefix the caller spelled, rather than trusting each caller.
 
 use std::path::{Path, PathBuf};
 
@@ -31,9 +36,10 @@ impl TempRoot {
             "test parent {} must be a directory",
             parent.display()
         );
-        let path = cowshed_os::scratch::create_named(parent, prefix).unwrap_or_else(|error| {
-            panic!("create owned test root under {}: {error}", parent.display())
-        });
+        let path =
+            cowshed_os::scratch::create_named(parent, &claimable(prefix)).unwrap_or_else(|error| {
+                panic!("create owned test root under {}: {error}", parent.display())
+            });
         Self(path)
     }
 }
@@ -43,6 +49,17 @@ impl std::ops::Deref for TempRoot {
 
     fn deref(&self) -> &Path {
         &self.0
+    }
+}
+
+/// The claimable spelling of a caller's prefix: the shared-temp sweep recovers a
+/// killed run's root from its pid-bearing name only when that name opens with
+/// `cowshed-` or `cs-`, so a prefix opening with neither gains `cs-`.
+fn claimable(prefix: &str) -> std::borrow::Cow<'_, str> {
+    if prefix.starts_with("cowshed-") || prefix.starts_with("cs-") {
+        std::borrow::Cow::Borrowed(prefix)
+    } else {
+        std::borrow::Cow::Owned(format!("cs-{prefix}"))
     }
 }
 
@@ -83,5 +100,43 @@ impl FixtureStore {
     /// The store root, shared as controller Git takes it.
     pub(crate) fn shared(&self) -> &std::sync::Arc<Path> {
         &self.shared
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TempRoot, claimable};
+
+    #[test]
+    fn claimable_normalizes_a_prefix() {
+        assert_eq!(claimable("cowshed-store"), "cowshed-store");
+        assert_eq!(claimable("cs-seal"), "cs-seal");
+        assert_eq!(claimable("plain-name"), "cs-plain-name");
+        assert_eq!(claimable("pr"), "cs-pr");
+    }
+
+    #[test]
+    fn every_name_it_creates_is_claimable() {
+        // The parent fixtures are granted (temp_parent::scratch_parent's rule, spelled
+        // here because this file also stands alone in test binaries without it).
+        let granted = std::env::var_os("COWSHED_RUNTIME_LINK")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let parent = TempRoot::new_in(&granted, "cs-claim-parent");
+        for prefix in ["plain-name", "cs-seal", "cowshed-store"] {
+            let root = TempRoot::new_in(&parent, prefix);
+            let name = root
+                .file_name()
+                .expect("a created root has a name")
+                .to_string_lossy();
+            assert!(
+                name.starts_with("cowshed-") || name.starts_with("cs-"),
+                "prefix {prefix:?} created the unclaimable name {name:?}"
+            );
+            assert!(
+                name.starts_with(&*claimable(prefix)),
+                "prefix {prefix:?} created {name:?}, not its claimable spelling"
+            );
+        }
     }
 }

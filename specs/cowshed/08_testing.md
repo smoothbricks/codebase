@@ -251,7 +251,10 @@ exact root/path. No fixture invents a mount, a private parent directory or a ski
 
 The shared Rust fixture guard has one constructor, `TempRoot::new_in(parent, prefix)`. Every caller selects its
 already-granted parent explicitly. Independent controller-git sandbox fixtures use the shared canonical `/tmp` parent;
-alias-owned fixtures keep their selected runtime alias unchanged.
+alias-owned fixtures keep their selected runtime alias unchanged. The constructor names every root claimably (a
+`cowshed-` or `cs-` opening, whatever the caller spelled): Drop removes a root on return and on panic, and the
+shared-temp sweep reclaims a killed run's root by the pid its name records (01_storage.md, "Shared temporary scratch"),
+which it can read only from a claimable name.
 
 A pure regression fixture runs inside an ordinary exec and covers both the HTTP and Unix-socket authentication cases. It
 is not a real APFS mount or cache cutover proof.
