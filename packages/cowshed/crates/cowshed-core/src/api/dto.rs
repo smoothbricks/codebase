@@ -3,7 +3,6 @@ use crate::error::CowshedError;
 use crate::project_retirement::ProjectRetirementReport;
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use base64::Engine;
-use bytes::Bytes;
 use cowshed_types::land_turn::Ticket;
 use cowshed_types::lifecycle::{DerivedWorkspace, MountRefusal, MountState, Pin as LifecyclePin};
 use cowshed_types::metadata::DetachedWorkspaceMetadata;
@@ -16,15 +15,12 @@ use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Digest;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use tokio::io::AsyncRead;
 
 /// The class an exec is admitted under (05_gateway.md "Classes"), fixed at the job's birth. It
 /// sets the nice the job's command runs at and whether memory pressure makes the job wait or ends
@@ -2948,46 +2944,6 @@ impl<'de> Deserialize<'de> for ExecRecord {
     }
 }
 
-/// Where the child's stdin comes from.
-///
-/// Frontends cannot carry this enum on their wire — `Stream` holds a live reader — so each keeps
-/// its own spelling and maps into it here:
-///
-/// - CLI flags (`cowshed-cli/src/runtime.rs`, `exec_command`): no flag → `Empty`,
-///   `--stdin` → `Stream`, `--stdin-file` → `WorkspaceFile`, `--stdin-base64` → `Inline`;
-///   `Open` has no flag.
-/// - napi wire (`cowshed-napi/src/lib.rs`, `NapiExecRequest`): `stdin` string → `Inline`,
-///   `stdinWorkspacePath` → `WorkspaceFile`, neither → `Empty`; `Stream` and `Open` have no wire
-///   spelling.
-///
-/// Each frontend pins its mapping with an exhaustive-match seam (`cli_stdin_spelling`,
-/// `wire_stdin_spelling`), so adding a variant here breaks those matches at compile time instead
-/// of silently becoming a mode neither frontend can produce.
-pub enum StdinSource {
-    Empty,
-    Inline(Bytes),
-    Stream(Pin<Box<dyn AsyncRead + Send>>),
-    WorkspaceFile(WorkspacePath),
-    /// Stdin stays open after admission with no source behind it: the job's attachment writes it
-    /// through `JobStdin::write` and ends it, once, through `JobStdin::close`. Its `StdinInfo`
-    /// kind is `stream`.
-    Open,
-}
-
-impl fmt::Debug for StdinSource {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("Empty"),
-            Self::Inline(bytes) => formatter.debug_tuple("Inline").field(&bytes.len()).finish(),
-            Self::Stream(_) => formatter.write_str("Stream(<async reader>)"),
-            Self::WorkspaceFile(path) => {
-                formatter.debug_tuple("WorkspaceFile").field(path).finish()
-            }
-            Self::Open => formatter.write_str("Open"),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RunSandboxMode {
@@ -3162,31 +3118,6 @@ pub enum JobFailure {
     /// command never ran. The cause is on stderr. A cold activation that itself fails is not
     /// this: the job ends with the activation's own status (11_shell.md).
     Unlaunched,
-}
-
-#[derive(Debug)]
-pub struct ExecRequest {
-    pub command: ExecCommand,
-    pub cwd: Option<WorkspacePath>,
-    pub mode: RunSandboxMode,
-    pub env: HashMap<String, String>,
-    pub trace: Option<TraceContext>,
-    pub stdin: StdinSource,
-    pub stdout_copy: Option<OutputPublication>,
-    pub stderr_copy: Option<OutputPublication>,
-    /// Names this exec for idempotent admission: a repeat with the same key and request answers
-    /// the job the first admitted, and never spawns again.
-    pub admission_key: Option<AdmissionKey>,
-    /// The class the command is admitted under (05_gateway.md "Classes"): background by default,
-    /// interactive when its requester awaits its result, a gate when a trusted coordinator route
-    /// asks for one, or a resident.
-    pub class: ExecClass,
-    /// The most compiler and test threads the command's jobserver holds; `None` holds the host's
-    /// cores, and a larger want is held to them (`JobScheduling::requested`, 05_gateway.md
-    /// "Parallelism inside a job").
-    pub want: Option<NonZeroUsize>,
-    /// Where the command runs: the workspace sandbox, or a coordinator's host boundary outside it.
-    pub scope: ExecScope,
 }
 
 /// Where an exec's command runs (07_api.md "Exec and grants").

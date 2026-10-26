@@ -12,18 +12,19 @@ use url::Url;
 
 #[cfg(target_os = "macos")]
 use super::storage_host::RuntimeStorageHost;
+use crate::api::capability::{ExecRequest, StdinSource};
 #[cfg(target_os = "macos")]
 use crate::api::dto::GitOid;
 #[cfg(target_os = "macos")]
 use crate::api::dto::{AbandonedPreservation, AbandonedWork};
 use crate::api::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions,
-    GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
+    CheckpointResult, CommandArg, DoctorReport, EmptyResult, ForkOptions, GcOptions, GcReport,
+    GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
     JobTailLimits, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants,
     PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, RemovedWorkspace, SealedJob, StdinSource,
-    WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    RemoveProjectReport, RemoveReport, RemovedWorkspace, SealedJob, WorkspaceIncarnation,
+    WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 #[cfg(target_os = "macos")]
 use crate::api::dto::{BranchLandings, LandingCommits, UnlandedPaths};
@@ -19375,10 +19376,10 @@ mod removal_supervisor_tests {
 
     use super::NativeProjectRuntimeHost;
     use crate::{
+        api::capability::{ExecRequest, StdinSource},
         api::dto::{
-            BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, OutputStorage,
-            OutputSummary, ProtectedOutput, RunSandboxMode, SealedJob, Sha256Digest, StdinSource,
-            StreamInfo,
+            BinaryData, CommandArg, ExecCommand, ExitStatus, JobId, OutputStorage, OutputSummary,
+            ProtectedOutput, RunSandboxMode, SealedJob, Sha256Digest, StreamInfo,
         },
         error::{CowshedError, Result},
         runtime::supervisor::{

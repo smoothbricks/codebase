@@ -5928,9 +5928,10 @@ mod tests {
     mod foreground_relay {
         use super::*;
         use bytes::Bytes;
+        use cowshed_core::api::capability::StdinSource;
         use cowshed_core::api::dto::{
             CommandArg, ExecCommand as JobCommand, ExitStatus, GrantSet, RunSandboxMode,
-            StdinSource, WorkspaceState,
+            WorkspaceState,
         };
         use cowshed_core::api::server::{RouterHandle, RouterResponse};
         use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};

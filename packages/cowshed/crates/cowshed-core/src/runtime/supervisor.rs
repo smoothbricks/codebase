@@ -16,13 +16,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::api::capability::{ExecRequest, StdinSource};
 use crate::api::dto::ExecClass;
 use crate::api::dto::{
-    AdmissionKey, BinaryData, CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus,
-    JobFailure, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobState, JobTail,
-    JobTailLimits, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
-    ProtectedOutput, SealedJob, Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo,
-    TraceContext, UtcTimestamp, WorkspacePath,
+    AdmissionKey, BinaryData, CommandArg, ExecCommand, ExecScope, ExitStatus, JobFailure, JobId,
+    JobInfo, JobJournalCursor, JobListeningPorts, JobState, JobTail, JobTailLimits,
+    OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, SealedJob,
+    Sha256Digest, StdinInfo, StdinKind, StreamInfo, TraceContext, UtcTimestamp, WorkspacePath,
 };
 use crate::api::journal_tail::tail_journals;
 use crate::api::process::JobLeafAttribution;

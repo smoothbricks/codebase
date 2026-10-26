@@ -1591,7 +1591,8 @@ mod tests {
 
     #[tokio::test]
     async fn real_apfs_quiet_seed_live_capture_refuses_admission_until_publication() {
-        use crate::api::dto::{ExecCommand, ExecRequest, ExitStatus, RunSandboxMode, StdinSource};
+        use crate::api::capability::{ExecRequest, StdinSource};
+        use crate::api::dto::{ExecCommand, ExitStatus, RunSandboxMode};
         use crate::runtime::build_volumes::BuildVolumes;
         use crate::runtime::supervisor::{
             CommitmentPublisher, WorkspaceSupervisor, WorkspaceSupervisorConfig,
@@ -2427,7 +2428,8 @@ mod tests {
     /// share their workspace/build attachments; each sample takes its own baseline.
     #[tokio::test]
     async fn real_apfs_owned_volume_usage_and_job_accounting_through_multi_volume_release() {
-        use crate::api::dto::{ExecCommand, ExecRequest, ExitStatus, JobId, StdinSource};
+        use crate::api::capability::{ExecRequest, StdinSource};
+        use crate::api::dto::{ExecCommand, ExitStatus, JobId};
         use crate::runtime::job_groups::Birth;
         use crate::runtime::supervisor::{
             ArtifactSink as _, ArtifactStoreSink, CommitmentDraft, CommitmentSink, OwnedProcess,
