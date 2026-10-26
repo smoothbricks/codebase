@@ -22,7 +22,6 @@ use cowshed_core::api::{
 };
 use cowshed_core::build_volume::nx::tree_holders;
 use cowshed_core::error::Result;
-use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::runtime::job_cpu::cpu_pool_directory;
 use cowshed_core::runtime::shell_host::ShellHostProgram;
 use cowshed_core::runtime::shell_pool::ShellPoolConfig;
@@ -38,6 +37,7 @@ use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::host_load::HostLoad;
 use cowshed_os::process::ExitWatch;
+use cowshed_types::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";

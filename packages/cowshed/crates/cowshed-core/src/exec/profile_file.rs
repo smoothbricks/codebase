@@ -262,7 +262,7 @@ mod tests {
         crate::runtime::supervisor_socket::socket_path(
             store,
             &cowshed_types::repository::RepoId::parse("acme/widget").unwrap(),
-            &crate::metadata::WorkspaceName::new(workspace).unwrap(),
+            &cowshed_types::metadata::WorkspaceName::new(workspace).unwrap(),
         )
     }
 

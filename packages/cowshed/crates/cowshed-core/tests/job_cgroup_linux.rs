@@ -41,7 +41,6 @@ use std::time::Duration;
 
 use cowshed_core::api::dto::{ExecClass, JobId};
 use cowshed_core::error::ErrorCode;
-use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::runtime::job_cgroup::{
     CGROUP_MOUNT, CONTROLLER_LEAF, CgroupAuthority, CgroupError, CgroupMemberSignal, Controller,
     IncarnationCgroups, JobCgroup, JobCgroupIdentity,
@@ -53,6 +52,7 @@ use cowshed_os::deadline::{Bound, LatencyClass, REAP};
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::process::RunState;
 use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
+use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_types::repository::RepoId;
 use serde::{Deserialize, Serialize};
 

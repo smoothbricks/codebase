@@ -23,8 +23,8 @@ use super::operations::{
     AdoptView, Lane, LogsChunk, Operation, Scope, StreamOperation, WorkerView, WorkspaceView,
 };
 use crate::error::{CowshedError, Result};
-use crate::metadata::WorkspaceName;
 use bytes::Bytes;
+use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::RepoId;
 use serde::de::DeserializeOwned;
 use serde_json::Value;

@@ -23,7 +23,6 @@ use cowshed_core::api::{
 };
 use cowshed_core::host_dirs::support_directory;
 use cowshed_core::land_turn as turns;
-use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
 use cowshed_core::runtime::supervisor_manager::{
     self, ProgramSpawner, SocketPeers, SupervisorManager,
@@ -44,6 +43,7 @@ use cowshed_gateway_types::host_status::{LoadReading, MemoryPressureReading, Swa
 use cowshed_os::deadline::WaitError;
 use cowshed_os::namespace::HostNamespace;
 use cowshed_os::stdio::Blocking;
+use cowshed_types::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_types::repository::RepoId;
 use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
@@ -5145,7 +5145,6 @@ mod tests {
     mod startup {
         use std::num::NonZeroUsize;
 
-        use cowshed_core::metadata::WorkspaceName;
         use cowshed_core::runtime::supervisor_manager::{
             Draining, Recovery, SupervisorPeers, SupervisorSpawner,
         };
@@ -5155,6 +5154,7 @@ mod tests {
             CredentialError, CredentialProvider, CredentialQuery, CredentialRecord,
             UpstreamConnection, UpstreamConnector, UpstreamHealth,
         };
+        use cowshed_types::metadata::WorkspaceName;
 
         use super::*;
 
@@ -5261,7 +5261,7 @@ mod tests {
             async fn workspace_session(
                 &self,
                 _: &RepoId,
-                _: &cowshed_core::metadata::WorkspaceName,
+                _: &cowshed_types::metadata::WorkspaceName,
             ) -> Result<Option<cowshed_core::gateway_sessions::WorkspaceSessionSnapshot>>
             {
                 Err(CowshedError::internal("the inventory was read"))
@@ -5300,7 +5300,7 @@ mod tests {
             let repo = cowshed_types::repository::RepoId::parse("acme/widget").expect("repo id");
             for workspace in workspaces {
                 let workspace =
-                    cowshed_core::metadata::WorkspaceName::new(*workspace).expect("workspace");
+                    cowshed_types::metadata::WorkspaceName::new(*workspace).expect("workspace");
                 fs::write(
                     supervisor_socket::socket_path(&store, &repo, &workspace),
                     b"",

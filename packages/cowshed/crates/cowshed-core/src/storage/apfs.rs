@@ -12,10 +12,11 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::api::held_lock::{LockHolding, LockOperation};
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
+use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
 use cowshed_os::timing::timed_async;
+use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 use super::lifecycle::{
@@ -27,7 +28,8 @@ use super::lifecycle::{
     RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision, StorageFact, StorageGcOptions,
     StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
 };
-use super::{CheckpointLabel, PRE_RESTORE_PREFIX, StorageLayout, StorageLayoutError};
+use super::{StorageLayout, StorageLayoutError};
+use cowshed_types::lifecycle::{CheckpointLabel, PRE_RESTORE_PREFIX};
 
 pub const DEFAULT_IMAGE_CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(100);
 use super::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
@@ -108,9 +110,9 @@ impl ApfsSubstrateConfig {
         let Ok(layout) = StorageLayout::new(&self.store_root, current) else {
             return OwnedRepoIds::sole(current.clone());
         };
-        let Ok(binding) = crate::metadata::read_json::<cowshed_types::repository::RepositoryBinding>(
-            &layout.project().repository_binding,
-        ) else {
+        let Ok(binding) = cowshed_types::metadata::read_json::<
+            cowshed_types::repository::RepositoryBinding,
+        >(&layout.project().repository_binding) else {
             return OwnedRepoIds::sole(current.clone());
         };
         match binding.owned_repo_ids() {
@@ -173,9 +175,10 @@ impl MarkerExpectation {
     /// when it does not. A marker that cannot be read is not ours (01a_apfs.md, "Ownership,
     /// identity, and the volume label"); the read's own error says why it could not be read.
     pub(crate) fn judge(&self, root: &Path) -> Result<(), MountRefusalReason> {
-        let marker =
-            crate::metadata::WorkspaceMarker::read_from(&root.join(super::WORKSPACE_MARKER_PATH))
-                .map_err(|error| MountRefusalReason::MarkerUnreadable(error.to_string()))?;
+        let marker = cowshed_types::metadata::WorkspaceMarker::read_from(
+            &root.join(super::WORKSPACE_MARKER_PATH),
+        )
+        .map_err(|error| MountRefusalReason::MarkerUnreadable(error.to_string()))?;
         if self.repos.accepts(&marker.repo_id)
             && marker.workspace == self.workspace
             && marker.workspace_incarnation == self.incarnation
@@ -304,8 +307,8 @@ pub struct PendingPublicationFact {
 pub struct PendingAdoption {
     pub incarnation: WorkspaceIncarnation,
     pub image: PathBuf,
-    pub info: crate::metadata::WorkspaceInfoSnapshot,
-    pub grants: crate::metadata::GrantSet,
+    pub info: cowshed_types::metadata::WorkspaceInfoSnapshot,
+    pub grants: cowshed_types::metadata::GrantSet,
 }
 
 impl PendingAdoption {
@@ -562,7 +565,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn validate_pending_clone(
         &self,
         image: &Path,
-        expected: &crate::metadata::DetachedWorkspaceMetadata,
+        expected: &cowshed_types::metadata::DetachedWorkspaceMetadata,
     ) -> Result<(), ApfsStorageError>;
 
     /// The unfinished adoption whose canonical main still carries `PendingFence`, if any. A main
@@ -1341,9 +1344,9 @@ where
     /// or activating it. A retry of the original intent remains the publication authority.
     pub async fn defragment_pending_clone(
         &self,
-        metadata: crate::metadata::DetachedWorkspaceMetadata,
+        metadata: cowshed_types::metadata::DetachedWorkspaceMetadata,
     ) -> Result<DefragmentOutcome, ApfsStorageError> {
-        if metadata.publication_state != crate::metadata::PublicationState::PendingFence
+        if metadata.publication_state != cowshed_types::metadata::PublicationState::PendingFence
             || metadata.workspace.is_main()
         {
             return Err(ApfsStorageError::InvalidPlan(
@@ -1767,7 +1770,7 @@ where
     /// state as it found it.
     pub async fn execute_pending_clone_retirement<F, Fut, R, E>(
         &self,
-        metadata: crate::metadata::DetachedWorkspaceMetadata,
+        metadata: cowshed_types::metadata::DetachedWorkspaceMetadata,
         identity: OperationIdentity,
         inspect: F,
     ) -> Result<(RetiredRef, R), StagedExecutionError<E>>
@@ -1778,7 +1781,7 @@ where
         E: Send,
     {
         if metadata.workspace.is_main()
-            || metadata.publication_state != crate::metadata::PublicationState::PendingFence
+            || metadata.publication_state != cowshed_types::metadata::PublicationState::PendingFence
         {
             return Err(ApfsStorageError::InvalidPlan(
                 "pending retirement requires an unfinished session clone",
@@ -4037,7 +4040,7 @@ fn active_expected(
 pub(crate) const COMPANION_SUFFIX: &str = ".ca.key";
 
 pub(crate) fn companion_path(image: &Path) -> PathBuf {
-    crate::metadata::append_suffix(image, COMPANION_SUFFIX)
+    cowshed_types::metadata::append_suffix(image, COMPANION_SUFFIX)
 }
 
 fn absent_expected(expected: &[LifecycleFact]) -> Result<Revision, ApfsStorageError> {
@@ -4306,7 +4309,7 @@ pub fn build_volume_label(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::GrantSet;
+    use cowshed_types::metadata::GrantSet;
 
     /// A busy build volume names what holds it: the job when its hold file is held, the process
     /// with the volume open otherwise (live: a host `cat` with its cwd on the mount, pid 64266,

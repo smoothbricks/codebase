@@ -15,9 +15,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use cowshed_core::api::{ExitStatus, JobId};
-use cowshed_core::metadata::{
-    GrantSet, MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName,
-};
 use cowshed_core::runtime::supervisor::{
     ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess, SandboxPolicy, SpawnSink,
     SystemSpawnSink, WorkspaceAuthoritySnapshot,
@@ -30,6 +27,9 @@ use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_core::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV};
 use cowshed_gateway_types::WorkspaceToken;
+use cowshed_types::metadata::{
+    GrantSet, MACOS_PORT_MIN, PortBlock, WorkspaceIncarnation, WorkspaceName,
+};
 use cowshed_types::repository::RepoId;
 
 #[path = "support/nx_reads.rs"]
@@ -1711,7 +1711,7 @@ fn production_workspace(
         workspace_mount: mount,
         exec_temp_dir,
         store_root: &root.join("store"),
-        workspace_incarnation: &cowshed_core::metadata::WorkspaceIncarnation::new(
+        workspace_incarnation: &cowshed_types::metadata::WorkspaceIncarnation::new(
             "0123456789abcdef0123456789abcdef",
         )
         .expect("a valid workspace incarnation"),
@@ -2444,7 +2444,7 @@ async fn host_controller_managed_cargo_is_the_toolchain_and_the_installed_cli_st
             temp_dir: &sandbox.exec_temp_dir,
             capability_env: &sandbox.capabilities.contribution,
         },
-        cowshed_core::metadata::Platform::Macos,
+        cowshed_types::metadata::Platform::Macos,
         Some(sandbox.port_block),
     )
     .expect("publish the controller's served environment");

@@ -237,7 +237,7 @@ impl Host {
         #[cfg(target_os = "linux")]
         let cgroups = cgroup_authority()
             .incarnation(
-                &cowshed_core::metadata::WorkspaceIncarnation::new(
+                &cowshed_types::metadata::WorkspaceIncarnation::new(
                     uuid::Uuid::new_v4().simple().to_string(),
                 )
                 .expect("incarnation"),

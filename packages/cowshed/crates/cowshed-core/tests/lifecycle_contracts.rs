@@ -4,12 +4,12 @@ use std::thread::ThreadId;
 
 use async_trait::async_trait;
 use cowshed_apfs::image::ImageCapacity;
-use cowshed_core::metadata::{
+use cowshed_core::storage::lifecycle::*;
+use cowshed_types::lifecycle::CheckpointLabel;
+use cowshed_types::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
     WorkspaceRole,
 };
-use cowshed_core::storage::CheckpointLabel;
-use cowshed_core::storage::lifecycle::*;
 use cowshed_types::repository::RepoId;
 use proptest::prelude::*;
 

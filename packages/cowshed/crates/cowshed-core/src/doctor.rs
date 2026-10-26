@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::metadata::WorkspaceName;
+use cowshed_types::metadata::WorkspaceName;
 
 /// How long a probe takes before its `done` line prints. On a loaded host every ordinary probe
 /// answered in under a second, while the ones a slow doctor's time went to — the gateway's

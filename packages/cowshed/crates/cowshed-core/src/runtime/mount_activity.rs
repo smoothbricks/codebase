@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use crate::build_volume::nx::{self, TreeHold};
 use crate::error::CowshedError;
-use crate::metadata::WorkspaceName;
 use crate::runtime::job_groups;
+use cowshed_types::metadata::WorkspaceName;
 
 /// How many holders a refusal names; the rest are counted.
 const NAMED_HOLDERS: usize = 10;

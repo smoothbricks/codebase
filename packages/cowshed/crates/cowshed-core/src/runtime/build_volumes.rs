@@ -28,7 +28,6 @@ use crate::build_volume::{
     Registration, ReleaseClaim, TrackedBuildStateRefusal, cargo, link, nx,
 };
 use crate::capabilities::BuildStatePath;
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 #[cfg(test)]
 use crate::storage::apfs::ApfsExecutionHost;
 use crate::storage::apfs::ApfsStorageError;
@@ -40,6 +39,7 @@ use crate::{CowshedError, Result};
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::LockMode;
+use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 
@@ -4903,7 +4903,7 @@ mod tests {
             rename: false,
         });
         journal.mark_mutating(&workspace.owner.name).unwrap();
-        crate::metadata::write_json(&journal_path, &journal).unwrap();
+        cowshed_types::metadata::write_json(&journal_path, &journal).unwrap();
         let error = scratch.volumes.execute_reseed(plan).await.unwrap_err();
         assert_eq!(error.code, crate::ErrorCode::Conflict, "{error}");
         assert!(
@@ -4912,7 +4912,7 @@ mod tests {
         );
         assert!(error.message.contains("Fork"), "{error}");
         journal.clear(&workspace.owner.name);
-        crate::metadata::write_json(&journal_path, &journal).unwrap();
+        cowshed_types::metadata::write_json(&journal_path, &journal).unwrap();
 
         let plan = scratch
             .volumes

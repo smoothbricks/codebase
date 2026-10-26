@@ -3,8 +3,8 @@ use super::*;
 /// A real directory controller job and gateway join never read sibling session authority.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_workspace_jobs_ignore_corrupt_and_missing_sibling_grants() {
-    use cowshed_core::metadata::{DetachedWorkspaceMetadata, sidecar_path};
     use cowshed_core::storage::StorageLayout;
+    use cowshed_types::metadata::{DetachedWorkspaceMetadata, sidecar_path};
     let mut fixture = Fixture::directory();
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;

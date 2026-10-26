@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cowshed_apfs::disk_lease::{lease_socket, leased_at};
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
+use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{
     ApfsBackend, AttachedImage, CommandOutput, CommandRequest, CreateImageRequest,
     DISK_CHILD_DEADLINE, DetachIntent, MacOsApfsBackend, SystemCommandRunner,
@@ -29,6 +29,7 @@ use cowshed_gateway::{
 };
 use cowshed_gateway_types::DiskClass;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::image::IMAGE_EXTENSION;
 
 struct NoCredentials;
 

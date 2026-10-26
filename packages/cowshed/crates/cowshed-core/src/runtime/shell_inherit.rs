@@ -480,7 +480,7 @@ pub enum RecordError {
     #[error("cannot encode the activation record: {0}")]
     Encode(#[from] serde_json::Error),
     #[error("cannot publish the activation record: {0}")]
-    Publish(#[from] crate::metadata::MetadataError),
+    Publish(#[from] cowshed_types::metadata::MetadataError),
     #[error("cannot lock the activation record {path:?}: {source}")]
     Lock { path: PathBuf, source: io::Error },
 }
@@ -648,7 +648,7 @@ pub fn write_record(
     };
     {
         let _fence = lock_record(placement.root)?;
-        crate::metadata::write_atomic_bytes(
+        cowshed_types::metadata::write_atomic_bytes(
             &record_path(placement.root),
             &serde_json::to_vec(&record)?,
         )?;
@@ -717,8 +717,8 @@ impl Uncertified {
     /// comparison and the write happen under the origin's record fence, so a newer record its
     /// own activation wrote in between is never overwritten.
     fn certify_origin(&self, root: &Path) -> Origin {
-        use crate::metadata::WorkspaceMarker;
         use crate::storage::{WORKSPACE_MARKER_PATH, verify_no_symlinks};
+        use cowshed_types::metadata::WorkspaceMarker;
         let refused = |reason: String| Origin::Refused(reason);
         let ours = match WorkspaceMarker::read_from(&root.join(WORKSPACE_MARKER_PATH)) {
             Ok(marker) => marker,
@@ -787,7 +787,7 @@ impl Uncertified {
                 }
             };
             record.proof = self.proof_with(root);
-            crate::metadata::write_atomic_bytes(&path, &serde_json::to_vec(&record)?)?;
+            cowshed_types::metadata::write_atomic_bytes(&path, &serde_json::to_vec(&record)?)?;
             Ok(Origin::Updated)
         })();
         written.unwrap_or_else(|error| refused(error.to_string()))

@@ -40,8 +40,8 @@ use crate::api::dto::{
 };
 use crate::capabilities::nx;
 use crate::error::{CowshedError, Result};
-use crate::metadata::WorkspaceRole;
 use crate::sandbox::SandboxConfig;
+use cowshed_types::metadata::WorkspaceRole;
 
 /// How often a shed's supervisor probes its Nx daemon. Short, because from the daemon's death to
 /// the next probe a host client finds no daemon and starts its own outside the sandbox, and a

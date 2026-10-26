@@ -38,16 +38,17 @@ use std::sync::{Mutex, PoisonError};
 
 use cowshed_apfs::{DetachIntent, MountAccess};
 
-use crate::metadata::{
+use crate::workspace_credentials::{
+    mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
+};
+use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
+use cowshed_types::image::is_image_path;
+use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION,
     WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
     sidecar_path,
 };
-use crate::workspace_credentials::{
-    mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
-};
-use cowshed_apfs::image::{ImageCapacity, is_image_path};
-use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 use super::apfs::native::{
@@ -70,10 +71,8 @@ use super::lifecycle::{
     Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcOptions, StorageGcPlan,
     StorageGcReport, SubstrateStats, derive_workspaces,
 };
-use super::{
-    CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH, discover_session_images,
-    verify_no_symlinks,
-};
+use super::{WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks};
+use cowshed_types::lifecycle::{CheckpointLabel, PRE_RESTORE_PREFIX};
 
 /// The name every refusal of a physical-volume request gives this backend.
 const BACKEND: &str = "directory";
@@ -173,7 +172,7 @@ const MOVE_SUFFIX: &str = ".cowshed-move";
 
 /// The name beside its image path a payload passes through while it moves.
 fn move_sibling(image: &Path) -> PathBuf {
-    crate::metadata::append_suffix(image, MOVE_SUFFIX)
+    cowshed_types::metadata::append_suffix(image, MOVE_SUFFIX)
 }
 
 fn is_real_directory(path: &Path) -> Result<bool, ApfsStorageError> {
@@ -453,7 +452,7 @@ fn move_home(
         if !open.is_empty() {
             return Err(ApfsStorageError::BuildVolumeHeld {
                 image: image.to_owned(),
-                hold: crate::metadata::append_suffix(image, ".hold"),
+                hold: cowshed_types::metadata::append_suffix(image, ".hold"),
                 holds: Vec::new(),
                 open,
             });
@@ -556,7 +555,7 @@ fn ensure_parent(path: &Path) -> Result<(), ApfsStorageError> {
 }
 
 fn validate_image(image: &Path) -> Result<(), ApfsStorageError> {
-    crate::metadata::validate_image_path(image).map_err(host_error)
+    cowshed_types::metadata::validate_image_path(image).map_err(host_error)
 }
 
 impl DirectoryExecutionHost {
@@ -1139,11 +1138,12 @@ impl DirectoryExecutionHost {
         let (Some(owner), Some(repo)) = (parts.next(), parts.next()) else {
             return Err(outside());
         };
-        let name = crate::metadata::WorkspaceName::new("reclaimed")
+        let name = cowshed_types::metadata::WorkspaceName::new("reclaimed")
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let incarnation =
-            crate::metadata::WorkspaceIncarnation::new(uuid::Uuid::new_v4().simple().to_string())
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        let incarnation = cowshed_types::metadata::WorkspaceIncarnation::new(
+            uuid::Uuid::new_v4().simple().to_string(),
+        )
+        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         Ok(super::apfs::deleting_image_below(
             &store
                 .join(owner)
@@ -1647,16 +1647,17 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
                     && old.repo_id == *workspace.repo()
                     && old.workspace == *workspace.name()
             }),
-            Err(crate::metadata::MetadataError::Io { source, .. })
+            Err(cowshed_types::metadata::MetadataError::Io { source, .. })
                 if source.kind() == io::ErrorKind::NotFound =>
             {
                 None
             }
             Err(error) => return Err(ApfsStorageError::MarkerMismatch(error.to_string())),
         };
-        let owned_links_revision = copied.map_or(crate::metadata::OWNED_LINKS_REVISION, |old| {
-            old.owned_links_revision
-        });
+        let owned_links_revision = copied
+            .map_or(cowshed_types::metadata::OWNED_LINKS_REVISION, |old| {
+                old.owned_links_revision
+            });
         let marker = WorkspaceMarker {
             version: MARKER_VERSION,
             repo_id: workspace.repo().clone(),
@@ -1677,7 +1678,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         ))?;
         fs::create_dir_all(parent)
             .map_err(|error| io_error("create marker directory", parent, error))?;
-        crate::metadata::write_json(&marker_path, &marker).map_err(host_error)
+        cowshed_types::metadata::write_json(&marker_path, &marker).map_err(host_error)
     }
 
     fn validate_marker(
@@ -2094,7 +2095,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             pin: pin.into(),
         };
         let path = checkpoint_fact_path(image);
-        crate::metadata::write_json(&path, &fact).map_err(host_error)?;
+        cowshed_types::metadata::write_json(&path, &fact).map_err(host_error)?;
         sync_parent_path(&path)
     }
 
@@ -2194,7 +2195,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             destination_incarnation: workspace.incarnation().clone(),
         };
         let recovery_path = restore_recovery_fact_path(canonical);
-        crate::metadata::write_json(&recovery_path, &recovery_fact).map_err(host_error)?;
+        cowshed_types::metadata::write_json(&recovery_path, &recovery_fact).map_err(host_error)?;
         sync_parent_path(&recovery_path)?;
         self.publish_metadata(
             canonical,
@@ -2521,7 +2522,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             } else {
                 let fact_path = checkpoint_fact_path(&checkpoint);
                 let fact: CheckpointFactWire =
-                    crate::metadata::read_json(&fact_path).map_err(host_error)?;
+                    cowshed_types::metadata::read_json(&fact_path).map_err(host_error)?;
                 if fact.version != CHECKPOINT_FACT_VERSION
                     || fact.repo_id != *workspace.repo()
                     || fact.workspace != *workspace.name()

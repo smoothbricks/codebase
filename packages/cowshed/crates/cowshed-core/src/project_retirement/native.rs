@@ -15,7 +15,6 @@ mod macos {
     };
     use cowshed_os::fork_lock::Fenced;
 
-    use crate::metadata::WorkspaceName;
     use crate::project_retirement::{
         ProjectRetirementReport, RetirementIntent, RetirementPhase, acquire_collector,
         acquire_retirement_run,
@@ -25,6 +24,7 @@ mod macos {
     use crate::storage::lifecycle::dispatch_blocking;
     use crate::storage::recovery::{IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntentJournal};
     use crate::{CowshedError, ErrorCode, Result};
+    use cowshed_types::metadata::WorkspaceName;
     use cowshed_types::repository::{RepoId, SESSIONS_DIRECTORY};
 
     const DRAIN_BOUND: Duration = Duration::from_secs(30);
@@ -73,7 +73,7 @@ mod macos {
                     continue;
                 }
                 // Every RAW image: workspaces, checkpoints and retained re-adoption inputs.
-                if cowshed_apfs::image::is_image_path(&path) {
+                if cowshed_types::image::is_image_path(&path) {
                     if directory == sessions {
                         let name =
                             path.file_stem()

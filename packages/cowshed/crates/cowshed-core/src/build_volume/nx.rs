@@ -1744,7 +1744,7 @@ fn parse_utc_millis(value: &str) -> Option<u128> {
         return None;
     }
     let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<u64>().ok();
-    let days = crate::storage::days_from_civil(number(0..4)?, number(5..7)?, number(8..10)?)?;
+    let days = cowshed_types::clock::days_from_civil(number(0..4)?, number(5..7)?, number(8..10)?)?;
     let (hour, minute, second, millis) = (
         number(11..13)?,
         number(14..16)?,

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 
-use crate::metadata::GRANTS_SIDECAR_SUFFIX;
+use cowshed_types::metadata::GRANTS_SIDECAR_SUFFIX;
 
 use cowshed_gateway_types::STORE_ROOT;
 
@@ -476,7 +476,7 @@ pub enum HostConfigError {
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use crate::metadata::WorkspaceName;
+    use cowshed_types::metadata::WorkspaceName;
     use cowshed_types::repository::RepoId;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -507,7 +507,8 @@ mod tests {
             },
         ])
         .expect("repository binding");
-        crate::metadata::write_json(&paths.repository_binding, &binding).expect("binding file");
+        cowshed_types::metadata::write_json(&paths.repository_binding, &binding)
+            .expect("binding file");
         paths.project_root
     }
 

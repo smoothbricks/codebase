@@ -31,11 +31,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::dto::GitOid;
 use crate::capabilities::BuildStatePath;
-use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::storage::StorageLayoutError;
 use crate::storage::apfs::release::{Listing, released_in_store};
-use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::metadata::{
+    MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json,
+};
 use cowshed_types::repository::ProjectPaths;
 
 pub use link::BUILD_LINK;
@@ -213,7 +215,7 @@ impl BuildVolumeRecord {
             version: RECORD_VERSION,
             tree,
             role,
-            created_at: crate::storage::deletion_log::rfc3339_utc(std::time::SystemTime::now()),
+            created_at: cowshed_types::clock::rfc3339_utc(std::time::SystemTime::now()),
             checked_out: None,
             stage: BuildVolumeStage::Published,
             extents: None,
@@ -1814,7 +1816,7 @@ mod tests {
                             None,
                             BuildVolumeRole::Seed {
                                 target: WorkspaceName::main(),
-                                incarnation: crate::metadata::WorkspaceIncarnation::new(
+                                incarnation: cowshed_types::metadata::WorkspaceIncarnation::new(
                                     "0".repeat(32),
                                 )
                                 .unwrap(),

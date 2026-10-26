@@ -8,12 +8,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cowshed_core::api::{
     AbandonedPreservation, AdoptOptions, LandingCommits, RemoveOptions, RemoveReport, UnlandedPaths,
 };
-use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
     IntentLease, IntentLeases, KeptAbandonBundles, LIFECYCLE_INTENTS_FILE, LifecycleIntent,
     LifecycleIntentCompletion, LifecycleIntentJournal, LifecycleIntentPhase, MintOptions,
 };
 use cowshed_os::fork_lock::Spawn as _;
+use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 
 const CHILD_MODE: &str = "COWSHED_LIFECYCLE_CRASH_CHILD";
 const CHILD_ROOT: &str = "COWSHED_LIFECYCLE_CRASH_ROOT";

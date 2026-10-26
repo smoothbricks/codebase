@@ -681,7 +681,7 @@ impl GitRepository {
                 }
                 let bytes = fs::read(&draft)
                     .map_err(|error| io_error("read Git identity draft", &draft, error))?;
-                crate::metadata::write_atomic_bytes(&path, &bytes).map_err(|error| {
+                cowshed_types::metadata::write_atomic_bytes(&path, &bytes).map_err(|error| {
                     CowshedError::internal(format!(
                         "publish Git identity at {}: {error}",
                         path.display()
@@ -4423,7 +4423,8 @@ fn sandboxed_git_command_with_paths(
         // fixture's own in a test, never one it does not serve (04_sandbox.md, "Exec pipeline"
         // step 4; 08_testing.md, "Fixtures").
         store_root: store_root.to_path_buf(),
-        port_block: crate::metadata::PortBlock::new(40_960, 16).expect("static macOS port block"),
+        port_block: cowshed_types::metadata::PortBlock::new(40_960, 16)
+            .expect("static macOS port block"),
         retained_port_blocks: Vec::new(),
         cpu_pool_directory: None,
         mode: RunSandboxMode::ReadWrite,

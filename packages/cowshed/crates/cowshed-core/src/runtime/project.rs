@@ -43,7 +43,6 @@ use crate::api::server::{
     RouterRequest, RouterResponse,
 };
 use crate::error::{CowshedError, ErrorCode, Result};
-use crate::metadata::WorkspaceName;
 use crate::runtime::job_progress::JobProgressStream;
 use crate::runtime::process_stream::JobProcessStream;
 #[cfg(target_os = "macos")]
@@ -53,6 +52,7 @@ use crate::runtime::supervisor_socket::AdmissionSource;
 use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
 use cowshed_os::timing::timed_async;
+use cowshed_types::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use cowshed_types::repository::OwnedRepoIds;
 use cowshed_types::repository::{RepoId, RepositoryBinding};
@@ -598,7 +598,7 @@ enum Residue {
     /// `dry_run` only named.
     AbandonedClone {
         image: PathBuf,
-        metadata: Box<crate::metadata::DetachedWorkspaceMetadata>,
+        metadata: Box<cowshed_types::metadata::DetachedWorkspaceMetadata>,
         dry_run: bool,
     },
 }
@@ -651,8 +651,8 @@ impl RecoveryScope {
 #[cfg(all(test, target_os = "macos"))]
 mod recovery_scope_tests {
     use super::{IntentReplay, RecoveryScope, rename_selected_by_source, unfinished_rename_claim};
-    use crate::metadata::WorkspaceName;
     use crate::storage::recovery::LifecycleIntent;
+    use cowshed_types::metadata::WorkspaceName;
 
     fn name(value: &str) -> WorkspaceName {
         WorkspaceName::new(value).unwrap()
@@ -1904,7 +1904,7 @@ impl ProjectActor {
         params: WorkspaceInSlotRequest,
     ) -> Result<WorkspaceView> {
         self.require_repo(&params.repo_id)?;
-        let wanted = crate::metadata::SlotId::new(params.slot).map_err(|error| {
+        let wanted = cowshed_types::metadata::SlotId::new(params.slot).map_err(|error| {
             CowshedError::usage(
                 error.to_string(),
                 "choose a slot within the project's range",
@@ -1916,16 +1916,16 @@ impl ProjectActor {
         } = self.host.snapshots().await?;
         // The slot's tenant is held, not absent: naming no workspace would send the caller to
         // fork into a slot that is occupied.
-        if let Some(held) = unproven
-            .iter()
-            .find(|held| crate::metadata::SlotId::from_mount_path(&held.mount) == Some(wanted))
-        {
+        if let Some(held) = unproven.iter().find(|held| {
+            cowshed_types::metadata::SlotId::from_mount_path(&held.mount) == Some(wanted)
+        }) {
             return Err(native_integrity_error(&held.reason));
         }
         let snapshot = workspaces
             .into_iter()
             .find(|snapshot| {
-                crate::metadata::SlotId::from_mount_path(&snapshot.info.mount) == Some(wanted)
+                cowshed_types::metadata::SlotId::from_mount_path(&snapshot.info.mount)
+                    == Some(wanted)
             })
             .ok_or_else(|| {
                 CowshedError::not_found(
@@ -2852,7 +2852,7 @@ struct BoundPortBlock {
 /// fixture `claims` hold (a detached or retired workspace's block) with no unbound interval.
 #[cfg(target_os = "macos")]
 fn bind_port_block(
-    block: crate::metadata::PortBlock,
+    block: cowshed_types::metadata::PortBlock,
     existing: Option<&GrantSet>,
     claims: Option<&crate::storage::bootstrap::FixturePortClaims>,
 ) -> std::io::Result<Option<BoundPortBlock>> {
@@ -2885,7 +2885,7 @@ fn bind_port_block(
 async fn reserve_specific_port_grants(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
-    block: crate::metadata::PortBlock,
+    block: cowshed_types::metadata::PortBlock,
 ) -> Result<Option<PortGrantReservation>> {
     reserve_port_grant_replacement(inventory, reservation_root, block, None).await
 }
@@ -2894,23 +2894,24 @@ async fn reserve_specific_port_grants(
 async fn reserve_port_grant_replacement(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
-    block: crate::metadata::PortBlock,
+    block: cowshed_types::metadata::PortBlock,
     existing: Option<&GrantSet>,
 ) -> Result<Option<PortGrantReservation>> {
     let grants = GrantSet::closed_baseline(Some(block)).map_err(native_integrity_error)?;
     let mut reservation = PortGrantReservation {
         grants,
         markers: Vec::with_capacity(
-            usize::from(block.size()).div_ceil(usize::from(crate::metadata::NEW_PORT_BLOCK_SIZE)),
+            usize::from(block.size())
+                .div_ceil(usize::from(cowshed_types::metadata::NEW_PORT_BLOCK_SIZE)),
         ),
         listeners: Vec::new(),
         claims: Vec::new(),
     };
     // Own every covered initial-size grid cell before publication: a smaller allocator
     // cannot claim a block in the middle of a larger allocation.
-    let claim_base = block.base() - block.base() % crate::metadata::NEW_PORT_BLOCK_SIZE;
+    let claim_base = block.base() - block.base() % cowshed_types::metadata::NEW_PORT_BLOCK_SIZE;
     for base in (claim_base..block.base() + block.size())
-        .step_by(usize::from(crate::metadata::NEW_PORT_BLOCK_SIZE))
+        .step_by(usize::from(cowshed_types::metadata::NEW_PORT_BLOCK_SIZE))
     {
         let Some(marker) = claim_port_block(reservation_root, base).map_err(|error| {
             CowshedError::internal(format!(
@@ -2955,13 +2956,13 @@ async fn reserve_port_grant_replacement(
 async fn reserve_port_grants(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
-    used: crate::metadata::ReservedPortBlocks,
+    used: cowshed_types::metadata::ReservedPortBlocks,
 ) -> Result<PortGrantReservation> {
     reserve_port_grants_of_size(
         inventory,
         reservation_root,
         used,
-        crate::metadata::NEW_PORT_BLOCK_SIZE,
+        cowshed_types::metadata::NEW_PORT_BLOCK_SIZE,
     )
     .await
 }
@@ -2971,12 +2972,14 @@ async fn reserve_port_grants(
 async fn reserve_port_grants_of_size(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
-    used: crate::metadata::ReservedPortBlocks,
+    used: cowshed_types::metadata::ReservedPortBlocks,
     size: u16,
 ) -> Result<PortGrantReservation> {
-    for block in
-        crate::metadata::PortBlock::macos_candidates_with_size(inventory.port_allocation(), size)
-            .map_err(native_integrity_error)?
+    for block in cowshed_types::metadata::PortBlock::macos_candidates_with_size(
+        inventory.port_allocation(),
+        size,
+    )
+    .map_err(native_integrity_error)?
     {
         if used.overlapping(block).is_some() {
             continue;
@@ -3002,9 +3005,9 @@ async fn reserve_port_collision_repair(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
     owned: &GrantSet,
-    colliding: &[crate::metadata::PortBlock],
+    colliding: &[cowshed_types::metadata::PortBlock],
 ) -> Result<(
-    crate::metadata::PortBlock,
+    cowshed_types::metadata::PortBlock,
     GrantSet,
     Option<PortGrantReservation>,
 )> {
@@ -3033,7 +3036,7 @@ async fn reserve_port_collision_repair(
 }
 
 #[cfg(target_os = "macos")]
-fn retain_port_authority(grants: &mut GrantSet, block: crate::metadata::PortBlock) {
+fn retain_port_authority(grants: &mut GrantSet, block: cowshed_types::metadata::PortBlock) {
     grants
         .retained_port_blocks
         .retain(|owned| !block.overlaps(*owned));
@@ -3067,7 +3070,7 @@ async fn reserve_grown_port_grants(
             .any(|held| held.overlaps(block) && !owned.port_blocks().any(|own| own == held))
     };
     let containing_base = existing.base() - existing.base() % size;
-    if let Ok(block) = crate::metadata::PortBlock::new(containing_base, size)
+    if let Ok(block) = cowshed_types::metadata::PortBlock::new(containing_base, size)
         && inventory.port_allocation().contains(block)
         && !overlaps_sibling(block)
         && let Some(reservation) =
@@ -3075,9 +3078,11 @@ async fn reserve_grown_port_grants(
     {
         return Ok(reservation);
     }
-    for block in
-        crate::metadata::PortBlock::macos_candidates_with_size(inventory.port_allocation(), size)
-            .map_err(native_integrity_error)?
+    for block in cowshed_types::metadata::PortBlock::macos_candidates_with_size(
+        inventory.port_allocation(),
+        size,
+    )
+    .map_err(native_integrity_error)?
     {
         if block.base() == containing_base || overlaps_sibling(block) {
             continue;
@@ -3315,7 +3320,7 @@ fn move_terminal_release(
     let moved = target.join(format!(
         "{}.{}",
         crate::build_volume::BuildVolumeId::mint(),
-        cowshed_apfs::image::IMAGE_EXTENSION
+        cowshed_types::image::IMAGE_EXTENSION
     ));
     match std::fs::rename(image, &moved) {
         Ok(()) => {}
@@ -3579,7 +3584,7 @@ pub(crate) fn finish_restored_project_unbinding(
                     "move the collision aside and retry",
                 ));
             }
-            let actual = crate::metadata::read_json::<RepositoryBinding>(path)
+            let actual = cowshed_types::metadata::read_json::<RepositoryBinding>(path)
                 .map_err(native_integrity_error)?;
             if actual != *expected {
                 return Err(CowshedError::integrity(
@@ -4215,7 +4220,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                 .canonical_metadata(&recovery_repo, name)
                                 .map_err(native_storage_error)?
                                 && metadata.publication_state
-                                    == crate::metadata::PublicationState::Active
+                                    == cowshed_types::metadata::PublicationState::Active
                             {
                                 facts.push(crate::storage::lifecycle::StorageFact {
                                     workspace:
@@ -5187,7 +5192,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         .image()
                         .to_path_buf();
                     let metadata =
-                        crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+                        cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
                             .map_err(|error| {
                                 crate::storage::apfs::ApfsStorageError::Host(error.to_string())
                             })?;
@@ -5254,7 +5259,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     async fn pending_metadata(
         &self,
-    ) -> Result<Vec<(PathBuf, crate::metadata::DetachedWorkspaceMetadata)>> {
+    ) -> Result<Vec<(PathBuf, cowshed_types::metadata::DetachedWorkspaceMetadata)>> {
         let main_image = self
             .layout
             .main_image()
@@ -5296,9 +5301,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             );
             let mut pending = Vec::new();
             for image in images {
-                let metadata = crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
-                    .map_err(native_integrity_error)?;
-                if metadata.publication_state == crate::metadata::PublicationState::PendingFence {
+                let metadata =
+                    cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+                        .map_err(native_integrity_error)?;
+                if metadata.publication_state
+                    == cowshed_types::metadata::PublicationState::PendingFence
+                {
                     pending.push((image, metadata));
                 }
             }
@@ -5439,7 +5447,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn clone_source_incarnation(
         &self,
         current: &NativeWorkspace,
-    ) -> Result<crate::metadata::WorkspaceIncarnation> {
+    ) -> Result<cowshed_types::metadata::WorkspaceIncarnation> {
         let name = current.derived.workspace.name();
         let mount = self.workspace_mount_path(name)?;
         let marker = read_workspace_marker(&mount).await?.ok_or_else(|| {
@@ -6944,7 +6952,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn bind_slot(
         &self,
         workspace: &WorkspaceName,
-        slot: crate::metadata::SlotId,
+        slot: cowshed_types::metadata::SlotId,
     ) -> Result<()> {
         let layout = self.layout.clone();
         let workspace = workspace.clone();
@@ -6964,7 +6972,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn release_slot(
         &self,
         workspace: &WorkspaceName,
-    ) -> Result<Option<crate::metadata::SlotId>> {
+    ) -> Result<Option<cowshed_types::metadata::SlotId>> {
         let layout = self.layout.clone();
         let workspace = workspace.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
@@ -9595,8 +9603,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn repair_port_collision(
         &mut self,
         workspace: &WorkspaceName,
-        colliding: &[crate::metadata::PortBlock],
-    ) -> Result<crate::metadata::PortBlock> {
+        colliding: &[cowshed_types::metadata::PortBlock],
+    ) -> Result<cowshed_types::metadata::PortBlock> {
         self.validate_binding().await?;
         let current = self.current(workspace).await?;
         if !current
@@ -9648,7 +9656,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
                 move || -> Result<()> {
                     let mut metadata =
-                        crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+                        cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
                             .map_err(native_integrity_error)?;
                     if metadata.grants.port_block != previous.port_block
                         || metadata.grants.retained_port_blocks != previous.retained_port_blocks
@@ -10583,7 +10591,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// lease, read afresh ([`Self::retire_abandoned_clone`]).
     async fn abandoned_pending_workspaces(
         &mut self,
-    ) -> Result<Vec<(PathBuf, crate::metadata::DetachedWorkspaceMetadata)>> {
+    ) -> Result<Vec<(PathBuf, cowshed_types::metadata::DetachedWorkspaceMetadata)>> {
         self.reload_lifecycle_intents().await?;
         let mut abandoned = Vec::new();
         for (image, metadata) in self.pending_metadata().await? {
@@ -10643,7 +10651,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn retire_abandoned_clone(
         &mut self,
         image: &Path,
-        metadata: &crate::metadata::DetachedWorkspaceMetadata,
+        metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
         dry_run: bool,
     ) -> Result<bool> {
         self.reload_lifecycle_intents().await?;
@@ -10712,14 +10720,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         workspace: &WorkspaceName,
         options: RemoveOptions,
         origin: crate::storage::recovery::LifecycleIntent,
-        metadata: crate::metadata::DetachedWorkspaceMetadata,
+        metadata: cowshed_types::metadata::DetachedWorkspaceMetadata,
     ) -> Result<RemoveReport> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::lifecycle::{MountIntent, MountState, OperationIdentity, Substrate};
 
         if metadata.repo_id != self.descriptor.repo_id
             || metadata.workspace != *workspace
-            || metadata.publication_state != crate::metadata::PublicationState::PendingFence
+            || metadata.publication_state != cowshed_types::metadata::PublicationState::PendingFence
         {
             return Err(CowshedError::integrity(
                 format!("pending retirement metadata does not name {workspace}"),
@@ -10979,7 +10987,7 @@ fn superseded_session(
 #[cfg(target_os = "macos")]
 struct NativeWorkspace {
     derived: crate::storage::lifecycle::DerivedWorkspace,
-    metadata: crate::metadata::DetachedWorkspaceMetadata,
+    metadata: cowshed_types::metadata::DetachedWorkspaceMetadata,
     image: PathBuf,
 }
 
@@ -11211,7 +11219,7 @@ fn converge_binding_identity(
     old_repo_id: &RepoId,
     new_repo_id: &RepoId,
 ) -> Result<()> {
-    let binding: RepositoryBinding = crate::metadata::read_json(path).map_err(|error| {
+    let binding: RepositoryBinding = cowshed_types::metadata::read_json(path).map_err(|error| {
         CowshedError::integrity(
             format!("cannot read repository binding {}: {error}", path.display()),
             "repair the repository binding, then reopen cowshed",
@@ -11234,7 +11242,7 @@ fn converge_binding_identity(
     let renamed = binding
         .rename_primary(new_repo_id.clone())
         .map_err(native_integrity_error)?;
-    crate::metadata::write_json(path, &renamed).map_err(|error| {
+    cowshed_types::metadata::write_json(path, &renamed).map_err(|error| {
         CowshedError::environment_missing(
             format!(
                 "cannot publish repository binding {}: {error}",
@@ -11258,8 +11266,8 @@ fn rewrite_sidecar_identities(
     new_repo_id: &RepoId,
 ) -> Result<()> {
     for sidecar in project_sidecars(project_root)? {
-        let mut metadata: crate::metadata::DetachedWorkspaceMetadata =
-            crate::metadata::read_json(&sidecar).map_err(|error| {
+        let mut metadata: cowshed_types::metadata::DetachedWorkspaceMetadata =
+            cowshed_types::metadata::read_json(&sidecar).map_err(|error| {
                 CowshedError::integrity(
                     format!(
                         "cannot read workspace sidecar {}: {error}",
@@ -11271,12 +11279,13 @@ fn rewrite_sidecar_identities(
         if metadata.repo_id != *old_repo_id {
             continue;
         }
-        let image = crate::metadata::image_from_sidecar_path(&sidecar).ok_or_else(|| {
-            CowshedError::integrity(
-                format!("workspace sidecar {} names no image", sidecar.display()),
-                "repair the workspace sidecar, then reopen cowshed",
-            )
-        })?;
+        let image =
+            cowshed_types::metadata::image_from_sidecar_path(&sidecar).ok_or_else(|| {
+                CowshedError::integrity(
+                    format!("workspace sidecar {} names no image", sidecar.display()),
+                    "repair the workspace sidecar, then reopen cowshed",
+                )
+            })?;
         metadata.repo_id = new_repo_id.clone();
         metadata.validate(&image).map_err(|error| {
             CowshedError::integrity(
@@ -11287,7 +11296,7 @@ fn rewrite_sidecar_identities(
                 "repair the workspace sidecar, then reopen cowshed",
             )
         })?;
-        crate::metadata::write_json(&sidecar, &metadata).map_err(|error| {
+        cowshed_types::metadata::write_json(&sidecar, &metadata).map_err(|error| {
             CowshedError::environment_missing(
                 format!(
                     "cannot publish workspace sidecar {}: {error}",
@@ -11344,7 +11353,7 @@ fn project_sidecars(root: &Path) -> Result<Vec<PathBuf>> {
             }
             if metadata.is_dir() {
                 pending.push(path);
-            } else if crate::metadata::image_from_sidecar_path(&path).is_some() {
+            } else if cowshed_types::metadata::image_from_sidecar_path(&path).is_some() {
                 sidecars.push(path);
             }
         }
@@ -11362,7 +11371,7 @@ enum ProjectRootValidation {
 #[cfg(target_os = "macos")]
 fn validate_workspace_controller_root(
     derived: &crate::storage::lifecycle::DerivedWorkspace,
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
     project_root: &Path,
     validation: ProjectRootValidation,
 ) -> std::result::Result<(), crate::storage::apfs::ApfsStorageError> {
@@ -13379,7 +13388,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     )
                     .await?;
                     crate::storage::lifecycle::dispatch_blocking(move || {
-                        crate::metadata::write_json(&binding_path, &binding)
+                        cowshed_types::metadata::write_json(&binding_path, &binding)
                     })
                     .await
                     .map_err(|error| CowshedError::internal(error.to_string()))?
@@ -13462,7 +13471,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // could let another workspace claim the slot and make recovery impossible.
         let slot = options
             .slot
-            .map(crate::metadata::SlotId::new)
+            .map(cowshed_types::metadata::SlotId::new)
             .transpose()
             .map_err(|error| {
                 CowshedError::usage(
@@ -14798,7 +14807,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         .map_err(|error| CowshedError::internal(format!("defrag metadata task failed: {error}")))?
         .map_err(native_storage_error)?;
         if let Some(metadata) = metadata
-            && metadata.publication_state == crate::metadata::PublicationState::PendingFence
+            && metadata.publication_state == cowshed_types::metadata::PublicationState::PendingFence
             && !workspace.is_main()
         {
             let stopped = self.stop_supervisor(&workspace).await?;
@@ -14981,10 +14990,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         require_checkpointable(&workspace, &current.metadata, "checkpoint")?;
         let explicitly_labeled = options.label.is_some();
         let label = match options.label {
-            Some(value) => {
-                crate::storage::CheckpointLabel::new(value).map_err(native_integrity_error)?
-            }
-            None => crate::storage::CheckpointLabel::utc_default(
+            Some(value) => cowshed_types::lifecycle::CheckpointLabel::new(value)
+                .map_err(native_integrity_error)?,
+            None => cowshed_types::lifecycle::CheckpointLabel::utc_default(
                 std::time::SystemTime::now(),
                 |candidate| {
                     current
@@ -15034,7 +15042,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         require_checkpointable(&workspace, &current.metadata, "restore")?;
-        let label = crate::storage::CheckpointLabel::new(label).map_err(native_integrity_error)?;
+        let label = cowshed_types::lifecycle::CheckpointLabel::new(label)
+            .map_err(native_integrity_error)?;
         let checkpoint = current
             .derived
             .checkpoints
@@ -15301,9 +15310,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             if !matches!(candidate.reason(), StorageGcReason::RetiredWorkspace) {
                 continue;
             }
-            let Ok(metadata) =
-                crate::metadata::DetachedWorkspaceMetadata::read_for_image(candidate.path())
-            else {
+            let Ok(metadata) = cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(
+                candidate.path(),
+            ) else {
                 continue;
             };
             if metadata.info_snapshot.git_worktree {
@@ -15506,8 +15515,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 move || {
                     (|| -> Result<_> {
                         current.metadata =
-                            crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
-                                .map_err(native_integrity_error)?;
+                            cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(
+                                &image,
+                            )
+                            .map_err(native_integrity_error)?;
                         if delta
                             .expected_revision
                             .is_some_and(|revision| revision != current.metadata.grants.revision)
@@ -15716,7 +15727,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         let base = u16::try_from(
-            slot.checked_mul(u32::from(crate::metadata::NEW_PORT_BLOCK_SIZE))
+            slot.checked_mul(u32::from(cowshed_types::metadata::NEW_PORT_BLOCK_SIZE))
                 .ok_or_else(|| {
                     CowshedError::usage("slot overflows port space", "choose a smaller slot")
                 })?,
@@ -15730,7 +15741,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
             })?
             .size();
-        let block = crate::metadata::PortBlock::new(base, size)
+        let block = cowshed_types::metadata::PortBlock::new(base, size)
             .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?;
         if !self.descriptor.storage.port_allocation().contains(block) {
             return Err(CowshedError::usage(
@@ -16640,7 +16651,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             let marker = crate::doctor::probe(
                                 format!("{workspace_name}/marker"),
                                 crate::storage::lifecycle::dispatch_blocking(move || {
-                                    crate::metadata::WorkspaceMarker::read_from(
+                                    cowshed_types::metadata::WorkspaceMarker::read_from(
                                         &checked_marker_path,
                                     )
                                     .map_err(|error| error.to_string())
@@ -17588,12 +17599,14 @@ fn binding_integrity_error(error: impl std::fmt::Display) -> CowshedError {
 ///
 /// Portable because the router needs it on every target: a marker is plain metadata, and the
 /// question "which project does this directory belong to" has nothing platform-specific in it.
-async fn read_workspace_marker(path: &Path) -> Result<Option<crate::metadata::WorkspaceMarker>> {
+async fn read_workspace_marker(
+    path: &Path,
+) -> Result<Option<cowshed_types::metadata::WorkspaceMarker>> {
     let marker_path = path.join(crate::storage::WORKSPACE_MARKER_PATH);
     crate::storage::lifecycle::dispatch_blocking(move || {
-        match crate::metadata::WorkspaceMarker::read_from(&marker_path) {
+        match cowshed_types::metadata::WorkspaceMarker::read_from(&marker_path) {
             Ok(marker) => Ok(Some(marker)),
-            Err(crate::metadata::MetadataError::Io { source, .. })
+            Err(cowshed_types::metadata::MetadataError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 Ok(None)
@@ -17699,7 +17712,7 @@ async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<Work
     // — and only for main — the recorded project root and the invocation root are the same
     // directory.
     let claims_main = marker.workspace.is_main();
-    if claims_main != (marker.role == crate::metadata::WorkspaceRole::Main) {
+    if claims_main != (marker.role == cowshed_types::metadata::WorkspaceRole::Main) {
         return Err(CowshedError::conflict(
             format!(
                 "workspace marker at {} names {} with role {:?}",
@@ -18062,7 +18075,7 @@ async fn persist_binding(
     let path = layout.project().repository_binding.clone();
     let binding = binding.clone();
     crate::storage::lifecycle::dispatch_blocking(move || {
-        crate::metadata::write_json(&path, &binding)
+        cowshed_types::metadata::write_json(&path, &binding)
     })
     .await
     .map_err(|error| CowshedError::internal(error.to_string()))?
@@ -18075,9 +18088,9 @@ async fn read_persisted_binding(
 ) -> Result<Option<RepositoryBinding>> {
     let path = layout.project().repository_binding.clone();
     crate::storage::lifecycle::dispatch_blocking(move || {
-        match crate::metadata::read_json::<RepositoryBinding>(&path) {
+        match cowshed_types::metadata::read_json::<RepositoryBinding>(&path) {
             Ok(binding) => Ok(Some(binding)),
-            Err(crate::metadata::MetadataError::Io { source, .. })
+            Err(cowshed_types::metadata::MetadataError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 Ok(None)
@@ -18264,16 +18277,16 @@ async fn enforce_adopt_secret_policy(
     quarantine: bool,
 ) -> Result<()> {
     crate::storage::lifecycle::dispatch_blocking(move || {
-        let waivers = match crate::metadata::read_json::<Vec<crate::secrets::SecretWaiver>>(
+        let waivers = match cowshed_types::metadata::read_json::<Vec<crate::secrets::SecretWaiver>>(
             &waivers_path,
         ) {
             Ok(waivers) => waivers,
-            Err(crate::metadata::MetadataError::Io { source, .. })
+            Err(cowshed_types::metadata::MetadataError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 Vec::new()
             }
-            Err(error @ crate::metadata::MetadataError::Json { .. }) => {
+            Err(error @ cowshed_types::metadata::MetadataError::Json { .. }) => {
                 return Err(CowshedError::integrity(
                     error.to_string(),
                     format!(
@@ -21025,7 +21038,7 @@ fn requested_port_block_size(delta: &GrantDelta, revoke: bool) -> Result<Option<
             "bind service ports directly inside the workspace",
         ));
     }
-    crate::metadata::PortBlock::size_for_service_ports(service_ports)
+    cowshed_types::metadata::PortBlock::size_for_service_ports(service_ports)
         .map(Some)
         .map_err(|_| {
             CowshedError::usage(
@@ -21059,7 +21072,10 @@ fn normalize_grant_delta(delta: &mut GrantDelta, revoke: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn normalize_egress_delta(rules: &mut [crate::metadata::EgressRule], revoke: bool) -> Result<()> {
+fn normalize_egress_delta(
+    rules: &mut [cowshed_types::metadata::EgressRule],
+    revoke: bool,
+) -> Result<()> {
     for rule in rules {
         match cowshed_gateway_types::HostPattern::parse(&rule.host) {
             Ok(host) => rule.host = host.to_string(),
@@ -21257,8 +21273,8 @@ fn update_set<T: PartialEq>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
 /// side by side for one host, so no grant could ever change a host's mode.
 #[cfg(target_os = "macos")]
 fn update_egress(
-    current: &mut Vec<crate::metadata::EgressRule>,
-    delta: Vec<crate::metadata::EgressRule>,
+    current: &mut Vec<cowshed_types::metadata::EgressRule>,
+    delta: Vec<cowshed_types::metadata::EgressRule>,
     revoke: bool,
 ) {
     for rule in delta {
@@ -21305,7 +21321,7 @@ mod grant_unit_tests {
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-grant-unit"),
             store_root: mount_root.join("store"),
-            port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
+            port_block: cowshed_types::metadata::PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,
             mode: RunSandboxMode::ReadWrite,
@@ -21430,8 +21446,8 @@ mod grant_unit_tests {
     /// — and revoking a host removes its rule whatever mode it holds.
     #[test]
     fn an_egress_grant_restates_its_hosts_rule_and_a_revoke_removes_it_whatever_its_mode() {
-        use crate::metadata::EgressMode;
-        let rule = |host: &str, mode| crate::metadata::EgressRule {
+        use cowshed_types::metadata::EgressMode;
+        let rule = |host: &str, mode| cowshed_types::metadata::EgressRule {
             host: host.to_owned(),
             ports: Vec::new(),
             mode,
@@ -21501,10 +21517,10 @@ mod grant_unit_tests {
 
     fn egress_delta(host: &str) -> GrantDelta {
         GrantDelta {
-            egress: vec![crate::metadata::EgressRule {
+            egress: vec![cowshed_types::metadata::EgressRule {
                 host: host.to_owned(),
                 ports: Vec::new(),
-                mode: crate::metadata::EgressMode::Intercept,
+                mode: cowshed_types::metadata::EgressMode::Intercept,
             }],
             ..GrantDelta::default()
         }
@@ -21585,7 +21601,7 @@ mod grant_unit_tests {
             ..GrantSet::default()
         };
         let fork = GrantSet::closed_baseline(Some(
-            crate::metadata::PortBlock::new(40_960, 64).expect("fresh fork block"),
+            cowshed_types::metadata::PortBlock::new(40_960, 64).expect("fresh fork block"),
         ))
         .expect("closed fork");
         let mut project = crate::project_policy::ProjectGrants {
@@ -21814,9 +21830,9 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
     repo_id: &RepoId,
     workspaces: Option<&std::collections::BTreeSet<WorkspaceName>>,
 ) -> Result<RetiredTrash> {
-    use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceRole, sidecar_path};
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
-    use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
+    use cowshed_types::image::{IMAGE_EXTENSION, is_image_path};
+    use cowshed_types::metadata::{DetachedWorkspaceMetadata, WorkspaceRole, sidecar_path};
 
     let trash = project_root
         .join("sessions")
@@ -21963,10 +21979,10 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
 #[cfg(all(test, target_os = "macos"))]
 mod retired_recovery_tests {
     use super::*;
-    use crate::metadata::{
+    use cowshed_os::namespace::{HostNamespace, TestNamespace};
+    use cowshed_types::metadata::{
         DetachedWorkspaceMetadata, GrantSet, Platform, PortBlock, PublicationState, SIDECAR_VERSION,
     };
-    use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
     #[test]
     fn retired_trash_is_a_verified_restart_baseline_fact() {
@@ -21993,9 +22009,9 @@ mod retired_recovery_tests {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".into(),
             grants,
-            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+            info_snapshot: cowshed_types::metadata::WorkspaceInfoSnapshot {
                 project_root: std::path::PathBuf::from("/project"),
-                role: crate::metadata::WorkspaceRole::Workspace,
+                role: cowshed_types::metadata::WorkspaceRole::Workspace,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 branch: None,
                 created_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -22050,9 +22066,9 @@ mod retired_recovery_tests {
             publication_state: PublicationState::PendingFence,
             updated_at: "2026-07-14T00:00:00Z".into(),
             grants,
-            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+            info_snapshot: cowshed_types::metadata::WorkspaceInfoSnapshot {
                 project_root: std::path::PathBuf::from("/project"),
-                role: crate::metadata::WorkspaceRole::Workspace,
+                role: cowshed_types::metadata::WorkspaceRole::Workspace,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 branch: None,
                 created_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -22126,7 +22142,7 @@ mod retired_recovery_tests {
         let image = trash.join(format!("main-{}.dmg", incarnation.as_str()));
         std::fs::write(&image, b"retired main image").unwrap();
         let mut grants = GrantSet::closed_baseline(Some(
-            PortBlock::new(crate::metadata::MACOS_PORT_MAX - 15, 16).unwrap(),
+            PortBlock::new(cowshed_types::metadata::MACOS_PORT_MAX - 15, 16).unwrap(),
         ))
         .unwrap();
         grants.revision = 8;
@@ -22139,9 +22155,9 @@ mod retired_recovery_tests {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".into(),
             grants,
-            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+            info_snapshot: cowshed_types::metadata::WorkspaceInfoSnapshot {
                 project_root: std::path::PathBuf::from("/project"),
-                role: crate::metadata::WorkspaceRole::Main,
+                role: cowshed_types::metadata::WorkspaceRole::Main,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 branch: None,
                 created_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -22163,7 +22179,7 @@ mod retired_recovery_tests {
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
             retired[0].workspace().role(),
-            crate::metadata::WorkspaceRole::Main
+            cowshed_types::metadata::WorkspaceRole::Main
         );
         assert_eq!(
             retired[0].resulting_revision(),
@@ -22245,9 +22261,9 @@ mod retired_recovery_tests {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".into(),
             grants: GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).unwrap())).unwrap(),
-            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+            info_snapshot: cowshed_types::metadata::WorkspaceInfoSnapshot {
                 project_root: PathBuf::from("/project"),
-                role: crate::metadata::WorkspaceRole::Workspace,
+                role: cowshed_types::metadata::WorkspaceRole::Workspace,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 branch: None,
                 created_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -22303,7 +22319,7 @@ mod retired_recovery_tests {
             "an inspecting open reclaimed {}",
             image.display()
         );
-        assert!(crate::metadata::sidecar_path(&image).exists());
+        assert!(cowshed_types::metadata::sidecar_path(&image).exists());
 
         open(RecoveryScope::Workspaces(Default::default())).await;
         assert!(
@@ -22328,7 +22344,7 @@ mod retired_recovery_tests {
         let trash = project_root.join("sessions/.trash");
         std::fs::create_dir_all(&trash).unwrap();
         let image = trash.join("raven-0198f2c0b7e34dc795f17b238b331c80.dmg");
-        let companion = crate::metadata::append_suffix(&image, ".ca.key");
+        let companion = cowshed_types::metadata::append_suffix(&image, ".ca.key");
         std::fs::write(&image, b"retired image").unwrap();
         std::fs::write(&companion, b"retired CA key").unwrap();
         let namespace = TestNamespace::mint().expect("a test namespace");
@@ -22473,7 +22489,7 @@ fn workspace_lineage(
     retained_recovery_budget_bytes: usize,
 ) -> Result<std::collections::BTreeSet<WorkspaceIncarnation>> {
     let marker_path = mount.join(crate::storage::WORKSPACE_MARKER_PATH);
-    let mut marker = crate::metadata::WorkspaceMarker::read_from(&marker_path)
+    let mut marker = cowshed_types::metadata::WorkspaceMarker::read_from(&marker_path)
         .map_err(|error| CowshedError::integrity(error.to_string(), "cowshed doctor --json"))?;
     if marker.workspace_incarnation != *current {
         return Err(CowshedError::integrity(
@@ -22503,7 +22519,7 @@ fn workspace_lineage(
         // Persisting the healed marker is an optimization — the next open recomputes the same
         // lineage from the same records — so a write failure (a full disk, a read-only mount)
         // must not take the workspace down with it.
-        let _ = crate::metadata::write_json(&marker_path, &marker);
+        let _ = cowshed_types::metadata::write_json(&marker_path, &marker);
     }
     Ok(marker.lineage.unwrap_or_default().into_iter().collect())
 }
@@ -23311,8 +23327,8 @@ fn unlanded_paths_text(paths: &[crate::api::dto::UnlandedPath], target: &str) ->
 /// workspace already has one. Only genuine record damage becomes an integrity error.
 #[cfg(target_os = "macos")]
 fn slot_binding_error(error: crate::storage::StorageLayoutError) -> CowshedError {
-    use crate::metadata::MetadataError;
     use crate::storage::StorageLayoutError;
+    use cowshed_types::metadata::MetadataError;
 
     match &error {
         StorageLayoutError::Metadata(
@@ -23393,7 +23409,7 @@ fn main_removal_mode_refusal() -> CowshedError {
 /// directory, and nothing in main's working tree.
 #[cfg(target_os = "macos")]
 fn git_worktree_repository(
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
     main_mount: PathBuf,
 ) -> Option<PathBuf> {
     is_git_worktree(metadata).then(|| main_mount.join(".git"))
@@ -23426,7 +23442,7 @@ async fn repair_git_worktree_link(
 #[cfg(target_os = "macos")]
 fn require_checkpointable(
     name: &WorkspaceName,
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
     verb: &str,
 ) -> Result<()> {
     if !is_git_worktree(metadata) {
@@ -23447,7 +23463,7 @@ fn require_checkpointable(
 /// Read from the store-side sidecar, so it answers while the workspace is detached — which is
 /// exactly when retirement and `gc` need it.
 #[cfg(target_os = "macos")]
-fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> bool {
+fn is_git_worktree(metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata) -> bool {
     metadata.info_snapshot.git_worktree
 }
 
@@ -23465,7 +23481,7 @@ fn another_process_is_running(workspace: &WorkspaceName) -> CowshedError {
 /// and the retirement's containment check against main still guards the clone's history.
 #[cfg(target_os = "macos")]
 fn abandoned_clone_origin(
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
 ) -> crate::storage::recovery::LifecycleIntent {
     match &metadata.info_snapshot.forked_from {
         Some(source) => crate::storage::recovery::LifecycleIntent::Fork {
@@ -23524,10 +23540,10 @@ fn image_lifecycle_lock_is_held(image: &Path) -> Result<bool> {
 #[cfg(target_os = "macos")]
 fn diagnose_mounted_marker(
     workspace_name: &WorkspaceName,
-    marker: &crate::metadata::WorkspaceMarker,
+    marker: &cowshed_types::metadata::WorkspaceMarker,
     expected_repos: &OwnedRepoIds,
     expected_workspace: &WorkspaceName,
-    expected_incarnation: &crate::metadata::WorkspaceIncarnation,
+    expected_incarnation: &cowshed_types::metadata::WorkspaceIncarnation,
     expected_project_root: &Path,
     marker_path: PathBuf,
 ) -> Vec<crate::api::dto::Finding> {
@@ -23893,7 +23909,7 @@ fn seed_age_finding(
     age: &super::build_volumes::SeedAge,
     checkout: PathBuf,
 ) -> Option<crate::api::dto::Finding> {
-    use crate::storage::deletion_log::rfc3339_utc;
+    use cowshed_types::clock::rfc3339_utc;
     if !age.reseeds() {
         return None;
     }
@@ -24279,7 +24295,7 @@ fn quarantine_and_companion_findings_blocking(
                     if !tombstone_path.is_file() {
                         continue;
                     }
-                    let Ok(tombstone) = crate::metadata::read_json::<
+                    let Ok(tombstone) = cowshed_types::metadata::read_json::<
                         crate::storage::apfs::native::QuarantineTombstone,
                     >(&tombstone_path) else {
                         continue;
@@ -24311,11 +24327,11 @@ fn quarantine_and_companion_findings_blocking(
         }
     }
     for (workspace, image) in images {
-        let sidecar = crate::metadata::sidecar_path(image);
+        let sidecar = cowshed_types::metadata::sidecar_path(image);
         // The companion rides beside its image with a `.ca.key` suffix (the store's companion
         // convention); a live image whose sidecar survived without one can no longer pass
         // CA-gated verbs.
-        let companion = crate::metadata::append_suffix(image, ".ca.key");
+        let companion = cowshed_types::metadata::append_suffix(image, ".ca.key");
         if image.is_file() && sidecar.is_file() && !companion.exists() {
             findings.push(missing_ca_companion_finding(
                 workspace,
@@ -24446,7 +24462,9 @@ fn node_modules_install_findings(
 mod doctor_hint_tests {
     use super::*;
     use crate::git::{CowshedUpstream, MergeDriver, MergeDriverState};
-    use crate::metadata::{MARKER_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole};
+    use cowshed_types::metadata::{
+        MARKER_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole,
+    };
     use std::path::PathBuf;
     #[test]
     fn install_receipt_reports_missing_drift_and_matching_lock_bytes_without_writes() {
@@ -25041,14 +25059,20 @@ mod doctor_hint_tests {
         std::fs::create_dir_all(&live).expect("live dir");
         let bare_image = live.join("kestrel.dmg");
         std::fs::write(&bare_image, b"image").expect("bare image");
-        std::fs::write(crate::metadata::sidecar_path(&bare_image), b"sidecar")
-            .expect("bare sidecar");
+        std::fs::write(
+            cowshed_types::metadata::sidecar_path(&bare_image),
+            b"sidecar",
+        )
+        .expect("bare sidecar");
         let whole_image = live.join("falcon.dmg");
         std::fs::write(&whole_image, b"image").expect("whole image");
-        std::fs::write(crate::metadata::sidecar_path(&whole_image), b"sidecar")
-            .expect("whole sidecar");
         std::fs::write(
-            crate::metadata::append_suffix(&whole_image, ".ca.key"),
+            cowshed_types::metadata::sidecar_path(&whole_image),
+            b"sidecar",
+        )
+        .expect("whole sidecar");
+        std::fs::write(
+            cowshed_types::metadata::append_suffix(&whole_image, ".ca.key"),
             b"key",
         )
         .expect("whole companion");
@@ -25092,11 +25116,11 @@ mod doctor_hint_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod git_worktree_tests {
     use super::*;
-    use crate::metadata::{
+    use cowshed_os::test_backstop::CommandBackstop as _;
+    use cowshed_types::metadata::{
         DetachedWorkspaceMetadata, GrantSet, Platform, PortBlock, PublicationState,
         SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole,
     };
-    use cowshed_os::test_backstop::CommandBackstop as _;
 
     fn sidecar(git_worktree: bool) -> DetachedWorkspaceMetadata {
         DetachedWorkspaceMetadata {
@@ -25304,13 +25328,13 @@ mod workspace_marker_reader_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod workspace_origin_tests {
     use super::*;
-    use crate::metadata::{
+    use crate::storage::lifecycle::{
+        DerivedWorkspace, LifecycleWorkspace, MountState, Revision, StorageFact,
+    };
+    use cowshed_types::metadata::{
         DetachedWorkspaceMetadata, GrantSet, MARKER_VERSION, Platform, PortBlock, PublicationState,
         SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker,
         WorkspaceRole,
-    };
-    use crate::storage::lifecycle::{
-        DerivedWorkspace, LifecycleWorkspace, MountState, Revision, StorageFact,
     };
 
     fn temp_directory(test: &str) -> PathBuf {
@@ -25418,7 +25442,7 @@ mod workspace_origin_tests {
     fn write_marker(root: &Path, workspace: &str, role: WorkspaceRole, project_root: &Path) {
         let path = root.join(crate::storage::WORKSPACE_MARKER_PATH);
         std::fs::create_dir_all(path.parent().expect("marker parent")).expect("marker directory");
-        crate::metadata::write_json(
+        cowshed_types::metadata::write_json(
             &path,
             &WorkspaceMarker {
                 version: MARKER_VERSION,
@@ -25544,7 +25568,7 @@ mod workspace_origin_tests {
             primary: true,
         }])
         .expect("binding");
-        crate::metadata::write_json(&layout.project().repository_binding, &binding)
+        cowshed_types::metadata::write_json(&layout.project().repository_binding, &binding)
             .expect("persist binding");
 
         let (resolved_repo, _, resolved_binding) =
@@ -25603,12 +25627,15 @@ mod workspace_origin_tests {
                 primary: true,
             }])
             .expect("mismatched binding");
-        crate::metadata::write_json(&layout.project().repository_binding, &mismatched_binding)
-            .expect("persist mismatched binding");
+        cowshed_types::metadata::write_json(
+            &layout.project().repository_binding,
+            &mismatched_binding,
+        )
+        .expect("persist mismatched binding");
         project_binding_from_workspace_origin(&store, &session, Some(&origin))
             .await
             .expect_err("marker and binding repository identities must agree");
-        crate::metadata::write_json(&layout.project().repository_binding, &binding)
+        cowshed_types::metadata::write_json(&layout.project().repository_binding, &binding)
             .expect("persist binding");
         project_binding_from_workspace_origin(&store, &session, Some(&origin))
             .await
@@ -25923,7 +25950,7 @@ mod binding_heal_persistence_tests {
             primary: true,
         }])
         .expect("binding");
-        crate::metadata::write_json(&layout.project().repository_binding, &recorded)
+        cowshed_types::metadata::write_json(&layout.project().repository_binding, &recorded)
             .expect("persist recorded binding");
 
         let remotes = [crate::git::RemoteUrl {
@@ -26471,10 +26498,10 @@ mod binding_tests {
 
     #[tokio::test]
     async fn startup_pending_restore_destination_is_absent_until_restore_fence() {
-        use crate::metadata::WorkspaceRole;
         use crate::runtime::supervisor::{CommitmentDraft, CommitmentPublisher, CommitmentSink};
         use crate::storage::apfs::PendingPublicationFact;
         use crate::storage::lifecycle::{LifecycleWorkspace, Revision, StorageFact};
+        use cowshed_types::metadata::WorkspaceRole;
 
         let root = std::env::temp_dir().join(format!(
             "cowshed-project-pending-restore-{}",
@@ -26554,9 +26581,9 @@ mod binding_tests {
     /// pass and an opening holding main's lock take it.
     #[test]
     fn an_opening_activates_only_the_restores_whose_image_lock_it_holds() {
-        use crate::metadata::WorkspaceRole;
         use crate::storage::apfs::PendingPublicationFact;
         use crate::storage::lifecycle::{LifecycleWorkspace, Revision};
+        use cowshed_types::metadata::WorkspaceRole;
 
         let store = PathBuf::from("/private/cowshed/store/acme/widget");
         let replaced =
@@ -26624,14 +26651,14 @@ mod port_reservation_tests {
         reserve_port_grant_replacement, reserve_port_grants,
     };
     use crate::gateway_inventory::NativeGatewayInventory;
-    use crate::metadata::{
+    use crate::storage::StorageLayout;
+    use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
+    use cowshed_os::namespace::TestNamespace;
+    use cowshed_types::metadata::{
         DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform,
         PortAllocation, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
         WorkspaceName,
     };
-    use crate::storage::StorageLayout;
-    use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
-    use cowshed_os::namespace::TestNamespace;
     use cowshed_types::repository::{BoundIdentity, RepoId, RepositoryBinding};
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
@@ -26659,7 +26686,7 @@ mod port_reservation_tests {
             primary: true,
         }])
         .expect("binding");
-        crate::metadata::write_json(&layout.project().repository_binding, &binding)
+        cowshed_types::metadata::write_json(&layout.project().repository_binding, &binding)
             .expect("publish binding");
         let storage = ValidatedHostStorage::new(root.join("home"), Vec::new(), roots);
         (NativeGatewayInventory::new(storage), layout)
@@ -26822,9 +26849,9 @@ mod port_reservation_tests {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-14T00:00:00Z".to_owned(),
             grants: first.grants.clone(),
-            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+            info_snapshot: cowshed_types::metadata::WorkspaceInfoSnapshot {
                 project_root: std::path::PathBuf::from("/project"),
-                role: crate::metadata::WorkspaceRole::Main,
+                role: cowshed_types::metadata::WorkspaceRole::Main,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 branch: None,
                 created_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -26944,9 +26971,9 @@ mod port_reservation_tests {
             publication_state: PublicationState::PendingFence,
             updated_at: "2026-07-14T00:00:00Z".to_owned(),
             grants: first.grants.clone(),
-            info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+            info_snapshot: cowshed_types::metadata::WorkspaceInfoSnapshot {
                 project_root: std::path::PathBuf::from("/project"),
-                role: crate::metadata::WorkspaceRole::Workspace,
+                role: cowshed_types::metadata::WorkspaceRole::Workspace,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 branch: None,
                 created_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -26995,7 +27022,7 @@ mod port_reservation_tests {
         let mut published =
             DetachedWorkspaceMetadata::read_for_image(image.image()).expect("pending sidecar");
         published.workspace = WorkspaceName::main();
-        published.info_snapshot.role = crate::metadata::WorkspaceRole::Main;
+        published.info_snapshot.role = cowshed_types::metadata::WorkspaceRole::Main;
         published.publication_state = PublicationState::Active;
         published
             .write_for_image(main.image())
@@ -27013,10 +27040,10 @@ mod port_reservation_tests {
                 && collision.claimed.block.base() == first_base
         ));
         std::fs::remove_file(main.image()).expect("remove conflicting payload");
-        std::fs::remove_file(crate::metadata::sidecar_path(main.image()))
+        std::fs::remove_file(cowshed_types::metadata::sidecar_path(main.image()))
             .expect("remove conflicting sidecar");
         published.workspace = WorkspaceName::session("foreign").expect("foreign name");
-        published.info_snapshot.role = crate::metadata::WorkspaceRole::Workspace;
+        published.info_snapshot.role = cowshed_types::metadata::WorkspaceRole::Workspace;
         published.publication_state = PublicationState::PendingFence;
         published
             .write_for_image(image.image())
@@ -27046,7 +27073,7 @@ mod port_reservation_tests {
             primary: true,
         }])
         .expect("binding");
-        crate::metadata::write_json(&layout.project().repository_binding, &binding)
+        cowshed_types::metadata::write_json(&layout.project().repository_binding, &binding)
             .expect("publish binding");
         let intent = fixture.intent(None);
         let carried = intent
@@ -27167,7 +27194,7 @@ mod port_reservation_tests {
                        block: PortBlock| {
             std::fs::create_dir_all(image.parent().expect("image directory")).expect("directory");
             std::fs::write(image, b"detached image fixture").expect("image");
-            let role = crate::metadata::WorkspaceRole::for_name(&workspace);
+            let role = cowshed_types::metadata::WorkspaceRole::for_name(&workspace);
             DetachedWorkspaceMetadata {
                 version: SIDECAR_VERSION,
                 repo_id: RepoId::parse("acme/widget").expect("repo"),
@@ -27180,7 +27207,7 @@ mod port_reservation_tests {
                 publication_state,
                 updated_at: "2026-07-14T00:00:00Z".to_owned(),
                 grants: GrantSet::closed_baseline(Some(block)).expect("grants"),
-                info_snapshot: crate::metadata::WorkspaceInfoSnapshot {
+                info_snapshot: cowshed_types::metadata::WorkspaceInfoSnapshot {
                     project_root: std::path::PathBuf::from("/project"),
                     role,
                     base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
@@ -27279,7 +27306,7 @@ mod port_reservation_tests {
         assert_eq!(taken.kind(), ErrorKind::AddrInUse);
         let contender_root = root("claim-contender");
         let (contender, _) = inventory(&contender_root);
-        let mut others = crate::metadata::ReservedPortBlocks::default();
+        let mut others = cowshed_types::metadata::ReservedPortBlocks::default();
         for candidate in PortBlock::macos_candidates(contender.port_allocation())
             .filter(|candidate| *candidate != block)
         {
@@ -27363,7 +27390,7 @@ mod port_reservation_tests {
             );
         }
         // Every other candidate is held, so the block with the outside listener is the only offer.
-        let mut others = crate::metadata::ReservedPortBlocks::default();
+        let mut others = cowshed_types::metadata::ReservedPortBlocks::default();
         for candidate in PortBlock::macos_candidates(inventory.port_allocation())
             .filter(|candidate| *candidate != block)
         {
@@ -27390,7 +27417,7 @@ mod port_reservation_tests {
         let staging = root.join("store/.staging");
         let count = PortBlock::macos_candidates(allocation).count();
         let held = || PortBlock::macos_candidates(allocation).skip(count / 2);
-        let mut used = crate::metadata::ReservedPortBlocks::default();
+        let mut used = cowshed_types::metadata::ReservedPortBlocks::default();
         for block in held() {
             used.insert(block);
         }
@@ -27628,7 +27655,7 @@ mod terminal_project_cleanup_tests {
         ] {
             let (root, paths) = project("unbinding-interruption");
             let binding = test_binding();
-            crate::metadata::write_json(&paths.repository_binding, &binding).unwrap();
+            cowshed_types::metadata::write_json(&paths.repository_binding, &binding).unwrap();
             std::fs::write(&paths.checkout_root, b"checkout root").unwrap();
             let journal = paths.project_root.join("lifecycle-intents.json");
             let before = std::fs::read(&journal).unwrap();
@@ -27733,11 +27760,11 @@ mod terminal_project_cleanup_tests {
     fn a_recorded_or_released_lifecycle_lease_never_refuses_the_purge() {
         let (root, paths) = project("recorded-lease");
         std::fs::create_dir_all(&paths.sessions).expect("sessions");
-        let main = crate::metadata::WorkspaceName::main();
+        let main = cowshed_types::metadata::WorkspaceName::main();
         let held = crate::storage::recovery::IntentLease::try_claim(&paths.sessions, &main)
             .expect("claim")
             .expect("the lease is free");
-        let raven = crate::metadata::WorkspaceName::new("raven").expect("name");
+        let raven = cowshed_types::metadata::WorkspaceName::new("raven").expect("name");
         drop(
             crate::storage::recovery::IntentLease::try_claim(&paths.sessions, &raven)
                 .expect("claim")
@@ -27829,7 +27856,7 @@ mod terminal_project_cleanup_tests {
         let image = paths.sessions.join(format!(".trash/raven-{VOLUME}.dmg"));
         for kept in [
             image.clone(),
-            crate::metadata::sidecar_path(&image),
+            cowshed_types::metadata::sidecar_path(&image),
             paths.exec_temp.join("raven/scratch"),
             paths.checkpoints.join("raven/before.dmg"),
         ] {
@@ -28019,7 +28046,7 @@ mod terminal_project_cleanup_tests {
     fn a_real_binding_unlink_failure_preserves_recovery_authority() {
         let (root, paths) = project("binding-unlink-refusal");
         let binding = test_binding();
-        crate::metadata::write_json(&paths.repository_binding, &binding).unwrap();
+        cowshed_types::metadata::write_json(&paths.repository_binding, &binding).unwrap();
         let journal = paths.project_root.join("lifecycle-intents.json");
         let before = std::fs::read(&journal).unwrap();
         let retained = paths.project_root.join("binding-before-refusal");
@@ -28310,8 +28337,8 @@ import("./compile-cache-lib.mjs").then((lib) => {
         let trash = published_directory_trash(&host, &metadata);
         std::fs::create_dir_all(trash.parent().expect("trash")).expect("trash");
         std::fs::hard_link(
-            crate::metadata::sidecar_path(&image),
-            crate::metadata::sidecar_path(&trash),
+            cowshed_types::metadata::sidecar_path(&image),
+            cowshed_types::metadata::sidecar_path(&trash),
         )
         .expect("stage sidecar");
         std::fs::hard_link(
@@ -28322,7 +28349,8 @@ import("./compile-cache-lib.mjs").then((lib) => {
         host.retire_image(&image, &trash).expect("retire to trash");
         let payload = tree_bytes(&trash);
         assert!(!payload.is_empty(), "the oracle snapshot is empty");
-        let sidecar = std::fs::read(crate::metadata::sidecar_path(&trash)).expect("sidecar");
+        let sidecar =
+            std::fs::read(cowshed_types::metadata::sidecar_path(&trash)).expect("sidecar");
         let companion =
             std::fs::read(crate::storage::apfs::companion_path(&trash)).expect("companion");
 
@@ -28358,7 +28386,7 @@ import("./compile-cache-lib.mjs").then((lib) => {
             "the export changed payload bytes"
         );
         assert_eq!(
-            std::fs::read(crate::metadata::sidecar_path(&moved)).expect("moved sidecar"),
+            std::fs::read(cowshed_types::metadata::sidecar_path(&moved)).expect("moved sidecar"),
             sidecar
         );
         assert_eq!(
@@ -28626,7 +28654,7 @@ mod exec_admission_tests {
 mod session_reopen_tests {
     use super::super::supervisor::{SessionToken, WorkspaceAuthoritySnapshot};
     use super::superseded_session;
-    use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
+    use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
     use cowshed_types::repository::RepoId;
 
     fn token(identity: u64) -> SessionToken {
@@ -28749,7 +28777,7 @@ mod volume_labeller_tests {
         let slotted = crate::storage::StorageLayout::new(&store, &repo)
             .expect("layout")
             .canonical_image(
-                &crate::metadata::WorkspaceName::new("slotted").expect("workspace name"),
+                &cowshed_types::metadata::WorkspaceName::new("slotted").expect("workspace name"),
             )
             .expect("image path")
             .image()

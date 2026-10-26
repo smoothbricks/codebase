@@ -41,7 +41,7 @@ use crate::api::dto::{
 };
 use crate::error::ErrorCode;
 use crate::git::{CommitSubject, ContentNotHeld, GitRepository};
-use crate::metadata::{WorkspaceName, WorkspaceRole};
+use cowshed_types::metadata::{WorkspaceName, WorkspaceRole};
 
 /// The branch a workspace's work has to reach, resolved live, with the object store that holds it.
 #[derive(Clone, Debug, Eq, PartialEq)]

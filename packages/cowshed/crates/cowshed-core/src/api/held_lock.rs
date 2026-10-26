@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::server::MAX_JSON_FRAME_BYTES;
-use crate::metadata::WorkspaceName;
+use cowshed_types::metadata::WorkspaceName;
 
 /// A kernel identifier (a device, an inode, a process's unique id) on the wire as its exact
 /// decimal string. A JSON number past 2^53 loses precision in JavaScript, and a reader that

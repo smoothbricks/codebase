@@ -133,7 +133,7 @@ mod tests {
     use super::*;
     use cowshed_core::ErrorCode;
     use cowshed_core::api::{EmptyResult, MountResult};
-    use cowshed_core::metadata::WorkspaceName;
+    use cowshed_types::metadata::WorkspaceName;
     use std::path::PathBuf;
 
     #[test]

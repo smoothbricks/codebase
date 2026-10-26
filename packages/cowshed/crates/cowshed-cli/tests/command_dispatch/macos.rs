@@ -16,7 +16,6 @@ use cowshed_core::api::dto::{
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
-use cowshed_core::metadata::{PortBlock, WorkspaceName};
 use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::runtime::land_lease::{self, Holding};
 use cowshed_core::storage::apfs::native::{
@@ -35,6 +34,7 @@ use cowshed_os::test_backstop::{
     AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _, FileBackstop as _,
     UnixStreamBackstop as _,
 };
+use cowshed_types::metadata::{PortBlock, WorkspaceName};
 use cowshed_types::repository::RepoId;
 use std::cell::Cell;
 use std::ffi::OsString;
@@ -885,7 +885,7 @@ async fn real_apfs_doctor_repair_moves_the_newer_of_two_workspaces_sharing_a_por
         .expect("topic image")
         .image()
         .to_owned();
-    let mut metadata = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+    let mut metadata = cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
         .expect("topic metadata");
     metadata.grants.port_block = Some(main_block);
     metadata
@@ -1628,7 +1628,7 @@ async fn directory_detach_and_rm_refuse_a_host_process_holding_the_mount() {
         .expect("held-topic image")
         .image()
         .to_owned();
-    let mut metadata = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+    let mut metadata = cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
         .expect("held-topic metadata");
     metadata.info_snapshot.created_at = "2026-01-01T00:00:00Z".to_owned();
     metadata
@@ -5372,7 +5372,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             &fixture.checkout,
             &["status", "--porcelain", "--untracked-files=all"],
         );
-        let old = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+        let old = cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
             .expect("main's sidecar")
             .workspace_incarnation;
 
@@ -5394,7 +5394,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             String::from_utf8_lossy(&stdout)
         );
 
-        let new = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+        let new = cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
             .expect("the replacement's sidecar")
             .workspace_incarnation;
         assert_ne!(new, old, "the replacement is a new incarnation");
@@ -5698,7 +5698,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         fixture.checkout.to_str().unwrap()
     );
     let recovered_metadata =
-        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image).unwrap();
+        cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image).unwrap();
     assert_eq!(recovered_metadata.workspace_incarnation, replacement);
     assert_eq!(
         inventory
@@ -5891,7 +5891,7 @@ async fn real_apfs_missing_main_recovers_empty_and_surviving_builds_and_replays_
         .await
         .expect("stop the runtime before main is lost");
     let lost_incarnation =
-        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+        cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
             .expect("main's Active sidecar before the loss")
             .workspace_incarnation;
     let scratch = fixture._scratch.path();
@@ -5926,7 +5926,7 @@ async fn real_apfs_missing_main_recovers_empty_and_surviving_builds_and_replays_
     // a stray retained record would stand beside the next retention's original.
     for lost in [
         main_image.clone(),
-        cowshed_core::metadata::sidecar_path(&main_image),
+        cowshed_types::metadata::sidecar_path(&main_image),
         PathBuf::from(format!("{}.ca.key", main_image.display())),
         build_image.clone(),
         layout.record(&main_volume),
@@ -5969,7 +5969,7 @@ async fn real_apfs_missing_main_recovers_empty_and_surviving_builds_and_replays_
     .await;
 
     let replacement =
-        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+        cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
             .expect("the replacement's Active sidecar")
             .workspace_incarnation;
     assert_ne!(
@@ -6077,7 +6077,7 @@ fn lose_main_to_a_plain_checkout(fixture: &Fixture, main_image: &Path, phase: &s
         .expect("detach main without force");
     for lost in [
         main_image.to_owned(),
-        cowshed_core::metadata::sidecar_path(main_image),
+        cowshed_types::metadata::sidecar_path(main_image),
         PathBuf::from(format!("{}.ca.key", main_image.display())),
     ] {
         fs::remove_file(&lost).unwrap_or_else(|error| panic!("lose {}: {error}", lost.display()));
@@ -6191,7 +6191,7 @@ async fn prove_missing_main_keeps_surviving_build(fixture: &mut Fixture) {
         "nothing is minted under the dead recorded id"
     );
     let replacement =
-        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+        cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
             .expect("the replacement's Active sidecar")
             .workspace_incarnation;
     let (_, seed) = layout
@@ -6424,7 +6424,7 @@ async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_
         "the resumed re-adoption completed"
     );
     assert_eq!(
-        cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
+        cowshed_types::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
             .expect("the replacement's sidecar")
             .workspace_incarnation,
         source.replacement,
@@ -6647,18 +6647,18 @@ async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
         let untracked = a_mount.join("u");
         move || -> Instant {
             loop {
-                match cowshed_core::metadata::read_json::<
-                    cowshed_core::metadata::DetachedWorkspaceMetadata,
+                match cowshed_types::metadata::read_json::<
+                    cowshed_types::metadata::DetachedWorkspaceMetadata,
                 >(&sidecar_b)
                 {
                     Ok(metadata)
                         if metadata.publication_state
-                            == cowshed_core::metadata::PublicationState::Active =>
+                            == cowshed_types::metadata::PublicationState::Active =>
                     {
                         break;
                     }
                     Ok(_) => std::thread::sleep(Duration::from_millis(1)),
-                    Err(cowshed_core::metadata::MetadataError::Io { source, .. })
+                    Err(cowshed_types::metadata::MetadataError::Io { source, .. })
                         if source.kind() == std::io::ErrorKind::NotFound =>
                     {
                         std::thread::sleep(Duration::from_millis(1));

@@ -1108,10 +1108,10 @@ impl CanonicalRoots {
         self.store.join(GATEWAY_SOCKET_NAME)
     }
 
-    pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
+    pub fn port_allocation(&self) -> cowshed_types::metadata::PortAllocation {
         match self.ports {
-            PortPartition::Host => crate::metadata::PortAllocation::Host,
-            PortPartition::Fixture(_) => crate::metadata::PortAllocation::Fixture,
+            PortPartition::Host => cowshed_types::metadata::PortAllocation::Host,
+            PortPartition::Fixture(_) => cowshed_types::metadata::PortAllocation::Fixture,
         }
     }
 
@@ -1258,7 +1258,7 @@ impl ValidatedHostStorage {
         self.roots.control_socket()
     }
 
-    pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
+    pub fn port_allocation(&self) -> cowshed_types::metadata::PortAllocation {
         self.roots.port_allocation()
     }
 }

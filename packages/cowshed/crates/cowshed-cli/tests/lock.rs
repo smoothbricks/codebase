@@ -1324,7 +1324,7 @@ fn image_lock_taker() {
         return;
     };
     let store = PathBuf::from(std::env::var_os(IMAGE_STORE_ENV).expect("the image lock's store"));
-    let workspace = cowshed_core::metadata::WorkspaceName::new(
+    let workspace = cowshed_types::metadata::WorkspaceName::new(
         std::env::var(IMAGE_WORKSPACE_ENV).expect("the workspace the lock is taken for"),
     )
     .expect("a workspace name");

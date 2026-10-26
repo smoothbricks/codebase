@@ -4,14 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cowshed_apfs::image::{ImageCapacity, is_image_path};
+use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::LockMode;
 use cowshed_apfs::{DetachIntent, MountAccess};
-use cowshed_core::metadata::{
-    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
-    WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
-};
-use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, Alongside, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError,
     ApfsSubstrate, ApfsSubstrateConfig, Beside, DEFAULT_IMAGE_CAPACITY, FoundMount,
@@ -26,6 +21,12 @@ use cowshed_core::storage::lifecycle::{
     SubstrateStats,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::image::is_image_path;
+use cowshed_types::lifecycle::CheckpointLabel;
+use cowshed_types::metadata::{
+    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation,
+    WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
+};
 use cowshed_types::repository::RepoId;
 use proptest::prelude::*;
 
@@ -369,7 +370,7 @@ impl ApfsExecutionHost for FakeHost {
     fn validate_pending_clone(
         &self,
         image: &Path,
-        expected: &cowshed_core::metadata::DetachedWorkspaceMetadata,
+        expected: &cowshed_types::metadata::DetachedWorkspaceMetadata,
     ) -> Result<(), ApfsStorageError> {
         let state = self.state.lock().expect("fake state");
         let pending = state
@@ -3373,13 +3374,13 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
         "/store/acme/widget/sessions/unfinished.dmg",
     );
     let substrate = substrate(host.clone(), CountingLane::default());
-    let metadata = cowshed_core::metadata::DetachedWorkspaceMetadata {
-        version: cowshed_core::metadata::SIDECAR_VERSION,
+    let metadata = cowshed_types::metadata::DetachedWorkspaceMetadata {
+        version: cowshed_types::metadata::SIDECAR_VERSION,
         repo_id: repo(),
         workspace: name,
         workspace_incarnation: pending.incarnation().clone(),
-        platform: cowshed_core::metadata::Platform::Macos,
-        publication_state: cowshed_core::metadata::PublicationState::PendingFence,
+        platform: cowshed_types::metadata::Platform::Macos,
+        publication_state: cowshed_types::metadata::PublicationState::PendingFence,
         updated_at: original.created_at.clone(),
         grants: original.grants.clone(),
         info_snapshot: WorkspaceInfoSnapshot {

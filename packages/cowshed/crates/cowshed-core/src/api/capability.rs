@@ -33,12 +33,12 @@ use super::server::{
     MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
-use crate::metadata::WorkspaceName;
 use crate::runtime::supervisor_socket::AdmissionSource;
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(unix)]
 use cowshed_os::deadline::{self, Idle, Peer, Progress, Silent};
+use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -3610,7 +3610,7 @@ mod tests {
                     "0198f2c0b7e34dc795f17b238b331c80",
                 )
                 .unwrap(),
-                role: crate::metadata::WorkspaceRole::Workspace,
+                role: cowshed_types::metadata::WorkspaceRole::Workspace,
                 mount: PathBuf::from("/mnt/raven"),
                 state: super::super::dto::WorkspaceState::Detached,
                 branch: None,

@@ -18,10 +18,7 @@ use super::{
     DirectoryExecutionHost, MountPointState, allocated_tree_bytes, host_error, mount_point_state,
     observed_mount, read_metadata, require_home,
 };
-use crate::metadata::{
-    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, PublicationState, WorkspaceIncarnation,
-    WorkspaceMarker, WorkspaceName, sidecar_path,
-};
+use crate::storage::WORKSPACE_MARKER_PATH;
 use crate::storage::apfs::native::{
     CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, HeldScope, QuarantineTombstone,
     RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire, abandon_bundles,
@@ -41,9 +38,13 @@ use crate::storage::lifecycle::{
     StorageGcReason, StorageGcReport, StorageGcRetained,
 };
 use crate::storage::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
-use crate::storage::{CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH};
-use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
 use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
+use cowshed_types::image::{IMAGE_EXTENSION, is_image_path};
+use cowshed_types::lifecycle::{CheckpointLabel, PRE_RESTORE_PREFIX};
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, PublicationState, WorkspaceIncarnation,
+    WorkspaceMarker, WorkspaceName, sidecar_path,
+};
 use cowshed_types::repository::{
     CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, QUARANTINE_DIRECTORY, RepoId, SESSIONS_DIRECTORY,
 };
@@ -247,7 +248,7 @@ impl DirectoryExecutionHost {
         canonical: &Path,
         held_locks: &[PathBuf],
     ) -> Result<Option<Option<ImageLockGuard>>, ApfsStorageError> {
-        let lock = crate::metadata::append_suffix(canonical, ".lock");
+        let lock = cowshed_types::metadata::append_suffix(canonical, ".lock");
         if held_locks.contains(&lock) {
             Ok(Some(None))
         } else {
@@ -359,10 +360,10 @@ impl DirectoryExecutionHost {
             reason: "missing-ca-companion".to_owned(),
             image: image.display().to_string(),
             companion: companion.display().to_string(),
-            quarantined_at: deletion_log::rfc3339_utc(now),
+            quarantined_at: cowshed_types::clock::rfc3339_utc(now),
             sidecar: quarantined_sidecar.display().to_string(),
         };
-        crate::metadata::write_json(&tombstone, &record).map_err(host_error)?;
+        cowshed_types::metadata::write_json(&tombstone, &record).map_err(host_error)?;
         sync_parent_path(&tombstone)?;
         if path_exists(companion)? {
             let name = companion.file_name().ok_or(ApfsStorageError::InvalidPlan(
@@ -628,7 +629,7 @@ impl DirectoryExecutionHost {
         let canonical_sidecar = sidecar_path(canonical);
         if path_exists(&recovery_fact_path)? {
             let fact: RestoreRecoveryFactWire =
-                crate::metadata::read_json(&recovery_fact_path).map_err(host_error)?;
+                cowshed_types::metadata::read_json(&recovery_fact_path).map_err(host_error)?;
             if fact.destination_incarnation.as_str() != replacement_incarnation {
                 return Ok(());
             }
@@ -991,7 +992,7 @@ impl DirectoryExecutionHost {
                     )));
                 }
                 let fact_path = checkpoint_fact_path(image);
-                match crate::metadata::read_json::<CheckpointFactWire>(&fact_path) {
+                match cowshed_types::metadata::read_json::<CheckpointFactWire>(&fact_path) {
                     Ok(fact)
                         if fact.version == CHECKPOINT_FACT_VERSION
                             && fact.repo_id == *retired.workspace().repo()
@@ -1464,7 +1465,7 @@ impl DirectoryExecutionHost {
                     Err(error) => return Err(io_error("read checkpoint age", &fact_path, error)),
                 };
                 let fact: CheckpointFactWire =
-                    crate::metadata::read_json(&fact_path).map_err(host_error)?;
+                    cowshed_types::metadata::read_json(&fact_path).map_err(host_error)?;
                 if fact.version != CHECKPOINT_FACT_VERSION
                     || fact.repo_id != *repo
                     || fact.workspace != workspace_name

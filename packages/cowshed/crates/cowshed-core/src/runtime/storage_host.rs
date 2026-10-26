@@ -10,7 +10,6 @@ use crate::build_volume::{
     BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration,
     ReleaseClaim,
 };
-use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, CompactedSeed, CompactionSource,
     SeedCatchUp, SeedCompaction,
@@ -21,6 +20,7 @@ use crate::storage::lifecycle::ExtentCount;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_types::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
 use cowshed_types::repository::RepoId;
 
 mod native;

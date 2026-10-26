@@ -40,11 +40,11 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::metadata::WorkspaceName;
+use cowshed_types::metadata::WorkspaceName;
 
 /// Per-project destruction evidence, stored beside `lifecycle-intents.json`.
 pub const DELETION_LOG_FILE: &str = "deletion-log.jsonl";
@@ -302,7 +302,7 @@ pub fn log_retirement(
         None => (None, None),
     };
     let entry = DeletionLogEntry {
-        at: rfc3339_utc(SystemTime::now()),
+        at: cowshed_types::clock::rfc3339_utc(SystemTime::now()),
         op: DeletionOp::RetireWorkspace,
         workspace: workspace.to_owned(),
         image,
@@ -328,7 +328,7 @@ pub fn log_recovery(
     recovered_to: &Path,
 ) {
     let entry = DeletionLogEntry {
-        at: rfc3339_utc(SystemTime::now()),
+        at: cowshed_types::clock::rfc3339_utc(SystemTime::now()),
         op: DeletionOp::RecoverRetiredImage,
         workspace: workspace.to_owned(),
         image: Some(image.to_path_buf()),
@@ -399,7 +399,7 @@ pub fn log_deletion(
     artifact: &Path,
 ) {
     let entry = DeletionLogEntry {
-        at: rfc3339_utc(SystemTime::now()),
+        at: cowshed_types::clock::rfc3339_utc(SystemTime::now()),
         op,
         workspace: workspace.to_owned(),
         image: image.map(Path::to_path_buf),
@@ -584,21 +584,6 @@ fn companion_path_for(image: &Path) -> PathBuf {
     let mut path = image.as_os_str().to_owned();
     path.push(".ca.key");
     PathBuf::from(path)
-}
-
-pub(crate) fn rfc3339_utc(now: SystemTime) -> String {
-    let secs = now
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let (year, month, day) = crate::storage::civil_from_days(secs / 86_400);
-    let clock = secs % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        clock / 3_600,
-        (clock % 3_600) / 60,
-        clock % 60,
-    )
 }
 
 #[cfg(test)]

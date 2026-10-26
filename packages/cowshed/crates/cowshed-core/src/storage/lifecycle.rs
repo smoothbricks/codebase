@@ -6,11 +6,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::metadata::{GrantSet, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_types::metadata::{GrantSet, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use cowshed_types::repository::RepoId;
 
-use super::CheckpointLabel;
+use cowshed_types::lifecycle::CheckpointLabel;
 
 /// A monotonic controller-visible revision.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]

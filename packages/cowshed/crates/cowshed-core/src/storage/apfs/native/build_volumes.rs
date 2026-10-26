@@ -15,12 +15,12 @@ use crate::build_volume::{
     BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
     CapturedBuildVolume, LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::ApfsStorageError;
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, mount_is_in_progress};
 use cowshed_os::process::Holder;
+use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 use std::ops::ControlFlow;
 
 use crate::storage::apfs::extents::{self, CaughtUp, Copied};
@@ -1388,12 +1388,12 @@ mod tests {
     use super::*;
     use crate::api::resources::JobAccounting;
     use crate::build_volume::BuildVolumeRole;
-    use crate::metadata::WorkspaceName;
     use crate::storage::apfs::ApfsSubstrateConfig;
     use cowshed_apfs::mounts::KernelMountSnapshot;
     use cowshed_apfs::{CommandRequest, SystemCommandRunner};
     use cowshed_os::namespace::{HostNamespace, TestNamespace};
     use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
+    use cowshed_types::metadata::WorkspaceName;
     use cowshed_types::repository::{ProjectPaths, RepoId};
     use std::io::Read;
     use std::sync::Arc;
@@ -1707,13 +1707,13 @@ mod tests {
             defaults.authority.workspace_incarnation.clone(),
             crate::storage::lifecycle::Revision::new(defaults.authority.lifecycle_revision),
             crate::storage::lifecycle::Revision::new(defaults.authority.grant_revision),
-            crate::metadata::WorkspaceRole::Main,
+            cowshed_types::metadata::WorkspaceRole::Main,
         )
         .unwrap();
         crate::workspace_credentials::mint_workspace_credentials(
             &workspace,
             &checkout,
-            crate::metadata::Platform::Macos,
+            cowshed_types::metadata::Platform::Macos,
             Some(defaults.sandbox.port_block),
             &root.path().join("ca.key"),
         )

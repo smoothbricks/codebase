@@ -15,17 +15,19 @@ use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, RECORD_SUFFIX,
     Registrant, Registration, ReleaseClaim,
 };
-use crate::metadata::append_suffix;
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
 use crate::storage::recovery::{
     MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptMain, ReAdoptSource,
 };
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
+use cowshed_types::metadata::append_suffix;
 
 /// The files beside a workspace image: its grants sidecar and its CA companion.
-const MAIN_COMPANION_SUFFIXES: [&str; 2] =
-    [crate::metadata::GRANTS_SIDECAR_SUFFIX, COMPANION_SUFFIX];
+const MAIN_COMPANION_SUFFIXES: [&str; 2] = [
+    cowshed_types::metadata::GRANTS_SIDECAR_SUFFIX,
+    COMPANION_SUFFIX,
+];
 
 /// The claim a seed of main's published build volume is captured under (16_build_volumes.md,
 /// "Targets and seeds"). A volume the caller's re-adoption claim already holds is captured under
@@ -491,7 +493,10 @@ where
             }
         };
         let seeded = layout
-            .seed_of(&crate::metadata::WorkspaceName::main(), &source.replacement)
+            .seed_of(
+                &cowshed_types::metadata::WorkspaceName::main(),
+                &source.replacement,
+            )
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         if seeded.is_some() {
             self.mount_build_volume(layout, claim.id())?;
@@ -502,7 +507,7 @@ where
             BuildVolumeRecord::new(
                 owner.tree.clone(),
                 BuildVolumeRole::Seed {
-                    target: crate::metadata::WorkspaceName::main(),
+                    target: cowshed_types::metadata::WorkspaceName::main(),
                     incarnation: source.replacement.clone(),
                 },
             ),
@@ -922,7 +927,6 @@ fn replacement_published(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
     use crate::storage::StorageLayout;
     use crate::storage::apfs::ApfsSubstrateConfig;
     use crate::storage::recovery::{
@@ -932,6 +936,7 @@ mod tests {
         AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
     };
     use cowshed_os::fork_lock::Fenced;
+    use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 
     struct RefuseFirstMount {
         layout: BuildVolumeLayout,

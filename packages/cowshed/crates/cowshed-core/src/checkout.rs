@@ -14,10 +14,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::metadata::{
+use crate::storage::WORKSPACE_MARKER_PATH;
+use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, MetadataError, WorkspaceMarker, sidecar_path, write_json,
 };
-use crate::storage::WORKSPACE_MARKER_PATH;
 use cowshed_types::repository::RepoId;
 
 /// Where one project's recorded checkout path is durably held.
@@ -168,7 +168,7 @@ pub fn observed_checkout(observed: &Path, mount_point: &Path) -> Option<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::{
+    use cowshed_types::metadata::{
         MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
         WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
     };
@@ -241,8 +241,8 @@ mod tests {
                 platform: Platform::Macos,
                 publication_state: PublicationState::Active,
                 updated_at: "2026-07-13T00:00:00Z".to_owned(),
-                grants: crate::metadata::GrantSet::closed_baseline(Some(
-                    crate::metadata::PortBlock::new(49_136, 16).expect("port block"),
+                grants: cowshed_types::metadata::GrantSet::closed_baseline(Some(
+                    cowshed_types::metadata::PortBlock::new(49_136, 16).expect("port block"),
                 ))
                 .expect("grants"),
                 info_snapshot: WorkspaceInfoSnapshot {

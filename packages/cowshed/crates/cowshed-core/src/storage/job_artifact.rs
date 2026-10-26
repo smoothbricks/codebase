@@ -41,10 +41,10 @@ use crate::api::resources::{
     UsageReconciliation, VolumeUsage, WallMicros,
 };
 use crate::error::CowshedError;
-use crate::metadata::WorkspaceIncarnation;
 use cowshed_os::deadline::{Bound, CONTROL, Expired};
 use cowshed_os::flock::{LockError, LockHolder};
 use cowshed_os::fsio::Durability;
+use cowshed_types::metadata::WorkspaceIncarnation;
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 mod publication;
 use crate::storage::verify_no_symlinks;

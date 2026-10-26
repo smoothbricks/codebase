@@ -196,7 +196,7 @@ fn publish_git_fetch_config(mount: &Path, mappings: &[GitFetchMapping]) -> Resul
             )));
         }
     }
-    crate::metadata::write_atomic_bytes(&path, output.as_bytes())
+    cowshed_types::metadata::write_atomic_bytes(&path, output.as_bytes())
         .map_err(|error| failure(error.to_string()))?;
     Ok(Some(path))
 }
@@ -700,7 +700,7 @@ mod tests {
             shed_links: Vec::new(),
             exec_temp_dir: root.join("temp"),
             store_root: root.join("store"),
-            port_block: crate::metadata::PortBlock::new(49_136, 16).expect("ports"),
+            port_block: cowshed_types::metadata::PortBlock::new(49_136, 16).expect("ports"),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,
             mode: crate::sandbox::RunSandboxMode::ReadWrite,

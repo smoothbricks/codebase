@@ -2,8 +2,8 @@ use cowshed_cli::output::{Output, write_error_envelope, write_success_envelope};
 use cowshed_os::test_backstop::CommandBackstop as _;
 
 use cowshed_core::api::{EmptyResult, MountResult};
-use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::{CowshedError, ErrorCode};
+use cowshed_types::metadata::WorkspaceName;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;

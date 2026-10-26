@@ -831,6 +831,7 @@ version = "0.1.0"
 dependencies = [
  "cowshed-gateway-types",
  "cowshed-os",
+ "cowshed-types",
  "libc",
  "plist",
  "serde",
@@ -846,6 +847,7 @@ version = "0.1.0"
 dependencies = [
  "cowshed-apfs",
  "cowshed-os",
+ "cowshed-types",
  "libc",
 ]
 
@@ -1045,7 +1047,10 @@ name = "cowshed-types"
 version = "0.1.0"
 dependencies = [
  "cowshed-gateway-types",
+ "cowshed-os",
+ "proptest",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

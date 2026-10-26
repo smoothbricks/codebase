@@ -36,9 +36,9 @@ use super::supervisor_socket::{
     self, AuthorityWire, BuildId, protocol_error, read_json, verify_peer, write_json,
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
-use crate::metadata::WorkspaceName;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::timing;
+use cowshed_types::metadata::WorkspaceName;
 
 /// How long a started supervisor may take to open its project, mount its workspace and answer.
 const START_BOUND: Duration = Duration::from_secs(180);
@@ -1524,7 +1524,7 @@ mod tests {
         supervisor_socket::socket_path(
             store,
             &cowshed_types::repository::RepoId::parse("acme/widget").expect("repo id"),
-            &crate::metadata::WorkspaceName::new(workspace).expect("workspace"),
+            &cowshed_types::metadata::WorkspaceName::new(workspace).expect("workspace"),
         )
     }
 
@@ -2022,7 +2022,7 @@ mod tests {
         let authority = WorkspaceAuthoritySnapshot {
             repo_id: cowshed_types::repository::RepoId::parse("acme/widget").unwrap(),
             workspace: WorkspaceName::new("raven").unwrap(),
-            workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(
+            workspace_incarnation: cowshed_types::metadata::WorkspaceIncarnation::new(
                 "0198f2c0b7e34dc795f17b238b331c80",
             )
             .unwrap(),

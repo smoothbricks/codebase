@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 use super::{COPY_PROOF_FILE, CopyCheckpoint, MANIFEST_FILE, recover, recover_by_copy};
 use crate::api::dto::{RecoveredImage, RecoveryCause, RecoveryRetention};
 use crate::error::{CowshedError, ErrorCode, Result};
-use crate::metadata::{DetachedWorkspaceMetadata, sidecar_path};
 use crate::storage::apfs::{ApfsExecutionHost as _, companion_path};
 use crate::storage::deletion_log::{self, Caller, KeptRecovery, RetiredBy};
 use crate::storage::directory::DirectoryExecutionHost;
 use crate::storage::directory::tests::{Scratch, published_directory};
 use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
+use cowshed_types::metadata::{DetachedWorkspaceMetadata, sidecar_path};
 use cowshed_types::repository::RepoId;
 
 const IMAGE_LEN: u64 = 32 * 1024 * 1024;

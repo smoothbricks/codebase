@@ -40,9 +40,9 @@ use crate::api::dto::{
     LandOutcomeCommitment, OutputLimitInfo, RestoreCommitment, Sha256Digest, TerminalCommitment,
     WorkspaceIntroducedCommitment, WorkspaceRetiredCommitment,
 };
-use crate::metadata::WorkspaceIncarnation;
 use crate::storage::job_artifact::write_controller_commitments;
 use crate::storage::trace_segment::TelemetryDate;
+use cowshed_types::metadata::WorkspaceIncarnation;
 use cowshed_types::repository::RepoId;
 
 use cowshed_os::fsio::{

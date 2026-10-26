@@ -23,7 +23,6 @@ use crate::build_volume::{
     BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
     CapturedBuildVolume, LinkResolution, Registrant, Registration, ReleaseClaim, link,
 };
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, io_error, path_exists,
@@ -34,6 +33,7 @@ use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_os::fsio::AnchoredDirectory;
 use cowshed_os::process::Holder;
+use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 
 /// The record beside a build volume of the write instant it holds everything up to
 /// (`mark_seed_written`). It speaks only while the tree is unchanged since it was written.
@@ -49,7 +49,7 @@ struct WrittenMark {
 }
 
 fn written_mark_path(image: &Path) -> PathBuf {
-    crate::metadata::append_suffix(image, WRITTEN_SUFFIX)
+    cowshed_types::metadata::append_suffix(image, WRITTEN_SUFFIX)
 }
 
 fn change_time(metadata: &fs::Metadata) -> SystemTime {
@@ -529,7 +529,8 @@ impl DirectoryExecutionHost {
         if clock > change_time(&mark_metadata) {
             return Ok(clock);
         }
-        let recorded: WrittenMark = crate::metadata::read_json(&mark).map_err(host_error)?;
+        let recorded: WrittenMark =
+            cowshed_types::metadata::read_json(&mark).map_err(host_error)?;
         if recorded.version != WRITTEN_VERSION || recorded.nanos >= 1_000_000_000 {
             return Err(ApfsStorageError::Host(format!(
                 "build volume written mark {} is not version {WRITTEN_VERSION}",
@@ -554,7 +555,7 @@ impl DirectoryExecutionHost {
                 ApfsStorageError::InvalidPlan("build volume write instant precedes the epoch")
             })?;
         let mark = written_mark_path(&image);
-        crate::metadata::write_json(
+        cowshed_types::metadata::write_json(
             &mark,
             &WrittenMark {
                 version: WRITTEN_VERSION,

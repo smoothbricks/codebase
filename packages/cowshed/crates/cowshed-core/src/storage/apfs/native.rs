@@ -17,21 +17,22 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use crate::copy::copy_until_quiescent_blocking;
-use crate::metadata::{
-    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, MARKER_VERSION, MetadataError, Platform,
-    PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
-    WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
-};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
+use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, DetachIntent, MacOsApfsBackend,
     MountAccess, RecoveredImageAttachment,
 };
 #[cfg(target_os = "macos")]
 use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_types::image::{IMAGE_EXTENSION, is_image_path};
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, MARKER_VERSION, MetadataError, Platform,
+    PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
+    WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
+};
 use cowshed_types::repository::{
     CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY,
 };
@@ -46,9 +47,7 @@ use super::super::lifecycle::{
     StorageGcDeferred, StorageGcOptions, StorageGcPlan, StorageGcReason, StorageGcReport,
     StorageGcRetained, SubstrateStats, derive_workspaces,
 };
-use super::super::{
-    CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
-};
+use super::super::{WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks};
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, COMPANION_SUFFIX, LockMode,
     MarkerExpectation, MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError,
@@ -56,6 +55,7 @@ use super::{
     recovery_staging_mount, retired_image_below, split_retired_stem, volume_key,
 };
 use cowshed_os::timing::timed;
+use cowshed_types::lifecycle::{CheckpointLabel, PRE_RESTORE_PREFIX};
 use image_telemetry::{Image, ImageTelemetry};
 
 mod blank_template;
@@ -239,7 +239,7 @@ pub(in crate::storage) fn restore_recovery_fact(
     metadata: &DetachedWorkspaceMetadata,
 ) -> Result<RestoreRecoveryFactWire, ApfsStorageError> {
     let path = restore_recovery_fact_path(image);
-    let fact: RestoreRecoveryFactWire = crate::metadata::read_json(&path)
+    let fact: RestoreRecoveryFactWire = cowshed_types::metadata::read_json(&path)
         .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
     if fact.version != RESTORE_RECOVERY_FACT_VERSION
         || fact.repo_id != metadata.repo_id
@@ -283,8 +283,7 @@ pub(in crate::storage) fn validate_restore_recovery_lineage(
         .join(fact.workspace.as_str())
         .join(format!(
             "{}{}.{IMAGE_EXTENSION}",
-            super::PRE_RESTORE_PREFIX,
-            fact.destination_incarnation,
+            PRE_RESTORE_PREFIX, fact.destination_incarnation,
         ));
     let undo_metadata = DetachedWorkspaceMetadata::read_for_image(&undo)
         .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -1041,7 +1040,7 @@ pub fn interrupted_publications(project: &Path) -> Result<Vec<PathBuf>, ApfsStor
 }
 
 pub(in crate::storage) fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
-    crate::metadata::image_from_sidecar_path(sidecar).ok_or_else(|| {
+    cowshed_types::metadata::image_from_sidecar_path(sidecar).ok_or_else(|| {
         ApfsStorageError::Host(format!(
             "invalid detached restore sidecar path: {}",
             sidecar.display()
@@ -1824,19 +1823,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
     }
 
-    /// Render unix seconds as an RFC3339 UTC timestamp using the crate's total civil-date
-    /// conversion rather than `libc::gmtime_r` (the same reason `utc_now` exists).
-    fn rfc3339_utc(seconds: u64) -> String {
-        let (year, month, day) = crate::storage::civil_from_days(seconds / 86_400);
-        let clock = seconds % 86_400;
-        format!(
-            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-            clock / 3_600,
-            clock % 3_600 / 60,
-            clock % 60,
-        )
-    }
-
     /// Quarantine a keyless canonical's grants sidecar so one workspace's missing CA identity
     /// never aborts the store-wide pass. Same-volume renames only: the companion (if present)
     /// and the sidecar move into `<project>/quarantine/<ws>-<unix_ts>/` beside a `tombstone.json`
@@ -1883,10 +1869,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             reason: "missing-ca-companion".to_owned(),
             image: image.display().to_string(),
             companion: companion.display().to_string(),
-            quarantined_at: Self::rfc3339_utc(now),
+            quarantined_at: cowshed_types::clock::rfc3339_utc(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(now),
+            ),
             sidecar: quarantined_sidecar.display().to_string(),
         };
-        crate::metadata::write_json(&tombstone, &record)
+        cowshed_types::metadata::write_json(&tombstone, &record)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         sync_parent_path(&tombstone)?;
         if fs::symlink_metadata(companion).is_ok() {
@@ -2343,7 +2331,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     )));
                 }
                 let fact_path = checkpoint_fact_path(image);
-                match crate::metadata::read_json::<CheckpointFactWire>(&fact_path) {
+                match cowshed_types::metadata::read_json::<CheckpointFactWire>(&fact_path) {
                     Ok(fact)
                         if fact.version == CHECKPOINT_FACT_VERSION
                             && fact.repo_id == *retired.workspace().repo()
@@ -3440,7 +3428,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 if !fact_path.exists() {
                     continue;
                 }
-                let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
+                let fact: CheckpointFactWire = cowshed_types::metadata::read_json(&fact_path)
                     .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
                 let expected_label = image
                     .file_stem()
@@ -4492,7 +4480,7 @@ where
         mount_point: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError> {
         self.verify_controller_path(image)?;
-        crate::metadata::validate_image_path(image)
+        cowshed_types::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         if path_exists(image)? {
             return Err(ApfsStorageError::Host(format!(
@@ -4515,7 +4503,7 @@ where
         DetachedWorkspaceMetadata::read_for_image(source)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         for path in [source, destination] {
-            crate::metadata::validate_image_path(path)
+            cowshed_types::metadata::validate_image_path(path)
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         }
         Self::ensure_parent(destination)?;
@@ -4532,7 +4520,7 @@ where
         mount: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        crate::metadata::validate_image_path(image)
+        cowshed_types::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         if mount.is_some() {
             self.backend.sync_for_freshness(image, mount)?;
@@ -4900,16 +4888,17 @@ where
                     && old.repo_id == *workspace.repo()
                     && old.workspace == *workspace.name()
             }),
-            Err(crate::metadata::MetadataError::Io { source, .. })
+            Err(cowshed_types::metadata::MetadataError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
                 None
             }
             Err(error) => return Err(ApfsStorageError::MarkerMismatch(error.to_string())),
         };
-        let owned_links_revision = copied.map_or(crate::metadata::OWNED_LINKS_REVISION, |old| {
-            old.owned_links_revision
-        });
+        let owned_links_revision = copied
+            .map_or(cowshed_types::metadata::OWNED_LINKS_REVISION, |old| {
+                old.owned_links_revision
+            });
         let marker = WorkspaceMarker {
             version: MARKER_VERSION,
             repo_id: workspace.repo().clone(),
@@ -4932,7 +4921,7 @@ where
         ))?;
         fs::create_dir_all(parent)
             .map_err(|error| io_error("create marker directory", parent, error))?;
-        crate::metadata::write_json(&marker_path, &marker)
+        cowshed_types::metadata::write_json(&marker_path, &marker)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
@@ -5474,7 +5463,7 @@ where
         source_image: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        crate::metadata::validate_image_path(image)
+        cowshed_types::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         // The fence can be the first artifact a project holds: adopt writes it before anything
         // else exists beside main's image.
@@ -5607,7 +5596,7 @@ where
             pin: pin.into(),
         };
         let path = checkpoint_fact_path(image);
-        crate::metadata::write_json(&path, &fact)
+        cowshed_types::metadata::write_json(&path, &fact)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         sync_parent_path(&path)
     }
@@ -5753,7 +5742,7 @@ where
             destination_incarnation: workspace.incarnation().clone(),
         };
         let recovery_path = restore_recovery_fact_path(canonical);
-        crate::metadata::write_json(&recovery_path, &recovery_fact)
+        cowshed_types::metadata::write_json(&recovery_path, &recovery_fact)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         sync_parent_path(&recovery_path)?;
         self.publish_metadata(
@@ -6327,7 +6316,7 @@ where
                 }
                 if recovery_fact_path.exists() {
                     let recovery_fact: RestoreRecoveryFactWire =
-                        crate::metadata::read_json(&recovery_fact_path)
+                        cowshed_types::metadata::read_json(&recovery_fact_path)
                             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
                     if recovery_fact.destination_incarnation.as_str() != replacement_incarnation {
                         continue;
@@ -6569,7 +6558,7 @@ where
         workspace: &LifecycleWorkspace,
         image: &Path,
     ) -> Result<SubstrateStats, ApfsStorageError> {
-        crate::metadata::validate_image_path(image)
+        cowshed_types::metadata::validate_image_path(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         let detached = DetachedWorkspaceMetadata::read_for_image(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -6620,37 +6609,38 @@ where
                         checkpoint_image.display()
                     ))
                 })?;
-            let pinned =
-                if let Some(destination) = expected_label.strip_prefix(super::PRE_RESTORE_PREFIX) {
-                    let destination = WorkspaceIncarnation::new(destination).map_err(|error| {
-                        ApfsStorageError::Host(format!(
-                            "invalid pre-restore checkpoint image {}: {error}",
-                            checkpoint_image.display()
-                        ))
-                    })?;
-                    if checkpoint_metadata.workspace_incarnation == destination {
-                        return Err(ApfsStorageError::MarkerMismatch(format!(
-                            "pre-restore checkpoint retained the destination incarnation: {}",
-                            checkpoint_image.display()
-                        )));
-                    }
-                    false
-                } else {
-                    let fact_path = checkpoint_fact_path(&checkpoint_image);
-                    let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
-                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                    if fact.version != CHECKPOINT_FACT_VERSION
-                        || fact.repo_id != *workspace.repo()
-                        || fact.workspace != *workspace.name()
-                        || fact.label.as_str() != expected_label
-                    {
-                        return Err(ApfsStorageError::Host(format!(
-                            "checkpoint fact does not match image path: {}",
-                            fact_path.display()
-                        )));
-                    }
-                    fact.pin == CheckpointPinWire::Pinned
-                };
+            let pinned = if let Some(destination) =
+                expected_label.strip_prefix(super::PRE_RESTORE_PREFIX)
+            {
+                let destination = WorkspaceIncarnation::new(destination).map_err(|error| {
+                    ApfsStorageError::Host(format!(
+                        "invalid pre-restore checkpoint image {}: {error}",
+                        checkpoint_image.display()
+                    ))
+                })?;
+                if checkpoint_metadata.workspace_incarnation == destination {
+                    return Err(ApfsStorageError::MarkerMismatch(format!(
+                        "pre-restore checkpoint retained the destination incarnation: {}",
+                        checkpoint_image.display()
+                    )));
+                }
+                false
+            } else {
+                let fact_path = checkpoint_fact_path(&checkpoint_image);
+                let fact: CheckpointFactWire = cowshed_types::metadata::read_json(&fact_path)
+                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                if fact.version != CHECKPOINT_FACT_VERSION
+                    || fact.repo_id != *workspace.repo()
+                    || fact.workspace != *workspace.name()
+                    || fact.label.as_str() != expected_label
+                {
+                    return Err(ApfsStorageError::Host(format!(
+                        "checkpoint fact does not match image path: {}",
+                        fact_path.display()
+                    )));
+                }
+                fact.pin == CheckpointPinWire::Pinned
+            };
             let bytes =
                 allocated_file_bytes(&fs::metadata(&checkpoint_image).map_err(|error| {
                     io_error("read checkpoint statistics", &checkpoint_image, error)
@@ -6746,7 +6736,7 @@ pub(in crate::storage) fn workspace_checkpoint_facts(
             continue;
         }
         let fact_path = checkpoint_fact_path(&image);
-        let wire: CheckpointFactWire = match crate::metadata::read_json(&fact_path) {
+        let wire: CheckpointFactWire = match cowshed_types::metadata::read_json(&fact_path) {
             Ok(wire) => wire,
             Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 continue;
@@ -7331,11 +7321,11 @@ mod tests {
     #[test]
     fn retained_companions_converge_on_replay_and_move_nothing_on_refusal() {
         use crate::build_volume::RECORD_SUFFIX;
-        use crate::metadata::{GRANTS_SIDECAR_SUFFIX, append_suffix};
         use crate::storage::apfs::COMPANION_SUFFIX;
         use crate::storage::recovery::re_adopt_tests::Fixture;
         use cowshed_apfs::SystemCommandRunner;
         use cowshed_os::namespace::{HostNamespace, TestNamespace};
+        use cowshed_types::metadata::{GRANTS_SIDECAR_SUFFIX, append_suffix};
         use std::os::unix::fs::symlink;
 
         #[derive(Clone, Copy)]
@@ -7573,7 +7563,7 @@ mod tests {
                 .expect("host");
         let mut metadata = fixture.source(None).metadata;
         metadata.workspace = WorkspaceName::session("retired").expect("workspace");
-        metadata.info_snapshot.role = crate::metadata::WorkspaceRole::Workspace;
+        metadata.info_snapshot.role = cowshed_types::metadata::WorkspaceRole::Workspace;
         metadata.info_snapshot.branch = Some("cowshed/retired".to_owned());
         let trash = retired_image_below(
             &storage.project().sessions,
@@ -7974,12 +7964,12 @@ mod tests {
             "no marker: a lineage of its own"
         );
         let marker = WorkspaceMarker {
-            version: crate::metadata::MARKER_VERSION,
+            version: cowshed_types::metadata::MARKER_VERSION,
             repo_id: repo.clone(),
             project_root: root.clone(),
             workspace: WorkspaceName::new("raven").unwrap(),
             workspace_incarnation: source.clone(),
-            role: crate::metadata::WorkspaceRole::Workspace,
+            role: cowshed_types::metadata::WorkspaceRole::Workspace,
             base_commit: "8f31c2d".into(),
             created_at: "2026-08-23T00:00:00Z".into(),
             forked_from: None,
@@ -7987,7 +7977,7 @@ mod tests {
             lineage: Some(vec![ancestor.clone()]),
             owned_links_revision: 0,
         };
-        crate::metadata::write_json(&marker_path, &marker).unwrap();
+        cowshed_types::metadata::write_json(&marker_path, &marker).unwrap();
         assert_eq!(
             clone_lineage_from(&marker_path, &repo),
             vec![source.clone(), ancestor.clone()],
@@ -8001,7 +7991,7 @@ mod tests {
             lineage: None,
             ..marker
         };
-        crate::metadata::write_json(&marker_path, &legacy).unwrap();
+        cowshed_types::metadata::write_json(&marker_path, &legacy).unwrap();
         assert_eq!(
             clone_lineage_from(&marker_path, &repo),
             vec![source],

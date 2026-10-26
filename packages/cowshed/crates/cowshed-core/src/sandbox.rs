@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::capabilities::{
     CapabilityGrant, DetectedCapabilities, DetectionContext, GrantAccess, GrantScope,
 };
-pub use crate::metadata::PortBlock;
 use cowshed_gateway_types::STORE_ROOT;
+pub use cowshed_types::metadata::PortBlock;
 
 fn cowshed_root() -> &'static Path {
     Path::new(STORE_ROOT)
@@ -332,7 +332,7 @@ pub struct WorkspaceSandbox<'a> {
     /// The telemetry root, which no workspace process may read.
     pub telemetry_root: &'a Path,
     /// The workspace's effective grants: its own and the project's.
-    pub grants: &'a crate::metadata::GrantSet,
+    pub grants: &'a cowshed_types::metadata::GrantSet,
     /// `[sandbox] deny` from main's `.cowshed.toml`: workspace-relative paths the operator's
     /// own checkout declares no job may read or write. Never a workspace's copy of the file.
     pub repository_deny: &'a [PathBuf],
@@ -350,7 +350,7 @@ pub struct WorkspaceSandbox<'a> {
     pub exec_temp_dir: PathBuf,
     /// The store the workspace's supervisor serves, whose `run/profiles` its launches read.
     pub store_root: &'a Path,
-    pub workspace_incarnation: &'a crate::metadata::WorkspaceIncarnation,
+    pub workspace_incarnation: &'a cowshed_types::metadata::WorkspaceIncarnation,
 }
 
 /// The sandbox a workspace's supervisor runs in and hands `plan_exec` for every child it
@@ -552,8 +552,8 @@ fn validated_sandbox_paths(
         block
             .validate()
             .map_err(|_| SandboxError::InvalidPortBlock {
-                base: block.base,
-                size: block.size,
+                base: block.base(),
+                size: block.size(),
             })?;
     }
 
@@ -945,8 +945,8 @@ pub fn seatbelt_profile(
     } else {
         for block in held_port_blocks(config) {
             for port in block.ports().map_err(|_| SandboxError::InvalidPortBlock {
-                base: block.base,
-                size: block.size,
+                base: block.base(),
+                size: block.size(),
             })? {
                 push_line(
                     &mut profile,
@@ -2344,9 +2344,9 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
         let home = Path::new("/Users/tester");
         let mount_root = Path::new("/Users/tester/.cowshed/mnt");
         let main = Path::new("/Users/tester/Dev/widget");
-        let grants = crate::metadata::GrantSet {
+        let grants = cowshed_types::metadata::GrantSet {
             port_block: Some(PortBlock::new(40_960, 16).unwrap()),
-            ..crate::metadata::GrantSet::default()
+            ..cowshed_types::metadata::GrantSet::default()
         };
         let build = |mount: &Path| {
             workspace_sandbox(WorkspaceSandbox {
@@ -2364,7 +2364,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                 workspace_mount: mount.to_path_buf(),
                 exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
                 store_root: Path::new("/private/tmp/cowshed-raven-store"),
-                workspace_incarnation: &crate::metadata::WorkspaceIncarnation::new(
+                workspace_incarnation: &cowshed_types::metadata::WorkspaceIncarnation::new(
                     "0123456789abcdef0123456789abcdef",
                 )
                 .unwrap(),
@@ -2458,10 +2458,10 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     /// Main's `[sandbox] deny` joins the workspace's own granted denies, as one sorted set.
     #[test]
     fn the_workspace_builder_unions_granted_and_repository_denies() {
-        let grants = crate::metadata::GrantSet {
+        let grants = cowshed_types::metadata::GrantSet {
             port_block: Some(PortBlock::new(40_960, 16).unwrap()),
             deny: vec![PathBuf::from("b"), PathBuf::from("a")],
-            ..crate::metadata::GrantSet::default()
+            ..cowshed_types::metadata::GrantSet::default()
         };
         let config = workspace_sandbox(WorkspaceSandbox {
             home: Path::new("/Users/tester"),
@@ -2478,7 +2478,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             workspace_mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/raven"),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
             store_root: Path::new("/private/tmp/cowshed-raven-store"),
-            workspace_incarnation: &crate::metadata::WorkspaceIncarnation::new(
+            workspace_incarnation: &cowshed_types::metadata::WorkspaceIncarnation::new(
                 "0123456789abcdef0123456789abcdef",
             )
             .unwrap(),
@@ -2512,12 +2512,13 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
         std::fs::write(&bash, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bash, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
-        let grants = crate::metadata::GrantSet {
+        let grants = cowshed_types::metadata::GrantSet {
             port_block: Some(PortBlock::new(40_960, 16).unwrap()),
-            ..crate::metadata::GrantSet::default()
+            ..cowshed_types::metadata::GrantSet::default()
         };
         let incarnation =
-            crate::metadata::WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef").unwrap();
+            cowshed_types::metadata::WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef")
+                .unwrap();
         let build = |program_directories: &[PathBuf]| {
             workspace_sandbox(WorkspaceSandbox {
                 home: &home,
@@ -2645,7 +2646,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     /// per port of their own recorded size.
     #[test]
     fn profile_is_deterministic_and_has_one_literal_rule_per_block_port() {
-        for size in [16, crate::metadata::NEW_PORT_BLOCK_SIZE] {
+        for size in [16, cowshed_types::metadata::NEW_PORT_BLOCK_SIZE] {
             let mut config = config(RunSandboxMode::ReadWrite);
             config.port_block = PortBlock::new(40_960, size).unwrap();
             let first = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
@@ -2707,17 +2708,8 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             profile.contains("(allow network-bind network-inbound (local tcp \"localhost:*\"))")
         );
 
-        config.retained_port_blocks.push(PortBlock {
-            base: 41_041,
-            size: 16,
-        });
-        assert_eq!(
-            seatbelt_profile(&config, SandboxProfileRole::ExecutedChild),
-            Err(SandboxError::InvalidPortBlock {
-                base: 41_041,
-                size: 16
-            })
-        );
+        // An invalid retained block is unrepresentable: PortBlock's constructor and
+        // deserializer both refuse one, so seatbelt_profile never sees it.
     }
 
     /// A loopback-any grant admits outbound loopback TCP to every port with one wildcard rule in
@@ -3215,7 +3207,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     fn no_allow_precedes_a_deny_that_covers_it() {
         let pool = crate::runtime::job_cpu::cpu_pool_directory(
             Path::new("/private/cowshed/store"),
-            &crate::metadata::WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+            &cowshed_types::metadata::WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
                 .unwrap(),
         );
         let fifos = format!(
@@ -3346,7 +3338,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     fn port_block_is_exact_and_cannot_overflow() {
         assert!(PortBlock::new(40_960, 15).is_err());
         assert!(PortBlock::new(u16::MAX - 14, 16).is_err());
-        for size in [16, crate::metadata::NEW_PORT_BLOCK_SIZE] {
+        for size in [16, cowshed_types::metadata::NEW_PORT_BLOCK_SIZE] {
             assert_eq!(
                 PortBlock::new(40_960, size)
                     .unwrap()

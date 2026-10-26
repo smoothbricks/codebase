@@ -288,12 +288,12 @@ impl TelemetryDate {
     /// `None` unless the triple is a proleptic-Gregorian date on or after 1970-01-01.
     pub fn new(year: u16, month: u8, day: u8) -> Option<Self> {
         let (year, month, day) = (u64::from(year), u64::from(month), u64::from(day));
-        super::days_from_civil(year, month, day).map(|_| Self { year, month, day })
+        cowshed_types::clock::days_from_civil(year, month, day).map(|_| Self { year, month, day })
     }
 
     /// The UTC date `seconds` after the epoch. Total over every `u64`.
     pub fn from_unix_seconds(seconds: u64) -> Self {
-        let (year, month, day) = super::civil_from_days(seconds / 86_400);
+        let (year, month, day) = cowshed_types::clock::civil_from_days(seconds / 86_400);
         Self { year, month, day }
     }
 }

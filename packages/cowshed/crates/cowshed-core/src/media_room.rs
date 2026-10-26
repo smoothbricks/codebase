@@ -23,7 +23,7 @@ use std::time::SystemTime;
 use cowshed_apfs::media_cap::{MEDIA_PER_IMAGE, MediaReading};
 
 use crate::api::operations::OperationRequest;
-use crate::metadata::WorkspaceName;
+use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::RepoId;
 
 /// Why an attached workspace keeps its images.
@@ -667,7 +667,7 @@ mod native {
 
     fn unreleased(
         repo: &cowshed_types::repository::RepoId,
-        name: &crate::metadata::WorkspaceName,
+        name: &cowshed_types::metadata::WorkspaceName,
         error: &dyn Display,
     ) -> Busy {
         cowshed_os::eprintln!(
@@ -922,7 +922,7 @@ mod tests {
             ForkRequest, LandRequest, OperationRequest as Op, ReseedRequest,
             WorkspaceAttachRequest, WorkspaceRequest,
         };
-        use crate::metadata::WorkspaceName;
+        use cowshed_types::metadata::WorkspaceName;
         use cowshed_types::repository::RepoId;
 
         use super::{AttachDemand, attach_demand};

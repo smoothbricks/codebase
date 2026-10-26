@@ -23,16 +23,16 @@ use serde::{Deserialize, Serialize};
 use crate::api::dto::{RecoveredImage, RecoveryRetention};
 use crate::copy::{CopyFileIdentity, copy_held_file, verify_held_file};
 use crate::error::{CowshedError, Result};
-use crate::metadata::{
-    DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, sidecar_path,
-};
 use crate::storage::StorageLayout;
 use crate::storage::apfs::native::{checkpoint_fact_path, restore_recovery_fact_path};
 use crate::storage::apfs::{companion_path, split_retired_stem};
 use crate::storage::deletion_log::{self, DeletionKind};
 use crate::storage::recovery::{ABANDON_BUNDLE_EXTENSION, TRASH_NAMESPACE};
-use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_apfs::store_lock::{LockMode, acquire_image_locks};
+use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, sidecar_path,
+};
 use cowshed_types::repository::RepoId;
 /// Backend-owned ephemeral cleanup under recovery's held workspace lifecycle lock.
 pub trait RecoveryEnvironment {
@@ -683,7 +683,7 @@ fn plan(
         files,
         grants,
         retained: deletion_log::recovery_retention(project_root, image),
-        recovered_at: deletion_log::rfc3339_utc(SystemTime::now()),
+        recovered_at: cowshed_types::clock::rfc3339_utc(SystemTime::now()),
         copy,
     };
     if manifest.copy.is_some() {

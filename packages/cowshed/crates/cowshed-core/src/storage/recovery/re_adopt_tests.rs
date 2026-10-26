@@ -22,12 +22,12 @@ use crate::api::GitOid;
 use crate::api::dto::{AdoptOptions, RemoveReport};
 use crate::build_volume::{BuildVolumeId, BuildVolumeRecord, BuildVolumeRole};
 use crate::git_preservation::{self, GitPreservationSnapshot};
-use crate::metadata::{
+use crate::temp_root::TempRoot;
+use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
     PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
     WorkspaceRole, sidecar_path,
 };
-use crate::temp_root::TempRoot;
 use cowshed_types::repository::RepoId;
 
 use super::{

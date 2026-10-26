@@ -207,7 +207,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
         let cgroup = {
             use super::super::job_cgroup::CgroupAuthority;
             let authority = CgroupAuthority::delegated().expect("real delegated cgroup");
-            let incarnation = crate::metadata::WorkspaceIncarnation::new(
+            let incarnation = cowshed_types::metadata::WorkspaceIncarnation::new(
                 uuid::Uuid::new_v4().simple().to_string(),
             )
             .expect("incarnation");

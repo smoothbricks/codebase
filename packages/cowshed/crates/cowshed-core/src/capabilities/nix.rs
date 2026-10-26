@@ -392,7 +392,7 @@ mod tests {
             shed_links: Vec::new(),
             exec_temp_dir: fixture.root.join(".cowshed-tmp"),
             store_root: fixture.root.join("store"),
-            port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
+            port_block: cowshed_types::metadata::PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,
             mode: crate::sandbox::RunSandboxMode::ReadWrite,

@@ -19,7 +19,6 @@ use crate::api::dto::AdoptOptions;
 use crate::api::operations::ReAdoption;
 use crate::build_volume::BuildVolumeId;
 use crate::error::{CowshedError, ErrorCode, Result};
-use crate::metadata::WorkspaceName;
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::storage::apfs::COMPANION_SUFFIX;
 use crate::storage::lifecycle::AdoptHandoff;
@@ -28,7 +27,8 @@ use crate::storage::recovery::{
     ReAdoptEmptyBuild, ReAdoptImage, ReAdoptKeptBuild, ReAdoptMain, ReAdoptMissingMain,
     ReAdoptRetained, ReAdoptSource, STAGING_NAMESPACE,
 };
-use cowshed_apfs::image::IMAGE_EXTENSION;
+use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::metadata::WorkspaceName;
 
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// Re-adopt main: gate, record, then run the replacement (step 1 of the spec, then 2-5).
@@ -186,8 +186,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .to_owned();
         for path in [
             canonical.clone(),
-            crate::metadata::sidecar_path(&canonical),
-            crate::metadata::append_suffix(&canonical, COMPANION_SUFFIX),
+            cowshed_types::metadata::sidecar_path(&canonical),
+            cowshed_types::metadata::append_suffix(&canonical, COMPANION_SUFFIX),
         ] {
             if present(&path)? {
                 return Err(CowshedError::integrity(
@@ -764,7 +764,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 /// The main a re-adoption replaces, as [`StorageProjectRuntimeHost::replaced_main`] found it.
 struct ReplacedMain {
     image: PathBuf,
-    metadata: crate::metadata::DetachedWorkspaceMetadata,
+    metadata: cowshed_types::metadata::DetachedWorkspaceMetadata,
     mounted: bool,
 }
 
@@ -773,11 +773,14 @@ struct ReplacedMain {
 /// nothing, so only what is there is named; a path that cannot be inspected is an error, never
 /// silently left out of the report.
 fn retained_paths(source: &ReAdoptSource) -> Result<Vec<PathBuf>> {
-    use crate::metadata::append_suffix;
+    use cowshed_types::metadata::append_suffix;
     let mut paths = match &source.main {
         ReAdoptMain::Retained(image) => vec![
             image.retained.clone(),
-            append_suffix(&image.retained, crate::metadata::GRANTS_SIDECAR_SUFFIX),
+            append_suffix(
+                &image.retained,
+                cowshed_types::metadata::GRANTS_SIDECAR_SUFFIX,
+            ),
             append_suffix(&image.retained, COMPANION_SUFFIX),
         ],
         ReAdoptMain::Missing(missing) => vec![missing.preserved.clone()],
@@ -957,7 +960,7 @@ async fn capture_git(checkout: &Path) -> Result<crate::git_preservation::GitPres
 /// path it moves to. An image with no record yet is an interrupted creation, never a seed.
 fn old_seeds(
     inputs: Vec<(BuildVolumeId, PathBuf)>,
-    old: &crate::metadata::WorkspaceIncarnation,
+    old: &cowshed_types::metadata::WorkspaceIncarnation,
     retained: &Path,
 ) -> Result<Vec<ReAdoptRetained>> {
     let mut seeds = Vec::new();
@@ -1060,7 +1063,7 @@ fn build_inputs(images: &Path) -> Result<Vec<(BuildVolumeId, PathBuf)>> {
     let mut inputs = Vec::new();
     for entry in entries {
         let path = entry.map_err(unreadable)?.path();
-        let known = cowshed_apfs::image::is_image_path(&path);
+        let known = cowshed_types::image::is_image_path(&path);
         let id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -1077,8 +1080,8 @@ fn build_inputs(images: &Path) -> Result<Vec<(BuildVolumeId, PathBuf)>> {
 fn read_build_record_present(
     image: &Path,
 ) -> Result<Option<crate::build_volume::BuildVolumeRecord>> {
-    let record = crate::metadata::append_suffix(image, crate::build_volume::RECORD_SUFFIX);
-    match crate::metadata::read_json::<crate::build_volume::BuildVolumeRecord>(&record) {
+    let record = cowshed_types::metadata::append_suffix(image, crate::build_volume::RECORD_SUFFIX);
+    match cowshed_types::metadata::read_json::<crate::build_volume::BuildVolumeRecord>(&record) {
         Ok(read) if read.version == crate::build_volume::RECORD_VERSION => Ok(Some(read)),
         Ok(read) => Err(CowshedError::integrity(
             format!(
@@ -1089,7 +1092,7 @@ fn read_build_record_present(
             ),
             "cowshed doctor --json",
         )),
-        Err(crate::metadata::MetadataError::Io { source, .. })
+        Err(cowshed_types::metadata::MetadataError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
             Ok(None)

@@ -71,9 +71,9 @@ use crate::api::resources::{
     ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, ResourceUnitError, StorageIoBytes,
     StorageIoTotals,
 };
-use crate::metadata::WorkspaceIncarnation;
 use crate::runtime::live_membership::{LiveMember, LiveMembership};
 use crate::runtime::placement::linux::ClassCgroup;
+use cowshed_types::metadata::WorkspaceIncarnation;
 
 /// Where the unified cgroup hierarchy is mounted.
 pub const CGROUP_MOUNT: &str = "/sys/fs/cgroup";

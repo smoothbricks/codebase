@@ -1219,7 +1219,7 @@ impl Projected for crate::api::dto::GcReport {
     const READER: &'static Reader = &GC_REPORT;
 }
 
-impl Projected for crate::metadata::GrantSet {
+impl Projected for cowshed_types::metadata::GrantSet {
     const READER: &'static Reader = &GRANT_SET;
 }
 

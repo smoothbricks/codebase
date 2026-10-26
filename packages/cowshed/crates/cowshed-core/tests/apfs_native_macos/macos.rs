@@ -19,11 +19,6 @@ use cowshed_apfs::{
     CommandRunError, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     MountAccess, SystemCommandRunner,
 };
-use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
-    PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
-    WorkspaceRole, sidecar_path,
-};
 use cowshed_core::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource, RestoreFailpoint,
     SystemKernelMountSource,
@@ -38,10 +33,16 @@ use cowshed_core::storage::lifecycle::{
     OperationIdentity, Pin, RetiredRef, Revision, StorageGcOptions, StorageGcReason,
     derive_workspaces,
 };
-use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
+use cowshed_core::storage::{StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::lifecycle::CheckpointLabel;
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
+    PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
+    WorkspaceRole, sidecar_path,
+};
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
@@ -1784,7 +1785,7 @@ fn marker_validation_checks_every_detached_identity_dimension() {
 /// writes into a fresh destination with a new incarnation, so no case takes the idempotent branch.
 #[test]
 fn write_marker_owned_links_revision_follows_the_copy_that_produced_the_marker() {
-    use cowshed_core::metadata::{MARKER_VERSION, OWNED_LINKS_REVISION, WorkspaceMarker};
+    use cowshed_types::metadata::{MARKER_VERSION, OWNED_LINKS_REVISION, WorkspaceMarker};
 
     let fixture = Fixture::new("owned-links-revision");
     let host = native_host(&fixture, RecordingRunner::default());
@@ -1813,7 +1814,7 @@ fn write_marker_owned_links_revision_follows_the_copy_that_produced_the_marker()
             lineage: None,
             owned_links_revision: revision,
         };
-        cowshed_core::metadata::write_json(&mount.join(".cowshed/workspace.json"), &legacy)
+        cowshed_types::metadata::write_json(&mount.join(".cowshed/workspace.json"), &legacy)
             .expect("copied marker");
     };
     let read_revision = |mount: &Path| {
@@ -1985,7 +1986,7 @@ fn metadata_publication_writes_the_requested_identity_and_revision() {
     assert_eq!(published.grants.revision, 17);
     assert_eq!(
         published.info_snapshot,
-        cowshed_core::metadata::WorkspaceInfoSnapshot {
+        cowshed_types::metadata::WorkspaceInfoSnapshot {
             project_root: fixture.root.join("project"),
             role: WorkspaceRole::Main,
             base_commit: "0123456789abcdef".to_owned(),
@@ -2044,7 +2045,7 @@ fn preserved_metadata_keeps_origin_facts_and_refreshes_capture_time() {
     let destination = layout
         .checkpoint_image(
             &WorkspaceName::new("main").expect("main"),
-            &cowshed_core::storage::CheckpointLabel::new("saved").expect("label"),
+            &cowshed_types::lifecycle::CheckpointLabel::new("saved").expect("label"),
         )
         .expect("destination");
     create_image(source.image());
@@ -2118,7 +2119,7 @@ fn canonical_identity_mismatches_are_rejected_one_dimension_at_a_time() {
 fn checkpoint_observation_reads_authoritative_detached_metadata() {
     let fixture = Fixture::new("checkpoint-observe");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let label = cowshed_core::storage::CheckpointLabel::new("ready").expect("label");
+    let label = cowshed_types::lifecycle::CheckpointLabel::new("ready").expect("label");
     let checkpoint = layout
         .checkpoint_image(&WorkspaceName::new("main").expect("main"), &label)
         .expect("checkpoint");

@@ -55,7 +55,7 @@ impl Process {
         Ok(Self {
             pid,
             unique_id: unique_id(pid)?,
-            since: crate::storage::deletion_log::rfc3339_utc(SystemTime::now()),
+            since: cowshed_types::clock::rfc3339_utc(SystemTime::now()),
             command: display_command(std::env::args_os()),
         })
     }

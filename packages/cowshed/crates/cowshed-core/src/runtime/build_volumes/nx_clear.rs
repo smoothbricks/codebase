@@ -12,10 +12,10 @@ use super::reseed::named;
 use super::{BuildVolumes, RuntimeStorageHost, io, storage};
 use crate::api::dto::NxStateClearResult;
 use crate::build_volume::{BuildVolumeState, nx};
-use crate::metadata::WorkspaceName;
 use crate::storage::apfs::native::BuildVolumeClaim;
 use crate::{CowshedError, Result};
 use cowshed_apfs::store_lock::LockMode;
+use cowshed_types::metadata::WorkspaceName;
 
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// Delete every entry directly in each Nx cache and workspace-data directory the build volume

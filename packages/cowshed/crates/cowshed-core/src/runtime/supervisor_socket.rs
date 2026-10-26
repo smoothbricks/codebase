@@ -165,7 +165,7 @@ const SOCKET_DIGEST_HEX: usize = 32;
 pub fn socket_path(
     store_root: &Path,
     repo_id: &cowshed_types::repository::RepoId,
-    workspace: &crate::metadata::WorkspaceName,
+    workspace: &cowshed_types::metadata::WorkspaceName,
 ) -> PathBuf {
     let mut identity = Vec::with_capacity(repo_id.as_str().len() + workspace.as_str().len() + 1);
     identity.extend_from_slice(repo_id.as_str().as_bytes());
@@ -253,8 +253,8 @@ struct HelloWire {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct AuthorityWire {
     repo_id: cowshed_types::repository::RepoId,
-    workspace: crate::metadata::WorkspaceName,
-    workspace_incarnation: crate::metadata::WorkspaceIncarnation,
+    workspace: cowshed_types::metadata::WorkspaceName,
+    workspace_incarnation: cowshed_types::metadata::WorkspaceIncarnation,
     grant_revision: u64,
     lifecycle_revision: u64,
 }
@@ -1498,7 +1498,7 @@ impl DrainReport {
         let published = serde_json::to_vec(&wire)
             .map_err(|error| error.to_string())
             .and_then(|bytes| {
-                crate::metadata::write_atomic_bytes(&self.path, &bytes)
+                cowshed_types::metadata::write_atomic_bytes(&self.path, &bytes)
                     .map_err(|error| error.to_string())
             });
         if let Err(error) = published {
@@ -3406,7 +3406,7 @@ impl JobHold {
 /// between the job's admission and its hold changes nothing.
 pub async fn hold(
     path: &Path,
-    incarnation: &crate::metadata::WorkspaceIncarnation,
+    incarnation: &cowshed_types::metadata::WorkspaceIncarnation,
     job_id: JobId,
 ) -> Result<JobHold> {
     let serving = hello(path).await?;
@@ -3948,7 +3948,7 @@ mod socket_ownership_tests {
         let socket = socket_path(
             Path::new("/store"),
             &cowshed_types::repository::RepoId::parse("acme/widget").expect("repo id"),
-            &crate::metadata::WorkspaceName::new("raven").expect("workspace"),
+            &cowshed_types::metadata::WorkspaceName::new("raven").expect("workspace"),
         );
         let named = |path: &Path| is_socket_name(path.file_name().expect("a file name"));
         assert!(named(&socket), "{}", socket.display());
@@ -4447,8 +4447,8 @@ mod drain_read_tests {
                 WorkspaceAuthoritySnapshot {
                     repo_id: cowshed_types::repository::RepoId::parse("acme/widget")
                         .expect("a repo"),
-                    workspace: crate::metadata::WorkspaceName::main(),
-                    workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(
+                    workspace: cowshed_types::metadata::WorkspaceName::main(),
+                    workspace_incarnation: cowshed_types::metadata::WorkspaceIncarnation::new(
                         "0".repeat(32),
                     )
                     .expect("an incarnation"),

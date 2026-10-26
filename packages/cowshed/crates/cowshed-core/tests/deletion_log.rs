@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cowshed_apfs::{CommandOutput, CommandRequest, CommandRunner};
-use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsExecutionHost, ApfsSubstrateConfig};
 use cowshed_core::storage::deletion_log::{
@@ -19,6 +18,7 @@ use cowshed_core::storage::recovery::{
     FenceStep, FenceSteps, LifecycleIntent, LifecycleIntentJournal,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::RepoId;
 
 #[derive(Clone, Default)]

@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::api::dto::CheckpointQuota;
-use crate::metadata::{EgressRule, GrantSet, MetadataError, WorkspaceName, read_json, write_json};
+use cowshed_types::metadata::{
+    EgressRule, GrantSet, MetadataError, WorkspaceName, read_json, write_json,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -109,7 +111,7 @@ pub struct EffectiveRevisionOverflow;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::EgressMode;
+    use cowshed_types::metadata::EgressMode;
 
     fn rule(host: &str, ports: &[u16]) -> EgressRule {
         EgressRule {

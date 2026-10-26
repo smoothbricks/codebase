@@ -11,13 +11,13 @@ use cowshed_core::gateway_sessions::{
     reconcile_against_status, reconcile_project, reconcile_project_with_reallocator,
     reconcile_workspace, stable_workspace_id, workspace_session_prefix,
 };
-use cowshed_core::metadata::{
-    EgressMode, EgressRule, GrantSet, WorkspaceIncarnation, WorkspaceName,
-};
 use cowshed_core::{CowshedError, HeldWorkspace, Result};
 use cowshed_gateway_types::{
     CanonicalTarget, DaemonStatus, EgressMode as GatewayEgressMode, SessionStatus, TargetScheme,
     WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+};
+use cowshed_types::metadata::{
+    EgressMode, EgressRule, GrantSet, WorkspaceIncarnation, WorkspaceName,
 };
 use cowshed_types::repository::RepoId;
 use std::collections::{BTreeMap, BTreeSet};

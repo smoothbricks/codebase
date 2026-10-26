@@ -9,4 +9,5 @@ publish.workspace = true
 [dev-dependencies]
 cowshed-apfs = { path = "../cowshed-apfs" }
 cowshed-os = { path = "../cowshed-os" }
+cowshed-types = { path = "../cowshed-types" }
 libc = "0.2"

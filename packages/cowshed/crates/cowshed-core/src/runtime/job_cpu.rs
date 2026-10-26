@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::api::dto::{ExecClass, JobId};
 use crate::error::{CowshedError, CpuAdmissionRefusal, Result};
 use crate::host_pressure::{Decision, RECHECK_EVERY, may_start, read_memory_pressure};
-use crate::metadata::WorkspaceIncarnation;
+use cowshed_types::metadata::WorkspaceIncarnation;
 
 /// The count a job's command reads beside its fifo (05_gateway.md "Cargo reads its holder's
 /// jobserver").

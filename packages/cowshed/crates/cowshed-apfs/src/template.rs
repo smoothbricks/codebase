@@ -8,12 +8,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::image::{IMAGE_EXTENSION, ImageCapacity};
+use crate::image::ImageCapacity;
 use crate::store_lock::{LockMode, StoreLockError, Taker, acquire_image_locks, verify_no_symlinks};
 use crate::{
     ApfsBackend, ApfsError, CommandRunner, CreateImageRequest, DetachIntent, MacOsApfsBackend,
     timed_apfs_step,
 };
+use cowshed_types::image::IMAGE_EXTENSION;
 
 /// Why the store's template could not be found or minted.
 #[derive(Debug)]

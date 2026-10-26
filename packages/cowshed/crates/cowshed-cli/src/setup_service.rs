@@ -40,7 +40,6 @@ use cowshed_core::caches_retirement::{
     self, LeftoverReason, Merge, Owner, RetirementError, RetirementLayout, RetirementReport,
 };
 use cowshed_core::capabilities::sccache::cache_directory;
-use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::runtime::project::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::bootstrap::{
     CachesVolume, CanonicalRoots, FstabOutcome, HostAction, HostActionOutcome, HostActionResult,
@@ -54,6 +53,7 @@ use cowshed_core::{
     CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
     validate_existing_host_storage,
 };
+use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::RepoId;
 use std::fs;
 use std::io::{self, Write};

@@ -6,7 +6,7 @@ use crate::capabilities::{CapabilityContribution, EnvAction};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
+use cowshed_types::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
 
 pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
 

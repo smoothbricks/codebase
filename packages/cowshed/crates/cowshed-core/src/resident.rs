@@ -30,12 +30,12 @@
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::GitOid;
-use crate::metadata::{
-    DetachedWorkspaceMetadata, PublicationState, WorkspaceMarker, WorkspaceName, sidecar_path,
-};
 use crate::runtime::supervisor::{WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle};
 use crate::runtime::supervisor_socket::{self, Hello};
 use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, PublicationState, WorkspaceMarker, WorkspaceName, sidecar_path,
+};
 use cowshed_types::repository::RepoId;
 
 /// Git's own discovery honours these; a caller that sets one is answered by Git, through the
@@ -424,14 +424,14 @@ fn current_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::{
-        GrantSet, MARKER_VERSION, NEW_PORT_BLOCK_SIZE, Platform, PortBlock, SIDECAR_VERSION,
-        WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole, write_json,
-    };
     use crate::storage::recovery::{
         LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
     };
     use cowshed_os::test_backstop::CommandBackstop as _;
+    use cowshed_types::metadata::{
+        GrantSet, MARKER_VERSION, NEW_PORT_BLOCK_SIZE, Platform, PortBlock, SIDECAR_VERSION,
+        WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole, write_json,
+    };
     use std::os::unix::fs::PermissionsExt as _;
 
     const RETIRED_SESSIONS: usize = 1000;

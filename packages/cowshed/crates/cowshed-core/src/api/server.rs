@@ -5,11 +5,11 @@ use super::operations::{
 };
 use super::peer_credentials::PeerCredentialsError;
 use crate::error::{CowshedError, ErrorCode, Result};
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use async_trait::async_trait;
 use bytes::Bytes;
 use codec::Demand;
 use cowshed_os::timing::StepSink;
+use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_types::repository::RepoId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

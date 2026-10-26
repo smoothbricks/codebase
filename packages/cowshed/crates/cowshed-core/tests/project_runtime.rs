@@ -32,9 +32,6 @@ use cowshed_core::api::operations::{
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
 use cowshed_core::error::CpuAdmissionRefusal;
-use cowshed_core::metadata::{
-    NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
-};
 use cowshed_core::runtime::job_groups::Birth;
 #[cfg(target_os = "macos")]
 use cowshed_core::runtime::supervisor::NxDaemonRetirement;
@@ -49,6 +46,9 @@ use cowshed_core::runtime::{
     ProjectSnapshots, RuntimeLogChunk, WorkspaceSnapshot,
 };
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
+use cowshed_types::metadata::{
+    NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
 use cowshed_types::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
 
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
@@ -2605,7 +2605,7 @@ fn supervisor_config_of(
             workspace_mount: workspace_root.clone(),
             exec_temp_dir: root.join("tmp"),
             store_root: root.join("store"),
-            port_block: cowshed_core::metadata::PortBlock::new(49_136, 16).expect("port block"),
+            port_block: cowshed_types::metadata::PortBlock::new(49_136, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,

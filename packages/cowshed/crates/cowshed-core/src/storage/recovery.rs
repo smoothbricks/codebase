@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RemoveReport, RevisionTarget};
 use crate::error::{CowshedError, Result as CowshedResult};
-use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::metadata::{
+    MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json,
+};
 use cowshed_types::repository::RepoId;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
 pub const STAGING_NAMESPACE: &str = ".staging";
@@ -173,7 +175,7 @@ pub struct ReAdoptSource {
     /// main could be re-adopted holds as a retained image.
     #[serde(rename = "image")]
     pub main: ReAdoptMain,
-    pub metadata: crate::metadata::DetachedWorkspaceMetadata,
+    pub metadata: cowshed_types::metadata::DetachedWorkspaceMetadata,
     /// The incarnation the replacement is published as, chosen before the first mutation: the
     /// only one the intent may complete with.
     pub replacement: WorkspaceIncarnation,
@@ -342,7 +344,7 @@ impl ReAdoptSource {
                     let staged_image = project
                         .join(STAGING_NAMESPACE)
                         .join(format!("readopt-{new}-build"))
-                        .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
+                        .with_extension(cowshed_types::image::IMAGE_EXTENSION);
                     if build.replacement_image != staged_image {
                         return refuse(format!(
                             "replacement build image {} is not {}",
@@ -370,7 +372,7 @@ impl ReAdoptSource {
             ReAdoptMain::Missing(missing) => {
                 let canonical = project
                     .join("main")
-                    .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
+                    .with_extension(cowshed_types::image::IMAGE_EXTENSION);
                 if missing.canonical != canonical {
                     return refuse(format!(
                         "missing main image {} is not {}",
@@ -525,10 +527,10 @@ pub const RETAINED_NAMESPACE: &str = "retained";
 
 /// Both paths of a retained input are RAW images. Cowshed attaches RAW only and converts nothing,
 /// so a record naming a file in another format is refused by that format and its path
-/// ([`crate::metadata::MetadataError::UnsupportedImageExtension`]), never attached.
+/// ([`cowshed_types::metadata::MetadataError::UnsupportedImageExtension`]), never attached.
 fn require_raw(original: &Path, retained: &Path) -> std::result::Result<(), String> {
-    crate::metadata::validate_image_path(original)
-        .and_then(|()| crate::metadata::validate_image_path(retained))
+    cowshed_types::metadata::validate_image_path(original)
+        .and_then(|()| cowshed_types::metadata::validate_image_path(retained))
         .map_err(|error| error.to_string())
 }
 
@@ -544,7 +546,7 @@ fn retained_at(
     let image = |parent: &Path, name: &str| {
         parent
             .join(name)
-            .with_extension(cowshed_apfs::image::IMAGE_EXTENSION)
+            .with_extension(cowshed_types::image::IMAGE_EXTENSION)
     };
     original == image(directory, stem) && retained == image(retained_directory, retained_stem)
 }
@@ -732,7 +734,7 @@ impl LifecycleIntent {
     /// The detached metadata this intent carries for the workspace it rebuilds. A re-adoption's
     /// main keeps its grants, port block included, here while its image sits retained or staged
     /// outside the canonical inventory (04_sandbox.md, `portBlock`).
-    pub fn carried_metadata(&self) -> Option<&crate::metadata::DetachedWorkspaceMetadata> {
+    pub fn carried_metadata(&self) -> Option<&cowshed_types::metadata::DetachedWorkspaceMetadata> {
         match self {
             Self::ReAdopt { source, .. } => Some(&source.metadata),
             Self::Adopt { .. } | Self::Create { .. } | Self::Fork { .. } | Self::Retire { .. } => {
@@ -1594,7 +1596,7 @@ mod prepared_retirement_diagnostic_tests {
     use std::path::Path;
 
     use crate::error::{CowshedError, ErrorCode};
-    use crate::metadata::WorkspaceName;
+    use cowshed_types::metadata::WorkspaceName;
 
     use super::prepared_retirement_unreadable;
 

@@ -1140,9 +1140,9 @@ mod tests {
             BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, Registrant,
             Registration,
         };
-        use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
         use crate::storage::apfs::{ApfsSubstrateConfig, native::MacOsApfsExecutionHost};
         use cowshed_os::namespace::{HostNamespace, TestNamespace};
+        use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
         use cowshed_types::repository::{ProjectPaths, RepoId};
 
         let fixture = Fixture::new();

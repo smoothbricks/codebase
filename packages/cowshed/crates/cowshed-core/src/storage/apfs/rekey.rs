@@ -43,12 +43,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::metadata::{
+use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
+use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, PublicationState, WorkspaceIncarnation, WorkspaceMarker,
     WorkspaceName, WorkspaceRole, image_from_sidecar_path, read_json, sidecar_path,
     validate_image_path,
 };
-use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
 use cowshed_types::repository::RepoId;
 
 use super::ApfsStorageError;
@@ -267,7 +267,7 @@ pub fn rekey_workspace(
     // recognizes, and the revision derives from the quarantined copy, so a
     // retry converges instead of drifting.
     let republished = DetachedWorkspaceMetadata {
-        grants: crate::metadata::GrantSet {
+        grants: cowshed_types::metadata::GrantSet {
             revision,
             ..source.base.grants.clone()
         },

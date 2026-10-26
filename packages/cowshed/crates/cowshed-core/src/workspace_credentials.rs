@@ -14,12 +14,12 @@ use thiserror::Error;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::metadata::{
-    Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes,
-};
 use crate::storage::lifecycle::LifecycleWorkspace;
 use crate::workspace_environment::{
     EnvironmentMount, WorkspaceEnvironmentError, write_workspace_environment,
+};
+use cowshed_types::metadata::{
+    Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes,
 };
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
@@ -548,8 +548,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::metadata::WorkspaceRole;
     use crate::storage::lifecycle::Revision;
+    use cowshed_types::metadata::WorkspaceRole;
 
     /// The tightest owned set for a workspace: exactly the identity it answers to.
     fn sole(workspace: &LifecycleWorkspace) -> OwnedRepoIds {
@@ -635,11 +635,11 @@ mod tests {
         fs::create_dir(&image_mount).expect("image mount");
         let key_path = root.join("raven.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
-        let port_block = crate::metadata::PortBlock::new(40_976, 16).expect("live block");
+        let port_block = cowshed_types::metadata::PortBlock::new(40_976, 16).expect("live block");
         mint_workspace_credentials(
             &workspace,
             &image_mount,
-            crate::metadata::Platform::Macos,
+            cowshed_types::metadata::Platform::Macos,
             Some(port_block),
             &key_path,
         )
@@ -659,7 +659,7 @@ mod tests {
                 temp_dir: &temp_dir,
                 capability_env: &crate::capabilities::CapabilityContribution::default(),
             },
-            crate::metadata::Platform::Macos,
+            cowshed_types::metadata::Platform::Macos,
             Some(port_block),
         )
         .expect("republish");
@@ -743,7 +743,7 @@ mod tests {
         mint_workspace_credentials(
             &workspace("00112233445566778899aabbccddeeff"),
             &image_mount,
-            crate::metadata::Platform::Linux,
+            cowshed_types::metadata::Platform::Linux,
             None,
             &key_path,
         )

@@ -1,18 +1,16 @@
 use std::ffi::OsStr;
-use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::metadata::{
+use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::lifecycle::CheckpointLabel;
+use cowshed_types::metadata::{
     CheckoutRootRecord, MetadataError, SlotBindings, SlotBindingsRecord, WorkspaceName,
     append_suffix, sidecar_path,
 };
-use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_types::repository::{PathLayoutError, ProjectPaths, RepoId};
 
 pub mod apfs;
@@ -30,90 +28,7 @@ pub mod trace_columns;
 pub mod trace_segment;
 
 pub const WORKSPACE_MARKER_PATH: &str = ".cowshed/workspace.json";
-/// The undo-image grammar [`CheckpointLabel`] refuses and the restorer writes. One constant,
-/// because a label admitted here that later collides with a controller undo image would
-/// silently overwrite the only crash-consistent copy of a workspace.
-pub const PRE_RESTORE_PREFIX: &str = "pre-restore-";
 use recovery::STAGING_NAMESPACE;
-
-/// A validated, path-safe checkpoint label.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CheckpointLabel(String);
-
-impl CheckpointLabel {
-    pub fn new(value: impl Into<String>) -> Result<Self, StorageLayoutError> {
-        let value = value.into();
-        let bytes = value.as_bytes();
-        let valid = (1..=128).contains(&bytes.len())
-            && !value.starts_with(PRE_RESTORE_PREFIX)
-            && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-            && bytes.iter().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'.' | b'_' | b'-')
-            });
-        if valid {
-            Ok(Self(value))
-        } else {
-            Err(StorageLayoutError::InvalidCheckpointLabel(value))
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// The default label for an unlabeled checkpoint: the UTC second of the request, rendered in
-    /// the label alphabet (`2026-07-11t120309z`). Workspace revision is the wrong key — it does
-    /// not advance between checkpoints, so a revision-derived default collides deterministically
-    /// on the second unlabeled checkpoint. A checkpoint image may be the only crash-consistent
-    /// copy, so an existing label is never reused or overwritten: a same-second collision takes
-    /// `-2`, `-3`, … instead.
-    pub fn utc_default(now: SystemTime, mut is_taken: impl FnMut(&str) -> bool) -> Self {
-        let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let (year, month, day) = civil_from_days(seconds / 86_400);
-        let clock = seconds % 86_400;
-        let base = format!(
-            "{year:04}-{month:02}-{day:02}t{:02}{:02}{:02}z",
-            clock / 3_600,
-            clock % 3_600 / 60,
-            clock % 60,
-        );
-        if !is_taken(&base) {
-            return Self(base);
-        }
-        (2_u64..)
-            .map(|ordinal| format!("{base}-{ordinal}"))
-            .find(|candidate| !is_taken(candidate))
-            .map(Self)
-            .expect("existing checkpoint labels are finite")
-    }
-}
-
-impl fmt::Display for CheckpointLabel {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl Serialize for CheckpointLabel {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for CheckpointLabel {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
 
 /// All controller-owned sibling paths associated with one image.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,7 +203,8 @@ impl StorageLayout {
 
     /// Every slot occupancy for this project. An absent record is no occupancies.
     pub fn slot_bindings(&self) -> Result<SlotBindings, StorageLayoutError> {
-        match crate::metadata::read_json::<SlotBindingsRecord>(&self.project.slot_bindings) {
+        match cowshed_types::metadata::read_json::<SlotBindingsRecord>(&self.project.slot_bindings)
+        {
             Ok(record) => Ok(record.into_bindings()?),
             Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 Ok(SlotBindings::default())
@@ -298,7 +214,7 @@ impl StorageLayout {
     }
 
     pub fn record_slot_bindings(&self, bindings: &SlotBindings) -> Result<(), MetadataError> {
-        crate::metadata::write_json(
+        cowshed_types::metadata::write_json(
             &self.project.slot_bindings,
             &SlotBindingsRecord::new(bindings),
         )
@@ -307,7 +223,8 @@ impl StorageLayout {
     /// The checkout root main's removal recorded, or `None` when main has never been removed.
     /// A present record that does not parse fails closed.
     pub fn recorded_checkout_root(&self) -> Result<Option<PathBuf>, MetadataError> {
-        match crate::metadata::read_json::<CheckoutRootRecord>(&self.project.checkout_root) {
+        match cowshed_types::metadata::read_json::<CheckoutRootRecord>(&self.project.checkout_root)
+        {
             Ok(record) => Ok(Some(record.checkout_root().to_owned())),
             Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 Ok(None)
@@ -317,7 +234,7 @@ impl StorageLayout {
     }
 
     pub fn record_checkout_root(&self, checkout_root: &Path) -> Result<(), MetadataError> {
-        crate::metadata::write_json(
+        cowshed_types::metadata::write_json(
             &self.project.checkout_root,
             &CheckoutRootRecord::new(checkout_root)?,
         )
@@ -397,62 +314,6 @@ fn image_stem(file_name: &str) -> Option<&str> {
         .strip_suffix(IMAGE_EXTENSION)
         .and_then(|name| name.strip_suffix('.'))
         .filter(|stem| !stem.is_empty())
-}
-
-/// Days since 1970-01-01 to a proleptic-Gregorian civil date (Howard Hinnant's algorithm,
-/// restricted to the non-negative domain). Total over every `u64` second count, unlike
-/// `libc::gmtime_r`, which rejects out-of-range `time_t` — a label generator must not fail.
-pub(crate) const fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let day_of_era = z % 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + (month <= 2) as u64;
-    (year, month, day)
-}
-
-/// Inverse of [`civil_from_days`]. `None` when the triple is not a proleptic-Gregorian
-/// date on or after 1970-01-01 — the non-negative domain that function is total over.
-pub(crate) const fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
-    if year == 0 || month < 1 || month > 12 || day == 0 {
-        return None;
-    }
-    let (era_year, shifted_month) = if month > 2 {
-        (year, month - 3)
-    } else {
-        let Some(previous) = year.checked_sub(1) else {
-            return None;
-        };
-        (previous, month + 9)
-    };
-    let era = era_year / 400;
-    let year_of_era = era_year - era * 400;
-    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let Some(z) = era.checked_mul(146_097) else {
-        return None;
-    };
-    let Some(z) = z.checked_add(day_of_era) else {
-        return None;
-    };
-    let Some(days) = z.checked_sub(719_468) else {
-        return None;
-    };
-    let (y, m, d) = civil_from_days(days);
-    if y == year && m == month && d == day {
-        Some(days)
-    } else {
-        None
-    }
 }
 
 fn checked_child(root: &Path, component: &str) -> Result<PathBuf, StorageLayoutError> {
@@ -538,8 +399,8 @@ fn reject_symlink(path: &Path) -> Result<(), StorageLayoutError> {
 
 #[derive(Debug, Error)]
 pub enum StorageLayoutError {
-    #[error("invalid checkpoint label {0:?}")]
-    InvalidCheckpointLabel(String),
+    #[error(transparent)]
+    InvalidCheckpointLabel(#[from] cowshed_types::lifecycle::InvalidCheckpointLabel),
     #[error("workspace `main` is not a session")]
     MainIsNotSession,
     #[error("unsafe storage path component {0:?}")]
@@ -565,7 +426,7 @@ pub enum StorageLayoutError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::SlotId;
+    use cowshed_types::metadata::SlotId;
     use proptest::prelude::*;
 
     fn layout() -> StorageLayout {
@@ -681,7 +542,7 @@ mod tests {
             paths.ca_private_key,
             Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg.ca.key")
         );
-        crate::metadata::validate_image_path(&paths.image).unwrap();
+        cowshed_types::metadata::validate_image_path(&paths.image).unwrap();
     }
 
     #[test]
@@ -831,103 +692,6 @@ mod tests {
     }
 
     #[test]
-    fn labels_are_immutable_validated_components() {
-        for valid in ["a", "ci-fail", "2026-07-11t120000z", "release_1.2"] {
-            let label = CheckpointLabel::new(valid).unwrap();
-            assert_eq!(label.to_string(), valid);
-            let encoded = serde_json::to_string(&label).unwrap();
-            assert_eq!(
-                serde_json::from_str::<CheckpointLabel>(&encoded).unwrap(),
-                label
-            );
-        }
-        for invalid in [
-            "",
-            ".",
-            "..",
-            "Upper",
-            "-leading",
-            "slash/name",
-            "a b",
-            "pre-restore-user",
-            "pre-restore-00000000000000000000000000000002",
-        ] {
-            assert!(
-                CheckpointLabel::new(invalid).is_err(),
-                "accepted {invalid:?}"
-            );
-        }
-    }
-
-    fn at(seconds: u64) -> SystemTime {
-        UNIX_EPOCH + std::time::Duration::from_secs(seconds)
-    }
-
-    #[test]
-    fn the_default_label_is_the_documented_utc_second() {
-        for (seconds, expected) in [
-            (0, "1970-01-01t000000z"),
-            (1_783_771_200, "2026-07-11t120000z"),
-            // Leap day and both neighbours: a leap-year error shifts one of the three.
-            (1_835_395_199, "2028-02-28t235959z"),
-            (1_835_395_200, "2028-02-29t000000z"),
-            (1_835_481_600, "2028-03-01t000000z"),
-            // Year boundary at exactly midnight UTC.
-            (1_893_455_999, "2029-12-31t235959z"),
-            (1_893_456_000, "2030-01-01t000000z"),
-            // 2100 is the century rule's first bite: divisible by 4 but not a leap year.
-            (4_107_542_399, "2100-02-28t235959z"),
-            (4_107_542_400, "2100-03-01t000000z"),
-            // 2400 restores the 400-year exception, so its February 29th exists.
-            (13_574_585_228, "2400-02-29t060708z"),
-        ] {
-            let label = CheckpointLabel::utc_default(at(seconds), |_| false);
-            assert_eq!(label.as_str(), expected, "at {seconds}s");
-            // Every generated default must survive the validator it bypasses.
-            assert_eq!(CheckpointLabel::new(expected).unwrap(), label);
-        }
-    }
-
-    #[test]
-    fn civil_from_days_pins_known_unix_epoch_dates() {
-        // Independent of the label formatter: a wrong calendar goes red even if it is
-        // self-inverse. Day numbers are unix seconds / 86400.
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(days_from_civil(1970, 1, 1), Some(0));
-        assert_eq!(civil_from_days(20_645), (2026, 7, 11));
-        assert_eq!(days_from_civil(2026, 7, 11), Some(20_645));
-        // 2100 is divisible by 4 but not a leap year.
-        assert_eq!(civil_from_days(47_540), (2100, 2, 28));
-        assert_eq!(days_from_civil(2100, 2, 28), Some(47_540));
-        assert_eq!(days_from_civil(2100, 2, 29), None);
-        assert_eq!(civil_from_days(47_541), (2100, 3, 1));
-        // 2000 is the 400-year leap exception; 1900 is the other century non-leap and
-        // also sits before the unix epoch this pair is total over.
-        assert!(days_from_civil(2000, 2, 29).is_some());
-        assert_eq!(days_from_civil(1900, 2, 29), None);
-        assert_eq!(days_from_civil(1900, 2, 28), None);
-        assert!(days_from_civil(2400, 2, 29).is_some());
-    }
-
-    #[test]
-    fn a_same_second_collision_takes_the_next_ordinal_and_never_reuses_a_label() {
-        let now = at(1_783_771_200);
-        let base = CheckpointLabel::utc_default(now, |_| false);
-        assert_eq!(base.as_str(), "2026-07-11t120000z");
-
-        let taken = [base.as_str().to_owned()];
-        let second =
-            CheckpointLabel::utc_default(now, |candidate| taken.iter().any(|l| l == candidate));
-        assert_eq!(second.as_str(), "2026-07-11t120000z-2");
-
-        let taken = [taken[0].clone(), second.as_str().to_owned()];
-        let third =
-            CheckpointLabel::utc_default(now, |candidate| taken.iter().any(|l| l == candidate));
-        assert_eq!(third.as_str(), "2026-07-11t120000z-3");
-        assert_eq!(CheckpointLabel::new(third.as_str()).unwrap(), third);
-    }
-
-    #[test]
     fn enumeration_returns_only_published_dmg_images() {
         let entries = [
             "/store/sessions/raven.dmg",
@@ -1043,26 +807,5 @@ mod tests {
             prop_assert_eq!(first, reparsed);
         }
 
-        // TelemetryDate::new takes years that fit u16, from unix
-        // epoch day 0 (1970-01-01) through 65535-12-31. Pre-1970 dates are outside
-        // this pair: civil_from_days is total over u64 days, not over negative time_t.
-        #[test]
-        fn days_from_civil_inverts_civil_from_days(
-            days in 0u64..=days_from_civil(65535, 12, 31).expect("u16 max year is after 1970"),
-        ) {
-            let (year, month, day) = civil_from_days(days);
-            prop_assert_eq!(days_from_civil(year, month, day), Some(days));
-        }
-
-        #[test]
-        fn civil_from_days_inverts_valid_post_epoch_dates(
-            year in 1970u64..=65535,
-            month in 1u64..=12,
-            day in 1u64..=31,
-        ) {
-            if let Some(days) = days_from_civil(year, month, day) {
-                prop_assert_eq!(civil_from_days(days), (year, month, day));
-            }
-        }
     }
 }

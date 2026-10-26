@@ -15,10 +15,6 @@ use cowshed_apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
     ImageCapture, MacOsApfsBackend, SystemCommandRunner, volume_name,
 };
-use cowshed_core::metadata::{
-    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
-    WorkspaceRole,
-};
 use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling, shared_bytes};
 use cowshed_core::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
@@ -31,8 +27,13 @@ use cowshed_core::storage::lifecycle::{
     AdoptHandoff, AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent,
     MountState, OperationIdentity, Pin, RestoreMode, Revision, StorageGcOptions, Substrate,
 };
-use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
+use cowshed_core::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_types::lifecycle::CheckpointLabel;
+use cowshed_types::metadata::{
+    GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
+    WorkspaceRole,
+};
 use cowshed_types::repository::RepoId;
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
@@ -52,9 +53,9 @@ fn seed(namespace: TestNamespace, store: &Path) {
 struct DeterministicIncarnations(AtomicU64);
 
 impl IncarnationSource for DeterministicIncarnations {
-    fn mint(&self) -> Result<cowshed_core::metadata::WorkspaceIncarnation, ApfsStorageError> {
+    fn mint(&self) -> Result<cowshed_types::metadata::WorkspaceIncarnation, ApfsStorageError> {
         let value = self.0.fetch_add(1, Ordering::Relaxed);
-        cowshed_core::metadata::WorkspaceIncarnation::new(format!("{value:032x}"))
+        cowshed_types::metadata::WorkspaceIncarnation::new(format!("{value:032x}"))
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 }
@@ -403,7 +404,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         let streamed = fs::read(&stream)?;
         assert_eq!(streamed.len(), STREAM_MEBIBYTES * 1024 * 1024);
         assert!(streamed.iter().all(|byte| *byte == 0x5a));
-        let marker = cowshed_core::metadata::WorkspaceMarker::read_from(
+        let marker = cowshed_types::metadata::WorkspaceMarker::read_from(
             &checkout_path.join(WORKSPACE_MARKER_PATH),
         )?;
         assert_eq!(&marker.workspace_incarnation, restored.incarnation());

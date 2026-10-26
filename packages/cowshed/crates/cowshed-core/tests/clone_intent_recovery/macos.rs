@@ -14,9 +14,6 @@ use cowshed_core::api::dto::{
 };
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
-use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, PortBlock, PublicationState, WorkspaceIncarnation, WorkspaceName,
-};
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope, supervisor_socket};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
@@ -30,6 +27,9 @@ use cowshed_core::storage::recovery::{
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::TestNamespace;
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, PortBlock, PublicationState, WorkspaceIncarnation, WorkspaceName,
+};
 use cowshed_types::repository::RepoId;
 use serde_json::{Value, json};
 
@@ -67,7 +67,7 @@ async fn clean_landed_source_is_physically_deleted_before_reply_and_crash_replay
         !image.exists(),
         "source image is physically absent before shutdown"
     );
-    assert!(!cowshed_core::metadata::sidecar_path(&image).exists());
+    assert!(!cowshed_types::metadata::sidecar_path(&image).exists());
     let trash = fixture.layout().project().sessions.join(".trash");
     assert!(
         !trash.exists(),
@@ -480,10 +480,10 @@ async fn ignored_content_is_released_and_hidden_only_copy_content_keeps_recovery
             fs::read(recovery.join("ignored-notes")).unwrap(),
             b"only ignored copy\n"
         );
-        assert!(cowshed_core::metadata::sidecar_path(&recovery).exists());
+        assert!(cowshed_types::metadata::sidecar_path(&recovery).exists());
     }
     restarted.shutdown().await.expect("stop restarted runtime");
-    fs::remove_file(cowshed_core::metadata::sidecar_path(&recovery)).unwrap();
+    fs::remove_file(cowshed_types::metadata::sidecar_path(&recovery)).unwrap();
     let missing_record = fixture.gc().await;
     fixture
         .call(
@@ -898,7 +898,7 @@ impl Fixture {
         self.layout()
             .slot_bindings()
             .expect("slot bindings")
-            .tenant(cowshed_core::metadata::SlotId::new(slot).expect("slot"))
+            .tenant(cowshed_types::metadata::SlotId::new(slot).expect("slot"))
             .cloned()
     }
 
@@ -1145,7 +1145,7 @@ fn worktree() -> ForkOptions {
 }
 #[tokio::test]
 async fn cold_named_open_reads_selected_authority_and_preserves_full_diagnostics() {
-    use cowshed_core::metadata::sidecar_path;
+    use cowshed_types::metadata::sidecar_path;
     let fixture = Fixture::new("cold-named-scope");
     let runtime = fixture.adopt().await;
     for workspace in ["selected", "broken"] {
@@ -1333,7 +1333,7 @@ fn image_lock_holder() {
         &cowshed_core::held_lock::ImageLockTaker {
             holding: &cowshed_core::api::held_lock::LockHolding::of(
                 cowshed_core::api::held_lock::LockOperation::Fork,
-                &cowshed_core::metadata::WorkspaceName::new("sibling").unwrap(),
+                &cowshed_types::metadata::WorkspaceName::new("sibling").unwrap(),
             ),
         },
     )
@@ -1479,7 +1479,7 @@ fn an_entry_wait_ends_when_the_watched_process_exits() {
 /// is served as it stands under the held lock.
 #[tokio::test]
 async fn a_supervisor_serves_while_other_processes_hold_its_image_locks() {
-    use cowshed_core::metadata::sidecar_path;
+    use cowshed_types::metadata::sidecar_path;
     let fixture = Fixture::new("sup-locks");
     let runtime = fixture.adopt().await;
     for workspace in ["served", "broken"] {

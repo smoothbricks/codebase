@@ -163,11 +163,11 @@ pub(crate) fn published_directory(
 ) -> (
     super::DirectoryExecutionHost,
     PathBuf,
-    crate::metadata::DetachedWorkspaceMetadata,
+    cowshed_types::metadata::DetachedWorkspaceMetadata,
 ) {
     use super::*;
-    use crate::metadata::{GrantSet, PortBlock};
     use cowshed_os::namespace::{HostNamespace, TestNamespace};
+    use cowshed_types::metadata::{GrantSet, PortBlock};
     let config = ApfsSubstrateConfig::new(
         HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
         scratch.path().join("store"),
@@ -230,7 +230,7 @@ pub(crate) fn published_directory(
         lineage: None,
         owned_links_revision: 0,
     };
-    crate::metadata::write_json(&image.join(WORKSPACE_MARKER_PATH), &marker).unwrap();
+    cowshed_types::metadata::write_json(&image.join(WORKSPACE_MARKER_PATH), &marker).unwrap();
     (
         DirectoryExecutionHost::new(config).unwrap(),
         image,
@@ -286,7 +286,7 @@ fn directory_named_snapshot_and_mount_fence_ignore_broken_siblings() {
     );
     let mut stale = WorkspaceMarker::read_from(&mount.join(WORKSPACE_MARKER_PATH)).unwrap();
     stale.workspace_incarnation = WorkspaceIncarnation::new(format!("{:032x}", 99)).unwrap();
-    crate::metadata::write_json(&mount.join(WORKSPACE_MARKER_PATH), &stale).unwrap();
+    cowshed_types::metadata::write_json(&mount.join(WORKSPACE_MARKER_PATH), &stale).unwrap();
     assert!(host.workspace_mount_state(&mounted.workspace).is_err());
     assert!(
         host.workspace_snapshot(
@@ -335,7 +335,7 @@ fn directory_source_release_keeps_canonical_authority_on_cleanup_refusal() {
 /// outside this module composes the actual release with that guard on one store.
 pub(crate) fn published_directory_paths(
     host: &super::DirectoryExecutionHost,
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
 ) -> (PathBuf, PathBuf) {
     use super::*;
     let storage = layout(&host.config, &metadata.repo_id).unwrap();
@@ -349,7 +349,7 @@ pub(crate) fn published_directory_paths(
 /// carries in production.
 pub(crate) fn release_published_directory(
     host: &super::DirectoryExecutionHost,
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
 ) {
     use super::*;
     let workspace = metadata_workspace_ref(metadata).unwrap();
@@ -361,7 +361,7 @@ pub(crate) fn release_published_directory(
 /// fixture with store-level operations a layout names (recovery export above all).
 pub(crate) fn published_directory_layout(
     host: &super::DirectoryExecutionHost,
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
 ) -> crate::storage::StorageLayout {
     use super::*;
     layout(&host.config, &metadata.repo_id).unwrap()
@@ -371,7 +371,7 @@ pub(crate) fn published_directory_layout(
 /// keeps, named after the workspace and its incarnation.
 pub(crate) fn published_directory_trash(
     host: &super::DirectoryExecutionHost,
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
 ) -> PathBuf {
     use super::*;
     layout(&host.config, &metadata.repo_id)
@@ -390,7 +390,7 @@ pub(crate) fn published_directory_trash(
 /// the recovery export, which must preserve the image.
 pub(crate) fn reclaim_retired_published_directory(
     host: &super::DirectoryExecutionHost,
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    metadata: &cowshed_types::metadata::DetachedWorkspaceMetadata,
 ) {
     use super::*;
     let workspace = metadata_workspace_ref(metadata).unwrap();
@@ -1157,7 +1157,7 @@ fn host_controller_recovery_refuses_a_mounted_temp_subtree_and_keeps_the_image()
     let mount_image = scratch
         .path()
         .join("mounted")
-        .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
+        .with_extension(cowshed_types::image::IMAGE_EXTENSION);
     crate::blank_image::blank_image(namespace, &mount_image);
     let mount = exec_temp.join("mounted");
     fs::create_dir_all(&mount).unwrap();
@@ -1294,7 +1294,7 @@ fn host_controller_recovery_refuses_a_mounted_temp_root_and_keeps_the_image() {
     let mount_image = scratch
         .path()
         .join("root-volume")
-        .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
+        .with_extension(cowshed_types::image::IMAGE_EXTENSION);
     crate::blank_image::blank_image(namespace, &mount_image);
     let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(namespace)));
     let attachment = backend

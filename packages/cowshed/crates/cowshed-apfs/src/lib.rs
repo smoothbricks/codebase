@@ -16,7 +16,7 @@ pub mod release_authority;
 pub mod store_lock;
 pub mod template;
 
-use crate::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
+use crate::image::ImageCapacity;
 use crate::mounts::{NativeUnmountError, PostUnmountFd, UnmountEffect, UnmountMode};
 use cowshed_os::deadline::{Bound, LatencyClass};
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
@@ -24,6 +24,7 @@ use cowshed_os::host_load::HostLoad;
 use cowshed_os::namespace::HostNamespace;
 pub use cowshed_os::process::{CommandOutput, ProcessStatus};
 use cowshed_os::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
+use cowshed_types::image::{IMAGE_EXTENSION, is_image_path};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;

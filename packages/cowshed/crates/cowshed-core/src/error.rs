@@ -376,8 +376,8 @@ pub enum FenceRefusal {
     /// `workspace` is no longer the incarnation the caller expected (the source's
     /// `expected_workspace_incarnation`) or resolved (a lane base passed as `into`).
     IncarnationMoved {
-        workspace: crate::metadata::WorkspaceName,
-        observed: crate::metadata::WorkspaceIncarnation,
+        workspace: cowshed_types::metadata::WorkspaceName,
+        observed: cowshed_types::metadata::WorkspaceIncarnation,
     },
     /// The source workspace's head is not the one expected or validated.
     SourceMoved { observed: crate::api::dto::GitOid },
@@ -582,7 +582,7 @@ impl CowshedError {
     /// as [`cowshed_gateway_types::SupervisorRecovery`]. Every other workspace is served.
     pub fn recovering(
         recovery: cowshed_gateway_types::SupervisorRecovery,
-        workspace: &crate::metadata::WorkspaceName,
+        workspace: &cowshed_types::metadata::WorkspaceName,
     ) -> Self {
         Self {
             code: ErrorCode::Conflict,
@@ -1213,7 +1213,7 @@ mod tests {
         );
 
         // Found through a wrapping error's source chain, the way storage errors carry it.
-        let wrapped = crate::metadata::MetadataError::Io {
+        let wrapped = cowshed_types::metadata::MetadataError::Io {
             path: "/store/.journal.tmp.1".into(),
             source: std::io::Error::from_raw_os_error(libc::EPERM),
         };

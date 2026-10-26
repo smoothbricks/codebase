@@ -12,10 +12,6 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::api::dto::WorkspaceState;
 use crate::api::dto::{ProjectWorkspaces, UnprovenWorkspace, WorkspaceInfo};
-use crate::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, PortBlock, PublicationState, ReservedPortBlocks,
-    WorkspaceIncarnation, WorkspaceName, sidecar_path,
-};
 use crate::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
@@ -34,6 +30,10 @@ use crate::workspace_credentials::{
 };
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::mounts::KernelMountSnapshot;
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, GrantSet, PortBlock, PublicationState, ReservedPortBlocks,
+    WorkspaceIncarnation, WorkspaceName, sidecar_path,
+};
 use cowshed_types::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
 
 pub(crate) const MAX_BINDING_BYTES: u64 = 1024 * 1024;
@@ -941,7 +941,7 @@ fn sidecar_images(directory: &Path) -> Result<Vec<PathBuf>, GatewayInventoryErro
     }
     Ok(read_directory(directory, "enumerating grants sidecars")?
         .iter()
-        .filter_map(|path| crate::metadata::image_from_sidecar_path(path))
+        .filter_map(|path| cowshed_types::metadata::image_from_sidecar_path(path))
         .collect())
 }
 
@@ -981,7 +981,7 @@ impl NativeGatewayInventory {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn port_allocation(&self) -> crate::metadata::PortAllocation {
+    pub(crate) fn port_allocation(&self) -> cowshed_types::metadata::PortAllocation {
         self.storage.port_allocation()
     }
 
@@ -1599,9 +1599,9 @@ impl NativeGatewayInventory {
         checkout: &Path,
     ) -> Result<Option<RepoId>, GatewayInventoryError> {
         let marker_path = checkout.join(crate::storage::WORKSPACE_MARKER_PATH);
-        let marker = match crate::metadata::WorkspaceMarker::read_from(&marker_path) {
+        let marker = match cowshed_types::metadata::WorkspaceMarker::read_from(&marker_path) {
             Ok(marker) => marker,
-            Err(crate::metadata::MetadataError::Io { source, .. })
+            Err(cowshed_types::metadata::MetadataError::Io { source, .. })
                 if source.kind() == io::ErrorKind::NotFound =>
             {
                 // An unmounted main has no in-image marker. The store names its owner by the root it
@@ -1620,7 +1620,9 @@ impl NativeGatewayInventory {
             path: marker_path.clone(),
             message,
         };
-        if marker.role != crate::metadata::WorkspaceRole::Main || !marker.workspace.is_main() {
+        if marker.role != cowshed_types::metadata::WorkspaceRole::Main
+            || !marker.workspace.is_main()
+        {
             return Err(refused(format!(
                 "in-image marker names {} with role {:?}, not the main workspace",
                 marker.workspace, marker.role
@@ -1850,7 +1852,7 @@ impl NativeGatewayInventory {
             ] {
                 for image in sidecar_images(&directory)? {
                     if canonical
-                        && cowshed_apfs::image::is_image_path(&image)
+                        && cowshed_types::image::is_image_path(&image)
                         && fs::symlink_metadata(&image).is_ok()
                     {
                         continue;
@@ -1861,8 +1863,10 @@ impl NativeGatewayInventory {
                     let read = verify_no_symlinks(store, &sidecar)
                         .map_err(|error| error.to_string())
                         .and_then(|()| {
-                            crate::metadata::read_json::<DetachedWorkspaceMetadata>(&sidecar)
-                                .map_err(|error| error.to_string())
+                            cowshed_types::metadata::read_json::<DetachedWorkspaceMetadata>(
+                                &sidecar,
+                            )
+                            .map_err(|error| error.to_string())
                         });
                     match read {
                         Ok(metadata) if metadata.repo_id == repo => {
@@ -2778,7 +2782,7 @@ fn verify_image_path(store_root: &Path, image: &Path) -> Result<(), GatewayInven
                 .map_err(|error| invalid(&sidecar, error.to_string()))?;
             let metadata = DetachedWorkspaceMetadata::read_for_image(image)
                 .map_err(|error| invalid(&sidecar, error.to_string()))?;
-            let marker = crate::metadata::WorkspaceMarker::read_from(
+            let marker = cowshed_types::metadata::WorkspaceMarker::read_from(
                 &target.join(crate::storage::WORKSPACE_MARKER_PATH),
             )
             .map_err(|error| invalid(image, error.to_string()))?;
@@ -2883,15 +2887,15 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Mutex;
 
-    use crate::metadata::{
-        MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION, WorkspaceInfoSnapshot,
-        WorkspaceRole, write_json,
-    };
-    use crate::storage::CheckpointLabel;
     use crate::storage::bootstrap::CanonicalRoots;
     use crate::storage::lifecycle::{KernelMountFact, LifecycleWorkspace, Pin, Revision};
     use crate::workspace_credentials::mint_workspace_credentials;
     use cowshed_os::namespace::TestNamespace;
+    use cowshed_types::lifecycle::CheckpointLabel;
+    use cowshed_types::metadata::{
+        MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION, WorkspaceInfoSnapshot,
+        WorkspaceRole, write_json,
+    };
     use cowshed_types::repository::{BoundIdentity, RepositoryBinding};
 
     use super::*;
@@ -3277,7 +3281,7 @@ mod tests {
             .project()
             .clone();
         let binding: RepositoryBinding =
-            crate::metadata::read_json(&paths.repository_binding).expect("binding");
+            cowshed_types::metadata::read_json(&paths.repository_binding).expect("binding");
         let merged_in = binding
             .rename_primary(merged.clone())
             .expect("adopt as the merged identity")
@@ -3331,9 +3335,9 @@ mod tests {
         let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
         let project = layout.project().clone();
         let raw = layout.main_image().expect("main image").image().to_owned();
-        let raw_sidecar = crate::metadata::sidecar_path(&raw);
+        let raw_sidecar = cowshed_types::metadata::sidecar_path(&raw);
         let aside = project.project_root.join("main-aside.dmg");
-        let aside_sidecar = crate::metadata::sidecar_path(&aside);
+        let aside_sidecar = cowshed_types::metadata::sidecar_path(&aside);
 
         let binding = RepositoryBinding::new(vec![
             BoundIdentity {
@@ -3352,12 +3356,12 @@ mod tests {
         .expect("ambiguous binding");
         write_json(&project.repository_binding, &binding).expect("binding file");
 
-        let marker = crate::metadata::WorkspaceMarker {
-            version: crate::metadata::MARKER_VERSION,
+        let marker = cowshed_types::metadata::WorkspaceMarker {
+            version: cowshed_types::metadata::MARKER_VERSION,
             repo_id: repo.clone(),
             project_root: checkout.clone(),
             workspace: WorkspaceName::new("main").expect("main"),
-            workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(incarnation)
+            workspace_incarnation: cowshed_types::metadata::WorkspaceIncarnation::new(incarnation)
                 .expect("incarnation"),
             role: WorkspaceRole::Main,
             base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
@@ -3472,7 +3476,7 @@ mod tests {
         // Incarnation drift between marker and sidecar.
         let mut drifted = marker.clone();
         drifted.workspace_incarnation =
-            crate::metadata::WorkspaceIncarnation::new("00000000000000000000000000000002")
+            cowshed_types::metadata::WorkspaceIncarnation::new("00000000000000000000000000000002")
                 .expect("other incarnation");
         write_json(&marker_path, &drifted).expect("drifted marker");
         let message = refusal(inventory.re_adoption_primary_for_checkout(&checkout).await);
@@ -4137,10 +4141,10 @@ mod tests {
                 read: vec![PathBuf::from("/opt/shared")],
                 deny_write: Vec::new(),
                 deny: Vec::new(),
-                egress: vec![crate::metadata::EgressRule {
+                egress: vec![cowshed_types::metadata::EgressRule {
                     host: "registry.example.test".to_owned(),
                     ports: Vec::new(),
-                    mode: crate::metadata::EgressMode::Intercept,
+                    mode: cowshed_types::metadata::EgressMode::Intercept,
                 }],
             },
             ..crate::project_policy::ProjectPolicy::default()
@@ -4886,7 +4890,7 @@ mod tests {
         )
         .unwrap();
         let binding: RepositoryBinding =
-            crate::metadata::read_json(&layout.project().repository_binding).unwrap();
+            cowshed_types::metadata::read_json(&layout.project().repository_binding).unwrap();
         let error = crate::runtime::project::finish_restored_project_unbinding(
             layout.project(),
             &binding,

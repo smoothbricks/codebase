@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use cowshed_apfs::SystemCommandRunner;
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
+use cowshed_apfs::image::ImageCapacity;
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::operations::{ListLanding, ReAdoption};
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
@@ -29,10 +29,6 @@ use cowshed_core::api::{
     validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
-use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
-};
-use cowshed_core::metadata::{EgressMode, EgressRule};
 use cowshed_core::runtime::supervisor_socket::JobHold;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
@@ -56,6 +52,11 @@ use cowshed_core::{
     JobHandle, NativeGatewayInventory, Result, UnreachableMain, validate_existing_host_storage,
 };
 use cowshed_gateway_types::STORE_ROOT;
+use cowshed_types::image::IMAGE_EXTENSION;
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
+use cowshed_types::metadata::{EgressMode, EgressRule};
 use cowshed_types::repository::RepoId;
 use std::collections::HashMap;
 use std::fs;
@@ -1183,7 +1184,7 @@ impl ForegroundJob for JobHandle {
 pub(crate) async fn hold_foreground(
     job: &impl ForegroundJob,
     socket: &Path,
-    incarnation: &cowshed_core::metadata::WorkspaceIncarnation,
+    incarnation: &cowshed_types::metadata::WorkspaceIncarnation,
     id: cowshed_core::api::JobId,
 ) -> Result<JobHold> {
     match cowshed_core::runtime::supervisor_socket::hold(socket, incarnation, id).await {
@@ -5931,7 +5932,7 @@ mod tests {
             StdinSource, WorkspaceState,
         };
         use cowshed_core::api::server::{RouterHandle, RouterResponse};
-        use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+        use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
         use cowshed_types::repository::{BoundIdentity, RepositoryBinding};
         use serde_json::{Value, json};
         use std::num::NonZeroUsize;

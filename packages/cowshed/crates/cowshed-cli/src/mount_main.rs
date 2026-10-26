@@ -18,14 +18,14 @@
 use async_trait::async_trait;
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_core::api::MountResult;
-use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, MetadataError, PublicationState, WorkspaceName, read_json,
-};
 use cowshed_core::storage::StorageLayout;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
 use cowshed_core::storage::lifecycle::{MountIntent, MountState, Substrate};
 use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
+use cowshed_types::metadata::{
+    DetachedWorkspaceMetadata, MetadataError, PublicationState, WorkspaceName, read_json,
+};
 use cowshed_types::repository::{RepoId, RepositoryBinding};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;

@@ -1015,10 +1015,10 @@ mod tests {
         parse_support(
             "#[derive(Serialize)] pub struct Supported { pub value: u8 }",
             &mut api,
-            "cowshed_core::metadata",
+            "cowshed_types::metadata",
         )
         .expect("support declarations");
-        assert_eq!(api.records["Supported"].module, "cowshed_core::metadata");
+        assert_eq!(api.records["Supported"].module, "cowshed_types::metadata");
         assert!(!api.records["Supported"].exported);
     }
 }

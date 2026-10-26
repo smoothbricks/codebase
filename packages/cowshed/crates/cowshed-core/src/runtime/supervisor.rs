@@ -43,7 +43,6 @@ use crate::exec::{
     ExecError, ProfileLaunch, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
     prepare_child_descriptors,
 };
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::sandbox::{
     SandboxConfig, SandboxProfileRole, SeatbeltProfile, sandbox_runtime_dir, sandbox_runtime_link,
     seatbelt_profile, shared_daemon_runtime_dir, shared_daemon_runtime_link,
@@ -54,6 +53,7 @@ use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE
 use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use cowshed_types::repository::{OwnedRepoIds, RepoId};
 
 use crate::runtime::child_fence::ChildFence;
@@ -349,7 +349,8 @@ impl Default for WorkspaceSupervisorConfig {
                 workspace_mount: workspace_root,
                 exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
                 store_root: PathBuf::from("/tmp/cowshed-store"),
-                port_block: crate::metadata::PortBlock::new(49_136, 16).expect("static port block"),
+                port_block: cowshed_types::metadata::PortBlock::new(49_136, 16)
+                    .expect("static port block"),
                 retained_port_blocks: Vec::new(),
                 mode: crate::sandbox::RunSandboxMode::ReadWrite,
                 grants: crate::sandbox::SandboxGrants::default(),
@@ -3312,7 +3313,7 @@ impl WorkspaceSupervisor {
                 temp_dir: &config.sandbox.exec_temp_dir,
                 capability_env: &config.sandbox.capabilities.contribution,
             },
-            crate::metadata::Platform::Macos,
+            cowshed_types::metadata::Platform::Macos,
             Some(config.sandbox.port_block),
         )
         .map_err(|error| {
@@ -8367,7 +8368,7 @@ pub(crate) fn utc_now() -> Result<UtcTimestamp> {
 
 /// The UTC second `seconds` after the epoch as the API's timestamp type.
 pub(crate) fn utc_at_second(seconds: u64) -> Result<UtcTimestamp> {
-    let (year, month, day) = crate::storage::civil_from_days(seconds / 86_400);
+    let (year, month, day) = cowshed_types::clock::civil_from_days(seconds / 86_400);
     let clock = seconds % 86_400;
     UtcTimestamp::new(format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
@@ -8524,7 +8525,7 @@ mod workspace_toolchain_tests {
             workspace_mount: mount.to_path_buf(),
             exec_temp_dir: mount.parent().expect("root").join("tmp"),
             store_root: mount.parent().expect("root").join("store"),
-            port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
+            port_block: cowshed_types::metadata::PortBlock::new(40_960, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
             mode: RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
@@ -8592,7 +8593,8 @@ mod workspace_toolchain_tests {
             std::fs::write(mount.join(convention), "").expect("project convention");
         }
         let mut sandbox = sandbox_at(&mount);
-        sandbox.port_block = crate::metadata::PortBlock::new(49_104, 16).expect("port block");
+        sandbox.port_block =
+            cowshed_types::metadata::PortBlock::new(49_104, 16).expect("port block");
         sandbox
             .configure_capabilities()
             .expect("detect capabilities");
@@ -9002,7 +9004,7 @@ mod workspace_toolchain_tests {
                     host_home: &configured.home,
                     capability_env: &configured.capabilities.contribution,
                 },
-                crate::metadata::Platform::Macos,
+                cowshed_types::metadata::Platform::Macos,
                 Some(configured.port_block),
             )
             .expect("publish host environment");

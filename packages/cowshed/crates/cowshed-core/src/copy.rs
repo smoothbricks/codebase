@@ -2082,7 +2082,7 @@ mod tests {
         let image = root
             .path()
             .join("destination")
-            .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
+            .with_extension(cowshed_types::image::IMAGE_EXTENSION);
         crate::blank_image::blank_image(root.namespace(), &image);
         let backend = MacOsApfsBackend::new(SystemCommandRunner::new(HostNamespace::Test(
             root.namespace(),

@@ -1,19 +1,7 @@
-//! What a workspace image is on disk: its one file extension and its capacity.
+//! A disk image's capacity. Its file extension is cowshed-types' image grammar.
 
 use std::error::Error;
-use std::ffi::OsStr;
 use std::fmt;
-use std::path::Path;
-
-/// Every workspace image is a sparse RAW file holding one case-sensitive APFS volume
-/// (specs/cowshed/01a_apfs.md, "Images"): one extension, no alias, nothing inferred from
-/// anything else.
-pub const IMAGE_EXTENSION: &str = "dmg";
-
-/// Whether `path` names `<stem>.dmg`.
-pub fn is_image_path(path: &Path) -> bool {
-    path.extension() == Some(OsStr::new(IMAGE_EXTENSION))
-}
 
 /// A disk-image capacity, held as an exact byte count.
 ///

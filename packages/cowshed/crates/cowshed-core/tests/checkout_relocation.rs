@@ -21,12 +21,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::checkout::CheckoutRecord;
 use cowshed_core::git::{GitRepository, MainRemote, MergeDriverState};
-use cowshed_core::metadata::{
+use cowshed_core::storage::WORKSPACE_MARKER_PATH;
+use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PortBlock, PublicationState,
     SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
     WorkspaceRole, write_json,
 };
-use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 use cowshed_types::repository::RepoId;
 
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
@@ -182,7 +182,7 @@ impl Relocated {
             platform: Platform::Macos,
             publication_state: PublicationState::Active,
             updated_at: "2026-08-28T00:00:00Z".to_owned(),
-            grants: cowshed_core::metadata::GrantSet::closed_baseline(Some(
+            grants: cowshed_types::metadata::GrantSet::closed_baseline(Some(
                 PortBlock::new(40_960, 16).expect("port block"),
             ))
             .expect("grants"),

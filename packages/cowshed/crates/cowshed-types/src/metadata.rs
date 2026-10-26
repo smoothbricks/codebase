@@ -1,5 +1,5 @@
+use crate::repository::RepoId;
 use cowshed_gateway_types::{is_macos_port_block, is_port_block};
-use cowshed_types::repository::RepoId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -17,7 +17,7 @@ pub const OWNED_LINKS_REVISION: u8 = 1;
 pub const SIDECAR_VERSION: u32 = 1;
 pub const CHECKOUT_ROOT_VERSION: u32 = 1;
 pub const SLOT_BINDINGS_VERSION: u32 = 1;
-use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
+use crate::image::{IMAGE_EXTENSION, is_image_path};
 /// The macOS port range and the size new blocks get are the gateway's grammar; core names the
 /// same items rather than restating them.
 pub use cowshed_gateway_types::{MACOS_PORT_MAX, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE};
@@ -1136,7 +1136,7 @@ impl DetachedWorkspaceMetadata {
 pub const GRANTS_SIDECAR_SUFFIX: &str = ".grants.json";
 
 /// Append a suffix to a path's final component without touching its extension handling.
-pub(crate) fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value: OsString = path.as_os_str().to_owned();
     value.push(suffix);
     PathBuf::from(value)
@@ -1818,31 +1818,12 @@ mod tests {
 
     #[test]
     fn host_and_fixture_allocations_never_share_ports() {
-        use crate::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
-        use cowshed_os::namespace::TestNamespace;
-
-        let host =
-            ValidatedHostStorage::new(PathBuf::from("/home"), Vec::new(), CanonicalRoots::global());
-        let fixture = ValidatedHostStorage::new(
-            PathBuf::from("/fixture"),
-            Vec::new(),
-            CanonicalRoots::fixture(
-                TestNamespace::mint().expect("a test namespace"),
-                PathBuf::from("/fixture/store"),
-            ),
-        );
-        assert_eq!(host.port_allocation(), PortAllocation::Host);
-        assert_eq!(fixture.port_allocation(), PortAllocation::Fixture);
-        assert_eq!(*host.port_allocation().range().start(), MACOS_PORT_MIN);
-        assert_eq!(
-            *host.port_allocation().range().end() + 1,
-            *fixture.port_allocation().range().start()
-        );
-        assert_eq!(*fixture.port_allocation().range().end(), MACOS_PORT_MAX);
-        for (allocation, other) in [
-            (host.port_allocation(), fixture.port_allocation()),
-            (fixture.port_allocation(), host.port_allocation()),
-        ] {
+        let host = PortAllocation::Host;
+        let fixture = PortAllocation::Fixture;
+        assert_eq!(*host.range().start(), MACOS_PORT_MIN);
+        assert_eq!(*host.range().end() + 1, *fixture.range().start());
+        assert_eq!(*fixture.range().end(), MACOS_PORT_MAX);
+        for (allocation, other) in [(host, fixture), (fixture, host)] {
             assert!(PortBlock::macos_candidates(allocation).next().is_some());
             for exponent in 1..=14 {
                 let size = 1 << exponent;

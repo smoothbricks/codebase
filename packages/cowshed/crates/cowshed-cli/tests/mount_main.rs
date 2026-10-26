@@ -14,14 +14,14 @@ use cowshed_cli::mount_main::{
     MainMountBackend, ResolvedMainMount, dispatch_mount_main, resolve_main_mount,
 };
 use cowshed_cli::output::Output;
-use cowshed_core::metadata::{
+use cowshed_core::storage::StorageLayout;
+use cowshed_core::storage::lifecycle::MountIntent;
+use cowshed_core::{ErrorCode, Result};
+use cowshed_types::metadata::{
     DetachedWorkspaceMetadata, GrantSet, Platform, PublicationState, SIDECAR_VERSION,
     WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, read_json,
     write_json,
 };
-use cowshed_core::storage::StorageLayout;
-use cowshed_core::storage::lifecycle::MountIntent;
-use cowshed_core::{ErrorCode, Result};
 use cowshed_types::repository::{BoundIdentity, RepoId, RepositoryBinding};
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -10,10 +10,10 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::runtime::supervisor_manager::StartReport;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::{CowshedError, Result};
+use cowshed_types::metadata::WorkspaceName;
 
 /// The argument that selects this verb.
 pub const VERB: &str = "__workspace-supervisor";

@@ -406,7 +406,7 @@ pub struct Fresh { pub value: u8 }
     let mut api = Api::default();
     records::parse_support(api_source, &mut api, "cowshed_gateway_types::status")
         .expect("the first support declaration parses");
-    let error = records::parse_support(support_source, &mut api, "cowshed_core::metadata")
+    let error = records::parse_support(support_source, &mut api, "cowshed_types::metadata")
         .expect_err("a second support declaration cannot share a bare name with the first");
     assert!(error.to_string().contains("Shared"), "{error}");
     assert_eq!(

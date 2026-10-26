@@ -6,7 +6,7 @@ use cowshed_core::api::hold::KernelAddress;
 use cowshed_core::api::operations::FdHoldersRequest;
 use cowshed_core::api::server::HostRole;
 use cowshed_core::api::{ExecClass, ExecScope, GrantDelta, LandMode, LandTurnName};
-use cowshed_core::metadata::{EgressMode, EgressRule, MetadataError, WorkspaceName};
+use cowshed_types::metadata::{EgressMode, EgressRule, MetadataError, WorkspaceName};
 use cowshed_types::repository::RepoId;
 use std::ffi::{OsStr, OsString};
 use std::fmt;

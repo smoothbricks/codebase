@@ -18,6 +18,7 @@ bench = false
 [dependencies]
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 cowshed-os = { path = "../cowshed-os" }
+cowshed-types = { path = "../cowshed-types" }
 libc = "0.2"
 plist = "1"
 serde.workspace = true

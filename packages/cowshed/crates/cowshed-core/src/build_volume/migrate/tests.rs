@@ -1,11 +1,11 @@
 use super::*;
 use crate::build_volume::{BuildVolumeRecord, BuildVolumeRole, Registrant};
-use crate::metadata::WorkspaceName;
 use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 use crate::storage::apfs::ApfsSubstrateConfig;
 use crate::storage::directory::DirectoryExecutionHost;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::CommandBackstop as _;
+use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::{ProjectPaths, RepoId};
 use std::path::PathBuf;
 
@@ -71,7 +71,8 @@ fn linked_registration() -> Registration {
             },
         ),
         Registrant::Workspace {
-            incarnation: crate::metadata::WorkspaceIncarnation::new("0".repeat(32)).unwrap(),
+            incarnation: cowshed_types::metadata::WorkspaceIncarnation::new("0".repeat(32))
+                .unwrap(),
         },
     )
 }
@@ -101,7 +102,7 @@ fn sandbox(checkout: &Path) -> SandboxConfig {
         workspace_mount: checkout.to_owned(),
         exec_temp_dir: checkout.join("exec-temp"),
         store_root: checkout.join("store"),
-        port_block: crate::metadata::PortBlock::new(49_184, 16).unwrap(),
+        port_block: cowshed_types::metadata::PortBlock::new(49_184, 16).unwrap(),
         retained_port_blocks: Vec::new(),
         cpu_pool_directory: None,
         mode: RunSandboxMode::ReadWrite,

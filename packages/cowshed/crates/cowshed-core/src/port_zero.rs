@@ -95,7 +95,9 @@ mod tests {
         match (read("COWSHED_PORT_BASE"), read("COWSHED_PORT_BLOCK_SIZE")) {
             (Some(base), Some(size)) => (base, size),
             (None, None) => (
-                *crate::metadata::PortAllocation::Fixture.range().start(),
+                *cowshed_types::metadata::PortAllocation::Fixture
+                    .range()
+                    .start(),
                 64,
             ),
             half => panic!("a port block exported half: {half:?}"),
@@ -211,7 +213,10 @@ mod tests {
                 .trim()
                 .parse()
                 .unwrap_or_else(|error| panic!("{runtime}: {error}: {output:?}"));
-            assert!(port > crate::metadata::MACOS_PORT_MAX, "{runtime}: {port}");
+            assert!(
+                port > cowshed_types::metadata::MACOS_PORT_MAX,
+                "{runtime}: {port}"
+            );
         }
     }
 }

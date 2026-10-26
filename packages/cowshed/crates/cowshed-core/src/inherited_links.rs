@@ -39,9 +39,11 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use crate::error::{CowshedError, Result};
-use crate::metadata::{OWNED_LINKS_REVISION, WorkspaceIncarnation, WorkspaceMarker, write_json};
 use crate::storage::WORKSPACE_MARKER_PATH;
 use cowshed_os::fsio::AnchoredDirectory;
+use cowshed_types::metadata::{
+    OWNED_LINKS_REVISION, WorkspaceIncarnation, WorkspaceMarker, write_json,
+};
 use cowshed_types::repository::RepoId;
 
 /// What a symlink's recorded target means once its tree moves.

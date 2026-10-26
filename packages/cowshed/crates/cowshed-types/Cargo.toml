@@ -8,5 +8,10 @@ publish.workspace = true
 # runtime or the API client; cowshed-gateway-types owns repository-id validation.
 [dependencies]
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+cowshed-os = { path = "../cowshed-os" }
 serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true
 thiserror = "2"
+
+[dev-dependencies]
+proptest.workspace = true

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use cowshed_core::Cowshed;
-use cowshed_core::metadata::WorkspaceRole;
+use cowshed_types::metadata::WorkspaceRole;
 
 /// The `cowshed` binary under test, read when the test runs. `env!` would bake in the path of
 /// the checkout that compiled this test, but the test runs from a cached nextest archive

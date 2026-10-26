@@ -1,16 +1,16 @@
 use crate::api::process::{JobContainment, OutlivedProcess};
 use crate::error::CowshedError;
 use crate::land_turn::Ticket;
-use crate::metadata::DetachedWorkspaceMetadata;
-pub use crate::metadata::{
-    EgressMode, EgressRule, GrantSet, Platform, PortBlock, RepoRule, SimVerb, WorkspaceIncarnation,
-    WorkspaceName, WorkspaceRole,
-};
 use crate::project_retirement::ProjectRetirementReport;
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use crate::storage::lifecycle::{DerivedWorkspace, MountRefusal, MountState, Pin as LifecyclePin};
 use base64::Engine;
 use bytes::Bytes;
+use cowshed_types::metadata::DetachedWorkspaceMetadata;
+pub use cowshed_types::metadata::{
+    EgressMode, EgressRule, GrantSet, Platform, PortBlock, RepoRule, SimVerb, WorkspaceIncarnation,
+    WorkspaceName, WorkspaceRole,
+};
 use cowshed_types::repository::{BoundIdentity, RepoId};
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
