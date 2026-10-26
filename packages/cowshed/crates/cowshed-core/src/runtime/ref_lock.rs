@@ -21,10 +21,9 @@ pub struct RefLock {
 impl RefLock {
     /// Take the ref lock at `path`, creating its file if no writer has yet. An uncontended lock is
     /// taken at once; a held one is waited for on a helper thread, and the wait says every
-    /// [`cowshed_os::flock::HOLDER_REPORT`] how long it has waited and who held the file when it began, as the kernel
-    /// shows it ([`held_lock::observe`]): one look at the holders for the whole wait, never one per
-    /// report. Nothing bounds the wait: the holder is a writer moving the same branch, which a land
-    /// must follow, not overtake.
+    /// [`cowshed_os::flock::HOLDER_REPORT`] how long it has waited and who holds the file, as the
+    /// kernel shows it then ([`held_lock::holders`]). Nothing bounds the wait: the holder is a writer
+    /// moving the same branch, which a land must follow, not overtake.
     pub async fn acquire(path: &RefLockPath) -> Result<Self> {
         let opened = Opened::open(path.as_path()).map_err(|error| failure(path, "open", &error))?;
         let opened = match opened
@@ -45,7 +44,6 @@ impl RefLock {
             .map_err(|error| failure(path, "start the waiter for", &error))?;
         tokio::pin!(waiter);
         let started = Instant::now();
-        let held = held_lock::holders(path.as_path());
         let mut report = tokio::time::interval_at(
             tokio::time::Instant::now(),
             cowshed_os::flock::HOLDER_REPORT,
@@ -62,9 +60,10 @@ impl RefLock {
                     return Ok(Self { held });
                 }
                 _ = report.tick() => cowshed_os::eprintln!(
-                    "cowshed: land has waited {}s for the ref lock {}: {held} when the wait began",
+                    "cowshed: land has waited {}s for the ref lock {}: {}",
                     started.elapsed().as_secs(),
                     path.as_str(),
+                    held_lock::holders(path.as_path()),
                 ),
             }
         }
