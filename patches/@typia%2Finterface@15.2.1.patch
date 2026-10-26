@@ -1,0 +1,43 @@
+diff --git a/lib/index.mjs b/lib/index.mjs
+new file mode 100644
+index 0000000..73975ac
+--- /dev/null
++++ b/lib/index.mjs
+@@ -0,0 +1,16 @@
++// src/tags/index.ts
++var exports_tags = {};
++// src/protobuf/ProtobufWire.ts
++var ProtobufWire;
++((ProtobufWire) => {
++  ProtobufWire[ProtobufWire["VARIANT"] = 0] = "VARIANT";
++  ProtobufWire[ProtobufWire["I64"] = 1] = "I64";
++  ProtobufWire[ProtobufWire["LEN"] = 2] = "LEN";
++  ProtobufWire[ProtobufWire["START_GROUP"] = 3] = "START_GROUP";
++  ProtobufWire[ProtobufWire["END_GROUP"] = 4] = "END_GROUP";
++  ProtobufWire[ProtobufWire["I32"] = 5] = "I32";
++})(ProtobufWire ||= {});
++export {
++  ProtobufWire,
++  exports_tags as tags
++};
+diff --git a/package.json b/package.json
+index 99d65a0..4cd9bd0 100644
+--- a/package.json
++++ b/package.json
+@@ -7,6 +7,7 @@
+   "exports": {
+     ".": {
+       "types": "./lib/index.d.ts",
++      "import": "./lib/index.mjs",
+       "default": "./lib/index.js"
+     },
+     "./package.json": "./package.json"
+@@ -75,5 +76,6 @@
+     "build": "rimraf lib && ttsc",
+     "dev": "ttsc --watch",
+     "evidence": "evidence"
+-  }
++  },
++  "module": "lib/index.mjs"
+ }
+\ No newline at end of file

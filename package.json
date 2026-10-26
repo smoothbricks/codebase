@@ -251,7 +251,9 @@
     "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch",
     "nx@23.2.1": "patches/nx@23.2.1.patch",
     "@nx/js@23.2.1": "patches/@nx%2Fjs@23.2.1.patch",
-    "ttsc@0.34.1": "patches/ttsc@0.34.1.patch"
+    "ttsc@0.34.1": "patches/ttsc@0.34.1.patch",
+    "typia@15.2.1": "patches/typia@15.2.1.patch",
+    "@typia/interface@15.2.1": "patches/@typia%2Finterface@15.2.1.patch"
   },
   "overrides": {
     "typia": "15.2.1",

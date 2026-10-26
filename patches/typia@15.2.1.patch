@@ -1,0 +1,61 @@
+diff --git a/native/core/programmers/internal/FeatureProgrammer.go b/native/core/programmers/internal/FeatureProgrammer.go
+index 13b41a1..30533f7 100644
+--- a/native/core/programmers/internal/FeatureProgrammer.go
++++ b/native/core/programmers/internal/FeatureProgrammer.go
+@@ -762,7 +762,13 @@ func (featureProgrammerNamespace) Compose(props FeatureProgrammer_ComposeProps)
+ 
+ func (featureProgrammerNamespace) WriteDecomposed(props FeatureProgrammer_WriteDecomposedProps) *shimast.Node {
+   f := nativecontext.NodeFactoryOf(props.Emit)
++  // Uninitialized `let` slots (`errors`, `_report`, `_errorFactory`) are
++  // assigned by the returned arrow and read by the functor helpers and the
++  // checker closures. Declare them first, so no closure captures a binding
++  // declared after it.
++  slots, rest := featureProgrammer_splitUninitializedLets(props.Result.Statements)
+   statements := []*shimast.Node{}
++  statements = append(statements, slots...)
+   statements = append(statements, props.Functor.Declare()...)
+   keys := make([]string, 0, len(props.Result.Functions))
+   for key := range props.Result.Functions {
+@@ -775,7 +781,7 @@ func (featureProgrammerNamespace) WriteDecomposed(props FeatureProgrammer_WriteD
+     }
+     statements = append(statements, props.Result.Functions[key])
+   }
+-  statements = append(statements, props.Result.Statements...)
++  statements = append(statements, rest...)
+   response := props.Result.Arrow
+   if props.ReturnWrapper != nil {
+     response = props.ReturnWrapper(props.Result.Arrow)
+@@ -798,6 +804,33 @@ func (featureProgrammerNamespace) WriteDecomposed(props FeatureProgrammer_WriteD
+   )
+ }
+ 
++func featureProgrammer_splitUninitializedLets(statements []*shimast.Node) (slots []*shimast.Node, rest []*shimast.Node) {
++  for _, statement := range statements {
++    if featureProgrammer_isUninitializedLet(statement) {
++      slots = append(slots, statement)
++    } else {
++      rest = append(rest, statement)
++    }
++  }
++  return slots, rest
++}
++
++func featureProgrammer_isUninitializedLet(statement *shimast.Node) bool {
++  if statement == nil || statement.Kind != shimast.KindVariableStatement {
++    return false
++  }
++  list := statement.AsVariableStatement().DeclarationList
++  if list == nil || list.Flags&shimast.NodeFlagsLet == 0 {
++    return false
++  }
++  for _, declaration := range list.AsVariableDeclarationList().Declarations.Nodes {
++    if declaration.AsVariableDeclaration().Initializer != nil {
++      return false
++    }
++  }
++  return true
++}
++
+ func (featureProgrammerNamespace) Write(props FeatureProgrammer_WriteProps) *shimast.Node {
+   f := nativecontext.NodeFactoryOf(props.Context.Emit)
+   initialized := props.Config.Initializer(FeatureProgrammer_InitializerProps{

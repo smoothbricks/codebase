@@ -35,7 +35,7 @@ import { useFixtureCargoHome } from '../testing/fixture-cargo-home.js';
 
 useFixtureCargoHome();
 
-const NODE_CLI = join(import.meta.dir, '..', '..', 'dist', 'node-cli.js');
+const NODE_CLI = join(import.meta.dir, '..', '..', 'dist', 'ts', 'node-cli.js');
 const NATIVE_CLI = join(
   import.meta.dir,
   '..',

@@ -7,25 +7,24 @@ import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 const PLUGIN_LINK = 'node_modules/@smoothbricks/nx-plugin';
 
 /**
- * The command that runs a tool package's CLI `file` (a path inside the package) from the directory `cwd` (relative to
- * the workspace root) an inferred target runs in.
+ * The command that runs a tool package's executable `file` (a path inside the package) from the directory `cwd`
+ * (relative to the workspace root) an inferred target runs in.
  *
  * A tool package is a dependency of this plugin, never of the workspace root, so the root `node_modules` has no link to
- * it. Its CLI is named through the plugin's root link, as the plugin's own `nextest.toml` is and for the same reason (never the
- * plugin's real location, whose depth from each workspace differs), and then one step up to the package beside the
- * plugin: every install layout puts a package's dependencies next to it, the workspace's `packages/` directory for a
- * linked checkout, a hoisted `node_modules/@smoothbricks/`, a bun or pnpm store's per-package `node_modules`. The kernel
- * resolves that `..` from where the link really points, so a native executable runs from the path as written, which is
- * why it is concatenated rather than joined: a lexical join would drop the link before the `..`. Node resolves its main
- * module lexically too, so a JavaScript CLI is named through the link's `realpath` first.
+ * it. Its executable is named through the plugin's root link, as the plugin's own `nextest.toml` is and for the same
+ * reason (never the plugin's real location, whose depth from each workspace differs), and then one step up to the
+ * package beside the plugin: every install layout puts a package's dependencies next to it, the workspace's `packages/`
+ * directory for a linked checkout, a hoisted `node_modules/@smoothbricks/`, a bun or pnpm store's per-package
+ * `node_modules`. The kernel resolves that `..` from where the link really points, so the executable runs from the
+ * path as written, which is why it is concatenated rather than joined: a lexical join would drop the link before the
+ * `..`.
  */
-export function toolCommand(cwd: string, tool: string, file: string, runtime: 'native' | 'node'): string {
-  const link = posix.join(posix.relative(cwd, '.'), PLUGIN_LINK);
-  return runtime === 'native' ? `${link}/../${tool}/${file}` : `node "$(realpath ${link})/../${tool}/${file}"`;
+function toolCommand(cwd: string, tool: string, file: string): string {
+  return `${posix.join(posix.relative(cwd, '.'), PLUGIN_LINK)}/../${tool}/${file}`;
 }
 
 /** The tool packages whose executables inferred commands run. */
-const NATIVE_TOOL_PACKAGES = ['build-inputs', 'nextest-extract'] as const;
+const NATIVE_TOOL_PACKAGES = ['build-inputs', 'cargo-retain', 'nextest-extract'] as const;
 
 export type NativeToolPackage = (typeof NATIVE_TOOL_PACKAGES)[number];
 
@@ -99,7 +98,7 @@ export function nativeToolCommand(
       `@smoothbricks/${tool} ships ${bin} for darwin-arm64, darwin-x64, linux-arm64 and linux-x64 only, and Nx is inferring this workspace for another platform`,
     );
   }
-  return toolCommand(cwd, tool, `dist/bin/${tools.platform}/${bin}`, 'native');
+  return toolCommand(cwd, tool, `dist/bin/${tools.platform}/${bin}`);
 }
 
 /** The task that builds `tool`'s executables for this host, when this workspace builds them. */

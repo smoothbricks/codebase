@@ -235,10 +235,10 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   refuses the pass. Every pass still reads the current fingerprint graph. The locked scan reuses directory-entry types
   and reads its small metadata files synchronously, avoiding duplicate stats and one asynchronous dispatch per tiny
   file; it does not walk retained artifact contents or reuse an earlier graph that could miss in-place recompiles.
-  `cargo-retention` runs that package's `smoo-nx-cargo-retain` CLI to preview the same selection, nested roots included,
-  without changing anything. `incremental/` and the split-debuginfo objects rustc keeps inside current generations
-  (rust-lang/rust#161824) are not reclaimed, so neither the target directory nor a nested root is bounded. Empty
-  fingerprint hashes are kept as unfinished compilations. The preservation proof covers Cargo's current unit and
+  `cargo-retention` runs that package's native `smoo-nx-cargo-retain` executable to preview the same selection, nested
+  roots included, without changing anything. `incremental/` and the split-debuginfo objects rustc keeps inside current
+  generations (rust-lang/rust#161824) are not reclaimed, so neither the target directory nor a nested root is bounded.
+  Empty fingerprint hashes are kept as unfinished compilations. The preservation proof covers Cargo's current unit and
   dependency records, not every debug reference in copied binaries or other checkouts. In particular, a binary copied up
   before a failed link can outlive the generation its debug map names; this pass does not establish that machine-wide
   debug closure.

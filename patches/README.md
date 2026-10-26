@@ -17,6 +17,24 @@ upstream declaration preserves the same contract.
 Flechette 2.7 builds Date64 metadata from numeric millisecond inputs. The Compact fixture seeds only that schema with a
 number; its physical payload remains `BigInt64Array`, with the same i64 round-trip assertions.
 
+## typia output scriptc compiles
+
+scriptc compiles a package's ttsc-emitted JavaScript to a native executable (`scriptc-<arch>-<family>`,
+`packages/nx-plugin/README.md`), and two facts of typia 15.2.1 stop it. Both patches change no validator's behaviour.
+
+- `typia@15.2.1.patch`: `FeatureProgrammer.WriteDecomposed` (`native/core/programmers/internal/FeatureProgrammer.go`)
+  appended the uninitialized `let errors; let _report;` (validate) and `let _errorFactory;` (assert) after the functor
+  helpers and checker closures that read them. That is valid JavaScript, but scriptc 0.4.4 refuses a closure over a
+  binding declared after it ("a binding form with no lowering"), so the program built and died on its first invalid
+  input. The patch declares those slots first. ttsc builds typia's transformer from `node_modules/typia/native`, so the
+  next ttsc run rebuilds it from the patched source.
+- `@typia/interface@15.2.1.patch`: ttsc keeps `import typia from 'typia'` after transforming every call away, and
+  `typia/lib/index.mjs` re-exports `tags` from `@typia/interface`, which ships only its tsc CommonJS output (top-level
+  `this`, `exports` as a value), which scriptc refuses. The patch adds `lib/index.mjs` (the package's whole runtime
+  surface: the `ProtobufWire` enum and an empty `tags` namespace) and an `import` export condition naming it.
+
+Retire each when typia or scriptc removes its cause; bump both with typia.
+
 ## Activating a patch change
 
 Prepare Nx changes with `bun patch nx@23.2.1`, then use the registry-index regeneration flow:

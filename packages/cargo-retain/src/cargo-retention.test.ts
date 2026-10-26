@@ -402,8 +402,8 @@ async function noOpPassReadsFingerprintsOnce(fx: Churn): Promise<void> {
   const check = labelled('a no-op pass reads current fingerprints once without async dispatch or duplicate type stats');
   await clearReceipt(fx.target);
   planned(await retain(fx.ws, { apply: true, now: future() }));
-  const module = join(import.meta.dir, '..', 'dist', 'cargo-retention.js');
-  const locksModule = join(import.meta.dir, '..', 'dist', 'locks-node.js');
+  const module = join(import.meta.dir, '..', 'dist', 'ts', 'cargo-retention.js');
+  const locksModule = join(import.meta.dir, '..', 'dist', 'ts', 'locks-node.js');
   const source = lines(
     'import fs from "node:fs";',
     'import promises from "node:fs/promises";',
@@ -687,7 +687,7 @@ async function reclaimsNestedRoot(fx: Churn): Promise<void> {
 async function cliPlansReadOnlyAndApplies(fx: Churn, superseded: readonly string[]): Promise<void> {
   const check = labelled('the CLI plans read-only, applies with a receipt, and exits 3 on a refused pass');
   await clearReceipt(fx.target);
-  const bin = join(import.meta.dir, '..', 'dist', 'node-cli.js');
+  const bin = join(import.meta.dir, '..', 'dist', 'ts', 'node-cli.js');
   const cli = async (args: string[]): Promise<CargoRun> => {
     const child = Bun.spawn(['node', bin, ...args], { cwd: fx.ws, env: cargoEnv(), stdout: 'pipe', stderr: 'pipe' });
     const [code, stdout, stderr] = await Promise.all([

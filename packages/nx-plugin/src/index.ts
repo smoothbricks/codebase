@@ -97,13 +97,7 @@ import { isNonSourceDirectory } from './source-directories.js';
 import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
 import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
 import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
-import {
-  type NativeTools,
-  nativeToolCommand,
-  nativeToolDependsOn,
-  resolveNativeTools,
-  toolCommand,
-} from './tool-bins.js';
+import { type NativeTools, nativeToolCommand, nativeToolDependsOn, resolveNativeTools } from './tool-bins.js';
 import {
   isBuildOutputTargetName,
   isTestRunnerTargetName,
@@ -1827,8 +1821,9 @@ async function createProjectTargets(
     targets['cargo-retention'] = {
       executor: 'nx:run-commands',
       cache: false,
+      dependsOn: nativeToolDependsOn(nativeTools, 'cargo-retain'),
       options: {
-        command: toolCommand(cargoWorkspaceRoot, 'cargo-retain', 'dist/node-cli.js', 'node'),
+        command: nativeToolCommand(nativeTools, cargoWorkspaceRoot, 'cargo-retain', 'smoo-nx-cargo-retain'),
         cwd: cargoWorkspaceRoot,
       },
     };
