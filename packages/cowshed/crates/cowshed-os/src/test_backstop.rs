@@ -100,6 +100,15 @@ fn expired_on(op: &'static str, on: &str, bound: Bound) -> io::Error {
     )
 }
 
+/// The error a raw wait would have given: a failed wait's own OS error, as std's and tokio's
+/// `wait` answer it; an expiry, which a raw wait never gives, as the typed failure.
+fn as_raw_wait(failure: ReapError) -> io::Error {
+    match failure {
+        ReapError::Wait { source, .. } => source,
+        expired @ ReapError::Expired(_) => expired.into(),
+    }
+}
+
 fn wait_within(child: &mut std::process::Child, bound: Bound) -> io::Result<ExitStatus> {
     drop(child.stdin.take());
     deadline::reap(
@@ -108,7 +117,7 @@ fn wait_within(child: &mut std::process::Child, bound: Bound) -> io::Result<Exit
         &deadline::start("test wait", bound),
         Progress::Nothing,
     )
-    .map_err(io::Error::from)
+    .map_err(as_raw_wait)
 }
 
 /// Run the blocking `call` on a thread of its own and wait for its answer within `bound`. Past the
@@ -155,8 +164,10 @@ impl ChildBackstop for std::process::Child {
         let status = match deadline::reap(TEST_CHILD, &mut self, &deadline, Progress::Nothing) {
             Ok(status) => status,
             Err(failure) => {
-                deadline::collect_later(TEST_CHILD, self);
-                return Err(failure.into());
+                if matches!(failure, ReapError::Expired(_)) {
+                    deadline::collect_later(TEST_CHILD, self);
+                }
+                return Err(as_raw_wait(failure));
             }
         };
         let (stdout, stderr) = pumps
@@ -210,7 +221,7 @@ impl AsyncChildBackstop for tokio::process::Child {
                 Progress::Nothing,
             )
             .await
-            .map_err(io::Error::from)
+            .map_err(as_raw_wait)
         }
     }
 

@@ -3740,7 +3740,9 @@ impl GitRepository {
     /// because git exited early is not reported, git's status and answers are: a batch git did not
     /// read whole answers short, which its caller refuses.
     // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
-    // Git sandbox (`git_command_with_objects`): it waits on no other process.
+    // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
+    // files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+    // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
     #[allow(clippy::disallowed_methods)]
     async fn run_input<I, S>(&self, args: I, input: Vec<u8>) -> Result<Output>
     where
@@ -3797,8 +3799,10 @@ where
 /// controller writes and verifies bundles in its denied store, which no
 /// workspace profile can read. These object-only verbs do not check out files,
 /// run merge/filter drivers, use configured remotes, or invoke hooks (disabled here).
-// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace Git
-// sandbox (`git_command_with_objects`): it waits on no other process.
+// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
+// Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
+// files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+// (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
 #[allow(clippy::disallowed_methods)]
 async fn run_git_bundle_at<I, S>(
     root: &Path,
@@ -4500,8 +4504,10 @@ fn sandboxed_git_command_with_paths(
     if linked {
         // Git's own reading of its config, under the same profile, names every driver it could
         // select; each is switched off for the command the caller runs.
-        // WHY unbounded: a workspace git with hooks off and drivers off or confined by the
-        // workspace Git sandbox (`git_command_with_objects`): it waits on no other process.
+        // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
+        // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
+        // files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+        // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
         #[allow(clippy::disallowed_methods)]
         let listing = build()?
             .args(["config", "-z", "--name-only", "--list"])
@@ -4567,8 +4573,10 @@ fn git_command_with_objects(
     Ok(command)
 }
 
-// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace Git
-// sandbox (`git_command_with_objects`): it waits on no other process.
+// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
+// Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
+// files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+// (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
 #[allow(clippy::disallowed_methods)]
 async fn run_git_at_with_objects<I, S>(
     #[cfg(target_os = "macos")] store_root: &Path,
@@ -4811,8 +4819,10 @@ const CHECK_IGNORE_BATCH: &[&str] = &["check-ignore", "--stdin", "-z", "--no-ind
 /// all of the input before reading any answer deadlocks as soon as the answers fill the stdout
 /// pipe: git blocks writing its stdout, the caller blocks writing git's stdin, and neither
 /// returns. A write that fails because git exited early is not reported: git's status is.
-// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace Git
-// sandbox (`git_command_with_objects`): it waits on no other process.
+// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
+// Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
+// files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+// (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
 #[allow(clippy::disallowed_methods)]
 fn git_batch_blocking(
     mut command: std::process::Command,

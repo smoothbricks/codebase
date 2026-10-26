@@ -45,7 +45,7 @@ use crate::api::resources::SampleInterval;
 use crate::api::server::codec::Demand;
 use crate::error::{CowshedError, Result};
 use crate::storage::job_artifact::StreamKind;
-use cowshed_os::deadline::{self, PeerStream, Progress, Silent, WaitError};
+use cowshed_os::deadline::{self, Occupant, PeerStream, Progress, Silent, WaitError, occupant};
 use cowshed_os::fork_lock::Fenced;
 
 /// The identity of a cowshed build: the Mach-O `LC_UUID` the linker derives from the image's
@@ -1063,41 +1063,6 @@ impl Instance {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
-    }
-}
-
-/// What holds the file at a socket path, as far as the kernel shows.
-#[derive(Debug)]
-enum Occupant {
-    /// Nothing is there.
-    Absent,
-    /// A socket file no socket is attached to: nothing will accept on it again.
-    Stopped,
-    /// A socket file a socket is still attached to, whoever holds it.
-    Live,
-}
-
-/// Whether a socket is still attached to the socket file at `path`. Neither a stream connection
-/// nor its listener's process says so. Measured on Darwin, a live listener whose queue is full
-/// refuses a stream connection, as does a socket that is bound and not listening; a listener
-/// still accepts after the process that created it exited, from a child that inherited it, and
-/// the kernel's peer identity names that exited creator. A datagram connection is refused only
-/// when no socket at all is attached to the file -- every descriptor of it closed, in every
-/// process -- and otherwise fails as the wrong type or, to a datagram socket, is made: Darwin's
-/// `unp_connect` and Linux's `unix_find_bsd` find the attached socket before they compare types,
-/// and neither looks at a queue. Measured on Darwin, a killed listener's file is detached by the
-/// time its NOTE_EXIT is delivered. No bind attaches a socket to a file that already exists, so
-/// a file found detached stays detached. Any other answer is an error, never stopped.
-fn occupant(path: &Path) -> io::Result<Occupant> {
-    if Instance::at(path)?.is_none() {
-        return Ok(Occupant::Absent);
-    }
-    match std::os::unix::net::UnixDatagram::unbound()?.connect(path) {
-        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(Occupant::Stopped),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Occupant::Absent),
-        Err(error) if error.raw_os_error() == Some(libc::EPROTOTYPE) => Ok(Occupant::Live),
-        Ok(()) => Ok(Occupant::Live),
-        Err(error) => Err(error),
     }
 }
 

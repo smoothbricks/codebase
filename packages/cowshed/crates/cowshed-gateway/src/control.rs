@@ -1211,11 +1211,17 @@ async fn serve<R, W>(
                 None => None,
                 Some(path) => match connect_parent(path).await {
                     Ok(stream) => Some((path.to_path_buf(), stream)),
+                    // Only a pool that cannot be reached is absent: no socket file, or one no
+                    // socket is attached to. Darwin refuses a full queue too, which is a pool that
+                    // is there.
                     Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                        ) =>
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            || (error.kind() == std::io::ErrorKind::ConnectionRefused
+                                && matches!(
+                                    cowshed_os::deadline::occupant(path),
+                                    Ok(cowshed_os::deadline::Occupant::Absent
+                                        | cowshed_os::deadline::Occupant::Stopped)
+                                )) =>
                     {
                         cowshed_os::eprintln!(
                             "cowshed: the requester's CPU pool {} does not answer ({error}); `{command}` asks the host budget alone",
@@ -1229,7 +1235,7 @@ async fn serve<R, W>(
                         let refused = failure(
                             ControlFailureCode::Rejected,
                             format!(
-                                "the requester's CPU pool {} did not take its connect ({error}); `{command}` is refused",
+                                "the requester's CPU pool {} did not take its connect ({error}) and is not shown absent; `{command}` is refused",
                                 path.display()
                             ),
                         );

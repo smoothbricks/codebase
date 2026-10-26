@@ -383,8 +383,8 @@ pub async fn connect_unix(
 
 /// Run `connect` to `peer` within `deadline`: a peer whose address does not exist is absent, and
 /// a connect still pending at the bound has expired with nothing sent. A refused connect is an
-/// I/O failure: only the caller can tell whether a socket that refuses still has its holder
-/// attached (a full queue) or none (a peer that left).
+/// I/O failure: Darwin refuses a full queue as it refuses a socket file nothing is attached to, so
+/// a caller that must tell a peer that left from one that is there asks [`occupant`].
 pub async fn establish<S>(
     deadline: &Deadline,
     peer: &Peer,
@@ -412,6 +412,51 @@ fn unconnected(deadline: &Deadline, peer: &Peer, source: io::Error) -> WaitError
             last: Progress::Nothing,
             source,
         }
+    }
+}
+
+/// What holds the file at a unix socket path, as far as the kernel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Occupant {
+    /// Nothing is there.
+    Absent,
+    /// A socket file no socket is attached to: nothing will accept on it again.
+    Stopped,
+    /// A socket file a socket is still attached to, whoever holds it.
+    Live,
+}
+
+/// Whether a socket is still attached to the socket file at `path`. Neither a stream connection
+/// nor its listener's process says so. Measured on Darwin, a live listener whose queue is full
+/// refuses a stream connection, as does a socket that is bound and not listening; a listener
+/// still accepts after the process that created it exited, from a child that inherited it, and
+/// the kernel's peer identity names that exited creator. A datagram connection is refused only
+/// when no socket at all is attached to the file -- every descriptor of it closed, in every
+/// process -- and otherwise fails as the wrong type or, to a datagram socket, is made: Darwin's
+/// `unp_connect` and Linux's `unix_find_bsd` find the attached socket before they compare types,
+/// and neither looks at a queue. Measured on Darwin, a killed listener's file is detached by the
+/// time its NOTE_EXIT is delivered. No bind attaches a socket to a file that already exists, so
+/// a file found detached stays detached. Anything at `path` but a socket file, and any other
+/// answer, is an error, never stopped.
+pub fn occupant(path: &Path) -> io::Result<Occupant> {
+    use std::os::unix::fs::FileTypeExt as _;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a socket", path.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Occupant::Absent),
+        Err(error) => return Err(error),
+    }
+    match std::os::unix::net::UnixDatagram::unbound()?.connect(path) {
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(Occupant::Stopped),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Occupant::Absent),
+        Err(error) if error.raw_os_error() == Some(libc::EPROTOTYPE) => Ok(Occupant::Live),
+        Ok(()) => Ok(Occupant::Live),
+        Err(error) => Err(error),
     }
 }
 

@@ -1120,21 +1120,44 @@ const SAME_BUILD_BOUND: Duration = Duration::from_secs(10);
 /// ([`OtherBuild`]), whose hint names the install that ends the disagreement.
 ///
 /// No manager answering is not a disagreement: there is no other build to refuse this one, and
-/// the verbs that need a daemon say so themselves. No socket, or one nothing listens on (Darwin
-/// refuses at once, as it does a full queue, which cannot be told apart), is none answering. A
-/// connect that has not completed at the handshake bound is a manager that is there and stuck,
-/// and fails the verb before it changes anything.
+/// the verbs that need a daemon say so themselves. No socket file, or one no socket is attached to
+/// (`deadline::occupant`), is none answering. A refused connect while a socket is still attached
+/// (a full queue, or a holder that does not accept), or one that has not completed at the
+/// handshake bound, is a manager that is there, and fails the verb before it changes anything.
 pub async fn require_same_build(store_root: &Path) -> Result<()> {
     let path = manager_socket_path(store_root);
     let mut stream = match connect_manager(&path).await {
         Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(());
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            match cowshed_os::deadline::occupant(&path) {
+                Ok(
+                    cowshed_os::deadline::Occupant::Absent
+                    | cowshed_os::deadline::Occupant::Stopped,
+                ) => {
+                    return Ok(());
+                }
+                Ok(cowshed_os::deadline::Occupant::Live) => {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "the cowshed daemon at {} refuses a build check while a socket is still \
+                             attached to it: its queue is full, or its holder does not accept",
+                            path.display()
+                        ),
+                        "retry once the daemon answers; cowshed doctor --json",
+                    ));
+                }
+                Err(probe) => {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "the cowshed daemon at {} refused a build check ({error}), and whether \
+                             it is still there cannot be read: {probe}",
+                            path.display()
+                        ),
+                        "cowshed doctor --json",
+                    ));
+                }
+            }
         }
         Err(error) => {
             return Err(CowshedError::environment_missing(
