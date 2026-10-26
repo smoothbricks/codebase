@@ -674,9 +674,11 @@ An image's price is the compile seconds of the workspace's Cargo units it would 
   and `tests/<t>/main.rs` are target `<t>`; any other file there, a shared `tests/common/mod.rs`, dirties every target
   of that kind). Any other owned path dirties the member's library and, through the rebased tree's `cargo metadata`
   resolve graph, every member depending on it, transitively. A registry package whose `Cargo.lock` entry the rebased
-  tree has and the image's tree lacked, or locked otherwise, dirties every member reaching it. A change in meaning
-  (blank lines and whole-line comments aside) to the root `Cargo.toml`, any `.cargo/config` or `.cargo/config.toml`, or
-  `rust-toolchain`/`rust-toolchain.toml` dirties every member: its effect on unit identity is not computed.
+  tree has and the image's tree lacked, or locked otherwise, dirties every member reaching it through any path of that
+  graph, a cycle of dev-dependencies between members included. A change in meaning (blank lines and whole-line comments
+  aside) to the root `Cargo.toml`, any `.cargo/config` or `.cargo/config.toml`, or
+  `rust-toolchain`/`rust-toolchain.toml` dirties every member: its effect on unit identity is not computed. A change to
+  one of them that is not one in meaning dirties no member, whichever member's directory holds it.
 - **What a unit costs.** Its compile seconds in the workspace's host dev/test target
   (`target/debug/build/<package>/<unit hash>/fingerprint/`): the modification time of the unit's `<unit>.json`
   fingerprint, which Cargo writes once the unit is built, less that of `invoked.timestamp`, written before the compiler
@@ -684,7 +686,9 @@ An image's price is the compile seconds of the workspace's Cargo units it would 
   stamp is not timed). Of a unit's generations, the one whose hash file was used last counts (`-Zmtime-on-use`, "One
   Cargo environment on every path"). A unit costs the same whichever image holds it, so the workspace's own fingerprints
   price both images. A dirty member with no timed unit is reported `unpriced`, never priced free. Registry units are not
-  priced: sccache serves them. Every price is serial unit-seconds, not gate wall time.
+  priced: sccache serves them. Every price is serial unit-seconds, not gate wall time. A member with no build directory
+  has no timed unit; a target directory that exists but cannot be read, or a tree file Git cannot read, is a pricing
+  failure, never a member without timings.
 - **Equal Cargo environments and one freshness mode are assumed.** A unit whose environment input differs between the
   build that filled an image and the gate (a `CC_<target>` one set and the other did not) rebuilds whatever its tree,
   and so does every unit of an image built under the other fingerprint mode (`"fingerprint":"mtime"` units where the
@@ -713,11 +717,13 @@ move the pick. A seed 442 paths apart rebuilt 144 units, 2650 serial s and 206 s
 1574 serial s and 63 s wall. The fingerprint times of that build summed to 2616 s against Cargo's own 2650 s, and the
 dirty-unit rules named exactly the 18 packages that rebuilt.
 
-- **Enforced by**: `tooling/land-pick.test.ts` (ownership, test-only reach, closure, lock and configuration changes,
-  pricing, the tie, space and unpriced-member rules, compile and build-script run timing, the preview's seed and refusal
-  code) and `tooling/land-host.test.ts` (a land reseeds onto the seed it priced, keeps its own volume when that prices
-  cheaper, when main's seed changed after the price, when the pricing fails, and when the preview finds no seed or fails
-  otherwise, each said apart, and says a reseed that did not finish; every one of them gates and lands).
+- **Enforced by**: `tooling/land-pick.test.ts` (ownership, test-only reach, closure, registry reach through a member
+  cycle, lock and configuration changes in meaning and not, pricing, the tie, space and unpriced-member rules, compile
+  and build-script run timing, an unreadable target directory, the preview's seed and refusal code) and
+  `tooling/land-host.test.ts` (a land reseeds onto the seed it priced, and picks again before a re-gate after main
+  moved; keeps its own volume when that prices cheaper, when main's seed changed after the price, when the pricing
+  fails, and when the preview finds no seed or fails otherwise, each said apart; and says a reseed that did not finish;
+  every one of them gates and lands).
 
 ### Clearing a checkout's Nx state
 

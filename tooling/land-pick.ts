@@ -19,6 +19,8 @@ import { basename, dirname, join, relative } from 'node:path';
 /** Paths whose change makes Cargo's configuration differ for every unit: their effect on unit identity is not computed. */
 const CONFIG_FILES = ['Cargo.toml', 'rust-toolchain', 'rust-toolchain.toml'];
 const NESTED_CONFIG = /(^|\/)\.cargo\/config(\.toml)?$/;
+/** Whether a path is Cargo configuration: only a change in meaning to it counts, and that dirties every member. */
+const isConfig = (path: string): boolean => CONFIG_FILES.includes(path) || NESTED_CONFIG.test(path);
 
 /** A workspace member as the gate tree's `cargo metadata` resolves it. */
 export interface Member {
@@ -106,6 +108,34 @@ export function changedLockEntries(
 }
 
 /**
+ * Each member's registry packages (name@version, the key Cargo.lock entries are compared by), reached through any
+ * path of the resolve graph. Each member walks the graph itself: dev-dependencies can make a cycle between members,
+ * and a walk that shared its unfinished sets would hand the second member of a cycle what the first had reached so far.
+ */
+export function registryReach(
+  memberIds: ReadonlySet<string>,
+  depsOf: ReadonlyMap<string, readonly string[]>,
+): Map<string, Set<string>> {
+  const reach = new Map<string, Set<string>>();
+  for (const id of memberIds) {
+    const found = new Set<string>();
+    const seen = new Set([id]);
+    const stack = [id];
+    for (let node = stack.pop(); node !== undefined; node = stack.pop()) {
+      for (const dep of depsOf.get(node) ?? []) {
+        if (seen.has(dep)) continue;
+        seen.add(dep);
+        stack.push(dep);
+        // A registry package id ends in #name@version.
+        if (!memberIds.has(dep)) found.add(dep.slice(dep.lastIndexOf('#') + 1));
+      }
+    }
+    reach.set(id, found);
+  }
+  return reach;
+}
+
+/**
  * The dirty members of an image built at one tree, for the gate tree: each changed path's owner (its tests only, for
  * a path under its tests/, benches/ or examples/), each member reaching a registry package whose locked entry changed,
  * and every member depending on a dirty package, transitively. A configuration change dirties every member.
@@ -117,7 +147,7 @@ export function dirtyMembers(
   configChanged: (path: string) => boolean,
 ): Dirty {
   for (const path of changedPaths) {
-    if ((CONFIG_FILES.includes(path) || NESTED_CONFIG.test(path)) && configChanged(path)) {
+    if (isConfig(path) && configChanged(path)) {
       return { kind: 'all', because: path };
     }
   }
@@ -130,7 +160,7 @@ export function dirtyMembers(
     pending.push(member);
   };
   for (const path of changedPaths) {
-    if (path === 'Cargo.lock') continue;
+    if (path === 'Cargo.lock' || isConfig(path)) continue;
     const owner = owningMember(members, path);
     if (owner === undefined) continue;
     const inner = owner.dir === '' ? path : relative(owner.dir, path);
@@ -267,13 +297,13 @@ function run(command: string, args: readonly string[], cwd: string): string {
   return result.stdout;
 }
 
-/** A file of a tree, or undefined when the tree has no such path. */
+/** A file of a tree, or undefined when the tree has no such path; a git failure fails the price. */
 function treeFile(checkout: string, tree: string, path: string): string | undefined {
-  const result = spawnSync('git', ['-C', checkout, 'cat-file', 'blob', `${tree}:${path}`], {
-    encoding: 'utf8',
-    maxBuffer: 1 << 28,
-  });
-  return result.status === 0 ? result.stdout : undefined;
+  const entry = run('git', ['-C', checkout, 'ls-tree', '-z', tree, '--', path], checkout);
+  if (entry === '') return undefined;
+  const blob = /^\d+ blob ([0-9a-f]+)\t/.exec(entry)?.[1];
+  if (blob === undefined) fail(`${tree}:${path} is not a file: ${entry}`);
+  return run('git', ['-C', checkout, 'cat-file', 'blob', blob], checkout);
 }
 
 /** The fields of `cargo metadata --format-version 1` the pick reads; Cargo documents the format as stable. */
@@ -300,19 +330,7 @@ function readMembers(checkout: string): Member[] {
     metadata.packages.map((pkg) => [pkg.id, relative(metadata.workspace_root, dirname(pkg.manifest_path))]),
   );
   const depsOf = new Map(metadata.resolve.nodes.map((node) => [node.id, node.deps.map((dep) => dep.pkg)]));
-  const reachCache = new Map<string, Set<string>>();
-  const reachable = (id: string): Set<string> => {
-    const known = reachCache.get(id);
-    if (known !== undefined) return known;
-    const found = new Set<string>();
-    reachCache.set(id, found);
-    for (const dep of depsOf.get(id) ?? []) {
-      // A registry package id ends in #name@version, the key Cargo.lock entries are compared by.
-      if (!memberIds.has(dep)) found.add(dep.slice(dep.lastIndexOf('#') + 1));
-      for (const key of reachable(dep)) found.add(key);
-    }
-    return found;
-  };
+  const registry = registryReach(memberIds, depsOf);
   const dependents = new Map<string, string[]>();
   for (const id of memberIds) {
     for (const dep of depsOf.get(id) ?? []) {
@@ -323,7 +341,7 @@ function readMembers(checkout: string): Member[] {
     name: nameOf.get(id) ?? id,
     dir: dirOf.get(id) ?? '',
     dependents: dependents.get(id) ?? [],
-    registry: reachable(id),
+    registry: registry.get(id) ?? new Set(),
   }));
 }
 
@@ -336,25 +354,41 @@ function readMembers(checkout: string): Member[] {
  * one whose hash file was used last wins: every build that uses a unit stamps that file (-Zmtime-on-use), and nothing
  * else.
  */
-export function readUnitTimes(checkout: string, members: readonly Member[]): Map<string, UnitTime[]> {
+/** A directory's entries; absent only when it does not exist, unreadable for any other error. */
+type Listing =
+  | { readonly kind: 'entries'; readonly names: readonly string[] }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unreadable'; readonly cause: string };
+
+function listDirectory(path: string): Listing {
+  try {
+    return { kind: 'entries', names: readdirSync(path) };
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { kind: 'absent' };
+    return { kind: 'unreadable', cause: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Each member's unit times, or the directory that could not be read: never a price read from part of the target. */
+export type UnitTimes =
+  | { readonly kind: 'read'; readonly times: Map<string, UnitTime[]> }
+  | { readonly kind: 'unreadable'; readonly path: string; readonly cause: string };
+
+export function readUnitTimes(checkout: string, members: readonly Member[]): UnitTimes {
   const build = join(checkout, 'target', 'debug', 'build');
   const times = new Map<string, UnitTime[]>();
   for (const member of members) {
     const newest = new Map<string, { readonly used: number; readonly seconds: number }>();
-    let generations: string[];
-    try {
-      generations = readdirSync(join(build, member.name));
-    } catch {
-      continue;
-    }
-    for (const generation of generations) {
+    const packageDir = join(build, member.name);
+    const generations = listDirectory(packageDir);
+    if (generations.kind === 'unreadable') return { kind: 'unreadable', path: packageDir, cause: generations.cause };
+    if (generations.kind === 'absent') continue;
+    for (const generation of generations.names) {
       const fingerprint = join(build, member.name, generation, 'fingerprint');
-      let files: string[];
-      try {
-        files = readdirSync(fingerprint);
-      } catch {
-        continue;
-      }
+      const listed = listDirectory(fingerprint);
+      if (listed.kind === 'unreadable') return { kind: 'unreadable', path: fingerprint, cause: listed.cause };
+      if (listed.kind === 'absent') continue;
+      const files = listed.names;
       const stamp = files.includes('invoked.timestamp')
         ? join(fingerprint, 'invoked.timestamp')
         : join(build, member.name, generation, 'run', 'invoked.timestamp');
@@ -373,7 +407,7 @@ export function readUnitTimes(checkout: string, members: readonly Member[]): Map
       [...newest].map(([unit, time]) => ({ unit, seconds: time.seconds })),
     );
   }
-  return times;
+  return { kind: 'read', times };
 }
 
 /** Where a checkout's build volume sits: `.cowshed/build` names <mount root>/.build/<owner>/<repo>/<volume id>. */
@@ -426,7 +460,9 @@ function priceCommand(checkout: string, builtTree: string, preview: string): voi
   const seedTree = sidecarTree(seedSidecar);
   const gateTree = run('git', ['-C', checkout, 'rev-parse', 'HEAD^{tree}'], checkout).trim();
   const members = readMembers(checkout);
-  const times = readUnitTimes(checkout, members);
+  const read = readUnitTimes(checkout, members);
+  if (read.kind === 'unreadable') fail(`cannot read ${read.path}: ${read.cause}`);
+  const times = read.times;
   let timedUnits = 0;
   for (const units of times.values()) timedUnits += units.length;
   const own = priceImage(checkout, builtTree, gateTree, members, times);

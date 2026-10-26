@@ -14,6 +14,7 @@ import {
   previewSeed,
   price,
   readUnitTimes,
+  registryReach,
   testOnlyUnit,
   type UnitTime,
 } from './land-pick.ts';
@@ -94,6 +95,31 @@ describe('dirtyMembers', () => {
       kind: 'members',
       members: new Map(),
     });
+  });
+
+  it('dirties no member for a comment-only change to configuration a member owns', () => {
+    const root: Member = { name: 'root', dir: '', dependents: [], registry: new Set() };
+    expect(
+      dirtyMembers([root, ...MEMBERS], ['Cargo.toml', 'crates/core/.cargo/config.toml'], new Set(), unchangedConfig),
+    ).toEqual({ kind: 'members', members: new Map() });
+  });
+});
+
+describe('registryReach', () => {
+  const a = 'path+file:///w/crates/a#a@0.1.0';
+  const b = 'path+file:///w/crates/b#b@0.1.0';
+  const syn = 'registry+https://github.com/rust-lang/crates.io-index#syn@2.0.1';
+  const quote = 'registry+https://github.com/rust-lang/crates.io-index#quote@1.0.40';
+
+  it('gives both members of a dev-dependency cycle every registry package either reaches', () => {
+    const depsOf = new Map([
+      [a, [b, syn]],
+      [b, [a, quote]],
+      [syn, [quote]],
+    ]);
+    const reach = registryReach(new Set([a, b]), depsOf);
+    expect([...(reach.get(a) ?? [])].sort()).toEqual(['quote@1.0.40', 'syn@2.0.1']);
+    expect([...(reach.get(b) ?? [])].sort()).toEqual(['quote@1.0.40', 'syn@2.0.1']);
   });
 });
 
@@ -266,13 +292,28 @@ describe('readUnitTimes', () => {
       });
       // Used last, but with no stamp it has no compile to time, so it neither prices nor displaces lib-core.
       generation(checkout, 'unstamped', { 'fingerprint/lib-core.json': T + 500, 'fingerprint/lib-core': T + 1000 });
-      const times = [...(readUnitTimes(checkout, [core]).get('core') ?? [])].sort((a, b) =>
-        a.unit.localeCompare(b.unit),
-      );
+      const read = readUnitTimes(checkout, [core]);
+      if (read.kind !== 'read') throw new Error(`expected unit times, got ${read.kind}`);
+      const times = [...(read.times.get('core') ?? [])].sort((a, b) => a.unit.localeCompare(b.unit));
       expect(times).toEqual([
         { unit: 'lib-core', seconds: 12 },
         { unit: 'run-build-script-build-script-build', seconds: 3 },
       ]);
+    } finally {
+      rmSync(checkout, { recursive: true, force: true });
+    }
+  });
+
+  it('reads a member with no build directory as untimed, and any other unreadable directory as a failure', () => {
+    const checkout = mkdtempSync(join(tmpdir(), 'land-pick-'));
+    try {
+      const absent = readUnitTimes(checkout, [core]);
+      expect(absent.kind === 'read' ? [...absent.times] : absent).toEqual([]);
+      mkdirSync(join(checkout, 'target/debug/build'), { recursive: true });
+      writeFileSync(join(checkout, 'target/debug/build/core'), '');
+      const unreadable = readUnitTimes(checkout, [core]);
+      expect(unreadable.kind).toBe('unreadable');
+      expect(unreadable.kind === 'unreadable' ? unreadable.path : '').toBe(join(checkout, 'target/debug/build/core'));
     } finally {
       rmSync(checkout, { recursive: true, force: true });
     }

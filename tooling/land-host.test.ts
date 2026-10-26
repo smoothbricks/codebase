@@ -676,6 +676,18 @@ describe('land-host.sh', () => {
       expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
     });
 
+    it('picks again, and reseeds again, before the re-gate after main moved', () => {
+      const land = fixture(false, false, { preview: 'seed', price: `seed ${SEED}` });
+      const run = land.land(
+        [DAEMON_STOP, passingRun(GATE), DAEMON_STOP, passingRun(GATE), passingRun(MAIN_BUILD)],
+        true,
+      );
+      expect(run.status, run.log).toBe(0);
+      expect(run.log).toContain('main moved while the gate ran');
+      expect(run.reseeds).toEqual([PREVIEW, PREVIEW, RESEED, PREVIEW, PREVIEW, RESEED]);
+      expect(run.log.split(`reseeding ws from main's seed ${SEED}`)).toHaveLength(3);
+      expect(git(land.main, 'rev-parse', 'HEAD')).toBe(git(land.ws, 'rev-parse', 'HEAD'));
+    });
     it('tells a failed reseed preview from a missing seed', () => {
       const land = fixture(false, false, { preview: 'conflict' });
       const run = land.land(passing());
