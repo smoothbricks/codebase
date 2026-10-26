@@ -40,13 +40,13 @@ use crate::api::process::{
 };
 use crate::runtime::job_spans::{JOB_SPAN_ID, SpanOutcome};
 use crate::runtime::process_tree::ProcessIdentity;
-use crate::storage::trace_columns::{
-    Category, Enum, I32, Optional, Text, TraceEnum, U32, U64, trace_columns, trace_enum,
-};
+use crate::storage::trace_columns::{Category, Enum, I32, Optional, Text, U32, U64, trace_columns};
 use crate::storage::trace_segment::{
     EntryType, SealStep, SpanAddress, SystemColumns, SystemRow, TelemetryDate, TraceSegmentError,
     seal_segment, system_fields, trace_batch,
 };
+use cowshed_types::trace_enum;
+use cowshed_types::trace_enum::TraceEnum;
 
 /// The name of a process span's start and end rows.
 pub const PROCESS_RUN: &str = "process.run";
