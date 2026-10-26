@@ -694,7 +694,7 @@ impl Growth {
                 self.room = self.extra;
                 None
             }
-            TopUpOutcome::Full | TopUpOutcome::Waiting | TopUpOutcome::Floor => {
+            TopUpOutcome::Full | TopUpOutcome::Waiting => {
                 // Refused: ask again at the next check, so the spell is measured asking.
                 self.back_off = std::time::Duration::ZERO;
                 self.next_offer = now;

@@ -673,12 +673,18 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
     let mut a = Asker::ask(&socket, 2, "/w/a").await;
     // Beside gate work the host is quiet: background's grant is one token, whatever it wants.
     assert_eq!(a.granted().await, 1);
-    // A second background token would leave background at half the host, so c queues.
+    // No gate ask waits, so background takes the free tokens, one each, and the host fills.
+    let mut b = Asker::ask(&socket, 1, "/w/b").await;
+    assert_eq!(b.granted().await, 1);
+    let mut d = Asker::ask(&socket, 1, "/w/d").await;
+    assert_eq!(d.granted().await, 1);
     let mut queued = Asker::ask(&socket, 1, "/w/c").await;
     // A land task asks the gate job's pool after c queued. The pool lends nothing of its own: the
-    // child is granted the host's free tokens, ahead of c, not a share of the gate's single token.
+    // child is granted the next returned token, ahead of c, not a share of the gate's single token.
     let mut task = Asker::child(&pool, 2).await;
-    assert_eq!(task.granted().await, 2);
+    assert_eq!(task.granted_within(Duration::from_millis(50)).await, None);
+    drop(a);
+    assert_eq!(task.granted().await, 1);
     assert_eq!(queued.granted_within(Duration::from_millis(50)).await, None);
     let status = ledger(&socket).await;
     let land = status
@@ -686,13 +692,11 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
         .iter()
         .find(|checkout| checkout.checkout == "/w/land")
         .expect("the land holds");
-    assert_eq!((land.held, land.running), (3, 2), "{status:?}");
+    assert_eq!((land.held, land.running), (2, 2), "{status:?}");
+    // The task's token returns and no gate ask waits: c takes it.
     drop(task);
-    // Background still holds its one token: c is served when background returns it.
-    assert_eq!(queued.granted_within(Duration::from_millis(50)).await, None);
-    drop(a);
     assert_eq!(queued.granted().await, 1);
-    drop((gate, queued));
+    drop((gate, b, d, queued));
     gateway.drain().await.expect("drain");
 }
 
@@ -986,15 +990,10 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     );
     drop(older_task);
     assert_eq!(younger_task.granted().await, 1);
-    // The lands hold the host's larger part: the feature waits while they work.
+    // No gate ask waits now: the feature's next runner takes the returned token beside the lands.
     drop(feature_two);
-    assert_eq!(
-        feature_next.granted_within(Duration::from_millis(50)).await,
-        None
-    );
-    drop((older, younger, younger_task));
     assert_eq!(feature_next.granted().await, 1);
-    drop(feature_next);
+    drop((older, younger, younger_task, feature_next));
     gateway.drain().await.expect("drain");
 }
 
@@ -1321,8 +1320,9 @@ async fn an_activation_stake_holds_one_background_token_until_it_drops() {
 /// "A resident's start holds one token"). Measured 2026-10-21: the keeper asked
 /// its start's stake of the host as background while another repository's gate and background
 /// tests filled background's room. The stake waited 324 s, and the land, waiting on the daemon,
-/// gave up. Here background holds its whole room: the stake asked of the host alone queues behind
-/// it, and the same stake drawn on the land's gate pool is granted at once from the gate's half.
+/// gave up. Here background fills the host beside the land: the stake asked of the host alone
+/// queues behind it, and the same stake drawn on the land's gate pool, one of the gate's tasks, is
+/// granted the next returned token ahead of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_background_is_full() {
     use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
@@ -1330,11 +1330,16 @@ async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_backgr
     let (gateway, _root, socket) = gateway(4).await;
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut background = Asker::ask(&socket, 2, "/w/tests").await;
-    // Beside the land the host is quiet: background is granted one token, all it may hold here.
+    // Beside the land the host is quiet: background is granted one token a grant, and with no gate
+    // ask waiting it fills the free tokens.
     assert_eq!(background.granted().await, 1);
+    let mut filler = Asker::ask(&socket, 1, "/w/filler").await;
+    assert_eq!(filler.granted().await, 1);
+    let mut full = Asker::ask(&socket, 1, "/w/full").await;
+    assert_eq!(full.granted().await, 1);
     let admission = GatewayJobCpu::new(socket.clone());
     let start = "node /w/land/node_modules/nx/dist/src/daemon/server/start.js --kept";
-    // Asked of the host alone, as the keeper asked it before: it queues behind background's room.
+    // Asked of the host alone, as the keeper asked it before: it queues at the full host.
     let mut alone =
         Box::pin(admission.activation(PathBuf::from("/w/land"), start.to_owned(), None));
     loop {
@@ -1351,20 +1356,27 @@ async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_backgr
             break;
         }
     }
-    // Drawn on the land's gate pool, it is one of the gate's tasks: granted the host's free token
-    // while background's room stays full.
-    let stake = admission
-        .activation(
-            PathBuf::from("/w/land"),
-            start.to_owned(),
-            Some(pool.to_string_lossy().into_owned()),
-        )
+    // Drawn on the land's gate pool, it is one of the gate's tasks: granted the next returned token,
+    // ahead of the host-alone stake that asked first.
+    let pooled = tokio::spawn({
+        let admission = GatewayJobCpu::new(socket.clone());
+        let pool = pool.to_string_lossy().into_owned();
+        async move {
+            admission
+                .activation(PathBuf::from("/w/land"), start.to_owned(), Some(pool))
+                .await
+        }
+    });
+    waiters_reach(&socket, "/w/land", 2).await;
+    drop(filler);
+    let stake = pooled
         .await
+        .expect("the pooled start's task")
         .expect("the land's gate pool grants the start");
     assert_eq!(
         ledger(&socket).await.held,
-        3,
-        "the gate's, background's one and the start's"
+        4,
+        "the gate's, background's two and the start's"
     );
     // Its host ask was withdrawn when the pool won: only the host-alone stake still waits.
     waiters_reach(&socket, "/w/land", 1).await;
@@ -1372,8 +1384,8 @@ async fn a_kept_daemons_start_drawn_on_a_lands_gate_pool_is_granted_while_backgr
     drop(background);
     let alone = alone
         .await
-        .expect("the host-alone stake is granted once background returns its room");
-    drop((alone, gate));
+        .expect("the host-alone stake is granted once a token returns");
+    drop((alone, gate, full));
     while ledger(&socket).await.held != 0 {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

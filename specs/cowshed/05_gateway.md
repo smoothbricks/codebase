@@ -1384,14 +1384,13 @@ core count.
   minutes after they ended, the ledger 17 tokens free and nothing queued. So a lent pool whose grant came from the host
   ledger below its `want` looks at its fifo every second; while the fifo holds no token it asks the ledger for one more,
   at its own rank, one token at a time up to its `want`, and at once when a child waits on its socket. The ledger gives
-  it only a token no request waits for, and, to work behind the oldest gate job, only within the floor ("Room for a
-  gate"); otherwise it refuses at once. A token the pool added that sits in its fifo goes straight back, as any returned
-  token does, first to a waiter; an offer that sat idle backs the next one off, doubling to 30 s, and one a reader took
-  is followed at once. The deadlock argument holds: a top-up is never waited for, granted or refused at once with no
-  queue place, and it never takes a token a waiting request could have. A refused ask is asked again every second, and a
-  pool the ledger refuses for 3 s, its fifo empty throughout, says so once a spell, naming the pool, the job and the
-  ledger:
-  `cowshed: cpu-pool STARVED pool=… job=… held=… want=… refused_ms=… socket_waiters=… cause=full|waiting|floor ledger_free=… ledger_total=… ledger_queued=…`.
+  it only a token no request waits for; otherwise it refuses at once. A token the pool added that sits in its fifo goes
+  straight back, as any returned token does, first to a waiter; an offer that sat idle backs the next one off, doubling
+  to 30 s, and one a reader took is followed at once. The deadlock argument holds: a top-up is never waited for, granted
+  or refused at once with no queue place, and it never takes a token a waiting request could have. A refused ask is
+  asked again every second, and a pool the ledger refuses for 3 s, its fifo empty throughout, says so once a spell,
+  naming the pool, the job and the ledger:
+  `cowshed: cpu-pool STARVED pool=… job=… held=… want=… refused_ms=… socket_waiters=… cause=full|waiting ledger_free=… ledger_total=… ledger_queued=…`.
   A reader blocked on the fifo is invisible to the pool, so the empty fifo stands for it; `socket_waiters` counts the
   children queued on the pool's socket. The pool's own back-off is not a refusal. A grant a pool lends its own children
   ("Nested runners") does not top up: only the host ledger tops up. A runner sized when it starts keeps that size; only
@@ -1523,14 +1522,16 @@ core count.
   `SIGSTOP`/`SIGCONT`: wall and idle bounds would keep advancing during a freeze, and a killed nextest run cannot
   resume, so its owner would rerun it whole and read a failure it did not cause. So each background grant is sized when
   it is made, by whether gate-class work holds or waits then: **with none, background may be granted every token; beside
-  it the host is quiet, and each background grant is one token, made only while the work behind the oldest gate job —
-  background and younger gate jobs — then holds less than half the host, and at least one token on a host of two or
-  more** (`behind + 1 ≤ max(1, ⌊(N − 1)/2⌋)` for N ≥ 2, `Ledger::floor_open`), so a host of two or three tokens still
-  runs one background job beside a gate, and a host of one leaves its token to the gate. That is the floor "Gate
-  admission" grants, made the only background grant: the same checkout-fair order picks (an overdue head first, then the
-  fewest held), and the grant is one token. Measured 2026-10-22: no gate job ran, background was capped at 9 of 18
-  tokens, `leak-prevent` held all 9, and three other sheds waited while the other 9 idled; so with no gate work
-  background takes the whole host.
+  it the host is quiet, and each background grant is one token; while a gate-class request waits, it is made only while
+  the work behind the oldest gate job — background and younger gate jobs — then holds less than half the host, and at
+  least one token on a host of two or more** (`behind + 1 ≤ max(1, ⌊(N − 1)/2⌋)` for N ≥ 2, `Ledger::floor_open`), so a
+  host of two or three tokens still runs one background job beside a gate, and a host of one leaves its token to the
+  gate. That is the floor "Gate admission" grants, made the only background grant: the same checkout-fair order picks
+  (an overdue head first, then the fewest held), and the grant is one token. Measured 2026-10-22: no gate job ran,
+  background was capped at 9 of 18 tokens, `leak-prevent` held all 9, and three other sheds waited while the other 9
+  idled; so with no gate work background takes the whole host. Measured 2026-10-26 on the train-6 install: one gate job
+  holding 1 token and asking nothing more left 17 background asks queued while 9 of 18 tokens idled; so the floor binds
+  only while a gate-class request waits, and with none waiting background takes the free tokens, one each.
 
   The quiet replaces a convention. While a land gated, its lander broadcast a "quiet window" asking every agent to start
   no host test runs, bulk I/O, forks or attach churn until it reported (SB trains 3 and 4, 2026-10-25), and work started
@@ -2223,8 +2224,9 @@ uninterruptible waits behind them.
   listing finishes what it left: so a gateway restart or a reboot (the gateway is `RunAtLoad`) frees every entry left,
   an image cut short mid-free included.
 - **What is never done.** No verb or other releasing process truncates an image, starts a process to free one, or holds
-  an image lock through a free. The gateway applies no `IOPOL_THROTTLE`, and no timer, poll or environment variable
-  drives the queue: the thread waits on its hand-overs and on the ledger's answer.
+  an image lock through a free. The gateway applies no `IOPOL_THROTTLE`, and no environment variable drives the queue:
+  the thread waits on its hand-overs and on the ledger's answer, and its one timer is the 10 s read of the free space
+  while it waits for gate work to end ("One cut at a time").
 
 Space lags. Until the cleanup frees an entry the store's container still holds its allocation, so free-space figures and
 extent counts lag the commit by the entry's wait in the queue and the free's own duration, and an entry the gateway was
