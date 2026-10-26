@@ -236,7 +236,8 @@ mod tests {
                 .write(true)
                 .open(&lease)
                 .expect("the lease file");
-            bare.lock().expect("flock the lease with no record");
+            bare.try_lock()
+                .expect("flock the fresh lease with no record");
             let refusal = take(&sessions, "topic", Holding::Remove)
                 .expect_err("a flocked lease admitted a taker");
             assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
