@@ -19,6 +19,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::ApfsStorageError;
+use crate::copy::RegionCursor;
 #[cfg(target_os = "macos")]
 use crate::copy::native::bypass_cache;
 use crate::copy::native::next_data_region;
@@ -164,6 +165,8 @@ pub fn shared_bytes(source: &Path, clone: &Path) -> Result<u64, ApfsStorageError
     let (source_file, source_length) = open(source)?;
     let (clone_file, clone_length) = open(clone)?;
     let length = source_length.min(clone_length);
+    let mut source_regions = RegionCursor::new(&source_file, length)
+        .map_err(|error| io_error("find source data to compare extents", source, error))?;
     let mut shared = 0_u64;
     let mut offset = 0;
     while let Some((start, end)) = next_data_region(&clone_file, offset, length)
@@ -173,7 +176,8 @@ pub fn shared_bytes(source: &Path, clone: &Path) -> Result<u64, ApfsStorageError
         while position < end {
             let theirs = physical_run(&clone_file, position, end - position)
                 .map_err(|error| io_error("map clone extents", clone, error))?;
-            let Some((source_start, source_end)) = next_data_region(&source_file, position, length)
+            let Some((source_start, source_end)) = source_regions
+                .region_at(position, length)
                 .map_err(|error| io_error("find source data to compare extents", source, error))?
             else {
                 return Ok(shared);
@@ -428,6 +432,8 @@ pub fn catch_up<Stop>(
     };
     let (base_file, base_length) = open(base)?;
     let (next_file, length) = open(next)?;
+    let mut base_regions = RegionCursor::new(&base_file, base_length)
+        .map_err(|error| io_error("find the old seed's data", base, error))?;
     let writer = OpenOptions::new()
         .write(true)
         .open(copy)
@@ -447,7 +453,8 @@ pub fn catch_up<Stop>(
         while position < end {
             let theirs = physical_run(&next_file, position, end - position)
                 .map_err(|error| io_error("map the new seed's extents", next, error))?;
-            let (step, shared) = match next_data_region(&base_file, position, base_length)
+            let (step, shared) = match base_regions
+                .region_at(position, base_length)
                 .map_err(|error| io_error("find the old seed's data", base, error))?
             {
                 Some((base_start, base_end)) if base_start <= position => {

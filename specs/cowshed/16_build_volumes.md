@@ -551,7 +551,10 @@ faster than it catches up, is started again by the next land that freezes main's
   written and punched, and the time taken. After **8** catch-ups the seed is replaced faster than the copy follows it,
   and the compaction stops. A copy already under way finishes the seed it started rather than switching to the new one:
   it reads one immutable clone in one pass and takes no lock, a switch would still need the catch-up for the part
-  already copied, and finishing writes at most the new seed's changes to the remaining part twice.
+  already copied, and finishing writes at most the new seed's changes to the remaining part twice. Physical-layout
+  comparisons retain each file's current logical data region across physical extents, as the byte comparison does:
+  SEEK_DATA/SEEK_HOLE probes advance only past that region's end, never once per extent. A pure counting test covers
+  leading, interior and trailing holes and many extents per region; probe count follows regions, not extents.
 - **Main's live volume moves onto the compacted seed.** After a publication, with main's image lock let go, main's live
   build volume is replaced by a clone of the compacted seed through the workspace reseed of main from main (Workspace
   reseed: both participants are main, so its image lock and lifecycle lease are each taken once). It moves only when it

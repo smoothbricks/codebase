@@ -370,30 +370,44 @@ struct Run {
 
 /// One file's place among its data regions: the first region ending past the walk's offset, or
 /// `None` once only a hole remains.
-struct RegionCursor<'a> {
+pub(crate) struct RegionCursor<'a> {
     file: &'a fs::File,
     region: Option<(u64, u64)>,
 }
 
 impl<'a> RegionCursor<'a> {
-    fn new(file: &'a fs::File, length: u64) -> io::Result<Self> {
+    pub(crate) fn new(file: &'a fs::File, length: u64) -> io::Result<Self> {
         Ok(Self {
             file,
             region: native::next_data_region(file, 0, length)?,
         })
     }
 
+    /// The current or next data region for a monotonically increasing offset and fixed length.
+    pub(crate) fn region_at(&mut self, offset: u64, length: u64) -> io::Result<Option<(u64, u64)>> {
+        advance_data_region(&mut self.region, offset, |offset| {
+            native::next_data_region(self.file, offset, length)
+        })
+    }
     /// What the file has from `offset` on, and where that ends.
     fn at(&mut self, offset: u64, length: u64) -> io::Result<(Content, u64)> {
-        if self.region.is_some_and(|(_, end)| end <= offset) {
-            self.region = native::next_data_region(self.file, offset, length)?;
-        }
-        Ok(match self.region {
+        Ok(match self.region_at(offset, length)? {
             None => (Content::Hole, length),
             Some((start, _)) if start > offset => (Content::Hole, start),
             Some((_, end)) => (Content::Data, end),
         })
     }
+}
+
+fn advance_data_region(
+    region: &mut Option<(u64, u64)>,
+    offset: u64,
+    probe: impl FnOnce(u64) -> io::Result<Option<(u64, u64)>>,
+) -> io::Result<Option<(u64, u64)>> {
+    if region.is_some_and(|(_, end)| end <= offset) {
+        *region = probe(offset)?;
+    }
+    Ok(*region)
 }
 
 /// The runs of `[0, length)` in ascending order. Each ends at the nearer of the two files' next
@@ -1363,6 +1377,45 @@ mod tests {
         CopyReport, DIRECTORY_STAGING_MODE, EntryKind, Snapshot, converge, copy_with_budget,
         describe_churn, render_path, snapshot, validate_copy_roots,
     };
+
+    #[test]
+    fn region_probes_follow_regions_not_extents() {
+        use std::cell::Cell;
+
+        for extents in [1_u64, 16, 4096] {
+            let regions = [(2, extents + 2), (extents + 4, 2 * extents + 4)];
+            let layouts: [&[(u64, u64)]; 3] = [&regions[..1], &regions, &[]];
+            for layout in layouts {
+                let probes = Cell::new(0_usize);
+                let probe = |offset| {
+                    probes.set(probes.get() + 1);
+                    Ok(layout
+                        .iter()
+                        .copied()
+                        .find(|&(_, end)| end > offset)
+                        .map(|(start, end)| (start.max(offset), end)))
+                };
+                let mut region = probe(0).expect("initial region");
+                // Each unit step represents a separate physical extent, including steps in holes.
+                for offset in 0..2 * extents + 8 {
+                    let actual = super::advance_data_region(&mut region, offset, probe)
+                        .expect("advance region")
+                        .map(|(start, end)| (start.max(offset), end));
+                    let expected = layout
+                        .iter()
+                        .copied()
+                        .find(|&(_, end)| end > offset)
+                        .map(|(start, end)| (start.max(offset), end));
+                    assert_eq!(actual, expected, "layout {layout:?}, offset {offset}");
+                }
+                assert_eq!(
+                    probes.get(),
+                    layout.len() + 1,
+                    "one probe per region plus EOF, independent of {extents} extents: {layout:?}"
+                );
+            }
+        }
+    }
 
     fn temp_root(label: &str) -> PathBuf {
         let suffix = SystemTime::now()
