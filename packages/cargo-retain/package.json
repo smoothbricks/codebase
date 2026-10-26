@@ -96,6 +96,12 @@
       },
       "test-node": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^dependencyDefault",
+          "bunToolchain"
+        ],
         "options": {
           "command": "bun test --timeout=0",
           "cwd": "{projectRoot}",
@@ -105,6 +111,16 @@
       },
       "test-native": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "default",
+          "^dependencyDefault",
+          "bunToolchain",
+          {
+            "dependentTasksOutputFiles": "**/*",
+            "transitive": true
+          }
+        ],
         "dependsOn": [
           "build"
         ],
