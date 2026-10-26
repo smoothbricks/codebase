@@ -46,7 +46,6 @@ type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 mod compaction;
 mod nx_clear;
 mod reseed;
-pub use compaction::SEED_COMPACTION_VERB;
 pub(crate) use compaction::{
     Admission, CompactionDue, CompactionTurn, Published, SEED_COMPACTION_CATCH_UPS,
     SEED_COMPACTION_WAIT, seconds_since, start_compaction,

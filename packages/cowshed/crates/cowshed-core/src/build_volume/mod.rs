@@ -14,7 +14,6 @@
 
 pub mod cache_adapter;
 pub mod cargo;
-#[cfg(target_os = "macos")]
 pub mod discard;
 pub mod link;
 #[cfg(target_os = "macos")]

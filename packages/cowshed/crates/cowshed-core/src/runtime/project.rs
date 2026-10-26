@@ -68,6 +68,11 @@ const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
 /// If they diverged, `land` would satisfy a check `rm` does not make.
 pub const DEFAULT_LANDING_BRANCH: &str = "main";
 
+/// The hidden verb a land starts to compact its target's seed, `cowshed __compact-seed
+/// <project-root>` ([`ProjectRuntimeHost::compact_seed`]; 16_build_volumes.md, "Seed
+/// compaction"). It is the CLI's on every platform: only a host with build volumes compacts.
+pub const SEED_COMPACTION_VERB: &str = "__compact-seed";
+
 /// Immutable facts returned by one authoritative substrate enumeration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceSnapshot {

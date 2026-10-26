@@ -50,11 +50,10 @@ pub mod supervisor_socket;
 pub mod volume_usage;
 pub mod wait_spans;
 
-pub use build_volumes::SEED_COMPACTION_VERB;
 pub use nx_daemon::{NxKeeperHold, NxKeeperState};
 pub use project::{
     ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost,
-    ProjectSnapshots, RecoveryScope, RuntimeLogChunk, WorkspaceSnapshot,
+    ProjectSnapshots, RecoveryScope, RuntimeLogChunk, SEED_COMPACTION_VERB, WorkspaceSnapshot,
 };
 pub use supervisor::{
     CheckpointBarrier, CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk,
