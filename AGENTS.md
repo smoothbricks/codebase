@@ -21,7 +21,7 @@ is the host-installed CLI of `packages/cowshed`.
   creates one, `cowshed path <ws>` prints its directory, `cowshed rm <ws>` retires it; `<ws>` is the shed's name (its
   `.cowshed/workspace.json` `workspace` field, whose `role` says shed or main). **main** is the shared checkout
   (`cowshed path main`); never edit code there. These commands run from the trusted host shell: a sandboxed worker's
-  cowshed CLI is refused at its first write, so it hands fork, land and `rm` to its lead.
+  cowshed CLI is refused at its first write, so it hands fork, land, `rm` and `gc` to its lead.
 - **cowshed exec**: `cowshed exec <ws> -- <cmd>` runs a build, test or bench under cowshed's jobserver, which admits
   work by CPU tokens so host load stays schedulable. Work started outside it holds no token and starves everyone. Host
   targets that a sandbox can't run (`host-e2e`) use `cowshed exec <ws> --host -- direnv exec . <cmd>`.
@@ -43,14 +43,20 @@ is the host-installed CLI of `packages/cowshed`.
    defect or one contract change) promptly with `git commit --only -- <paths>`, never the whole index. Commit your WIP
    before a disruptive host operation. _Enforced by: review._
 2. **Landing.** When you land, retire a shed or claim something is landed → use the land command. "Landed" means the
-   commit is an ancestor of `main` (`git merge-base --is-ancestor`). Retire a shed only after its work is landed. When
-   `cowshed rm` refuses, never add `--force` or `--abandon`: a shed whose content `main` already holds
-   (`cowshed ls --landing` counts its unlanded commits) is reset to `main` and removed with plain `cowshed rm`; a shed
-   with unlanded work, failed or partly landed, is landed, or left to its owner. `--abandon` keeps every destroyed tip
-   as a ref in `main`'s `.git`; `--force` destroys the uncommitted tree. A fix that removes a fleet bottleneck, such as
-   a failure that blocks more than one shed, comes before local polish. Combine related fixes into one train, with one
-   lander per project: a second land of the same project loses the cache hits the first just wrote. _Enforced by: the
-   land turn and `tooling/land-host.sh`; `cowshed rm`'s containment refusal; review for the flags._
+   commit is an ancestor of `main` (`git merge-base --is-ancestor`). Retire every finished shed promptly, and only after
+   its work is landed or deliberately dropped: a shed left standing holds its image and build volumes. When `cowshed rm`
+   refuses, never add `--force`: a shed whose content `main` already holds (`cowshed ls --landing` counts its unlanded
+   commits) is reset to `main` if dirt blocks the removal, then removed with plain `cowshed rm`; a shed whose work was
+   deliberately dropped (superseded or obsolete, the reason clear from the brief, the git log or the session JSONL) is
+   removed with `cowshed rm --abandon` (clear dirt first: `--abandon` waives none), then `cowshed gc --abandoned`; a
+   shed with real unlanded work and a live owner, failed or partly landed, is landed, or left to that owner. `--abandon`
+   bundles the unlanded tips it destroys into `sessions/.trash/`, and `gc --abandoned` deletes all of the project's
+   bundles, each the only copy of its commits; `--force` destroys the uncommitted tree. Maintainer rulings of 2026-10-18
+   and 2026-10-26: cleaning up is as important as creating, if not more, and `--abandon` may be used for it. A fix that
+   removes a fleet bottleneck, such as a failure that blocks more than one shed, comes before local polish. Combine
+   related fixes into one train, with one lander per project: a second land of the same project loses the cache hits the
+   first just wrote. _Enforced by: the land turn and `tooling/land-host.sh`; `cowshed rm`'s containment refusal; review
+   for the flags._
 3. **Edits.** When you are about to edit → work in your own shed (one owner per unit, no git worktrees, never a peer's
    path until released). Use absolute workspace paths in filesystem and edit tools, so a session's cwd cannot redirect
    an edit into `main`. Markdown that belongs to no code unit goes straight to `main` with the doc commit (see
