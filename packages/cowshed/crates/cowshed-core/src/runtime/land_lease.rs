@@ -46,7 +46,7 @@ impl Holding {
     /// [`Holding::Land`]; a preflight takes no lease at all (02_workspaces.md,
     /// "`cowshed land`", `--preflight`), so it answers while another operation
     /// holds the lease, whoever that is.
-    pub(crate) const fn for_land(preflight: bool) -> Option<Self> {
+    pub const fn for_land(preflight: bool) -> Option<Self> {
         if preflight { None } else { Some(Self::Land) }
     }
 
