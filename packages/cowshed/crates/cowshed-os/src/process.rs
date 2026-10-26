@@ -1670,8 +1670,9 @@ impl fmt::Display for Holder {
 mod tests {
     use super::*;
 
-    /// The state a process is read in follows its life: a sleeping child sleeps, an exited and
-    /// unreaped one is a zombie, a reaped one is gone.
+    /// The state a process is read in follows its life: a live child is running, in an
+    /// uninterruptible wait or asleep, an exited and unreaped one is a zombie, a reaped one is
+    /// gone.
     #[test]
     fn a_childs_run_state_follows_its_life() {
         use crate::fork_lock::Spawn as _;
@@ -1684,17 +1685,24 @@ mod tests {
         let exit = ExitWatch::of(child.id())
             .expect("watch sleep")
             .expect("sleep runs");
-        // Asleep in nanosleep once it has started; until then it may still be running its start.
-        let state = run_state(pid);
-        assert!(
-            matches!(state, RunState::Sleeping | RunState::Running),
-            "{state}"
-        );
+        // The child is read the instant it has started: asleep in nanosleep once it has, and
+        // until then running its start or in an uninterruptible kernel wait during it. Every state
+        // is read before any is asserted, so a failed assertion leaves no sleeper running.
+        let started = run_state(pid);
         child.kill().expect("kill sleep");
         exit.wait().expect("sleep exits");
-        assert_eq!(run_state(pid), RunState::Zombie);
+        let exited = run_state(pid);
         child.wait().expect("reap sleep");
-        assert_eq!(run_state(pid), RunState::Gone);
+        let reaped = run_state(pid);
+        assert!(
+            matches!(
+                started,
+                RunState::Running | RunState::Sleeping | RunState::Uninterruptible
+            ),
+            "{started}"
+        );
+        assert_eq!(exited, RunState::Zombie);
+        assert_eq!(reaped, RunState::Gone);
     }
 
     /// A procfs TCP table names a port only for a `LISTEN` row whose socket the process holds:

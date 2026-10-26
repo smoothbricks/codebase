@@ -1387,14 +1387,16 @@ mod tests {
 
     const SHORT_REAP: Bound = Bound::new(LatencyClass::Reap, Duration::from_millis(50));
 
-    /// Kill the process group `leader` leads, which this test started.
+    /// Kill the process group `leader` leads, which this test started. A group with no member
+    /// left is already ended: the assertions that follow say what ended it.
     fn kill_group(leader: u32) {
         let group = libc::pid_t::try_from(leader).expect("a pid");
         // SAFETY: a negative pid addresses only the group this test's own child leads.
-        assert_eq!(
-            unsafe { libc::kill(-group, libc::SIGKILL) },
-            0,
-            "kill the test's group"
+        let killed = unsafe { libc::kill(-group, libc::SIGKILL) };
+        let error = io::Error::last_os_error();
+        assert!(
+            killed == 0 || error.raw_os_error() == Some(libc::ESRCH),
+            "kill the test's group: {error}"
         );
     }
 
@@ -1405,33 +1407,43 @@ mod tests {
             .spawn_locked()
             .expect("spawn sleep");
         let pid = child.id();
-        let failure = reap(
+        let expiry = reap(
             "probe child",
             &mut child,
             &start("reap probe", SHORT_REAP),
             Progress::Nothing,
-        )
-        .expect_err("sleep 600 does not exit within 50 ms");
-        let ReapError::Expired(expired) = &failure else {
-            panic!("expected TIMEOUT, got {failure}");
-        };
-        assert_eq!(expired.op, "reap probe");
-        assert_eq!(expired.peer.pid, pid);
-        assert_eq!(expired.peer.state, RunState::Sleeping, "{failure}");
-        assert!(expired.elapsed >= SHORT_REAP.within, "{failure}");
-        assert_eq!(failure.code(), "TIMEOUT");
-        // The expiry left the child running: it is reaped once killed.
+        );
+        // The expiry left the child running: it is killed and collected before any assertion can
+        // panic, so a failed one leaves no sleeper behind.
         child.kill().expect("kill sleep");
-        let status = reap(
+        let collected = reap(
             "probe child",
             &mut child,
             &start("reap probe", REAP),
             Progress::Signalled {
                 signal: libc::SIGKILL,
             },
-        )
-        .expect("a killed child is reaped");
+        );
+        let failure = expiry.expect_err("sleep 600 does not exit within 50 ms");
+        let ReapError::Expired(expired) = &failure else {
+            panic!("expected TIMEOUT, got {failure}");
+        };
+        assert_eq!(expired.op, "reap probe");
+        assert_eq!(expired.peer.pid, pid);
+        // Alive at the bound, in a state a child shows right after it started: running its
+        // start, in an uninterruptible kernel wait during it, or asleep in nanosleep. One the
+        // wait had collected would be a zombie or gone.
+        assert!(
+            matches!(
+                expired.peer.state,
+                RunState::Running | RunState::Sleeping | RunState::Uninterruptible
+            ),
+            "{failure}"
+        );
+        assert!(expired.elapsed >= SHORT_REAP.within, "{failure}");
+        assert_eq!(failure.code(), "TIMEOUT");
         use std::os::unix::process::ExitStatusExt as _;
+        let status = collected.expect("a killed child is reaped");
         assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
@@ -1447,18 +1459,19 @@ mod tests {
             .expect("spawn sh");
         let pid = child.id();
         let pumps = OutputPumps::start(&mut child);
-        let status = reap(
+        let exit = reap(
             "probe child",
             &mut child,
             &start("reap probe", REAP),
             Progress::Nothing,
-        )
-        .expect("sh exits once it started sleep");
-        assert!(status.success(), "{status}");
-        let failure = pumps
-            .join("probe child", pid, &start("collect output", SHORT_REAP))
-            .expect_err("sleep holds both pipes");
+        );
+        let held = pumps.join("probe child", pid, &start("collect output", SHORT_REAP));
+        // Its sleep outlives it, holding both pipes: the group is ended before any assertion can
+        // panic, so a failed one leaves no sleeper behind.
         kill_group(pid);
+        let status = exit.expect("sh exits once it started sleep");
+        assert!(status.success(), "{status}");
+        let failure = held.expect_err("sleep holds both pipes");
         let OutputError::Held { stream, expired } = &failure else {
             panic!("expected the held pipe, got {failure}");
         };
