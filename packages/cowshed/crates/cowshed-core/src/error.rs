@@ -119,21 +119,24 @@ pub struct CowshedError {
     /// explicit removal's reason): one pointer slot in every Result, never one per cause.
     #[serde(flatten, default, deserialize_with = "known_to_this_build")]
     cold: Option<Box<ColdRefusal>>,
-    /// What the storage layer refused with, for a caller in this process to act on; never on the
-    /// wire. Boxed like `otherBuild` and `fence`: it is rare, and every `Result` in cowshed
+    /// What the storage layer refused with, or the wait on another process that expired, for a
+    /// caller in this process to act on; never on the wire. Boxed like `otherBuild` and `fence`: it is rare, and every `Result` in cowshed
     /// carries this type.
     #[serde(skip)]
-    storage_cause: Option<Box<StorageCause>>,
+    local_cause: Option<Box<LocalCause>>,
 }
 
-/// The structured storage refusal a [`CowshedError`] keeps for a caller in this process.
+/// The structured cause a [`CowshedError`] keeps for a caller in this process, never on the wire.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum StorageCause {
+enum LocalCause {
     /// The exact stale lifecycle fact `execute_checked` found.
     LifecycleConflict(crate::storage::lifecycle::Conflict),
     /// The image locks an operation taking them without waiting found held (01_storage.md,
     /// "Lock order").
     ImageLocksHeld(Box<[std::path::PathBuf]>),
+    /// A wait on another process that expired (05_gateway.md, "Deadlines"), for the boundary that
+    /// owns the wait to record as its span (13_telemetry.md, "Wait spans").
+    Wait(crate::runtime::wait_spans::WaitFailure),
 }
 
 /// Canonical wire fields remain flat; only the private storage groups these exclusive causes.
@@ -536,7 +539,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            storage_cause: None,
+            local_cause: None,
         }
     }
 
@@ -566,7 +569,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            storage_cause: Some(Box::new(StorageCause::LifecycleConflict(conflict))),
+            local_cause: Some(Box::new(LocalCause::LifecycleConflict(conflict))),
         }
     }
 
@@ -575,7 +578,7 @@ impl CowshedError {
     /// waits for them alone (01_storage.md, "Lock order").
     pub fn image_locks_held(message: impl Into<String>, locks: Box<[std::path::PathBuf]>) -> Self {
         Self {
-            storage_cause: Some(Box::new(StorageCause::ImageLocksHeld(locks))),
+            local_cause: Some(Box::new(LocalCause::ImageLocksHeld(locks))),
             ..Self::conflict(
                 message,
                 "retry once the operation holding the lock has finished",
@@ -606,7 +609,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            storage_cause: None,
+            local_cause: None,
         }
     }
 
@@ -635,7 +638,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            storage_cause: None,
+            local_cause: None,
         }
     }
 
@@ -659,7 +662,7 @@ impl CowshedError {
             admission: None,
             stdin: None,
             cold: None,
-            storage_cause: None,
+            local_cause: None,
         }
     }
 
@@ -870,20 +873,47 @@ impl CowshedError {
 
     /// The exact stale lifecycle fact, when this error came from `execute_checked`.
     pub fn lifecycle_conflict_source(&self) -> Option<&crate::storage::lifecycle::Conflict> {
-        match self.storage_cause.as_deref()? {
-            StorageCause::LifecycleConflict(conflict) => Some(conflict),
-            StorageCause::ImageLocksHeld(_) => None,
+        match self.local_cause.as_deref()? {
+            LocalCause::LifecycleConflict(conflict) => Some(conflict),
+            LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) => None,
         }
     }
 
     /// The image locks found held, when this is an operation's refusal to wait for them.
     pub fn image_locks_held_source(&self) -> Option<&[std::path::PathBuf]> {
-        match self.storage_cause.as_deref()? {
-            StorageCause::ImageLocksHeld(locks) => Some(locks),
-            StorageCause::LifecycleConflict(_) => None,
+        match self.local_cause.as_deref()? {
+            LocalCause::ImageLocksHeld(locks) => Some(locks),
+            LocalCause::LifecycleConflict(_) | LocalCause::Wait(_) => None,
         }
     }
 
+    /// This error, carrying the wait that expired when `failure` is one, in place of any other
+    /// in-process cause it held; with `None`, this error unchanged.
+    pub fn with_wait(self, failure: Option<crate::runtime::wait_spans::WaitFailure>) -> Self {
+        match failure {
+            Some(failure) => Self {
+                local_cause: Some(Box::new(LocalCause::Wait(failure))),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// This error with its message reworded by `message`, which reads the current one: its code,
+    /// hint and every cause it carries are kept, an expired wait among them.
+    pub fn reworded(self, message: impl FnOnce(&str) -> String) -> Self {
+        Self {
+            message: message(&self.message),
+            ..self
+        }
+    }
+    /// The wait on another process that expired, when this error reports one.
+    pub fn wait_source(&self) -> Option<&crate::runtime::wait_spans::WaitFailure> {
+        match self.local_cause.as_deref()? {
+            LocalCause::Wait(failure) => Some(failure),
+            LocalCause::LifecycleConflict(_) | LocalCause::ImageLocksHeld(_) => None,
+        }
+    }
     /// The two builds, when this is the daemon's refusal of another build's request.
     pub fn other_build_source(&self) -> Option<&OtherBuild> {
         self.other_build.as_deref()
@@ -949,9 +979,9 @@ impl fmt::Display for CowshedError {
 
 impl std::error::Error for CowshedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self.storage_cause.as_deref()? {
-            StorageCause::LifecycleConflict(conflict) => Some(conflict),
-            StorageCause::ImageLocksHeld(_) => None,
+        match self.local_cause.as_deref()? {
+            LocalCause::LifecycleConflict(conflict) => Some(conflict),
+            LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) => None,
         }
     }
 }

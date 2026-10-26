@@ -864,6 +864,8 @@ dependencies = [
 name = "cowshed-cli"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
  "async-trait",
  "base64 0.22.1",
  "bytes",

@@ -19,8 +19,8 @@ vocabulary (`Deadline`, `LatencyClass`, `RetryClass`, `BlockedReason`; specs/lma
 "Rust"). It does not take lmao's telemetry runtime, so cowshed works without lmao's tracing. One `cowshed-core` module
 writes lmao's Arrow trace schema — the system-column prefix, the entry-type dictionary and sealed-segment publication —
 byte-for-byte aligned with `lmao-arrow`'s, because that crate cannot be imported without `lmao-core`'s span buffers. The
-gateway's request spans and the supervisor's job spans both use that module; neither keeps a copy. Nothing in cowshed
-queries traces with `lmao-query`.
+gateway's request spans, the supervisor's job spans, the native image observations and the CLI's wait spans all use that
+module; none keeps a copy. Nothing in cowshed queries traces with `lmao-query`.
 
 **Job span segments.** The workspace supervisor writes each job's span with the trace context the controller minted or
 adopted for it (`JobInfo.trace`): a `span-start` row at admission, the `job.unattributed` row below when its terminal
@@ -78,6 +78,8 @@ it. This is what upgrades a first-party tool's traffic from tier-2 to tier-1 att
   source workspace's trace, `restore` links to the checkpoint's, `checkpoint` links to the workspace's. The clone graph
   becomes a queryable provenance graph — from any gateway denial you can walk back to which task created this workspace
   from which state of main.
+- **Wait spans.** A wait on another cowshed process that expires (05_gateway.md, "Deadlines") is a `cowshed.wait` span,
+  so `lmao-q errors` lists the expiry with its cause (below, "Wait spans").
 - **Grant-mutation spans.** Each `grant`/`revoke` (04_sandbox.md) records the trace that caused it, so
   `revision × trace` answers "**why** does this workspace hold this grant" — the task, not just the timestamp.
 - **The escalation loop as one trace.** The exit-6 negotiation (12_mcp.md) — denial span (with the EPERM evidence,
@@ -178,6 +180,37 @@ print(rows.sort_values("timestamp")[[
 ]].to_string(index=False))
 PY
 ```
+
+## Wait spans
+
+A wait one cowshed process has on another that ends `TIMEOUT`, `SILENT` or `PEER_LOST` (05_gateway.md, "Deadlines")
+reaches the boundary that owns it as a value, and that boundary records it as a span. A boundary with a span of its own
+ends that span `span-err` with the failure's message. The CLI has none. When a command ends in an expired wait, its one
+error boundary seals the failure as its own segment `wait-<uuid>.arrow` under `<store>/telemetry/<yyyy-mm-dd>/`, the UTC
+date the wait began, through the same `trace_segment` owner as the job spans. The span is span 1 of a fresh lmao thread.
+Its `span-start` row, named `cowshed.wait`, is stamped when the wait began (the expiry less the time waited), and its
+`span-err` row at the expiry, with the failure's sentence as its message. The span is in the trace the CLI adopted from
+`TRACEPARENT` (version `00`, lowercase hex, neither id all zeros), with the adopted span id in `w3c_parent_span_id`;
+with no such `TRACEPARENT` it is the root of a fresh trace. A wait that is answered writes nothing: the command owns
+that time. A seal that fails is said on stderr and never changes the command's outcome; the command's own report names
+the failure either way.
+
+| Column               | Type     | Meaning                                                                          |
+| -------------------- | -------- | -------------------------------------------------------------------------------- |
+| `wait_op`            | `Utf8`   | The op that waited (`hello`, `status`, `process-events`, …).                     |
+| `wait_peer`          | `Utf8`   | The peer or holder, as the failure names it: its role, socket and pid.           |
+| `wait_peer_pid`      | `u32`    | The pid the kernel reported for the peer; null when it reported none.            |
+| `wait_class`         | `Utf8`   | A `TIMEOUT`'s latency class (`control`, `handshake`, …); null otherwise.         |
+| `wait_bound_us`      | `u64`    | A `TIMEOUT`'s request bound or a `SILENT`'s silence bound; null for `PEER_LOST`. |
+| `wait_code`          | `S.enum` | `TIMEOUT`, `SILENT` or `PEER_LOST`, on the `span-err` row only.                  |
+| `wait_elapsed_us`    | `u64`    | The whole wait, on the `span-err` row only.                                      |
+| `wait_last`          | `Utf8`   | The last progress the waiter saw, on the `span-err` row only.                    |
+| `process_id`         | `u32`    | The process that waited.                                                         |
+| `w3c_parent_span_id` | `u64`    | The adopted `TRACEPARENT`'s span id; null in a minted trace.                     |
+
+The expiries that reach this boundary come from every workspace-supervisor call and from the gateway control requests
+that reconciliation and the CLI make; 05_gateway.md ("Deadlines", Spans) lists them and the expiries that write no span.
+`lmao-q --dir "$STORE/telemetry/$DAY" errors` lists each with its sentence.
 
 ## Process-tree spans
 

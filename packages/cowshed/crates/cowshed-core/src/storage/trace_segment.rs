@@ -4,8 +4,8 @@
 //! `lmao-arrow::trace_schema` cannot be imported alone: that crate also links its sibling
 //! `lmao-core` runtime. This module keeps the system-column prefix and the entry-type dictionary
 //! byte-for-byte aligned with it until the schema is extracted into a dependency-free crate. The
-//! gateway's request spans and the supervisor's job spans are both written here; neither keeps a
-//! copy.
+//! gateway's request spans, the supervisor's job spans, the native image observations and the
+//! CLI's wait spans are all written here; none keeps a copy.
 //!
 //! A segment is one Arrow IPC stream holding one record batch, at
 //! `<telemetry root>/<yyyy-mm-dd>/<stem>.arrow`: written to a create-new 0600 temporary,

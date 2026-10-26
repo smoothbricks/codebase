@@ -32,6 +32,7 @@ use crate::metadata::{
     EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation, WorkspaceName,
 };
 use crate::repository::RepoId;
+use crate::runtime::wait_spans::WaitFailure;
 use crate::storage::bootstrap::{FixturePortClaims, ValidatedHostStorage};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -46,6 +47,8 @@ pub struct ReconcileReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GatewayStatusError {
     Absent,
+    /// The status request's wait expired (05_gateway.md, "Deadlines").
+    Waited(Box<WaitFailure>),
     Control(String),
 }
 
@@ -59,6 +62,8 @@ pub enum ControlRefusal {
     Superseded(String),
     /// The host kernel already owns the listener; a publisher may choose another port block.
     AddressInUse(String),
+    /// The write's wait expired (05_gateway.md, "Deadlines").
+    Waited(Box<WaitFailure>),
     Failed(String),
 }
 
@@ -68,6 +73,7 @@ impl std::fmt::Display for ControlRefusal {
             Self::Superseded(reason) | Self::Failed(reason) | Self::AddressInUse(reason) => {
                 formatter.write_str(reason)
             }
+            Self::Waited(failure) => formatter.write_str(&failure.message),
         }
     }
 }
@@ -624,6 +630,11 @@ async fn reconciliation_status<C: GatewayControl + ?Sized>(
 ) -> Result<DaemonStatus> {
     let status = control.status().await.map_err(|error| match error {
         GatewayStatusError::Absent => gateway_absent(uid),
+        GatewayStatusError::Waited(failure) => CowshedError::environment_missing(
+            format!("gateway status failed: {}", failure.message),
+            "cowshed doctor --json names the gateway and its socket",
+        )
+        .with_wait(Some(*failure)),
         GatewayStatusError::Control(message) => {
             CowshedError::internal(format!("gateway status failed: {message}"))
         }
@@ -723,6 +734,16 @@ where
             {
                 Ok(()) => report.removed += 1,
                 Err(ControlRefusal::Superseded(_)) => report.superseded += 1,
+                Err(ControlRefusal::Waited(failure)) => {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "could not remove stale gateway session {}: {}",
+                            installed.workspace_id, failure.message
+                        ),
+                        "cowshed doctor --json names the gateway and its socket",
+                    )
+                    .with_wait(Some(*failure)));
+                }
                 Err(ControlRefusal::Failed(error) | ControlRefusal::AddressInUse(error)) => {
                     return Err(CowshedError::internal(format!(
                         "could not remove stale gateway session {}: {error}",
@@ -779,6 +800,16 @@ where
             match control.remove(&owner.workspace_id, owner.revision).await {
                 Ok(()) => report.removed += 1,
                 Err(ControlRefusal::Superseded(_)) => report.superseded += 1,
+                Err(ControlRefusal::Waited(failure)) => {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "could not remove stale gateway session {} holding endpoint {}: {}",
+                            owner.workspace_id, owner.endpoint, failure.message
+                        ),
+                        "cowshed doctor --json names the gateway and its socket",
+                    )
+                    .with_wait(Some(*failure)));
+                }
                 Err(ControlRefusal::Failed(error) | ControlRefusal::AddressInUse(error)) => {
                     return Err(CowshedError::internal(format!(
                         "could not remove stale gateway session {} holding endpoint {}: {error}",
@@ -789,6 +820,8 @@ where
         }
     }
     let mut failures = Vec::new();
+    // The first install whose wait expired: the error the failures end in carries it.
+    let mut waited = None;
     for (identity, session) in &desired_by_id {
         let unchanged = installed_by_id
             .get(identity.as_str())
@@ -809,6 +842,14 @@ where
                 }
                 Err(ControlRefusal::Superseded(_)) => {
                     report.superseded += 1;
+                    break;
+                }
+                Err(ControlRefusal::Waited(failure)) => {
+                    failures.push(format!(
+                        "could not install gateway session {identity}: {}",
+                        failure.message
+                    ));
+                    waited.get_or_insert(failure);
                     break;
                 }
                 Err(ControlRefusal::Failed(error)) => {
@@ -873,7 +914,7 @@ where
     if failures.is_empty() {
         Ok(report)
     } else {
-        Err(CowshedError::internal(failures.join("; ")))
+        Err(CowshedError::internal(failures.join("; ")).with_wait(waited.map(|failure| *failure)))
     }
 }
 

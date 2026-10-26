@@ -22,7 +22,7 @@ use crate::api::dto::{
     JobFailure, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobState, JobTail,
     JobTailLimits, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
     ProtectedOutput, SealedJob, Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo,
-    TraceContext, TraceId, UtcTimestamp, WorkspacePath,
+    TraceContext, UtcTimestamp, WorkspacePath,
 };
 use crate::api::journal_tail::tail_journals;
 use crate::api::process::JobLeafAttribution;
@@ -6236,7 +6236,7 @@ impl SupervisorActor {
                 return Err(error);
             }
         };
-        let trace = trace.unwrap_or_else(new_trace_context);
+        let trace = trace.unwrap_or_else(TraceContext::mint);
         let info = JobInfo {
             repo_id: self.authority.repo_id.clone(),
             workspace_incarnation: self.authority.workspace_incarnation.clone(),
@@ -8925,16 +8925,6 @@ fn validate_checkpoint_id(value: &str) -> Result<()> {
             "invalid checkpoint commitment id",
             "use a 1-128 character alphanumeric checkpoint id",
         ))
-    }
-}
-
-fn new_trace_context() -> TraceContext {
-    let trace = Uuid::new_v4().simple().to_string();
-    let span = Uuid::new_v4().simple().to_string();
-    TraceContext {
-        trace_id: TraceId::new(trace).expect("UUID simple form is a nonzero trace id"),
-        span_id: crate::api::dto::SpanId::new(&span[..16])
-            .expect("UUID prefix is a nonzero span id"),
     }
 }
 

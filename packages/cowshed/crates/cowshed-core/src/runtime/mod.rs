@@ -47,6 +47,7 @@ pub mod supervisor;
 pub mod supervisor_manager;
 pub mod supervisor_socket;
 pub mod volume_usage;
+pub mod wait_spans;
 
 pub use nx_daemon::{NxKeeperHold, NxKeeperState};
 pub use project::{

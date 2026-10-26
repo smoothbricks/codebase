@@ -315,7 +315,8 @@ impl GatewayControlClient {
                             return;
                         }
                     }
-                    Err(ControlError::UnexpectedEof) => return,
+                    // The gateway ended the follow: the stream is over.
+                    Err(ControlError::Wait(WaitError::PeerLost { .. })) => return,
                     Err(error) => {
                         let _ = sender.send(Err(error)).await;
                         return;
@@ -2942,7 +2943,7 @@ where
             .await;
         read.map_err(|error| ControlError::Wait(reader.get_ref().fail(error)))?;
         if bytes.is_empty() {
-            return Err(ControlError::UnexpectedEof);
+            return Err(ControlError::Wait(reader.get_ref().lost()));
         }
         if bytes.len() > MAX_CONTROL_MESSAGE as usize || !bytes.ends_with(b"\n") {
             return Err(ControlError::InvalidResponse);
@@ -3209,8 +3210,6 @@ pub enum ControlError {
     Encoding(String),
     #[error("gateway control response is invalid")]
     InvalidResponse,
-    #[error("gateway control stream ended")]
-    UnexpectedEof,
     #[error("gateway control rejected operation ({code:?}): {message}")]
     Rejected {
         code: ControlFailureCode,

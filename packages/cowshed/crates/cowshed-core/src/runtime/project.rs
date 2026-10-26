@@ -6851,11 +6851,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             };
             return match rollback {
                 Ok(()) => Err(error),
-                Err(rollback) => Err(CowshedError::new(
-                    error.code,
-                    format!("{}; restoring main also failed: {rollback}", error.message),
-                    error.hint,
-                )),
+                Err(rollback) => Err(error
+                    .reworded(|message| {
+                        format!("{message}; restoring main also failed: {rollback}")
+                    })
+                    .with_wait(rollback.wait_source().cloned())),
             };
         }
         Ok(())
@@ -8056,14 +8056,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .await?;
         if !options.restore {
             self.collect_build_volumes().await.map_err(|failed| {
-                CowshedError::new(
-                    failed.code,
+                failed.reworded(|message| {
                     format!(
-                        "retired {workspace}, but its build volumes were not collected: {}",
-                        failed.message
-                    ),
-                    failed.hint,
-                )
+                        "retired {workspace}, but its build volumes were not collected: {message}"
+                    )
+                })
             })?;
         }
         Ok(report)
@@ -8617,7 +8614,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     Ok(()) => Err(primary),
                     Err(cleanup) => Err(CowshedError::internal(format!(
                         "workspace removal failed: {primary}; state restoration also failed: {cleanup}"
-                    ))),
+                    ))
+                    .with_wait(primary.wait_source().or(cleanup.wait_source()).cloned())),
                 };
             }
         };
@@ -15555,14 +15553,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     })
     .await
     .map_err(|failed| {
-        CowshedError::new(
-            failed.code,
+        failed.reworded(|message| {
             format!(
-                "rebased {workspace} to {oid}, but carrying {}'s Nx cache into its build volume failed: {}",
-                into.name, failed.message
-            ),
-            failed.hint,
-        )
+                "rebased {workspace} to {oid}, but carrying {}'s Nx cache into its build volume failed: {message}",
+                into.name
+            )
+        })
     })?,
 };
         Ok(RebaseReport { oid, build_volume })
@@ -15749,14 +15745,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             )
             .await
             .map_err(|failed| {
-                CowshedError::new(
-                    failed.code,
+                failed.reworded(|message| {
                     format!(
-                        "landed {source_head} on {target_branch}, but its build volume was not adopted: {}",
-                        failed.message
-                    ),
-                    failed.hint,
-        )
+                        "landed {source_head} on {target_branch}, but its build volume was not adopted: {message}"
+                    )
+                })
     })?,
     // The target keeps its volume and seed; the unit's volume is still the unit's, and its
     // retire releases it (16_build_volumes.md, "Ungated folds").
@@ -15834,14 +15827,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     gone.message
                 ),
                 Err(kept) => {
-                    return Err(CowshedError::new(
-                        kept.code,
+                    return Err(kept.reworded(|message| {
                         format!(
-                            "landed {source_head} on {target_branch}, but workspace {workspace} was kept: {}",
-                            kept.message
-                        ),
-                        kept.hint,
-                    ));
+                            "landed {source_head} on {target_branch}, but workspace {workspace} was kept: {message}"
+                        )
+                    }));
                 }
             }
         } else if plan == LandPlan::Gated {
@@ -22220,7 +22210,8 @@ fn native_staged_error(
         } => CowshedError::integrity(
             format!("{initializer}; cleanup also failed: {cleanup}"),
             "cowshed doctor --json",
-        ),
+        )
+        .with_wait(initializer.wait_source().cloned()),
     }
 }
 

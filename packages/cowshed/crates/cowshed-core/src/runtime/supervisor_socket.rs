@@ -30,6 +30,7 @@ use super::supervisor::{
     CheckpointBarrier, Command, LogChunk, NxDaemonRetirement, RetireWhen, SessionSnapshot,
     SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
+use super::wait_spans::{WaitFailure, peer_pid};
 use crate::api::dto::{
     AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobId, JobInfo,
     JobJournalCursor, JobState, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand,
@@ -822,7 +823,8 @@ const SUPERVISOR: &str = "workspace supervisor";
 
 /// A wait on the supervisor that ended without its answer, as the caller's error. The message
 /// is the wait's own: its code, op, the supervisor's socket and pid, the time waited and the last
-/// progress seen.
+/// progress seen. An expired wait also rides on it as its [`WaitFailure`], for the boundary that
+/// records its span (05_gateway.md, "Deadlines", Spans).
 fn waited(failure: WaitError) -> CowshedError {
     let hint = match &failure {
         WaitError::Expired(_) | WaitError::Silent(_) => {
@@ -837,6 +839,7 @@ fn waited(failure: WaitError) -> CowshedError {
         WaitError::Io { .. } => "cowshed doctor --json names the supervisor and its socket",
     };
     CowshedError::environment_missing(failure.to_string(), hint)
+        .with_wait(WaitFailure::of(&failure))
 }
 
 /// Connect to the supervisor at `path` for `op`, whose request has `bound` from now.
@@ -957,7 +960,10 @@ async fn answer_of(
                         job.state,
                         stream.peer()
                     );
-                    return Err(stuck(stalled.silent(holder, deadline::clock())));
+                    return Err(stuck(
+                        stalled.silent(holder, deadline::clock()),
+                        peer_pid(stream.peer()),
+                    ));
                 }
             }
             Some(_) | None => {
@@ -967,12 +973,15 @@ async fn answer_of(
     }
 }
 
-/// A job that stopped between its last process and its end, as the waiter's error.
-fn stuck(silent: Silent<String>) -> CowshedError {
+/// A job that stopped between its last process and its end, as the waiter's error, carrying the
+/// silence as its [`WaitFailure`]; `supervisor_pid` is the pid the kernel reported for the
+/// supervisor the job is reached through.
+fn stuck(silent: Silent<String>, supervisor_pid: Option<i32>) -> CowshedError {
     CowshedError::environment_missing(
         silent.to_string(),
         "the supervisor has not published the job's end; cowshed doctor --json names the supervisor",
     )
+    .with_wait(Some(WaitFailure::silent(&silent, supervisor_pid)))
 }
 
 // ---------------------------------------------------------------------------------------------

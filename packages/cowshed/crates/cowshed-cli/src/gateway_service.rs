@@ -30,6 +30,7 @@ use cowshed_core::runtime::supervisor_manager::{
     self, ProgramSpawner, SocketPeers, SupervisorManager,
 };
 use cowshed_core::runtime::supervisor_socket;
+use cowshed_core::runtime::wait_spans::WaitFailure;
 use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::{
     CowshedError, ErrorCode, GatewayStoreBackend, NativeGatewayInventory, Result, StartupHealState,
@@ -89,7 +90,14 @@ impl ControlSocket {
         self.0
             .session_current(workspace_id, revision)
             .await
-            .map_err(control_error)
+            .map_err(|error| match expired(&error) {
+                Some(failure) => CowshedError::environment_missing(
+                    error.to_string(),
+                    "cowshed doctor --json names the gateway and its socket",
+                )
+                .with_wait(Some(failure)),
+                None => control_error(error),
+            })
     }
 
     /// Clear the project's Nx accepted-task store. A refusal while the project's Nx work is in
@@ -124,7 +132,8 @@ impl ControlSocket {
                 error => CowshedError::environment_missing(
                     format!("the gateway did not clear the project's Nx store: {error}"),
                     "cowshed gateway status",
-                ),
+                )
+                .with_wait(expired(&error)),
             })
     }
 }
@@ -136,7 +145,10 @@ impl GatewayControl for ControlSocket {
             // A missing socket is not a fault: no daemon is running, and the remedy is to start
             // one rather than to report a broken control plane.
             ControlError::Wait(WaitError::Absent { .. }) => GatewayStatusError::Absent,
-            error => GatewayStatusError::Control(error.to_string()),
+            error => match expired(&error) {
+                Some(failure) => GatewayStatusError::Waited(Box::new(failure)),
+                None => GatewayStatusError::Control(error.to_string()),
+            },
         })
     }
 
@@ -169,7 +181,28 @@ fn control_refusal(error: ControlError) -> ControlRefusal {
             code: ControlFailureCode::AddressInUse,
             ..
         } => ControlRefusal::AddressInUse(error.to_string()),
-        error => ControlRefusal::Failed(error.to_string()),
+        error => match expired(&error) {
+            Some(failure) => ControlRefusal::Waited(Box::new(failure)),
+            None => ControlRefusal::Failed(error.to_string()),
+        },
+    }
+}
+
+/// The wait `error` reports, when it is one that expired (05_gateway.md, "Deadlines", Spans).
+fn expired(error: &ControlError) -> Option<WaitFailure> {
+    match error {
+        ControlError::Wait(failure) => WaitFailure::of(failure),
+        ControlError::InvalidSocketPath
+        | ControlError::InvalidTcpEndpoint
+        | ControlError::InvalidControllerCredential
+        | ControlError::Unauthorized
+        | ControlError::MessageTooLarge
+        | ControlError::InvalidAuditTailLimit
+        | ControlError::InvalidSession(_)
+        | ControlError::Encoding(_)
+        | ControlError::InvalidResponse
+        | ControlError::Rejected { .. }
+        | ControlError::Io(_) => None,
     }
 }
 

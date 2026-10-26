@@ -45,6 +45,9 @@ tokio.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+# The expired-wait boundary test (src/run.rs) reads the Arrow segment it seals.
+arrow-array = "56"
+arrow-ipc = "56"
 # The install and restart decisions (src/agent_cycle.rs) are property-tested.
 proptest = "1"
 # Paused time: a test lets a day pass while a foreground exec still waits for its job.

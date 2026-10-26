@@ -11,6 +11,8 @@ use std::io;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use cowshed_core::CowshedError;
+use cowshed_core::runtime::wait_spans::{WaitFailure, WaitSpans};
+use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
 use crate::capabilities::sccache;
@@ -255,6 +257,12 @@ async fn run_parsed(parsed: args::Cli, interrupts: InterruptPolicy) -> Ending {
 async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i32, i32> {
     let json = parsed.global.json;
     let mut output = output::Output::stdio(parsed.global.quiet);
+    // A wait that expires under this command is sealed as its span in the host's telemetry, in the
+    // trace its caller exported (13_telemetry.md, "Wait spans").
+    let waits = WaitSpans::adopting(
+        CanonicalRoots::global().telemetry().to_path_buf(),
+        std::env::var("TRACEPARENT").ok().as_deref(),
+    );
     // Help is an answer, not a diagnostic: it goes to stdout, exits 0, and is never suppressed by
     // --quiet, because it is the output the caller asked for.
     if let args::Command::Help(topic) = &parsed.command {
@@ -297,11 +305,11 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // authenticates this wrapper before exec replaces its image without changing its life.
     if let args::Command::SubtreeRoot(root) = &parsed.command {
         let outcome = crate::subtree::root(root).await;
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     if let args::Command::RetireDescendants(retire) = &parsed.command {
         let outcome = crate::subtree::retire(retire, &mut output).await;
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     // Lock invocations were separated during synchronous preparation to own their state channel.
     // Observations read only the kernel, before anything asks the daemon.
@@ -316,7 +324,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     }
     if let args::Command::Skill(skill_args) = &parsed.command {
         let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     if matches!(parsed.command, args::Command::BuildState) {
         let outcome = match parsed.global.project.as_deref() {
@@ -330,11 +338,11 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
                 })
                 .and_then(|start| crate::build_state::dispatch(&start, json, &mut output)),
         };
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     if let args::Command::Gateway(action) = &parsed.command {
         let outcome = gateway_service::dispatch(*action, parsed.global.json, &mut output).await;
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     // An embedding process's controller: a service over the socket it was handed that lasts as long
     // as that process keeps its end open, so like the host services above it sits outside the
@@ -348,7 +356,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         }
         .await
         .map(|()| 0);
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     // An embedding process's host connection: like the controller it lasts as long as that
     // process keeps its end open. It names no project, so nothing is resolved before it serves.
@@ -359,7 +367,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         }
         .await
         .map(|()| 0);
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     // Enrolment is a host operation with a project subject: it needs the repository identity a
     // credential record binds to, and nothing else the project bridge provides.
@@ -370,7 +378,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             }
             Err(error) => Err(error),
         };
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     // Binding an identity is the same shape: a project subject, the binding record, and the main
     // checkout's remotes — nothing the project bridge adds.
@@ -381,19 +389,19 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             }
             Err(error) => Err(error),
         };
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     if let args::Command::Sccache(action) = &parsed.command {
         let outcome =
             sccache::service::dispatch(action.clone(), parsed.global.json, &mut output).await;
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     // `setup` has no project and no workspace: its subject is the host, so it dispatches here
     // beside the other host services rather than through the project runtime bridge.
     if let args::Command::Setup(setup_args) = &parsed.command {
         let outcome =
             setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
-        return Ok(finish(outcome, &mut output, json));
+        return Ok(finish(outcome, &mut output, json, &waits));
     }
     // A land step that starts while an install holds the slot waits for that install, and then
     // holds nothing (`install_basis::wait_for_install`): no install ever waits on a land step.
@@ -409,7 +417,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         .await;
         match waited {
             Ok(support) => waited_in = support,
-            Err(error) => return Ok(finish(Err(error), &mut output, json)),
+            Err(error) => return Ok(finish(Err(error), &mut output, json, &waits)),
         }
     }
     // The daemon refuses another build's cowshed at the first supervisor a verb asks for, which
@@ -421,9 +429,10 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
                 Err(continue_as_installed(support)),
                 &mut output,
                 json,
+                &waits,
             ));
         }
-        return Ok(finish(Err(error), &mut output, json));
+        return Ok(finish(Err(error), &mut output, json, &waits));
     }
     // Project and host commands run the controller in this process, and its workspace supervisors
     // run jobs as children in their own process groups, out of reach of the terminal's signals.
@@ -444,7 +453,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             signal = interrupts.received() => return Err(signal),
         }
     };
-    Ok(finish(outcome, &mut output, json))
+    Ok(finish(outcome, &mut output, json, &waits))
 }
 
 /// Replace this process with the installed cowshed, run with this process's own arguments
@@ -593,15 +602,20 @@ fn is_land_step(command: &args::Command) -> bool {
 
 /// Turn one command's outcome into this process's exit code, reporting a failure in whichever
 /// format the caller asked for. Every dispatch path ends here so none of them can grow its own
-/// idea of how an error is written.
+/// idea of how an error is written. A failure that is an expired wait is also sealed as its span
+/// through `waits` (05_gateway.md, "Deadlines", Spans).
 fn finish<W: io::Write, E: io::Write>(
     outcome: Result<i32, CowshedError>,
     output: &mut output::Output<W, E>,
     json: bool,
+    waits: &WaitSpans,
 ) -> i32 {
     match outcome {
         Ok(exit_code) => exit_code,
         Err(error) => {
+            if let Some(failure) = error.wait_source() {
+                record_wait(waits, failure);
+            }
             let exit_code = i32::from(error.exit_code());
             if let Err(write_error) = write_error(output, error, json, None) {
                 cowshed_os::eprintln!("cowshed: failed to write command result: {write_error}");
@@ -613,6 +627,16 @@ fn finish<W: io::Write, E: io::Write>(
     }
 }
 
+/// Seal the expired wait a command failed with as its span. A seal that fails is said on stderr and
+/// never changes the command's outcome, whose own report names the wait either way.
+fn record_wait(waits: &WaitSpans, failure: &WaitFailure) {
+    if let Err(error) = waits.seal(failure, std::time::SystemTime::now()) {
+        cowshed_os::eprintln!(
+            "cowshed: the expired wait's span could not be sealed under {}: {error}",
+            waits.root().display()
+        );
+    }
+}
 fn emit_error(error: CowshedError, command_map: Option<&str>, json: bool, quiet: bool) -> i32 {
     let exit_code = i32::from(error.exit_code());
     let mut output = output::Output::stdio(quiet);
@@ -793,5 +817,150 @@ mod tests {
             "--abandon",
         ];
         assert!(args::parse_args(steered).is_err());
+    }
+
+    /// A supervisor that took the hello and never answers (05_gateway.md, "Deadlines"): the hello
+    /// expires `TIMEOUT` within the handshake bound, and the command's boundary seals the expiry
+    /// as a one-span `cowshed.wait` segment under the trace the CLI adopted from `TRACEPARENT`
+    /// (13_telemetry.md, "Wait spans"). Time is paused: the listener never sends a byte, so no
+    /// readiness arrives from outside the runtime while the bound runs.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_wait_reaches_the_command_boundary_as_a_sealed_span() {
+        use arrow_array::cast::AsArray as _;
+        use arrow_array::types::{UInt8Type, UInt16Type, UInt32Type, UInt64Type};
+        use arrow_array::{Array as _, ArrayAccessor as _};
+
+        let root =
+            crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cswait");
+        let socket = root.join("s.sock");
+        // Bound and never accepted: the kernel completes the connect and takes the hello.
+        let _silent = std::os::unix::net::UnixListener::bind(&socket).expect("silent supervisor");
+        let telemetry = root.join("telemetry");
+        std::fs::create_dir(&telemetry).expect("telemetry root");
+        let waits = WaitSpans::adopting(
+            telemetry.clone(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+
+        let outcome = cowshed_core::runtime::supervisor_socket::hello(&socket)
+            .await
+            .map(|_| 0);
+        let mut output = output::Output::new(Vec::new(), Vec::new(), false);
+        let code = finish(outcome, &mut output, false, &waits);
+        let (_, stderr) = output.into_inner();
+        let stderr = String::from_utf8(stderr).expect("utf-8 stderr");
+        assert_ne!(code, 0);
+        assert!(
+            stderr.contains("TIMEOUT: hello on workspace supervisor"),
+            "{stderr}"
+        );
+
+        let segments: Vec<_> = std::fs::read_dir(&telemetry)
+            .expect("telemetry root")
+            .flat_map(|partition| {
+                std::fs::read_dir(partition.expect("partition").path()).expect("partition")
+            })
+            .map(|entry| entry.expect("segment").path())
+            .collect();
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        let name = segments[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("name");
+        assert!(
+            name.starts_with("wait-") && name.ends_with(".arrow"),
+            "{name}"
+        );
+        let mut reader = arrow_ipc::reader::StreamReader::try_new(
+            std::fs::File::open(&segments[0]).expect("open segment"),
+            None,
+        )
+        .expect("an Arrow stream");
+        let batch = reader.next().expect("one batch").expect("a readable batch");
+        assert!(reader.next().is_none(), "one batch per segment");
+        assert_eq!(batch.num_rows(), 2);
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let entry = column("entry_type").as_dictionary::<UInt8Type>();
+        let entry = entry
+            .downcast_dict::<arrow_array::StringArray>()
+            .expect("names");
+        assert_eq!((entry.value(0), entry.value(1)), ("span-start", "span-err"));
+        let message = column("message").as_dictionary::<UInt32Type>();
+        let message = message
+            .downcast_dict::<arrow_array::StringArray>()
+            .expect("messages");
+        assert_eq!(message.value(0), "cowshed.wait");
+        assert!(
+            message.value(1).starts_with(&format!(
+                "TIMEOUT: hello on workspace supervisor at {}",
+                socket.display()
+            )),
+            "{}",
+            message.value(1)
+        );
+        let trace = column("trace_id").as_dictionary::<UInt32Type>();
+        let trace = trace
+            .downcast_dict::<arrow_array::StringArray>()
+            .expect("traces");
+        for row in 0..2 {
+            assert_eq!(trace.value(row), "4bf92f3577b34da6a3ce929d0e0e4736");
+        }
+        let threads = column("thread_id").as_primitive::<UInt64Type>();
+        assert_eq!(threads.value(0), threads.value(1));
+        let spans = column("span_id").as_primitive::<UInt32Type>();
+        assert_eq!((spans.value(0), spans.value(1)), (1, 1));
+        assert_eq!(column("parent_span_id").null_count(), 2);
+        let parent = column("w3c_parent_span_id").as_primitive::<UInt64Type>();
+        assert_eq!(parent.value(0), 0x00f0_67aa_0ba9_02b7);
+
+        let utf8 = |name: &str, row: usize| {
+            let values = column(name).as_string::<i32>();
+            (!values.is_null(row)).then(|| values.value(row).to_owned())
+        };
+        let code = column("wait_code").as_dictionary::<UInt16Type>();
+        let code = code
+            .downcast_dict::<arrow_array::StringArray>()
+            .expect("codes");
+        assert!(
+            code.is_null(0),
+            "the start row does not know how the wait ends"
+        );
+        assert_eq!(code.value(1), "TIMEOUT");
+        assert_eq!(utf8("wait_op", 0).as_deref(), Some("hello"));
+        assert_eq!(utf8("wait_class", 0).as_deref(), Some("handshake"));
+        assert!(
+            utf8("wait_peer", 0).is_some_and(|peer| peer.contains(&socket.display().to_string())),
+            "{:?}",
+            utf8("wait_peer", 0)
+        );
+        let pid = column("wait_peer_pid").as_primitive::<UInt32Type>();
+        assert_eq!(
+            pid.value(0),
+            std::process::id(),
+            "the listener is this process"
+        );
+        let bound = column("wait_bound_us").as_primitive::<UInt64Type>();
+        assert_eq!(bound.value(0), 10_000_000);
+        let elapsed = column("wait_elapsed_us").as_primitive::<UInt64Type>();
+        assert!(elapsed.is_null(0));
+        assert!(elapsed.value(1) >= 10_000_000, "{}", elapsed.value(1));
+        assert!(
+            utf8("wait_last", 1).is_some_and(|last| last.starts_with("sent ")),
+            "{:?}",
+            utf8("wait_last", 1)
+        );
+        let process = column("process_id").as_primitive::<UInt32Type>();
+        assert_eq!(process.value(1), std::process::id());
+        let at = column("timestamp").as_primitive::<arrow_array::types::TimestampNanosecondType>();
+        assert_eq!(
+            u64::try_from(at.value(1) - at.value(0)).expect("the span ends after it starts")
+                / 1_000,
+            elapsed.value(1),
+            "the span covers exactly the wait"
+        );
     }
 }

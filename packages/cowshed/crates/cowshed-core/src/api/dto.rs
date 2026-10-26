@@ -657,6 +657,41 @@ pub struct TraceContext {
     pub span_id: SpanId,
 }
 
+impl TraceContext {
+    /// A fresh root: a random trace and a random span in it.
+    pub fn mint() -> Self {
+        let trace = uuid::Uuid::new_v4().simple().to_string();
+        let span = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            trace_id: TraceId::new(trace).expect("UUID simple form is a nonzero trace id"),
+            span_id: SpanId::new(&span[..16]).expect("UUID prefix is a nonzero span id"),
+        }
+    }
+
+    /// The context a W3C `traceparent` of version `00` names (`00-<trace>-<span>-<flags>`, in
+    /// lowercase hex, neither id all zeros), as a traced caller exports it in `TRACEPARENT`;
+    /// `None` for any other value, which a participant ignores and starts a fresh trace for.
+    pub fn from_traceparent(value: &str) -> Option<Self> {
+        let mut fields = value.split('-');
+        let (Some("00"), Some(trace), Some(span), Some(flags), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return None;
+        };
+        if flags.len() != 2 || !is_lowercase_hex(flags) {
+            return None;
+        }
+        Some(Self {
+            trace_id: TraceId::new(trace).ok()?,
+            span_id: SpanId::new(span).ok()?,
+        })
+    }
+}
+
 /// One lifecycle step of a controller call that asked for its steps, reported when the step starts
 /// and again when it ends (`cowshed_os::timing`). Step ids are unique within the call. A step's
 /// `parent` is the step it runs inside, absent at the call's top level, and is always reported

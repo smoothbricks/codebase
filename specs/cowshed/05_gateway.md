@@ -969,8 +969,16 @@ the handshake bound.
   heartbeat proves that the controller process and its connection serve, and names the op the actor is busy with. It
   does not prove the actor is not deadlocked: an actor stuck inside one op keeps the heartbeats coming, and their
   `forMs` keeps rising. A version 1 connection, an older client's, hears none (07_api.md, "Controller handshake").
-- **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
-  with the failure's message.
+- **Spans.** A failure reaches the boundary that owns the wait as a value. A `TIMEOUT`, `SILENT` or `PEER_LOST` failure
+  carries its facts (`WaitFailure`: code, op, peer and its pid, class, bound, time waited, last progress) on the
+  caller's error, inside the process only. An owner that has a span ends it `span-err` with the failure's message. The
+  CLI has none: a command that ends in an expired wait seals it, at its one error boundary, as a one-span `cowshed.wait`
+  segment in the trace it adopted from `TRACEPARENT` (13_telemetry.md, "Wait spans"). The expiries that carry it come
+  from every workspace-supervisor call and from the gateway control requests that reconciliation and the CLI make
+  (`status`, session install and removal, `session-current`, `nx-cache-clear`). A `BLOCKED` peer and a failed I/O call
+  are not expiries and write no span. Neither does an answered wait, whose time the command owns, nor an expiry the
+  caller takes as an answer (doctor's unanswered gateway, a probe of whether a gateway runs). The stderr line stays: the
+  command's own report names the failure, and a seal that fails is said there and never changes the outcome.
 - **Enforcement.** TypeScript: the `deadline/no-unbounded-wait` ESLint rule (`tooling/checks/no-unbounded-wait.ts`,
   wired in `eslint.config.ts` over `packages/*/src`) refuses `fetch` without a `signal`, a socket connect (`net`/`tls`
   `connect`, `createConnection`, `Socket#connect`, `Bun.connect`), a Bun child's `exited`, `events.once` on a child,

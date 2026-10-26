@@ -1302,7 +1302,8 @@ fn combine_teardown(first: Option<CowshedError>, second: Option<CowshedError>) -
                 first.message, second.message
             ),
             format!("{}; {}", first.hint, second.hint),
-        )),
+        )
+        .with_wait(first.wait_source().or(second.wait_source()).cloned())),
     }
 }
 
@@ -1316,7 +1317,8 @@ pub fn merge_primary(primary: CowshedError, teardown: Option<CowshedError>) -> C
                 primary.message, teardown.message
             ),
             format!("{}; teardown: {}", primary.hint, teardown.hint),
-        ),
+        )
+        .with_wait(primary.wait_source().or(teardown.wait_source()).cloned()),
     }
 }
 
