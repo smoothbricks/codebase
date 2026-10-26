@@ -804,6 +804,10 @@ follow that stream rather than poll job PIDs. Missing events are hangs owned by 
 never independent test deadlines. A test proves a descriptor's release by the kernel's grant to a waiter, never by a
 non-blocking probe at the spawn's return or at the child's reaping.
 
+Land-turn fixtures observe queued replies and executed-command readiness before asserting their queue and order
+snapshots. Detached after-land records are read on a vnode subscription armed before the first lands.log read, not on an
+elapsed-time poll.
+
 An unfinished test name is not holder attribution. During the final ten seconds of an unchanged no-progress interval,
 the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed
 progress discards and cancels that interval's snapshot. At expiry the executor emits the completed observation, or an

@@ -1,6 +1,6 @@
 //! `cowshed land-turn`, run as the binary a land runs: the lands of one repository take turns in
 //! the order they asked, a waiter killed in line leaves the queue, and a holder killed mid-land
-//! hands the turn on. Each land's command appends its workspace to an order file, then blocks
+//! hands the turn on. Each land's command appends its workspace to an order file, announces readiness, then blocks
 //! until the test writes to its fifo, so the test decides when each land ends. The queue is the
 //! gateway's state: each test runs its own gateway and reads the queue with `land-turns` while
 //! the lands wait.
@@ -11,14 +11,13 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead as _, BufReader, ErrorKind, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cowshed_core::api::dto::{ExitStatus, LandTurnQueue};
 use cowshed_core::runtime::job_groups::{await_exit_unreaped, signal_unreaped_group};
@@ -34,7 +33,6 @@ mod test_gateway;
 use test_gateway::TestGateway;
 
 const REPO: &str = "testrepo";
-const POLL: Duration = Duration::from_millis(20);
 /// How long a test waits for any one step before it fails naming that step: the run's no-progress
 /// backstop, the one bound that decides a hang (`cowshed_os::test_backstop`), never a deadline of
 /// the test's own.
@@ -130,7 +128,7 @@ impl Land {
             io::Error::last_os_error()
         );
         let script = format!(
-            "echo {workspace} >> {}; read x < {}",
+            "echo {workspace} >> {}; echo command-started >&2; read x < {}",
             home.order().display(),
             fifo.display()
         );
@@ -205,31 +203,11 @@ impl Land {
             .fifo
             .as_ref()
             .expect("a gated land has a fifo to release");
-        let deadline = Instant::now() + BACKSTOP;
-        loop {
-            // Non-blocking, so a fifo with no reader yet fails with ENXIO instead of hanging.
-            match OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(fifo)
-            {
-                Ok(mut writer) => {
-                    writer.write_all(b"\n").expect("write the release line");
-                    return;
-                }
-                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "{}: its command never opened {} to be released in {BACKSTOP:?}; stderr was {:?}",
-                        self.workspace,
-                        fifo.display(),
-                        self.seen
-                    );
-                    thread::sleep(POLL);
-                }
-                Err(error) => panic!("open {}: {error}", fifo.display()),
-            }
-        }
+        OpenOptions::new()
+            .write(true)
+            .open(fifo)
+            .and_then(|mut writer| writer.write_all(b"\n"))
+            .expect("release the command once it opens its fifo");
     }
 
     /// SIGSTOP: the process keeps every lock it holds and runs no code until resumed.
@@ -278,24 +256,20 @@ impl Land {
         }
     }
 
-    /// The first stderr line containing `needle`, waiting up to [`BACKSTOP`] for it.
+    /// The first stderr line starting with `needle`, waiting up to [`BACKSTOP`] for it.
     fn stderr_line(&mut self, needle: &str) -> String {
-        let deadline = Instant::now() + BACKSTOP;
         loop {
-            if let Some(line) = self.seen.iter().find(|line| line.contains(needle)) {
+            if let Some(line) = self.seen.iter().find(|line| line.starts_with(needle)) {
                 return line.clone();
             }
-            match self
-                .stderr
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            {
+            match self.stderr.recv_timeout(BACKSTOP) {
                 Ok(line) => self.seen.push(line),
                 Err(mpsc::RecvTimeoutError::Timeout) => panic!(
-                    "{}: no stderr line containing {needle:?} in {BACKSTOP:?}; stderr was {:?}",
+                    "{}: no stderr line starting with {needle:?} in {BACKSTOP:?}; stderr was {:?}",
                     self.workspace, self.seen
                 ),
                 Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-                    "{}: stderr ended with no line containing {needle:?}; stderr was {:?}",
+                    "{}: stderr ended with no line starting with {needle:?}; stderr was {:?}",
                     self.workspace, self.seen
                 ),
             }
@@ -347,71 +321,52 @@ fn queue(home: &Home) -> Vec<String> {
         })
 }
 
-/// Waits until the queue's workspaces, in turn order, are exactly `expected`.
-fn wait_for_queue(home: &Home, expected: &[&str]) {
-    let deadline = Instant::now() + BACKSTOP;
-    loop {
-        let queued = queue(home);
-        if queued == expected {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the queue was not {expected:?} in {BACKSTOP:?}: it is {queued:?}"
-        );
-        thread::sleep(POLL);
-    }
+/// The waiter's queued reply acknowledges its place before the queue snapshot is asserted.
+fn wait_for_queue(home: &Home, land: &mut Land, expected: &[&str]) {
+    let ahead = expected
+        .iter()
+        .position(|workspace| *workspace == land.workspace.as_str())
+        .expect("the waiter is in the expected queue");
+    let holder = expected.first().expect("a queued land has a holder");
+    land.stderr_line(&format!(
+        "cowshed: land turn {REPO}: {ahead} ahead; {holder} holds it"
+    ));
+    assert_eq!(queue(home), expected, "the acknowledged queue is in order");
 }
 
-/// Waits until the order file holds exactly `expected`. A line that is not the next one expected
-/// is a wrong turn, and fails at once.
-fn wait_for_order(home: &Home, expected: &[&str]) {
-    let deadline = Instant::now() + BACKSTOP;
-    loop {
-        let ran = order(home);
-        assert!(
-            ran.len() <= expected.len() && ran == expected[..ran.len()],
-            "turns out of order: expected {expected:?}, ran {ran:?}"
-        );
-        if ran.len() == expected.len() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the lands ran {ran:?} of {expected:?} in {BACKSTOP:?}; the queue is {:?}",
-            queue(home)
-        );
-        thread::sleep(POLL);
-    }
+/// The command announces readiness after appending its workspace to the order file.
+fn wait_for_order(home: &Home, land: &mut Land, expected: &[&str]) {
+    land.stderr_line("command-started");
+    assert_eq!(order(home), expected, "turns ran out of order");
 }
 
 /// Three lands in line: the first two ask and are then stopped, holding their tickets. The third
-/// asks after the holder has gone, behind them. Stopped lands still hold their locks, so the
+/// asks after the holder has gone, behind them. Stopped lands keep their tickets, so the
 /// third cannot pass them however soon the holder releases: the turns follow the order of asking.
 #[test]
 fn a_land_that_asks_as_the_head_releases_waits_for_the_earlier_waiters() {
     let home = Home::new();
     let mut holder = Land::gated(&home, "H");
-    wait_for_order(&home, &["H"]);
+    wait_for_order(&home, &mut holder, &["H"]);
     let mut first = Land::gated(&home, "W1");
-    wait_for_queue(&home, &["H", "W1"]);
+    wait_for_queue(&home, &mut first, &["H", "W1"]);
     let mut second = Land::gated(&home, "W2");
-    wait_for_queue(&home, &["H", "W1", "W2"]);
+    wait_for_queue(&home, &mut second, &["H", "W1", "W2"]);
     first.stop();
     second.stop();
     holder.release();
     holder.wait_success();
     let mut third = Land::gated(&home, "W3");
-    wait_for_queue(&home, &["W1", "W2", "W3"]);
+    wait_for_queue(&home, &mut third, &["W1", "W2", "W3"]);
     first.resume();
     second.resume();
-    wait_for_order(&home, &["H", "W1"]);
+    wait_for_order(&home, &mut first, &["H", "W1"]);
     first.release();
     first.wait_success();
-    wait_for_order(&home, &["H", "W1", "W2"]);
+    wait_for_order(&home, &mut second, &["H", "W1", "W2"]);
     second.release();
     second.wait_success();
-    wait_for_order(&home, &["H", "W1", "W2", "W3"]);
+    wait_for_order(&home, &mut third, &["H", "W1", "W2", "W3"]);
     third.release();
     third.wait_success();
 }
@@ -422,12 +377,12 @@ fn a_land_that_asks_as_the_head_releases_waits_for_the_earlier_waiters() {
 fn a_killed_holder_passes_the_turn_on() {
     let home = Home::new();
     let mut holder = Land::gated(&home, "H");
-    wait_for_order(&home, &["H"]);
+    wait_for_order(&home, &mut holder, &["H"]);
     let mut waiter = Land::gated(&home, "W1");
-    wait_for_queue(&home, &["H", "W1"]);
+    wait_for_queue(&home, &mut waiter, &["H", "W1"]);
     holder.kill_hard();
-    wait_for_order(&home, &["H", "W1"]);
-    wait_for_queue(&home, &["W1"]);
+    wait_for_order(&home, &mut waiter, &["H", "W1"]);
+    assert_eq!(queue(&home), ["W1"], "the waiter holds the turn");
     waiter.release();
     waiter.wait_success();
 }
@@ -438,21 +393,21 @@ fn a_killed_holder_passes_the_turn_on() {
 fn a_waiter_killed_in_line_blocks_no_later_land() {
     let home = Home::new();
     let mut holder = Land::gated(&home, "H");
-    wait_for_order(&home, &["H"]);
+    wait_for_order(&home, &mut holder, &["H"]);
     let mut killed = Land::gated(&home, "W1");
-    wait_for_queue(&home, &["H", "W1"]);
+    wait_for_queue(&home, &mut killed, &["H", "W1"]);
     let mut next = Land::gated(&home, "W2");
-    wait_for_queue(&home, &["H", "W1", "W2"]);
+    wait_for_queue(&home, &mut next, &["H", "W1", "W2"]);
     killed.kill_hard();
-    wait_for_queue(&home, &["H", "W2"]);
+    wait_for_queue(&home, &mut next, &["H", "W2"]);
     holder.release();
     holder.wait_success();
-    wait_for_order(&home, &["H", "W2"]);
+    wait_for_order(&home, &mut next, &["H", "W2"]);
     let mut last = Land::gated(&home, "W3");
-    wait_for_queue(&home, &["W2", "W3"]);
+    wait_for_queue(&home, &mut last, &["W2", "W3"]);
     next.release();
     next.wait_success();
-    wait_for_order(&home, &["H", "W2", "W3"]);
+    wait_for_order(&home, &mut last, &["H", "W2", "W3"]);
     last.release();
     last.wait_success();
     assert!(queue(&home).is_empty(), "tickets left in the queue");
@@ -465,21 +420,25 @@ fn a_waiter_killed_in_line_blocks_no_later_land() {
 fn a_waiter_killed_in_line_is_recorded_as_abandoned() {
     let home = Home::new();
     let mut holder = Land::gated(&home, "H");
-    wait_for_order(&home, &["H"]);
+    wait_for_order(&home, &mut holder, &["H"]);
     let mut killed = Land::gated(&home, "W1");
-    wait_for_queue(&home, &["H", "W1"]);
+    wait_for_queue(&home, &mut killed, &["H", "W1"]);
     let killed_pid = killed.pid();
     killed.kill_hard();
-    wait_for_queue(&home, &["H"]);
     holder.release();
     holder.wait_success();
 
+    let mut probe = Land::gated(&home, "probe");
+    wait_for_order(&home, &mut probe, &["H", "probe"]);
     let turns = queues(&home, 0);
     let repo = turns
         .iter()
         .find(|turns| turns.repo.as_str() == REPO)
         .expect("the repository is listed for its abandoned ticket");
-    assert!(repo.tickets.is_empty(), "no live ticket: {repo:?}");
+    let [ticket] = repo.tickets.as_slice() else {
+        panic!("only the probe holds a live ticket: {repo:?}");
+    };
+    assert_eq!(ticket.workspace, "probe");
     let [abandoned] = repo.abandoned.as_slice() else {
         panic!("one abandoned ticket: {repo:?}");
     };
@@ -488,6 +447,8 @@ fn a_waiter_killed_in_line_is_recorded_as_abandoned() {
         ("W1", killed_pid)
     );
     assert_eq!(abandoned.reason, "it left the queue before its turn");
+    probe.release();
+    probe.wait_success();
 }
 
 /// The line a waiting land prints names the holder, its pid, its bound command's pid, how many
@@ -496,7 +457,7 @@ fn a_waiter_killed_in_line_is_recorded_as_abandoned() {
 fn the_waiting_line_names_the_holder() {
     let home = Home::new();
     let mut holder = Land::gated(&home, "H");
-    wait_for_order(&home, &["H"]);
+    wait_for_order(&home, &mut holder, &["H"]);
     let mut waiter = Land::gated(&home, "W1");
     let line = waiter.stderr_line(&format!(
         "cowshed: land turn testrepo: 1 ahead; H holds it (pid {}, command pid ",
@@ -508,7 +469,7 @@ fn the_waiting_line_names_the_holder() {
     );
     holder.release();
     holder.wait_success();
-    wait_for_order(&home, &["H", "W1"]);
+    wait_for_order(&home, &mut waiter, &["H", "W1"]);
     waiter.release();
     waiter.wait_success();
 }
@@ -522,7 +483,7 @@ fn a_head_waiting_for_the_outside_lock_names_the_process_holding_it() {
     let home = Home::new();
     let lock = home.path.join("outside.lock");
     let mut holder = Land::gated_in(&home, "otherrepo", "H", Some(&lock));
-    wait_for_order(&home, &["H"]);
+    wait_for_order(&home, &mut holder, &["H"]);
     let mut waiter = Land::gated_in(&home, REPO, "W", Some(&lock));
     let line = waiter.stderr_line("cowshed: land turn testrepo: next, waiting for ");
     let named = format!(
@@ -541,7 +502,7 @@ fn a_head_waiting_for_the_outside_lock_names_the_process_holding_it() {
     );
     holder.release();
     holder.wait_success();
-    wait_for_order(&home, &["H", "W"]);
+    wait_for_order(&home, &mut waiter, &["H", "W"]);
     waiter.release();
     waiter.wait_success();
 }
@@ -568,10 +529,10 @@ fn a_land_exits_with_its_commands_status() {
 fn a_land_killed_without_its_command_keeps_its_turn_and_outside_lock_until_the_command_ends() {
     let home = Home::new();
     let outside = home.path.join("outside.lock");
-    let holder = Land::gated_in(&home, REPO, "H", Some(&outside));
-    wait_for_order(&home, &["H"]);
+    let mut holder = Land::gated_in(&home, REPO, "H", Some(&outside));
+    wait_for_order(&home, &mut holder, &["H"]);
     let mut waiter = Land::gated(&home, "W1");
-    wait_for_queue(&home, &["H", "W1"]);
+    wait_for_queue(&home, &mut waiter, &["H", "W1"]);
     send(holder.pid(), libc::SIGKILL);
     holder.wait_exit();
     let outside_held = File::open(&outside)
@@ -588,7 +549,7 @@ fn a_land_killed_without_its_command_keeps_its_turn_and_outside_lock_until_the_c
     );
     assert_eq!(order(&home), ["H"], "a land ran beside the held turn");
     holder.release();
-    wait_for_order(&home, &["H", "W1"]);
+    wait_for_order(&home, &mut waiter, &["H", "W1"]);
     waiter.release();
     waiter.wait_success();
 }
@@ -648,7 +609,7 @@ fn a_land_refuses_invalid_git_config_before_asking_for_a_turn() {
     let home = Home::new();
     let outside = home.path.join("outside.lock");
     let mut holder = Land::gated_in(&home, REPO, "H", Some(&outside));
-    wait_for_order(&home, &["H"]);
+    wait_for_order(&home, &mut holder, &["H"]);
     let ran = home.path.join("invalid-ran");
     let mut refused = Land::start(
         "invalid",
@@ -723,14 +684,21 @@ fn a_process_the_command_leaves_running_holds_no_turn() {
         .trim()
         .parse::<u32>()
         .expect("the descendant's pid");
+    let exited = cowshed_os::process::ExitWatch::of(pid)
+        .expect("watch the owned descendant's exit")
+        .expect("the command left its descendant running");
     let mut second = Land::spawn(&home, "second", "true");
     second.wait_success();
-    // SAFETY: kill(2) with signal 0 sends nothing and takes no pointers; it only reports whether
-    // `pid` exists.
-    let alive = unsafe { libc::kill(i32::try_from(pid).expect("a pid fits in pid_t"), 0) } == 0;
-    if alive {
-        send(pid, libc::SIGKILL);
-    }
+    let alive = !exited
+        .within(Duration::ZERO)
+        .expect("read the descendant's exit event");
+    first.kill_hard();
+    assert!(
+        exited
+            .within(BACKSTOP)
+            .expect("wait for the descendant's exit"),
+        "the owned descendant did not exit before the no-progress backstop"
+    );
     assert!(alive, "the first land's command left no process running");
     assert!(
         queue(&home).is_empty(),

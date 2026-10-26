@@ -1461,37 +1461,50 @@ impl HostProcesses {
 /// whether the entry appeared. The kernel's `NOTE_WRITE` on the directory wakes it to look again,
 /// so its writer must rename the entry into place whole: its appearance is then its content.
 fn await_entry(dir: &Path, name: &str, cancel: std::io::PipeReader) -> bool {
+    await_vnode(dir, Some(cancel), || dir.join(name).exists())
+}
+
+/// Recheck owned state only when its vnode changes or its cancellation pipe closes. Registration
+/// precedes the first look, so a write between the look and the wait cannot be missed.
+fn await_vnode(
+    path: &Path,
+    cancel: Option<std::io::PipeReader>,
+    mut ready: impl FnMut() -> bool,
+) -> bool {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let directory = fs::File::open(dir).expect("open the watched directory");
+    let directory = fs::File::open(path).expect("open the watched vnode");
     // SAFETY: kqueue takes no arguments; a negative answer is an error.
     let queue = unsafe { libc::kqueue() };
     assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
     // SAFETY: `queue` is a new descriptor this function alone owns.
     let queue = unsafe { OwnedFd::from_raw_fd(queue) };
-    let changes = [
-        libc::kevent {
-            ident: directory.as_raw_fd() as libc::uintptr_t,
-            filter: libc::EVFILT_VNODE,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
-            fflags: libc::NOTE_WRITE,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        },
-        libc::kevent {
-            ident: cancel.as_raw_fd() as libc::uintptr_t,
+    let cancel_id = cancel
+        .as_ref()
+        .map(|cancel| usize::try_from(cancel.as_raw_fd()).expect("a descriptor is nonnegative"));
+    let mut changes = vec![libc::kevent {
+        ident: directory.as_raw_fd() as libc::uintptr_t,
+        filter: libc::EVFILT_VNODE,
+        flags: libc::EV_ADD | libc::EV_CLEAR,
+        fflags: libc::NOTE_WRITE,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    }];
+    if let Some(ident) = cancel_id {
+        changes.push(libc::kevent {
+            ident,
             filter: libc::EVFILT_READ,
             flags: libc::EV_ADD,
             fflags: 0,
             data: 0,
             udata: std::ptr::null_mut(),
-        },
-    ];
-    // SAFETY: two valid changes, no events requested back, no timeout.
+        });
+    }
+    // SAFETY: valid vnode and optional pipe changes, no events requested back, no timeout.
     let registered = unsafe {
         libc::kevent(
             queue.as_raw_fd(),
             changes.as_ptr(),
-            2,
+            libc::c_int::try_from(changes.len()).expect("one or two event filters"),
             std::ptr::null_mut(),
             0,
             std::ptr::null(),
@@ -1501,12 +1514,11 @@ fn await_entry(dir: &Path, name: &str, cancel: std::io::PipeReader) -> bool {
         registered,
         0,
         "watch {}: {}",
-        dir.display(),
+        path.display(),
         std::io::Error::last_os_error()
     );
-    // Registered before the first look, so an entry renamed in after it still wakes the wait.
     loop {
-        if dir.join(name).exists() {
+        if ready() {
             return true;
         }
         // SAFETY: an all-zero `kevent` is a valid value of the plain C struct.
@@ -1522,8 +1534,8 @@ fn await_entry(dir: &Path, name: &str, cancel: std::io::PipeReader) -> bool {
                 std::ptr::null(),
             )
         };
-        if fired == 1 && event.ident == cancel.as_raw_fd() as libc::uintptr_t {
-            return dir.join(name).exists();
+        if fired == 1 && cancel_id.is_some_and(|ident| event.ident == ident) {
+            return ready();
         }
         if fired < 0 {
             let error = std::io::Error::last_os_error();
@@ -1531,7 +1543,7 @@ fn await_entry(dir: &Path, name: &str, cancel: std::io::PipeReader) -> bool {
                 error.raw_os_error(),
                 Some(libc::EINTR),
                 "watch {}: {error}",
-                dir.display()
+                path.display()
             );
         }
     }
@@ -7962,24 +7974,15 @@ impl DeclaredLand {
             .unwrap_or_default()
     }
 
-    /// Waits for the detached after-land child to have recorded `count` lines. Nothing announces
-    /// that child's writes: it runs detached in a session of its own, is no child of the test's,
-    /// and holds nothing the test can wait on, so the log is read again until the no-progress
-    /// backstop.
+    /// The kernel's write event on lands.log announces the detached child's records. The
+    /// subscription is armed before reading the log, and the runner owns the no-progress bound.
     fn wait_for_lands(&self, count: usize) -> Vec<cowshed_core::declared_land::LandRecord> {
-        let backstop = Instant::now() + cowshed_os::test_backstop::NO_PROGRESS;
-        loop {
-            let lands = self.lands();
-            if lands.len() >= count {
-                return lands;
-            }
-            assert!(
-                Instant::now() < backstop,
-                "the after-land child recorded {} of {count} lands.log lines before the no-progress backstop: {lands:?}",
-                lands.len()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut lands = Vec::new();
+        await_vnode(&self.turn.join("lands.log"), None, || {
+            lands = self.lands();
+            lands.len() >= count
+        });
+        lands
     }
 }
 
