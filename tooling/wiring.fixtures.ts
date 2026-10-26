@@ -365,6 +365,44 @@ expectFindings(
   ['pub prod_only@crates/core/src/lib.rs:2'],
 );
 
+expectFindings(
+  'a package whose only emit leaves it builds none of its entries, so its dist/ does not map back to src/',
+  {
+    'packages/x/package.json': '{ "name": "@w/x", "main": "./dist/index.js" }\n',
+    'packages/x/tsconfig.json': '{ "compilerOptions": { "rootDir": "src", "outDir": "../../.cache/proof" } }\n',
+    'packages/x/src/index.ts': 'export const unbuilt = 1;\n',
+  },
+  ['export unbuilt@packages/x/src/index.ts:1'],
+);
+
+expectFindings(
+  'a module file wins over a same-stem directory index, as Node and TypeScript resolve it',
+  {
+    'packages/w/package.json': PKG('@w/w'),
+    'packages/w/src/util.ts': 'export const fileWins = 1;\n',
+    'packages/w/src/util/index.ts': 'export const indexLoses = 2;\n',
+    'packages/w/src/main.ts': "import { fileWins, indexLoses } from './util';\nconsole.log(fileWins, indexLoses);\n",
+  },
+  ['export indexLoses@packages/w/src/util/index.ts:1'],
+);
+
+expectFindings(
+  'a targetDefaults dependsOn scoped to other projects does not run the same-named target elsewhere',
+  {
+    'nx.json': '{ "targetDefaults": { "gate": { "dependsOn": [{ "target": "proof", "projects": ["other"] }] } } }\n',
+    'packages/t/package.json': TARGETS('      "proof": { "command": "true" }'),
+    'packages/other/package.json':
+      '{ "name": "@w/other", "private": true, "nx": { "name": "other", "targets": { "proof": { "command": "true" } } } }\n',
+  },
+  ['target proof@packages/t/package.json:7'],
+);
+
+expectAdded(
+  'widening a Rust item from pub(crate) to pub adds it',
+  { path: 'crates/core/src/lib.rs', before: 'pub(crate) fn widened() {}\n', after: 'pub fn widened() {}\n' },
+  [{ kind: 'pub', name: 'widened' }],
+);
+
 // --- The root lint's scope ------------------------------------------------------------------------------------------
 
 {

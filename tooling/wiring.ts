@@ -393,12 +393,14 @@ interface Emit {
 /**
  * The emits of the package in `dir`, from every tsconfig it owns: each effective `rootDir` → `outDir` (see
  * {@link compilerDirs}). A package that declares none builds the conventional layouts, `dist/` from `src/` or from
- * itself. An emit that leaves its package (a proof build into the workspace cache) builds nothing its manifest names.
+ * itself. An emit that leaves its package (a proof build into the workspace cache) builds nothing its manifest names,
+ * so a package whose every emit leaves it maps no build path back to a source.
  */
 function packageEmits(dir: string, tsconfigs: readonly string[], tree: WiringTree): Emit[] {
   const inside = (path: string): boolean =>
     path !== dir && under(path, dir) && path !== '..' && !path.startsWith('../');
   const emits: Emit[] = [];
+  let declares = false;
   for (const path of tsconfigs) {
     const { rootDir, outDir } = compilerDirs(path, tree, []);
     if (typeof outDir !== 'string') continue;
@@ -406,9 +408,10 @@ function packageEmits(dir: string, tsconfigs: readonly string[], tree: WiringTre
       throw new WiringInputError(
         `${path} sets outDir without rootDir, so its build cannot be mapped back to the sources it compiles`,
       );
+    declares = true;
     if ((rootDir === dir || inside(rootDir)) && inside(outDir)) emits.push({ root: rootDir, out: outDir });
   }
-  if (emits.length > 0) return emits;
+  if (declares) return emits;
   return [
     { root: posix.join(dir, 'src'), out: posix.join(dir, 'dist') },
     { root: dir, out: posix.join(dir, 'dist') },
@@ -571,10 +574,11 @@ function sourceCandidates(path: string, tracked: ReadonlySet<string>, emits: rea
   for (const base of bases) {
     if (tracked.has(base) && TS_SOURCE.test(base)) out.add(base);
     const stem = base.replace(/\.d\.(ts|mts|cts)$/, '').replace(/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/, '');
-    for (const ext of TS_EXTENSIONS) {
-      if (tracked.has(stem + ext)) out.add(stem + ext);
-      if (tracked.has(`${stem}/index${ext}`)) out.add(`${stem}/index${ext}`);
-    }
+    // A module file wins over a same-stem directory's index, as Node and TypeScript resolve it.
+    const files = TS_EXTENSIONS.map((ext) => stem + ext).filter((p) => tracked.has(p));
+    const found =
+      files.length > 0 ? files : TS_EXTENSIONS.map((ext) => `${stem}/index${ext}`).filter((p) => tracked.has(p));
+    for (const p of found) out.add(p);
   }
   return [...out];
 }
@@ -838,6 +842,8 @@ function attributesBefore(text: string, blanked: string, at: number): string {
 
 interface RustItem {
   readonly name: string;
+  /** The restriction, whitespace dropped: empty for plain `pub`, `(crate)` for `pub(crate)`. */
+  readonly visibility: string;
   readonly line: number;
   /** The JavaScript name a `#[napi]` item is called by. */
   readonly napi: string | undefined;
@@ -845,9 +851,9 @@ interface RustItem {
   readonly abi: string | undefined;
 }
 
-/** A `pub` item, restricted visibility (`pub(crate)`, `pub(super)`, `pub(in …)`) included. */
+/** A `pub` item, its restricted visibility (`pub(crate)`, `pub(super)`, `pub(in …)`) included and captured. */
 const RUST_PUB =
-  /\bpub(?:\s*\([^)]*\))?\s+(?:(?:const|async|unsafe|extern(?:\s+"\s*")?)\s+)*(fn|struct|enum|trait|type|const|static(?:\s+mut)?|union)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+  /\bpub(\s*\([^)]*\))?\s+(?:(?:const|async|unsafe|extern(?:\s+"\s*")?)\s+)*(fn|struct|enum|trait|type|const|static(?:\s+mut)?|union)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
 
 function camelCase(snake: string): string {
   return snake.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
@@ -858,15 +864,15 @@ function rustPubItems(text: string): RustItem[] {
   const prod = withoutTests(blanked);
   const items: RustItem[] = [];
   for (const m of prod.matchAll(RUST_PUB)) {
-    const name = m[2];
+    const name = m[3];
     if (name === undefined) continue;
     const attrs = attributesBefore(text, blanked, m.index);
     const napiAttr = /#\[napi\b([^\]]*)\]/.exec(attrs);
     const jsName = napiAttr === null ? undefined : (/js_name\s*=\s*"([^"]+)"/.exec(napiAttr[1] ?? '')?.[1] ?? null);
-    const napi = jsName === undefined ? undefined : (jsName ?? (m[1] === 'fn' ? camelCase(name) : name));
+    const napi = jsName === undefined ? undefined : (jsName ?? (m[2] === 'fn' ? camelCase(name) : name));
     const exported = /#\[(?:unsafe\()?export_name\s*=\s*"([^"]+)"/.exec(attrs)?.[1];
     const abi = exported ?? (/#\[(?:unsafe\()?no_mangle\b/.test(attrs) ? name : undefined);
-    items.push({ name, line: lineAt(text, m.index), napi, abi });
+    items.push({ name, visibility: (m[1] ?? '').replace(/\s+/g, ''), line: lineAt(text, m.index), napi, abi });
   }
   return items;
 }
@@ -1059,11 +1065,19 @@ function dependsOnReaches(depender: NxTarget, target: NxTarget): boolean {
     }
     if (!isRecord(d) || d.target !== target.name) return false;
     if (d.dependencies === true) return upstream;
-    const projects = typeof d.projects === 'string' ? [d.projects] : Array.isArray(d.projects) ? d.projects : undefined;
-    return projects === undefined
-      ? depender.project === target.project
-      : projects.some((p) => p === target.project || p === '*');
+    const projects = dependsOnProjects(d);
+    return projects === undefined ? depender.project === target.project : projectsName(projects, target.project);
   });
+}
+
+/** The `projects` a `dependsOn` object scopes itself to; undefined when it names none. */
+function dependsOnProjects(d: Record<string, unknown>): readonly unknown[] | undefined {
+  return typeof d.projects === 'string' ? [d.projects] : Array.isArray(d.projects) ? d.projects : undefined;
+}
+
+/** Whether a `dependsOn` `projects` scope holds `project`. */
+function projectsName(projects: readonly unknown[], project: string): boolean {
+  return projects.some((p) => p === project || p === '*');
 }
 
 /** What a target's own metadata says about its reach; undefined when it says nothing. */
@@ -1155,9 +1169,11 @@ export function addedItems(changes: readonly WiringChange[]): Added[] {
       }
     }
     if (path.endsWith('.rs')) {
-      const old = new Set(before === undefined ? [] : rustPubItems(before).map((i) => i.name));
+      // Keyed by visibility too: widening `pub(crate)` to `pub` adds a public item.
+      const key = (i: RustItem): string => `${i.visibility} ${i.name}`;
+      const old = new Set(before === undefined ? [] : rustPubItems(before).map(key));
       for (const item of rustPubItems(after))
-        if (!old.has(item.name))
+        if (!old.has(key(item)))
           out.push({ kind: /_OP$/.test(item.name) ? 'op' : 'pub', name: item.name, file: path, line: item.line });
       const oldVerbs = new Set(before === undefined ? [] : clapVerbs(before).map((v) => v.name));
       for (const v of clapVerbs(after))
@@ -1475,13 +1491,22 @@ class Judge {
     if (target === undefined) return { ok: true };
     const declared = targetDeclaration(target, this.#tree);
     if (declared !== undefined) return declared;
-    // nx.json targetDefaults give every project's target of that name its dependsOn, `^name` included.
+    // nx.json targetDefaults give every project's target of that name its dependsOn, `^name` included; an object
+    // entry scoped by `projects` runs the target only in the projects it names.
     const nxJson = this.#tree.textOf('nx.json');
     const defaults = nxJson === undefined ? undefined : parseManifest('nx.json', nxJson).targetDefaults;
     if (isRecord(defaults)) {
       for (const config of Object.values(defaults)) {
         const deps = isRecord(config) && Array.isArray(config.dependsOn) ? config.dependsOn : [];
-        if (deps.some((d) => d === name || d === `^${name}` || (isRecord(d) && d.target === name))) return { ok: true };
+        if (
+          deps.some(
+            (d) =>
+              d === name ||
+              d === `^${name}` ||
+              (isRecord(d) && d.target === name && projectsName(dependsOnProjects(d) ?? ['*'], target.project)),
+          )
+        )
+          return { ok: true };
       }
     }
     for (const file of this.#production(this.#tree.filesHolding(name, false))) {
