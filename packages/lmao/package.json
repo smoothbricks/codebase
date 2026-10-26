@@ -186,7 +186,9 @@
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
           "{projectRoot}/.cargo/config.toml",
-          "{projectRoot}/scripts/build-rust-dist.mjs"
+          "{projectRoot}/scripts/build-rust-dist.mjs",
+          "{workspaceRoot}/patches/**/*",
+          "!{workspaceRoot}/patches/**/*.md"
         ],
         "outputs": [
           "{projectRoot}/dist/rust/"
