@@ -282,6 +282,22 @@ expectFindings(
   },
   ['script own.ts@packages/own/src/bin/own.ts:1'],
 );
+
+expectFindings(
+  "a published package's publishConfig bin wires its script; a private package's publishConfig is no host entry",
+  {
+    'packages/pub/package.json':
+      '{ "name": "@w/pub", "publishConfig": { "bin": { "pub": "./dist/ts/bin/pub.js" } } }\n',
+    'packages/pub/tsconfig.lib.json': '{ "compilerOptions": { "rootDir": "src", "outDir": "dist/ts" } }\n',
+    'packages/pub/src/bin/pub.ts': 'console.log(1);\n',
+    'packages/priv/package.json':
+      '{ "name": "@w/priv", "private": true, "publishConfig": { "bin": { "priv": "./dist/ts/bin/priv.js" } } }\n',
+    'packages/priv/tsconfig.lib.json': '{ "compilerOptions": { "rootDir": "src", "outDir": "dist/ts" } }\n',
+    'packages/priv/src/bin/priv.ts': 'console.log(2);\n',
+  },
+  ['script priv.ts@packages/priv/src/bin/priv.ts:1'],
+);
+
 // --- Nx targets -----------------------------------------------------------------------------------------------------
 
 const TARGETS = (targets: string): string =>

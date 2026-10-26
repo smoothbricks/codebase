@@ -14,7 +14,8 @@
 //           `[X]:`, a comparison), by its constant or its string value.
 //   verb    a CLI verb (a clap `Subcommand` variant, a typer `@….command`): a non-test file outside the CLI's own
 //           package that invokes it.
-//   script  a new file under bin/, scripts/ or tooling/: a non-test file names its path or imports it.
+//   script  a new file under bin/, scripts/ or tooling/: a non-test file names its path or imports it, or its published
+//           package's manifest exposes it (`bin`, `exports`, also under `publishConfig`) through the package's emit.
 //   target  an Nx target: another target's dependsOn or command, or a non-test file, runs it; or its own metadata says
 //           who runs its cases (`ownedBy`) or why no gate does (`ungated`, a closed enum; `ci` names a workflow that
 //           runs it). A continuous watcher has no verdict.
@@ -526,6 +527,7 @@ const RESOLUTION_FIELDS: Readonly<Record<string, true>> = {
   devDependencies: true,
   peerDependencies: true,
   optionalDependencies: true,
+  publishConfig: true,
 };
 
 /** Every string leaf of an `exports`/`bin` value: condition objects and arrays flatten. */
@@ -646,7 +648,8 @@ class Resolver {
 
   /**
    * A module its own package's manifest makes an entry: a host field (an extension or plugin list) names it,
-   * or a published (non-private) package exposes it through `exports`, `main`, `module` or `bin`.
+   * or a published (non-private) package exposes it through `exports`, `main`, `module` or `bin`, at the top level or
+   * under `publishConfig` (what a publish rewrites them to). A private package's `publishConfig` exposes nothing.
    */
   isManifestEntry(path: string): boolean {
     const owner = this.ownerOf(path);
@@ -656,9 +659,15 @@ class Resolver {
       .filter(([field]) => !Object.hasOwn(RESOLUTION_FIELDS, field))
       .flatMap(([, value]) => leaves(value))
       .filter((leaf) => leaf.startsWith('./'));
+    const exposed = (fields: Record<string, unknown>): string[] => [
+      ...leaves(fields.exports),
+      ...leaves(fields.main),
+      ...leaves(fields.module),
+      ...leaves(fields.bin),
+    ];
     const published = owner.private
       ? []
-      : [...leaves(m.exports), ...leaves(m.main), ...leaves(m.module), ...leaves(m.bin)];
+      : [...exposed(m), ...(isRecord(m.publishConfig) ? exposed(m.publishConfig) : [])];
     return [...host, ...published].some((template) => {
       const pattern = new RegExp(`^${escapeRegExp(posix.join(owner.dir, template)).replaceAll('\\*', '.+')}$`);
       return this.#addressesOf(path).some((address) => pattern.test(address));
