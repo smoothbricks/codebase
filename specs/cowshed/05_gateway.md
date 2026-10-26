@@ -1587,8 +1587,9 @@ core count.
   background run beside the land waits like any other; without it, a land task that forked its own repository would wait
   for its own land, forever. The `cpu-budget` ledger lists the waiting forks and attaches as `quiet`, each with its
   `repository`, `pid`, `command` and `waitedMs`. The same question has a host scope that only the gateway's own
-  released-image cleanup asks, in process and before every cut: it waits while gate-class work of any repository holds
-  or waits, and its `quiet` entry has no `repository` ("Deleting released images").
+  released-image cleanup asks, in process and before every cut while the store is not under pressure: it waits while
+  gate-class work of any repository holds or waits, and its `quiet` entry has no `repository` ("Deleting released
+  images").
 - **No admission deadline, for any class** (Danny tg#6679, tg#6693). A gate is the highest-priority work there is, so it
   is never failed for waiting in the order that serves it: a gate jobserver request, like a background one, waits until
   it is granted or its client closes the connection, which leaves the queue. The operator request is
@@ -2194,15 +2195,20 @@ uninterruptible waits behind them.
   - Pressure is the store container's free space below 1/8 of its capacity, measured with `statvfs`:
     `f_bavail·f_frsize < f_blocks·f_frsize / 8`. One constant, `PRESSURE_FREE_FRACTION = 8`, holds the fraction. A
     container whose space cannot be read is under no pressure, and the thread says so on stderr.
-- **One cut at a time, and none beside gate work.** The thread frees one entry at a time, so one release cut runs per
-  gateway, and therefore per container on a host. Before every `ftruncate` cut it asks the gateway's own CPU ledger, in
-  process, whether the host is quiet: the question a fork asks for its repository ("A fork or attach waits for its
-  repository's gate"), asked at host scope. It waits, with no deadline, while gate-class work of any repository holds or
-  waits ("Room for a gate"). While it waits it holds only that entry's own `flock`, never an image lock
-  (`main.dmg.lock`, `sessions/<ws>.dmg.lock`; 01_storage.md, "Lock order") and never a token. The wait is said on
+- **One cut at a time, and none beside gate work unless the store is under pressure** (pressure 2026-10-26: lands ran
+  nearly back to back, the cleanup's quiet wait reached 679 s with 86 released images in `.deleting`, and free space
+  fell to 895 GB, below the floor of about 931 GB). The thread frees one entry at a time, so one release cut runs per
+  gateway, and therefore per container on a host. Under pressure each cut runs at once, beside gate work too, still one
+  at a time and in the pressure order above. Without pressure, before every `ftruncate` cut it asks the gateway's own
+  CPU ledger, in process, whether the host is quiet: the question a fork asks for its repository ("A fork or attach
+  waits for its repository's gate"), asked at host scope. It waits, with no deadline, while gate-class work of any
+  repository holds or waits ("Room for a gate"). While it waits it holds only that entry's own `flock`, never an image
+  lock (`main.dmg.lock`, `sessions/<ws>.dmg.lock`; 01_storage.md, "Lock order") and never a token. The wait is said on
   stderr, `cowshed: released-image cleanup of <entry> waits beside gate job: …`, and `cpu-budget`'s `quiet` ("Host CPU
-  budget", Wire) lists it with no `repository` and the command `image-cleanup <entry>`. A gate that starts while a cut
-  runs meets that one cut, and the next cut waits for the gate to end.
+  budget", Wire) lists it with no `repository` and the command `image-cleanup <entry>`. While it waits it reads the free
+  space again every 10 s, and pressure ends the wait, said on stderr
+  (`cowshed: released-image cleanup of <entry> cuts beside gate work: …`). A gate that starts while a cut runs meets
+  that one cut, and the next cut waits for the gate to end unless the store is under pressure.
 - **One entry's free.** The thread `flock`s the entry without waiting. An entry another process holds is left, and said
   on stderr: its holder is a releaser still syncing its own rename, and that releaser hands it over afterwards. Before
   the first cut the thread syncs the entry's directory and that directory's parent, because a releaser may have died

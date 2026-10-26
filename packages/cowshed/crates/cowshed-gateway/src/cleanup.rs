@@ -130,7 +130,13 @@ fn run(
             }
         };
         let Queued { entry, pending } = queue.swap_remove(position);
-        let mut before_cut = || wait_out_gates(budget, &entry);
+        let mut before_cut = || {
+            if waits_for_gates(pressure(store, &mut said_space)) {
+                wait_out_gates(budget, store, &entry, &mut said_space)
+            } else {
+                Ok(())
+            }
+        };
         match free_committed(&entry, &mut before_cut) {
             Ok(Released::Freed { bytes, steps }) => cowshed_os::eprintln!(
                 "cowshed: freed released image {} ({bytes} bytes, {steps} cuts)",
@@ -240,11 +246,28 @@ fn free_and_capacity(store: &Path) -> std::io::Result<(u64, u64)> {
     ))
 }
 
-/// Before a cut of `entry`: wait, with no deadline, while gate-class work of any repository holds
-/// or waits (05_gateway.md "Room for a gate"), and say so. The wait holds the entry's lock and no
-/// token. A ledger that is gone, or an install's restart cutting it off, stops the cleanup
-/// (`Interrupted`): no cut is made while the gateway restarts.
-fn wait_out_gates(budget: &CpuBudget, entry: &Path) -> std::io::Result<()> {
+/// How often a cut waiting for gate work reads the store's free space again: pressure arising
+/// while it waits ends the wait.
+const PRESSURE_RECHECK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a cut waits out gate work under `pressure` (05_gateway.md "Deleting released images"):
+/// only without pressure. Under it the container's free space outranks a gate's quiet, and the
+/// cut, still the only one, runs beside the gate.
+fn waits_for_gates(pressure: Pressure) -> bool {
+    pressure == Pressure::None
+}
+
+/// Before a cut of `entry` without pressure: wait, with no deadline, while gate-class work of any
+/// repository holds or waits (05_gateway.md "Room for a gate"), and say so; the store coming under
+/// pressure meanwhile ends the wait, read every [`PRESSURE_RECHECK`]. The wait holds the entry's
+/// lock and no token. A ledger that is gone, or an install's restart cutting it off, stops the
+/// cleanup (`Interrupted`): no cut is made while the gateway restarts.
+fn wait_out_gates(
+    budget: &CpuBudget,
+    store: &Path,
+    entry: &Path,
+    said_space: &mut bool,
+) -> std::io::Result<()> {
     let stopping = || {
         std::io::Error::new(
             std::io::ErrorKind::Interrupted,
@@ -265,7 +288,22 @@ fn wait_out_gates(budget: &CpuBudget, entry: &Path) -> std::io::Result<()> {
             "cowshed: released-image cleanup of {} waits beside gate job: {gate}",
             entry.display()
         );
-        granted.blocking_recv().map_err(|_| stopping())?;
+        let mut granted = granted;
+        loop {
+            match granted.try_recv() {
+                Ok(()) => break,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return Err(stopping()),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+            if !waits_for_gates(pressure(store, said_space)) {
+                cowshed_os::eprintln!(
+                    "cowshed: released-image cleanup of {} cuts beside gate work: the store's free space fell below 1/{PRESSURE_FREE_FRACTION} of its capacity",
+                    entry.display()
+                );
+                break;
+            }
+            std::thread::sleep(PRESSURE_RECHECK);
+        }
     }
     drop(stake);
     Ok(())
@@ -290,6 +328,16 @@ pub(crate) fn admissible(store: &Path, entry: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Measured 2026-10-26 on the train-6 install: lands ran nearly back to back, the cleanup's
+    /// quiet wait reached 679 s with 86 released images in `.deleting`, and free space fell to
+    /// 895 GB, below the pressure floor (capacity/8, about 931 GB). Under pressure a cut runs beside
+    /// gate work; only without it does a cut wait for gates to end.
+    #[test]
+    fn under_pressure_a_cut_runs_beside_gate_work() {
+        assert!(!super::waits_for_gates(Pressure::Below));
+        assert!(super::waits_for_gates(Pressure::None));
+    }
+
     use super::*;
 
     /// Only an absolute entry below the store, in a `.deleting` directory, is taken.
