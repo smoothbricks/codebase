@@ -573,6 +573,7 @@ struct WaitRecord {
     path: PathBuf,
     next: AtomicU64,
     failed: AtomicBool,
+    clock: fn() -> u128,
 }
 
 /// One wait in progress; dropping it, on any path, unwinding included, appends its end.
@@ -581,21 +582,36 @@ struct Waiting<'a> {
     seq: u64,
 }
 
+/// One wait record's edge, formatted from explicit process, sequence and clock facts.
+enum WaitEdge {
+    Start(DiskClass),
+    End,
+}
+
+fn wait_record_line(edge: WaitEdge, pid: u32, seq: u64, at_unix_micros: u128) -> String {
+    match edge {
+        WaitEdge::Start(class) => format!("start {pid} {seq} {at_unix_micros} {class}\n"),
+        WaitEdge::End => format!("end {pid} {seq} {at_unix_micros}\n"),
+    }
+}
+
 impl WaitRecord {
     fn new(path: std::ffi::OsString) -> Self {
         Self {
             path: PathBuf::from(path),
             next: AtomicU64::new(0),
             failed: AtomicBool::new(false),
+            clock: unix_micros,
         }
     }
 
     fn begin(&self, class: DiskClass) -> Waiting<'_> {
         let seq = self.next.fetch_add(1, Ordering::Relaxed);
-        self.append(&format!(
-            "start {} {seq} {} {class}\n",
+        self.append(&wait_record_line(
+            WaitEdge::Start(class),
             std::process::id(),
-            unix_micros()
+            seq,
+            (self.clock)(),
         ));
         Waiting { record: self, seq }
     }
@@ -665,11 +681,11 @@ impl CommandRecord {
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        self.record.append(&format!(
-            "end {} {} {}\n",
+        self.record.append(&wait_record_line(
+            WaitEdge::End,
             std::process::id(),
             self.seq,
-            unix_micros()
+            (self.record.clock)(),
         ));
     }
 }
@@ -1601,13 +1617,36 @@ mod tests {
     }
 
     #[test]
+    fn wait_record_lines_preserve_explicit_identity_class_and_timestamp() {
+        for (edge, pid, seq, at, expected) in [
+            (
+                WaitEdge::Start(DiskClass::Storage),
+                7,
+                2,
+                123,
+                "start 7 2 123 storage\n",
+            ),
+            (
+                WaitEdge::Start(DiskClass::Namespace),
+                42,
+                0,
+                0,
+                "start 42 0 0 namespace\n",
+            ),
+            (WaitEdge::End, 7, 2, 456, "end 7 2 456\n"),
+        ] {
+            assert_eq!(wait_record_line(edge, pid, seq, at), expected);
+        }
+    }
+
+    #[test]
     fn a_wait_is_recorded_as_a_start_before_it_and_an_end_after_it_however_it_ends() {
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/cowshed-dl-{}.waits",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let record = WaitRecord::new(path.clone().into_os_string());
-        let before = unix_micros();
+        let root = TempRoot::new_in(&std::env::temp_dir(), "cowshed-dl-record");
+        let path = root.join("waits");
+        let record = WaitRecord {
+            clock: || 123_456,
+            ..WaitRecord::new(path.clone().into_os_string())
+        };
         let first = record.begin(DiskClass::Storage);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _second = record.begin(DiskClass::Namespace);
@@ -1615,9 +1654,7 @@ mod tests {
         }));
         assert!(unwound.is_err());
         drop(first);
-        let after = unix_micros();
         let text = std::fs::read_to_string(&path).expect("record");
-        std::fs::remove_file(&path).expect("remove record");
         let pid = std::process::id().to_string();
         let lines: Vec<Vec<&str>> = text.lines().map(|line| line.split(' ').collect()).collect();
         let edges: Vec<(&str, &str, &str)> = lines
@@ -1636,8 +1673,11 @@ mod tests {
         assert_eq!(lines[0].get(4), Some(&"storage"));
         assert_eq!(lines[1].get(4), Some(&"namespace"));
         for fields in &lines {
-            let at: u128 = fields[3].parse().expect("microseconds");
-            assert!((before..=after).contains(&at), "{fields:?}");
+            assert_eq!(
+                fields[3].parse::<u128>().expect("unix microseconds"),
+                123_456,
+                "{fields:?}"
+            );
         }
     }
 }
