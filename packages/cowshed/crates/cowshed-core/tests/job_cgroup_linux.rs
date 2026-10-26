@@ -1615,7 +1615,7 @@ fn an_unending_member_is_named_past_the_reap_bound(authority: &CgroupAuthority) 
         .kill_and_wait(bound)
         .expect_err("a member whose exit never comes is never reported reaped");
     let waited = started.elapsed();
-    let CgroupError::Unreaped(expired) = &refused else {
+    let CgroupError::Unreaped { expired, beside } = &refused else {
         panic!("an expiry naming the member, not {refused:?}");
     };
     assert!(
@@ -1623,6 +1623,7 @@ fn an_unending_member_is_named_past_the_reap_bound(authority: &CgroupAuthority) 
         "the member had its whole bound: {waited:?}"
     );
     assert_eq!(expired.bound, bound.within);
+    assert!(beside.is_empty(), "nothing else failed: {beside:?}");
     assert_eq!(expired.peer.cgroup, job.path());
     let members = expired
         .peer

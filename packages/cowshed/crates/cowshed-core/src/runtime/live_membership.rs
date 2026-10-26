@@ -34,8 +34,8 @@ impl LiveMember {
 impl fmt::Display for LiveMember {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.image {
-            Some(image) => write!(formatter, "{} running {image}", self.peer),
-            None => write!(formatter, "{} running an unread image", self.peer),
+            Some(image) => write!(formatter, "{}, image {image}", self.peer),
+            None => write!(formatter, "{}, image unread", self.peer),
         }
     }
 }
@@ -132,8 +132,8 @@ mod tests {
             message,
             format!(
                 "TIMEOUT: job cgroup kill on job cgroup {JOB} with 2 live members: \
-                 job member pid 41 (in an uninterruptible kernel wait) running /usr/bin/fsck; \
-                 job member pid 42 (sleeping) running an unread image: no answer within its reap \
+                 job member pid 41 (in an uninterruptible kernel wait), image /usr/bin/fsck; \
+                 job member pid 42 (sleeping), image unread: no answer within its reap \
                  bound of 5s; waited 5.002s, last progress: signalled 9"
             )
         );

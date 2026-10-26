@@ -182,9 +182,14 @@ pub enum CgroupError {
     #[error("job cgroup {path} still holds processes: its counters are not final")]
     Populated { path: PathBuf },
     /// The membership did not end within its reap bound: code TIMEOUT, terminal. The holder
-    /// names every member still alive with its pid, image and kernel state.
-    #[error("{0}")]
-    Unreaped(Box<Expired<LiveMembership>>),
+    /// names every member still alive with its pid, image and kernel state; `beside` holds what
+    /// else failed in the same retirement (a refused TERM, a failed membership snapshot), kept
+    /// with the expiry so the caller still reads the membership as the failure.
+    #[error("{expired}{}", beside_suffix(.beside))]
+    Unreaped {
+        expired: Box<Expired<LiveMembership>>,
+        beside: Vec<CgroupError>,
+    },
     #[error("{path}: {detail}")]
     Malformed { path: PathBuf, detail: String },
     #[error("{path} does not exist: this kernel or this cgroup's controllers do not provide it")]
@@ -201,6 +206,14 @@ pub enum CgroupError {
         #[source]
         source: ResourceUnitError,
     },
+}
+
+/// What failed beside an expiry, as its message continues: nothing, or each failure in turn.
+fn beside_suffix(beside: &[CgroupError]) -> String {
+    beside
+        .iter()
+        .map(|error| format!("; beside it: {error}"))
+        .collect()
 }
 
 type Result<T, E = CgroupError> = std::result::Result<T, E>;
@@ -936,10 +949,20 @@ impl JobCgroup {
             return Ok(Arc::clone(proof));
         }
         if let Err(term) = self.terminate() {
-            let ended = self.kill_and_wait(reap);
-            return Err(CgroupError::Malformed {
-                path: self.path.clone(),
-                detail: format!("TERM refused: {term}; KILL and empty-membership join: {ended:?}"),
+            return Err(match self.kill_and_wait(reap) {
+                Err(CgroupError::Unreaped {
+                    expired,
+                    mut beside,
+                }) => {
+                    beside.push(term);
+                    CgroupError::Unreaped { expired, beside }
+                }
+                ended => CgroupError::Malformed {
+                    path: self.path.clone(),
+                    detail: format!(
+                        "TERM refused: {term}; KILL and empty-membership join: {ended:?}"
+                    ),
+                },
             });
         }
         let grace_ends =
@@ -1028,12 +1051,16 @@ impl JobCgroup {
         for member in signalled.pinned.values() {
             loop {
                 let Some(remaining) = deadline.remaining(deadline::clock()) else {
-                    let live = signalled
+                    let live: Vec<_> = signalled
                         .pinned
                         .values()
                         .filter(|pinned| !matches!(pinned.exited(), Ok(true)))
                         .map(|pinned| LiveMember::observed(pinned.pid, pinned.image.clone()))
                         .collect();
+                    // Every exit came by the bound, if not through this member's watch.
+                    if live.is_empty() {
+                        return Ok(());
+                    }
                     return Err(self.unreaped(deadline, Ok(live), last));
                 };
                 match member.watch.within(remaining) {
@@ -1061,6 +1088,16 @@ impl JobCgroup {
         match (killed, waited) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (
+                Err(kill),
+                Err(CgroupError::Unreaped {
+                    expired,
+                    mut beside,
+                }),
+            ) => {
+                beside.push(kill);
+                Err(CgroupError::Unreaped { expired, beside })
+            }
             (Err(kill), Err(wait)) => Err(CgroupError::Malformed {
                 path: self.path.clone(),
                 detail: format!("KILL failed: {kill}; empty-membership join failed: {wait}"),
@@ -1077,10 +1114,14 @@ impl JobCgroup {
                     members
                         .into_iter()
                         .map(|member| LiveMember::observed(member.pid, member.image))
-                        .collect()
+                        .collect::<Vec<_>>()
                 })
                 .map_err(|census| census.to_string());
-            return Err(self.unreaped(deadline, live, last));
+            // A census that finds no member alive, of a cgroup that now reads empty, is the
+            // membership ending at the bound: the joins decide what is left.
+            if !matches!(&live, Ok(members) if members.is_empty()) || self.populated()? {
+                return Err(self.unreaped(deadline, live, last));
+            }
         }
         self.join_signalled(deadline, last)
     }
@@ -1093,14 +1134,17 @@ impl JobCgroup {
         live: Result<Vec<LiveMember>, String>,
         last: Progress,
     ) -> CgroupError {
-        CgroupError::Unreaped(Box::new(deadline.expired(
-            LiveMembership {
-                cgroup: self.path.clone(),
-                members: live,
-            },
-            last,
-            deadline::clock(),
-        )))
+        CgroupError::Unreaped {
+            expired: Box::new(deadline.expired(
+                LiveMembership {
+                    cgroup: self.path.clone(),
+                    members: live,
+                },
+                last,
+                deadline::clock(),
+            )),
+            beside: Vec::new(),
+        }
     }
 
     /// Wait until the kernel reports no live member, for as long as `remaining` grants (`None`

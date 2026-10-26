@@ -2622,14 +2622,14 @@ impl SpawnSink for SystemSpawnSink {
 pub(super) fn cgroup_error(error: super::job_cgroup::CgroupError) -> CowshedError {
     let hint = match &error {
         // Retirement's own wait expired: the delegation is fine, a member outlived its kill.
-        super::job_cgroup::CgroupError::Unreaped(_) => {
-            "a member that outlives SIGKILL is in an uninterruptible kernel wait, which ends only \\
-             when that call returns: read its kernel stack (/proc/<pid>/stack, as root) for what \\
-             it waits on; the job keeps its claims, and killing it again retires it once the \\
+        super::job_cgroup::CgroupError::Unreaped { .. } => {
+            "a member that outlives SIGKILL is in an uninterruptible kernel wait, which ends only \
+             when that call returns: read its kernel stack (/proc/<pid>/stack, as root) for what \
+             it waits on; the job keeps its claims, and killing it again retires it once the \
              member has exited"
         }
         _ => {
-            "run the supervisor in a delegated cgroup v2 scope (Delegate=yes), with writable \\
+            "run the supervisor in a delegated cgroup v2 scope (Delegate=yes), with writable \
              cgroup.procs, cgroup.subtree_control and cgroup.kill; Linux 6.5+ is required"
         }
     };
