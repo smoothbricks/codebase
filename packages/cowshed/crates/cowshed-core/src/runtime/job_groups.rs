@@ -2798,23 +2798,16 @@ os._exit(0)
     /// `/usr/bin/top` (setuid root on every macOS host) runs as root's effective uid and the
     /// job's real uid. Read once its exec is seen (no uid poll), it reads with the flavors
     /// `decide_life` takes, while `proc_pid_rusage` declines it with `EPERM`; it proves its group
-    /// running and once exited and held unreaped; and retirement's signal reaches it. The sandbox
-    /// does not honor setuid, so the check says so instead of waiting for a root it cannot get.
+    /// running and once exited and held unreaped; and retirement's signal reaches it. The shell's
+    /// sibling report proves its body started before the watch: /bin/sh first execs its selected
+    /// shell, and that earlier NOTE_EXEC is not top's exec.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     fn host_controller_a_setuid_root_leader_reads_proves_its_group_and_retires() {
-        let mut group = OwnedGroup(
-            Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    "sleep 600 & read _; exec /usr/bin/top -l 0 -s 1 >/dev/null",
-                ])
-                .stdin(Stdio::piped())
-                .process_group(0)
-                .spawn_locked()
-                .expect("spawn a job group"),
-        );
+        let (job, sibling) =
+            group_with_child("sleep 600 & echo $!; read _; exec /usr/bin/top -l 0 -s 1 >/dev/null");
+        let mut group = OwnedGroup(job);
         let pid = group.0.id();
         let leader_pid = i32::try_from(pid).expect("a pid");
         let birth = super::Birth::Observed(leader(pid));
@@ -2852,11 +2845,6 @@ os._exit(0)
                 .any(|member| member.pid == pid && member.uid == 0),
             "{members:?}"
         );
-        let sibling = members
-            .iter()
-            .find(|member| member.pid != pid)
-            .expect("the leader's live sibling")
-            .pid;
         assert!(super::signal_life(pid, record.unique_id, libc::SIGTERM).expect("signal top"));
         assert_eq!(
             super::await_exit_unreaped(leader_pid).expect("top exits"),

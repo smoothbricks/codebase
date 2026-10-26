@@ -367,9 +367,11 @@ proof launches only its unique one-shot agent from the generated gateway plist, 
 
 Workspace supervisors and children deliberately deny `file-link`; this host-controller proof cannot run inside them.
 
-An exit-watch fixture waits for an executed-body readiness byte before its parent captures the process identity and
-registers the watch. The parent holds the child's input gate until registration; returning from spawn alone is not
-readiness. Its actual parent retains the child unreaped through the exit observation.
+A fixture watching an executed shell body's later exec or exit waits for body readiness before its parent captures the
+process identity and registers the watch. The parent holds the child's input gate until registration; returning from
+spawn alone is not readiness: macOS's `/bin/sh` first execs its selected shell. Its actual parent retains the child
+unreaped through the exit observation. The setuid leader fixture uses its sleeping sibling's reported pid as that
+readiness, so the next `NOTE_EXEC` belongs to `top` rather than the shell trampoline.
 
 The inherited-shell equivalence fixture (`cowshed-shell` `shell_pool.rs`,
 `host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_evaluation`) is the two-root test 11_shell.md
