@@ -2213,6 +2213,12 @@ instead of each sizing its runner to the whole host. Its scope is one run. A com
 as configured, sized only by the ceilings it inherits, and nothing is said; a cowshed job's own jobserver fifo still
 reaches it by Cargo's own rule ("Cargo reads its holder's jobserver").
 
+CPU admission connects and sends within the 5 s control bound, then waits for the queue acknowledgement and grant under
+15 s of actor silence, not a total queue deadline (`specs/cowshed/05_gateway.md`, "Deadlines"). A queued reply past 2 s
+is accepted; the disk gateway's old-protocol half-close is not CPU admission policy. While tokens are held, the pool
+actor sends an advancing heartbeat every 5 s, so a live queue waits until tokens return. A silent actor fails admission
+as `SILENT` with its endpoint, bound, waited time and last progress; the command never runs outside the pool.
+
 A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count, and the same count as a make
 jobserver fifo beside it: `g − 1` token bytes, the command holding the implicit first, which the pool lends a socket
 child only once the fifo is empty. A socket grant takes fifo bytes first and that slot last, and its release writes the

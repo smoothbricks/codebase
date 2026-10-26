@@ -912,6 +912,15 @@ the handshake bound.
   that is running or draining with no process of its group left is not progress. If that state persists for the silence
   bound, the wait fails `SILENT`, naming the job as stuck between its last process and its end. A queued job is
   progress, because a background start waits out memory pressure with no deadline (Host scheduling, "Memory pressure").
+- **CPU-pool admission has its own policy.** Connecting and writing the complete request share the 5 s control bound.
+  After the write completes, the client keeps its connection open and reads the queue acknowledgement and grant under
+  the 15 s heartbeat-silence bound, never a total queue-age bound. A valid queued answer arriving after 2 s is still
+  accepted: the disk lease's 2 s half-close probes a gateway predating that protocol and has no place in CPU admission.
+  While requests wait for tokens, the pool actor writes `{"ok":true,"progress":n}` every 5 s. Only an advancing positive
+  sequence renews silence, as does the queued acknowledgement. The heartbeat runs on the same event loop that admits and
+  grants, not an independent liveness thread. A queue that keeps heartbeating waits until a token returns; a silent
+  actor fails admission as `SILENT`, naming the socket, bound, elapsed wait and last progress. Expiry ends only this
+  client's wait and releases its connection; it neither runs the command unbudgeted nor signals the pool.
 - **The gateway control plane heartbeats the same way.** A one-shot request is connected, written and half-closed within
   the control bound. While its answer is not ready, and while an audit-tail follow waits for events, the gateway writes
   `{"ok":true,"progress":n}` every 5 s, once its actor has answered a ping. A heartbeat line, once begun, is written

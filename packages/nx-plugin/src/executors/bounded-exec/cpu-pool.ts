@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import typia from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { holdLease, type Unleased } from './gateway-lease.js';
+import { type CpuLeaseProgress, CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
 import { CPU_TOKENS_ENV, parseInheritedTokens } from './runner-sizing.js';
 
 /**
@@ -61,6 +62,7 @@ interface CpuPoolRequest {
 
 /** The pool's answers, in `holdLease`'s framing. */
 type CpuPoolReply =
+  | CpuLeaseProgress
   | { ok: true; lease: 'queued' }
   | { ok: true; lease: 'granted'; tokens: number }
   | { ok: false; code: 'invalid-request'; error: string };
@@ -146,11 +148,7 @@ export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number
       reason: `the parent CPU pool's endpoint ${JSON.stringify(parent.socket)} is not a socket path`,
     };
   }
-  const lease = await holdLease(parent.socket, { op: 'cpu-pool', want }, 'the parent CPU pool', {
-    ackMs: 2_000,
-    afterCloseMs: 5_000,
-    grantMs: null,
-  });
+  const lease = await holdLease(parent.socket, { op: 'cpu-pool', want }, 'the parent CPU pool', new CpuLeaseWait());
   if (!lease.granted) {
     return lease;
   }
@@ -357,6 +355,14 @@ export async function createCpuPool(
   const failures: string[] = [];
   const queue: Waiter[] = [];
   const children = new Set<Socket>();
+  // This callback runs on the pool's actor, so it proves the same loop that admits and grants is turning.
+  let progress = 0;
+  const heartbeat = setInterval(() => {
+    progress += 1;
+    for (const { child } of queue) {
+      if (child.socket.writable) child.socket.write(frame({ ok: true, progress }));
+    }
+  }, HEARTBEAT_MS);
   let resolveStarted!: (failure: Error | null) => void;
   const started = new Promise<Error | null>((done) => {
     resolveStarted = done;
@@ -534,6 +540,7 @@ export async function createCpuPool(
   const shutdown = (): Promise<CloseOutcome> => {
     shut ??= (async (): Promise<CloseOutcome> => {
       closing = true;
+      clearInterval(heartbeat);
       stopWatching();
       await started;
       for (const socket of children) {

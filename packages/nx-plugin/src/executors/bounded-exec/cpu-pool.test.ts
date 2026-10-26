@@ -26,10 +26,12 @@ import {
   type TokenGrant,
   takeParentCpuTokens,
 } from './cpu-pool.js';
+import type { CpuLeaseProgress } from './lease-wait.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
 
 /** The pool's replies as the wire carries them, one line each. */
 type PoolReply =
+  | CpuLeaseProgress
   | { ok: true; lease: 'queued' }
   | { ok: true; lease: 'granted'; tokens: number }
   | { ok: false; code: 'invalid-request'; error: string };
@@ -164,7 +166,9 @@ function childOf(endpoint: string, request: string): Child {
       for (;;) {
         const line = lines.shift();
         if (line !== undefined) {
-          return parseReply(line);
+          const reply = parseReply(line);
+          if ('progress' in reply) continue;
+          return reply;
         }
         if (ended) {
           throw (

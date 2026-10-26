@@ -1,4 +1,8 @@
 import { connect } from 'node:net';
+import typia from 'typia';
+import { type CpuLeaseProgress, CpuLeaseWait } from './lease-wait.js';
+
+const isCpuProgress = typia.createEquals<CpuLeaseProgress>();
 
 /**
  * The client half of a lease held on a unix socket: the gateway's host disk-lifecycle lease
@@ -8,8 +12,8 @@ import { connect } from 'node:net';
  * The client writes one request line and keeps the connection open without half-closing it. The
  * gateway answers `queued` at once and `granted` when the lease is the client's, and the lease
  * lasts until the client closes the connection, so a client that dies holding one releases it with
- * its socket. A lease never decides whether a command runs: without a grant, it runs without one
- * and the caller says why.
+ * its socket. The caller decides what a refusal means: disk work may run unleased, while CPU
+ * admission fails rather than running outside its parent's count.
  */
 
 /** The cowshed gateway's control socket, at the store root every peer agrees on. */
@@ -46,15 +50,15 @@ export type HeldLease =
 /**
  * Ask the gateway at `socket` for the lease `request` names, `what` in its messages ("disk
  * leases", "the parent CPU pool"). A gateway from before one-line requests says nothing until it reads
- * EOF, so a request not queued within `ackMs` is half-closed and that gateway's refusal read; a
- * gateway that reads the line but does not know the operation refuses it at once. Both predate the
- * lease.
+ * EOF, so a disk request not queued within its ack bound is half-closed to read that gateway's
+ * refusal. CPU admission instead uses its own control/silence policy: no compatibility half-close,
+ * and no total queue bound (specs/cowshed/05_gateway.md, "Deadlines").
  */
 export function holdLease(
   socket: string,
   request: Readonly<Record<string, unknown>>,
   what: string,
-  bounds: LeaseBounds,
+  bounds: LeaseBounds | CpuLeaseWait,
   onQueued?: () => void,
 ): Promise<HeldLease> {
   // `Promise.withResolvers` would read better but needs lib es2024; this package inherits lib
@@ -63,7 +67,8 @@ export function holdLease(
   const promise = new Promise<HeldLease>((settled) => {
     resolve = settled;
   });
-  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a unix-socket connect completes or fails at once; the request's ack is bounded by bounds.ackMs and then bounds.afterCloseMs, and a queued lease's grant by bounds.grantMs, or, for a parent CPU pool's grant (grantMs null), by its siblings returning their tokens
+  const cpu = bounds instanceof CpuLeaseWait ? bounds : null;
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: CPU connect/send is control-bounded and its answer heartbeat-silence-bounded by armCpu(); disk acknowledgement and half-close are bounded below, and a queued disk lease lasts until its holder releases it
   const connection = connect(socket);
   // `closed` is made when a consumer reads it, so a lease nobody watches allocates no promise. The
   // flag, not `connection.destroyed`, says the socket really closed: `destroy()` sets that flag before
@@ -90,7 +95,24 @@ export function holdLease(
     clearTimeout(timer);
     timer = setTimeout(onExpiry, ms);
   };
+  const armCpu = (): void => {
+    if (cpu === null || state === 'settled') return;
+    wait(cpu.remainingMs(), () => {
+      const failure = cpu.expired();
+      if (failure === null) {
+        armCpu();
+        return;
+      }
+      unleased(
+        `${failure.code}: cpu-pool: the lease endpoint ${socket} exceeded ${failure.boundMs} ms (waited ${failure.elapsedMs} ms; last progress: ${failure.last})`,
+        'other',
+        failure.code,
+      );
+    });
+  };
+  armCpu();
   const answer = (line: string) => {
+    if (state === 'settled') return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
@@ -103,6 +125,14 @@ export function holdLease(
       return;
     }
     const fields: Readonly<Record<string, unknown>> = Object.fromEntries(Object.entries(parsed));
+    if (cpu !== null && isCpuProgress(parsed)) {
+      if (!cpu.heartbeat(parsed.progress)) {
+        unleased(`the lease endpoint ${socket} sent non-advancing CPU progress: ${line}`);
+      } else {
+        armCpu();
+      }
+      return;
+    }
     const lease = fields.lease;
     if (fields.ok !== true) {
       const error = String(fields.error ?? '');
@@ -129,10 +159,13 @@ export function holdLease(
     } else if (state === 'asked' && lease === 'queued') {
       state = 'queued';
       onQueued?.();
-      const grantMs = bounds.grantMs;
-      if (grantMs === null) {
+      if (bounds instanceof CpuLeaseWait) {
+        bounds.queued();
+        armCpu();
+      } else if (bounds.grantMs === null) {
         clearTimeout(timer);
       } else {
+        const grantMs = bounds.grantMs;
         wait(grantMs, () => unleased(`the lease endpoint ${socket} granted nothing within ${grantMs} ms`));
       }
     } else if (state === 'queued' && lease === 'granted') {
@@ -154,12 +187,19 @@ export function holdLease(
   };
   connection.on('connect', () => {
     state = 'asked';
-    connection.write(`${JSON.stringify(request)}\n`);
-    wait(bounds.ackMs, () => {
-      state = 'half-closed';
-      connection.end();
-      wait(bounds.afterCloseMs, () => unleased(`the lease endpoint ${socket} answered nothing`));
-    });
+    if (bounds instanceof CpuLeaseWait) {
+      connection.write(`${JSON.stringify(request)}\n`, () => {
+        bounds.sent();
+        armCpu();
+      });
+    } else {
+      connection.write(`${JSON.stringify(request)}\n`);
+      wait(bounds.ackMs, () => {
+        state = 'half-closed';
+        connection.end();
+        wait(bounds.afterCloseMs, () => unleased(`the lease endpoint ${socket} answered nothing`));
+      });
+    }
   });
   connection.on('data', (chunk: Buffer) => {
     buffered += chunk.toString('utf8');
