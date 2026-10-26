@@ -756,7 +756,10 @@ mod tests {
     /// Raven's checkout made a Git repository with its own build volume holding `paths`, linked
     /// and recorded at the fingerprint its tracked build inputs have now, as a refresh leaves
     /// it. Answers the volume's mountpoint.
-    fn linked_volume(store: &Store, paths: &[crate::capabilities::BuildStatePath]) -> PathBuf {
+    fn linked_volume(
+        store: &Store,
+        paths: &[cowshed_types::capabilities::BuildStatePath],
+    ) -> PathBuf {
         use crate::build_volume::{
             BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
             link,
@@ -813,7 +816,8 @@ mod tests {
             admission(&store, None).await,
             Err(Decline::BuildStateUnrecorded)
         );
-        let target = crate::capabilities::BuildStatePath::new("target", "target").expect("path");
+        let target =
+            cowshed_types::capabilities::BuildStatePath::new("target", "target").expect("path");
         let volume = linked_volume(&store, &[target]);
         assert_eq!(admission(&store, Some(&volume)).await, Ok(()));
 

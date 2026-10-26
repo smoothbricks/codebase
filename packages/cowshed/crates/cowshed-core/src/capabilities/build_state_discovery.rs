@@ -9,82 +9,15 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use super::{BuildStatePath, CapabilityId, DeclaredState, DetectionContext, merge_build_state};
+use super::{DetectionContext, merge_build_state};
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Run;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CargoDiscoveryPhase {
-    WorkspaceRoot,
-    Metadata,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum BuildStateFinding {
-    CargoUnavailable {
-        manifest: PathBuf,
-        phase: CargoDiscoveryPhase,
-        cause: String,
-    },
-    /// The job that asks Cargo held no `cargo` on its PATH, so Cargo was asked about none of the
-    /// manifests its batch carried. `shell` is the checkout-relative directory of the workspace
-    /// shell whose activation put none there, or `None` when no shell selects the directory the
-    /// job ran in: cowshed links no toolchain of its own (15_capabilities.md, "Bootstrap
-    /// executables").
-    NoCargo {
-        shell: Option<PathBuf>,
-        manifests: Vec<PathBuf>,
-    },
-}
-
-impl std::fmt::Display for BuildStateFinding {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CargoUnavailable {
-                manifest,
-                phase,
-                cause,
-            } => write!(
-                formatter,
-                "Cargo could not name the {} of {}, so its target directory is not on the build \
-                 volume: {cause}",
-                match phase {
-                    CargoDiscoveryPhase::WorkspaceRoot => "workspace root",
-                    CargoDiscoveryPhase::Metadata => "target directory",
-                },
-                manifest.display()
-            ),
-            Self::NoCargo { shell, manifests } => {
-                let manifests = manifests
-                    .iter()
-                    .map(|manifest| manifest.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                match shell {
-                    Some(shell) => write!(
-                        formatter,
-                        "the workspace shell activated from {} put no `cargo` on its jobs' PATH, \
-                         and cowshed links none of its own, so Cargo was not asked about \
-                         {manifests} and their target directories are not on the build volume: \
-                         declare the toolchain in that shell",
-                        shell.join(".envrc").display()
-                    ),
-                    None => write!(
-                        formatter,
-                        "no workspace shell (`.envrc`) declares a toolchain for {manifests}, and \
-                         cowshed links no `cargo` of its own, so Cargo was not asked about them and \
-                         their target directories are not on the build volume: declare the \
-                         toolchain in the repository's shell"
-                    ),
-                }
-            }
-        }
-    }
-}
+use cowshed_types::capabilities::{
+    BuildStateFinding, BuildStatePath, CapabilityId, CapabilityOverride, CargoDiscoveryPhase,
+    DeclaredState,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuildStateDiscovery {
@@ -910,7 +843,7 @@ struct CargoMetadata {
 /// fixture's, contributes nothing, and none under `node_modules` is a package of the project.
 fn javascript_tool_caches(
     context: &DetectionContext<'_>,
-    overrides: &BTreeMap<CapabilityId, super::CapabilityOverride>,
+    overrides: &BTreeMap<CapabilityId, CapabilityOverride>,
     active: &[CapabilityId],
     tracked: &mut TrackedManifests,
 ) -> Result<Vec<BuildStatePath>> {

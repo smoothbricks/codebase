@@ -1,9 +1,10 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, GrantAccess,
-    GrantScope, add_bootstrap,
+    CapabilityContribution, CapabilityGrant, DetectionContext, Detector, GrantAccess, GrantScope,
+    add_bootstrap,
 };
 use crate::Result;
+use cowshed_types::capabilities::CapabilityId;
 
 pub static BUN_HOME: SharedToolHome = SharedToolHome {
     variable: Some("BUN_INSTALL_CACHE_DIR"),

@@ -1421,7 +1421,8 @@ async fn host_controller_shell_activation_selects_nearest_workspace_envrc() {
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_cargo_discovery_asks_the_toolchain_the_dev_environment_provides() {
-    use cowshed_core::capabilities::{BuildStatePath, JobCargo, discover_build_state};
+    use cowshed_core::capabilities::{JobCargo, discover_build_state};
+    use cowshed_types::capabilities::BuildStatePath;
     let root = scratch("cargo-discovery-toolchain");
     let sandbox = workspace(&root, 41_120);
     install_real_tool(&sandbox, "direnv");

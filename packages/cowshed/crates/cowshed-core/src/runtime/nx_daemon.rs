@@ -41,6 +41,7 @@ use crate::api::dto::{
 use crate::capabilities::nx;
 use crate::error::{CowshedError, Result};
 use crate::sandbox::SandboxConfig;
+use cowshed_types::config::NxDaemonIdle;
 use cowshed_types::metadata::WorkspaceRole;
 
 /// How often a shed's supervisor probes its Nx daemon. Short, because from the daemon's death to
@@ -77,29 +78,6 @@ pub(crate) const PAUSE_CAP: Duration = Duration::from_secs(15 * 60);
 /// costs a resident daemon, not a stalled job: the supervisor's retirement stops it once more,
 /// and a probe that finds it gone counts afresh.
 pub(crate) const STOP_ATTEMPTS: u32 = 3;
-
-/// How long a shed must show no use of Nx before its supervisor stops the daemon it keeps: main's
-/// `.cowshed.toml` `[nx] daemon_idle`, [`NxDaemonIdle::DEFAULT`] without it (04_sandbox.md, "The
-/// Nx daemon stays on"). Never zero: a zero bound would stop a daemon at the probe after the one
-/// that found it come up.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NxDaemonIdle(Duration);
-
-impl NxDaemonIdle {
-    /// Long enough that a gate's runs, an edit and the next run share one warm daemon (a cold one
-    /// recomputes the project graph and every plugin worker's state), short enough that a shed
-    /// whose agent has finished costs its host five minutes of a daemon, not the rest of the day.
-    pub const DEFAULT: Self = Self(Duration::from_secs(5 * 60));
-
-    /// The bound `idle`; `None` for zero.
-    pub fn new(idle: Duration) -> Option<Self> {
-        (!idle.is_zero()).then_some(Self(idle))
-    }
-
-    pub const fn get(self) -> Duration {
-        self.0
-    }
-}
 
 /// The daemon of an Nx project, as its rendezvous record and the world agree on it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

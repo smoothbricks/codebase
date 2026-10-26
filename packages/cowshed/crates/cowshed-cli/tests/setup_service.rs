@@ -2612,7 +2612,7 @@ fn build_state_result(repo: &str, result: Result<BuildStateRefresh>) -> ProjectB
 #[tokio::test]
 async fn build_state_migration_reports_each_main_and_rebuild_only_findings() {
     use cowshed_core::build_volume::{BuildStateTool, BuildVolumeId, DisplacedBuildStateFinding};
-    use cowshed_core::capabilities::{BuildStateFinding, CargoDiscoveryPhase};
+    use cowshed_types::capabilities::{BuildStateFinding, CargoDiscoveryPhase};
     let volume = BuildVolumeId::parse("0123456789abcdef0123456789abcdef").unwrap();
     let mut host = FakeHost {
         build_state: vec![

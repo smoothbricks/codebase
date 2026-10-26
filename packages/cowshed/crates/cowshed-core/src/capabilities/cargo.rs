@@ -21,11 +21,12 @@ use std::path::{Path, PathBuf};
 
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, DetectionScope,
-    Detector, EnvAction, GrantAccess, GrantScope,
+    CapabilityContribution, CapabilityGrant, DetectionContext, DetectionScope, Detector, EnvAction,
+    GrantAccess, GrantScope,
 };
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::capabilities::CapabilityId;
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Cargo,

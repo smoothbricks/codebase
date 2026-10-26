@@ -1761,12 +1761,12 @@ fn parse_utc_millis(value: &str) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::BuildStatePath;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use cowshed_os::fork_lock::Spawn as _;
     use cowshed_os::test_backstop::ChildBackstop as _;
     #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::UnixStreamBackstop as _;
+    use cowshed_types::capabilities::BuildStatePath;
 
     fn scratch(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

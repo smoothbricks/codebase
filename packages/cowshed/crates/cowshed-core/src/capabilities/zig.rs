@@ -1,9 +1,9 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap,
-    add_shared_tool_home,
+    CapabilityContribution, DetectionContext, Detector, add_bootstrap, add_shared_tool_home,
 };
 use crate::Result;
+use cowshed_types::capabilities::CapabilityId;
 
 pub static ZIG_HOME: SharedToolHome = SharedToolHome {
     variable: Some("ZIG_GLOBAL_CACHE_DIR"),

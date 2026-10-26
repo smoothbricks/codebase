@@ -1119,7 +1119,7 @@ impl GitRepository {
     pub(crate) async fn first_unheld_untracked(
         &self,
         checkout: &Path,
-        build_state: Vec<crate::capabilities::BuildStatePath>,
+        build_state: Vec<cowshed_types::capabilities::BuildStatePath>,
     ) -> Result<Option<PathBuf>> {
         let mut args = vec![
             "ls-files".to_owned(),
@@ -6468,7 +6468,7 @@ mod tests {
     #[tokio::test]
     async fn source_release_exempts_the_build_state_links_cowshed_made() {
         use crate::build_volume::link;
-        use crate::capabilities::BuildStatePath;
+        use cowshed_types::capabilities::BuildStatePath;
 
         let store = crate::temp_root::FixtureStore::new();
         let root = repository();

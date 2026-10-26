@@ -30,10 +30,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::api::dto::GitOid;
-use crate::capabilities::BuildStatePath;
 use crate::storage::StorageLayoutError;
 use crate::storage::apfs::release::{Listing, released_in_store};
 use cowshed_os::fork_lock::Fenced;
+use cowshed_types::capabilities::BuildStatePath;
 use cowshed_types::image::IMAGE_EXTENSION;
 use cowshed_types::metadata::{
     MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json,
@@ -444,7 +444,7 @@ impl BuildVolumeState {
 }
 
 fn path_from_wire(wire: &PathWire) -> crate::Result<BuildStatePath> {
-    BuildStatePath::new(&wire.checkout, &wire.volume)
+    Ok(BuildStatePath::new(&wire.checkout, &wire.volume)?)
 }
 
 /// The first two paths that overlap on either side, or `()` when none do: one build-state path
@@ -617,7 +617,7 @@ pub struct BuildStateRefresh {
     /// Checkout-relative.
     pub added: Vec<PathBuf>,
     pub displaced: Vec<DisplacedBuildStateFinding>,
-    pub findings: Vec<crate::capabilities::BuildStateFinding>,
+    pub findings: Vec<cowshed_types::capabilities::BuildStateFinding>,
 }
 
 /// What a checkout's build link should become before its volume is mounted.

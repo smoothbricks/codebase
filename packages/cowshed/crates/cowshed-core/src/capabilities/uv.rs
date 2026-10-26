@@ -1,9 +1,10 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CapabilityContribution, CapabilityId, DetectionContext, Detector, EnvAction, add_bootstrap,
+    CapabilityContribution, DetectionContext, Detector, EnvAction, add_bootstrap,
     add_shared_tool_home,
 };
 use crate::Result;
+use cowshed_types::capabilities::CapabilityId;
 
 pub static UV_HOME: SharedToolHome = SharedToolHome {
     variable: Some("UV_CACHE_DIR"),

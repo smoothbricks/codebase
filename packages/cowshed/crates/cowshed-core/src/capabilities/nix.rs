@@ -1,9 +1,10 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, EnvAction,
-    GrantAccess, GrantScope, SharedCache, add_bootstrap,
+    CapabilityContribution, CapabilityGrant, DetectionContext, Detector, EnvAction, GrantAccess,
+    GrantScope, SharedCache, add_bootstrap,
 };
 use crate::{CowshedError, Result};
+use cowshed_types::capabilities::CapabilityId;
 use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
 

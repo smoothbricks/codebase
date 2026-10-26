@@ -64,7 +64,6 @@ use crate::runtime::job_resources::{
     Boundary, JobSampler, Member, Observation, Sampling, StreamTally,
 };
 use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
-pub use crate::runtime::nx_daemon::NxDaemonIdle;
 use crate::runtime::nx_daemon::{NxDaemonKeeper, Probe, Verdict};
 #[cfg(target_os = "macos")]
 use crate::runtime::process_monitor::ProcessMonitor;
@@ -77,6 +76,7 @@ use crate::storage::job_artifact::{
     CompletedJobArtifacts, JobAdmission, JobEnding, JobScheduling, OutputTargets,
     SealedCheckpointManifest, StreamKind,
 };
+use cowshed_types::config::NxDaemonIdle;
 
 #[cfg(test)]
 const DEFAULT_ACTOR_CAPACITY: usize = 64;
@@ -5630,9 +5630,9 @@ impl SupervisorActor {
             && child.capabilities.active.iter().any(|id| {
                 matches!(
                     id,
-                    crate::capabilities::CapabilityId::Bun
-                        | crate::capabilities::CapabilityId::Npm
-                        | crate::capabilities::CapabilityId::Pnpm
+                    cowshed_types::capabilities::CapabilityId::Bun
+                        | cowshed_types::capabilities::CapabilityId::Npm
+                        | cowshed_types::capabilities::CapabilityId::Pnpm
                 )
             }) {
             let exec_temp = child.exec_temp_dir.clone();

@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
-use cowshed_core::capabilities::BuildStatePath;
 use cowshed_core::exec::{ProfileLaunch, SANDBOX_EXEC};
 use cowshed_core::git::git_command_at;
 use cowshed_core::host_dirs::support_directory;
 use cowshed_core::sandbox::{
     RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
 };
+use cowshed_types::capabilities::BuildStatePath;
 use cowshed_types::metadata::PortBlock;
 
 struct Scratch(PathBuf);

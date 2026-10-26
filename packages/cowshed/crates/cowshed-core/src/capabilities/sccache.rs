@@ -1,9 +1,10 @@
 use super::{
-    CapabilityContribution, CapabilityGrant, CapabilityId, DetectionContext, Detector, EnvAction,
-    GrantAccess, GrantScope,
+    CapabilityContribution, CapabilityGrant, DetectionContext, Detector, EnvAction, GrantAccess,
+    GrantScope,
 };
 use crate::{CowshedError, Result};
 use cowshed_gateway_types::STORE_ROOT;
+use cowshed_types::capabilities::CapabilityId;
 use std::path::{Path, PathBuf};
 
 /// Host shells source the same detector-owned client settings as supervisor children.

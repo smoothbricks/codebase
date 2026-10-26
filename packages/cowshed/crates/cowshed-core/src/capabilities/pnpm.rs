@@ -1,6 +1,7 @@
 use super::cache::{SharedLayout, SharedToolHome};
-use super::{CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap};
+use super::{CapabilityContribution, DetectionContext, Detector, add_bootstrap};
 use crate::Result;
+use cowshed_types::capabilities::CapabilityId;
 
 #[cfg(target_os = "macos")]
 const PNPM_HOME_PATH: &str = "Library/pnpm/store";

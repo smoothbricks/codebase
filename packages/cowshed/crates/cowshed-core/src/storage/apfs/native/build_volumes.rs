@@ -1848,7 +1848,7 @@ mod tests {
             layout: &BuildVolumeLayout,
         ) -> Self {
             use crate::build_volume::link;
-            use crate::capabilities::BuildStatePath;
+            use cowshed_types::capabilities::BuildStatePath;
 
             let image = root.join("store/lane.dmg");
             crate::blank_image::blank_image(namespace, &image);

@@ -1,9 +1,10 @@
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CapabilityContribution, CapabilityId, DetectionContext, Detector, EnvAction, add_bootstrap,
+    CapabilityContribution, DetectionContext, Detector, EnvAction, add_bootstrap,
     add_shared_tool_home,
 };
 use crate::Result;
+use cowshed_types::capabilities::CapabilityId;
 
 /// Gradle's own `~/.gradle`: only `caches` is shared. The daemon, wrapper distributions, native
 /// libraries, JDKs and `gradle.properties` beside it stay the host's.

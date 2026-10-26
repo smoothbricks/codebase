@@ -429,6 +429,18 @@ impl FenceRefusal {
     }
 }
 
+impl From<cowshed_types::capabilities::InvalidBuildStatePath> for CowshedError {
+    fn from(error: cowshed_types::capabilities::InvalidBuildStatePath) -> Self {
+        use cowshed_types::capabilities::InvalidBuildStatePath;
+        let hint = match &error {
+            InvalidBuildStatePath::Invalid { .. } => {
+                "repair the capability build-state contribution"
+            }
+            InvalidBuildStatePath::NotUtf8(_) => "use a UTF-8 capability directory",
+        };
+        Self::integrity(error.to_string(), hint)
+    }
+}
 impl CowshedError {
     pub fn class_not_permitted(
         class: crate::api::dto::ExecClass,
