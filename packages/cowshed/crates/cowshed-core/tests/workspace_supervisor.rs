@@ -478,7 +478,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
         build_volume_released: None,
-        nx_daemon_idle: cowshed_core::runtime::supervisor::NxDaemonIdle::DEFAULT,
+        nx_daemon_idle: cowshed_types::config::NxDaemonIdle::DEFAULT,
     }
 }
 
@@ -7355,7 +7355,7 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     use cowshed_core::build_volume::{
         BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link,
     };
-    use cowshed_core::capabilities::{BuildStatePath, RelPath};
+    use cowshed_types::capabilities::{BuildStatePath, RelPath};
     use cowshed_types::repository::ProjectPaths;
 
     let (mut supervisor_config, root) = nx_project("raven");

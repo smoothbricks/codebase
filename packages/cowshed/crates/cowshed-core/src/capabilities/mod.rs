@@ -9,17 +9,15 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::{CowshedError, Result};
 use cache::{SharedLayout, SharedToolHome};
+use cowshed_types::capabilities::{BuildStatePath, CapabilityId, CapabilityOverride};
 
-mod build_state;
-pub use build_state::{BuildStatePath, DeclaredState, RelPath};
 mod build_state_discovery;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use build_state_discovery::HostCargo;
 pub(crate) use build_state_discovery::installed_javascript_trees;
 pub use build_state_discovery::{
-    BuildStateDiscovery, BuildStateFinding, CargoAnswer, CargoDiscoveryPhase, CargoQuery,
-    CargoRunner, CargoUnanswered, JobCargo, discover_build_state, may_name_build_state,
-    tracked_manifest_fingerprint,
+    BuildStateDiscovery, CargoAnswer, CargoQuery, CargoRunner, CargoUnanswered, JobCargo,
+    discover_build_state, may_name_build_state, tracked_manifest_fingerprint,
 };
 pub mod bun;
 pub mod cache;
@@ -37,85 +35,6 @@ pub mod pnpm;
 pub mod sccache;
 pub mod uv;
 pub mod zig;
-
-/// A detector's identity. It deserializes from its [`Self::name`], the key of a `.cowshed.toml`
-/// `[capabilities.<name>]` section.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CapabilityId {
-    Direnv,
-    Nx,
-    Cargo,
-    Go,
-    Bun,
-    Npm,
-    Pnpm,
-    Uv,
-    Zig,
-    Gradle,
-    Nix,
-    Sccache,
-    Codegraph,
-}
-
-impl CapabilityId {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Direnv => "direnv",
-            Self::Nx => "nx",
-            Self::Cargo => "cargo",
-            Self::Go => "go",
-            Self::Bun => "bun",
-            Self::Npm => "npm",
-            Self::Pnpm => "pnpm",
-            Self::Uv => "uv",
-            Self::Zig => "zig",
-            Self::Gradle => "gradle",
-            Self::Nix => "nix",
-            Self::Sccache => "sccache",
-            Self::Codegraph => "codegraph",
-        }
-    }
-    pub const fn section_name(self) -> &'static str {
-        match self {
-            Self::Direnv => "capabilities.direnv",
-            Self::Nx => "capabilities.nx",
-            Self::Cargo => "capabilities.cargo",
-            Self::Go => "capabilities.go",
-            Self::Bun => "capabilities.bun",
-            Self::Npm => "capabilities.npm",
-            Self::Pnpm => "capabilities.pnpm",
-            Self::Uv => "capabilities.uv",
-            Self::Zig => "capabilities.zig",
-            Self::Gradle => "capabilities.gradle",
-            Self::Nix => "capabilities.nix",
-            Self::Sccache => "capabilities.sccache",
-            Self::Codegraph => "capabilities.codegraph",
-        }
-    }
-
-    pub const ALL: [Self; 13] = [
-        Self::Direnv,
-        Self::Nx,
-        Self::Cargo,
-        Self::Go,
-        Self::Bun,
-        Self::Npm,
-        Self::Pnpm,
-        Self::Uv,
-        Self::Zig,
-        Self::Gradle,
-        Self::Nix,
-        Self::Sccache,
-        Self::Codegraph,
-    ];
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CapabilityOverride {
-    pub disabled: bool,
-    pub directory: Option<PathBuf>,
-}
 
 #[derive(Clone, Copy)]
 pub struct DetectionContext<'a> {
@@ -814,21 +733,6 @@ fn detection_error(path: &Path, error: io::Error) -> CowshedError {
     )
 }
 
-pub fn validate_override_directory(value: &str) -> std::result::Result<PathBuf, &'static str> {
-    let path = Path::new(value);
-    if value.is_empty()
-        || value.as_bytes().contains(&0)
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-        || path.components().collect::<PathBuf>().as_os_str() != path.as_os_str()
-    {
-        return Err("capability directory must be a nonempty normalized workspace-relative path");
-    }
-    Ok(path.to_owned())
-}
-
 /// Share `tool`'s cache directories where the host keeps them and point a child at that path.
 ///
 /// The cache directories are read-write subtrees the supervisor creates; a split tool's root is a
@@ -1018,30 +922,7 @@ pub fn add_bootstrap(
 /// the value a production shell passes as [`DetectionContext::program_directories`]. Only this
 /// function asks the host who it is; detection itself inspects only the directories it is given.
 pub fn host_program_directories(home: &Path) -> Vec<PathBuf> {
-    let mut directories = vec![
-        home.join(".nix-profile/bin"),
-        home.join(".local/state/nix/profile/bin"),
-    ];
-    if let Some(user) = effective_user_name() {
-        directories.push(Path::new("/etc/profiles/per-user").join(&user).join("bin"));
-        directories.push(
-            Path::new("/nix/var/nix/profiles/per-user")
-                .join(user)
-                .join("profile/bin"),
-        );
-    }
-    directories.extend(
-        [
-            "/run/current-system/sw/bin",
-            "/nix/var/nix/profiles/default/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]
-        .map(PathBuf::from),
-    );
-    directories
+    cowshed_types::capabilities::host_program_directories(home, effective_user_name().as_deref())
 }
 
 fn effective_user_name() -> Option<OsString> {

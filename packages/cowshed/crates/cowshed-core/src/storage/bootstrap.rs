@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use toml::Spanned;
 
-use crate::capabilities::{CapabilityId, CapabilityOverride, DeclaredState};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::process::fmt_command_failure;
+use cowshed_types::capabilities::{CapabilityId, CapabilityOverride, DeclaredState};
 
 use super::fstab::FstabPin;
 
@@ -312,18 +312,18 @@ pub struct CowshedConfig {
     /// `[sandbox] deny`.
     caches_home: Vec<PathBuf>,
     capabilities: std::collections::BTreeMap<
-        crate::capabilities::CapabilityId,
-        crate::capabilities::CapabilityOverride,
+        cowshed_types::capabilities::CapabilityId,
+        cowshed_types::capabilities::CapabilityOverride,
     >,
     /// `[build] capacity`: the capacity of the build volumes this project creates from nothing
     /// (16_build_volumes.md, "Substrate"); a clone and a seed inherit their source's instead.
     build_capacity: Option<cowshed_apfs::image::ImageCapacity>,
     /// `[build] state`: build state the repository declares for tools no capability detects
     /// (16_build_volumes.md, "Declared build state"), sorted, no spelling inside another.
-    build_state: Vec<crate::capabilities::DeclaredState>,
+    build_state: Vec<cowshed_types::capabilities::DeclaredState>,
     /// `[nx] daemon_idle`: how long a shed goes unused before its supervisor stops the Nx daemon
     /// it keeps (04_sandbox.md, "The Nx daemon stays on").
-    nx_daemon_idle: Option<crate::runtime::supervisor::NxDaemonIdle>,
+    nx_daemon_idle: Option<cowshed_types::config::NxDaemonIdle>,
 }
 
 impl CowshedConfig {
@@ -342,8 +342,8 @@ impl CowshedConfig {
     pub fn capabilities(
         &self,
     ) -> &std::collections::BTreeMap<
-        crate::capabilities::CapabilityId,
-        crate::capabilities::CapabilityOverride,
+        cowshed_types::capabilities::CapabilityId,
+        cowshed_types::capabilities::CapabilityOverride,
     > {
         &self.capabilities
     }
@@ -357,15 +357,15 @@ impl CowshedConfig {
 
     /// The entries `[build] state` declares; empty without it. Patterns are expanded against the
     /// checkout at discovery.
-    pub fn build_state(&self) -> &[crate::capabilities::DeclaredState] {
+    pub fn build_state(&self) -> &[cowshed_types::capabilities::DeclaredState] {
         &self.build_state
     }
 
     /// How long a shed goes unused before its supervisor stops its Nx daemon: `[nx] daemon_idle`,
-    /// else [`crate::runtime::supervisor::NxDaemonIdle::DEFAULT`].
-    pub fn nx_daemon_idle(&self) -> crate::runtime::supervisor::NxDaemonIdle {
+    /// else [`cowshed_types::config::NxDaemonIdle::DEFAULT`].
+    pub fn nx_daemon_idle(&self) -> cowshed_types::config::NxDaemonIdle {
         self.nx_daemon_idle
-            .unwrap_or(crate::runtime::supervisor::NxDaemonIdle::DEFAULT)
+            .unwrap_or(cowshed_types::config::NxDaemonIdle::DEFAULT)
     }
 }
 
@@ -504,30 +504,30 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
             })
         })
         .transpose()?;
-    let capabilities =
-        file.capabilities
-            .into_iter()
-            .map(|(id, section)| {
-                let directory = section
-                    .directory
-                    .map(|directory| {
-                        crate::capabilities::validate_override_directory(directory.get_ref())
-                            .map_err(|reason| ConfigError::InvalidCapabilityDirectory {
-                                section: id.section_name(),
-                                line: line_of(input, &directory),
-                                reason,
-                            })
-                    })
-                    .transpose()?;
-                Ok((
-                    id,
-                    CapabilityOverride {
-                        disabled: section.disabled,
-                        directory,
-                    },
-                ))
-            })
-            .collect::<Result<_, ConfigError>>()?;
+    let capabilities = file
+        .capabilities
+        .into_iter()
+        .map(|(id, section)| {
+            let directory = section
+                .directory
+                .map(|directory| {
+                    cowshed_types::capabilities::validate_override_directory(directory.get_ref())
+                        .map_err(|reason| ConfigError::InvalidCapabilityDirectory {
+                            section: id.section_name(),
+                            line: line_of(input, &directory),
+                            reason,
+                        })
+                })
+                .transpose()?;
+            Ok((
+                id,
+                CapabilityOverride {
+                    disabled: section.disabled,
+                    directory,
+                },
+            ))
+        })
+        .collect::<Result<_, ConfigError>>()?;
     Ok(CowshedConfig {
         substrate,
         sandbox_deny,
@@ -541,7 +541,7 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
 
 /// `[nx] daemon_idle`: a whole number of seconds, minutes or hours above zero (`"90s"`, `"5m"`,
 /// `"1h"`); `None` for anything else.
-fn nx_daemon_idle(text: &str) -> Option<crate::runtime::supervisor::NxDaemonIdle> {
+fn nx_daemon_idle(text: &str) -> Option<cowshed_types::config::NxDaemonIdle> {
     let (count, seconds) = [('s', 1), ('m', 60), ('h', 60 * 60)]
         .into_iter()
         .find_map(|(unit, seconds)| Some((text.strip_suffix(unit)?, seconds)))?;
@@ -549,7 +549,7 @@ fn nx_daemon_idle(text: &str) -> Option<crate::runtime::supervisor::NxDaemonIdle
         return None;
     }
     let seconds = count.parse::<u64>().ok()?.checked_mul(seconds)?;
-    crate::runtime::supervisor::NxDaemonIdle::new(std::time::Duration::from_secs(seconds))
+    cowshed_types::config::NxDaemonIdle::new(std::time::Duration::from_secs(seconds))
 }
 
 /// Main's `.cowshed.toml`, the only copy whose `[sandbox]` and `[caches]` sections are trusted:

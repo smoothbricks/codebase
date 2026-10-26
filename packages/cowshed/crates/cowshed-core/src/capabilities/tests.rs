@@ -1,5 +1,6 @@
 use super::test_support::Fixture;
 use super::*;
+use cowshed_types::capabilities::{CapabilityId, CapabilityOverride, validate_override_directory};
 
 #[test]
 fn a_plain_repository_has_only_the_core_executable_probes() {

@@ -200,7 +200,7 @@ pool = "tank"
 /// its entries, and a literal string is a string. Each entry error names its own line.
 #[test]
 fn cowshed_config_arrays_follow_the_toml_grammar() {
-    use cowshed_core::capabilities::{BuildStatePath, DeclaredState};
+    use cowshed_types::capabilities::{BuildStatePath, DeclaredState};
     let config = parse_cowshed_config(
         r#"[sandbox]
 deny = [
@@ -380,7 +380,7 @@ fn build_capacity_defaults_to_100_gibibytes_and_is_an_image_capacity() {
 /// hours above zero.
 #[test]
 fn nx_daemon_idle_defaults_to_five_minutes_and_is_a_positive_whole_duration() {
-    use cowshed_core::runtime::supervisor::NxDaemonIdle;
+    use cowshed_types::config::NxDaemonIdle;
     use std::time::Duration;
     assert_eq!(
         parse_cowshed_config("").unwrap().nx_daemon_idle(),
@@ -499,7 +499,7 @@ fn caches_home_is_an_array_of_home_relative_paths() {
 /// its own `declared/` namespace.
 #[test]
 fn build_state_declares_disjoint_checkout_relative_paths() {
-    use cowshed_core::capabilities::{BuildStatePath, DeclaredState};
+    use cowshed_types::capabilities::{BuildStatePath, DeclaredState};
     assert_eq!(parse_cowshed_config("").unwrap().build_state(), []);
     let config = parse_cowshed_config(
         "[build]\nstate = [\"vendor/upstream\", \"tools/.pin\", \"packages/*/.cache/lmao\", \"vendor/upstream\"] # rebuildable\n",
@@ -589,7 +589,7 @@ fn main_cowshed_config_reads_main_and_refuses_an_invalid_file() {
 }
 #[test]
 fn capability_overrides_are_strict_convention_overrides() {
-    use cowshed_core::capabilities::CapabilityId;
+    use cowshed_types::capabilities::CapabilityId;
     for id in CapabilityId::ALL {
         let config = parse_cowshed_config(&format!(
             "[{}]\ndisabled = true\ndirectory = \"tools/project\"\n",

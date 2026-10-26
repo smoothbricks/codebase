@@ -12,10 +12,10 @@ use std::path::PathBuf;
 
 use super::cache::{SharedLayout, SharedToolHome};
 use super::{
-    CapabilityContribution, CapabilityId, DetectionContext, DetectionScope, Detector,
-    add_shared_tool_home,
+    CapabilityContribution, DetectionContext, DetectionScope, Detector, add_shared_tool_home,
 };
 use crate::Result;
+use cowshed_types::capabilities::CapabilityId;
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Go,

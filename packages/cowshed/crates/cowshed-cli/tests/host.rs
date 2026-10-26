@@ -17,8 +17,8 @@ use cowshed_core::api::operations::{
     HostRetireDescendants, HostTreeHolders, SccacheStatusRead,
 };
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
-use cowshed_core::capabilities::BuildStatePath;
 use cowshed_core::{Host, SccacheHost};
+use cowshed_types::capabilities::BuildStatePath;
 
 /// The `cowshed` binary under test, read when the test runs (see tests/controller.rs).
 fn cowshed() -> PathBuf {

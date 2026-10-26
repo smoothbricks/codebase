@@ -2465,7 +2465,7 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
     } else {
         PublicationPolicy::CreateNew
     };
-    let publication = |path: PathBuf, label| {
+    let publication = |path: PathBuf, label| -> Result<OutputPublication> {
         Ok(OutputPublication {
             path: workspace_path(path, label)?,
             policy,

@@ -80,8 +80,8 @@ fn locks_in(target: &Path) -> io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::BuildStatePath;
     use cowshed_os::test_backstop::FileBackstop as _;
+    use cowshed_types::capabilities::BuildStatePath;
 
     fn scratch(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

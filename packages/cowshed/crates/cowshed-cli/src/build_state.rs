@@ -6,8 +6,8 @@ use std::path::Path;
 
 use cowshed_core::api::{BuildStateLink, BuildStateListing};
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
-use cowshed_core::capabilities::BuildStatePath;
 use cowshed_core::{CowshedError, Result};
+use cowshed_types::capabilities::BuildStatePath;
 
 use crate::output::Output;
 

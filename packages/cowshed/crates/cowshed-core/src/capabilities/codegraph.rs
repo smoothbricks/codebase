@@ -1,11 +1,9 @@
 //! The .codegraph marker owns one checkout's entire per-tree index (spec 16).
 //! The index is cloned/adopted with build state, not shared between tree writers.
 
-use super::{
-    BuildStatePath, CapabilityContribution, CapabilityId, DetectionContext, DetectionScope,
-    Detector, MarkerKind,
-};
+use super::{CapabilityContribution, DetectionContext, DetectionScope, Detector, MarkerKind};
 use crate::{CowshedError, Result};
+use cowshed_types::capabilities::{BuildStatePath, CapabilityId};
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Codegraph,

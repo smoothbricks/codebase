@@ -34,10 +34,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::{
-    CapabilityContribution, CapabilityId, DetectedCapabilities, DetectionContext, DetectionScope,
-    Detector, EnvAction,
+    CapabilityContribution, DetectedCapabilities, DetectionContext, DetectionScope, Detector,
+    EnvAction,
 };
 use crate::{CowshedError, Result};
+use cowshed_types::capabilities::{BuildStatePath, CapabilityId};
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Nx,
@@ -91,12 +92,12 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         build_state: ["cache", "workspace-data"]
             .into_iter()
             .map(|name| {
-                super::BuildStatePath::from_paths(
+                BuildStatePath::from_paths(
                     &project.join(STATE).join(name),
                     &project.join("nx").join(name),
                 )
             })
-            .collect::<Result<Vec<_>>>()?,
+            .collect::<std::result::Result<Vec<_>, _>>()?,
         ..CapabilityContribution::default()
     };
     contribution
@@ -164,7 +165,8 @@ mod tests {
 
     use super::*;
     use crate::capabilities::test_support::{Fixture, assert_switch};
-    use crate::capabilities::{CapabilityOverride, DaemonIsolation, detect};
+    use crate::capabilities::{DaemonIsolation, detect};
+    use cowshed_types::capabilities::CapabilityOverride;
 
     #[test]
     fn nx_json_switches_nx_on_and_off() {
@@ -223,9 +225,13 @@ mod tests {
                     discard_at_mint: vec![PathBuf::from(".nx/workspace-data/d")],
                 },
                 build_state: vec![
-                    super::super::BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
-                    super::super::BuildStatePath::new(".nx/workspace-data", "nx/workspace-data")
+                    cowshed_types::capabilities::BuildStatePath::new(".nx/cache", "nx/cache")
                         .unwrap(),
+                    cowshed_types::capabilities::BuildStatePath::new(
+                        ".nx/workspace-data",
+                        "nx/workspace-data"
+                    )
+                    .unwrap(),
                 ],
                 ..CapabilityContribution::default()
             }

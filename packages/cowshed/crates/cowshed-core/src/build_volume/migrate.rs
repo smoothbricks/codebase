@@ -13,10 +13,10 @@ use super::{
     BuildStateTool, BuildVolumeId, BuildVolumeLayout, BuildVolumeState, DisplacedBuildStateFinding,
     Registration, TrackedBuildStateRefusal, discard, link, nx, tracked_source,
 };
-use crate::capabilities::BuildStatePath;
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::{CowshedError, Result};
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_types::capabilities::BuildStatePath;
 
 pub struct FirstTouch<'a> {
     pub checkout: &'a Path,
@@ -154,7 +154,7 @@ fn adopt_preflighted(
             .map(|state| {
                 BuildStatePath::from_paths(state.checkout.as_path(), state.checkout.as_path())
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let source_state = BuildVolumeState {
             paths: source_paths,
             fingerprint: None,

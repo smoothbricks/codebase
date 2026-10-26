@@ -18,8 +18,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
-use crate::capabilities::BuildStatePath;
 use crate::error::{CowshedError, Result};
+use cowshed_types::capabilities::BuildStatePath;
 
 /// The one name a checkout reaches its build volume through, relative to the checkout root.
 pub const BUILD_LINK: &str = ".cowshed/build";

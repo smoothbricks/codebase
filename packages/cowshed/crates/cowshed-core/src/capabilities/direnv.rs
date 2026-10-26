@@ -1,8 +1,9 @@
 use super::{
-    CapabilityContribution, CapabilityId, DetectionContext, Detector, EnvAction, GrantAccess,
-    SharedCache, ShellActivation, add_bootstrap,
+    CapabilityContribution, DetectionContext, Detector, EnvAction, GrantAccess, SharedCache,
+    ShellActivation, add_bootstrap,
 };
 use crate::Result;
+use cowshed_types::capabilities::CapabilityId;
 
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Direnv,

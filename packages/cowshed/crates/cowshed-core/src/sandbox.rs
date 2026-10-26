@@ -1704,8 +1704,8 @@ mod tests {
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
         let paths = vec![
-            crate::capabilities::BuildStatePath::new("target", "target").unwrap(),
-            crate::capabilities::BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+            cowshed_types::capabilities::BuildStatePath::new("target", "target").unwrap(),
+            cowshed_types::capabilities::BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
         ];
         crate::build_volume::link::point(&sandbox.workspace_mount, &first).unwrap();
         crate::build_volume::link::link_paths(&sandbox.workspace_mount, &first, &paths).unwrap();

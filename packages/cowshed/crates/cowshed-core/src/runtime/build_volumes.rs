@@ -27,7 +27,6 @@ use crate::build_volume::{
     BuildVolumeRole, BuildVolumeStage, BuildVolumeState, CapturedBuildVolume, Registrant,
     Registration, ReleaseClaim, TrackedBuildStateRefusal, cargo, link, nx,
 };
-use crate::capabilities::BuildStatePath;
 #[cfg(test)]
 use crate::storage::apfs::ApfsExecutionHost;
 use crate::storage::apfs::ApfsStorageError;
@@ -39,6 +38,7 @@ use crate::{CowshedError, Result};
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::LockMode;
+use cowshed_types::capabilities::BuildStatePath;
 use cowshed_types::metadata::{WorkspaceIncarnation, WorkspaceName};
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
@@ -4124,10 +4124,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_build_resize_grows_the_volume_and_seed_so_a_later_fork_inherits_it() {
-        use crate::capabilities::BuildStatePath;
         use crate::storage::apfs::ApfsSubstrateConfig;
         use cowshed_apfs::SystemCommandRunner;
         use cowshed_os::namespace::HostNamespace;
+        use cowshed_types::capabilities::BuildStatePath;
         const GIB: u64 = ImageCapacity::GIBIBYTE;
 
         let root = crate::scratch_apfs::ScratchRoot::new("build-resize").expect("scratch root");

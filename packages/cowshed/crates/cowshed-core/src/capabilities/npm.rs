@@ -1,6 +1,7 @@
 use super::cache::{SharedLayout, SharedToolHome};
-use super::{CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap};
+use super::{CapabilityContribution, DetectionContext, Detector, add_bootstrap};
 use crate::Result;
+use cowshed_types::capabilities::CapabilityId;
 
 pub static NPM_HOME: SharedToolHome = SharedToolHome {
     variable: Some("NPM_CONFIG_CACHE"),
