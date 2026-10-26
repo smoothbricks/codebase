@@ -8710,6 +8710,14 @@ fn main() {
             )
             .unwrap();
         fs::write(mount.join("after-seed"), b"live work").unwrap();
+
+        // Flushed, as the move's own comparison flushes it: left in the kernel's cache, the write
+        // can reach the image between the preview and the move, and the move then refuses its
+        // plan as stale (its image allocation changed) before it compares the write's time.
+        scratch
+            .host
+            .build_volume_written(&scratch.layout, &live)
+            .unwrap();
         let workspace = reseed_workspace(&scratch, main, checkout.clone());
         let plan = scratch
             .volumes
