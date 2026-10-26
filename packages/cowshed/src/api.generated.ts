@@ -772,13 +772,17 @@ export type CpuProbation = {
  * attach waits for its repository's gate").
  */
 export type CpuQuietWaiter = {
-  readonly repository: string;
+  /**
+   * The repository whose gate work it waits for; absent for the released-image cleanup, which
+   * waits for any.
+   */
+  readonly repository?: string;
   /**
    * The client process, when its socket named one.
    */
   readonly pid?: number & tags.Type<'int32'>;
   /**
-   * What the client said it waits to run: `fork <ws>` or `attach <ws>`.
+   * What it waits to run: `fork <ws>`, `attach <ws>` or `image-cleanup <entry>`.
    */
   readonly command: string;
   /**
@@ -1131,9 +1135,10 @@ export type FdHolder = {
 export type FdHolders = {
   readonly holders: ReadonlyArray<FdHolder>;
   /**
-   * The processes whose descriptors the kernel withheld from this user (another user's, unless
-   * the census runs as root). Any of them may hold an object: counted, never reported as
-   * holding none.
+   * The processes whose descriptors were not read: those the kernel withheld from this user
+   * (another user's, unless the census runs as root) and, on Darwin, those a cowshed lifecycle
+   * operation runs in, which a census never asks (a fork's first mount of its new image holds its
+   * vnode for minutes). Any of them may hold an object: counted, never reported as holding none.
    */
   readonly uninspected: number & tags.Type<'uint32'>;
 };
