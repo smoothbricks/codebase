@@ -3034,13 +3034,32 @@ mod tests {
         stdin_writes: AtomicUsize,
         active_calls: AtomicUsize,
         rpc_calls: AtomicUsize,
+        changed: tokio::sync::Notify,
     }
 
-    struct ActiveCall<'a>(&'a AtomicUsize);
+    impl TestRuntime {
+        /// Wait until `ready` reads true of the counters, woken by each counter
+        /// change instead of yielding against them. Registering before the read
+        /// keeps a change between the read and the wait from being lost.
+        async fn when(&self, ready: impl Fn(&Self) -> bool) {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if ready(self) {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+
+    struct ActiveCall<'a>(&'a AtomicUsize, &'a tokio::sync::Notify);
 
     impl Drop for ActiveCall<'_> {
         fn drop(&mut self) {
             self.0.fetch_sub(1, Ordering::SeqCst);
+            self.1.notify_waiters();
         }
     }
 
@@ -3094,10 +3113,12 @@ mod tests {
         ) -> Result<BinaryDownload> {
             assert_eq!(method, "job.logs");
             let call = self.log_calls.fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_waiters();
             match self.mode.load(Ordering::SeqCst) {
                 1 => {
                     self.active_calls.fetch_add(1, Ordering::SeqCst);
-                    let _active = ActiveCall(&self.active_calls);
+                    self.changed.notify_waiters();
+                    let _active = ActiveCall(&self.active_calls, &self.changed);
                     future::pending().await
                 }
                 2 => match call {
@@ -3480,27 +3501,36 @@ mod tests {
         }
         let first = queued_actor_call(Arc::clone(&runtime), "project.list").await;
         let second = queued_actor_call(Arc::clone(&runtime), "project.doctor").await;
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                read_rpc_request(&mut server),
-            )
-            .await
-            .is_err(),
-            "a full connection sends no excess non-stream call"
+        // A stream is served while the connection is full, and the actor handles its
+        // messages in order: the stream's frame fences the two queued calls, which
+        // the actor took before it. Had either been sent when it arrived, its frame
+        // would precede the stream's on the wire; the stream's frame is the next one,
+        // so both calls were queued, unsent, when the actor reached the stream.
+        let mut opening = Box::pin(runtime.stream("job.processEvents", empty_params()));
+        poll_pending(opening.as_mut()).await;
+        let (_, request) = read_rpc_request(&mut server).await;
+        assert_eq!(
+            request["method"], "job.processEvents",
+            "a full connection sent an excess non-stream call: {request}"
         );
+        assert_eq!(request["id"], 65);
+        let stream = opening.await.unwrap();
+        drop(stream);
+        let (_, demand) = read_rpc_request(&mut server).await;
+        assert_eq!(demand, json!({"id": 65, "demand": "close"}));
+        write_rpc_success(&mut server, 65, json!({}), None).await;
 
         // Any answer frees a slot, not merely the oldest one's answer.
         write_rpc_success(&mut server, 32, json!({}), None).await;
         let (_, request) = read_rpc_request(&mut server).await;
-        assert_eq!(request["id"], 65);
+        assert_eq!(request["id"], 66);
         assert_eq!(request["method"], "project.list");
         write_rpc_success(&mut server, 1, json!({}), None).await;
         let (_, request) = read_rpc_request(&mut server).await;
-        assert_eq!(request["id"], 66);
+        assert_eq!(request["id"], 67);
         assert_eq!(request["method"], "project.doctor");
 
-        for id in 2..=66 {
+        for id in (2..=64).chain([66, 67]) {
             if id != 32 {
                 write_rpc_success(&mut server, id, json!({}), None).await;
             }
@@ -5307,7 +5337,7 @@ mod tests {
         let runtime = Arc::new(TestRuntime::default());
         runtime.mode.store(3, Ordering::SeqCst);
         let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
-        let stream = poll_job_stream(
+        let mut stream = poll_job_stream(
             runtime_trait,
             test_authority(),
             JobId::new(7).unwrap(),
@@ -5315,11 +5345,29 @@ mod tests {
             0,
             false,
         );
-        while runtime.log_calls.load(Ordering::SeqCst) < 9 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The bounded channel holds eight pages; the ninth poll completes and its
+        // send pends on the full channel. Each page consumed from there admits
+        // exactly one more poll, which the counter's next change reports.
+        runtime
+            .when(|runtime| runtime.log_calls.load(Ordering::SeqCst) >= 9)
+            .await;
         assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 9);
+        for completed in 10..=12 {
+            let page = stream
+                .next()
+                .await
+                .expect("a buffered page")
+                .expect("the page reads");
+            assert_eq!(&page[..], b"x");
+            runtime
+                .when(|runtime| runtime.log_calls.load(Ordering::SeqCst) >= completed)
+                .await;
+            assert_eq!(
+                runtime.log_calls.load(Ordering::SeqCst),
+                completed,
+                "one consumed page admits exactly one more poll"
+            );
+        }
         drop(stream);
     }
     #[tokio::test]
@@ -5335,14 +5383,14 @@ mod tests {
             0,
             true,
         );
-        while runtime.active_calls.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
+        runtime
+            .when(|runtime| runtime.active_calls.load(Ordering::SeqCst) == 1)
+            .await;
 
         drop(stream);
-        while runtime.active_calls.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
+        runtime
+            .when(|runtime| runtime.active_calls.load(Ordering::SeqCst) == 0)
+            .await;
     }
 
     #[tokio::test]
