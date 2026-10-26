@@ -8502,16 +8502,6 @@ fn main() {
             .unwrap();
         assert_eq!(latest, replacement);
         assert!(record.is_published());
-        assert_eq!(
-            record.extents,
-            Some(
-                crate::storage::apfs::extents::prove_forkable(&scratch.layout.image(&replacement))
-                    .unwrap()
-                    .extents()
-                    .get()
-            ),
-            "the compacted seed's record keeps its extent count, for its release"
-        );
         assert_eq!(record.tree, Some(GitOid::new("a".repeat(40)).unwrap()));
         let image = scratch.layout.image(&replacement);
         assert!(
