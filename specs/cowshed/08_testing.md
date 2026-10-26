@@ -489,39 +489,32 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   the host's filesystem, cut a few steps, abandoned, and finished by a second release that counts only what was left.
   The deleting directory's crash points are witnessed the same way. A release returns with its entry whole and unlocked
   and frees nothing, whatever it releases (a build volume, a removed workspace's image, an orphan session or staging
-  image, an expired checkpoint, a failed restore's staged clone) and whether or not a gateway takes its hand-over: the
-  image is off its name, every byte waits in `.deleting`, and a retry finds the commit already made, makes its rename
-  durable and answers. A link in place of the deleting directory refuses. A directory store's release of a tree a
-  process holds anything inside answers with the tree committed whole to its `.deleting` directory, deletes nothing and
-  hands nothing over, and `finish_build_releases` leaves a build-volume tree while it is held and deletes it once it is
-  not. An unsynced native entry still requires all rename syncs before its owner's retry answers. Directory regressions
-  replace the deleting directory's pathname after acquisition: neither retry confirmation nor the finisher may follow
-  the foreign tree. The finisher syncs both held directories while the unsynced entry is still intact, then deletes
-  through those descriptors; a replaced opened child and foreign symlink targets remain untouched. A real self-held
-  payload stays, but the finisher's own observation does not retain it.
-- **Released images are handed to the gateway and freed by its cleanup queue** (05_gateway.md, "Deleting released
-  images"). A release through a store whose configuration names no gateway (a function call over a fixture store no test
-  gave one) returns with its entry whole in `.deleting` and says so once per process. The hand-over is a function call
-  to a listener that plays the gateway: it writes one `released` line naming the entry, with the counts its releaser
-  knew and no others, half-closes and reads the answer; a listener that refuses, never answers or is absent leaves the
-  entry whole, said once on stderr, and the release still answers. The gateway's side takes an absolute entry in a
-  `.deleting` directory of its store and answers `{"ok":true}`, and refuses a relative entry, one with a `..` component,
-  one outside its store and one outside a `.deleting` directory as `invalid-request`, and any entry that arrives before
-  its cleanup has started as `rejected`. The order is `cleanup_order::next`, a pure function checked over table-driven
-  rows of entries and pressure: with no pressure the fewest extents go first; under pressure the most unique bytes per
-  extent go first, the fewer extents on a tie, and a clone that shares every extent after one that frees; an entry with
-  no record goes last, oldest first, in both modes, and under pressure so does one without both counts. The pressure
-  read is the real container's free space, checked within its capacity, and `PRESSURE_FREE_FRACTION` is the one fraction
-  it is compared by, so no test fills a container. The startup listing is a function call over a scratch store with
-  released images planted in each project's `build/.deleting` and `sessions/.deleting`, in an archived project's
+  image, an expired checkpoint, a failed restore's staged clone) and whether or not a gateway takes its nudge: the image
+  is off its name, every byte waits in `.deleting`, and a retry finds the commit already made, makes its rename durable
+  and answers. A link in place of the deleting directory refuses. A directory store's release of a tree a process holds
+  anything inside answers with the tree committed whole to its `.deleting` directory, deletes nothing and nudges
+  nothing, and `finish_build_releases` leaves a build-volume tree while it is held and deletes it once it is not. An
+  unsynced native entry still requires all rename syncs before its owner's retry answers. Directory regressions replace
+  the deleting directory's pathname after acquisition: neither retry confirmation nor the finisher may follow the
+  foreign tree. The finisher syncs both held directories while the unsynced entry is still intact, then deletes through
+  those descriptors; a replaced opened child and foreign symlink targets remain untouched. A real self-held payload
+  stays, but the finisher's own observation does not retain it.
+- **Released images are nudged to the gateway and freed by its cleanup** (05_gateway.md, "Deleting released images"). A
+  release through a store whose configuration names no gateway (a function call over a fixture store no test gave one)
+  returns with its entry whole in `.deleting` and says so once per process. The nudge is a function call to a listener
+  that plays the gateway: `deleter::nudge` writes one `{"op":"released"}` line with no entry and no counts, half-closes
+  and reads the answer; a listener that refuses, never answers within 2 s or is absent leaves the entry whole, said once
+  on stderr, and the release still answers. The startup listing is a function call over a scratch store with released
+  images planted in each project's `build/.deleting` and `sessions/.deleting`, in an archived project's
   (`.retired-projects/<operation-id>/build/.deleting` and `…/sessions/.deleting`) and in the store's own `.deleting`,
-  workspace and build images alike: it lists them all with no record, leaves a legacy `.releasing` alone, names each
-  stray and each unreadable directory, leaves every other file of an archive untouched, skips the receipt files beside
-  the archives, and frees and syncs nothing. A free of an entry another process holds leaves it, and a deletion that
-  stops after its first cut is finished by the next listing from the file's length. The unbinding moves each released
-  image of its project into `<store>/.deleting`, hands each one over and frees none, an entry the cleanup holds moving
-  with it. A workspace image left in `sessions/.deleting` does not delay project recovery, which reconciles the record
-  its rename left imageless without waiting for the image; the gateway's startup listing queues it.
+  workspace and build images alike: it lists them all, leaves a legacy `.releasing` alone, names each stray and each
+  unreadable directory, leaves every other file of an archive untouched, skips the receipt files beside the archives,
+  and frees and syncs nothing. The pass leaves an entry another process holds
+  (`the_cleanup_cuts_in_steps_and_never_cuts_a_held_entry` in release.rs), and a deletion that stops after its first cut
+  is finished by the next listing from the file's length. The unbinding moves each released image of its project into
+  `<store>/.deleting`, nudges the gateway for each one and frees none, an entry the cleanup holds moving with it. A
+  workspace image left in `sessions/.deleting` does not delay project recovery, which reconciles the record its rename
+  left imageless without waiting for the image; the gateway's next listing finds it.
 - **A supervisor's opening finishes nothing and waits for no image lock** (07_api.md, "Authority model"): for any
   generated workspace and probe name, a `Supervisor` opening observes what a `Workspaces` opening naming that one
   workspace observes, replays no intent, selects no rename and has no retirement target; over generated scopes it and
@@ -556,8 +549,8 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   gate-class request the tokens it asks for before any background; rows of gate requests by repository give each its
   answer (run now, or wait naming the gate job heading its repository) and the transition that releases it; rows of
   queued asks give each its typed cause (`repository-gate` or `tokens`) (05_gateway.md, "One gate per repository", "Room
-  for a gate"). Over the socket, a released image handed over while a land's gate holds tokens is freed with the gate
-  still holding (05_gateway.md, "Deleting released images").
+  for a gate"). Over the socket, a released image nudged while a land's gate holds tokens is freed with the gate still
+  holding (05_gateway.md, "Deleting released images").
 
 ## Integration tests (real substrate)
 
@@ -1159,7 +1152,7 @@ Covered flows:
   canonical-flag remount, 01a_apfs.md), stub `.envrc`;
 - lazy volume creation at adopt: the store volume created idempotently before the first image;
 - rm-while-busy (open file handle → grace → force detach);
-- gc: release of retired trash, orphan session and staging images and expired checkpoints, each handed to the gateway's
+- gc: release of retired trash, orphan session and staging images and expired checkpoints, each nudged to the gateway's
   cleanup, orphan mountpoint removal; real root-owned `0700` event-log debris on an unmounted directory is retained by a
   no-replace, same-parent rename, never blocks image reclamation or healthy doctor info, and mixed work, symlink
   substitutions, collisions and mounted filesystems remain protected;

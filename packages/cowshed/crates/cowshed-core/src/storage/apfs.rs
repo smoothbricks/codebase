@@ -1,4 +1,3 @@
-pub mod cleanup_order;
 pub mod deleter;
 pub mod extents;
 pub mod native;
@@ -43,8 +42,8 @@ pub struct ApfsSubstrateConfig {
     /// and main's mountpoint.
     pub checkout_path: PathBuf,
     pub capacity: ImageCapacity,
-    /// The gateway control socket a release hands its entry to (05_gateway.md, "Deleting released
-    /// images"); with none, the entry waits in `.deleting` for a gateway's start.
+    /// The gateway control socket a release nudges (05_gateway.md, "Deleting released images");
+    /// with none, the entry waits in `.deleting` for a gateway's start.
     pub cleanup: Option<std::sync::Arc<Path>>,
 }
 

@@ -1039,8 +1039,8 @@ pub struct CanonicalRoots {
     telemetry: PathBuf,
     namespace: HostNamespace,
     ports: PortPartition,
-    /// The gateway control socket a release hands its entry to (05_gateway.md, "Deleting released
-    /// images"): the host store's gateway, none for a fixture store.
+    /// The gateway control socket a release nudges (05_gateway.md, "Deleting released images"):
+    /// the host store's gateway, none for a fixture store.
     cleanup: Option<Arc<Path>>,
 }
 
@@ -1084,7 +1084,7 @@ impl CanonicalRoots {
         &self.store
     }
 
-    /// The gateway control socket this store's releases are handed to, if any.
+    /// The gateway control socket this store's releases nudge, if any.
     pub fn cleanup(&self) -> Option<&Arc<Path>> {
         self.cleanup.as_ref()
     }

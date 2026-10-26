@@ -334,6 +334,31 @@ pub fn encode_component(value: &str) -> Result<String, ComponentEncodingError> {
     encode_component_with_role(value, false)
 }
 
+/// Whether `name` is a component [`encode_component`] or [`encode_layout_owner`] can produce:
+/// every byte a lowercase letter or a digit, a `.`, `_` or `-` past the first byte, or a `%`
+/// escape of two uppercase hex digits. An encoded component never starts with `.`, so a store's
+/// own entries beside its projects (`.deleting`, `.retired-projects`) and the volume's system
+/// directories (`.Spotlight-V100`, `.Trashes`) are none.
+pub fn is_encoded_component(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        index += match byte {
+            b'a'..=b'z' | b'0'..=b'9' => 1,
+            b'.' | b'_' | b'-' if index != 0 => 1,
+            b'%' if bytes.get(index + 1..index + 3).is_some_and(|hex| {
+                hex.iter()
+                    .all(|digit| matches!(digit, b'0'..=b'9' | b'A'..=b'F'))
+            }) =>
+            {
+                3
+            }
+            _ => return false,
+        };
+    }
+    !bytes.is_empty()
+}
+
 /// Encode an owner component at the store layout root, additionally escaping reserved namespaces.
 pub fn encode_layout_owner(value: &str) -> Result<String, ComponentEncodingError> {
     encode_component_with_role(value, RESERVED_LAYOUT_OWNERS.contains(&value))

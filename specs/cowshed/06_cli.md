@@ -454,10 +454,10 @@ never named: a mount just to rename one would advance its image mtime, the seed-
 `rm` and `land`, including `land --no-retire`, collect build volumes synchronously: the moment no checkout links a
 volume and it is no target's latest seed, it is detached and released, unless a running cowshed job's shared hold or an
 unfinished create/fork in the lifecycle intent journal proves an owner. A release commits the image with one rename into
-the project's `build/.deleting`, hands the entry to the gateway, whose `image-cleanup` thread frees it a bounded step at
-a time (05_gateway.md, "Deleting released images"), and frees no byte itself, so space lags the command by the free. A
-hand-over the gateway does not take (absent, silent or refusing) is said on stderr and fails nothing: the release
-stands, and the entry waits for the gateway's next start. `gc` collects build volumes the same way, committing and never
+the project's `build/.deleting`, nudges the gateway, whose `image-cleanup` thread frees it a bounded step at a time
+(05_gateway.md, "Deleting released images"), and frees no byte itself, so space lags the command by the free. A nudge
+the gateway does not take (absent, silent for 2 s or refusing) is said on stderr and fails nothing: the release stands,
+and the entry waits for the gateway's next listing. `gc` collects build volumes the same way, committing and never
 freeing. A non-forced unmount gets a bounded grace; if it still refuses and no owner remains, release forces the
 unmount. It names each initial holder's pid and command on stderr and says whether the volume was released within the
 grace or forced afterwards. Force revokes those processes' volume access rather than killing them. A job admitted before

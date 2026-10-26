@@ -738,7 +738,7 @@ into `.retired-projects/<operation-id>` in the store. That tree holds the Git re
 and the resource evidence, unchanged: nothing is deleted, rewritten or copied, and an archive that already exists is
 never overwritten. The images stay in it, detached, so no disk space is freed. An archive is reserved host storage — no
 cowshed command lists, heals or reclaims it. Only a released image already waiting in the project's `.deleting`
-directories is freed there, by the gateway when it next starts; it is no evidence.
+directories is freed there, by the gateway's cleanup at its next listing; it is no evidence.
 
 Nothing is forced. A supervisor that has not finished draining, an owner that still holds the project, or a holder that
 keeps an image busy — an open file, a working directory, a running job — refuses its step with exit 4 and leaves the
@@ -1769,13 +1769,12 @@ the store; a retry after an interruption finishes the same move.
 
 Every other image a command lets go of — a clean removal's image, the build volumes `rm`, `land`, `reseed` and `gc`
 release, the seeds a fork or land replaces, an orphan or expired image `gc` collects, the staged image a failed restore
-or creation leaves — is renamed into the project's `sessions/.deleting/` or `build/.deleting/`, and the command starts a
-background process, its own executable, that frees that one image, a bounded step at a time, and answers at once; free
-space catches up while that process runs, not when the command returns. If the process cannot be spawned, the command
-fails with the image already released, and a retry finds it so; if it ends badly, its reaper says so on stderr and the
-gateway frees what it left when it next starts. Removing the whole project with `cowshed rm main --restore` frees
-nothing itself either: it moves its released images into the store's `.deleting/` and starts each one's deletion before
-it deletes the project's store directory.
+or creation leaves — is renamed into the project's `sessions/.deleting/` or `build/.deleting/`, and the command nudges
+the gateway and answers at once; the gateway frees the image a bounded cut at a time, one image at a time, and free
+space catches up while it does, not when the command returns. If the gateway is down or does not answer, the command
+says so on stderr and still answers: the image is released, and the gateway's next listing finds it. Removing the whole
+project with `cowshed rm main --restore` frees nothing itself either: it moves its released images into the store's
+`.deleting/` and nudges the gateway before it deletes the project's store directory.
 
 An image under `sessions/` without its grants sidecar is skipped by other commands with a named warning; `doctor`
 reports it, and `gc` can release it as an orphan after mount and lock checks. `gc` keeps going when an individual

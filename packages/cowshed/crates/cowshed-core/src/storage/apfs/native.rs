@@ -2804,10 +2804,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// Release `image`, the retired workspace's canonical or trashed image (02_workspaces.md, `rm`
     /// step 5): one rename to `sessions/.deleting/<ws>-<incarnation>.dmg` commits it, so nothing
     /// mounts, forks or reads it again, and this returns once that rename is durable; the gateway's
-    /// cleanup, which it is handed to, frees the bytes (05_gateway.md, "Deleting released
-    /// images"). Its CA companion, facts and grants sidecar are then removed by
+    /// cleanup, which it nudges, frees the bytes (05_gateway.md, "Deleting released images"). Its
+    /// CA companion, facts and grants sidecar are then removed by
     /// [`ApfsExecutionHost::reclaim_image`]. A crash after the rename leaves the entry, which nothing
-    /// names, for that scan.
+    /// names, for the cleanup's next listing.
     fn release_retired_image(
         &self,
         project: &Path,
@@ -2826,7 +2826,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .map_err(|error| io_error("release a retired workspace image", image, error))
         })?;
         if released {
-            self.hand_over(&entry, cowshed_gateway_types::ReleaseRecord::default());
+            self.nudge_cleanup(&entry);
             deletion_log::log_deletion_for_image(
                 image,
                 DeletionOp::ReclaimImage,
@@ -2837,13 +2837,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(())
     }
 
-    /// Hand `entry`, a release this host just committed and made durable, to the gateway's cleanup
-    /// its config names (05_gateway.md, "Deleting released images"), and return: nothing here frees
-    /// it. A config that names none (a fixture store no test gave a gateway) says so once, and the
-    /// entry waits in `.deleting` for a gateway's start.
-    pub(super) fn hand_over(&self, entry: &Path, record: cowshed_gateway_types::ReleaseRecord) {
+    /// Nudge the gateway's cleanup its config names after this host committed the release at
+    /// `entry` and made it durable (05_gateway.md, "Deleting released images"), and return: nothing
+    /// here frees it. A config that names none (a fixture store no test gave a gateway) says so
+    /// once, and the entry waits in `.deleting` for a gateway's start.
+    pub(super) fn nudge_cleanup(&self, entry: &Path) {
         match &self.config.cleanup {
-            Some(socket) => super::deleter::hand_over(socket, entry, record),
+            Some(socket) => super::deleter::nudge(socket, entry),
             None => super::deleter::say_no_cleanup(),
         }
     }
@@ -2889,7 +2889,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let released = super::release::commit_release(image, &entry)
             .map_err(|error| io_error("release an image nothing owns", image, error))?;
         if released {
-            self.hand_over(&entry, cowshed_gateway_types::ReleaseRecord::default());
+            self.nudge_cleanup(&entry);
         }
         Ok(released)
     }

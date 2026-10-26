@@ -410,16 +410,16 @@ impl Gateway {
     }
 
     /// Start freeing the released images of the store at `store` (05_gateway.md, "Deleting
-    /// released images"): one thread lists what an earlier gateway left and frees every entry
-    /// handed over from then on, one at a time. Until it starts, a hand-over is refused and its
-    /// entry waits for the listing. A second call starts nothing.
+    /// released images"): one thread lists the store's `.deleting` directories and frees what they
+    /// hold, one at a time, then lists again at every nudge. The handle is published before the
+    /// thread's first listing, so no nudge it refuses names an entry that listing missed. A second
+    /// call starts nothing.
     pub fn clean_up_released_images(&self, store: std::path::PathBuf) -> std::io::Result<()> {
-        if self.cleanup.get().is_some() {
+        let (cleanup, heard) = crate::cleanup::ImageCleanup::new();
+        if self.cleanup.set(cleanup).is_err() {
             return Ok(());
         }
-        let started = crate::cleanup::ImageCleanup::start(store)?;
-        let _ = self.cleanup.set(started);
-        Ok(())
+        crate::cleanup::ImageCleanup::start(store, heard)
     }
 
     pub fn handle(&self) -> GatewayHandle {

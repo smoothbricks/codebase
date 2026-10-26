@@ -24,8 +24,8 @@
 //! An image a lifecycle operation owns is released by one rename into the [`DELETING_DIRECTORY`]
 //! beside it ([`commit_release`]), so no cut ever lands on an image anything can still find, and
 //! the operation answers once that rename is durable. Its bytes are freed off every verb's path,
-//! by the gateway's cleanup queue, one entry at a time, which the releasing process hands the entry
-//! to ([`super::deleter`]); at its start the queue lists whatever an earlier gateway left
+//! by the gateway's cleanup, one entry at a time, which the releasing process nudges
+//! ([`super::deleter`]); each of its passes lists every `.deleting` directory
 //! ([`released_in`], 05_gateway.md "Deleting released images").
 
 use std::ffi::{CStr, CString};
@@ -76,7 +76,7 @@ use super::extents::for_each_run;
 /// 50.074 s for its first 454-run cut; reducing reclamation work cannot bound map splitting.
 pub const STEP_EXTENTS: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(1023));
 
-/// The fewest extents a timed cut frees ([`next_cut`]), and the step the gateway's cleanup plans
+/// The fewest extents a timed cut asks to free ([`next_cut`]; a short tail frees fewer), and the step the gateway's cleanup plans
 /// in: a cut of the last 64 runs still frees whole runs from the end.
 pub const STEP_FLOOR: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(63));
 
@@ -156,17 +156,14 @@ impl ReleasePlan {
     fn advance(&mut self) {
         self.cuts.pop();
     }
-
-    /// The length a cut freeing the plan's next `steps` steps cuts the file to, those steps taken
-    /// off the plan; `None` once every cut is made.
-    fn take(&mut self, steps: NonZeroU64) -> Option<u64> {
+    /// The length a cut freeing the plan's next `steps` steps cuts the file to, and how many cuts
+    /// the plan keeps once that cut is made; `None` once every cut is made.
+    fn reach(&self, steps: NonZeroU64) -> Option<(u64, usize)> {
         let kept = self
             .cuts
             .len()
             .saturating_sub(usize::try_from(steps.get()).unwrap_or(usize::MAX));
-        let cut = *self.cuts.get(kept)?;
-        self.cuts.truncate(kept);
-        Some(cut)
+        self.cuts.get(kept).map(|&cut| (cut, kept))
     }
 }
 
@@ -303,18 +300,20 @@ impl Release {
         self.unlink()
     }
 
-    /// Make every cut left, each sized by how long the one before took ([`next_cut`]), the
+    /// Make every cut left, each sized by how long the one before it in this entry took ([`next_cut`]), the
     /// first freeing [`STEP_EXTENTS`] runs, and unlink the empty file. The plan's steps are
     /// [`STEP_FLOOR`] runs, so every size is a whole number of them.
     fn finish_timed(mut self) -> io::Result<Released> {
         let mut size = STEP_EXTENTS;
         loop {
             let steps = NonZeroU64::new(size.get() / STEP_FLOOR.get()).unwrap_or(NonZeroU64::MIN);
-            let Some(cut) = self.plan.take(steps) else {
+            let Some((cut, kept)) = self.plan.reach(steps) else {
                 break;
             };
             let started = Instant::now();
             self.file.set_len(cut)?;
+            // The plan drops the cuts this one made only once it is made: the length is the journal.
+            self.plan.cuts.truncate(kept);
             size = next_cut(size, started.elapsed());
             self.steps += 1;
         }
@@ -348,8 +347,8 @@ pub fn release_file(path: &Path, step: StepExtents) -> io::Result<Released> {
 }
 /// Free the one committed release at `entry` in bounded steps and unlink it: what the gateway's
 /// cleanup does with each entry it picks (05_gateway.md, "Deleting released images"). An entry
-/// another process holds is left to it ([`Released::Busy`]): its releaser is still syncing its
-/// rename, and hands it over after. One another deletion unlinked, or nothing there, is
+/// another process holds is left to it ([`Released::Busy`]): another cleanup still cutting it, or
+/// an earlier deleter. One another deletion unlinked, or nothing there, is
 /// [`Released::Absent`]. The directory and its parent are synced before the first cut, since the
 /// releaser may have died between its rename and that rename's syncs, and the directory after the
 /// unlink. A link or any other non-regular file at `entry` refuses, untouched.
@@ -525,7 +524,7 @@ pub const DELETING_DIRECTORY: &str = ".deleting";
 
 /// Commit the release of `image`, owned by the calling operation, to `entry` in its directory's
 /// [`DELETING_DIRECTORY`], crash-safely, and say whether an image was released. Its caller then
-/// hands `entry` to the gateway's cleanup ([`super::deleter::hand_over`]).
+/// nudges the gateway's cleanup ([`super::deleter::nudge`]).
 ///
 /// The commit is one rename of `image` to `entry`, with every directory it touched synced: before
 /// it the image is its owner's and untouched, after it nothing finds the image by its name, so a
@@ -654,7 +653,7 @@ impl Drained {
 
 /// The released images a listing of deleting directories found, in the order it found them, and
 /// each entry or directory it left where it was, with why. Values, not lines on stderr: the
-/// gateway's cleanup says the ones it leaves and queues the rest.
+/// gateway's cleanup says the ones it leaves and frees the rest.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Listing {
     pub entries: Vec<PathBuf>,
@@ -684,9 +683,9 @@ pub struct Left {
 pub enum Why {
     /// Not a regular file named as a released image: never opened through a link, never freed.
     NotImage,
-    /// Another process holds the entry's lock: its releaser's commit is still syncing.
+    /// Another process holds the entry's lock: another cleanup or deleter is still cutting it.
     Busy,
-    /// The directory could not be read; its entries stay for the next gateway start.
+    /// The directory could not be read; its entries stay for the next pass.
     Failed(String),
 }
 
@@ -737,6 +736,22 @@ pub fn released_in(directory: &Path, is_entry: impl Fn(&str) -> bool) -> io::Res
     Ok(listing)
 }
 
+/// Whether the store entry at `path` holds projects: an encoded owner, or
+/// [`crate::storage::bootstrap::RETIRED_PROJECTS_NAMESPACE`], whose entries are archived projects.
+fn holds_projects(path: &Path) -> bool {
+    is_encoded_entry(path)
+        || path.file_name().is_some_and(|name| {
+            name == std::ffi::OsStr::new(crate::storage::bootstrap::RETIRED_PROJECTS_NAMESPACE)
+        })
+}
+
+/// Whether the store entry at `path` is named as an encoded owner or repository component.
+fn is_encoded_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(crate::repository::is_encoded_component)
+}
+
 /// [`released_in`] the directory `<project>/<images>/<namespace>` of every project in the store at
 /// `store` (`<store>/<owner>/<repo>`), together. A directory that cannot be listed is left in the
 /// listing, so one unreadable project never holds back the rest.
@@ -760,6 +775,9 @@ pub fn released_in_store(
     };
     for owner in owners {
         let owner = match owner {
+            // Only an encoded owner, or the archive of retired projects, holds projects: the volume's
+            // system directories do not.
+            Ok(owner) if !holds_projects(&owner.path()) => continue,
             Ok(owner) => owner.path(),
             Err(error) => {
                 pass.left.push(failed(store, error));
@@ -778,7 +796,7 @@ pub fn released_in_store(
         for repo in repos {
             let repo = match repo.and_then(|repo| Ok((repo.file_type()?, repo.path()))) {
                 // A file beside an owner's projects (`.cowshed-owner`) holds no project.
-                Ok((kind, _)) if !kind.is_dir() => continue,
+                Ok((kind, repo)) if !kind.is_dir() || !is_encoded_entry(&repo) => continue,
                 Ok((_, repo)) => repo,
                 Err(error) => {
                     pass.left.push(failed(&owner, error));
@@ -922,9 +940,10 @@ mod tests {
     fn the_next_cut_halves_past_the_target_and_doubles_under_half_of_it() {
         let ms = std::time::Duration::from_millis;
         // (this cut's extents, its wall time, the next cut's extents)
-        let rows: [(u64, std::time::Duration, u64); 10] = [
+        let rows: [(u64, std::time::Duration, u64); 11] = [
             (1024, ms(99), 1024),
             (1024, ms(101), 512),
+            (256, ms(101), 128),
             (128, ms(5_490), 64),
             (64, ms(5_490), 64),
             (512, ms(49), 1024),

@@ -60,7 +60,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
                                      #   that upgrades to exclusive with no record beside it (02_workspaces.md)
     <repo>.run                       # one retirement execution, fenced to the exact recorded generation
   .retired-projects/                  # preserved, detached evidence; never discovered as live projects
-    <operation-id>/                  # the complete former project store tree, renamed without copying or deleting; the gateway's cleanup lists the released images waiting in it at its start and frees them
+    <operation-id>/                  # the complete former project store tree, renamed without copying or deleting; the gateway's cleanup lists the released images waiting in it at every pass and frees them
     <operation-id>.json              # completed retirement receipt
   .deleting/                         # released images a project's unbinding moved out of its tree
     <id>.dmg                         # a fresh id, waiting for the gateway's cleanup
@@ -330,8 +330,8 @@ The APFS adapter's interrupted image/metadata publication protocol is specified 
 
 Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces, abandon bundles, ZFS origin pins
 (09_substrates.md), and APFS image-size ratchet all grow silently. `cowshed gc` enforces retention conventions.
-Reclaiming an image, whatever reclaims it, is releasing it: one rename into a `.deleting` directory, then a hand-over to
-the gateway, which deletes it in the background (05_gateway.md, "Deleting released images"). Background deletion handles
+Reclaiming an image, whatever reclaims it, is releasing it: one rename into a `.deleting` directory, then a nudge to the
+gateway, which deletes it in the background (05_gateway.md, "Deleting released images"). Background deletion handles
 only explicitly released images (build volumes, the sources of clean removals, the orphan, expired and staged images
 that `gc` and failed verbs release) and provably dead scratch, never idle workspaces:
 
@@ -341,7 +341,7 @@ that `gc` and failed verbs release) and provably dead scratch, never idle worksp
 | CI failure checkpoints                       | same checkpoint rule as above                                                          | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                                                                                                    |
 | Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**          | landing/removal is always explicit                                                                                                                                           |
 | Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are released to `.deleting`, not here    |
-| Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background | each is handed to the gateway's `image-cleanup` queue, which lists leftovers at its start (05_gateway.md); no verb frees it: `rm`, `land` and `gc` only commit and hand over |
+| Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background | each is nudged to the gateway, whose `image-cleanup` thread lists every `.deleting` each pass (05_gateway.md); no verb frees it: `rm`, `land` and `gc` only commit and nudge |
 | Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; the bundle is the only copy of the commits it holds        | explicit `cowshed gc --abandoned`                                                                                                                                            |
 | Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`   | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                                                                                     |
 

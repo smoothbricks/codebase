@@ -221,7 +221,7 @@ pub(crate) enum Freeze {
 /// The seeds of `target` a new seed replaced (16_build_volumes.md, "Garbage collection"), each
 /// claimed for its release under the target's image lock, after which no fork or land of the
 /// target reads them: [`BuildVolumes::retire_superseded`] commits each to `build/.deleting`
-/// once that lock is let go, so no seed's rename, sync or hand-over to the gateway runs under it.
+/// once that lock is let go, so no seed's rename, sync or nudge of the gateway runs under it.
 /// Dropped unretired, the claims go and the seeds stay recorded under the target, for the next
 /// seed's retirement or `gc`.
 #[derive(Debug)]

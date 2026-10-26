@@ -326,7 +326,7 @@ with main retired nothing links one, so main's linked volume and its seed go wit
 unbinding while the project is still bound, naming it and why, for the same command to retry. A release only commits,
 and the unbinding is the project's last act, its store tree going with it, so before it plans terminal storage it moves
 each released image of its project, from `build/.deleting` and `sessions/.deleting`, into
-`<store>/.deleting/<fresh id>.dmg` and hands each one to the gateway (05_gateway.md, "Deleting released images"). It
+`<store>/.deleting/<fresh id>.dmg` and nudges the gateway for each one (05_gateway.md, "Deleting released images"). It
 frees nothing itself, and a cut in progress moves with its entry, held open by the cleanup. Anything there that is not a
 released image stays, and the removal of terminal storage that follows refuses, naming it. Unbinding then removes
 terminal storage (`.staging/`, `sessions/`, `checkpoints/`, `tmp/` and `build/`, which by then may hold only empty
@@ -1401,18 +1401,18 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    commit the release with one rename of the canonical source image, never replacing a file, to
    `sessions/.deleting/<ws>-<incarnation>.dmg` and sync both directories, opening no byte of the image: before the
    rename the workspace is whole, and after it nothing mounts, forks, fences or reads the image again. Right after the
-   rename is durable the removal hands the entry to the gateway, one one-shot `released` request that returns at once
+   rename is durable the removal nudges the gateway with one one-shot `released` request that returns at once
    (05_gateway.md, "Deleting released images"), removes the CA companion, grants sidecar and facts and answers; it frees
    no byte of the image and never waits for the free (16_build_volumes.md, "Garbage collection"), so no reply of this
    verb waits for source-image bytes, and until the gateway's cleanup has freed the entry, the store's container still
    holds the image's allocation: free space lags the removal. A gateway that is absent, does not answer or refuses is
-   said once on stderr and fails nothing, since the rename is the release: the entry waits for the gateway's next start.
-   A failure before the rename refuses with the owner metadata and mutating intent kept for the same removal to retry.
-   `sessions/.deleting/` holds released images waiting to be freed, not a crash journal: a crash after the rename leaves
-   the entry, which nothing names, for the gateway's next start, and the next lifecycle open or recovery reconciles the
-   record the rename left imageless without waiting for the entry or freeing it, because the reconcile of a canonical
-   sidecar whose image is gone never depended on the bytes being freed. The removal's retry finds the workspace already
-   gone. An open confined to other workspaces neither reads nor waits for it.
+   said once on stderr and fails nothing, since the rename is the release: the entry waits for the gateway's next
+   listing. A failure before the rename refuses with the owner metadata and mutating intent kept for the same removal to
+   retry. `sessions/.deleting/` holds released images waiting to be freed, not a crash journal: a crash after the rename
+   leaves the entry, which nothing names, for the gateway's next start, and the next lifecycle open or recovery
+   reconciles the record the rename left imageless without waiting for the entry or freeing it, because the reconcile of
+   a canonical sidecar whose image is gone never depended on the bytes being freed. The removal's retry finds the
+   workspace already gone. An open confined to other workspaces neither reads nor waits for it.
 
    A gitignored path is disposable by the project's own declaration and never keeps a recovery image: one ignored by the
    workspace's own rules (`.gitignore`, `.git/info/exclude`, the user's excludes file) or by the surviving target
@@ -1573,13 +1573,13 @@ unpublished before retirement does not invalidate that recovery fact.
 one call: every session workspace, including clones a create never published, under the given `--force`/`--abandon`;
 each removal has already committed its release or completed its recovery preservation when collection begins; collects;
 with `--abandon` deletes the abandon bundles in `sessions/.trash`, the only copy of the commits they hold, which
-`--abandon` authorizes losing (01_storage.md); and restores main, whose final unbinding hands the project's released
-images to the gateway ("Checkout layouts"). Each step is idempotent, so a refusal leaves the rest to the same command. A
-collection that still finds the store changed under it (another process) is refused as retryable — `Conflict` with
-`Retry::GcPlanStale` — and the same command finishes the removal; callers never sleep and retry `gc` themselves.
-Recovery images can hold only-copy work even after all abandoned commits were bundled; they therefore refuse terminal
-store removal until their contents have been deliberately recovered with `gc --recover` (step 5), which the refusal's
-hint names. Bundle authorization alone never discards them.
+`--abandon` authorizes losing (01_storage.md); and restores main, whose final unbinding moves the project's released
+images into the store's `.deleting` and nudges the gateway ("Checkout layouts"). Each step is idempotent, so a refusal
+leaves the rest to the same command. A collection that still finds the store changed under it (another process) is
+refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal; callers never
+sleep and retry `gc` themselves. Recovery images can hold only-copy work even after all abandoned commits were bundled;
+they therefore refuse terminal store removal until their contents have been deliberately recovered with `gc --recover`
+(step 5), which the refusal's hint names. Bundle authorization alone never discards them.
 
 ## `cowshed attach` / `cowshed detach`
 

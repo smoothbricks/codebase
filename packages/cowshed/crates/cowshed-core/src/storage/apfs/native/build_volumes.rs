@@ -421,11 +421,6 @@ where
             Ok(proof) => proof,
             Err(error) => return Err(self.unregister(layout, &destination, creating, error)),
         };
-        // A seed's record keeps its proof's count, for the cleanup that frees it once released.
-        let registration = match &proof {
-            Some(proof) => registration.counted(proof.extents().get()),
-            None => registration,
-        };
         if let Err(error) = layout.publish(&destination, &registration) {
             return Err(self.unregister(layout, &destination, creating, host_error(error)));
         }
@@ -879,7 +874,6 @@ where
         let record = layout
             .read_record_present(id)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let extents = record.as_ref().and_then(|record| record.extents);
         let recorded = record.map(|record| record.role);
         if present && recorded.is_none() {
             return Err(ApfsStorageError::Host(format!(
@@ -915,13 +909,7 @@ where
         })?;
         if removed {
             layout.journal_release(id, recorded.as_ref(), true);
-            self.hand_over(
-                &layout.released(id),
-                cowshed_gateway_types::ReleaseRecord {
-                    unique_bytes: None,
-                    extents: extents.and_then(std::num::NonZeroU64::new),
-                },
-            );
+            self.nudge_cleanup(&layout.released(id));
         }
         // A volume whose image was already gone is retired by its record alone, said as such.
         if remove_if_present(&layout.record(id))? && !removed {

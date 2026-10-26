@@ -26,7 +26,7 @@ pub mod session;
 pub mod status;
 pub mod task_server;
 
-pub use cleanup::{RELEASED_OP, ReleaseRecord, ReleasedRequest};
+pub use cleanup::RELEASED_OP;
 pub use cpu_budget::{
     CPU_POOL_ENV, CPU_TOKENS_ENV, CPU_TOKENS_OP, CpuBackgroundStake, CpuBudgetStatus,
     CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder, CpuProbation, CpuTokensRequest,

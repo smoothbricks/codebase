@@ -476,14 +476,8 @@ enum ControlRequest {
     },
     /// Measure a fresh executable's first and second launch (05_gateway.md, "Control plane").
     FirstLaunch,
-    /// Hand a released image to the cleanup (05_gateway.md, "Deleting released images").
-    Released {
-        entry: PathBuf,
-        #[serde(default, rename = "uniqueBytes")]
-        unique_bytes: Option<u64>,
-        #[serde(default)]
-        extents: Option<std::num::NonZeroU64>,
-    },
+    /// Nudge the cleanup to list the store again (05_gateway.md, "Deleting released images").
+    Released,
 }
 
 impl ControlRequest {
@@ -506,7 +500,7 @@ impl ControlRequest {
             Self::NxCacheClear { .. } => "nx-cache-clear",
             Self::RamDetach { .. } => RAM_DETACH_OP,
             Self::FirstLaunch => FIRST_LAUNCH_OP,
-            Self::Released { .. } => cowshed_gateway_types::RELEASED_OP,
+            Self::Released => cowshed_gateway_types::RELEASED_OP,
         }
     }
 }
@@ -1015,7 +1009,7 @@ pub(crate) struct ControlServices {
     pub ram_disks: Option<Arc<dyn RamDisks>>,
     pub ram_leases: crate::ram_lease::Records,
     pub first_launch: Option<Arc<dyn FirstLaunchProbe>>,
-    /// The released-image cleanup a `released` request hands its entry to, once started.
+    /// The released-image cleanup a `released` request nudges, once its handle is published.
     pub cleanup: Arc<std::sync::OnceLock<crate::cleanup::ImageCleanup>>,
 }
 
@@ -2067,7 +2061,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
         "nx-cache-clear" => &["op", "repoId"],
-        cowshed_gateway_types::RELEASED_OP => &["op", "entry", "uniqueBytes", "extents"],
+        cowshed_gateway_types::RELEASED_OP => &["op"],
         RAM_LEASE_OP => &["op", "sectors"],
         RAM_DETACH_OP => &["op", "device", "registryEntry"],
         FIRST_LAUNCH_OP => &["op"],
@@ -2644,26 +2638,16 @@ async fn dispatch(
             measure_first_launch(services.first_launch.clone()).await,
             None,
         ),
-        ControlRequest::Released {
-            entry,
-            unique_bytes,
-            extents,
-        } => (
+        ControlRequest::Released => (
             match services.cleanup.get() {
                 None => failure(
                     ControlFailureCode::Rejected,
-                    "the released-image cleanup has not started; it lists the entry when it does"
+                    "the released-image cleanup has not started; its first listing finds the entry"
                         .to_owned(),
                 ),
-                Some(cleanup) => match cleanup.take(
-                    entry,
-                    cowshed_gateway_types::ReleaseRecord {
-                        unique_bytes,
-                        extents,
-                    },
-                ) {
+                Some(cleanup) => match cleanup.nudge() {
                     Ok(()) => success(),
-                    Err(error) => failure(ControlFailureCode::InvalidRequest, error),
+                    Err(error) => failure(ControlFailureCode::Rejected, error),
                 },
             },
             None,

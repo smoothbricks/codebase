@@ -200,11 +200,10 @@ pub struct BuildVolumeRecord {
     pub checked_out: Option<GitOid>,
     #[serde(default, skip_serializing_if = "BuildVolumeStage::is_published")]
     pub stage: BuildVolumeStage,
-    /// The extent runs a seed's publication proof read, at most 7141, where that proof stops
-    /// (01a_apfs.md, "Clone cost follows extents, not size"). A seed is never mounted, so its
-    /// count holds until its release hands it to the gateway's cleanup (05_gateway.md, "Deleting
-    /// released images"). `None` for a volume no proof counted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The extent count a seed's sidecar written before the cleanup lost its records carries.
+    /// Parsed so such a sidecar stays readable until the install strips the field from every
+    /// sidecar; never written and read by nothing. The next commit deletes it.
+    #[serde(default, skip_serializing)]
     pub extents: Option<u64>,
 }
 
@@ -261,16 +260,6 @@ impl Registration {
     /// The record written before the image exists.
     pub fn registered(&self) -> &BuildVolumeRecord {
         &self.registered
-    }
-
-    /// This registration, its record keeping `extents`, the count a publication proof read.
-    pub fn counted(self, extents: u64) -> Self {
-        Self {
-            registered: BuildVolumeRecord {
-                extents: Some(extents),
-                ..self.registered
-            },
-        }
     }
 
     /// The record written once the image holds what the role promises.

@@ -723,11 +723,10 @@ async fn a_second_gate_of_a_repository_hears_which_gate_holds_it() {
     gateway.drain().await.expect("drain");
 }
 
-/// 05_gateway.md "Deleting released images", over the socket: a release handed over while a
-/// land gates is freed as soon as the cleanup reaches it, beside the gate; an entry that is not
-/// in a `.deleting` directory of the store is refused.
+/// 05_gateway.md "Deleting released images", over the socket: a released image nudged while a
+/// land gates is freed as soon as the cleanup's pass reaches it, beside the gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_handed_over_image_is_freed_beside_gate_work() {
+async fn a_released_image_is_freed_beside_gate_work() {
     let (gateway, root, socket) = gateway(4).await;
     let store = root.path().join("store");
     let deleting = store.join("acme/widget/build/.deleting");
@@ -736,25 +735,18 @@ async fn a_handed_over_image_is_freed_beside_gate_work() {
         .clean_up_released_images(store.clone())
         .expect("the cleanup starts");
     let (gate, _pool) = Asker::gate_job(&socket, "/w/land").await;
-    let entry = deleting.join("0123.dmg");
+    let entry = deleting.join(format!(
+        "{}.dmg",
+        cowshed_core::build_volume::BuildVolumeId::mint()
+    ));
     std::fs::write(&entry, vec![9_u8; 64 * 1024]).expect("a released image");
-    let handed = |entry: &Path| {
-        format!(
-            "{}\n",
-            serde_json::json!({ "op": "released", "entry": entry, "extents": 1 })
-        )
-    };
-    let answer = one_shot(&socket, &handed(&entry)).await;
+    let answer = one_shot(&socket, "{\"op\":\"released\"}\n").await;
     assert_eq!(answer["ok"], true, "{answer}");
     // The gate still holds: the cleanup cuts beside it.
     while entry.exists() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     drop(gate);
-    let outside = store.join("acme/widget/build/main.dmg");
-    let answer = one_shot(&socket, &handed(&outside)).await;
-    assert_eq!(answer["ok"], false, "{answer}");
-    assert_eq!(answer["code"], "invalid-request", "{answer}");
     gateway.drain().await.expect("drain");
 }
 

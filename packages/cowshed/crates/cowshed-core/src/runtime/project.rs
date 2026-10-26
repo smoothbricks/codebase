@@ -3303,7 +3303,7 @@ fn move_terminal_releases(project_root: &Path, cleanup: Option<&Path>) -> Result
 }
 
 /// Move `image`, a released image listed in `directory`, into the store's `.deleting` at
-/// `target` under a fresh name, and hand it to the gateway's cleanup at `cleanup`.
+/// `target` under a fresh name, and nudge the gateway's cleanup at `cleanup`.
 #[cfg(target_os = "macos")]
 fn move_terminal_release(
     image: &Path,
@@ -3320,7 +3320,7 @@ fn move_terminal_release(
     match std::fs::rename(image, &moved) {
         Ok(()) => {}
         // The gateway's cleanup, freeing it in place, unlinked it after the listing: it is released,
-        // with nothing left to move or hand over (`release::free_committed` reads the same absence as
+        // with nothing left to move or nudge for (`release::free_committed` reads the same absence as
         // `Released::Absent`). A rename's ENOENT also names a missing destination parent, so only
         // the source's own absence counts.
         Err(error)
@@ -3338,11 +3338,7 @@ fn move_terminal_release(
             .map_err(|error| release_failed("sync", synced, error))?;
     }
     match cleanup {
-        Some(socket) => crate::storage::apfs::deleter::hand_over(
-            socket,
-            &moved,
-            cowshed_gateway_types::ReleaseRecord::default(),
-        ),
+        Some(socket) => crate::storage::apfs::deleter::nudge(socket, &moved),
         None => crate::storage::apfs::deleter::say_no_cleanup(),
     }
     Ok(())
@@ -6092,7 +6088,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 };
                 // Nothing links the previous volume and its record says superseded under the
                 // target, and no fork reads a superseded seed, so their releases (each a rename,
-                // sync and hand-over to the gateway, and for the volume an unmount and detach
+                // sync and nudge to the gateway, and for the volume an unmount and detach
                 // waiting on storagekitd) run once the lock is let go, beside the target's next
                 // steps. A job admitted on the previous volume before the move keeps it,
                 // recorded as the target's, until that job's end releases it.
