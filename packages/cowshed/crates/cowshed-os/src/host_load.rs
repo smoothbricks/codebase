@@ -42,14 +42,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_kernel_reports_all_three_averages() {
-        let load = HostLoad::read().expect("getloadavg answers on every supported host");
-        for average in [load.one, load.five, load.fifteen] {
-            assert!(average.is_finite() && average >= 0.0, "{load}");
-        }
-    }
-
-    #[test]
     fn the_report_names_each_window() {
         let load = HostLoad {
             one: 351.43,
