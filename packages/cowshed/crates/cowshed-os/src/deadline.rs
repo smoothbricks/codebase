@@ -484,6 +484,25 @@ pub fn collect_later(role: &'static str, mut child: std::process::Child) {
     });
 }
 
+/// [`collect_later`] for a child tokio spawned. A tokio child cannot become a std one, and nothing
+/// clears its `kill_on_drop` once spawned, so a task owns it until it exits and never drops it
+/// before. That task ends with the runtime: a child still running when its process ends is then
+/// killed by its own `kill_on_drop`, which is the process ending, not the wait that gave up on it.
+pub fn collect_later_async(role: &'static str, mut child: tokio::process::Child) {
+    let pid = child.id().unwrap_or_default();
+    tokio::spawn(async move {
+        // WHY unbounded: nothing waits on this task; it only collects the exit when it comes.
+        match child.wait().await {
+            Ok(status) => {
+                crate::eprintln!("cowshed: {role} pid {pid} ended after its wait expired: {status}")
+            }
+            Err(error) => crate::eprintln!(
+                "cowshed: {role} pid {pid} could not be collected after its wait expired: {error}"
+            ),
+        }
+    });
+}
+
 /// [`reap`] for a child tokio spawned, whose exit tokio's own driver watches.
 pub async fn reap_async(
     role: &'static str,
@@ -1514,6 +1533,41 @@ mod tests {
             .await
             .expect("an exited child is answered whatever the budget left");
         assert_eq!(status.code(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn a_tokio_child_collected_later_is_left_running_and_reaped_once_it_exits() {
+        use crate::fork_lock::Spawn as _;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("spawn sh");
+        let pid = libc::pid_t::try_from(child.id().expect("a pid")).expect("a pid_t");
+        let stdin = child.stdin.take().expect("sh's stdin");
+        collect_later_async("probe child", child);
+        // Dropped instead of owned, the child would be killed now (`kill_on_drop`).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                crate::process::run_state(pid),
+                RunState::Running | RunState::Sleeping
+            ),
+            "the child is left running: {}",
+            crate::process::run_state(pid)
+        );
+        // Its stdin closed, sh exits, and the task collects it: no zombie is left.
+        drop(stdin);
+        let mut state = crate::process::run_state(pid);
+        for _ in 0..200 {
+            if state == RunState::Gone {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            state = crate::process::run_state(pid);
+        }
+        assert_eq!(state, RunState::Gone);
     }
 
     #[test]
