@@ -10,6 +10,8 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
@@ -129,12 +131,12 @@ impl Peer {
         }
     }
 
-    /// The peer with the pid the kernel reports for `connection`.
-    pub fn credited(mut self, connection: &UnixStream) -> Self {
-        self.pid = match connection.peer_cred() {
-            Ok(credential) => credential
-                .pid()
-                .map_or(PeerPid::NotReported, PeerPid::Known),
+    /// The peer with the pid the kernel reports for `connection` ([`peer_pid`]): a tokio stream
+    /// or a std one.
+    pub fn credited(mut self, connection: &impl AsFd) -> Self {
+        self.pid = match peer_pid(connection) {
+            Ok(pid) if pid > 0 => PeerPid::Known(pid),
+            Ok(_) => PeerPid::NotReported,
             Err(error) => PeerPid::Unread(error.to_string()),
         };
         self
@@ -285,9 +287,7 @@ impl Bounding {
 /// whatever the framing returned.
 pub struct PeerStream<S> {
     io: S,
-    peer: Peer,
-    bounding: Bounding,
-    last: Progress,
+    wait: Waiting,
     timer: Pin<Box<Sleep>>,
 }
 
@@ -295,9 +295,7 @@ impl<S> fmt::Debug for PeerStream<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PeerStream")
-            .field("peer", &self.peer)
-            .field("bounding", &self.bounding)
-            .field("last", &self.last)
+            .field("wait", &self.wait)
             .finish_non_exhaustive()
     }
 }
@@ -325,20 +323,28 @@ pub async fn establish<S>(
     peer: &Peer,
     connect: impl Future<Output = io::Result<S>>,
 ) -> Result<S, WaitError> {
-    match within(deadline, peer, Progress::Nothing, connect).await? {
-        Ok(io) => Ok(io),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Err(WaitError::Absent {
+    within(deadline, peer, Progress::Nothing, connect)
+        .await?
+        .map_err(|source| unconnected(deadline, peer, source))
+}
+
+/// A connect to `peer` that failed with `source`: absent when nothing is at its address, an I/O
+/// failure otherwise.
+fn unconnected(deadline: &Deadline, peer: &Peer, source: io::Error) -> WaitError {
+    if source.kind() == io::ErrorKind::NotFound {
+        WaitError::Absent {
             op: deadline.op(),
             peer: Box::new(peer.clone()),
             source,
-        }),
-        Err(source) => Err(WaitError::Io {
+        }
+    } else {
+        WaitError::Io {
             op: deadline.op(),
             peer: Box::new(peer.clone()),
             elapsed: deadline.elapsed(clock()),
             last: Progress::Nothing,
             source,
-        }),
+        }
     }
 }
 
@@ -770,73 +776,32 @@ impl OutputPumps {
     }
 }
 
-impl<S> PeerStream<S> {
-    /// `io`, already connected to `peer` within `deadline`, which bounds the request on it.
-    pub fn connected(io: S, peer: Peer, deadline: Deadline) -> Self {
-        let bounding = Bounding::Request(deadline);
+/// What a connection's waits are on and bounded by, and how far the last one got: the state
+/// [`PeerStream`] and [`PeerSocket`] share, and the failures they name from it.
+#[derive(Debug)]
+struct Waiting {
+    peer: Peer,
+    bounding: Bounding,
+    last: Progress,
+}
+
+impl Waiting {
+    fn request(peer: Peer, deadline: Deadline) -> Self {
         Self {
-            timer: Box::pin(tokio::time::sleep(bounding.remaining())),
-            io,
             peer,
-            bounding,
+            bounding: Bounding::Request(deadline),
             last: Progress::Connected,
         }
     }
 
-    pub fn peer(&self) -> &Peer {
-        &self.peer
-    }
-
-    /// The connection itself, for what only it can say (its peer's credentials). Reading or
-    /// writing through it would bypass the bound.
-    pub fn get_ref(&self) -> &S {
-        &self.io
-    }
-
-    pub fn op(&self) -> &'static str {
-        self.bounding.op()
-    }
-
-    pub fn last(&self) -> Progress {
-        self.last
-    }
-
-    /// Bound the next request on this connection by `deadline`.
-    pub fn request(&mut self, deadline: Deadline) {
-        self.rebound(Bounding::Request(deadline));
-    }
-
-    /// Hold the connection for a long wait: its holder must send something at least every
-    /// `idle` bound, and may take as long as its work does.
-    pub fn hold(&mut self, idle: Idle) {
-        self.rebound(Bounding::Held(idle));
-    }
-
-    /// Hold a held connection's holder to `idle` of silence from here on; the wait's start and
-    /// last progress stay. A request's budget is left as it is.
-    pub fn silence(&mut self, idle: Duration) {
-        if let Bounding::Held(held) = &mut self.bounding {
-            held.set_silence(idle);
-            self.rearm();
-        }
-    }
-
-    fn rebound(&mut self, bounding: Bounding) {
-        self.bounding = bounding;
-        self.rearm();
-    }
-
-    fn rearm(&mut self) {
-        let at = tokio::time::Instant::now() + self.bounding.remaining();
-        self.timer.as_mut().reset(at);
-    }
-
-    fn progressed(&mut self, progress: Progress) {
+    /// Record `progress`, and answer whether it started a held wait's silence over.
+    fn progressed(&mut self, progress: Progress) -> bool {
         self.last = progress;
-        if let Bounding::Held(idle) = &mut self.bounding {
-            idle.observe(progress, clock());
-            self.rearm();
-        }
+        let Bounding::Held(idle) = &mut self.bounding else {
+            return false;
+        };
+        idle.observe(progress, clock());
+        true
     }
 
     /// The failure of the wait in progress: the bound it ran past.
@@ -853,22 +818,12 @@ impl<S> PeerStream<S> {
         }
     }
 
-    /// The timer only wakes the wait; the bound decides it. Tokio's timer fires on a millisecond
-    /// tick, so it can wake a little before the bound: with more than a tick left the timer is
-    /// re-armed for the rest, which also lets time pass before the next decision.
-    fn poll_bound<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
-        loop {
-            ready!(self.timer.as_mut().poll(cx));
-            if self.bounding.remaining() < TIMER_TICK {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, self.expiry())));
-            }
-            self.rearm();
-        }
+    /// The expiry as the `io::Error` a read or write returns through the protocol's framing.
+    fn timed_out(&self) -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, self.expiry())
     }
 
-    /// `error`, which an operation through this stream returned, as the typed failure of the
-    /// wait: the expiry it carries, the peer ending the connection, or the I/O error itself.
-    pub fn fail(&self, error: io::Error) -> WaitError {
+    fn fail(&self, error: io::Error) -> WaitError {
         let error = match error.downcast::<WaitError>() {
             Ok(wait) => return wait,
             Err(error) => error,
@@ -882,23 +837,105 @@ impl<S> PeerStream<S> {
                 elapsed: self.bounding.elapsed(),
                 last: self.last,
             },
-            _ => self.io_failure(error),
+            _ => WaitError::Io {
+                op: self.bounding.op(),
+                peer: Box::new(self.peer.clone()),
+                elapsed: self.bounding.elapsed(),
+                last: self.last,
+                source: error,
+            },
         }
+    }
+
+    fn lost(&self) -> WaitError {
+        self.fail(io::Error::from(io::ErrorKind::UnexpectedEof))
+    }
+}
+
+impl<S> PeerStream<S> {
+    /// `io`, already connected to `peer` within `deadline`, which bounds the request on it.
+    pub fn connected(io: S, peer: Peer, deadline: Deadline) -> Self {
+        let wait = Waiting::request(peer, deadline);
+        Self {
+            timer: Box::pin(tokio::time::sleep(wait.bounding.remaining())),
+            io,
+            wait,
+        }
+    }
+
+    pub fn peer(&self) -> &Peer {
+        &self.wait.peer
+    }
+
+    /// The connection itself, for what only it can say (its peer's credentials). Reading or
+    /// writing through it would bypass the bound.
+    pub fn get_ref(&self) -> &S {
+        &self.io
+    }
+
+    pub fn op(&self) -> &'static str {
+        self.wait.bounding.op()
+    }
+
+    pub fn last(&self) -> Progress {
+        self.wait.last
+    }
+
+    /// Bound the next request on this connection by `deadline`.
+    pub fn request(&mut self, deadline: Deadline) {
+        self.wait.bounding = Bounding::Request(deadline);
+        self.rearm();
+    }
+
+    /// Hold the connection for a long wait: its holder must send something at least every
+    /// `idle` bound, and may take as long as its work does.
+    pub fn hold(&mut self, idle: Idle) {
+        self.wait.bounding = Bounding::Held(idle);
+        self.rearm();
+    }
+
+    /// Hold a held connection's holder to `idle` of silence from here on; the wait's start and
+    /// last progress stay. A request's budget is left as it is.
+    pub fn silence(&mut self, idle: Duration) {
+        if let Bounding::Held(held) = &mut self.wait.bounding {
+            held.set_silence(idle);
+            self.rearm();
+        }
+    }
+
+    fn rearm(&mut self) {
+        let at = tokio::time::Instant::now() + self.wait.bounding.remaining();
+        self.timer.as_mut().reset(at);
+    }
+
+    fn progressed(&mut self, progress: Progress) {
+        if self.wait.progressed(progress) {
+            self.rearm();
+        }
+    }
+
+    /// The timer only wakes the wait; the bound decides it. Tokio's timer fires on a millisecond
+    /// tick, so it can wake a little before the bound: with more than a tick left the timer is
+    /// re-armed for the rest, which also lets time pass before the next decision.
+    fn poll_bound<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+        loop {
+            ready!(self.timer.as_mut().poll(cx));
+            if self.wait.bounding.remaining() < TIMER_TICK {
+                return Poll::Ready(Err(self.wait.timed_out()));
+            }
+            self.rearm();
+        }
+    }
+
+    /// `error`, which an operation through this stream returned, as the typed failure of the
+    /// wait: the expiry it carries, the peer ending the connection, or the I/O error itself.
+    pub fn fail(&self, error: io::Error) -> WaitError {
+        self.wait.fail(error)
     }
 
     /// The peer ended the connection before the answer the caller needed.
     pub fn lost(&self) -> WaitError {
-        self.fail(io::Error::from(io::ErrorKind::UnexpectedEof))
-    }
-
-    fn io_failure(&self, source: io::Error) -> WaitError {
-        WaitError::Io {
-            op: self.bounding.op(),
-            peer: Box::new(self.peer.clone()),
-            elapsed: self.bounding.elapsed(),
-            last: self.last,
-            source,
-        }
+        self.wait.lost()
     }
 }
 
@@ -914,7 +951,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for PeerStream<S> {
             Poll::Ready(Ok(())) => {
                 let read = buf.filled().len() - before;
                 if read != 0 {
-                    this.progressed(this.last.received(read as u64));
+                    this.progressed(this.wait.last.received(read as u64));
                 }
                 Poll::Ready(Ok(()))
             }
@@ -933,7 +970,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PeerStream<S> {
         let this = self.get_mut();
         match Pin::new(&mut this.io).poll_write(cx, buf) {
             Poll::Ready(Ok(written)) => {
-                this.last = this.last.sent(written as u64);
+                this.wait.last = this.wait.last.sent(written as u64);
                 Poll::Ready(Ok(written))
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
@@ -955,6 +992,370 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PeerStream<S> {
             Poll::Pending => this.poll_bound(cx),
             ready => ready,
         }
+    }
+}
+
+/// The pid the kernel reports for the process at the other end of the connected Unix stream
+/// `connection`: `LOCAL_PEERPID` on Darwin, `SO_PEERCRED` on Linux. It is the process that
+/// connected or made the pair, read from this connection, never whoever owns its path.
+pub fn peer_pid(connection: &impl AsFd) -> io::Result<libc::pid_t> {
+    let descriptor = connection.as_fd().as_raw_fd();
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut length = socklen_of::<libc::pid_t>()?;
+        // SAFETY: `connection` keeps `descriptor` open through the call, and the pointer and
+        // length describe one initialized `pid_t`.
+        let read = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                std::ptr::from_mut(&mut pid).cast(),
+                &mut length,
+            )
+        };
+        answered::<libc::pid_t>(read, length, "LOCAL_PEERPID")?;
+        Ok(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut length = socklen_of::<libc::ucred>()?;
+        // SAFETY: `connection` keeps `descriptor` open through the call, and the pointer and
+        // length describe one initialized `ucred`.
+        let read = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::from_mut(&mut credentials).cast(),
+                &mut length,
+            )
+        };
+        answered::<libc::ucred>(read, length, "SO_PEERCRED")?;
+        Ok(credentials.pid)
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        let _ = descriptor;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this kernel reports no peer pid",
+        ))
+    }
+}
+
+/// The size of one `T` as a `getsockopt` buffer length.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn socklen_of<T>() -> io::Result<libc::socklen_t> {
+    libc::socklen_t::try_from(std::mem::size_of::<T>()).map_err(io::Error::other)
+}
+
+/// `getsockopt`'s return `read` for `option`, which was to fill `length` bytes of one `T`.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn answered<T>(read: libc::c_int, length: libc::socklen_t, option: &str) -> io::Result<()> {
+    if read != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let expected = std::mem::size_of::<T>();
+    if usize::try_from(length).ok() != Some(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{option} answered {length} bytes, not {expected}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The blocking twin of [`PeerStream`], for a client that runs no async runtime: a connected Unix
+/// stream whose every read and write ends by the bound of the wait in progress.
+///
+/// Connecting is one nonblocking connect and a poll for writability clipped to what is left of
+/// the request's deadline. The stream stays nonblocking: a read or write that would block polls
+/// for readiness clipped to the wait's bound, and the bound, not the poll, decides the expiry.
+/// No socket timeout option is set: Darwin refuses `setsockopt` once the peer shut down, even
+/// while a whole answer is still readable, and a kernel timeout restarts on every partial read.
+///
+/// It is a `Read + Write`, so the protocol's own framing reads and writes through it unchanged. A
+/// wait past its bound fails with an `io::Error` of kind `TimedOut` carrying the [`WaitError`],
+/// which [`PeerSocket::fail`] recovers, typed, from whatever the framing returned.
+#[derive(Debug)]
+pub struct PeerSocket {
+    stream: std::os::unix::net::UnixStream,
+    wait: Waiting,
+}
+
+impl PeerSocket {
+    /// Connect to `role` at `socket` within `deadline`, which then bounds the request on it, and
+    /// name the pid the kernel reports for the listener. The failures are [`establish`]'s:
+    /// nothing at the path is `BLOCKED`, a connect still pending at the bound is `TIMEOUT` with
+    /// nothing sent, and a refusal, a full listen queue's included, is an I/O failure, never a
+    /// retry.
+    pub fn connect(
+        role: &'static str,
+        socket: &Path,
+        deadline: Deadline,
+    ) -> Result<Self, WaitError> {
+        let peer = Peer::unix(role, socket);
+        let stream = open(socket, &deadline, &peer)?;
+        let peer = peer.credited(&stream);
+        Ok(Self {
+            stream,
+            wait: Waiting::request(peer, deadline),
+        })
+    }
+
+    /// `stream`, already connected to `peer` within `deadline` (one end of a socketpair, say),
+    /// which bounds the request on it. The stream is made nonblocking here.
+    pub fn connected(
+        stream: std::os::unix::net::UnixStream,
+        peer: Peer,
+        deadline: Deadline,
+    ) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        Ok(Self {
+            stream,
+            wait: Waiting::request(peer, deadline),
+        })
+    }
+
+    pub fn peer(&self) -> &Peer {
+        &self.wait.peer
+    }
+
+    pub fn op(&self) -> &'static str {
+        self.wait.bounding.op()
+    }
+
+    pub fn last(&self) -> Progress {
+        self.wait.last
+    }
+
+    /// Bound the next request on this connection by `deadline`.
+    pub fn request(&mut self, deadline: Deadline) {
+        self.wait.bounding = Bounding::Request(deadline);
+    }
+
+    /// Hold the connection for a long wait: its holder must show progress at least every `idle`
+    /// bound, and may take as long as its work does.
+    pub fn hold(&mut self, idle: Idle) {
+        self.wait.bounding = Bounding::Held(idle);
+    }
+
+    /// The holder showed `progress` the protocol names (a heartbeat frame's stage, say), which
+    /// the bytes that carried it do not say. A held wait's silence starts over.
+    pub fn progressed(&mut self, progress: Progress) {
+        self.wait.progressed(progress);
+    }
+
+    /// `error`, which an operation through this connection returned, as the typed failure of
+    /// the wait: the expiry it carries, the peer ending the connection, or the I/O error itself.
+    pub fn fail(&self, error: io::Error) -> WaitError {
+        self.wait.fail(error)
+    }
+
+    /// The peer ended the connection before the answer the caller needed.
+    pub fn lost(&self) -> WaitError {
+        self.wait.lost()
+    }
+
+    /// Sleep until the stream is ready for `events` or the wait's bound is spent. The poll only
+    /// wakes the wait; the bound decides it, so a wake before the bound polls again.
+    fn ready(&self, events: libc::c_short) -> io::Result<()> {
+        loop {
+            let remaining = self.wait.bounding.remaining();
+            if remaining.is_zero() {
+                return Err(self.wait.timed_out());
+            }
+            match poll_ready(self.stream.as_fd(), events, remaining) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl io::Read for PeerSocket {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match io::Read::read(&mut &self.stream, buffer) {
+                Ok(read) => {
+                    if read != 0 {
+                        let received = self.wait.last.received(read as u64);
+                        self.wait.progressed(received);
+                    }
+                    return Ok(read);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.ready(libc::POLLIN)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl io::Write for PeerSocket {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            match io::Write::write(&mut &self.stream, bytes) {
+                Ok(written) => {
+                    self.wait.last = self.wait.last.sent(written as u64);
+                    return Ok(written);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.ready(libc::POLLOUT)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One nonblocking connect to `peer` at `socket`, its completion awaited within what is left of
+/// `deadline`. The stream stays nonblocking: every later wait on it polls within its own bound.
+fn open(
+    socket: &Path,
+    deadline: &Deadline,
+    peer: &Peer,
+) -> Result<std::os::unix::net::UnixStream, WaitError> {
+    let refused = |source| unconnected(deadline, peer, source);
+    let expired = || {
+        WaitError::Expired(Box::new(deadline.expired(
+            peer.clone(),
+            Progress::Nothing,
+            clock(),
+        )))
+    };
+    let (address, length) = unix_address(socket).map_err(refused)?;
+    // Darwin has no SOCK_CLOEXEC: the descriptor is made and marked under the fork lock, so no
+    // spawn forks between the two steps and carries it past its exec.
+    let descriptor = crate::fork_lock::create(|| {
+        // SAFETY: socket makes a fresh descriptor, owned exactly once below.
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if raw == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is the fresh descriptor socket just returned, which nothing else owns.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: fcntl changes only the flags of this owned descriptor.
+        if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } == -1
+            || unsafe { libc::fcntl(raw, libc::F_SETFL, libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(descriptor)
+    })
+    .map_err(refused)?;
+    // A full AF_UNIX listen queue answers EAGAIN at once: a refusal, not a pending connect, and
+    // no leave to try again. A connect a signal interrupted is made again, and one that answers
+    // it is already connected has connected.
+    loop {
+        if deadline.remaining(clock()).is_none() {
+            return Err(expired());
+        }
+        // SAFETY: `address` is a whole pathname sockaddr_un whose checked `length` fits it, and
+        // `descriptor` stays open through the call.
+        let connected = unsafe {
+            libc::connect(
+                descriptor.as_raw_fd(),
+                std::ptr::from_ref(&address).cast(),
+                length,
+            )
+        };
+        if connected == 0 {
+            return Ok(descriptor.into());
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EISCONN) => return Ok(descriptor.into()),
+            Some(libc::EINPROGRESS | libc::EALREADY) => break,
+            _ => return Err(refused(error)),
+        }
+    }
+    loop {
+        let remaining = deadline.remaining(clock()).ok_or_else(expired)?;
+        match poll_ready(descriptor.as_fd(), libc::POLLOUT, remaining) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(refused(error)),
+        }
+    }
+    let stream = std::os::unix::net::UnixStream::from(descriptor);
+    if let Some(error) = stream.take_error().map_err(refused)? {
+        return Err(refused(error));
+    }
+    // A clear SO_ERROR says no failure was recorded, not that the connect completed: the peer's
+    // address does.
+    stream.peer_addr().map_err(refused)?;
+    Ok(stream)
+}
+
+/// `socket` as a pathname `sockaddr_un` and its length. A path that is empty, holds a NUL or does
+/// not fit `sun_path` is invalid input.
+fn unix_address(socket: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    // SAFETY: every field of sockaddr_un, integers and a byte array, admits zero.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let path = socket.as_os_str().as_bytes();
+    if path.is_empty() || path.len() >= address.sun_path.len() || path.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the socket path {} is empty, holds a NUL, or is longer than sockaddr_un holds",
+                socket.display()
+            ),
+        ));
+    }
+    address.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).map_err(io::Error::other)?;
+    for (target, byte) in address.sun_path.iter_mut().zip(path) {
+        *target = libc::c_char::from_ne_bytes([*byte]);
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
+    let length = libc::socklen_t::try_from(length).map_err(io::Error::other)?;
+    #[cfg(target_vendor = "apple")]
+    {
+        address.sun_len = u8::try_from(length).map_err(io::Error::other)?;
+    }
+    Ok((address, length))
+}
+
+/// Wait up to `within` for `descriptor` to be ready for `events`, and answer whether it is. The
+/// timeout is rounded up to the poll's millisecond, so a poll never wakes before the bound it was
+/// asked to reach; the caller decides its bound again after every wake.
+fn poll_ready(
+    descriptor: BorrowedFd<'_>,
+    events: libc::c_short,
+    within: Duration,
+) -> io::Result<bool> {
+    let millis = within
+        .as_millis()
+        .saturating_add(u128::from(!within.subsec_nanos().is_multiple_of(1_000_000)));
+    let timeout = libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX);
+    let mut pending = libc::pollfd {
+        fd: descriptor.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: `pending` is one initialized pollfd, exclusively borrowed for the call, naming a
+    // descriptor the caller keeps open.
+    match unsafe { libc::poll(&raw mut pending, 1, timeout) } {
+        -1 => Err(io::Error::last_os_error()),
+        ready => Ok(ready != 0),
     }
 }
 
@@ -1279,5 +1680,125 @@ mod tests {
                 name: "workspace supervisor at /nonexistent-cowshed-deadline/peer.sock".to_owned(),
             })
         );
+    }
+
+    // The blocking twin on a real socketpair: its far end is the test's own, silent or closed as
+    // the case needs, so no thread runs and the deadline's clock alone decides.
+    fn paired(op: &'static str, bound: Bound) -> (PeerSocket, std::os::unix::net::UnixStream) {
+        let (near, far) = std::os::unix::net::UnixStream::pair().expect("a socketpair");
+        let peer = Peer::paired("probe holder", 0).credited(&near);
+        let socket = PeerSocket::connected(near, peer, start(op, bound)).expect("made nonblocking");
+        (socket, far)
+    }
+
+    fn own_pid() -> i32 {
+        i32::try_from(std::process::id()).expect("a pid")
+    }
+
+    #[test]
+    fn a_blocking_request_whose_peer_stays_silent_expires_naming_what_was_sent() {
+        use std::io::{Read as _, Write as _};
+        let (mut socket, far) = paired("status", SHORT);
+        assert_eq!(
+            socket.peer().pid,
+            PeerPid::Known(own_pid()),
+            "the pair's maker"
+        );
+        socket
+            .write_all(b"{\"op\":\"status\"}\n")
+            .expect("the request is written");
+        let mut byte = [0_u8; 1];
+        let error = socket.read_exact(&mut byte).expect_err("no answer comes");
+        let failure = socket.fail(error);
+        drop(far);
+        let WaitError::Expired(expired) = &failure else {
+            panic!("expected TIMEOUT, got {failure}");
+        };
+        assert_eq!(expired.op, "status");
+        assert_eq!(expired.last, Progress::Sent { bytes: 16 });
+        assert_eq!(expired.peer.pid, PeerPid::Known(own_pid()));
+        assert!(expired.elapsed >= SHORT.within, "{failure}");
+        assert_eq!(failure.code(), "TIMEOUT");
+        assert_eq!(failure.retry_class(), RetryClass::Terminal);
+    }
+
+    #[test]
+    fn a_blocking_held_wait_reads_its_holders_progress_and_fails_silent_after() {
+        use std::io::{Read as _, Write as _};
+        let (mut socket, mut far) = paired("hold", SHORT);
+        let silence = Duration::from_millis(80);
+        socket.hold(idle("job terminal", silence));
+        far.write_all(b"..").expect("two heartbeats");
+        let mut received = [0_u8; 2];
+        socket
+            .read_exact(&mut received)
+            .expect("the holder's progress");
+        socket.progressed(Progress::State("running"));
+        let error = socket
+            .read_exact(&mut received)
+            .expect_err("the holder falls silent");
+        let failure = socket.fail(error);
+        drop(far);
+        let WaitError::Silent(silent) = &failure else {
+            panic!("expected SILENT, got {failure}");
+        };
+        assert_eq!(silent.op, "job terminal");
+        assert_eq!(silent.last, Progress::State("running"));
+        assert!(silent.silent_for >= silence, "{failure}");
+        assert_eq!(failure.code(), "SILENT");
+    }
+
+    #[test]
+    fn a_blocking_wait_whose_peer_closes_before_its_answer_is_lost() {
+        use std::io::Read as _;
+        let (mut socket, far) = paired("hello", SHORT);
+        drop(far);
+        let mut byte = [0_u8; 1];
+        let error = socket.read_exact(&mut byte).expect_err("the peer is gone");
+        let failure = socket.fail(error);
+        assert!(
+            matches!(
+                &failure,
+                WaitError::PeerLost {
+                    op: "hello",
+                    last: Progress::Connected,
+                    ..
+                }
+            ),
+            "{failure}"
+        );
+        assert_eq!(failure.code(), "PEER_LOST");
+    }
+
+    #[test]
+    fn a_blocking_connect_with_no_socket_is_blocked_on_that_service() {
+        let socket = Path::new("/nonexistent-cowshed-deadline/peer.sock");
+        let failure = PeerSocket::connect("workspace supervisor", socket, start("hello", SHORT))
+            .expect_err("nothing listens there");
+        assert!(
+            matches!(&failure, WaitError::Absent { op: "hello", .. }),
+            "{failure}"
+        );
+        assert_eq!(failure.code(), "BLOCKED");
+    }
+
+    #[test]
+    fn a_blocking_connect_reaches_its_listener_and_names_its_pid() {
+        // A socket's path is used as spelled, so it takes the short fixture parent (08_testing.md,
+        // "Fixtures"): the workspace's runtime link, else /tmp, never the sandbox's TMPDIR.
+        let parent = std::env::var_os("COWSHED_RUNTIME_LINK")
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .subsec_nanos();
+        let socket = parent.join(format!("cs-ps-{}-{unique}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind the listener");
+        let connected = PeerSocket::connect("probe daemon", &socket, start("hello", SHORT));
+        std::fs::remove_file(&socket).expect("remove the socket");
+        drop(listener);
+        let connected = connected.expect("the listener's queue takes the connect");
+        assert_eq!(connected.peer().pid, PeerPid::Known(own_pid()));
+        assert_eq!(connected.last(), Progress::Connected);
     }
 }

@@ -859,7 +859,11 @@ answers a typed failure that names the op, the peer (its socket and pid), the bo
 progress the waiter saw. The expiry ends the wait, never the peer. Nothing retries around the failure and nothing raises
 the bound to pass it: the failure is the diagnosis. The values are `lmao-core`'s (`Deadline`, `Idle`, `Expired`,
 `Silent`, `RetryClass`; specs/lmao/01r_transient_errors_and_retry.md, "Rust"). The shell that maps a connection's reads
-and writes and the timer onto them is `cowshed-os::deadline` (`PeerStream`, `within`, `establish`).
+and writes and the timer onto them is `cowshed-os::deadline` (`PeerStream`, `within`, `establish`). `PeerSocket` is
+`PeerStream`'s blocking twin for a client that runs no async runtime: one nonblocking connect, then a poll before each
+read or write clipped to the wait's bound, and no socket timeout option, since Darwin refuses `setsockopt` once the peer
+has shut down and a kernel timeout restarts on every partial read. Both name the peer by the pid the kernel reports for
+the connection (`peer_pid`: `LOCAL_PEERPID` on Darwin, `SO_PEERCRED` on Linux), never by who owns the socket path.
 
 | class     | covers                                                     | bound |
 | --------- | ---------------------------------------------------------- | ----- |
