@@ -4770,9 +4770,9 @@ fn caches_volume_finding() -> Option<Finding> {
 /// a cached file's pages with every new vnode while memory could still hold them, and a limit
 /// under the floor gets there. A full table at or over the floor is a full cache and no finding.
 fn vnode_table_finding(
-    table: std::io::Result<cowshed_core::vnodes::VnodeTable>,
+    table: std::io::Result<cowshed_types::vnodes::VnodeTable>,
 ) -> Option<Finding> {
-    use cowshed_core::vnodes::Pressure;
+    use cowshed_types::vnodes::Pressure;
     let table = match table {
         Ok(table) => table,
         Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return None,
@@ -4818,7 +4818,7 @@ fn vnode_table_finding(
                 table.limit,
                 table.floor(),
                 table.memory,
-                cowshed_core::vnodes::MEMORY_PER_VNODE,
+                cowshed_types::vnodes::MEMORY_PER_VNODE,
                 table.allocated
             ),
         ),
@@ -5107,7 +5107,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     }
     findings.extend(vnode_table_finding(probe_sync(
         format_args!("vnode-table"),
-        cowshed_core::vnodes::VnodeTable::read,
+        cowshed_core::vnodes::read_vnode_table,
     )));
     findings.extend(orphaned_disk_image_helpers_finding(probe_sync(
         format_args!("disk-image-helpers"),
@@ -6478,7 +6478,7 @@ mod tests {
 
     #[test]
     fn doctor_names_vnode_pressure_and_the_limit_to_set() {
-        use cowshed_core::vnodes::VnodeTable;
+        use cowshed_types::vnodes::VnodeTable;
         let host = |allocated, free, limit| VnodeTable {
             allocated,
             free,

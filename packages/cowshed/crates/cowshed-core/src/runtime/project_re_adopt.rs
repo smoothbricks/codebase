@@ -487,6 +487,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         ),
                         &error,
                         "repair the recorded build hold and retry re-adoption",
+                        crate::vnodes::vnode_saturation,
                     )
                 })?
                 .ok_or_else(|| {

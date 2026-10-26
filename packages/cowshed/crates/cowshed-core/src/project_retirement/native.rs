@@ -294,7 +294,7 @@ mod macos {
                     if cowshed_apfs::detach_was_dissented(&error) {
                         CowshedError::conflict(message, "close the named holders, then retry the recorded retirement")
                     } else {
-                        CowshedError::storage_failure(message, &error, "resolve the storage error, then retry the recorded retirement")
+                        CowshedError::storage_failure(message, &error, "resolve the storage error, then retry the recorded retirement", crate::vnodes::vnode_saturation)
                     }
                 })?;
                 holds.push(hold_detached(image)?);

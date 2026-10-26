@@ -941,6 +941,7 @@ impl LifecycleIntentJournal {
                 ),
                 &error,
                 "repair cowshed storage and retry the lifecycle operation",
+                crate::vnodes::vnode_saturation,
             )
         })
     }
@@ -1514,6 +1515,7 @@ impl RepositoryIdentityIntent {
                 ),
                 &error,
                 "repair cowshed storage and retry `cowshed mv main --repo-id`",
+                crate::vnodes::vnode_saturation,
             )
         })
     }
@@ -1547,6 +1549,7 @@ impl RepositoryIdentityIntent {
                 ),
                 &error,
                 "repair cowshed storage and retry `cowshed mv main --repo-id`",
+                crate::vnodes::vnode_saturation,
             )),
         }
     }

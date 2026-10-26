@@ -875,6 +875,7 @@ fn io_failure(action: &str, path: &Path, error: io::Error) -> CowshedError {
             format!("cannot {action} {}: {error}", path.display()),
             &error,
             STORAGE_HINT,
+            crate::vnodes::vnode_saturation,
         ),
     }
 }

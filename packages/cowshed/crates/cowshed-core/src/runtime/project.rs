@@ -4125,6 +4125,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     ),
                     &error,
                     "repair cowshed storage and retry adoption",
+                    crate::vnodes::vnode_saturation,
                 )
             })?;
         }
@@ -22617,6 +22618,7 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
             other.to_string(),
             &other,
             "repair APFS storage and retry",
+            crate::vnodes::vnode_saturation,
         ),
     }
 }
