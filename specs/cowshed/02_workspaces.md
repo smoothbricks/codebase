@@ -1122,8 +1122,10 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
 
    **The repository lock is the target's ref lock, and it fences the head alone.** Writers that move the target branch
    outside cowshed — an operator's Markdown commit straight into main, say — order themselves by a lock file of their
-   own, and the land joins them when its caller names that file with `--ref-lock <file>`: it takes the file as a held
-   lock ("Held locks" below), the exclusive `flock(2)` lockf(1) also takes, re-reads the target head, revalidates the
+   own, and the land joins them when its caller names that file with `--ref-lock <file>`, or the land-turn queue they
+   take instead with `--ref-turn <queue>` (05_gateway.md "A ref turn"), which it takes for exactly the span below, its
+   ticket handed to the fence's git as the lock's descriptor is. With `--ref-lock`, it takes the file as a held lock
+   ("Held locks" below), the exclusive `flock(2)` lockf(1) also takes, re-reads the target head, revalidates the
    expected target head against it, fetches and fast-forwards, and lets go. The fetch and the fast-forward's git are
    handed the lock's descriptor, so the kernel keeps the lock until that git ends: a land killed mid-fast-forward never
    leaves git moving the ref outside it. Git's automatic gc and maintenance are off for them (`gc.auto=0`,
@@ -1138,9 +1140,9 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
    kernel shows it (`lock-holders`): one look at the holders per wait, never one per report. Its `delivery` span is the
    hold. Measured 2026-10-20 with the whole land under such a lock: an operator's land held its ref lock for 82 to 85 s
    per land, about 56 to 63 s of it build-volume adoption, and one land held it 45 minutes while its Nx cache
-   initialization waited, so every Markdown commit queued behind work the lock does not protect. Without `--ref-lock`,
-   git's own ref and index locks are the only fence against such writers, and the head is still re-read and revalidated
-   just before the fast-forward.
+   initialization waited, so every Markdown commit queued behind work the lock does not protect. Without `--ref-lock` or
+   `--ref-turn`, git's own ref and index locks are the only fence against such writers, and the head is still re-read
+   and revalidated just before the fast-forward.
 
    **Land has no branch-name contract.** It fetches whatever branch the workspace has checked out — `cowshed/<ws>` is
    what `fork` creates, but an agent may have made `wt/<ws>` or anything else, and land neither assumes nor requires the

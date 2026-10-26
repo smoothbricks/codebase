@@ -68,7 +68,7 @@ where
     };
     let command = PreparedCommand::prepare(program, rest)?;
     let home = canonical_home()?;
-    let directory = queue::land_turn_root(&support_directory(&home)).join(&args.repo);
+    let directory = queue::land_turn_root(&support_directory(&home)).join(args.repo.as_str());
     let description = args
         .argv
         .iter()
@@ -103,14 +103,14 @@ where
         tokio::select! {
             Some(wait) = received.recv() => {
                 waited = true;
-                written = written.and(report(output, &args.repo, &wait));
+                written = written.and(report(output, args.repo.as_str(), &wait));
             }
             joined = &mut taking => break joined,
         }
     };
     while let Ok(wait) = received.try_recv() {
         waited = true;
-        written = written.and(report(output, &args.repo, &wait));
+        written = written.and(report(output, args.repo.as_str(), &wait));
     }
     let turn = joined
         .map_err(|error| {

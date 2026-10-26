@@ -141,6 +141,12 @@ impl Turn {
         );
     }
 
+    /// The descriptor of this turn's ticket alone, for a command that holds the turn and no outside
+    /// lock ([`crate::runtime::ref_turn::RefTurn`]).
+    pub fn ticket_descriptor(&self) -> RawFd {
+        self.held_ticket.as_raw_fd()
+    }
+
     /// The descriptors that hold this turn: its ticket's lock and the outside lock's. A command
     /// handed them ([`crate::held_lock::keep_across_exec`]) holds the turn with this process, so
     /// the kernel keeps the turn until the command has ended too, however this process ends: no

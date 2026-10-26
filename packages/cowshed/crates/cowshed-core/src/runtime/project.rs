@@ -15688,11 +15688,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 landing
             }
         };
-        // The ref fence (02_workspaces.md "`cowshed land`" step 3). The caller's ref lock, when it
-        // names one, is held from re-reading the target head through the fast-forward and for
-        // nothing else: the checks and Nx cache initialization before it and the adoption and
-        // retirement after it run outside, so a writer queued on the lock waits for this fence
-        // alone. The `delivery` span is the hold.
+        // The ref fence (02_workspaces.md "`cowshed land`" step 3). The caller's ref lock or ref
+        // turn (land_plan admits one at most), when it names one, is held from re-reading the
+        // target head through the fast-forward and for nothing else: the checks and Nx cache
+        // initialization before it and the adoption and retirement after it run outside, so a
+        // writer queued on it waits for this fence alone. The `delivery` span is the hold.
         let ref_lock = match options.ref_lock.as_ref() {
             Some(path) => Some(
                 timed_async(
@@ -15704,9 +15704,24 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             ),
             None => None,
         };
-        timed_async("land", "delivery", async {
-            // Read again under the lock: the checks run for minutes, and the target can move
-            // meanwhile through a writer that holds this lock while it moves it.
+        let ref_turn = match options.ref_turn.as_ref() {
+            Some(queue) => Some(
+                timed_async(
+                    "land",
+                    "ref-turn-wait",
+                    super::ref_turn::RefTurn::acquire(queue, workspace.as_str()),
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let fence = ref_lock
+            .as_ref()
+            .map(super::ref_lock::RefLock::descriptor)
+            .or_else(|| ref_turn.as_ref().map(super::ref_turn::RefTurn::descriptor));
+        let delivered = timed_async("land", "delivery", async {
+            // Read again under the fence: the checks run for minutes, and the target can move
+            // meanwhile through a writer that holds this fence while it moves it.
             let tip = git_optional_ref_oid(store_root, &into.root, &target_ref).await?;
             require_target_head(options.expected_target_head.as_ref(), tip.as_ref())?;
             deliver_into(
@@ -15720,12 +15735,19 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 },
                 &target_branch,
                 plan,
-                ref_lock.as_ref().map(super::ref_lock::RefLock::descriptor),
+                fence,
             )
             .await
         })
-        .await?;
+        .await;
         drop(ref_lock);
+        if let Some(turn) = ref_turn {
+            turn.end(match &delivered {
+                Ok(()) => format!("delivered {source_head}"),
+                Err(error) => format!("refused: {}", error.message),
+            });
+        }
+        delivered?;
         // The target has moved: a failed build-volume step reads as such, never as a refused land.
         let build_volume = match plan {
             LandPlan::Gated => timed_async(
@@ -19860,6 +19882,12 @@ fn rebase_plan(
 /// `check` and `push_only`, and folds only into a lane base.
 #[cfg(target_os = "macos")]
 fn land_plan(options: &LandOptions, target: &WorkspaceName) -> Result<LandPlan> {
+    if options.ref_lock.is_some() && options.ref_turn.is_some() {
+        return Err(CowshedError::usage(
+            "a land fences its target under one ref fence: --ref-lock and --ref-turn name two",
+            "name the one the target's other branch writers take",
+        ));
+    }
     match options.mode {
         crate::api::dto::LandMode::Gated => Ok(LandPlan::Gated),
         crate::api::dto::LandMode::Ungated => {

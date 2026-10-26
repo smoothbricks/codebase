@@ -588,6 +588,7 @@ pub struct LandOptions {
     pub expected_source_head: Option<GitOid>,
     pub expected_target_head: Option<ExpectedRefHead>,
     pub ref_lock: Option<RefLockPath>,   // absolute; held only for the head fence and fast-forward (02, land step 3)
+    pub ref_turn: Option<LandTurnName>,  // the writers' land-turn queue, `<repo>.ref`; the same span; exclusive with ref_lock (05)
     pub mode: LandMode,                  // Ungated: a lane fold by Git alone, rebasing first; refused into main (02, "Lanes")
     pub preflight: bool,                 // land's fences before its check only, mutating nothing; absent when false (02)
 }

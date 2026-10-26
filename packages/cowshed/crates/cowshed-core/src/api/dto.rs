@@ -97,6 +97,10 @@ pub enum DtoError {
     InvalidWorkspacePath(PathBuf),
     #[error("invalid ref lock path {0:?}: it must be an absolute UTF-8 path with no NUL")]
     InvalidRefLockPath(PathBuf),
+    #[error(
+        "invalid land-turn queue {0:?}: it must be 1 to 64 of A-Z a-z 0-9 . _ -, not starting with `.`"
+    )]
+    InvalidLandTurnName(String),
     #[error("invalid trace id {0:?}")]
     InvalidTraceId(String),
     #[error("invalid span id {0:?}")]
@@ -601,6 +605,58 @@ impl<'de> Deserialize<'de> for RefLockPath {
     {
         Self::new(PathBuf::from(String::deserialize(deserializer)?))
             .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The name of one land-turn queue (05_gateway.md "Land turns"): a repository's land turn, or the
+/// ref turn `<repo>.ref` its other branch writers take ("A ref turn"). It is the queue's directory
+/// name, so it is 1 to 64 of `[A-Za-z0-9._-]`, not starting with a dot: no name reaches the
+/// queue's parent or a hidden file.
+#[cfg_attr(any(), cowshed_api(accessor = "as-str", scalar = "string"))]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LandTurnName(String);
+
+impl LandTurnName {
+    pub fn new(name: impl Into<String>) -> Result<Self, DtoError> {
+        let name = name.into();
+        let valid = (1..=64).contains(&name.len())
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+        if valid {
+            Ok(Self(name))
+        } else {
+            Err(DtoError::InvalidLandTurnName(name))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LandTurnName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Serialize for LandTurnName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for LandTurnName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -3704,6 +3760,11 @@ pub struct LandOptions {
     /// "`cowshed land`" step 3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_lock: Option<RefLockPath>,
+    /// The land-turn queue the target's other branch writers take while they move it, its ref
+    /// turn; land takes it for the same span as `ref_lock`, and the two are exclusive
+    /// (02_workspaces.md "`cowshed land`" step 3, 05_gateway.md "A ref turn").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_turn: Option<LandTurnName>,
     /// `Ungated` folds a unit into its lane base by Git alone: it rebases the unit onto the lane
     /// base's branch (nothing when already based), then fast-forwards and retires, with no check,
     /// no carry, no seed freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with
@@ -3728,6 +3789,7 @@ impl Default for LandOptions {
             expected_source_head: None,
             expected_target_head: None,
             ref_lock: None,
+            ref_turn: None,
             mode: LandMode::Gated,
             preflight: false,
         }

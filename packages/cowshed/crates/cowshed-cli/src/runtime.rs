@@ -20,12 +20,12 @@ use cowshed_core::api::{
     CheckpointInfo, CheckpointOptions, CheckpointResult, CommandArg, Coordinator, DefragmentResult,
     DoctorReport, EmptyResult, ExecRequest, ExpectedRefHead, Finding, FindingSeverity, ForkOptions,
     GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream,
-    LandOptions, LandReport, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta,
-    ProjectGrants, PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions,
-    RebaseReport, RefLockPath, RekeyResult, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RevisionTarget,
-    RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource, UnlandedPaths,
-    UnprovenWorkspace, UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState,
+    LandOptions, LandReport, LandTurnName, LandingCommits, MountResult, OutputPublication,
+    ProjectGrantDelta, ProjectGrants, PublicationPolicy, PushOptions, PushReport,
+    RebaseBuildVolume, RebaseOptions, RebaseReport, RefLockPath, RekeyResult, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
+    UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState,
     validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
@@ -2180,6 +2180,7 @@ where
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_target_head: args.expected_target_head.map(os_expected_ref).transpose()?,
                 ref_lock: args.ref_lock.map(os_ref_lock).transpose()?,
+                ref_turn: args.ref_turn.map(os_ref_turn).transpose()?,
                 mode: args.mode,
                 preflight: args.preflight,
             };
@@ -2348,6 +2349,19 @@ fn os_git_oid(value: std::ffi::OsString) -> Result<GitOid> {
             "use a full lowercase 40- or 64-hex object id",
         )
     })
+}
+
+/// `--ref-turn`: the land-turn queue a land takes for its ref fence, named as `cowshed land-turn`
+/// names it.
+fn os_ref_turn(value: std::ffi::OsString) -> Result<LandTurnName> {
+    let hint = "name the land-turn queue the target's other writers take, by convention <repo>.ref";
+    let name = value.into_string().map_err(|value| {
+        usage(
+            format!("the ref turn {} is not UTF-8", value.to_string_lossy()),
+            hint,
+        )
+    })?;
+    LandTurnName::new(name).map_err(|error| usage(error.to_string(), hint))
 }
 
 /// `--ref-lock`, resolved against this process's directory: the land opens it by that path.

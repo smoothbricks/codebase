@@ -985,6 +985,12 @@ export const parseLandSeed = (json: string): Api.LandSeed => assertLandSeed(JSON
 export const assertLandSeedList = typia.createAssertEquals<readonly Api.LandSeed[]>();
 export const parseLandSeedList = (json: string): readonly Api.LandSeed[] => assertLandSeedList(JSON.parse(json));
 
+export const assertLandTurnName = typia.createAssertEquals<Api.LandTurnName>();
+export const parseLandTurnName = (json: string): Api.LandTurnName => assertLandTurnName(JSON.parse(json));
+export const assertLandTurnNameList = typia.createAssertEquals<readonly Api.LandTurnName[]>();
+export const parseLandTurnNameList = (json: string): readonly Api.LandTurnName[] =>
+  assertLandTurnNameList(JSON.parse(json));
+
 export const assertLandTurnQueue = typia.createAssertEquals<Api.LandTurnQueue>();
 export const parseLandTurnQueue = (json: string): Api.LandTurnQueue => assertLandTurnQueue(JSON.parse(json));
 export const assertLandTurnQueueList = typia.createAssertEquals<readonly Api.LandTurnQueue[]>();

@@ -320,6 +320,7 @@ pub const PARITY: &[Row] = &[
     row("land", "expected-source-head", field(&[("coordinator.land", "options.expectedSourceHead")], &[argument("Coordinator.land", 1, "expectedSourceHead")])),
     row("land", "expected-target-head", field(&[("coordinator.land", "options.expectedTargetHead")], &[argument("Coordinator.land", 1, "expectedTargetHead")])),
     row("land", "ref-lock", field(&[("coordinator.land", "options.refLock")], &[argument("Coordinator.land", 1, "refLock")])),
+    row("land", "ref-turn", field(&[("coordinator.land", "options.refTurn")], &[argument("Coordinator.land", 1, "refTurn")])),
     
     row("land", "ungated", field(&[("coordinator.land", "options.mode")], &[argument("Coordinator.land", 1, "mode")])),
     row("land", "preflight", field(&[("coordinator.land", "options.preflight")], &[argument("Coordinator.land", 1, "preflight")])),

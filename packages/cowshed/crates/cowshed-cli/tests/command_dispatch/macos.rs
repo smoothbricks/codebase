@@ -3430,6 +3430,117 @@ async fn directory_a_land_fences_the_target_head_under_the_caller_ref_lock_subst
         .expect("stop the real directory project");
 }
 
+/// A land fences the target's head under the writers' ref turn (05_gateway.md "A ref turn"), as
+/// under a ref lock: a writer holds the turn from before the land starts and moves main only once
+/// the land's check has run, so the land read main's old head before it. The land, queued behind
+/// the writer, reads the new head once the turn is its own and refuses with the target moved.
+/// Rebased, the next land finds the turn free and lands, and holds no ticket once it returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_land_fences_the_target_head_under_the_writers_ref_turn_substrate_lifecycle() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let main = fixture.checkout.clone();
+    // The queue `cowshed land-turn` and the land's fence share: this user's support directory,
+    // under a name no other run takes, removed at the end.
+    let home = cowshed_core::gateway_sessions::canonical_home().expect("a canonical HOME");
+    let queue = format!("dispatch-ref-turn-{}", std::process::id());
+    let directory =
+        cowshed_core::land_turn::land_turn_root(&cowshed_core::host_dirs::support_directory(&home))
+            .join(&queue);
+    // Removed however the case ends, a failed assertion included.
+    struct RemoveQueue(PathBuf);
+    impl Drop for RemoveQueue {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.0) {
+                cowshed_os::eprintln!(
+                    "cannot remove the test's ref turn queue {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+    let _remove_queue = RemoveQueue(directory.clone());
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").unwrap();
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+    let checked = topic.join(".git/ref-fence-checked");
+
+    let writer = cowshed_core::land_turn::take(
+        &directory,
+        "doc-commit",
+        "git commit",
+        None,
+        Duration::from_secs(10),
+        |_| panic!("the writer is first in its queue"),
+    )
+    .expect("the writer took the ref turn");
+    let land = run(
+        &mut service,
+        [
+            "--json",
+            "land",
+            "topic",
+            "--ref-turn",
+            &queue,
+            "--expected-target-head",
+            &main_head,
+            "--check",
+            "/usr/bin/touch .git/ref-fence-checked",
+        ],
+    );
+    let doc_commit = async {
+        eventually(|| checked.exists()).await;
+        fs::write(main.join("doc.md"), b"doc\n").unwrap();
+        git(&main, &["add", "doc.md"]);
+        git(&main, &["commit", "-q", "-m", "doc"]);
+        writer.end("committed".to_owned());
+    };
+    let ((result, _, stderr), ()) = tokio::join!(land, doc_commit);
+    let error = result.expect_err("a land whose target moved under the ref turn landed");
+    assert!(
+        matches!(
+            error.fence_source(),
+            Some(cowshed_core::error::FenceRefusal::TargetMoved { observed: Some(_) })
+        ),
+        "the land did not refuse with the target moved: {error:?}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let doc_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD~1"]),
+        main_head,
+        "main holds the writer's commit and nothing the land delivered"
+    );
+
+    succeed(&mut service, ["rebase", "topic"]).await;
+    let rebased = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    succeed(
+        &mut service,
+        [
+            "--json",
+            "land",
+            "topic",
+            "--ref-turn",
+            &queue,
+            "--expected-target-head",
+            &doc_head,
+        ],
+    )
+    .await;
+    assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), rebased);
+    assert_eq!(
+        cowshed_core::land_turn::observe(&directory).expect("read the ref turn's queue"),
+        [],
+        "a land kept the ref turn after it returned"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_an_rm_during_a_land_is_refused_naming_it_substrate_lifecycle() {
     let mut fixture = Fixture::directory();

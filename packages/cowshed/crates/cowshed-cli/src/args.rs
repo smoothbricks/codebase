@@ -6,7 +6,8 @@ use cowshed_core::api::hold::KernelAddress;
 use cowshed_core::api::operations::FdHoldersRequest;
 use cowshed_core::api::server::HostRole;
 use cowshed_core::api::{
-    AbandonedRefSupersession, ExecClass, ExecScope, GitOid, GrantDelta, LandMode, SupersededReason,
+    AbandonedRefSupersession, ExecClass, ExecScope, GitOid, GrantDelta, LandMode, LandTurnName,
+    SupersededReason,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
@@ -260,7 +261,7 @@ pub struct DiskCommandArgs {
 /// land queue the command joins, the workspace the land is for, and the command run under its turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LandTurnArgs {
-    pub repo: String,
+    pub repo: LandTurnName,
     pub workspace: String,
     pub outside_lock: Option<PathBuf>,
     pub argv: Vec<OsString>,
@@ -684,6 +685,7 @@ pub struct LandArgs {
     pub expected_source_head: Option<OsString>,
     pub expected_target_head: Option<OsString>,
     pub ref_lock: Option<OsString>,
+    pub ref_turn: Option<OsString>,
     pub mode: LandMode,
     pub preflight: bool,
 }
@@ -1078,6 +1080,7 @@ pub fn cli_command() -> ClapCommand {
             value("expected-source-head"),
             value("expected-target-head"),
             value("ref-lock"),
+            value("ref-turn"),
             flag("ungated"),
             flag("preflight"),
         ]))
@@ -1798,8 +1801,7 @@ fn parse_land_turn(matches: &ArgMatches, global: &GlobalOptions) -> Result<Comma
     let repo = os(matches, "repo").ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
     let repo = repo
         .to_str()
-        .filter(|name| valid_repo_name(name))
-        .map(str::to_owned)
+        .and_then(|name| LandTurnName::new(name).ok())
         .ok_or_else(|| {
             UsageError::new(
                 format!(
@@ -2115,16 +2117,6 @@ fn parse_fd_holders(matches: &ArgMatches, global: &GlobalOptions) -> Result<Comm
         return Err(UsageError::new(USAGE.missing, USAGE));
     }
     Ok(Command::FdHolders(FdHoldersRequest { devices, inodes }))
-}
-
-/// A land queue is keyed by one directory name: 1 to 64 of `[A-Za-z0-9._-]`, not starting with a
-/// dot, so a name can never reach the queue's parent or a hidden file.
-fn valid_repo_name(name: &str) -> bool {
-    (1..=64).contains(&name.len())
-        && !name.starts_with('.')
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 const SUBTREE_ROOT: CommandSpec = CommandSpec {
@@ -4104,6 +4096,10 @@ const LAND: CommandSpec = CommandSpec {
             meaning: "the lock file every other writer of the target branch holds while it moves it (lockf(1)); land holds it only from re-reading the target head through the fast-forward, and says who holds it while it waits",
         },
         Opt {
+            spelling: "--ref-turn <queue>",
+            meaning: "the land-turn queue every other writer of the target branch takes while it moves it (`cowshed land-turn <queue> -- <cmd>`, by convention `<repo>.ref`); land takes that turn only from re-reading the target head through the fast-forward, in the order the writers asked, and says who holds it while it waits; exclusive with --ref-lock",
+        },
+        Opt {
             spelling: "--ungated",
             meaning: "fold into the lane base by Git alone: rebase onto its branch (nothing when already based), fast-forward and retire, with no check and no build-volume carry or adoption; needs --into <lane>, and conflicts with --check and --push-only",
         },
@@ -4131,6 +4127,7 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
         expected_source_head: os(matches, "expected-source-head"),
         expected_target_head: os(matches, "expected-target-head"),
         ref_lock: os(matches, "ref-lock"),
+        ref_turn: os(matches, "ref-turn"),
         mode: land_mode(matches),
         preflight: flagged(matches, "preflight"),
     }))
@@ -5818,8 +5815,8 @@ mod tests {
             "1111111111111111111111111111111111111111",
             "--expected-target-head",
             "missing",
-            "--ref-lock",
-            "/tmp/ref.lock",
+            "--ref-turn",
+            "repo.ref",
             "--json",
         ])
         .unwrap();
@@ -5834,7 +5831,8 @@ mod tests {
         assert!(!args.retire);
         assert!(args.push_only);
         assert!(args.preflight);
-        assert_eq!(args.ref_lock, Some(OsString::from("/tmp/ref.lock")));
+        assert_eq!(args.ref_turn, Some(OsString::from("repo.ref")));
+        assert_eq!(args.ref_lock, None);
         assert!(cli.global.json);
 
         let Command::Remove(remove) = parse_args(["rm", "main", "--restore"]).unwrap().command

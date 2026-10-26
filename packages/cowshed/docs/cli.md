@@ -1277,7 +1277,7 @@ replays as above and then stops, computing no hash and carrying nothing; `buildV
 `{kind:"skipped", reason:{kind:"ungated"}}`. Without `--into`, or with `--into main`, it is refused (exit 2, naming
 main), and so is `--gate` beside it: an ungated rebase runs no job.
 
-### `cowshed land <name> [--into <lane> [--ungated]] [--check <cmd>] [--ref-lock <file>]`
+### `cowshed land <name> [--into <lane> [--ungated]] [--check <cmd>] [--ref-lock <file> | --ref-turn <queue>]`
 
 The full close-out in one primitive: validate (`--check`) inside the sandbox, fast-forward the target's checkout to the
 workspace's branch, retire the workspace. The target is main, or with `--into <lane>` the lane base `<lane>`. A dirty
@@ -1326,6 +1326,12 @@ target head, check it against `--expected-target-head`, fetch and fast-forward; 
 build-volume adoption and retirement run without it, so such a writer waits for that fence alone. A land that finds the
 lock held waits for it and says on stderr every 10 s how long and which processes hold the file. A target that moved
 while it waited is refused as moved (exit 4); the caller rebases and lands again.
+
+`--ref-turn <queue>` names instead the land-turn queue every other writer of the target branch takes while it moves it,
+as an operator's Markdown commit into main takes `cowshed land-turn <repo>.ref -- <commit>`. Land takes that turn for
+the same span as `--ref-lock`, in the order the writers asked: a land that finds it held says on stderr every 10 s how
+many are ahead and which workspace and pid hold it, and the fast-forward's git inherits the turn's ticket, so the kernel
+keeps the turn until that git ends. `--ref-lock` and `--ref-turn` are exclusive.
 
 Post-land output restoration never reruns `--check` commands. Checks pass once in the landing workspace; only their
 attributed Nx task graphs may be hashed and restored from the adopted local cache. Missing or uncacheable results are

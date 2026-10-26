@@ -442,6 +442,17 @@ lander's lands died with its tool session three times, twice while queued and on
 away first starts the land in a session of its own (`setsid`, output to a file, not its child) and waits on the land's
 pid; `land-turn` itself never detaches, since the caller that stays reads its output and its exit status.
 
+**A ref turn.** A repository whose main also moves outside its lands (an operator's Markdown commit straight into main)
+keeps a second queue beside its land turn, by convention `<repo>.ref`: every writer that moves main's ref outside
+cowshed takes it for that move alone (`cowshed land-turn <repo>.ref --workspace <label> -- <commit>`), and a land names
+it to `cowshed land --ref-turn <repo>.ref`, which takes it only from re-reading the target head through the fast-forward
+(02_workspaces.md "`cowshed land`" step 3). It is a land-turn queue like any other: first asked, first served, the
+holder named, held through its ticket's descriptor, which the fast-forward's git inherits. A Markdown commit therefore
+waits for one fast-forward, never for a land's gate, and never barges. A land takes its land turn first and the ref turn
+inside it; a writer that holds the ref turn never asks for the land turn, so the two never deadlock. A flock(2) ref lock
+(`--ref-lock`) orders no waiters: the kernel wakes them all and the first to retry wins, and it names no holder in
+order.
+
 **A ticket's life is recorded.** Measured 2026-10-21: a land queued for 635 s vanished with its agent's session, its log
 stopping mid-wait, and nothing recorded it, so it read as running for half an hour while it did not exist. Each
 repository's `turns.log`, beside its tickets, gets one JSON line per event, appended and never rewritten:

@@ -2123,6 +2123,12 @@ export type LandOptions = {
    */
   readonly refLock?: RefLockPath;
   /**
+   * The land-turn queue the target's other branch writers take while they move it, its ref
+   * turn; land takes it for the same span as `ref_lock`, and the two are exclusive
+   * (02_workspaces.md "`cowshed land`" step 3, 05_gateway.md "A ref turn").
+   */
+  readonly refTurn?: LandTurnName;
+  /**
    * `Ungated` folds a unit into its lane base by Git alone: it rebases the unit onto the lane
    * base's branch (nothing when already based), then fast-forwards and retires, with no check,
    * no carry, no seed freeze, no adoption (02_workspaces.md "Lanes"). Refused into main, with
@@ -2193,6 +2199,14 @@ export type LandSeed =
   | ({ readonly kind: 'sealBusy' } & {
       readonly reason: string;
     });
+
+/**
+ * The name of one land-turn queue (05_gateway.md "Land turns"): a repository's land turn, or the
+ * ref turn `<repo>.ref` its other branch writers take ("A ref turn"). It is the queue's directory
+ * name, so it is 1 to 64 of `[A-Za-z0-9._-]`, not starting with a dot: no name reaches the
+ * queue's parent or a hidden file.
+ */
+export type LandTurnName = string;
 
 /**
  * One repository's land queue as `gateway status` observes it: its live tickets in turn order,
