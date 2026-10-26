@@ -88,8 +88,8 @@
           }
         ],
         "outputs": [],
+        "//": "Witness that cowshed:wire-fixtures publishes the corpus whole: cowshed:lint reads src/wire-fixtures.json while it regenerates, so a reader must see the old or the new formatted file, never the raw render.",
         "options": {
-          "comment": "Witness that cowshed:wire-fixtures publishes the corpus whole: cowshed:lint reads src/wire-fixtures.json while it regenerates, so a reader must see the old or the new formatted file, never the raw render.",
           "command": "node --test packages/cowshed/scripts/wire-fixtures.test.cjs",
           "cwd": ".",
           "idleTimeoutMs": 180000,
@@ -285,8 +285,8 @@
         "dependsOn": [
           "build"
         ],
+        "//": "Runs the package launcher, not dist/bin/darwin-arm64 directly: bin/cowshed resolves the host's native binary, so this works on every arch instead of only Apple Silicon. The note is not an option: nx:run-commands forwards every option it does not know to the command as an argument.",
         "options": {
-          "comment": "Runs the package launcher, not dist/bin/darwin-arm64 directly: bin/cowshed resolves the host's native binary, so this works on every arch instead of only Apple Silicon.",
           "cwd": "{projectRoot}",
           "command": "bin/cowshed {args}"
         }
@@ -477,8 +477,8 @@
           "build",
           "^build"
         ],
+        "//": "openHost and the typed launchers end to end: the built addon starts the package launcher's cowshed host, and each launcher spawns its verb through the package launcher, so the launcher's binary must be this checkout's build. It needs a Mac: host.diskCommand runs the real hdiutil. The root host-e2e aggregate reaches it and gate reaches it through that; test never does, because the Linux CI job runs test (specs/cowshed/08_testing.md, CI).",
         "options": {
-          "comment": "openHost and the typed launchers end to end: the built addon starts the package launcher's cowshed host, and each launcher spawns its verb through the package launcher, so the launcher's binary must be this checkout's build. It needs a Mac: host.diskCommand runs the real hdiutil. The root host-e2e aggregate reaches it and gate reaches it through that; test never does, because the Linux CI job runs test (specs/cowshed/08_testing.md, CI).",
           "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 host.napi.test.ts launchers.napi.test.ts",
           "cwd": "{projectRoot}/src",
           "env": {
@@ -589,8 +589,8 @@
             ]
           }
         ],
+        "//": "Build prerequisite for the cowshed-core exceptional shards, not a test. public_api_contracts' capability probe cargo-checks its case crates against cowshed-core, and its dependency build exceeded the 120s test bound on a cold hosted arm64 runner. This runs the ignored capability_probe_dependencies_check from the same archive with empty case crates, warming the shared target/ before the bounded shards. The 600s budget is a build budget, as in wire-warmup. cache:false is required because target/ is not an Nx output: a cached skip on a fresh runner would leave the probe cold. It reuses the generated runners' content-keyed extraction under Cargo's target directory rather than `--archive-file`, which unpacks into a fresh $TMPDIR/nextest-archive-* that a killed run never removes.",
         "options": {
-          "comment": "Build prerequisite for the cowshed-core exceptional shards, not a test. public_api_contracts' capability probe cargo-checks its case crates against cowshed-core, and its dependency build exceeded the 120s test bound on a cold hosted arm64 runner. This runs the ignored capability_probe_dependencies_check from the same archive with empty case crates, warming the shared target/ before the bounded shards. The 600s budget is a build budget, as in wire-warmup. cache:false is required because target/ is not an Nx output: a cached skip on a fresh runner would leave the probe cold. It reuses the generated runners' content-keyed extraction under Cargo's target directory rather than `--archive-file`, which unpacks into a fresh $TMPDIR/nextest-archive-* that a killed run never removes.",
           "command": "extracted=\"$(node \"$(realpath node_modules/@smoothbricks/nx-plugin)/../nextest-extract/dist/ts/bin/smoo-nx-nextest-extract.js\" .cache/nextest/archive.tar.zst)\" && cargo --frozen nextest run --binaries-metadata \"$extracted/target/nextest/binaries-metadata.json\" --cargo-metadata \"$extracted/target/nextest/cargo-metadata.json\" --target-dir-remap \"$extracted/target\" --workspace-remap . -E 'package(cowshed-core) and test(=capability_probe_dependencies_check)' --run-ignored only --no-tests=fail --user-config-file none",
           "cwd": ".",
           "timeoutMs": 600000,
@@ -633,8 +633,8 @@
         "dependsOn": [
           "api-check"
         ],
+        "//": "Build prerequisite for wire-test, not a test: the first load of each project through the compiler preload compiles the typia native plugin, which takes minutes on a cold Go cache and would blow wire-test's 120s bound. The 600s budget here is a build budget, not a test timeout increase: it bounds the compilation while staying inside the workflow's overall bound, and fails loudly instead of hanging release. cache:false is load-bearing — the ttsc plugin cache lives outside Nx outputs, so a cached skip on a fresh runner would run the test cold and hang it again. Uses the same compiler preload specifier as bunfig.toml; the trace preload is absent on purpose (its setup calls afterAll(), which throws outside `bun test`) and adds no plugin key (measured: harness import alone builds the full runtime key set).",
         "options": {
-          "comment": "Build prerequisite for wire-test, not a test: the first load of each project through the compiler preload compiles the typia native plugin, which takes minutes on a cold Go cache and would blow wire-test's 120s bound. The 600s budget here is a build budget, not a test timeout increase: it bounds the compilation while staying inside the workflow's overall bound, and fails loudly instead of hanging release. cache:false is load-bearing — the ttsc plugin cache lives outside Nx outputs, so a cached skip on a fresh runner would run the test cold and hang it again. Uses the same compiler preload specifier as bunfig.toml; the trace preload is absent on purpose (its setup calls afterAll(), which throws outside `bun test`) and adds no plugin key (measured: harness import alone builds the full runtime key set).",
           "command": "bun --preload @smoothbricks/lmao/bun/preload scripts/warm-ttsc-plugins.mjs",
           "cwd": "packages/cowshed",
           "timeoutMs": 600000,
@@ -664,8 +664,8 @@
             "transitive": true
           }
         ],
+        "//": "The public declaration IR runs its source lint before the real admission oracle, using the actual prebuilt owner generator and one Typia world. It needs no N-API wire corpus or native runtime fixture.",
         "options": {
-          "comment": "The public declaration IR runs its source lint before the real admission oracle, using the actual prebuilt owner generator and one Typia world. It needs no N-API wire corpus or native runtime fixture.",
           "command": "biome check --files-ignore-unknown=true declaration-model.test.ts && eslint declaration-model.test.ts && bun test --config=../bunfig.toml --timeout=0 declaration-model.test.ts",
           "cwd": "{projectRoot}/src",
           "idleTimeoutMs": 180000,
@@ -689,8 +689,8 @@
           "wire-fixtures",
           "wire-warmup"
         ],
+        "//": "Runs from source under the typia transform because the validators under test are the point. Depends on wire-fixtures (the corpus is a generated output, current by construction) and not on cargo-test: the Rust half proves the same corpus through include_str!, and cowshed:test already joins both legs; a cargo-test edge here only meant an unrelated Rust failure deleted this target from the run.",
         "options": {
-          "comment": "Runs from source under the typia transform because the validators under test are the point. Depends on wire-fixtures (the corpus is a generated output, current by construction) and not on cargo-test: the Rust half proves the same corpus through include_str!, and cowshed:test already joins both legs; a cargo-test edge here only meant an unrelated Rust failure deleted this target from the run.",
           "command": "bun test --config=../bunfig.toml --timeout=0 wire-contract.test.ts exec.test.ts",
           "cwd": "{projectRoot}/src",
           "idleTimeoutMs": 180000,
@@ -703,8 +703,8 @@
         "dependsOn": [
           "build"
         ],
+        "//": "dependsOn build so dist/bin exists: the check used to pass by finding nothing.",
         "options": {
-          "comment": "dependsOn build so dist/bin exists: the check used to pass by finding nothing.",
           "command": "bun scripts/verify-packaged-bin-bits.ts",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
@@ -728,8 +728,8 @@
       "apfs-test-root": {
         "executor": "nx:run-commands",
         "cache": false,
+        "//": "Makes sure the per-user mount root that real-image fixtures keep their scratch trees below exists, as cowshed setup makes it: /private/var/folders/cowshed, its <uid> directory, and mnt inside that (specs/cowshed/08_testing.md, Integration tests). The fixtures make t themselves, and a cowshed exec sandbox denies it, so it is never touched here. On a host setup has been through it only checks, and changes nothing. cache:false is load-bearing: the directories are host state, not an Nx output, so a cached skip on a fresh runner would leave them missing. It does nothing off macOS. The note is not an option: nx:run-commands forwards every option it does not know to the command as an argument.",
         "options": {
-          "comment": "Makes sure the per-user mount root that real-image fixtures keep their scratch trees below exists, as cowshed setup makes it: /private/var/folders/cowshed, its <uid> directory, and mnt inside that (specs/cowshed/08_testing.md, Integration tests). The fixtures make t themselves, and a cowshed exec sandbox denies it, so it is never touched here. On a host setup has been through it only checks, and changes nothing. cache:false is load-bearing: the directories are host state, not an Nx output, so a cached skip on a fresh runner would leave them missing. It does nothing off macOS.",
           "command": "bun scripts/apfs-test-root.ts",
           "cwd": "{projectRoot}"
         }
@@ -749,8 +749,8 @@
           }
         ],
         "outputs": [],
+        "//": "Unit tests of apfs-test-root.ts: every decision against an in-memory host, the real lstat and install against a temporary directory, and pins of its paths and modes to the Rust code that makes and refuses them. Runs from the project root on an explicit path, with an empty Bun config: the package bunfig.toml preloads LMAO's compiler and trace hooks, which a script test has no use for and which would make it wait on lmao's build. The host OS is an input because a darwin-only case skips elsewhere, and a result cached there must not replay here.",
         "options": {
-          "comment": "Unit tests of apfs-test-root.ts: every decision against an in-memory host, the real lstat and install against a temporary directory, and pins of its paths and modes to the Rust code that makes and refuses them. Runs from the project root on an explicit path, with an empty Bun config: the package bunfig.toml preloads LMAO's compiler and trace hooks, which a script test has no use for and which would make it wait on lmao's build. The host OS is an input because a darwin-only case skips elsewhere, and a result cached there must not replay here.",
           "command": "bun test --config=/dev/null --timeout=0 ./scripts/apfs-test-root.test.ts",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
@@ -784,8 +784,8 @@
             "transitive": false
           }
         ],
+        "//": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests from the owning workspace's prebuilt nextest archive, whose output bytes are hashed inputs. Compilation is cached and paid by cargo-test-archive before this run; the private runtime TMPDIR cannot change the compiled environment, so the 120s guard covers only extraction and tests.",
         "options": {
-          "comment": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests from the owning workspace's prebuilt nextest archive, whose output bytes are hashed inputs. Compilation is cached and paid by cargo-test-archive before this run; the private runtime TMPDIR cannot change the compiled environment, so the 120s guard covers only extraction and tests.",
           "command": "bun packages/cowshed/scripts/host-controller-test.ts",
           "cwd": ".",
           "idleTimeoutMs": 180000,
