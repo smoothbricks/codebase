@@ -865,16 +865,25 @@ read or write clipped to the wait's bound, and no socket timeout option, since D
 has shut down and a kernel timeout restarts on every partial read. Both name the peer by the pid the kernel reports for
 the connection (`peer_pid`: `LOCAL_PEERPID` on Darwin, `SO_PEERCRED` on Linux), never by who owns the socket path.
 
-| class     | covers                                                     | bound |
-| --------- | ---------------------------------------------------------- | ----- |
-| control   | connecting to a running daemon and sending it one request  | 5 s   |
-| handshake | connecting to a peer that should be running, and its hello | 10 s  |
-| reap      | a child's exit once its pipes closed or it was killed      | 5 s   |
-| ffi       | the image lease a disk-image command holds for its run     | 120 s |
-| ffi       | one launchctl print or bootstrap                           | 10 s  |
-| ffi       | a launchctl bootout of an agent whose exit timeout is ET   | ET+1  |
-| ffi       | a launchctl kickstart -k of that agent                     | ET+11 |
-| ffi       | one codesign signature or verification of the host binary  | 10 s  |
+| class       | covers                                                                                                           | bound |
+| ----------- | ---------------------------------------------------------------------------------------------------------------- | ----- |
+| control     | connecting to a running daemon and sending it one request                                                        | 5 s   |
+| handshake   | connecting to a peer that should be running, and its hello                                                       | 10 s  |
+| reap        | a child's exit once its pipes closed or it was killed                                                            | 5 s   |
+| ffi         | the image lease a disk-image command holds for its run                                                           | 120 s |
+| ffi         | one launchctl print or bootstrap                                                                                 | 10 s  |
+| ffi         | a launchctl bootout of an agent whose exit timeout is ET                                                         | ET+1  |
+| ffi         | a launchctl kickstart -k of that agent                                                                           | ET+11 |
+| ffi         | one codesign signature or verification of the host binary                                                        | 10 s  |
+| remote-http | one request to GitHub, Forgejo or the npm registry, or one `gh` command that makes one, through its whole answer | 17 s  |
+
+The remote-http bound is measured, not chosen: the slowest kind's p99 × 20, rounded up to the second. Measured
+2026-10-25 23:10–23:14 UTC from the macOS development host (18 CPUs, load average 15–28 while other gates ran), each
+sample a fresh connection read to the end of its body (`tooling/measure/remote-http-p99.sh 100`; the `gh` kinds with 60
+samples): GitHub REST `GET /repos/…/releases` p99 0.59 s, npm registry abbreviated packument p99 0.06 s, Forgejo (the
+project's own instance) `GET /api/v1/repos/search` p99 0.22 s, `gh api` one request p99 0.78 s, and `gh secret list` p99
+0.82 s, the slowest, which gives 16.4 s. Only reads were measured; a write (a release's create or update, a workflow
+dispatch, `gh secret set`'s key read and write) is held to the same bound. A new bound needs a new measurement here.
 
 A control or handshake bound covers establishing the connection and sending the request, which the kernel completes
 whatever the peer's load. The answer itself is bounded by the heartbeat silence below, never by a total, so a saturated
