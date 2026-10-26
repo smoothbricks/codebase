@@ -23,7 +23,11 @@ use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state, validate_state,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
+
+#[path = "common/memory.rs"]
+mod memory;
 
 const MAGICS: &[u32] = DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 
@@ -128,7 +132,7 @@ impl Interner for TestInterner {
     }
 }
 
-fn base_slot(slot: u32, kind: SlotType) -> LogicalSlot {
+fn base_slot<'text>(slot: u32, kind: SlotType) -> LogicalSlot<'text> {
     LogicalSlot {
         slot,
         kind,
@@ -144,7 +148,11 @@ fn base_slot(slot: u32, kind: SlotType) -> LogicalSlot {
     }
 }
 
-fn row(key: LogicalValue, fields: Vec<Option<LogicalValue>>, cmp_ts: Option<f64>) -> LogicalRow {
+fn row<'text>(
+    key: LogicalValue<'text>,
+    fields: Vec<Option<LogicalValue<'text>>>,
+    cmp_ts: Option<f64>,
+) -> LogicalRow<'text> {
     LogicalRow {
         key,
         key2: None,
@@ -164,6 +172,107 @@ fn round_trip(
     let back = export_slot(&image, logical.slot, enc, interner).expect("export");
     assert_eq!(&back, logical, "export of import is the identity");
     image
+}
+
+#[test]
+fn borrowed_text_import_matches_owned_without_a_text_allocation() {
+    let key = String::from("ключ/borrowed");
+    let value = String::from("text/borrowed/🦀");
+    let enc = SlotEncoding {
+        key: CellEncoding::Interned,
+        value: CellEncoding::Interned,
+        ..SlotEncoding::RAW
+    };
+    let prog = program(1, &halt(slot_def(0, SlotType::HashMap as u8, 8)));
+    let mut interner = TestInterner::default();
+    interner.intern(&key).expect("key admitted before import");
+    interner
+        .intern(&value)
+        .expect("value admitted before import");
+    let mut borrowed = base_slot(0, SlotType::HashMap);
+    borrowed.rows.push(row(
+        LogicalValue::Text(Cow::Borrowed(&key)),
+        vec![Some(LogicalValue::Text(Cow::Borrowed(&value)))],
+        None,
+    ));
+    let mut owned = base_slot(0, SlotType::HashMap);
+    owned.rows.push(row(
+        LogicalValue::Text(Cow::Owned(key.clone())),
+        vec![Some(LogicalValue::Text(Cow::Owned(value.clone())))],
+        None,
+    ));
+    let mut borrowed_image = fresh_image(&prog);
+    let mut owned_image = fresh_image(&prog);
+    memory::with_allocations(0, || {
+        for _ in 0..1024 {
+            let copy = borrowed.rows[0].key.clone();
+            let LogicalValue::Text(Cow::Borrowed(text)) = copy else {
+                panic!("a borrowed logical cell acquired a second owner");
+            };
+            assert_eq!(text.as_ptr(), key.as_ptr());
+            std::hint::black_box(copy);
+        }
+        import_slot(&mut borrowed_image, &borrowed, &enc, &mut interner).expect("borrowed import");
+    });
+    import_slot(&mut owned_image, &owned, &enc, &mut interner).expect("owned import");
+    assert_eq!(borrowed_image, owned_image);
+    assert_eq!(
+        export_slot(&borrowed_image, 0, &enc, &interner).expect("export"),
+        owned
+    );
+    let (_, owned_peak) = memory::peak_bytes(|| std::hint::black_box(key.clone()));
+    let (_, borrowed_peak) =
+        memory::peak_bytes(|| std::hint::black_box(borrowed.rows[0].key.clone()));
+    assert!(owned_peak >= key.len());
+    assert_eq!(borrowed_peak, 0);
+}
+
+#[test]
+fn transforms_preserve_borrowed_text_sources() {
+    struct ReadField;
+    impl ExprEvaluator for ReadField {
+        fn eval<'text>(
+            &mut self,
+            _bytecode: &[u8],
+            _constants: &[u8],
+            row: &TransformRowView<'_, 'text>,
+        ) -> Result<Option<LogicalValue<'text>>, ErrorCode> {
+            Ok(row.fields[0].clone())
+        }
+    }
+    let text = String::from("shared/🦀");
+    let mut old = base_slot(0, SlotType::StructMap);
+    old.field_types = vec![StructFieldType::String];
+    old.rows.push(row(
+        LogicalValue::U32(1),
+        vec![Some(LogicalValue::Text(Cow::Borrowed(&text)))],
+        None,
+    ));
+    let plan = TransformPlan {
+        fields: vec![
+            FieldTransform::Copy(0),
+            FieldTransform::Expr {
+                bytecode: vec![],
+                constants: vec![],
+            },
+        ],
+    };
+    let output = apply_transform(
+        &old,
+        &[StructFieldType::String, StructFieldType::String],
+        &plan,
+        std::slice::from_ref(&old),
+        &mut ReadField,
+    )
+    .expect("copy and expression transform");
+    assert_eq!(output.rows[0].fields.len(), plan.fields.len());
+    for field in &output.rows[0].fields {
+        let Some(LogicalValue::Text(Cow::Borrowed(borrowed))) = field else {
+            panic!("a transform copied borrowed text into another owner");
+        };
+        assert_eq!(borrowed.as_ptr(), text.as_ptr());
+        assert_eq!(*borrowed, text);
+    }
 }
 
 struct Lcg(u64);
@@ -667,12 +776,12 @@ fn generated_hashmap_states_round_trip_and_continue_identically() {
 struct FieldNumberEval;
 
 impl ExprEvaluator for FieldNumberEval {
-    fn eval(
+    fn eval<'text>(
         &mut self,
         bytecode: &[u8],
         _constants: &[u8],
-        row: &TransformRowView<'_>,
-    ) -> Result<Option<LogicalValue>, ErrorCode> {
+        row: &TransformRowView<'_, 'text>,
+    ) -> Result<Option<LogicalValue<'text>>, ErrorCode> {
         let index = usize::from(*bytecode.first().ok_or(ErrorCode::InvalidProgram)?);
         match row.fields.get(index) {
             Some(Some(LogicalValue::U32(v))) => Ok(Some(LogicalValue::F64(f64::from(*v) + 0.5))),
@@ -683,12 +792,12 @@ impl ExprEvaluator for FieldNumberEval {
         }
     }
 
-    fn project(
+    fn project<'text>(
         &mut self,
         bytes: &[u8],
         _reader: &[u8; 32],
-        _row: &TransformRowView<'_>,
-    ) -> Result<Option<LogicalValue>, ErrorCode> {
+        _row: &TransformRowView<'_, 'text>,
+    ) -> Result<Option<LogicalValue<'text>>, ErrorCode> {
         Ok(Some(LogicalValue::Bytes(
             bytes.iter().rev().copied().collect(),
         )))

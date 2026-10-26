@@ -16,6 +16,12 @@ fields carry their encoding in their field type: String and ArrayString are inte
 value-object bytes the caller's codec projects. A bitmap member under an ordinal codec is an interned lane whose
 resolver is that codec, which is how ordinal remapping travels.
 
+LogicalValue<'text>::Text carries Cow<'text, str>. Import adapters borrow text from their certified input for the
+synchronous import rather than copying each element. The caller keeps that source alive until import completes; cloning
+a borrowed cell preserves the same source. Export is a cold ownership boundary: its LogicalSlot<'static> owns text so
+the eager rewrite's frozen basis survives mutation of the source interner. TransformRowView separates the row borrow
+from the text-source lifetime; Copy and evaluator results preserve that lifetime, while computed text may own.
+
 ## 2. Export and import
 
 Export validates the image's geometry through bind_slot before reading any lane; a malformed image is a typed

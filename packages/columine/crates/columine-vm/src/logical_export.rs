@@ -35,6 +35,13 @@
 //! this module owns row iteration, field assembly, coercion to the
 //! target field types, and the allocation bound (one new logical slot,
 //! sized by the old slot's rows times the plan's fields).
+//!
+//! Text is a Cow tied to the caller's source: synchronous import adapters
+//! borrow certified frame/interner text, and cloning a borrowed cell copies
+//! only its view. Export is the cold ownership boundary: its frozen logical
+//! snapshot owns text so the source interner may be mutated during rewrite.
+//! The row-view lifetime is separate from its text-source lifetime; Copy and
+//! expression transforms preserve borrowed text and computed text may own.
 
 use crate::aggregates;
 use crate::bitmap_ops;
@@ -51,6 +58,7 @@ use columine_types::types::{
     arena_elem_size, is_arena_field_type, next_power_of_2, struct_field_size,
 };
 use core::cmp::Ordering;
+use std::borrow::Cow;
 
 // =============================================================================
 // Logical values
@@ -59,7 +67,7 @@ use core::cmp::Ordering;
 /// One logical cell. F64 equality is by IEEE bits, so a NaN the fold stored
 /// round-trips as itself instead of comparing unequal to its own import.
 #[derive(Clone, Debug)]
-pub enum LogicalValue {
+pub enum LogicalValue<'text> {
     Bool(bool),
     U32(u32),
     U64(u64),
@@ -67,13 +75,13 @@ pub enum LogicalValue {
     F64(f64),
     /// An interned value, or a bitmap ordinal under an ordinal codec,
     /// carried as the text it names.
-    Text(String),
+    Text(Cow<'text, str>),
     /// Opaque value-object bytes; schema projection is the caller's codec.
     Bytes(Vec<u8>),
-    Array(Vec<LogicalValue>),
+    Array(Vec<LogicalValue<'text>>),
 }
 
-impl PartialEq for LogicalValue {
+impl PartialEq for LogicalValue<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Bool(a), Self::Bool(b)) => a == b,
@@ -89,9 +97,9 @@ impl PartialEq for LogicalValue {
     }
 }
 
-impl Eq for LogicalValue {}
+impl Eq for LogicalValue<'_> {}
 
-impl LogicalValue {
+impl LogicalValue<'_> {
     /// The variant's name, for typed mismatch causes.
     pub(crate) fn kind_name(&self) -> &'static str {
         match self {
@@ -158,18 +166,18 @@ fn cmp_logical(a: &LogicalValue, b: &LogicalValue) -> Ordering {
 /// timestamp lane the fold keeps for latest-wins kinds, when the slot has
 /// one; without it a rebuilt slot would let a stale row win.
 #[derive(Clone, Debug)]
-pub struct LogicalRow {
-    pub key: LogicalValue,
+pub struct LogicalRow<'text> {
+    pub key: LogicalValue<'text>,
     /// The second key lane of a StructMap2 row.
-    pub key2: Option<LogicalValue>,
+    pub key2: Option<LogicalValue<'text>>,
     /// Present fields in descriptor order; None is a field the row never
     /// set (its presence bit is clear), which a reader decodes by its own
     /// wrapper, exactly as in the image.
-    pub fields: Vec<Option<LogicalValue>>,
+    pub fields: Vec<Option<LogicalValue<'text>>>,
     pub cmp_ts: Option<f64>,
 }
 
-impl PartialEq for LogicalRow {
+impl PartialEq for LogicalRow<'_> {
     fn eq(&self, other: &Self) -> bool {
         let ts_eq = match (self.cmp_ts, other.cmp_ts) {
             (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
@@ -180,14 +188,14 @@ impl PartialEq for LogicalRow {
     }
 }
 
-impl Eq for LogicalRow {}
+impl Eq for LogicalRow<'_> {}
 
 /// An aggregate's continuation: its accumulated value and its count. An
 /// average stores its sum as the value, so value and count together are
 /// what the next batch folds onto.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogicalAggregate {
-    pub value: LogicalValue,
+pub struct LogicalAggregate<'text> {
+    pub value: LogicalValue<'text>,
     pub count: u64,
 }
 
@@ -195,30 +203,30 @@ pub struct LogicalAggregate {
 /// won it. Importing the value without the timestamp would let an older
 /// row overwrite it after the slot is rebuilt.
 #[derive(Clone, Debug)]
-pub struct LogicalScalar {
-    pub value: LogicalValue,
+pub struct LogicalScalar<'text> {
+    pub value: LogicalValue<'text>,
     pub cmp_ts: f64,
 }
 
-impl PartialEq for LogicalScalar {
+impl PartialEq for LogicalScalar<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value && self.cmp_ts.to_bits() == other.cmp_ts.to_bits()
     }
 }
 
-impl Eq for LogicalScalar {}
+impl Eq for LogicalScalar<'_> {}
 
 /// One TTL eviction entry, decoded through the slot's encodings. For hash
 /// maps the value is the mapped value at eviction tracking time; for sets
 /// and bitmaps it is the key itself, as the TTL index stores it.
 #[derive(Clone, Debug)]
-pub struct LogicalEvictionEntry {
+pub struct LogicalEvictionEntry<'text> {
     pub timestamp: f64,
-    pub key: LogicalValue,
-    pub value: LogicalValue,
+    pub key: LogicalValue<'text>,
+    pub value: LogicalValue<'text>,
 }
 
-impl PartialEq for LogicalEvictionEntry {
+impl PartialEq for LogicalEvictionEntry<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.timestamp.to_bits() == other.timestamp.to_bits()
             && self.key == other.key
@@ -226,7 +234,7 @@ impl PartialEq for LogicalEvictionEntry {
     }
 }
 
-impl Eq for LogicalEvictionEntry {}
+impl Eq for LogicalEvictionEntry<'_> {}
 
 /// A condition-tree slot's continuation: its lifecycle state and every
 /// occupied derived-facts cell (live and tombstone identities alike, so
@@ -250,26 +258,26 @@ pub struct LogicalConditionCell {
 
 /// One outer entry of a nested slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogicalNestedEntry {
-    pub outer_key: LogicalValue,
-    pub inner: LogicalInner,
+pub struct LogicalNestedEntry<'text> {
+    pub outer_key: LogicalValue<'text>,
+    pub inner: LogicalInner<'text>,
 }
 
 /// An inner container of a nested slot: a map's or set's rows, or an
 /// aggregate's value and count.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogicalInner {
+pub struct LogicalInner<'text> {
     pub kind: SlotType,
     /// Raw AggType byte for an aggregate inner container.
     pub agg_type: u8,
-    pub rows: Vec<LogicalRow>,
-    pub aggregate: Option<LogicalAggregate>,
+    pub rows: Vec<LogicalRow<'text>>,
+    pub aggregate: Option<LogicalAggregate<'text>>,
 }
 
 /// The logical form of one slot: rows plus every continuation field its
 /// kind keeps outside the rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogicalSlot {
+pub struct LogicalSlot<'text> {
     pub slot: u32,
     pub kind: SlotType,
     /// Raw AggType byte (aggregate and scalar subtype); for a nested slot,
@@ -278,18 +286,18 @@ pub struct LogicalSlot {
     /// Struct field types in descriptor order (struct maps and struct
     /// ordered lists). For a scalar ordered list, the single element type.
     pub field_types: Vec<StructFieldType>,
-    pub rows: Vec<LogicalRow>,
-    pub aggregate: Option<LogicalAggregate>,
-    pub scalar: Option<LogicalScalar>,
-    pub nested: Vec<LogicalNestedEntry>,
+    pub rows: Vec<LogicalRow<'text>>,
+    pub aggregate: Option<LogicalAggregate<'text>>,
+    pub scalar: Option<LogicalScalar<'text>>,
+    pub nested: Vec<LogicalNestedEntry<'text>>,
     /// Live TTL eviction-index entries, in stored order.
-    pub eviction: Vec<LogicalEvictionEntry>,
+    pub eviction: Vec<LogicalEvictionEntry<'text>>,
     /// Entries in the evicted ring (evict-trigger slots), in stored order.
-    pub evicted: Vec<LogicalEvictionEntry>,
+    pub evicted: Vec<LogicalEvictionEntry<'text>>,
     pub condition: Option<LogicalCondition>,
 }
 
-impl LogicalSlot {
+impl LogicalSlot<'_> {
     fn empty(slot: u32, kind: SlotType, agg_type: u8) -> Self {
         Self {
             slot,
@@ -426,13 +434,17 @@ fn wrap<T>(op: &'static str, slot: u32, result: CauseResult<T>) -> Result<T, Log
 // Cell codecs
 // =============================================================================
 
-fn decode_u32(raw: u32, enc: CellEncoding, lookup: &dyn InternLookup) -> CauseResult<LogicalValue> {
+fn decode_u32(
+    raw: u32,
+    enc: CellEncoding,
+    lookup: &dyn InternLookup,
+) -> CauseResult<LogicalValue<'static>> {
     match enc {
         CellEncoding::Raw => Ok(LogicalValue::U32(raw)),
         CellEncoding::Boolean => Ok(LogicalValue::Bool(raw != 0)),
         CellEncoding::Interned => lookup
             .text(raw)
-            .map(|text| LogicalValue::Text(text.to_owned()))
+            .map(|text| LogicalValue::Text(text.to_owned().into()))
             .ok_or(LogicalExportCause::UnknownInternId(raw)),
     }
 }
@@ -503,12 +515,12 @@ fn export_eviction(
     key_enc: CellEncoding,
     value_enc: CellEncoding,
     lookup: &dyn InternLookup,
-    out: &mut LogicalSlot,
+    out: &mut LogicalSlot<'static>,
 ) -> CauseResult<()> {
     if !meta.has_ttl() {
         return Ok(());
     }
-    let read_entries = |base: u32, count: u32| -> CauseResult<Vec<LogicalEvictionEntry>> {
+    let read_entries = |base: u32, count: u32| -> CauseResult<Vec<LogicalEvictionEntry<'static>>> {
         let mut entries = Vec::with_capacity(count as usize);
         for i in 0..count {
             let at = base + i * state_init::EVICTION_ENTRY_SIZE;
@@ -530,7 +542,11 @@ fn export_eviction(
     Ok(())
 }
 
-fn aggregate_value(state: &[u8], offset: u32, agg_byte: u8) -> CauseResult<LogicalAggregate> {
+fn aggregate_value(
+    state: &[u8],
+    offset: u32,
+    agg_byte: u8,
+) -> CauseResult<LogicalAggregate<'static>> {
     let kind = if agg_byte == 0 {
         AggType::Sum
     } else {
@@ -556,11 +572,11 @@ fn decode_arena_payload(
     payload: &[u8],
     field_type: StructFieldType,
     lookup: &dyn InternLookup,
-) -> CauseResult<LogicalValue> {
-    let text = |id: u32| -> CauseResult<LogicalValue> {
+) -> CauseResult<LogicalValue<'static>> {
+    let text = |id: u32| -> CauseResult<LogicalValue<'static>> {
         lookup
             .text(id)
-            .map(|t| LogicalValue::Text(t.to_owned()))
+            .map(|t| LogicalValue::Text(t.to_owned().into()))
             .ok_or(LogicalExportCause::UnknownInternId(id))
     };
     let value = match field_type {
@@ -619,7 +635,7 @@ fn decode_row_fields(
     descriptor: &[StructFieldType],
     lookup: &dyn InternLookup,
     mut arena_payload: impl FnMut(u8) -> CauseResult<Option<Vec<u8>>>,
-) -> CauseResult<Vec<Option<LogicalValue>>> {
+) -> CauseResult<Vec<Option<LogicalValue<'static>>>> {
     let mut fields = Vec::with_capacity(descriptor.len());
     let mut offset = bitset_bytes;
     for (index, &field_type) in descriptor.iter().enumerate() {
@@ -637,7 +653,7 @@ fn decode_row_fields(
                 let id = bytes::read_u32(state, at);
                 lookup
                     .text(id)
-                    .map(|t| LogicalValue::Text(t.to_owned()))
+                    .map(|t| LogicalValue::Text(t.to_owned().into()))
                     .ok_or(LogicalExportCause::UnknownInternId(id))?
             }
             StructFieldType::Int64 => LogicalValue::I64(bytes::read_i64(state, at)),
@@ -673,7 +689,7 @@ fn export_slot_inner(
     slot: u32,
     enc: &SlotEncoding,
     lookup: &dyn InternLookup,
-) -> CauseResult<LogicalSlot> {
+) -> CauseResult<LogicalSlot<'static>> {
     let meta = state_init::bind_slot(state, slot).map_err(LogicalExportCause::Vm)?;
     let kind = meta.slot_type();
     let offset = meta.offset;
@@ -961,14 +977,14 @@ fn decode_scalar_cell(
     at: u32,
     elem: StructFieldType,
     lookup: &dyn InternLookup,
-) -> CauseResult<LogicalValue> {
+) -> CauseResult<LogicalValue<'static>> {
     Ok(match elem {
         StructFieldType::UInt32 => LogicalValue::U32(bytes::read_u32(state, at)),
         StructFieldType::String => {
             let id = bytes::read_u32(state, at);
             lookup
                 .text(id)
-                .map(|t| LogicalValue::Text(t.to_owned()))
+                .map(|t| LogicalValue::Text(t.to_owned().into()))
                 .ok_or(LogicalExportCause::UnknownInternId(id))?
         }
         StructFieldType::Int64 => LogicalValue::I64(bytes::read_i64(state, at)),
@@ -984,7 +1000,7 @@ fn export_inner(
     prefix: &NestedPrefix,
     enc: &SlotEncoding,
     lookup: &dyn InternLookup,
-) -> CauseResult<LogicalInner> {
+) -> CauseResult<LogicalInner<'static>> {
     let mut inner = LogicalInner {
         kind: prefix.inner_type,
         agg_type: prefix.inner_agg_type_byte,
@@ -1045,7 +1061,7 @@ pub fn export_slot(
     slot: u32,
     enc: &SlotEncoding,
     lookup: &dyn InternLookup,
-) -> Result<LogicalSlot, LogicalExportError> {
+) -> Result<LogicalSlot<'static>, LogicalExportError> {
     wrap(
         "export_slot",
         slot,
@@ -1139,7 +1155,9 @@ fn no_cmp_ts(row: &LogicalRow) -> CauseResult<()> {
     Ok(())
 }
 
-fn single_field(row: &LogicalRow) -> CauseResult<&LogicalValue> {
+fn single_field<'row, 'text>(
+    row: &'row LogicalRow<'text>,
+) -> CauseResult<&'row LogicalValue<'text>> {
     if row.fields.len() != 1 {
         return Err(LogicalExportCause::FieldShape {
             expected: 1,
@@ -2114,12 +2132,12 @@ pub struct TransformPlan {
 /// (the old value as field 0 for scalar and aggregate slots), its
 /// comparison timestamp, and the whole exported slot set as the frozen
 /// basis for reads of other slots in the set.
-pub struct TransformRowView<'a> {
-    pub key: Option<&'a LogicalValue>,
-    pub key2: Option<&'a LogicalValue>,
-    pub fields: &'a [Option<LogicalValue>],
+pub struct TransformRowView<'a, 'text> {
+    pub key: Option<&'a LogicalValue<'text>>,
+    pub key2: Option<&'a LogicalValue<'text>>,
+    pub fields: &'a [Option<LogicalValue<'text>>],
     pub cmp_ts: Option<f64>,
-    pub basis: &'a [LogicalSlot],
+    pub basis: &'a [LogicalSlot<'text>],
 }
 
 /// The embedder's expression evaluator for field transforms. Evaluation
@@ -2127,32 +2145,32 @@ pub struct TransformRowView<'a> {
 /// view: no clock, no entropy, no live state (the old image is already
 /// frozen in the exported slot set). None is an absent field.
 pub trait ExprEvaluator {
-    fn eval(
+    fn eval<'text>(
         &mut self,
         bytecode: &[u8],
         constants: &[u8],
-        row: &TransformRowView<'_>,
-    ) -> Result<Option<LogicalValue>, ErrorCode>;
+        row: &TransformRowView<'_, 'text>,
+    ) -> Result<Option<LogicalValue<'text>>, ErrorCode>;
 
     /// Project one value-object field's writer bytes to the reader codec
     /// named by its root commitment. The default refuses: an evaluator
     /// with no value-object codecs cannot silently pass writer bytes
     /// through as reader bytes.
-    fn project(
+    fn project<'text>(
         &mut self,
         _bytes: &[u8],
         _reader: &[u8; 32],
-        _row: &TransformRowView<'_>,
-    ) -> Result<Option<LogicalValue>, ErrorCode> {
+        _row: &TransformRowView<'_, 'text>,
+    ) -> Result<Option<LogicalValue<'text>>, ErrorCode> {
         Err(ErrorCode::InvalidProgram)
     }
 }
 
-fn coerce(
-    value: LogicalValue,
+fn coerce<'text>(
+    value: LogicalValue<'text>,
     target: StructFieldType,
     field: u32,
-) -> CauseResult<Option<LogicalValue>> {
+) -> CauseResult<Option<LogicalValue<'text>>> {
     let found = value.kind_name();
     let mismatch = |expected: &'static str| LogicalExportCause::FieldTypeMismatch {
         field,
@@ -2244,13 +2262,13 @@ fn coerce(
     Ok(Some(out))
 }
 
-fn eval_field_transform(
+fn eval_field_transform<'text>(
     up: &FieldTransform,
-    view: &TransformRowView<'_>,
+    view: &TransformRowView<'_, 'text>,
     target: StructFieldType,
     field: u32,
     eval: &mut dyn ExprEvaluator,
-) -> CauseResult<Option<LogicalValue>> {
+) -> CauseResult<Option<LogicalValue<'text>>> {
     match up {
         FieldTransform::Absent => Ok(None),
         FieldTransform::Copy(old) => match view.fields.get(usize::from(*old)) {
@@ -2319,13 +2337,13 @@ fn scalar_target_type(old: &LogicalSlot) -> CauseResult<StructFieldType> {
 /// slot, the plan, and the evaluator's answers. Keys, comparison
 /// timestamps, aggregate counts, and eviction entries carry unchanged:
 /// the plan rewrites values, never row identity or fold continuation.
-pub fn apply_transform(
-    old: &LogicalSlot,
+pub fn apply_transform<'text>(
+    old: &LogicalSlot<'text>,
     target_field_types: &[StructFieldType],
     plan: &TransformPlan,
-    basis: &[LogicalSlot],
+    basis: &[LogicalSlot<'text>],
     eval: &mut dyn ExprEvaluator,
-) -> Result<LogicalSlot, LogicalExportError> {
+) -> Result<LogicalSlot<'text>, LogicalExportError> {
     wrap(
         "apply_transform",
         old.slot,
@@ -2333,13 +2351,13 @@ pub fn apply_transform(
     )
 }
 
-fn apply_transform_inner(
-    old: &LogicalSlot,
+fn apply_transform_inner<'text>(
+    old: &LogicalSlot<'text>,
     target_field_types: &[StructFieldType],
     plan: &TransformPlan,
-    basis: &[LogicalSlot],
+    basis: &[LogicalSlot<'text>],
     eval: &mut dyn ExprEvaluator,
-) -> CauseResult<LogicalSlot> {
+) -> CauseResult<LogicalSlot<'text>> {
     let mut out = old.clone();
     if let Some(aggregate) = &old.aggregate {
         if plan.fields.len() != 1 {
