@@ -434,16 +434,24 @@ async fn run_fetch_helper(
         status = child.wait() => status.map_err(|_| RepoMirrorError::FetchFailed)?,
         _ = plan.cancellation.cancelled() => {
             // A helper that already exited refuses the signal; the reap answers for it either way.
-            let _ = child.start_kill();
+            // A helper that already exited refuses the signal; the reap answers for it either way. One
+            // whose reap expires is dropped: kill_on_drop and tokio's orphan reaper collect it
+            // whenever it exits, and nothing waits on that.
+            let last = match child.start_kill() {
+                Ok(()) => cowshed_os::deadline::Progress::Signalled {
+                    signal: libc::SIGKILL,
+                },
+                Err(_) => cowshed_os::deadline::Progress::Nothing,
+            };
             if let Err(failure) = cowshed_os::deadline::reap_async(
                 "git fetch helper",
                 &mut child,
                 &cowshed_os::deadline::start("reap cancelled git fetch helper", cowshed_os::deadline::REAP),
-                cowshed_os::deadline::Progress::Signalled { signal: libc::SIGKILL },
+                last,
             )
             .await
             {
-                cowshed_os::eprintln!("cowshed: {failure}");
+                cowshed_os::eprintln!("cowshed: {failure}; it is collected when it exits");
             }
             writer.abort();
             reader.abort();

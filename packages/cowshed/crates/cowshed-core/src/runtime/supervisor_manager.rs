@@ -520,10 +520,29 @@ impl SupervisorManager {
                 return answer;
             }
             if tokio::time::Instant::now() >= deadline {
-                let _ = child.start_kill();
+                let killed = child.start_kill();
+                let reaped = cowshed_os::deadline::reap_async(
+                    "supervisor",
+                    &mut child,
+                    &cowshed_os::deadline::start(
+                        "reap unserving supervisor",
+                        cowshed_os::deadline::REAP,
+                    ),
+                    cowshed_os::deadline::Progress::Signalled {
+                        signal: libc::SIGKILL,
+                    },
+                )
+                .await;
+                // A child dropped unreaped is collected by tokio's orphan reaper when it exits.
+                let ended = match (killed, reaped) {
+                    (_, Ok(_)) => String::new(),
+                    (killed, Err(reap)) => {
+                        format!(" (kill: {killed:?}; {reap}; it is collected when it exits)")
+                    }
+                };
                 return Err(CowshedError::environment_missing(
                     format!(
-                        "the supervisor of workspace {} did not serve within {} seconds",
+                        "the supervisor of workspace {} did not serve within {} seconds{ended}",
                         authority.workspace,
                         START_BOUND.as_secs()
                     ),
@@ -1101,11 +1120,31 @@ const SAME_BUILD_BOUND: Duration = Duration::from_secs(10);
 /// ([`OtherBuild`]), whose hint names the install that ends the disagreement.
 ///
 /// No manager answering is not a disagreement: there is no other build to refuse this one, and
-/// the verbs that need a daemon say so themselves.
+/// the verbs that need a daemon say so themselves. No socket, or one nothing listens on (Darwin
+/// refuses at once, as it does a full queue, which cannot be told apart), is none answering. A
+/// connect that has not completed at the handshake bound is a manager that is there and stuck,
+/// and fails the verb before it changes anything.
 pub async fn require_same_build(store_root: &Path) -> Result<()> {
     let path = manager_socket_path(store_root);
-    let Ok(mut stream) = connect_manager(&path).await else {
-        return Ok(());
+    let mut stream = match connect_manager(&path).await {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "the cowshed daemon at {} did not take a build check: {error}",
+                    path.display()
+                ),
+                "cowshed gateway start",
+            ));
+        }
     };
     write_json(
         &mut stream,

@@ -532,8 +532,9 @@ pub fn take(
         // it was told at its cadence; the lock is released at once, since only its end matters.
         // The first telling is what `ahead_of` just read; each later one looks again.
         let mut first = true;
-        // WHY unbounded: a land waits for the land ahead for as long as that land's turn runs,
-        // telling its place at its cadence; the land ahead's exit or the operator's interrupt ends it.
+        // WHY unbounded: debt: a land waits for the land ahead for as long as that land's turn runs,
+        // telling its place and the holder at its cadence; a land ahead that wedges holding its
+        // ticket stalls this one until the operator interrupts. Moves to cowshed_os::flock.
         #[allow(clippy::disallowed_methods)]
         wait_telling(
             move || nearest.lock_shared(),

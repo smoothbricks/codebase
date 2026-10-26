@@ -465,23 +465,35 @@ pub(crate) async fn stop_backend(
                 "cowshed: Nx cache backend for {repo_id} did not exit within {}s of SIGTERM; killing it",
                 BACKEND_STOP_GRACE.as_secs()
             );
-            process
-                .start_kill()
-                .map_err(|error| failed("kill", error))?;
-            cowshed_os::deadline::reap_async(
+            let killed = process.start_kill();
+            let last = match killed {
+                Ok(()) => cowshed_os::deadline::Progress::Signalled {
+                    signal: libc::SIGKILL,
+                },
+                Err(_) => cowshed_os::deadline::Progress::Signalled {
+                    signal: libc::SIGTERM,
+                },
+            };
+            // A backend whose reap expires is dropped: kill_on_drop and tokio's orphan reaper
+            // collect it whenever it exits, and nothing waits on that.
+            let reaped = cowshed_os::deadline::reap_async(
                 "Nx cache backend",
                 &mut process,
                 &cowshed_os::deadline::start(
                     "reap killed Nx cache backend",
                     cowshed_os::deadline::REAP,
                 ),
-                cowshed_os::deadline::Progress::Signalled {
-                    signal: libc::SIGKILL,
-                },
+                last,
             )
-            .await
-            .map(|_| ())
-            .map_err(|error| failed("reap", error.into()))
+            .await;
+            match (killed, reaped) {
+                (_, Ok(_)) => Ok(()),
+                (Ok(()), Err(reap)) => Err(failed("reap", reap.into())),
+                (Err(kill), Err(reap)) => Err(failed(
+                    "kill",
+                    std::io::Error::new(kill.kind(), format!("{kill}; {reap}")),
+                )),
+            }
         }
     }
 }

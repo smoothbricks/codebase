@@ -445,6 +445,10 @@ impl Host {
     ///
     /// `direnv allow` rewrites its allow file on every call, and that file is one of the inputs
     /// direnv records: approving an approved file would mark every generation stale.
+    // WHY unbounded: direnv's own bookkeeping (`status` reads its trust store, `allow` writes it),
+    // which waits on no other process; the orphan guard retires this host once the supervisor that
+    // asked is gone (11_shell.md).
+    #[allow(clippy::disallowed_methods)]
     fn approve(&self, envrc: &Path, stdout: OwnedFd, stderr: OwnedFd) -> io::Result<RawWaitStatus> {
         let directory = envrc.parent().unwrap_or(Path::new("/"));
         let status = self
@@ -651,6 +655,9 @@ impl Host {
                     .to_string()));
             }
         };
+        // WHY unbounded: `direnv status` reads direnv's own trust store and waits on no other
+        // process; the orphan guard retires this host once the supervisor that asked is gone.
+        #[allow(clippy::disallowed_methods)]
         let status = self
             .tool(directory)
             .arg("status")
@@ -881,40 +888,50 @@ impl Held {
         }
     }
 
-    /// Collect the leader, exited or killed (`last`), within the reap bound. Its id may name
+    /// Collect the leader, exited or killed (`last`), within the reap bound. A leader collected,
+    /// or handed to a collector at the bound, is no longer this host's to signal: its id may name
     /// another process from here on.
     fn reap(&mut self, last: Progress) -> io::Result<()> {
-        reap_child("command leader", self.pid, last)?;
-        self.reaped = true;
-        Ok(())
+        let reaped = reap_child("command leader", self.pid, last);
+        self.reaped = !matches!(reaped, Err(deadline::ReapError::Wait { .. }));
+        reaped.map_err(io::Error::from)
     }
 }
 
 /// Collect this host's own child `pid`, `role` to it, exited or killed, within the reap bound
-/// (specs/cowshed/05_gateway.md, "Deadlines"), `last` being what this host last did to it. One stuck
-/// in an uninterruptible kernel call is named, not waited for, and stays unreaped.
-pub(crate) fn reap_child(role: &'static str, pid: libc::pid_t, last: Progress) -> io::Result<()> {
-    let id =
-        u32::try_from(pid).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    deadline::await_exit(
+/// (specs/cowshed/05_gateway.md, "Deadlines"), `last` being what this host last did to it. One still
+/// running or still in its exit at the bound (an uninterruptible kernel call) is named and handed
+/// to a collector thread (`deadline::collect_pid_later`), never waited for here.
+pub(crate) fn reap_child(
+    role: &'static str,
+    pid: libc::pid_t,
+    last: Progress,
+) -> Result<(), deadline::ReapError> {
+    let id = u32::try_from(pid).map_err(|error| deadline::ReapError::Wait {
+        op: "reap child",
         role,
-        id,
-        &deadline::start("reap child", deadline::REAP),
-        last,
-    )?;
-    loop {
-        // WHY unbounded: `await_exit` has seen the child exit, so it is collected at once.
-        #[allow(clippy::disallowed_methods)]
-        // SAFETY: `pid` is this host's own child; a null status pointer is allowed.
-        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
-        if waited == pid {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
+        pid: 0,
+        elapsed: std::time::Duration::ZERO,
+        source: io::Error::new(io::ErrorKind::InvalidInput, error),
+    })?;
+    let budget = deadline::start("reap child", deadline::REAP);
+    let reaped = deadline::await_exit(role, id, &budget, last).and_then(|()| {
+        deadline::collect_exited(role, id, &budget, last, || {
+            // WHY unbounded: `WNOHANG` returns at once.
+            #[allow(clippy::disallowed_methods)]
+            // SAFETY: `pid` is this host's own child; a null status pointer is allowed.
+            let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            match waited {
+                0 => Ok(None),
+                waited if waited == pid => Ok(Some(())),
+                _ => Err(io::Error::last_os_error()),
+            }
+        })
+    });
+    if matches!(reaped, Err(deadline::ReapError::Expired(_))) {
+        deadline::collect_pid_later(role, pid);
     }
+    reaped
 }
 
 impl Drop for Held {

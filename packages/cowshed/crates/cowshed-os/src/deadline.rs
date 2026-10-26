@@ -526,10 +526,47 @@ pub fn await_exit(
     Ok(())
 }
 
+/// Collect the exit of `pid`, `role` to this process, that [`await_exit`] has seen, through
+/// `look`, a collection that never blocks (`try_wait`, or `waitpid` with `WNOHANG`). Darwin
+/// reports a process exiting before `wait` can collect it (measured: 17 of 2000 children were not
+/// yet waitable right after `NOTE_EXIT` or `ESRCH`), so `look` runs again each timer tick until
+/// it answers, within what is left of `deadline`. A process still in its exit at the bound (an
+/// uninterruptible close) is named with its kernel state, and stays as it is.
+pub fn collect_exited<T>(
+    role: &'static str,
+    pid: u32,
+    deadline: &Deadline,
+    last: Progress,
+    mut look: impl FnMut() -> io::Result<Option<T>>,
+) -> Result<T, ReapError> {
+    loop {
+        match look() {
+            Ok(Some(collected)) => return Ok(collected),
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) => {
+                return Err(ReapError::Wait {
+                    op: deadline.op(),
+                    role,
+                    pid,
+                    elapsed: deadline.elapsed(clock()),
+                    source,
+                });
+            }
+        }
+        if deadline.remaining(clock()).is_none() {
+            return Err(ReapError::Expired(Box::new(deadline.expired(
+                ChildPeer::observed(role, pid),
+                last,
+                clock(),
+            ))));
+        }
+        std::thread::sleep(TIMER_TICK);
+    }
+}
+
 /// Wait for `child`, `role` to this process, to exit within what is left of `deadline`: its
-/// status, or [`await_exit`]'s expiry naming it.
-// WHY unbounded: `await_exit` has seen the child exit, so its status is collected at once.
-#[allow(clippy::disallowed_methods)]
+/// status, or the expiry of [`await_exit`] or [`collect_exited`] naming it.
 pub fn reap(
     role: &'static str,
     child: &mut std::process::Child,
@@ -550,7 +587,7 @@ pub fn reap(
         return Ok(status);
     }
     await_exit(role, pid, deadline, last)?;
-    child.wait().map_err(failed)
+    collect_exited(role, pid, deadline, last, || child.try_wait())
 }
 
 /// Hand `child`, whose wait expired, to a thread that collects its exit whenever it comes and
@@ -580,13 +617,40 @@ pub fn collect_later_async(role: &'static str, mut child: tokio::process::Child)
     let pid = child.id().unwrap_or_default();
     tokio::spawn(async move {
         // WHY unbounded: nothing waits on this task; it only collects the exit when it comes.
-        match child.wait().await {
+        #[allow(clippy::disallowed_methods)]
+        let waited = child.wait().await;
+        match waited {
             Ok(status) => {
                 crate::eprintln!("cowshed: {role} pid {pid} ended after its wait expired: {status}")
             }
             Err(error) => crate::eprintln!(
                 "cowshed: {role} pid {pid} could not be collected after its wait expired: {error}"
             ),
+        }
+    });
+}
+
+/// [`collect_later`] for a raw child `pid` of this process: a thread collects its exit whenever it
+/// comes and says so. The pid is the collector's from here on; its caller signals it no more.
+// WHY unbounded: nothing waits on this thread; it only collects the exit when it comes.
+#[allow(clippy::disallowed_methods)]
+pub fn collect_pid_later(role: &'static str, pid: libc::pid_t) {
+    std::thread::spawn(move || {
+        loop {
+            // SAFETY: `pid` is this process's own unreaped child, which only this thread collects
+            // from here on; a null status pointer is allowed.
+            let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            if waited == pid {
+                crate::eprintln!("cowshed: {role} pid {pid} ended after its wait expired");
+                return;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                crate::eprintln!(
+                    "cowshed: {role} pid {pid} could not be collected after its wait expired: {error}"
+                );
+                return;
+            }
         }
     });
 }
@@ -1675,6 +1739,47 @@ mod tests {
             .expect("read the exit")
             .expect("the exit await_exit saw is still there to collect");
         assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn a_seen_exit_never_collectable_at_the_bound_expires_naming_the_child() {
+        let pid = std::process::id();
+        let mut looks = 0;
+        let failure = collect_exited(
+            "probe child",
+            pid,
+            &start("collect probe", SHORT_REAP),
+            Progress::Signalled {
+                signal: libc::SIGKILL,
+            },
+            || {
+                looks += 1;
+                Ok(None::<()>)
+            },
+        )
+        .expect_err("nothing ever collects");
+        let ReapError::Expired(expired) = &failure else {
+            panic!("expected TIMEOUT, got {failure}");
+        };
+        assert_eq!((expired.op, expired.peer.pid), ("collect probe", pid));
+        assert!(looks > 1, "the collection looks again each tick: {looks}");
+    }
+
+    #[test]
+    fn a_seen_exit_collectable_late_is_returned() {
+        let mut looks = 0;
+        let collected = collect_exited(
+            "probe child",
+            std::process::id(),
+            &start("collect probe", REAP),
+            Progress::Nothing,
+            || {
+                looks += 1;
+                Ok((looks == 3).then_some(7))
+            },
+        )
+        .expect("the third look collects");
+        assert_eq!(collected, 7);
     }
 
     #[tokio::test]

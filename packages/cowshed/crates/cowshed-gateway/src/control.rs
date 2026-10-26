@@ -1211,12 +1211,30 @@ async fn serve<R, W>(
                 None => None,
                 Some(path) => match connect_parent(path).await {
                     Ok(stream) => Some((path.to_path_buf(), stream)),
-                    Err(error) => {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
                         cowshed_os::eprintln!(
                             "cowshed: the requester's CPU pool {} does not answer ({error}); `{command}` asks the host budget alone",
                             path.display()
                         );
                         None
+                    }
+                    // Not absent: asking the host alone would admit the job twice beside a live pool.
+                    Err(error) => {
+                        let mut writer = writer;
+                        let refused = failure(
+                            ControlFailureCode::Rejected,
+                            format!(
+                                "the requester's CPU pool {} did not take its connect ({error}); `{command}` is refused",
+                                path.display()
+                            ),
+                        );
+                        let _ = write_response(&mut writer, &refused).await;
+                        return;
                     }
                 },
             };

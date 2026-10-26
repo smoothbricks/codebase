@@ -68,7 +68,15 @@ impl InstallSlot {
                 // runs, said on stderr first; the operator's interrupt ends it. debt: a holder that
                 // wedges stalls every later install. Moves to cowshed_os::flock::exclusive.
                 #[allow(clippy::disallowed_methods)]
-                let locked = tokio::task::spawn_blocking(move || lock.lock().map(|()| lock)).await;
+                let locked = tokio::task::spawn_blocking(move || {
+                    loop {
+                        match lock.lock() {
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            taken => break taken.map(|()| lock),
+                        }
+                    }
+                })
+                .await;
                 locked
                     .map_err(|error| {
                         CowshedError::internal(format!(
@@ -631,7 +639,7 @@ pub(crate) mod tests {
         assert_eq!(command.get_args().collect::<Vec<_>>(), ours);
         // The install's next one renames the stable name; the copy this step resolved still runs.
         std::fs::remove_file(bin.join(crate::launchd::COWSHED_BINARY_NAME)).unwrap();
-        let ran = command.output().expect("run the installed copy");
+        let ran = command.output_bounded().expect("run the installed copy");
         let mut expected = String::new();
         for argument in &ours {
             expected.push_str(&argument.to_string_lossy());

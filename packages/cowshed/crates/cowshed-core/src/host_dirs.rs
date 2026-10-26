@@ -73,7 +73,12 @@ pub fn wait_for_running_install(support_directory: &Path) -> std::io::Result<boo
     // stderr first; the operator's interrupt ends it. debt: an install that wedges holding the slot
     // stalls the step. Moves to cowshed_os::flock.
     #[allow(clippy::disallowed_methods)]
-    lock.lock_shared()?;
+    loop {
+        match lock.lock_shared() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            taken => break taken?,
+        }
+    }
     Ok(true)
 }
 

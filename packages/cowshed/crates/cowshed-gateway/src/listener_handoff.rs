@@ -131,7 +131,9 @@ fn one(mut descriptors: Vec<OwnedFd>) -> io::Result<OwnedFd> {
 }
 
 /// Connect to the handoff socket, or `None` when no install serves it: no socket file, or one a
-/// crashed install left that nothing listens on.
+/// crashed install left that nothing listens on. Darwin refuses a full queue the same way; that
+/// reads as no install too, and cannot happen here: the socket's only clients are one new gateway
+/// and the draining one, far below the listener's backlog (std's `bind`, 128).
 // WHY unbounded: Darwin answers a unix connect in the call, refused when nothing listens or the
 // queue is full, never parked (this module is macOS-only).
 #[allow(clippy::disallowed_methods)]

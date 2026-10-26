@@ -163,6 +163,9 @@ fn requeue_when_free(
     again: mpsc::Sender<(PathBuf, ReleaseRecord)>,
 ) {
     let named = entry.clone();
+    // WHY unbounded: a detached thread: nothing waits on it; it queues the entry again whenever
+    // its holder lets go.
+    #[allow(clippy::disallowed_methods)]
     let waiting = std::thread::Builder::new()
         .name("image-cleanup-held".to_owned())
         .spawn(move || {
@@ -278,7 +281,7 @@ mod tests {
         let entry = root.join("0123.dmg");
         std::fs::write(&entry, b"released").expect("entry");
         let holder = std::fs::File::open(&entry).expect("the holder's descriptor");
-        holder.lock().expect("the holder takes the entry");
+        holder.try_lock().expect("the holder takes the entry");
         let (again, queue) = mpsc::channel();
         requeue_when_free(entry.clone(), ReleaseRecord::default(), again);
         assert!(queue.try_recv().is_err(), "not queued while it is held");

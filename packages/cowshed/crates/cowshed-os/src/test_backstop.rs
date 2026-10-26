@@ -152,8 +152,13 @@ impl ChildBackstop for std::process::Child {
         drop(self.stdin.take());
         let deadline = deadline::start("test wait", BACKSTOP);
         let pumps = OutputPumps::start(&mut self);
-        let status = deadline::reap(TEST_CHILD, &mut self, &deadline, Progress::Nothing)
-            .map_err(io::Error::from)?;
+        let status = match deadline::reap(TEST_CHILD, &mut self, &deadline, Progress::Nothing) {
+            Ok(status) => status,
+            Err(failure) => {
+                deadline::collect_later(TEST_CHILD, self);
+                return Err(failure.into());
+            }
+        };
         let (stdout, stderr) = pumps
             .join(TEST_CHILD, self.id(), &deadline)
             .map_err(io::Error::from)?;
