@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { chmodSync, existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { createConnection, createServer } from 'node:net';
+import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -626,9 +626,19 @@ async function listeningChild(socketPath: string): Promise<Listener> {
   return { pid, stop: () => stopChild(child) };
 }
 
-/** Binds `socketPath` from this process, so the replacement exists before a daemon's exit could remove it. */
+/**
+ * Binds `socketPath` from this process, so the replacement exists before a daemon's exit could remove it. Like a
+ * listener that outlived its daemon, it takes every connection and neither reads nor writes. Closing it destroys the
+ * connections it still holds, because `server.close` waits for each to end, and an unread connection never sees its
+ * peer go: a request larger than the socket's read buffer pauses it, and bun then waits for that end forever, spinning
+ * (a CI-sized environment in the client's first request hung nx-plugin:test-shard3 with no process left but the runner).
+ */
 async function listenInProcess(socketPath: string): Promise<() => Promise<void>> {
-  const server = createServer(() => {});
+  const connections = new Set<Socket>();
+  const server = createServer((connection) => {
+    connections.add(connection);
+    connection.once('close', () => connections.delete(connection));
+  });
   const listening = Promise.withResolvers<void>();
   server.once('error', listening.reject);
   server.listen(socketPath, () => listening.resolve());
@@ -636,6 +646,7 @@ async function listenInProcess(socketPath: string): Promise<() => Promise<void>>
   return () => {
     const closed = Promise.withResolvers<void>();
     server.close(() => closed.resolve());
+    for (const connection of connections) connection.destroy();
     return closed.promise;
   };
 }
@@ -1280,11 +1291,8 @@ it('fails a request naming the pid and socket when the recorded daemon is gone a
       await fixtureWorkspace(workspace);
       const socketPath = join(socketDirectory, 'd.sock');
       await mkdir(socketDirectory, { recursive: true });
-      // The listener a surviving process kept: it takes every connection and never writes.
-      const listening = Promise.withResolvers<void>();
-      const leftover = createServer(() => {}).once('error', listening.reject);
-      leftover.listen(socketPath, listening.resolve);
-      await listening.promise;
+      // The listener a surviving process kept: it takes every connection and never answers.
+      const closeLeftover = await listenInProcess(socketPath);
       // The daemon the record names: a process that has ended.
       const ended = spawn('node', ['-e', ''], { stdio: 'ignore' });
       const gonePid = ended.pid;
@@ -1318,9 +1326,7 @@ it('fails a request naming the pid and socket when the recorded daemon is gone a
       } finally {
         // The record names a pid nothing holds; the fixture's retirement must not signal a reuse of it.
         await rm(recordPath(workspace), { force: true });
-        const closed = Promise.withResolvers<void>();
-        leftover.close(() => closed.resolve());
-        await closed.promise;
+        await closeLeftover();
       }
     },
     FIXTURE_WORKSPACE,
