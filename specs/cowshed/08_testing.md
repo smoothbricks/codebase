@@ -805,8 +805,8 @@ never independent test deadlines. A test proves a descriptor's release by the ke
 non-blocking probe at the spawn's return or at the child's reaping.
 
 Land-turn fixtures observe queued replies and executed-command readiness before asserting their queue and order
-snapshots. Detached after-land records are read on a vnode subscription armed before the first lands.log read, not on an
-elapsed-time poll.
+snapshots. The after-land job's records (a background job of main's supervisor, never awaited by the land) are read on a
+vnode subscription armed before the first lands.log read, not on an elapsed-time poll.
 
 An unfinished test name is not holder attribution. During the final ten seconds of an unchanged no-progress interval,
 the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed
