@@ -1882,24 +1882,89 @@ mod tests {
             unavailable => panic!("this platform's source gave no bytes: {unavailable:?}"),
         }
     }
+    /// A killed run's io root stays beside the test binary, where no shared-temp sweep
+    /// looks: the next start runs that sweep against this explicit parent before minting
+    /// its own claimed root. A live owner is kept by the sweep's recorded-pid check; a
+    /// dead one's root is archived as evidence and expired by the trash sweep.
+    fn reclaim_dead_io_roots(parent: &std::path::Path) {
+        use cowshed_os::scratch::{PASS_ENTRIES, Reaper, TrashReaper};
+        // The sweep archives beneath the store through an anchored chain that follows no
+        // symlink, and this parent is spelled through the build volume's link.
+        let store = std::fs::canonicalize(parent).expect("the io parent's canonical path");
+        let mut reaper = Reaper::new([store.clone()]).expect("reaper over the io parent");
+        loop {
+            let report = reaper.sweep(&store, false);
+            for finding in &report.findings {
+                cowshed_os::eprintln!("io root reclaim: {finding}");
+            }
+            if report.examined < PASS_ENTRIES {
+                break;
+            }
+        }
+        let mut trash = TrashReaper::default();
+        loop {
+            match trash.sweep(&store, std::time::SystemTime::now()) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "kept expired io archives under {}: {error}",
+                        parent.display()
+                    );
+                    break;
+                }
+            }
+        }
+    }
 
+    /// The next start reclaims a killed run's io root and keeps a live one's: a claimed
+    /// root named for a fixture this test still holds survives the sweep, and once that
+    /// fixture is reaped the same sweep takes the root.
+    #[test]
+    fn a_killed_runs_io_root_is_reclaimed_by_the_next_start() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let directory = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("its directory")
+            .to_path_buf();
+        let parent = crate::temp_root::TempRoot::new_in(&directory, "cs-process-usage-sweep");
+        let holder = Fixture::start("allocate 1", "allocated");
+        let planted = parent.join(format!(
+            "cs-process-usage-io-p{:08x}0000000",
+            holder.life.identity.pid
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&planted)
+            .expect("plant the earlier run's root");
+        std::fs::write(planted.join("first"), b"io").expect("its io file");
+        reclaim_dead_io_roots(&parent);
+        assert!(planted.is_dir(), "the live holder's root is kept");
+        holder.finish();
+        reclaim_dead_io_roots(&parent);
+        assert!(!planted.exists(), "the reaped holder's root is reclaimed");
+        let archived = std::fs::read_dir(parent.join(".trash/scratch"))
+            .expect("the reclaim archive")
+            .count();
+        assert_eq!(archived, 1, "the reaped holder's root is archived once");
+    }
     /// Each process's storage counters move by the uncached I/O it did itself: a writer and
     /// reader of known sizes, beside a second process doing other I/O, each count their own.
     #[test]
     fn each_process_counts_the_storage_io_it_did_itself() {
         const MIB: u64 = 1 << 20;
         // Beside this test binary: on the build's own storage, never a memory-backed /tmp.
+        // The guard's claimed root keeps the io files off the leak path: Drop removes them
+        // on return and on panic, and the next start's sweep reclaims a killed run's.
         let directory = std::env::current_exe()
             .expect("test binary")
             .parent()
             .expect("its directory")
             .to_path_buf();
-        let path = |name: &str| {
-            directory
-                .join(format!("process-usage-io-{}-{name}", std::process::id()))
-                .display()
-                .to_string()
-        };
+        reclaim_dead_io_roots(&directory);
+        let root = crate::temp_root::TempRoot::new_in(&directory, "cs-process-usage-io");
+        let path = |name: &str| root.join(name).display().to_string();
         let (first, second) = (path("first"), path("second"));
         let mut writer_reader = Fixture::start(&format!("io 8 4 {first}"), "ready");
         let mut writer = Fixture::start(&format!("io 2 0 {second}"), "ready");
@@ -1932,8 +1997,5 @@ mod tests {
         );
         writer_reader.finish();
         writer.finish();
-        for file in [first, second] {
-            std::fs::remove_file(file).expect("remove the fixture file");
-        }
     }
 }
