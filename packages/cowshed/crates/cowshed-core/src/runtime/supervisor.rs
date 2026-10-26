@@ -1689,31 +1689,179 @@ impl SandboxEnvironment {
     }
 }
 
+/// How a one-shot run ([`run_as_job`]) is bounded and watched: the silence it may show
+/// before failing `SILENT`, the live holder it may wait in line behind, the caller's own
+/// end (which ends the run with it), and where its phase is published while it runs.
+pub struct RunControl<'a> {
+    pub silence: Duration,
+    pub queued: Box<dyn FnMut() -> Option<String> + Send>,
+    pub cancelled: tokio::sync::oneshot::Receiver<()>,
+    pub observed: &'a JobRunState,
+}
+/// What a caller waiting on [`run_as_job`] can say about the run while it runs: the phase
+/// the run itself reached, and once its process exists, that process alone -- its pid, its
+/// kernel run state and (on macOS) its command. A report built from a snapshot names what
+/// was observed of the run itself, never a cause inferred from other processes.
+#[derive(Debug, Default)]
+pub struct JobRunState {
+    pid: std::sync::atomic::AtomicI32,
+}
+
+/// One snapshot of a [`JobRunState`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObservedRun {
+    /// No process yet: the sandbox environment is still being prepared host-side.
+    Preparing,
+    /// The run's leader process exists, in kernel state `state`; `command` is its argv
+    /// where the platform lets it be read.
+    Running {
+        pid: i32,
+        state: String,
+        command: Option<String>,
+    },
+}
+
+impl JobRunState {
+    fn spawned(&self, pid: i32) {
+        self.pid.store(pid, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The run as it is now.
+    pub fn snapshot(&self) -> ObservedRun {
+        let pid = self.pid.load(std::sync::atomic::Ordering::SeqCst);
+        if pid == 0 {
+            return ObservedRun::Preparing;
+        }
+        ObservedRun::Running {
+            pid,
+            state: format!("{}", cowshed_os::process::run_state(pid)),
+            command: observed_command(pid),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn observed_command(pid: i32) -> Option<String> {
+    let arguments = cowshed_os::process::process_arguments(pid).ok()?;
+    Some(
+        arguments
+            .argv
+            .iter()
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn observed_command(_pid: i32) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+/// A captured-output failure, named as its own: the file a one-shot run's stream was
+/// collected in could not be made, read back or removed.
+fn run_output_error(error: std::io::Error) -> CowshedError {
+    CowshedError::environment_missing(
+        format!("cannot collect a one-shot run's captured output: {error}"),
+        "check the workspace's temp directory and retry",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+/// Collect a fenced leader that was just SIGKILLed, waiting for the kernel to finish its
+/// exit. Used where the run that owned the fence is already gone, so nothing else reaps it.
+fn reap(fence: super::child_fence::ChildFence) {
+    let pid = fence.pid();
+    loop {
+        match fence.try_reap() {
+            Ok(Some(status)) => {
+                cowshed_os::eprintln!(
+                    "cowshed: project tool pid {pid} ended after its wait expired: {status}"
+                );
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: project tool pid {pid} could not be collected after its wait expired: {error}"
+                );
+                break;
+            }
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+/// One captured stream of a one-shot run: a fresh file in the workspace's exec temp, the
+/// owned descriptor a fenced child takes in place of a pipe. Opened read-write: the child
+/// writes through a clone of the handle and this process reads the bytes back from its own.
+fn run_output_file(sandbox: &SandboxConfig, stream: &str) -> Result<(std::fs::File, PathBuf)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = sandbox
+            .exec_temp_dir
+            .join(format!("run-{}-{next}.{stream}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(run_output_error(error)),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_run_output(file: &mut std::fs::File) -> Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(run_output_error)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(run_output_error)?;
+    Ok(bytes)
+}
+
 /// Run `argv` in `cwd` exactly as a one-shot read-write job of `sandbox` runs it, and collect its
 /// output: the capabilities detected for `cwd`, the executed-child profile, the job environment
 /// without a caller's variables, and the workspace shell's activation inside the sandbox.
+///
+/// The run ends when its process ends, or when `cancelled` resolves -- its sender dropped or
+/// fired, which is how a caller that is itself ending (an interrupted command) goes away:
+/// then the run's whole process group is killed and its leader reaped inside its fence
+/// before this answers, so no activation tree outlives the caller. While it runs,
+/// `observed` names its phase for a caller's wait report.
 ///
 /// Controller-owned discovery asks a project's tools through this rather than through the
 /// pre-activation environment: a checkout whose toolchain comes from its dev environment has
 /// none on the bootstrap PATH, or a different one, and a job only ever meets the activated one.
 ///
-/// The tool runs for as long as it shows progress (`cowshed_os::deadline::output_by_progress`):
-/// output, or CPU used by any of its members, restarts `silence`, and so does a live holder
-/// `queued` names, which the tool waits in line behind. One that shows none for `silence` fails
-/// `SILENT`, naming its running members, which are ended. Its members are its own process group
-/// on Darwin, and on Linux a run leaf of `incarnation`'s cgroups (07_api.md), which it enters
-/// before it executes and which is retired within the reap bound however the run ended: a run that
-/// failed and a leaf left with members are both said. Linux has no sandbox in code (04_sandbox.md,
-/// "Linux enforcement"), so there the one-shot plan's `sandbox-exec` is refused at its exec, after
-/// the child entered its leaf, and the run fails naming it.
+/// The tool runs for as long as it shows progress: output, or CPU used by any of its members,
+/// restarts `silence`, and so does a live holder `queued` names, which the tool waits in line
+/// behind. One that shows none for `silence` fails `SILENT`, naming its running members, which
+/// are ended. Its members are its own process group on Darwin, where the run is a fenced child
+/// decided by the same silence (`cowshed_os::deadline::at_silence`), and on Linux a run leaf of
+/// `incarnation`'s cgroups (07_api.md), which it enters before it executes and which is retired
+/// within the reap bound however the run ended: a run that failed and a leaf left with members
+/// are both said. Linux has no sandbox in code (04_sandbox.md, "Linux enforcement"), so there
+/// the one-shot plan's `sandbox-exec` is refused at its exec, after the child entered its leaf,
+/// and the run fails naming it.
 pub async fn run_as_job(
     sandbox: &SandboxConfig,
     incarnation: &crate::metadata::WorkspaceIncarnation,
     cwd: &Path,
     argv: Vec<OsString>,
-    silence: Duration,
-    mut queued: Box<dyn FnMut() -> Option<String> + Send>,
+    control: RunControl<'_>,
 ) -> Result<std::process::Output> {
+    let RunControl {
+        silence,
+        mut queued,
+        cancelled,
+        observed,
+    } = control;
     let mut ceiling = sandbox.clone();
     ceiling.configure_capabilities_for(cwd)?;
     let policy = SandboxPolicy::render(ceiling)?;
@@ -1721,62 +1869,459 @@ pub async fn run_as_job(
     let caller = BTreeMap::new();
     let environment = sandbox_environment(sandbox, &caller).await?;
     let plan = one_shot_plan(sandbox, profile, cwd.to_owned(), argv)?;
-    let mut command = sandboxed_command(&plan, &environment.child(&caller)).into_std();
+    let mut command = sandboxed_command(&plan, &environment.child(&caller));
     prepare_child_descriptors(&mut command)
         .map_err(ExecError::from)
         .map_err(map_exec_error)?;
     #[cfg(target_os = "linux")]
-    let run = super::job_cgroup::CgroupAuthority::delegated()
-        .and_then(|authority| authority.incarnation(incarnation))
-        .and_then(|cgroups| cgroups.run(ExecClass::Background, cowshed_os::deadline::REAP))
-        .map_err(cgroup_error)?;
-    #[cfg(not(target_os = "linux"))]
-    let _ = incarnation;
-    let program = plan.program.clone();
-    let (ran, retired) = tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
-        let members = cowshed_os::deadline::Members::OwnGroup;
-        #[cfg(target_os = "linux")]
-        let members = cowshed_os::deadline::Members::Leaf {
-            cgroup: run.directory(),
-            path: run.path(),
-        };
-        let output = cowshed_os::deadline::output_by_progress(
-            "project tool",
-            &mut command,
-            members,
-            silence,
-            &mut *queued,
-        );
-        #[cfg(target_os = "linux")]
-        let retired = run.retire(cowshed_os::deadline::REAP).map_err(cgroup_error);
-        #[cfg(not(target_os = "linux"))]
-        let retired = Ok(());
-        (output, retired)
-    })
-    .await
-    .map_err(|error| {
-        CowshedError::internal(format!("the project tool's thread failed: {error}"))
-    })?;
-    let output = ran.map_err(|error| match error {
-        cowshed_os::deadline::RunError::Spawn { source, .. } => {
-            map_exec_error(ExecError::from(classify_spawn_error(source)))
-        }
-        error => CowshedError::environment_missing(
-            format!("{}: {error}", program.display()),
-            "the named process stopped making progress: see what it waits for, then retry",
-        ),
-    });
-    match (output, retired) {
-        (Ok(output), Ok(())) => Ok(output),
-        (Ok(_), Err(unretired)) | (Err(unretired), Ok(())) => Err(unretired),
-        (Err(failed), Err(unretired)) => Err(failed.reworded(|message| {
-            format!(
-                "{message}; and its run leaf was not retired: {}",
-                unretired.message
+    let output = {
+        let run = super::job_cgroup::CgroupAuthority::delegated()
+            .and_then(|authority| authority.incarnation(incarnation))
+            .and_then(|cgroups| cgroups.run(ExecClass::Background, cowshed_os::deadline::REAP))
+            .map_err(cgroup_error)?;
+        // The leaf's census names the run's leader once it enters, and a signal to the
+        // leaf reaches every member: both are read from this duplicate of its directory
+        // while the run itself proceeds on its blocking thread.
+        let leaf = run.directory().try_clone_to_owned().map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot duplicate the run leaf's directory: {error}"),
+                "cowshed doctor --json",
             )
-        })),
-    }
+        })?;
+        let program = plan.program.clone();
+        let mut ran = tokio::task::spawn_blocking(move || {
+            let members = cowshed_os::deadline::Members::Leaf {
+                cgroup: run.directory(),
+                path: run.path(),
+            };
+            let output = cowshed_os::deadline::output_by_progress(
+                "project tool",
+                &mut command,
+                members,
+                silence,
+                &mut *queued,
+            );
+            let retired = run.retire(cowshed_os::deadline::REAP).map_err(cgroup_error);
+            (output, retired)
+        });
+        // However this future ends -- answered, cancelled below, or dropped with its
+        // caller -- the leaf is ended: on drop a detached thread keeps signalling it
+        // until its census is empty.
+        struct LeafEndOnDrop {
+            leaf: Option<std::os::fd::OwnedFd>,
+            finished: bool,
+        }
+        impl Drop for LeafEndOnDrop {
+            fn drop(&mut self) {
+                if self.finished {
+                    return;
+                }
+                let Some(leaf) = self.leaf.take() else {
+                    return;
+                };
+                let _ = cowshed_os::process::signal_cgroup(
+                    std::os::fd::AsFd::as_fd(&leaf),
+                    libc::SIGKILL,
+                );
+                let reaper = std::thread::Builder::new()
+                    .name("cowshed-leaf-end".to_owned())
+                    .spawn(move || {
+                        loop {
+                            let _ = cowshed_os::process::signal_cgroup(
+                                std::os::fd::AsFd::as_fd(&leaf),
+                                libc::SIGKILL,
+                            );
+                            match cowshed_os::process::cgroup_members(std::os::fd::AsFd::as_fd(
+                                &leaf,
+                            )) {
+                                Ok(members) if members.is_empty() => break,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    break;
+                                }
+                                _ => std::thread::sleep(std::time::Duration::from_millis(25)),
+                            }
+                        }
+                    });
+                if reaper.is_err() {
+                    cowshed_os::eprintln!(
+                        "cowshed: a dropped run's leaf was signalled once; no thread could keep ending it"
+                    );
+                }
+            }
+        }
+        let end_leaf = std::os::fd::AsFd::as_fd(&leaf)
+            .try_clone_to_owned()
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("cannot duplicate the run leaf's directory: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?;
+        let mut end_on_drop = LeafEndOnDrop {
+            leaf: Some(end_leaf),
+            finished: false,
+        };
+        tokio::pin!(cancelled);
+        let mut caller_gone = false;
+        let mut reported: Option<i32> = None;
+        let joined = loop {
+            // The leader enters the leaf alone before it executes, so the first
+            // member a census sees names it; a named member since gone is replaced,
+            // never left as the run's name.
+            let tick = if reported.is_none() {
+                std::time::Duration::from_millis(25)
+            } else {
+                std::time::Duration::from_secs(1)
+            };
+            tokio::select! {
+                biased;
+                joined = &mut ran => break joined,
+                _ = &mut cancelled, if !caller_gone => {
+                    caller_gone = true;
+                    if let Err(error) = cowshed_os::process::signal_cgroup(
+                        std::os::fd::AsFd::as_fd(&leaf),
+                        libc::SIGKILL,
+                    ) {
+                        cowshed_os::eprintln!(
+                            "cowshed: ending the cancelled run's leaf failed: {error}"
+                        );
+                    }
+                }
+                _ = tokio::time::sleep(tick) => {
+                    if caller_gone {
+                        // Repeated, not one-shot: the leaf is empty until its child
+                        // enters it, and a member forked after a snapshot is missed
+                        // by that snapshot alone.
+                        if let Err(error) = cowshed_os::process::signal_cgroup(
+                            std::os::fd::AsFd::as_fd(&leaf),
+                            libc::SIGKILL,
+                        ) {
+                            cowshed_os::eprintln!(
+                                "cowshed: ending the cancelled run's leaf failed: {error}"
+                            );
+                        }
+                    }
+                    let stale = reported.is_some_and(|pid| {
+                        matches!(
+                            cowshed_os::process::run_state(pid),
+                            cowshed_os::process::RunState::Zombie
+                                | cowshed_os::process::RunState::Gone
+                        )
+                    });
+                    if (reported.is_none() || stale)
+                        && let Ok(members) =
+                            cowshed_os::process::cgroup_members(std::os::fd::AsFd::as_fd(&leaf))
+                        && let Some(leader) = members.first()
+                    {
+                        observed.spawned(leader.pid);
+                        reported = Some(leader.pid);
+                    }
+                }
+            }
+        };
+        end_on_drop.finished = true;
+        let (ran, retired) = joined.map_err(|error| {
+            CowshedError::internal(format!("the project tool's thread failed: {error}"))
+        })?;
+        if caller_gone {
+            return Err(match retired {
+                Ok(()) => CowshedError::conflict(
+                    "the run was cancelled: its caller is gone, so its run leaf was ended",
+                    "retry",
+                ),
+                Err(unretired) => unretired.reworded(|message| {
+                    format!(
+                        "the run was cancelled: its caller is gone, so its run leaf was ended; and {message}"
+                    )
+                }),
+            });
+        }
+        let output = ran.map_err(|error| match error {
+            cowshed_os::deadline::RunError::Spawn { source, .. } => {
+                map_exec_error(ExecError::from(classify_spawn_error(source)))
+            }
+            error => CowshedError::environment_missing(
+                format!("{}: {error}", program.display()),
+                "the named process stopped making progress: see what it waits for, then retry",
+            ),
+        });
+        match (output, retired) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(_), Err(unretired)) | (Err(unretired), Ok(())) => Err(unretired),
+            (Err(failed), Err(unretired)) => Err(failed.reworded(|message| {
+                format!(
+                    "{message}; and its run leaf was not retired: {}",
+                    unretired.message
+                )
+            })),
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let output = {
+        let _ = incarnation;
+        let (mut out, out_path) = run_output_file(sandbox, "out")?;
+        let (mut err, err_path) = run_output_file(sandbox, "err")?;
+        // The captured streams are this run's to remove on every way out -- answered,
+        // cancelled, failed, or dropped with its caller.
+        struct RunFiles {
+            out: PathBuf,
+            err: PathBuf,
+        }
+        impl Drop for RunFiles {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.out);
+                let _ = std::fs::remove_file(&self.err);
+            }
+        }
+        let _files = RunFiles {
+            out: out_path.clone(),
+            err: err_path.clone(),
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(out.try_clone().map_err(run_output_error)?)
+            .stderr(err.try_clone().map_err(run_output_error)?);
+        let fence = super::child_fence::ChildFence::spawn(command)
+            .map_err(classify_spawn_error)
+            .map_err(ExecError::from)
+            .map_err(map_exec_error)?;
+        observed.spawned(fence.pid());
+        // However this future ends, a leader not yet collected is killed with its group, and
+        // the reap finishes on a detached thread: SIGKILL is not synchronous, and no runtime
+        // thread waits on the leader's actual exit. `finished` is set only once the fence has
+        // collected the leader.
+        struct FencedRun {
+            fence: Option<super::child_fence::ChildFence>,
+            finished: bool,
+        }
+        impl FencedRun {
+            fn fence(&self) -> &super::child_fence::ChildFence {
+                self.fence
+                    .as_ref()
+                    .expect("the fence is held until the run ends")
+            }
+        }
+        impl Drop for FencedRun {
+            fn drop(&mut self) {
+                if self.finished {
+                    return;
+                }
+                let Some(fence) = self.fence.take() else {
+                    return;
+                };
+                let _ = fence.signal(libc::SIGKILL);
+                let (send, receive) = std::sync::mpsc::channel::<super::child_fence::ChildFence>();
+                let reaper = std::thread::Builder::new()
+                    .name("cowshed-run-reap".to_owned())
+                    .spawn(move || {
+                        if let Ok(fence) = receive.recv() {
+                            reap(fence);
+                        }
+                    });
+                match reaper {
+                    Ok(_) => {
+                        if let Err(returned) = send.send(fence) {
+                            reap(returned.0);
+                        }
+                    }
+                    Err(_) => {
+                        // No thread to reap on, and this thread must not wait on a
+                        // kernel exit: detach as deadline's collect_later does, said
+                        // out loud; init collects the leader when this process ends.
+                        cowshed_os::eprintln!(
+                            "cowshed: project tool pid {} could not be given a reaper thread; it is collected when this process ends",
+                            fence.pid()
+                        );
+                        std::mem::forget(fence);
+                    }
+                }
+            }
+        }
+        let mut run = FencedRun {
+            fence: Some(fence),
+            finished: false,
+        };
+        tokio::pin!(cancelled);
+        let pgid = run.fence().pid();
+        let mut last_bytes = 0_u64;
+        let mut last_cpu = cowshed_os::process::group_cpu(pgid).ok();
+        let mut last_progress = tokio::time::Instant::now();
+        // Polled far inside the silence bound: growth restarts it from the instant it
+        // is seen, as each chunk restarts it in deadline's piped run.
+        let tick = (silence / 10).clamp(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(250),
+        );
+        enum RunEnd {
+            Exited,
+            Cancelled,
+            Silent {
+                bytes: u64,
+                cpu_unread: Option<String>,
+            },
+        }
+        let end = loop {
+            tokio::select! {
+                biased;
+                exited = run.fence().exited() => {
+                    let _ = exited?;
+                    break RunEnd::Exited;
+                }
+                _ = &mut cancelled => break RunEnd::Cancelled,
+                _ = tokio::time::sleep(tick) => {
+                    if matches!(
+                        cowshed_os::process::run_state(pgid),
+                        cowshed_os::process::RunState::Zombie
+                            | cowshed_os::process::RunState::Gone
+                    ) {
+                        break RunEnd::Exited;
+                    }
+                    let bytes = match (out.metadata(), err.metadata()) {
+                        (Ok(out), Ok(err)) => out.len() + err.len(),
+                        (Err(error), _) | (_, Err(error)) => {
+                            return Err(run_output_error(error));
+                        }
+                    };
+                    if bytes > last_bytes {
+                        last_bytes = bytes;
+                        last_progress = tokio::time::Instant::now();
+                        continue;
+                    }
+                    if last_progress.elapsed() < silence {
+                        continue;
+                    }
+                    let (cpu_now, cpu_unread) =
+                        match cowshed_os::process::group_cpu(pgid) {
+                            Ok(cpu) => (Some(cpu), None),
+                            Err(error) => (None, Some(error.to_string())),
+                        };
+                    match cowshed_os::deadline::at_silence(last_cpu, cpu_now, queued()) {
+                        cowshed_os::deadline::AtSilence::Worked => {
+                            last_cpu = cpu_now.or(last_cpu);
+                            last_progress = tokio::time::Instant::now();
+                        }
+                        cowshed_os::deadline::AtSilence::Queued(holder) => {
+                            cowshed_os::eprintln!(
+                                "cowshed: project tool pid {pgid} waits in line behind {holder}"
+                            );
+                            last_cpu = cpu_now.or(last_cpu);
+                            last_progress = tokio::time::Instant::now();
+                        }
+                        cowshed_os::deadline::AtSilence::Silent => {
+                            break RunEnd::Silent {
+                                bytes,
+                                cpu_unread,
+                            };
+                        }
+                    }
+                }
+            }
+        };
+        match end {
+            RunEnd::Exited => {
+                // The leader is exited but unreaped, so its group is still signalable:
+                // end every member it left (a discovery driver's backgrounded workers)
+                // before reaping it, as a piped run's closed streams would have. No
+                // census decides this: a failed or racing census must never be what
+                // lets the group outlive the run.
+                match run.fence().signal(libc::SIGTERM) {
+                    Ok(()) | Err(super::child_fence::NotSignalled::Reaped { .. }) => {}
+                    Err(not_signalled) => return Err(not_signalled.into_error()),
+                }
+                let status = match tokio::time::timeout(
+                    cowshed_os::deadline::REAP.within,
+                    run.fence().wait(),
+                )
+                .await
+                {
+                    Ok(waited) => {
+                        run.finished = run.fence().reaped();
+                        waited
+                            .map_err(classify_spawn_error)
+                            .map_err(ExecError::from)
+                            .map_err(map_exec_error)?
+                    }
+                    Err(_) => {
+                        return Err(CowshedError::environment_missing(
+                            format!(
+                                "{}: TIMEOUT: pid {pgid} is {} past the reap bound; it is collected later",
+                                plan.program.display(),
+                                cowshed_os::process::run_state(pgid)
+                            ),
+                            "see what it waits for, then retry",
+                        ));
+                    }
+                };
+                let stdout = read_run_output(&mut out)?;
+                let stderr = read_run_output(&mut err)?;
+                Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                })
+            }
+            RunEnd::Cancelled => {
+                match run.fence().signal(libc::SIGKILL) {
+                    Ok(()) | Err(super::child_fence::NotSignalled::Reaped { .. }) => {}
+                    Err(not_signalled) => return Err(not_signalled.into_error()),
+                }
+                match tokio::time::timeout(cowshed_os::deadline::REAP.within, run.fence().wait())
+                    .await
+                {
+                    Ok(Ok(_)) => run.finished = true,
+                    Ok(Err(_)) if run.fence().reaped() => run.finished = true,
+                    Ok(Err(error)) => {
+                        return Err(map_exec_error(ExecError::from(classify_spawn_error(error))));
+                    }
+                    Err(_) => {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "the run was cancelled: its caller is gone, so its process group was ended; its leader pid {pgid} is {} past the reap bound and is collected later",
+                                cowshed_os::process::run_state(pgid)
+                            ),
+                            "retry",
+                        ));
+                    }
+                }
+                Err(CowshedError::conflict(
+                    "the run was cancelled: its caller is gone, so its process group was ended",
+                    "retry",
+                ))
+            }
+            RunEnd::Silent { bytes, cpu_unread } => {
+                let state = cowshed_os::process::run_state(pgid);
+                let members = match cowshed_os::process::group_members(pgid) {
+                    Ok(members) if members.is_empty() => "no running member".to_owned(),
+                    Ok(members) => members
+                        .iter()
+                        .map(|member| format!(" {member};"))
+                        .collect::<String>(),
+                    Err(error) => format!(" (its members could not be listed: {error})"),
+                };
+                let cpu_note = cpu_unread
+                    .map(|error| format!("; its CPU could not be read: {error}"))
+                    .unwrap_or_default();
+                match run.fence().signal(libc::SIGTERM) {
+                    Ok(()) | Err(super::child_fence::NotSignalled::Reaped { .. }) => {}
+                    Err(not_signalled) => return Err(not_signalled.into_error()),
+                }
+                if tokio::time::timeout(cowshed_os::deadline::REAP.within, run.fence().wait())
+                    .await
+                    .is_ok()
+                {
+                    run.finished = run.fence().reaped();
+                }
+                Err(CowshedError::environment_missing(
+                    format!(
+                        "{}: SILENT: pid {pgid} is {state}, wrote {bytes} bytes and then no output, CPU or live holder for {silence:?}{cpu_note}; its running members:{members}",
+                        plan.program.display()
+                    ),
+                    "the named process stopped making progress: see what it waits for, then retry",
+                ))
+            }
+        }
+    };
+    output
 }
 
 /// Prepare the workspace's private environment host-side and describe the child environment.
@@ -2071,8 +2616,8 @@ pub(super) async fn sandbox_environment(
 fn sandboxed_command(
     plan: &SpawnPlan,
     environment: &BTreeMap<OsString, OsString>,
-) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(&plan.program);
+) -> std::process::Command {
+    let mut command = std::process::Command::new(&plan.program);
     command
         .env_clear()
         .args(&plan.args)
@@ -2245,7 +2790,7 @@ impl SpawnSink for SystemSpawnSink {
         }
         let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
         spawn_fenced(
-            sandboxed_command(&plan, &environment),
+            tokio::process::Command::from(sandboxed_command(&plan, &environment)),
             request.job_id,
             #[cfg(target_os = "macos")]
             request.cpu.nice,
@@ -8986,13 +9531,18 @@ mod workspace_toolchain_tests {
             .expect("executable");
         let sandbox = sandbox_at(&mount);
 
+        let (_cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
         let output = run_as_job(
             &sandbox,
             &WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
             &mount,
             vec![OsString::from("./which-bash")],
-            cowshed_os::deadline::HEARTBEAT_SILENCE,
-            Box::new(|| None),
+            RunControl {
+                silence: cowshed_os::deadline::HEARTBEAT_SILENCE,
+                queued: Box::new(|| None),
+                cancelled,
+                observed: &JobRunState::default(),
+            },
         )
         .await
         .expect("run the script as a job");
@@ -9003,6 +9553,79 @@ mod workspace_toolchain_tests {
                 .join(".cowshed/tools/bin/bash")
                 .to_str()
                 .expect("utf-8 path"),
+        );
+        std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
+    }
+
+    /// A caller that goes away -- its command interrupted -- ends the one-shot job it left
+    /// running: dropping the cancel sender kills the job's process group and reaps its
+    /// leader before the run answers, so no activation tree outlives the interrupted exec.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_cancelled_run_as_job_ends_its_process_group() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = scratch("cancel-run-as-job");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        std::fs::write(
+            mount.join(".cowshed/ca.pem"),
+            b"-----BEGIN CERTIFICATE-----\nWORKSPACE\n-----END CERTIFICATE-----\n",
+        )
+        .expect("workspace CA");
+        let script = mount.join("sleep-forever");
+        std::fs::write(&script, "#!/usr/bin/env bash\nexec sleep 3600\n").expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let sandbox = sandbox_at(&mount);
+        let observed = std::sync::Arc::new(JobRunState::default());
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn({
+            let sandbox = sandbox.clone();
+            let mount = mount.clone();
+            let observed = std::sync::Arc::clone(&observed);
+            async move {
+                run_as_job(
+                    &sandbox,
+                    &WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
+                    &mount,
+                    vec![OsString::from("./sleep-forever")],
+                    RunControl {
+                        silence: cowshed_os::deadline::HEARTBEAT_SILENCE,
+                        queued: Box::new(|| None),
+                        cancelled,
+                        observed: &observed,
+                    },
+                )
+                .await
+            }
+        });
+        // Readiness: the job's leader exists once the run reports its pid. A run that
+        // ends before reporting one fails the test with its own answer, never a spin.
+        let pid = loop {
+            if let ObservedRun::Running { pid, .. } = observed.snapshot() {
+                break pid;
+            }
+            if run.is_finished() {
+                panic!("the run ended before its leader existed: {:?}", run.await);
+            }
+            tokio::task::yield_now().await;
+        };
+        drop(cancel);
+        let error = run
+            .await
+            .expect("the run task answers")
+            .expect_err("a cancelled run answers with its cancellation");
+        assert_eq!(error.code.as_str(), "conflict", "{error:?}");
+        assert!(error.message.contains("cancelled"), "{error:?}");
+        // The leader was reaped inside its fence before the run answered: its pid is gone,
+        // not merely signalled.
+        assert_eq!(
+            cowshed_os::process::run_state(pid),
+            cowshed_os::process::RunState::Gone,
+            "process {pid} outlived its cancelled run"
         );
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }

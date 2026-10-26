@@ -822,6 +822,39 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         Ok(Some((id, state)))
     }
 
+    /// Whether a job of `workspace` could hold the volume `checkout` links now, asked before
+    /// work a refusal would discard (build-state discovery: a shell activation and its Cargo
+    /// queries). `Ok(None)` when the checkout links none. The shared hold a job takes is tried
+    /// and let go at once: an exclusive claim (a release, a seed capture, a reseed, a cache
+    /// clear) refuses with the refusal admission itself gives at the supervisor, so the exec
+    /// is answered in milliseconds instead of after the discovery it would have thrown away.
+    /// A claim taken after this probe still refuses at admission, unchanged.
+    pub fn probe_admissible(
+        &self,
+        workspace: &WorkspaceName,
+        checkout: &Path,
+    ) -> Result<Option<BuildVolumeId>> {
+        let Some(id) = self.layout.linked(checkout)? else {
+            return Ok(None);
+        };
+        match self.layout.admit(&id) {
+            Ok(_hold) => Ok(Some(id)),
+            Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
+                Err(CowshedError::conflict(
+                    format!("{workspace}'s job cannot start on build volume {id}: {error}"),
+                    "retry: the next admission resolves the checkout's current build volume",
+                ))
+            }
+            Err(error) => Err(CowshedError::environment_missing(
+                format!(
+                    "cannot hold build volume {id} at {}: {error}",
+                    self.layout.hold_path(&id).display()
+                ),
+                "check the cowshed store's permissions and retry",
+            )),
+        }
+    }
+
     /// Bring `checkout`'s build volume in line with what capability detection names now
     /// (16_build_volumes.md, "One link per checkout"). With `Discovered::Unchanged` the held
     /// paths are re-linked where a tool displaced them. With fresh discovery, new paths join the
@@ -4489,6 +4522,52 @@ mod tests {
         }
     }
 
+    /// Before an exec pays for build-state discovery, the volume its job must hold is probed:
+    /// an exclusively claimed volume refuses at once, with the refusal admission itself gives,
+    /// so no discovery runs only to be discarded.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn probe_admissible_refuses_an_exclusively_claimed_linked_volume() {
+        let scratch = Scratch::directory("probe-admissible");
+        let (checkout, id, _mount) = scratch.linked_checkout("main", 1);
+        let workspace = WorkspaceName::new("main").unwrap();
+        assert_eq!(
+            scratch
+                .volumes
+                .probe_admissible(&workspace, &checkout)
+                .unwrap(),
+            Some(id.clone())
+        );
+        let claim = scratch
+            .layout
+            .claim_release(&id)
+            .unwrap()
+            .expect("an exclusive claim on the unheld volume");
+        let refused = scratch
+            .volumes
+            .probe_admissible(&workspace, &checkout)
+            .unwrap_err();
+        assert_eq!(refused.code.as_str(), "conflict", "{refused:?}");
+        assert!(refused.message.contains(&id.to_string()), "{refused:?}");
+        drop(claim);
+        assert_eq!(
+            scratch
+                .volumes
+                .probe_admissible(&workspace, &checkout)
+                .unwrap(),
+            Some(id)
+        );
+        let unlinked = scratch.root.path().join("unlinked");
+        fs::create_dir_all(&unlinked).unwrap();
+        assert_eq!(
+            scratch
+                .volumes
+                .probe_admissible(&workspace, &unlinked)
+                .unwrap(),
+            None
+        );
+        scratch.release_all();
+    }
     #[cfg(target_os = "macos")]
     #[test]
     fn directory_cancelled_build_work_keeps_project_retirement_fenced_until_it_ends() {

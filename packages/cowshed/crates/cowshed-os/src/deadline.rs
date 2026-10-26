@@ -842,8 +842,12 @@ impl fmt::Display for SilentRun {
 /// What a run's spent silence decides ([`run_by_progress`]), given the CPU its group had used at
 /// the last look, the CPU it has used now (`None` when it could not be read), and the live holder
 /// the run waits behind, if any.
+/// The decision is shared with callers that run the same wait outside `run_by_progress`;
+/// they still owe the rest of its contract: restart the silence from the instant progress
+/// is observed, and on `Silent` name the child, its kernel state, the bytes it wrote and
+/// every running member, send the members `SIGTERM`, and reap the child within the reap bound.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum AtSilence {
+pub enum AtSilence {
     /// The group's CPU advanced: the run works, silently.
     Worked,
     /// No CPU advanced, but the run waits in line behind this live holder: queued, not silent.
@@ -852,7 +856,7 @@ pub(crate) enum AtSilence {
     Silent,
 }
 
-pub(crate) fn at_silence(last: Option<u64>, now: Option<u64>, queued: Option<String>) -> AtSilence {
+pub fn at_silence(last: Option<u64>, now: Option<u64>, queued: Option<String>) -> AtSilence {
     match (last, now, queued) {
         (Some(last), Some(now), _) if now > last => AtSilence::Worked,
         (_, _, Some(holder)) => AtSilence::Queued(holder),

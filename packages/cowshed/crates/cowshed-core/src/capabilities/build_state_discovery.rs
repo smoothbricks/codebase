@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::{BuildStatePath, CapabilityId, DeclaredState, DetectionContext, merge_build_state};
+use crate::runtime::supervisor::ObservedRun;
 use crate::{CowshedError, Result};
 use cowshed_os::fork_lock::Run;
 
@@ -285,10 +286,14 @@ pub trait CargoRunner {
 /// shell rather than one per manifest.
 ///
 /// Runs off the async runtime (the blocking pool): each job is awaited on `runtime`.
+/// `cancelled` resolves when the caller that asked for discovery is gone -- its sender
+/// dropped with the interrupted command -- and ends the batch's job the same way
+/// [`run_as_job`] ends it, so no activation tree outlives that caller.
 pub struct JobCargo<'a> {
     sandbox: &'a crate::sandbox::SandboxConfig,
     incarnation: &'a crate::metadata::WorkspaceIncarnation,
     runtime: tokio::runtime::Handle,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl<'a> JobCargo<'a> {
@@ -296,11 +301,13 @@ impl<'a> JobCargo<'a> {
         sandbox: &'a crate::sandbox::SandboxConfig,
         incarnation: &'a crate::metadata::WorkspaceIncarnation,
         runtime: tokio::runtime::Handle,
+        cancelled: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
         Self {
             sandbox,
             incarnation,
             runtime,
+            cancelled,
         }
     }
 }
@@ -336,40 +343,62 @@ impl CargoRunner for JobCargo<'_> {
             });
             let batch: Vec<&CargoQuery> = indices.iter().map(|index| &queries[*index]).collect();
             let directory = &batch[0].directory;
-            let home = self.sandbox.home.clone();
+            let (job_cancel, job_cancelled) = tokio::sync::oneshot::channel::<()>();
+            let mut job_cancel = Some(job_cancel);
+            let observed = crate::runtime::supervisor::JobRunState::default();
             let job = crate::runtime::supervisor::run_as_job(
                 self.sandbox,
                 self.incarnation,
                 directory,
                 driver_argv(args, &batch),
-                cowshed_os::deadline::HEARTBEAT_SILENCE,
-                Box::new(move || cargo_lock_held(&home)),
+                crate::runtime::supervisor::RunControl {
+                    silence: cowshed_os::deadline::HEARTBEAT_SILENCE,
+                    // Discovery's Cargo waits behind no holder: measured, neither
+                    // `locate-project` nor `metadata --no-deps --offline` waits on Cargo's
+                    // package-cache lock, held or churned, so no holder extends its silence.
+                    queued: Box::new(|| None),
+                    cancelled: job_cancelled,
+                    observed: &observed,
+                },
             );
-            let output = self.runtime.block_on(async {
+            let runtime = self.runtime.clone();
+            let output = runtime.block_on(async {
                 tokio::pin!(job);
                 let started = std::time::Instant::now();
-                // Who holds Cargo's locks is looked up once, at the first report, and named in
-                // every later one: the wait never walks the process table again.
-                let mut held: Option<String> = None;
                 let mut report = tokio::time::interval_at(
                     tokio::time::Instant::now() + WAIT_REPORT,
                     WAIT_REPORT,
                 );
-                loop {
+                let mut caller_gone = false;
+                let output = loop {
                     tokio::select! {
                         output = &mut job => break output,
                         _ = report.tick() => cowshed_os::eprintln!(
-                            "cowshed: build-state discovery has waited {}s on `cargo {}` in {} \
-                             ({} manifests, run as a job after the workspace shell's \
-                             activation); {} (holders as of the first report)",
-                            started.elapsed().as_secs(),
-                            args.first().copied().unwrap_or_default(),
-                            directory.display(),
-                            batch.len(),
-                            held.get_or_insert_with(|| cargo_lock_holders(&self.sandbox.home)),
+                            "{}",
+                            wait_report(
+                                started.elapsed().as_secs(),
+                                args.first().copied().unwrap_or_default(),
+                                directory,
+                                batch.len(),
+                                observed.snapshot(),
+                            )
                         ),
+                        _ = &mut self.cancelled, if !caller_gone => {
+                            caller_gone = true;
+                            drop(job_cancel.take());
+                        }
                     }
+                };
+                if caller_gone {
+                    // The job ended with its caller or raced it to an answer: the
+                    // batch's answers belong to nobody now, and the spent receiver
+                    // must never be polled by a later batch.
+                    return Err(CowshedError::conflict(
+                        "build state discovery was cancelled: its caller is gone",
+                        "retry",
+                    ));
                 }
+                output
             })?;
             let answered = driver_answers(&output, batch.len(), shell.as_deref());
             for (index, answer) in indices.into_iter().zip(answered) {
@@ -383,75 +412,39 @@ impl CargoRunner for JobCargo<'_> {
     }
 }
 
-/// How often a discovery job that has not answered says what it waits on.
+/// How often a discovery job that has not answered says what phase it is in.
 const WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The live holders of the host Cargo home's locks, as `<holder> holds <lock>`, when any process
-/// holds one: discovery's Cargo then waits in line behind it, queued, not silent. `None` when none
-/// does, or when the locks cannot be read, which proves no holder. Darwin only: elsewhere the
-/// holders are not read, so a Cargo blocked on its lock has only its own progress.
-fn cargo_lock_held(home: &Path) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let cargo_home = home.join(".cargo");
-        let held: Vec<String> = super::cargo::STATE_FILES
-            .iter()
-            .flat_map(|file| {
-                let lock = cargo_home.join(file);
-                crate::build_volume::nx::holders(&lock)
-                    .into_iter()
-                    .flatten()
-                    .map(move |holder| format!("{holder} holds {}", lock.display()))
-            })
-            .collect();
-        (!held.is_empty()).then(|| held.join("; "))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = home;
-        None
-    }
-}
-/// Who holds the host Cargo home's own locks open. Cargo blocks on its package-cache lock
-/// while another cargo resolves or builds, and discovery's Cargo shares that `$CARGO_HOME`
-/// ([`super::cargo::HOME`]), so a concurrent build is the usual reason a discovery job waits.
-fn cargo_lock_holders(home: &Path) -> String {
-    #[cfg(target_os = "macos")]
-    {
-        let cargo_home = home.join(".cargo");
-        let mut held = Vec::new();
-        for file in super::cargo::STATE_FILES {
-            let lock = cargo_home.join(file);
-            match crate::build_volume::nx::holders(&lock) {
-                Ok(holders) => held.extend(
-                    holders
-                        .into_iter()
-                        .map(|holder| format!("{} holds {}", holder, lock.display())),
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => held.push(format!("{} cannot be inspected: {error}", lock.display())),
-            }
+/// What a discovery job that has not answered says about its wait: how long, which Cargo
+/// question, and the phase the job itself was observed in -- still preparing its sandbox
+/// environment, or running as a named process in a named kernel state. Nothing else: a
+/// cause inferred from other processes (who happened to hold some file at the first
+/// report) is a guess, and a printed guess is read as fact.
+fn wait_report(
+    waited_secs: u64,
+    arg: &str,
+    directory: &Path,
+    manifests: usize,
+    observed: ObservedRun,
+) -> String {
+    let phase = match observed {
+        ObservedRun::Preparing => {
+            "the job is still preparing its sandbox environment; no process has started".to_owned()
         }
-        if held.is_empty() {
-            format!(
-                "no process holds Cargo's locks under {}, so the wait is the shell's activation \
-                 or Cargo itself",
-                cargo_home.display()
-            )
-        } else {
-            format!(
-                "Cargo waits for its package-cache lock: {}",
-                held.join("; ")
-            )
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        format!(
-            "a concurrent cargo holding the package-cache lock under {} is the usual reason",
-            home.join(".cargo").display()
-        )
-    }
+        ObservedRun::Running {
+            pid,
+            state,
+            command,
+        } => match command {
+            Some(command) => format!("its process {pid} is {state}: {command}"),
+            None => format!("its process {pid} is {state}"),
+        },
+    };
+    format!(
+        "cowshed: build-state discovery has waited {waited_secs}s on `cargo {arg}` in {} \
+         ({manifests} manifests, run as a job after the workspace shell's activation); {phase}",
+        directory.display()
+    )
 }
 
 /// Bound child processes independently of the number of tracked manifests. The existing
@@ -1267,6 +1260,44 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
+    /// The report of a discovery job that has not answered names what the job itself was
+    /// observed doing -- preparing, or running as a named process in a named state -- and
+    /// never a cause inferred from other processes: a guessed lock holder printed as fact
+    /// once sent four readers to a lock the job never waited on.
+    #[test]
+    fn a_wait_report_names_only_the_observed_phase() {
+        let preparing = wait_report(
+            42,
+            "locate-project",
+            Path::new("/checkout"),
+            3,
+            ObservedRun::Preparing,
+        );
+        assert!(
+            preparing.contains("still preparing its sandbox environment"),
+            "{preparing}"
+        );
+        let running = wait_report(
+            42,
+            "metadata",
+            Path::new("/checkout"),
+            1,
+            ObservedRun::Running {
+                pid: 4242,
+                state: "sleeping".to_owned(),
+                command: Some("direnv export bash".to_owned()),
+            },
+        );
+        assert!(running.contains("4242"), "{running}");
+        assert!(running.contains("sleeping"), "{running}");
+        assert!(running.contains("direnv export bash"), "{running}");
+        for report in [&preparing, &running] {
+            assert!(
+                !report.contains("package-cache") && !report.contains("lock"),
+                "a report must not name a cause it did not observe: {report}"
+            );
+        }
+    }
     fn git(fixture: &Fixture, args: &[&str]) {
         let output = crate::git::git_command_at(&fixture.root)
             .args(args)

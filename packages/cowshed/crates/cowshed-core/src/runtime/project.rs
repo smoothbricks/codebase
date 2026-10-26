@@ -5927,7 +5927,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 }
                 crate::runtime::nx_daemon::DaemonStopPlan::Owned { process, watch } => {
                     let outcome =
-                        crate::runtime::nx_daemon::stop_owned_daemon(process, watch, || {
+                        crate::runtime::nx_daemon::stop_owned_daemon(process, watch, || async {
+                            let (_cancel, cancelled) = tokio::sync::oneshot::channel();
+                            let observed = super::supervisor::JobRunState::default();
                             timed_async(
                                 "land",
                                 "stop-landing-nx",
@@ -5940,10 +5942,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                         "daemon".into(),
                                         "--stop".into(),
                                     ],
-                                    crate::build_volume::nx::DAEMON_EXIT_GRACE,
-                                    Box::new(|| None),
+                                    super::supervisor::RunControl {
+                                        silence: crate::build_volume::nx::DAEMON_EXIT_GRACE,
+                                        queued: Box::new(|| None),
+                                        cancelled,
+                                        observed: &observed,
+                                    },
                                 ),
                             )
+                            .await
                         })
                         .await?;
                     for diagnostic in &outcome.diagnostics {
@@ -6789,6 +6796,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let (discovered, findings) = if unchanged {
             (Discovered::Unchanged, Vec::new())
         } else {
+            // A volume under an exclusive claim refuses here, before discovery's shell
+            // activation is paid for an answer the refusal would discard.
+            volumes.probe_admissible(&name, mount)?;
             let main_mount = self.workspace_mount_path(&main_name())?;
             let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
             let sandbox = supervisor_sandbox(
@@ -6802,13 +6812,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 main_mount.clone(),
                 volumes.layout.grant(&name, mount)?,
             )?;
+            let (cancel_discovery, discovery_cancelled) = tokio::sync::oneshot::channel::<()>();
             let discovery = {
                 let mount = mount.to_owned();
                 let incarnation = current.derived.workspace.incarnation().clone();
                 let runtime = tokio::runtime::Handle::current();
                 crate::storage::lifecycle::dispatch_blocking(move || {
-                    let mut cargo =
-                        crate::capabilities::JobCargo::new(&sandbox, &incarnation, runtime);
+                    let mut cargo = crate::capabilities::JobCargo::new(
+                        &sandbox,
+                        &incarnation,
+                        runtime,
+                        discovery_cancelled,
+                    );
                     sandbox.with_detection_context(&mount, |context| {
                         crate::capabilities::discover_build_state(context, &mut cargo)
                     })
@@ -6818,6 +6833,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     CowshedError::internal(format!("build state discovery failed: {error}"))
                 })??
             };
+            drop(cancel_discovery);
             (
                 Discovered::Changed {
                     paths: discovery.paths,
