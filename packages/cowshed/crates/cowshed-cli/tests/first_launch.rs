@@ -25,7 +25,11 @@ fn probes() -> Vec<PathBuf> {
 #[test]
 fn a_probe_is_launched_twice_and_leaves_nothing_behind() {
     let before = probes();
-    let measured = measure(Path::new(env!("CARGO_BIN_EXE_cowshed"))).unwrap();
+    let measured = measure(Path::new(
+        &std::env::var_os("CARGO_BIN_EXE_cowshed")
+            .expect("cargo and nextest set CARGO_BIN_EXE_cowshed for an integration test"),
+    ))
+    .unwrap();
     cowshed_os::eprintln!(
         "first launch {} us, second {} us",
         measured.first_micros,

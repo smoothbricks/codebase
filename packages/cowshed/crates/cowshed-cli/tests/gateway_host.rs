@@ -2,14 +2,20 @@
 //! launchd stops a job with, and ends as the child ended.
 
 use cowshed_cli::gateway_host::{EXIT_FAILED, VERB};
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
 
 /// The host is the `cowshed` binary itself, run with the hidden verb launchd's plist gives it.
-fn cowshed() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_cowshed"))
+/// It is read when the test runs: `env!` would bake in the path of the checkout that compiled
+/// this test, but the test runs from a cached nextest archive that is relocated into every
+/// checkout, and nextest re-points `CARGO_BIN_EXE_cowshed` at the extracted binary only at runtime.
+fn cowshed() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_cowshed")
+            .expect("cargo and nextest set CARGO_BIN_EXE_cowshed for an integration test"),
+    )
 }
 
 #[test]
