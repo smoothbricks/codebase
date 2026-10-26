@@ -121,6 +121,7 @@ writeFileSync(
 `,
 );
 // Run under an owned block: prints the port the inspector of a child started with port 0 took, or the spawn's error.
+// The banner's lines can reach stderr as separate chunks: the first chunk that names the port prints it, once.
 const inspectScript = join(__dirname, 'inspect-zero.cjs');
 writeFileSync(
   inspectScript,
@@ -139,6 +140,7 @@ child.stderr.on('data', (chunk) => {
   text += chunk;
   const banner = /ws:\\/\\/[^\\s/]+:(\\d+)\\//.exec(text);
   if (banner === null) return;
+  child.stderr.removeAllListeners('data');
   console.log(banner[1]);
   child.stdin.end();
 });
