@@ -1071,17 +1071,24 @@ file descriptor can defer reclamation until its last close, so an unlink-only ti
 Background I/O priority (`IOPOL_THROTTLE`) prolongs that wait instead of shortening it: the freeing thread's own
 metadata reads are throttled with it, so the same free takes longer and holds the container's work longer. Cowshed
 instead frees at normal disk priority, as everything it starts runs (05_gateway.md, "On macOS nothing cowshed starts is
-throttled for I/O"), and cuts from the end with `ftruncate(2)`, at most **1,024 physical runs per
-cut**, then unlinks the empty file. The gateway's cleanup starts each entry at 1,024 runs and sizes each next cut by the
-time the one before it takes: past 100 ms (`CUT_TARGET`) the next cut is halved, down to 64 runs (`STEP_FLOOR`), and
-under 50 ms it is doubled, up to 1,024 (`next_cut`), so a cut that holds the container long is followed by smaller ones.
-Measured 2026-10-26 on the installed build, draining 99 released images back to back at a fixed 1,024 runs a cut: 206
-cuts in 45 s, most 0.07 to 0.2 s, five of 1.05 to 5.49 s, while build-volume mounts sat over 120 s in `mount(2)` and
-forks failed at them. The run count bounds reclamation work, **not a wall-time bound**: no size bounds one call's wall
-time. The file length remains the restart journal (16_build_volumes.md, "Garbage collection"). That bounded release runs
-only off every verb's path, in the gateway: the verb that releases an image nudges the gateway and returns, and the
-gateway's `image-cleanup` thread frees one entry at a time, cutting each at once (05_gateway.md, "Deleting released
-images").
+throttled for I/O"), and cuts from the end with `ftruncate(2)`, **1,024 physical runs** in the first cut of an entry,
+then unlinks the empty file. The gateway's cleanup starts each entry at 1,024 runs and sizes each next cut from the rate
+the one before it took: `runs × 250 ms / its time` (`CUT_TARGET`, `next_cut`), at most twice the last cut and at least
+64 runs (`STEP_FLOOR`), so a slow cut is followed at once by one its rate puts under the target, however much smaller,
+and a fast one by at most twice as many runs. 250 ms keeps one cut under the 500 ms a fork may wait behind it (Danny,
+2026-10-26): measured that day freeing real ~220 GB released build volumes (~0.9M runs) beside the gateway's own cuts,
+one cut's time varies about 1.8 times around the predicted size, so a 400 ms target put the p90 cut at 672 and 719 ms
+and 250 ms puts it at 379 to 448 ms (sizes of about 800 to 13,500 runs). The total per entry did not measurably change:
+43.9, 117.8 and 253.1 s at 250 ms against 116.8, 54.0, 75.2 and 120.8 s at a fixed 1,024 runs a cut, the host's own load
+moving it more than the sizing; the walk that plans the cuts takes 1.6 to 4.5 s and the final unlink of the emptied file
+a few ms. Cuts of 3.6 to 5.7 s occur under every sizing, and a probe creating and unlinking a file beside them stalled
+2.7 to 5.0 s under both, so the run count and the target bound reclamation work, **not a wall-time bound**: no size
+bounds one call's wall time. One `unlink` of the same entry would hold the container in a single call for the whole
+free: the 7.6 to 29 s per 131,072 extents measured 2026-10-22 (16_build_volumes.md, "Garbage collection") scales to
+about 52 to 200 s for 0.9M runs, the same order as the stepped total but in one call, which is why no image is freed by
+one unlink (estimate by linear scaling, not run on a live store). That bounded release runs only off every verb's path,
+in the gateway: the verb that releases an image nudges the gateway and returns, and the gateway's `image-cleanup` thread
+frees one entry at a time, cutting each at once (05_gateway.md, "Deleting released images").
 
 Stepping lets other writers progress between cuts; it is neither a scheduling guarantee nor a maximum duration for one
 kernel call. Concurrent releases lengthen one another's cuts, and a pause between cuts does not shorten them, so the

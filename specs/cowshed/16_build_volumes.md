@@ -1105,13 +1105,13 @@ delta incrementally, as an edit would.
   the source directory are synced for that entry before its first deletion.
 - Freeing an image never takes one go. One `unlink` of a written image is one free of its whole extent tree, and every
   writer of the store's APFS container waits behind it: a long free hangs every `cowshed fork` and `ls` on the host. So
-  a deletion cuts the image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut,
-  and unlinks it once it is empty; the table is `STEP_EXTENTS` in `storage/apfs/release.rs`. A cut's length grows with
-  its extents, so the gateway's cleanup starts each entry at 1,024 runs and sizes each next cut by the time the one
-  before it takes: halved, down to 64 runs, after a cut that runs past 100 ms, and doubled, up to 1,024, after one under
-  50 ms (`next_cut`; 01a_apfs.md, "Freeing an image"). The bound is on runs reclaimed, not time inside a kernel call. A
-  fresh clone's first cut does whole-map first-mutation work inside one syscall, which a step limit or yield cannot
-  split. An observed shared-map flag does not retain its other owner, so no flag-based shortcut bypasses the cuts. See
+  a deletion cuts the image from its end with `ftruncate(2)`, 1,024 physical runs (`F_LOG2PHYS_EXT`) in an entry's first
+  cut, and unlinks it once it is empty; the table is `STEP_EXTENTS` in `storage/apfs/release.rs`. A cut's length grows
+  with its extents, so the gateway's cleanup starts each entry at 1,024 runs and sizes each next cut from the rate the
+  one before it took, toward 250 ms under the 500 ms a fork may wait (at most twice the last cut, at least 64 runs;
+  `next_cut`; 01a_apfs.md, "Freeing an image"). The bound is on runs reclaimed, not time inside a kernel call. A fresh
+  clone's first cut does whole-map first-mutation work inside one syscall, which a step limit or yield cannot split. An
+  observed shared-map flag does not retain its other owner, so no flag-based shortcut bypasses the cuts. See
   01a_apfs.md, "Freeing an image", for the reasons and limitations. The image's length is the free's journal: a cut ends
   on a run boundary, so a free that did not finish (a crash, a gateway restart) leaves a shorter image that the next
   gateway listing frees, and nothing else records progress. The gateway frees one entry at a time, cutting each at once

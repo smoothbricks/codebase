@@ -310,9 +310,9 @@ Find the symptom in the left column and follow the link.
 - **Fact.** One `unlink` of a written image can reclaim its whole extent tree in a single kernel operation that other
   writers on the container can wait behind, and a clone's first mutation pays its whole map inside one syscall that
   userspace cannot split (_measured_).
-- **Rule.** Release cuts an image from its end with `ftruncate`, at most 1,024 physical runs per cut at normal disk
-  priority, then unlinks the empty file; the file length is the restart journal and the bound limits reclamation work,
-  not wall time.
+- **Rule.** Release cuts an image from its end with `ftruncate`, each cut sized toward 250 ms from the last cut's rate
+  (1,024 runs first, at least 64, at most twice the last) at normal disk priority, then unlinks the empty file; the file
+  length is the restart journal and the bound limits reclamation work, not wall time.
 - **Owners.** [01a_apfs.md §Freeing an image](./01a_apfs.md#freeing-an-image);
   [16_build_volumes.md §Garbage collection](./16_build_volumes.md#garbage-collection). Code:
   [`cowshed-core/src/storage/apfs/release.rs`] `STEP_EXTENTS`.

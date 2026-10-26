@@ -1721,14 +1721,13 @@ uninterruptible waits behind them.
   on stderr: its holder is another cleanup or deleter still cutting it. A busy entry, like one whose free fails, waits
   for the next pass, which the next release's nudge or the next gateway start begins. Before the first cut the thread
   syncs the entry's directory and that directory's parent, because a releaser may have died between its rename and the
-  rename's syncs. It then cuts from the end of the file, at most 1,024 physical runs per `ftruncate`, halved after a
-  slow cut down to 64 (each entry starting at 1,024, each next cut sized by how long the one before it takes;
-  01a_apfs.md, "Freeing an image"), at normal disk priority (16_build_volumes.md, "Garbage collection"; `IOPOL_THROTTLE`
-  stays rejected, 01a_apfs.md, "Freeing an image"), unlinks the empty file and syncs the directory. The file's length is
-  the journal: a cut ends on a run boundary, so an entry cut short is finished from its length. The thread says on
-  stderr each entry it frees, with its bytes and cuts. An entry that is gone when its turn comes (freed already, or
-  moved by a final unbinding) needs nothing; one whose free fails is said with its cause and stays in `.deleting` for
-  the next pass.
+  rename's syncs. It then cuts from the end of the file, each entry starting at 1,024 physical runs per `ftruncate` and
+  each next cut sized from the rate the one before it took, toward 250 ms (01a_apfs.md, "Freeing an image"), at normal
+  disk priority (16_build_volumes.md, "Garbage collection"; `IOPOL_THROTTLE` stays rejected, 01a_apfs.md, "Freeing an
+  image"), unlinks the empty file and syncs the directory. The file's length is the journal: a cut ends on a run
+  boundary, so an entry cut short is finished from its length. The thread says on stderr each entry it frees, with its
+  bytes and cuts. An entry that is gone when its turn comes (freed already, or moved by a final unbinding) needs
+  nothing; one whose free fails is said with its cause and stays in `.deleting` for the next pass.
 - **A restart finishes what it cut.** An install's restart stops the thread mid-entry, and the next gateway's first
   listing finishes what it left: so a gateway restart or a reboot (the gateway is `RunAtLoad`) frees every entry left,
   an image cut short mid-free included.

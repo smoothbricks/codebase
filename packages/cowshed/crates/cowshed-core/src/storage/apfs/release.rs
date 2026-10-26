@@ -4,9 +4,10 @@
 //! One `unlink(2)` of a written image frees its whole extent tree as one operation, and APFS
 //! frees extents one at a time: measured 2026-10-22 on this host's container (a clone of a 2 GiB
 //! file with a 4 KiB write every 32 KiB, 131,072 extents), one unlink ran 7.6 s to 29 s, and a
-//! trashed 300 GiB build image holds millions. So a release cuts the file from its end, at most
-//! [`STEP_EXTENTS`] extents per `ftruncate(2)`, and unlinks it only once it is empty. Other
-//! writers can progress during and between cuts; this does not bound their latency.
+//! trashed 300 GiB build image holds millions. So a release cuts the file from its end in bounded
+//! steps, [`STEP_EXTENTS`] runs a cut, or in the gateway's cleanup a size the last cut's rate
+//! sets ([`next_cut`]), and unlinks it only once it is empty. Other writers can progress during
+//! and between cuts; this does not bound their latency.
 //!
 //! The file's length is the release's journal. A step cuts at the start of a run, so an
 //! interrupted release leaves a shorter file with whole runs before its end; opening it again
@@ -47,7 +48,8 @@ use cowshed_apfs::SECTOR_BYTES;
 
 use super::extents::for_each_run;
 
-/// The most extents one step of a release frees.
+/// The extents one fixed step of a release frees, and the first cut of each entry the gateway's
+/// cleanup frees (later cuts follow [`next_cut`]).
 ///
 /// Measured 2026-10-22 with `ftruncate` steps over the 131,072-extent clone above, on the same
 /// container as the store (`/private/tmp`, disk3), normal disk priority, while the host's other
@@ -76,33 +78,36 @@ use super::extents::for_each_run;
 /// 50.074 s for its first 454-run cut; reducing reclamation work cannot bound map splitting.
 pub const STEP_EXTENTS: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(1023));
 
-/// The fewest extents a timed cut asks to free ([`next_cut`]; a short tail frees fewer), and the step the gateway's cleanup plans
-/// in: a cut of the last 64 runs still frees whole runs from the end.
+/// The fewest extents a timed cut asks to free ([`next_cut`]; a short tail frees fewer), and the
+/// step the gateway's cleanup plans in: a cut of the last 64 runs still frees whole runs from the
+/// end.
 pub const STEP_FLOOR: StepExtents = StepExtents(NonZeroU64::MIN.saturating_add(63));
 
-/// How long one cut of the gateway's cleanup may hold the store's container before the next cut
-/// is made smaller ([`next_cut`]).
+/// The wall time the gateway's cleanup sizes each cut toward ([`next_cut`]), under the 500 ms a
+/// fork may wait behind one cut (Danny, 2026-10-26).
 ///
-/// Measured 2026-10-26 on the installed build, the cleanup draining 99 released images (18.2 TB
-/// allocated) back to back at 1,024 runs a cut: 206 cuts in 45 s, most 0.07 to 0.2 s, five of
-/// 1.05 to 5.49 s, while build-volume mounts sat over 120 s in `mount(2)` and forks failed at
-/// them. A fixed run count bounds reclamation work, not how long one call holds the container.
-pub const CUT_TARGET: Duration = Duration::from_millis(100);
+/// Measured 2026-10-26 freeing real ~220 GB released build volumes (~0.9M runs each) beside
+/// the running gateway's own cuts: one cut's time varies about 1.8x around the size the last
+/// cut's rate predicts, so a 400 ms target put the p90 cut at 672 and 719 ms, past the ceiling,
+/// and 250 ms puts it at 379, 448 and 415 ms. Totals per entry were 43.9, 117.8 and 253.1 s at
+/// 250 ms against 116.8, 54.0, 75.2 and 120.8 s at the earlier fixed 1,024-run cap: the host's
+/// own load moved them more than the sizing did. Cuts of 3.6 to 5.7 s occurred under every
+/// sizing, and a probe's create+unlink beside them stalled 2.7 to 5.0 s under both.
+pub const CUT_TARGET: Duration = Duration::from_millis(250);
 
-/// The size of the cut after one of `step` extents that took `took`: halved, down to
-/// [`STEP_FLOOR`], when it ran past [`CUT_TARGET`]; doubled, up to [`STEP_EXTENTS`], when it
-/// took under half of it; otherwise the same.
-pub fn next_cut(step: StepExtents, took: Duration) -> StepExtents {
-    let extents = if took > CUT_TARGET {
-        NonZeroU64::new(step.get() / 2).map_or(STEP_FLOOR.0, |half| half.max(STEP_FLOOR.0))
-    } else if took < CUT_TARGET / 2 {
-        step.0
-            .saturating_mul(NonZeroU64::MIN.saturating_add(1))
-            .min(STEP_EXTENTS.0)
-    } else {
-        step.0
+/// The size of the cut after one of `runs` extents that took `took`: the rate it observed carried
+/// to `target`, `runs × target / took`, so a cut past the target is followed at once by one the
+/// rate puts under it, however much smaller; never more than twice `runs`, since a rate measured
+/// on a few runs is no promise for many; never below [`STEP_FLOOR`].
+pub fn next_cut(runs: StepExtents, took: Duration, target: Duration) -> StepExtents {
+    let grown = runs.get().saturating_mul(2);
+    let carried = match u64::try_from(took.as_nanos()) {
+        Ok(0) => grown,
+        Ok(took) => u64::try_from(u128::from(runs.get()) * target.as_nanos() / u128::from(took))
+            .unwrap_or(u64::MAX),
+        Err(_) => STEP_FLOOR.get(),
     };
-    StepExtents(extents)
+    StepExtents(NonZeroU64::new(carried.min(grown).max(STEP_FLOOR.get())).unwrap_or(STEP_FLOOR.0))
 }
 
 /// How many extents one step frees at most: never zero, so every plan ends.
@@ -300,9 +305,10 @@ impl Release {
         self.unlink()
     }
 
-    /// Make every cut left, each sized by how long the one before it in this entry took ([`next_cut`]), the
-    /// first freeing [`STEP_EXTENTS`] runs, and unlink the empty file. The plan's steps are
-    /// [`STEP_FLOOR`] runs, so every size is a whole number of them.
+    /// Make every cut left, each sized from the rate the one before it in this entry took
+    /// ([`next_cut`] toward [`CUT_TARGET`]), the first freeing [`STEP_EXTENTS`] runs, and unlink
+    /// the empty file. The plan's steps are [`STEP_FLOOR`] runs, so each size is rounded down to a
+    /// whole number of them, and that rounded size is the one whose time the rate is taken from.
     fn finish_timed(mut self) -> io::Result<Released> {
         let mut size = STEP_EXTENTS;
         loop {
@@ -314,7 +320,8 @@ impl Release {
             self.file.set_len(cut)?;
             // The plan drops the cuts this one made only once it is made: the length is the journal.
             self.plan.cuts.truncate(kept);
-            size = next_cut(size, started.elapsed());
+            let made = StepExtents(steps.saturating_mul(STEP_FLOOR.0));
+            size = next_cut(made, started.elapsed(), CUT_TARGET);
             self.steps += 1;
         }
         self.unlink()
@@ -930,31 +937,30 @@ mod tests {
         }
     }
 
-    /// The next cut's size follows the last one's wall time (05_gateway.md "Deleting released
-    /// images"): past the target it halves, down to the floor; under half the target it doubles,
-    /// up to the ceiling; between the two it stays.
+    /// The next cut's size is the observed rate times the target (05_gateway.md "Deleting released
+    /// images"): `runs × target / observed`, at most twice `runs` and at least the 64-run floor.
+    /// An overshoot shrinks it at once, however far; an undershoot grows it at most twofold.
     #[test]
-    fn the_next_cut_halves_past_the_target_and_doubles_under_half_of_it() {
+    fn the_next_cut_is_the_observed_rate_times_the_target() {
         let ms = std::time::Duration::from_millis;
-        // (this cut's extents, its wall time, the next cut's extents)
-        let rows: [(u64, std::time::Duration, u64); 11] = [
-            (1024, ms(99), 1024),
-            (1024, ms(101), 512),
-            (256, ms(101), 128),
-            (128, ms(5_490), 64),
-            (64, ms(5_490), 64),
-            (512, ms(49), 1024),
-            (64, ms(49), 128),
-            (128, ms(49), 256),
-            (1024, ms(1), 1024),
-            (128, ms(50), 128),
-            (128, ms(100), 128),
+        let target = ms(400);
+        // (this cut's runs, its wall time, the next cut's runs)
+        let rows: [(u64, std::time::Duration, u64); 9] = [
+            (1024, ms(400), 1024),
+            (1024, ms(200), 2048),
+            (1024, ms(100), 2048),
+            (1024, std::time::Duration::ZERO, 2048),
+            (4096, ms(500), 3276),
+            (40_000, ms(5_000), 3200),
+            (1024, ms(57_352), 64),
+            (64, ms(1_000), 64),
+            (30_000, ms(390), 30_769),
         ];
-        for (extents, took, next) in rows {
+        for (runs, took, next) in rows {
             assert_eq!(
-                next_cut(step(extents), took),
+                next_cut(step(runs), took, target),
                 step(next),
-                "{extents} extents in {took:?}"
+                "{runs} runs in {took:?}"
             );
         }
     }
