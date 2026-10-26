@@ -2723,6 +2723,7 @@ os._exit(0)
                 &[],
             )
             .unwrap();
+        let watches = member_exit_watches(pgid);
         group.0.kill().unwrap();
         // The leader exited; this test holds it unreaped, so its start time still answers.
         super::await_exit_unreaped(pgid).expect("leader exit");
@@ -2735,8 +2736,8 @@ os._exit(0)
             vec![9]
         );
         drop(group);
-        while super::group_has_live_members(pgid).unwrap() {
-            std::thread::sleep(Duration::from_millis(5));
+        for watch in watches {
+            watch.wait().unwrap();
         }
         assert!(!super::group_has_live_members(pgid).unwrap());
         assert!(take_lost(&ledger, Duration::ZERO).unwrap().is_empty());
@@ -2773,12 +2774,13 @@ os._exit(0)
         assert!(group_alive(pgid));
         // The child reads this pipe: reaping the leader must not end it, only the signals may.
         let held = job.stdin.take();
+        let watches = member_exit_watches(pgid);
 
         let ended = end_recorded(&ledger, Writer::Any, Duration::from_millis(200)).unwrap();
         assert_eq!(ended.signalled, vec![7]);
         let _ = job.wait_bounded();
-        while group_alive(pgid) {
-            std::thread::sleep(Duration::from_millis(5));
+        for watch in watches {
+            watch.wait().unwrap();
         }
         assert!(!group_alive(pgid), "the leader's child died with it");
         drop(held);
@@ -2932,16 +2934,35 @@ os._exit(0)
         child
     }
 
+    /// Exit watches on every member of `pgid` but its leader, armed while they run:
+    /// each is identity-fenced to the member as read, and a member already gone (its
+    /// watch refused as not-found) needs none. Arm before whatever ends them.
+    #[cfg(target_os = "macos")]
+    fn member_exit_watches(pgid: i32) -> Vec<super::ExitWatch> {
+        super::members_of(pgid)
+            .unwrap()
+            .iter()
+            .filter(|member| member.pid() != pgid)
+            .filter_map(|member| match member.watch_exit() {
+                Ok(watch) => Some(watch),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("watch member {} of {pgid}: {error}", member.pid()),
+            })
+            .collect()
+    }
+
     /// End what remains of a [`started_job_group`] once its leader is reaped: the group's id
     /// still names its backgrounded reader. Returns once no process holds the id, so nothing the
     /// test started outlives it holding the runner's output.
     #[cfg(target_os = "macos")]
     fn end_started_group(pgid: i32) {
+        let watches = member_exit_watches(pgid);
         // SAFETY: the test's own group; its backgrounded reader may still hold the id.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
-        while super::group_has_live_members(pgid).unwrap() {
-            std::thread::sleep(Duration::from_millis(5));
+        for watch in watches {
+            watch.wait().unwrap();
         }
+        assert!(!super::group_has_live_members(pgid).unwrap());
     }
 
     /// A process is signalled only through the identity it was read with: the pid and that pid's
@@ -3177,6 +3198,7 @@ os._exit(0)
             );
             // The descendant reads this pipe: reaping the leader must not close it.
             let held = group.0.stdin.take();
+            let watches = member_exit_watches(pgid);
             group.0.kill().unwrap();
             group.0.wait_bounded().unwrap();
             assert_eq!(super::start_time(pgid).unwrap(), None, "{label}");
@@ -3238,8 +3260,8 @@ os._exit(0)
 
             drop(group);
             drop(held);
-            while super::group_has_live_members(pgid).unwrap() {
-                std::thread::sleep(Duration::from_millis(5));
+            for watch in watches {
+                watch.wait().unwrap();
             }
             assert!(super::unresolved(&ledger).unwrap().is_empty(), "{label}");
             assert!(
