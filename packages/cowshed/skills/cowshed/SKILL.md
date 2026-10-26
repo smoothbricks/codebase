@@ -31,9 +31,9 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    daemon, one artifact): typing `cowshed setup` runs the installed copy and installs nothing new, so install a checkout
    build via its own `packages/cowshed/bin/cowshed setup`, never symlink `cowshed` on PATH into a checkout, and expect
    setup to refuse a build older than the installed one (`--downgrade` only when intended).
-3. One workspace per agent; work there, never in shared `main` (a pure-Markdown edit is the exception: see "Batch a
-   round of units"). Pass `--project <git-root>` explicitly rather than trusting cwd. Retire finished sheds; storage
-   grows with divergence, not clone count.
+3. One workspace per agent; work there, never in shared `main` (standalone Markdown unrelated to any shed's code is the
+   exception: see "Batch a round of units"). Pass `--project <git-root>` explicitly rather than trusting cwd. Retire
+   finished sheds; storage grows with divergence, not clone count.
 4. Workspaces publish `.cowshed/env`; direnv users need nothing extra (`source_env_if_exists .cowshed/env` is the
    optional hook). After a reboot or eject, `cowshed attach` re-mounts; it is idempotent.
 
@@ -128,10 +128,12 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
    and dropped back to its owner; then gate again.
 6. Only main, the batch and the units being coded stay mounted. Work superseded before it was folded is removed with
    `cowshed rm <unit> --abandon`, then `cowshed gc --abandoned`.
-7. Markdown-only changes never wait for a batch and never go into one. A pure-Markdown edit belongs in place on main
-   (`cowshed fork --markdown-only` is refused for exactly that) and is committed through the repository's doc route
-   whenever it is ready. The ref turn (`cowshed land --ref-turn`, 05_gateway.md "A ref turn") orders such a commit
-   against lands, and the batch's land rebases over it.
+7. Code plus the docs, specs and brief that describe it are one unit: they live in that unit's shed and land together,
+   through the batch. Only standalone Markdown unrelated to any shed's code belongs in place on main
+   (`cowshed fork --markdown-only` is refused for exactly that), committed through the repository's doc route whenever
+   it is ready; it never waits for a batch. Unrelated Markdown found while in a unit's shed is committed on main now,
+   and the code stays in its shed. The ref turn (`cowshed land --ref-turn`, 05_gateway.md "A ref turn") orders such a
+   commit against lands, and the batch's land rebases over it.
 
 ## Enter a shed through `cowshed exec`
 

@@ -92,9 +92,11 @@ Notes for harness integration:
 - **Land a round of units as one batch.** Fork one batch shed from main per round and each unit from the batch. Fold a
   finished unit with `cowshed land <unit> --into <batch> --ungated`: Git alone, no check, and it retires the unit's
   shed, so only main, the batch and the units being coded stay mounted. Gate once with `cowshed land <batch>` (or the
-  repository's land route); a red is fixed in the batch, or its unit goes back to its owner. Markdown-only changes never
-  go into a batch: they belong in place on main, committed whenever they are ready. The commands and their refusals are
-  in [usage.md](usage.md#lanes-one-change-built-by-several-workspaces).
+  repository's land route); a red is fixed in the batch, or its unit goes back to its owner. Code plus the docs, specs
+  and brief that describe it are one unit: they live in that unit's shed and land together, through the batch. Only
+  standalone Markdown unrelated to any shed's code goes straight to main through the repository's doc route, whenever it
+  is ready, and the batch's land rebases over it. The commands and their refusals are in
+  [usage.md](usage.md#lanes-one-change-built-by-several-workspaces).
 - If a task needs a _snapshot to retry from_, `cowshed checkpoint <ws> <label>` before the risky step and
   `cowshed restore <ws> <label>` on failure — both are milliseconds, and far cheaper than re-creating the workspace.
   Checkpoint publication first crosses a supervisor barrier: complete Arrow batches and spill files are sealed, and a
