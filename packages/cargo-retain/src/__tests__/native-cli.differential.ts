@@ -216,7 +216,9 @@ const SCENARIOS: readonly Scenario[] = [
 describe('the native CLI against the Node CLI on copies of one churned Cargo target', () => {
   it('prints, changes and refuses exactly as the Node CLI does', async () => {
     if (!existsSync(NATIVE_CLI)) {
-      throw new Error(`no native CLI at ${NATIVE_CLI}: build it first (nx run cargo-retain:scriptc-native)`);
+      throw new Error(
+        `no native CLI at ${NATIVE_CLI}: build it first (nx run cargo-retain:build, which runs the host's scriptc-<arch>-<family>)`,
+      );
     }
     await inFixture(async (base) => {
       const check = labelled('the native CLI matches the Node CLI');

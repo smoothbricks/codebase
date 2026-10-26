@@ -1818,10 +1818,11 @@ async function createProjectTargets(
     // schedules after runs that built (@smoothbricks/cargo-retain): the superseded unit
     // generations it would reclaim and why everything else stays. Never cached:
     // the verdict is about this machine's disk, not the commit.
+    const retainTool = nativeToolDependsOn(nativeTools, 'cargo-retain');
     targets['cargo-retention'] = {
       executor: 'nx:run-commands',
       cache: false,
-      dependsOn: nativeToolDependsOn(nativeTools, 'cargo-retain'),
+      ...(retainTool.length > 0 ? { dependsOn: retainTool } : {}),
       options: {
         command: nativeToolCommand(nativeTools, cargoWorkspaceRoot, 'cargo-retain', 'smoo-nx-cargo-retain'),
         cwd: cargoWorkspaceRoot,

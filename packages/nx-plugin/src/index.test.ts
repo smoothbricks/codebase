@@ -1034,6 +1034,44 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
   });
 
   //#region smoo!n/rust-output-target-inference
+  it("makes the retention preview wait for cargo-retain's host executable where the workspace builds it", async () => {
+    const workspace = await createWorkspace();
+    try {
+      const root = workspace.context.workspaceRoot;
+      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
+      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = ["crates/ferris-core"]\n');
+      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
+      await workspace.write('packages/nx-plugin/package.json', '{"name":"@smoothbricks/nx-plugin"}\n');
+      await workspace.write(
+        'packages/cargo-retain/package.json',
+        '{"name":"@smoothbricks/cargo-retain","nx":{"name":"cargo-retain"}}\n',
+      );
+      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(join(root, 'packages/nx-plugin'), join(root, 'node_modules/@smoothbricks/nx-plugin'), 'dir');
+      await prepareCargoFixture(root);
+      resetWorkspaceContext();
+      const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
+      const results = await infer(
+        ['packages/ferris/package.json', 'packages/cargo-retain/package.json'],
+        undefined,
+        workspace.context,
+      );
+      const ferris = results.find(([file]) => file === 'packages/ferris/package.json')?.[1].projects?.[
+        'packages/ferris'
+      ];
+      expect(ferris?.targets?.['cargo-retention']).toMatchObject({
+        dependsOn: [{ projects: ['cargo-retain'], target: 'scriptc-arm64-macos' }],
+        options: {
+          command:
+            '../../node_modules/@smoothbricks/nx-plugin/../cargo-retain/dist/bin/darwin-arm64/smoo-nx-cargo-retain',
+          cwd: 'packages/ferris',
+        },
+      });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('infers generic cargo workspace targets without any rust output targets', async () => {
     const workspace = await createWorkspace();
     try {
