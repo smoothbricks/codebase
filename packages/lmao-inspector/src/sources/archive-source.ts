@@ -1,7 +1,24 @@
 /**
  * Archive source fetches historical Arrow IPC data via HTTP for offline trace analysis.
  * Returns async iterables of Arrow IPC buffers for progressive loading.
+ *
+ * The archive is a remote peer that streams its answer, so every wait on it is an `idle` wait
+ * (specs/lmao/01r_transient_errors_and_retry.md, "TypeScript: deadlines"): the answer's head, and each read of its body,
+ * must arrive within the remote-http bound (`REMOTE_HTTP_MS`; smoothbricks specs/cowshed/05_gateway.md, "Deadlines").
+ * An archive silent for longer ends the read with `SilentError`, naming the bytes it had sent; the time the consumer
+ * spends between reads is never counted.
  */
+
+import { Ok } from '@smoothbricks/lmao';
+import {
+  idle,
+  NOTHING,
+  type Progress,
+  REMOTE_HTTP_MS,
+  received,
+  SYSTEM_TIMERS,
+  type Timers,
+} from '@smoothbricks/lmao/errors/Deadline';
 
 export interface ArchiveSource {
   /** Fetch Arrow IPC buffers for a given time range */
@@ -13,11 +30,40 @@ export interface ArchiveSource {
  * The server returns Arrow IPC files for the requested time range.
  */
 //#region smoo/lmao!n/inspector-archive-source.create
-export function createArchiveSource(baseUrl: string): ArchiveSource {
+export function createArchiveSource(baseUrl: string, timers: Timers = SYSTEM_TIMERS): ArchiveSource {
+  const holder = `archive ${baseUrl}`;
   return {
     async *fetchRange(startTime: number, endTime: number): AsyncIterable<Uint8Array> {
       const url = `${baseUrl}?start=${startTime}&end=${endTime}`;
-      const response = await fetch(url);
+      // Ending our side of the request ends the head's wait and every later read of the body.
+      const request = new AbortController();
+      let last: Progress = NOTHING;
+      /** One wait on the archive, ended `SILENT` once it has sent nothing for the remote-http bound. */
+      const heard = async <T>(op: string, wait: () => Promise<T>): Promise<T> => {
+        const answer = await idle(
+          op,
+          holder,
+          REMOTE_HTTP_MS,
+          async (silence) => {
+            silence.progress(last);
+            const end = () => request.abort(silence.signal.reason);
+            silence.signal.addEventListener('abort', end, { once: true });
+            try {
+              return new Ok(await wait());
+            } catch (error) {
+              // Past the bound, the request's abort is this wait's own end: the failure is the answer.
+              throw silence.signal.aborted ? silence.signal.reason : error;
+            } finally {
+              silence.signal.removeEventListener('abort', end);
+            }
+          },
+          timers,
+        );
+        if (!answer.isOk()) throw answer.error;
+        return answer.value;
+      };
+
+      const response = await heard('archive fetch', () => fetch(url, { signal: request.signal }));
 
       if (!response.ok) {
         throw new Error(`Archive fetch failed: ${response.status} ${response.statusText}`);
@@ -34,8 +80,9 @@ export function createArchiveSource(baseUrl: string): ArchiveSource {
 
       try {
         while (true) {
-          const { done, value } = await reader.read();
+          const { done, value } = await heard('archive read', () => reader.read());
           if (done) break;
+          last = received(last, value.length);
 
           // Accumulate into buffer
           const combined = new Uint8Array(buffer.length + value.length);

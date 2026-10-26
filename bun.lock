@@ -184,10 +184,10 @@
       "version": "0.1.14-next.0",
       "dependencies": {
         "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
+        "@smoothbricks/lmao": "workspace:*",
         "@uwdata/flechette": "^2.7.0",
       },
       "devDependencies": {
-        "@smoothbricks/lmao": "workspace:*",
         "@smoothbricks/validation": "workspace:*",
       },
       "peerDependencies": {
