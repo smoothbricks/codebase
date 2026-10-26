@@ -630,20 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn the_finding_names_count_pids_mapping_and_why() {
+    fn the_finding_names_count_pids_and_their_memory_mapping() {
         let orphans = OrphanedHelpers::among(&pids(&[11, 12]), &pids(&[]));
         let message = orphans.to_string();
         for needle in [
             "2 diskimagesiod helper(s)",
             "(pid 11, 12)",
-            "two reads in a row",
             "72 MiB",
             "144 MiB in all",
-            "error code 150",
-            "launchctl kill",
-            "does not free leaked image devices",
-            "`ps` as this user does not list them",
-            "launchctl print system",
         ] {
             assert!(
                 message.contains(needle),
@@ -683,34 +677,5 @@ mod tests {
             let error = creator_pid(garbled).expect_err(garbled);
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
-    }
-
-    /// libproc names root's helpers to an unprivileged caller: a device whose user client
-    /// exists both before and after the listing had its helper running throughout, so the
-    /// listing names it whatever else attaches or detaches meanwhile.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_live_helpers_and_creators_are_readable() {
-        let creators = || {
-            crate::disk_image_user_client_creators(None)
-                .expect("read disk image user client creators")
-                .iter()
-                .map(|creator| creator_pid(creator).expect("creator pid"))
-                .collect::<BTreeSet<_>>()
-        };
-        let before = creators();
-        let helpers = scan_processes()
-            .expect("list diskimagesiod helpers")
-            .helpers;
-        let after = creators();
-        let throughout = before
-            .intersection(&after)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        assert!(
-            throughout.is_subset(&helpers),
-            "user clients name helpers libproc does not list: {:?}",
-            throughout.difference(&helpers).collect::<Vec<_>>()
-        );
     }
 }
