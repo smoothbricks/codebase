@@ -1024,13 +1024,15 @@ the handshake bound.
   `// eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: <what ends the wait>`, and
   `deadline/unbounded-wait-why` refuses a disable of the rule without that reason. The root `no-unbounded-wait` target
   runs the rule's planted fixtures. Rust: each cowshed crate's `clippy.toml` disallows every wait on another process (a
-  child's `wait`/`wait_with_output`, tokio `Child::kill`, `fork_lock`'s `output_locked`/`status_locked`, a unix-socket
-  `connect`, `libc::flock` and `File::lock`/`lock_shared`, `waitpid`/`waitid`/`wait4`), each reason naming its bounded
-  form in `cowshed_os::deadline` (`reap`, `reap_async`, `output_within`, `connect_unix`). A kept site allows
+  child's `wait`/`wait_with_output`, tokio `Child::kill`, `Command::output`/`status`, `fork_lock`'s
+  `output_locked`/`status_locked`, a unix-socket `connect`, `libc::flock` and `File::lock`/`lock_shared`,
+  `waitpid`/`waitid`/`wait4`), each reason naming its bounded form in `cowshed_os::deadline` (`reap`, `reap_async`,
+  `output_within`, `run_to_log`, `connect_unix`) or `cowshed_os::flock` (`exclusive`, `queued`). A kept site allows
   `clippy::disallowed_methods` for its one item or statement beside `// WHY unbounded: <what ends the wait>`, and
   `cowshed:wait-why` (WAIT-WHY, `packages/nx-plugin/src/wait-why-policy.ts`, a dependency of `cowshed:lint`) refuses the
-  allow without it. Tests wait through `cowshed_os::test_backstop`'s helpers, bounded by the no-progress backstop; a
-  test keeps a raw wait, with its WHY, only where a helper thread would change what it measures.
+  allow without it, and refuses a reason that records `debt:`: that names a stall the site leaves, not an end, so the
+  site is bounded instead. Tests wait through `cowshed_os::test_backstop`'s helpers, bounded by the no-progress
+  backstop; a test keeps a raw wait, with its WHY, only where a helper thread would change what it measures.
 
 ## Disk-lifecycle lease
 

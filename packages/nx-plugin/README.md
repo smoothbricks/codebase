@@ -2100,10 +2100,11 @@ process (`WAIT_METHODS`: child waits and reaps, `Command::output`/`status`, `out
 connects, `flock`, `waitpid`), so clippy refuses one that is not bounded through `cowshed_os::deadline`. A site kept
 unbounded suppresses `clippy::disallowed_methods` for its one item or statement, and WAIT-WHY refuses the suppression
 unless an adjacent `// WHY unbounded: <what ends the wait>` says why: on the comment lines directly above the attribute,
-on the attribute, or on the first line it covers. It also refuses a crate whose `clippy.toml` lacks one of the waits.
-Test code waits through `cowshed_os::test_backstop`'s helpers, each bounded by the no-progress backstop; a test keeps a
-raw wait, with its WHY, only where a helper thread would change what it measures. SmoothBricks runs it from
-`cowshed:wait-why`, which `cowshed:lint` depends on.
+on the attribute, or on the first line it covers. A reason that records `debt:` names a stall the site leaves, not an
+end, and is refused too. It also refuses a crate whose `clippy.toml` lacks one of the waits. Test code waits through
+`cowshed_os::test_backstop`'s helpers, each bounded by the no-progress backstop; a test keeps a raw wait, with its WHY,
+only where a helper thread would change what it measures. SmoothBricks runs it from `cowshed:wait-why`, which
+`cowshed:lint` depends on.
 
 A `bounded-exec` command takes its CPU tokens from the CPU pool it inherits before it starts
 (`specs/cowshed/05_gateway.md`, "Host scheduling", "Parallelism inside a job"), so the runners of one build tree keep

@@ -6,7 +6,8 @@ import { type RustToken, rustTokens } from './rust-tokens.js';
 /**
  * WAIT-WHY (specs/cowshed/05_gateway.md, "Deadlines", Enforcement). Clippy refuses each cross-process wait a crate's
  * `clippy.toml` disallows; a site kept unbounded is suppressed for its one item or statement, and this check refuses
- * the suppression unless an adjacent `// WHY unbounded:` says what ends the wait.
+ * the suppression unless an adjacent `// WHY unbounded:` says what ends the wait. A reason that records `debt:` names
+ * a stall the site leaves, not an end, and is refused: the site is bounded instead.
  */
 export const WAIT_WHY = 'WAIT-WHY';
 
@@ -40,6 +41,8 @@ const WAIT_NAMES: ReadonlySet<string> = new Set(WAIT_METHODS.map((path) => path.
 
 /** The reason, with text after it: an empty `// WHY unbounded:` explains nothing. */
 const WHY = /\/\/\s*WHY unbounded:\s*\S/u;
+/** A reason that records debt: a waiver naming the stall it leaves, never what ends the wait. */
+const DEBT = /\bdebt:/u;
 
 const OPENERS = new Set(['(', '[', '{']);
 const CLOSERS = new Set([')', ']', '}']);
@@ -117,8 +120,9 @@ function suppressesDisallowedMethods(attribute: readonly RustToken[]): boolean {
 
 /**
  * The 1-based lines of each suppression of `clippy::disallowed_methods` in `source` that covers a call named like a
- * disallowed wait and has no `// WHY unbounded: <reason>` beside it. Beside it means: in the comment and attribute
- * lines directly above the attribute, on the attribute's own lines, or on the first line of what it covers.
+ * disallowed wait and has no `// WHY unbounded: <reason>` beside it, or whose reason records `debt:`. Beside it
+ * means: in the comment and attribute lines directly above the attribute, on the attribute's own lines, or on the
+ * first line of what it covers.
  */
 export function unexplainedWaitAllows(source: string): number[] {
   const tokens = rustTokens(source);
@@ -154,7 +158,7 @@ export function unexplainedWaitAllows(source: string): number[] {
     let above = attributeLine - 1;
     while (above >= 1 && /^\s*(?:\/\/|#!?\[)/u.test(lines[above - 1] ?? '')) above -= 1;
     const beside = lines.slice(above, coveredLine);
-    if (!beside.some((line) => WHY.test(line))) found.push(attributeLine);
+    if (!beside.some((line) => WHY.test(line)) || beside.some((line) => DEBT.test(line))) found.push(attributeLine);
   }
   return found;
 }
@@ -194,7 +198,8 @@ export function checkWaitWhy(crates: string): WaitWhyFinding[] {
           line,
           message:
             'allow(clippy::disallowed_methods) covers a cross-process wait without an adjacent ' +
-            '`// WHY unbounded: <what ends the wait>`; bound it with cowshed_os::deadline or say what ends it',
+            '`// WHY unbounded: <what ends the wait>`, or with one that records debt: instead of an end; bound it ' +
+            'with cowshed_os::deadline or say what ends it',
         });
       }
     }

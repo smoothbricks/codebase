@@ -16,6 +16,8 @@ describe('WAIT-WHY', () => {
       '#[cfg_attr(test, allow(clippy::disallowed_methods))]\nfn reap(pid: i32) { libc::waitpid(pid, null_mut(), 0); }',
       `${allow}\nlet output = Command::new("git").arg("status").output()?;`,
       `// WHY unbounded:\n${allow}\nlet status = child.wait();`,
+      `// WHY unbounded: debt: a holder that wedges stalls this.\n${allow}\nfile.lock()?;`,
+      `// WHY unbounded: the install ahead releases it; debt: a wedged\n// install stalls this.\n${allow}\nfile.lock()?;`,
     ]) {
       expect(unexplainedWaitAllows(source), source).toEqual([
         source.split('\n').findIndex((line) => line.includes('#')) + 1,
