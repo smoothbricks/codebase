@@ -2422,6 +2422,10 @@ impl Scratch {
                 ));
             }
         }
+        // AUTOCLEAR runs on the device's last close: our own open of it is dropped
+        // before the wait, exactly as the live cleanup drops its loop descriptor
+        // before awaiting the backing file's final close.
+        drop(device_file);
         closed
             .wait()
             .map_err(|error| format!("await dead scratch backing close: {error}"))?;
@@ -2492,7 +2496,14 @@ impl Scratch {
 /// killed: the killed run of [`scratch_next_start_reclaims_a_killed_run`].
 fn hold_scratch(uid: u32, gid: u32) {
     let scratch = Scratch::make(uid, gid);
-    println!("{REPORT}scratch {} held", scratch.root.display());
+    let mounted = scratch
+        .owned_mount()
+        .expect("kernel mount identity")
+        .is_some();
+    println!(
+        "{REPORT}scratch {} held mounted:{mounted}",
+        scratch.root.display()
+    );
     std::io::stdout().flush().expect("report the held scratch");
     std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("hold the scratch");
 }
@@ -2517,14 +2528,35 @@ fn scratch_next_start_reclaims_a_killed_run(uid: u32, gid: u32) {
             .next()
             .expect("the holder reports its root before it holds it")
             .expect("the holder's report line");
-        if let Some(root) = line
+        if let Some(report) = line
             .strip_prefix(REPORT)
             .and_then(|rest| rest.strip_prefix("scratch "))
-            .and_then(|rest| rest.strip_suffix(" held"))
         {
-            break PathBuf::from(root);
+            let (root, mounted) = report
+                .strip_suffix(" held mounted:true")
+                .map(|root| (root, true))
+                .or_else(|| {
+                    report
+                        .strip_suffix(" held mounted:false")
+                        .map(|root| (root, false))
+                })
+                .expect("the holder's report names its root and mount");
+            break (PathBuf::from(root), mounted);
         }
     };
+    let (root, mounted) = root;
+    assert!(
+        mounted,
+        "the holder fell back to tmpfs, so the mounted reclaim is unproven in this run: \
+         declare loop devices for the harness"
+    );
+    assert_ne!(
+        mount_identity(&root.join("mnt"))
+            .expect("the held mount's identity")
+            .id,
+        mount_identity(&root).expect("the held root's identity").id,
+        "the held scratch is a distinct kernel mount"
+    );
     holder.kill().expect("SIGKILL the scratch holder");
     let status = holder.wait_bounded().expect("reap the scratch holder");
     assert_eq!(
