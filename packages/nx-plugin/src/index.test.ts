@@ -31,6 +31,7 @@ import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-w
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
+import { isRecord } from './type-guards.js';
 import { applyWorkspaceConfig, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
 
 useFixtureCargoHome();
@@ -2360,7 +2361,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // A host no declared triple serves infers the dedicated host build. Here the host is darwin-arm64 and the
       // package declares Linux addons alone.
       const linuxOnly = await readFile(join(workspace.context.workspaceRoot, 'packages/cowshed/package.json'), 'utf8');
-      const manifest = JSON.parse(linuxOnly) as { napi: { targets: string[] } };
+      const manifest: unknown = JSON.parse(linuxOnly);
+      if (!isRecord(manifest) || !isRecord(manifest.napi))
+        throw new Error('the cowshed fixture manifest declares no napi block');
       manifest.napi.targets = ['aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu'];
       await workspace.write('packages/cowshed/package.json', JSON.stringify(manifest));
       const unservedHostTargets = await inferProjectTargets(
