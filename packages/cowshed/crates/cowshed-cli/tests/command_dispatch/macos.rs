@@ -4972,9 +4972,9 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
 ///
 /// The job that runs across the adoption is a loop that sleeps between ticks: a resident, which
 /// holds no CPU token for its lifetime (05_gateway.md, "A resident holds no token"). The ledger
-/// has three tokens, as the macOS arm64 CI runner has, so its background room beside gate work is
-/// one token ("Room for a gate"). Run as an ordinary background job, the loop held that token, so the
-/// land's `--check` job queued behind it at `check-wait` and the land never reached its adoption:
+/// has three tokens, as the macOS arm64 CI runner has. Run as an ordinary background job while
+/// background beside gate work was held to one token, the loop held that token, so the land's
+/// `--check` job queued behind it at `check-wait` and the land never reached its adoption:
 /// it hung on that runner until the idle bound, twice, and hung the same way here with this
 /// ledger at three tokens, while at four it passed. The jobs draw on that fixture ledger, never on
 /// a pool this test's runner holds ([`holds_no_cpu_pool`]), so every run sees the runner's room.
