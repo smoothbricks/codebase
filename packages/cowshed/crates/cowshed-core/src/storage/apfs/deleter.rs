@@ -43,6 +43,17 @@ pub fn hand_over(socket: &Path, entry: &Path, record: ReleaseRecord) {
     }
 }
 
+/// Say, once per process, that this store names no gateway cleanup (a fixture store no test gave
+/// a gateway): a release committed without a hand-over waits in `.deleting` for a gateway's
+/// start, which lists it (`leftovers`).
+pub fn say_no_cleanup() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        cowshed_os::eprintln!(
+            "cowshed: this store names no gateway cleanup; its released images wait in .deleting for a gateway's start"
+        )
+    });
+}
 fn send(socket: &Path, entry: &Path, record: ReleaseRecord) -> io::Result<()> {
     let mut line =
         serde_json::to_vec(&ReleasedRequest::new(entry, record)).map_err(io::Error::other)?;

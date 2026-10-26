@@ -1062,12 +1062,16 @@ impl GitRepository {
         Ok(work)
     }
 
-    /// Ignored and hidden bytes are not automatically rebuildable (02_workspaces.md, `rm` step
-    /// 5). Only what cowshed itself made is exempt: its `.cowshed/` directory, the volume's own
-    /// bookkeeping, and each link of `build_state` exactly as `link::link_paths` made it — the
-    /// paths the checkout's build volume records (16_build_volumes.md, "One link per checkout").
-    /// Every other untracked leaf must survive in the target checkout: this is the first one that
-    /// does not, in `git ls-files` order, or `None` when every one does.
+    /// Gitignored paths are disposable by the project's own declaration and never keep a recovery
+    /// image (02_workspaces.md, `rm` step 5): ignored by the workspace's own rules (`git ls-files
+    /// --exclude-standard`) or by the target checkout's current ones (`ignored_by_rules`, as
+    /// [`Self::dirty_paths_by`] reads main's). Hidden untracked leaves no rule ignores are not
+    /// work to `git status` (`is_untracked_junk`) yet may be the only copy, so each must survive
+    /// in the target checkout, byte for byte or by the same symlink target, unless cowshed itself
+    /// made it: its `.cowshed/` directory, the volume's own bookkeeping, and each link of
+    /// `build_state` exactly as `link::link_paths` made it (16_build_volumes.md, "One link per
+    /// checkout"). This is the first leaf that does not survive, in `git ls-files` order, or
+    /// `None` when every one does.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) async fn first_unheld_untracked(
         &self,
@@ -1077,6 +1081,7 @@ impl GitRepository {
         let mut args = vec![
             "ls-files".to_owned(),
             "--others".to_owned(),
+            "--exclude-standard".to_owned(),
             "-z".to_owned(),
         ];
         for directory in std::iter::once(".cowshed").chain(cowshed_apfs::VOLUME_METADATA) {
@@ -1090,23 +1095,44 @@ impl GitRepository {
         let root = self.root.clone();
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            output
+            let untracked: Vec<&[u8]> = output
                 .stdout
                 .split(|byte| *byte == 0)
                 .filter(|path| !path.is_empty())
-                .map(|path| Path::new(OsStr::from_bytes(path)))
-                .filter(|path| {
-                    !build_state.iter().any(|state| {
-                        state.checkout.as_path() == *path
-                            && crate::build_volume::link::is_fixed_link(&root, state)
+                .collect();
+            // One check-ignore for every path; it answers in input order, so the ignored paths
+            // are a subsequence of `untracked` and one pass separates them.
+            let ignored = ignored_by_rules(&checkout, &untracked)?;
+            let mut ignored = ignored.iter().map(Vec::as_slice).peekable();
+            Ok::<_, std::io::Error>(
+                untracked
+                    .into_iter()
+                    .filter(|path| {
+                        let is_ignored = ignored.peek() == Some(path);
+                        if is_ignored {
+                            ignored.next();
+                        }
+                        !is_ignored
                     })
-                })
-                .find(|path| !held_by_checkout(&root, &checkout, path))
-                .map(Path::to_path_buf)
+                    .map(|path| Path::new(OsStr::from_bytes(path)))
+                    .filter(|path| {
+                        !build_state.iter().any(|state| {
+                            state.checkout.as_path() == *path
+                                && crate::build_volume::link::is_fixed_link(&root, state)
+                        })
+                    })
+                    .find(|path| !held_by_checkout(&root, &checkout, path))
+                    .map(Path::to_path_buf),
+            )
         })
         .await
         .map_err(|error| {
             CowshedError::internal(format!("compare retirement-only-copy paths: {error}"))
+        })?
+        .map_err(|error| {
+            CowshedError::internal(format!(
+                "cannot judge untracked files against the target checkout's ignore rules: {error}"
+            ))
         })
     }
 
@@ -6205,32 +6231,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_release_requires_ignored_and_hidden_bytes_to_be_held_elsewhere() {
+    async fn source_release_requires_hidden_bytes_held_elsewhere_and_never_ignored_ones() {
         let store = crate::temp_root::FixtureStore::new();
         let root = repository();
         let main = repository();
         let git = GitRepository::from_root(store.shared(), &root);
         fs::write(root.join(".git/info/exclude"), "/ignored\n").unwrap();
         fs::write(root.join("ignored"), b"only copy\n").unwrap();
-        fs::write(root.join(".hidden"), b"hidden copy\\n").unwrap();
+        fs::write(root.join(".hidden"), b"hidden copy\n").unwrap();
         assert!(!git.is_dirty_by(Some(&main)).await.unwrap());
         assert_eq!(
             git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            Some(PathBuf::from(".hidden"))
+            Some(PathBuf::from(".hidden")),
+            "a hidden leaf no rule ignores is the only copy"
         );
-        for path in ["ignored", ".hidden"] {
-            fs::copy(root.join(path), main.join(path)).unwrap();
-        }
+        fs::copy(root.join(".hidden"), main.join(".hidden")).unwrap();
         assert_eq!(
             git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            None
+            None,
+            "an ignored leaf main does not hold is disposable"
         );
-        fs::write(root.join("ignored"), b"different\n").unwrap();
+        fs::create_dir_all(root.join(".bench")).unwrap();
+        fs::write(root.join(".bench/out"), b"bench output\n").unwrap();
         assert_eq!(
             git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
-            Some(PathBuf::from("ignored"))
+            Some(PathBuf::from(".bench/out"))
         );
-        fs::remove_file(root.join("ignored")).unwrap();
+        fs::write(main.join(".git/info/exclude"), "/.bench/\n").unwrap();
+        assert_eq!(
+            git.first_unheld_untracked(&main, Vec::new()).await.unwrap(),
+            None,
+            "a leaf the target's current rules ignore is disposable"
+        );
         fs::create_dir_all(root.join(".cowshed")).unwrap();
         fs::write(root.join(".cowshed/token"), b"controller identity").unwrap();
         assert_eq!(
@@ -6264,6 +6296,10 @@ mod tests {
         ];
         link::point(&root, &volume).unwrap();
         link::link_paths(&root, &volume, &recorded).unwrap();
+        // `link_paths` also excludes each linked path, and an ignored path is disposable on its
+        // own. With the exclude block removed, as a user may edit it away, the checkout
+        // leaves only the volume's record to judge the links, which is what this test proves.
+        fs::write(root.join(".git/info/exclude"), "").unwrap();
         fs::create_dir_all(root.join(".fseventsd")).unwrap();
         fs::write(root.join(".fseventsd/no_log"), b"").unwrap();
         fs::write(root.join(cowshed_apfs::SPOTLIGHT_OPT_OUT), b"").unwrap();

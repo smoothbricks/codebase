@@ -387,7 +387,10 @@ When main's image is missing, `adopt <checkout> --re-adopt` re-adopts it from th
 diagnostic on stderr and in the structured result, alongside the allocated bytes of the images it released for deletion.
 `doctor` diagnoses sidecarless session images by name rather than treating them as live workspaces or failing the
 inventory. Store-wide `ls --all` and attach/detach skip an unreadable project with a named warning and still process
-other projects; identity collisions remain errors. `doctor` retains a finding for each unreadable project while
+other projects; identity collisions remain errors. Resolving which project a checkout belongs to does the same: an
+unreadable project is skipped with a named warning while a readable one claims the root, and fails only a root no
+readable project claims, because the unreadable one may own it. A retired session's `<ws>-<incarnation>.dmg` is never
+read as a retired main, whatever its name begins with. `doctor` retains a finding for each unreadable project while
 inspecting the others.
 
 Store-wide attach and detach likewise try the other workspaces after one target or project fails and name each skipped

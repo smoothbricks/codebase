@@ -345,14 +345,21 @@ on stderr, and the unbinding keeps its shared hold. Because every holder recheck
 (`forget`, below), removing it cannot split them. The restore checks terminal storage before it retires main, exempting
 what main's retirement and this release remove (main's own checkpoints and temp dir, every build volume's image and
 record, and the deleting directories of `build/` and `sessions/`, which the unbinding finishes first), so its refusal
-leaves main in place. Binding removal becomes completion only after its parent sync; a retry finishes controller cleanup
-before removing the lease, without recreating project directories. A fresh controller can discover an interrupted
-unbinding from the exact canonical checkout-root record and a typed, unfinished `Mutating Retire(main, restore=true)` in
-the source journal, even for a checkout with no remote. This is read-only recovery admission, never active inventory or
-registration. Live bindings retain precedence; ambiguous matching continuation records refuse rather than choosing one.
-The lifecycle journal is released after the other controller records, so failures in their removal retain the
-continuation. A death after releasing the journal but before deleting the checkout record can leave only that unbound
-bookkeeping record; it holds no recovery authority, and a later adoption's main image outranks it.
+leaves main in place. The refusal names what owns the rest first: a recovery image in `sessions/.trash`, with the
+`gc --recover` that exports it, before the checkpoints and temp dir it keeps, then `sessions/` before `checkpoints/` and
+`tmp/`, so a live workspace's image is named rather than its temp dir. Binding removal becomes completion only after its
+parent sync; a retry finishes controller cleanup before removing the lease, without recreating project directories. A
+fresh controller can discover an interrupted unbinding from the exact canonical checkout-root record and a typed,
+unfinished `Mutating Retire(main, restore=true)` in the source journal, even for a checkout with no remote. This is
+read-only recovery admission, never active inventory or registration. Live bindings retain precedence; ambiguous
+matching continuation records refuse rather than choosing one. That unfinished record is the restore's own: no startup
+replay or other verb completes it while the project is bound, and a restore is never answered from a completed record,
+so a retry after any failed unbinding (a stray file, a release that cannot move) runs the unbinding again rather than
+reporting success while the binding stands. A released image the unbinding lists but finds already unlinked by the
+gateway's cleanup is released, not an error. The lifecycle journal is released after the other controller records, so
+failures in their removal retain the continuation. A death after releasing the journal but before deleting the checkout
+record can leave only that unbound bookkeeping record; it holds no recovery authority, and a later adoption's main image
+outranks it.
 
 ## `cowshed forget <owner/repo> --abandon` — retire from store authority
 
@@ -1400,16 +1407,19 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    sidecar whose image is gone never depended on the bytes being freed. The removal's retry finds the workspace already
    gone. An open confined to other workspaces neither reads nor waits for it.
 
-   Gitignored or hidden content is not rebuildable merely because Git calls the tree clean. What cowshed itself made in
-   the checkout is not its content: `.cowshed/`, the volume's own bookkeeping (`.fseventsd`, the Spotlight, trash,
-   temporary-items and revisions directories, and the Spotlight opt-out marker volumes adopted before 2026-10-25 carry),
-   and each build-state link exactly as cowshed made it for a path the record of the build volume the checkout links
-   names (16_build_volumes.md, "One link per checkout"): a symlink, under real parent directories, whose target is that
-   path's fixed relative target through `.cowshed/build`. A link at a path the record does not name, a named path linked
-   anywhere else, and a checkout whose volume record cannot be read exempt nothing. Every other untracked leaf must be
-   held byte-for-byte (or by the same symlink target) in the surviving target checkout before direct release. Otherwise
-   preserve the complete image as recovery. This does not weaken the ordinary dirty/unlanded refusal gates or grant a
-   new destruction override.
+   A gitignored path is disposable by the project's own declaration and never keeps a recovery image: one ignored by the
+   workspace's own rules (`.gitignore`, `.git/info/exclude`, the user's excludes file) or by the surviving target
+   checkout's current rules. Only uncommitted work, unlanded commits and untracked leaves no rule ignores keep one.
+   Hidden untracked leaves are not work to `git status`, yet can be the only copy, so each must still be held. What
+   cowshed itself made in the checkout is not its content: `.cowshed/`, the volume's own bookkeeping (`.fseventsd`, the
+   Spotlight, trash, temporary-items and revisions directories, and the Spotlight opt-out marker volumes adopted before
+   2026-10-25 carry), and each build-state link exactly as cowshed made it for a path the record of the build volume the
+   checkout links names (16_build_volumes.md, "One link per checkout"): a symlink, under real parent directories, whose
+   target is that path's fixed relative target through `.cowshed/build`. A link at a path the record does not name, a
+   named path linked anywhere else, and a checkout whose volume record cannot be read exempt nothing. Every other
+   untracked leaf no rule ignores must be held byte-for-byte (or by the same symlink target) in the surviving target
+   checkout before direct release. Otherwise preserve the complete image as recovery. This does not weaken the ordinary
+   dirty/unlanded refusal gates or grant a new destruction override.
 
    **Recovery source:** authorized dirty/in-progress or unlanded removal, only-copy content, and rename preservation
    keep the existing atomic recovery transaction: durably link complete grants/CA companions at
@@ -1478,7 +1488,10 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    before applying final times. macOS keeps native copyfile metadata transfer and verifies ordinary xattrs, resource
    forks and canonical extended ACLs. Filesystem-private compression representation is not copied metadata. Unsupported
    or forbidden metadata operations refuse; they are not silently dropped. Sparse verification enforces the existing
-   allocation contract, not identical physical extent topology on different filesystems.
+   allocation contract, not identical physical extent topology on different filesystems. Copy and verification bypass
+   the page cache (macOS `F_NOCACHE` on both descriptors; Linux has no per-descriptor equivalent short of `O_DIRECT`)
+   and read only data regions: a hole in either file is compared and hashed as zeros without a read, so a sparse image
+   reads only its allocated bytes, while the digest still covers its whole length.
 
    **No source artifact leaves the trash until every destination artifact is published, durable and verified.** The
    complete journal-owned destination proof is also published create-new as `recovery-copy.json`, with the same manifest

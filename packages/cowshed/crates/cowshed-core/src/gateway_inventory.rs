@@ -1468,98 +1468,130 @@ impl NativeGatewayInventory {
         let expected = fs::canonicalize(project_root)
             .map_err(|source| io_error("resolving project root", project_root, source))?;
         let mut matched = None;
+        // One project's unreadable records are that project's fault (06_cli.md: store-wide
+        // listing skips an unreadable project with a named warning). They fail only a root no
+        // readable project claims, because the unreadable project may be that root's owner.
+        let mut unreadable = Vec::new();
         for repo in discover_repositories(self.storage.store())? {
-            let layout = StorageLayout::new(self.storage.store(), &repo).map_err(|error| {
-                GatewayInventoryError::InvalidMetadata {
-                    path: self.storage.store().to_owned(),
-                    message: error.to_string(),
+            match self.main_claims_root(&repo, &expected) {
+                Ok(true) => {
+                    if matched.replace(repo).is_some() {
+                        return Err(GatewayInventoryError::AmbiguousProjectRoot(
+                            project_root.to_owned(),
+                        ));
+                    }
                 }
-            })?;
-            let mut images = Vec::new();
-            let image = layout
-                .main_image()
-                .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: layout.project().project_root.clone(),
-                    message: error.to_string(),
-                })?
-                .image()
-                .to_owned();
-            if fs::symlink_metadata(&image).is_ok_and(|metadata| metadata.file_type().is_file()) {
-                images.push(image);
+                Ok(false) => {}
+                Err(error) => unreadable.push((repo, error)),
             }
-            let trash = layout.project().sessions.join(".trash");
-            match fs::read_dir(&trash) {
-                Ok(entries) => {
-                    for entry in entries {
-                        let path = entry
-                            .map_err(|source| io_error("reading retirement trash", &trash, source))?
-                            .path();
-                        if path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.starts_with("main-"))
-                            && cowshed_apfs::image::is_image_path(&path)
+        }
+        let found = match matched {
+            Some(repo) => Some(repo),
+            None => pending_restore_for_checkout(self.storage.store(), &expected)?,
+        };
+        let mut unreadable = unreadable.into_iter();
+        let unclaimed = if found.is_none() {
+            unreadable.next()
+        } else {
+            None
+        };
+        for (repo, error) in unreadable {
+            cowshed_os::eprintln!("cowshed: skipping project {repo}: {error}");
+        }
+        match unclaimed {
+            Some((_, error)) => Err(error),
+            None => Ok(found),
+        }
+    }
+
+    /// Whether `repo`'s main names `expected` as its checkout: through main's live or retired
+    /// images while one exists, else through the checkout root the store recorded for it.
+    fn main_claims_root(
+        &self,
+        repo: &RepoId,
+        expected: &Path,
+    ) -> Result<bool, GatewayInventoryError> {
+        let layout = StorageLayout::new(self.storage.store(), repo).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: self.storage.store().to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let mut images = Vec::new();
+        let image = layout
+            .main_image()
+            .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                path: layout.project().project_root.clone(),
+                message: error.to_string(),
+            })?
+            .image()
+            .to_owned();
+        if fs::symlink_metadata(&image).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            images.push(image);
+        }
+        let trash = layout.project().sessions.join(".trash");
+        match fs::read_dir(&trash) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry
+                        .map_err(|source| io_error("reading retirement trash", &trash, source))?
+                        .path();
+                    // `<ws>-<incarnation>.dmg`, read as recovery export reads it: a
+                    // session named `main-probe` retires as `main-probe-<incarnation>.dmg`.
+                    if crate::storage::recovery_image::classify(&trash, &path)
+                            .is_ok_and(|(workspace, _)| workspace.is_main())
                             && fs::symlink_metadata(&path)
                                 .is_ok_and(|metadata| metadata.file_type().is_file())
                             // A retired image without its sidecar has no record left to name a
                             // checkout; it is bytes awaiting reclaim, not a claim on the root.
                             && !fs::symlink_metadata(sidecar_path(&path))
                                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                        {
-                            images.push(path);
-                        }
+                    {
+                        images.push(path);
                     }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(io_error("enumerating retirement trash", &trash, source));
                 }
             }
-            // Main's images name the checkout while any exists. Removing main takes them away, and
-            // it records the root in the store first, so a project still bound afterwards is found
-            // from its checkout through that record — and only then, so the record never outvotes
-            // an image.
-            let claims_root = if images.is_empty() {
-                layout
-                    .recorded_checkout_root()
-                    .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                        path: layout.project().checkout_root.clone(),
-                        message: error.to_string(),
-                    })?
-                    .and_then(|root| fs::canonicalize(root).ok())
-                    .is_some_and(|root| root == expected)
-            } else {
-                images.into_iter().try_fold(false, |claimed, image| {
-                    verify_image_path(self.storage.store(), &image)?;
-                    let metadata =
-                        DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
-                            GatewayInventoryError::InvalidMetadata {
-                                path: sidecar_path(&image),
-                                message: error.to_string(),
-                            }
-                        })?;
-                    if metadata.repo_id != repo || !metadata.workspace.is_main() {
-                        return Err(GatewayInventoryError::InvalidMetadata {
-                            path: sidecar_path(&image),
-                            message: "main image metadata identity does not match its binding"
-                                .to_owned(),
-                        });
-                    }
-                    let matches = fs::canonicalize(&metadata.info_snapshot.project_root)
-                        .is_ok_and(|root| root == expected);
-                    Ok::<_, GatewayInventoryError>(claimed || matches)
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(io_error("enumerating retirement trash", &trash, source));
+            }
+        }
+        // Main's images name the checkout while any exists. Removing main takes them away, and
+        // it records the root in the store first, so a project still bound afterwards is found
+        // from its checkout through that record — and only then, so the record never outvotes
+        // an image.
+        let claims_root = if images.is_empty() {
+            layout
+                .recorded_checkout_root()
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: layout.project().checkout_root.clone(),
+                    message: error.to_string(),
                 })?
-            };
-            if claims_root && matched.replace(repo).is_some() {
-                return Err(GatewayInventoryError::AmbiguousProjectRoot(
-                    project_root.to_owned(),
-                ));
-            }
-        }
-        if matched.is_some() {
-            return Ok(matched);
-        }
-        pending_restore_for_checkout(self.storage.store(), &expected)
+                .and_then(|root| fs::canonicalize(root).ok())
+                .is_some_and(|root| root == expected)
+        } else {
+            images.into_iter().try_fold(false, |claimed, image| {
+                verify_image_path(self.storage.store(), &image)?;
+                let metadata =
+                    DetachedWorkspaceMetadata::read_for_image(&image).map_err(|error| {
+                        GatewayInventoryError::InvalidMetadata {
+                            path: sidecar_path(&image),
+                            message: error.to_string(),
+                        }
+                    })?;
+                if metadata.repo_id != *repo || !metadata.workspace.is_main() {
+                    return Err(GatewayInventoryError::InvalidMetadata {
+                        path: sidecar_path(&image),
+                        message: "main image metadata identity does not match its binding"
+                            .to_owned(),
+                    });
+                }
+                let matches = fs::canonicalize(&metadata.info_snapshot.project_root)
+                    .is_ok_and(|root| root == expected);
+                Ok::<_, GatewayInventoryError>(claimed || matches)
+            })?
+        };
+        Ok(claims_root)
     }
 
     fn re_adoption_primary_for_checkout_blocking(
@@ -4693,7 +4725,7 @@ mod tests {
             canonical_image_paths(&layout, &storage.workspace).expect("canonical image");
         let trash = layout.project().sessions.join(".trash");
         fs::create_dir_all(&trash).expect("trash");
-        let retired = trash.join("main-retired.dmg");
+        let retired = trash.join("main-00000000000000000000000000000001.dmg");
         fs::rename(canonical.image(), &retired).expect("retire image");
         fs::rename(sidecar_path(canonical.image()), sidecar_path(&retired))
             .expect("retire metadata");
@@ -4709,6 +4741,104 @@ mod tests {
         );
     }
 
+    /// A session named like main keeps its retired image as `main-probe-<incarnation>.dmg`: that
+    /// is the session's record, never a retired main, so it neither claims nor fails any root.
+    #[tokio::test]
+    async fn a_retired_session_named_like_main_is_no_retired_main() {
+        let fixture = Fixture::new("main-named-session");
+        let widget = RepoId::parse("acme/widget").expect("repo");
+        let other = RepoId::parse("acme/other").expect("repo");
+        fixture.bind(&widget);
+        fixture.bind(&other);
+        fixture.workspace(
+            &widget,
+            WorkspaceName::main(),
+            "00000000000000000000000000000001",
+            4,
+            false,
+        );
+        let incarnation = "00000000000000000000000000000002";
+        let (storage, _) = fixture.workspace(
+            &other,
+            WorkspaceName::new("main-probe").expect("session name"),
+            incarnation,
+            4,
+            false,
+        );
+        let layout = StorageLayout::new(fixture.storage.store(), &other).expect("layout");
+        let canonical =
+            canonical_image_paths(&layout, &storage.workspace).expect("canonical image");
+        let trash = layout.project().sessions.join(".trash");
+        fs::create_dir_all(&trash).expect("trash");
+        let retired = trash.join(format!("main-probe-{incarnation}.dmg"));
+        fs::rename(canonical.image(), &retired).expect("retire image");
+        fs::rename(sidecar_path(canonical.image()), sidecar_path(&retired))
+            .expect("retire metadata");
+        let stranger = fixture.root.join("stranger");
+        fs::create_dir_all(&stranger).expect("unclaimed checkout");
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&fixture.root.join("checkout-widget"))
+                .await
+                .expect("another project's retired session is no main"),
+            Some(widget)
+        );
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&stranger)
+                .await
+                .expect("a retired session claims no root"),
+            None
+        );
+    }
+
+    /// One project's unreadable main record is that project's fault (06_cli.md, store-wide
+    /// listing skips an unreadable project): a root another project's main names still
+    /// resolves, and only a root no readable project claims reports it, because the unreadable
+    /// project may be that root's owner.
+    #[tokio::test]
+    async fn an_unreadable_main_record_fails_only_a_root_no_readable_project_claims() {
+        let fixture = Fixture::new("unreadable-main");
+        let widget = RepoId::parse("acme/widget").expect("repo");
+        let other = RepoId::parse("acme/other").expect("repo");
+        fixture.bind(&widget);
+        fixture.bind(&other);
+        fixture.workspace(
+            &widget,
+            WorkspaceName::main(),
+            "00000000000000000000000000000001",
+            4,
+            false,
+        );
+        let (storage, _) = fixture.workspace(
+            &other,
+            WorkspaceName::main(),
+            "00000000000000000000000000000002",
+            4,
+            false,
+        );
+        let layout = StorageLayout::new(fixture.storage.store(), &other).expect("layout");
+        let canonical =
+            canonical_image_paths(&layout, &storage.workspace).expect("canonical image");
+        fs::write(sidecar_path(canonical.image()), b"{").expect("corrupt the main record");
+        let stranger = fixture.root.join("stranger");
+        fs::create_dir_all(&stranger).expect("unclaimed checkout");
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&fixture.root.join("checkout-widget"))
+                .await
+                .expect("another project's unreadable main fails only that project"),
+            Some(widget)
+        );
+        assert!(matches!(
+            inventory.repository_for_project_root(&stranger).await,
+            Err(GatewayInventoryError::InvalidMetadata { .. })
+        ));
+    }
     #[tokio::test]
     async fn a_bound_project_whose_main_images_are_gone_is_found_by_its_recorded_checkout_root() {
         let fixture = Fixture::new("reclaimed-main");

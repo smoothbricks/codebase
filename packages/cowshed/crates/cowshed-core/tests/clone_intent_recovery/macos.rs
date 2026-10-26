@@ -226,12 +226,50 @@ async fn a_named_rm_abandon_supersedes_its_targets_refused_unfinished_retire() {
     assert_eq!(fixture.listed(&rm).await, ["lane", "main"]);
     rm.shutdown().await.expect("stop the removing runtime");
 }
-/// Neither a hidden name nor gitignore proves rebuildability. Only-copy source bytes keep
-/// their complete recovery image across shutdown, startup, plain gc and bundle-only gc.
+/// A gitignored path is disposable by the project's own declaration, so it never keeps a recovery
+/// image (02_workspaces.md, `rm` step 5): a tree whose only extra file is ignored retires with its
+/// image released. A hidden untracked file no rule ignores is still the only copy, and keeps its
+/// complete recovery image across shutdown, startup, plain gc and bundle-only gc.
 #[tokio::test]
-async fn ignored_only_copy_source_content_keeps_recovery_trash() {
+async fn ignored_content_is_released_and_hidden_only_copy_content_keeps_recovery_trash() {
     let fixture = Fixture::new("only-copy-source");
     let runtime = fixture.adopt().await;
+    let minted = fixture
+        .mint(&runtime, "scratch", ForkOptions::default())
+        .await
+        .expect("fork");
+    let scratch = PathBuf::from(minted["info"]["mount"].as_str().unwrap());
+    let scratch_image = fixture
+        .layout()
+        .session_image(&name("scratch"))
+        .unwrap()
+        .image()
+        .to_owned();
+    let scratch_metadata = DetachedWorkspaceMetadata::read_for_image(&scratch_image).unwrap();
+    fs::write(scratch.join("ignored-output"), b"rebuildable\n").unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(scratch.join(".git/info/exclude"))
+        .unwrap()
+        .write_all(b"\n/ignored-output\n")
+        .unwrap();
+    fixture
+        .remove(&runtime, "scratch")
+        .await
+        .expect("retire an ignored-only tree");
+    assert!(!scratch_image.exists());
+    assert!(
+        !fixture
+            .layout()
+            .project()
+            .sessions
+            .join(format!(
+                ".trash/scratch-{}.dmg",
+                scratch_metadata.workspace_incarnation
+            ))
+            .exists(),
+        "an ignored file kept a recovery image"
+    );
     let minted = fixture
         .mint(&runtime, "notes", ForkOptions::default())
         .await
@@ -323,6 +361,49 @@ async fn ignored_only_copy_source_content_keeps_recovery_trash() {
         .expect("stop missing-record runtime");
 }
 
+/// A restore whose unbinding fails after main retired is finished by the same command again
+/// (02_workspaces.md, `rm main --restore`): the reopening that replays its journaled retirement
+/// leaves it unfinished for the restore, and the retry removes the binding rather than answering
+/// with a recorded success while the binding stands.
+#[tokio::test]
+async fn a_restore_whose_unbinding_failed_is_finished_by_its_retry() {
+    let fixture = Fixture::new("restore-retry");
+    let runtime = fixture.adopt().await;
+    let layout = fixture.layout();
+    let stray = layout.project().mount_root.join("stray/notes.txt");
+    fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    fs::write(&stray, b"left in the mount tree").unwrap();
+    let restore = json!({
+        "repoId": fixture.repo,
+        "workspace": "main",
+        "options": RemoveOptions { restore: true, ..RemoveOptions::default() },
+    });
+    let error = fixture
+        .call(&runtime, "coordinator.destroy", restore.clone())
+        .await
+        .expect_err("a file in the mount tree fails the unbinding after main retired");
+    assert!(error.message.contains("notes.txt"), "{}", error.message);
+    assert!(
+        layout.project().repository_binding.exists(),
+        "the failed unbinding kept the binding"
+    );
+    runtime.shutdown().await.expect("stop runtime");
+    fs::remove_file(&stray).unwrap();
+
+    let retry = fixture
+        .open_removing("main")
+        .await
+        .expect("the retry reopens the still-bound project");
+    fixture
+        .call(&retry, "coordinator.destroy", restore)
+        .await
+        .expect("the retry finishes the restore");
+    assert!(
+        !layout.project().repository_binding.exists(),
+        "the retry answered while the binding stood"
+    );
+    retry.shutdown().await.expect("stop the retry runtime");
+}
 /// The directory store of the fixture whose scratch root is `scratch`: its `store` directory.
 fn fixture_storage(namespace: TestNamespace, scratch: &Path) -> ValidatedHostStorage {
     ValidatedHostStorage::new(

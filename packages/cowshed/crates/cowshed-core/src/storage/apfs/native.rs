@@ -2843,14 +2843,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     pub(super) fn hand_over(&self, entry: &Path, record: cowshed_gateway_types::ReleaseRecord) {
         match &self.config.cleanup {
             Some(socket) => super::deleter::hand_over(socket, entry, record),
-            None => {
-                static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| {
-                    cowshed_os::eprintln!(
-                        "cowshed: this store names no gateway cleanup; its released images wait in .deleting for a gateway's start"
-                    )
-                });
-            }
+            None => super::deleter::say_no_cleanup(),
         }
     }
 

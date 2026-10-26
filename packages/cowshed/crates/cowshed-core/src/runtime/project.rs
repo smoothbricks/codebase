@@ -3308,12 +3308,6 @@ struct DeletingDirectory {
 /// is not a released image stays, for the terminal plan to refuse naming it.
 #[cfg(target_os = "macos")]
 fn move_terminal_releases(project_root: &Path, cleanup: Option<&Path>) -> Result<()> {
-    let failed = |what: &str, path: &Path, error: std::io::Error| {
-        CowshedError::environment_missing(
-            format!("cannot {what} {}: {error}", path.display()),
-            "check controller storage permissions and retry",
-        )
-    };
     let store = project_root
         .parent()
         .and_then(Path::parent)
@@ -3329,11 +3323,13 @@ fn move_terminal_releases(project_root: &Path, cleanup: Option<&Path>) -> Result
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(failed("list released images in", &directory, error)),
+            Err(error) => {
+                return Err(release_failed("list released images in", &directory, error));
+            }
         };
         for entry in entries {
-            let entry =
-                entry.map_err(|error| failed("list released images in", &directory, error))?;
+            let entry = entry
+                .map_err(|error| release_failed("list released images in", &directory, error))?;
             let released = entry
                 .file_name()
                 .to_str()
@@ -3341,41 +3337,81 @@ fn move_terminal_releases(project_root: &Path, cleanup: Option<&Path>) -> Result
                 && entry
                     .file_type()
                     .is_ok_and(|kind| kind.is_file() || kind.is_dir());
-            if !released {
-                continue;
-            }
-            std::fs::create_dir_all(&target).map_err(|error| failed("create", &target, error))?;
-            let moved = target.join(format!(
-                "{}.{}",
-                crate::build_volume::BuildVolumeId::mint(),
-                cowshed_apfs::image::IMAGE_EXTENSION
-            ));
-            std::fs::rename(entry.path(), &moved)
-                .map_err(|error| failed("move the released image", &entry.path(), error))?;
-            for synced in [&target, &directory] {
-                cowshed_os::fsio::open_directory_nofollow(synced)
-                    .and_then(|held| cowshed_os::fsio::sync_held_directory(&held))
-                    .map_err(|error| failed("sync", synced, error))?;
-            }
-            if let Some(socket) = cleanup {
-                crate::storage::apfs::deleter::hand_over(
-                    socket,
-                    &moved,
-                    cowshed_gateway_types::ReleaseRecord::default(),
-                );
+            if released {
+                move_terminal_release(&entry.path(), &directory, &target, cleanup)?;
             }
         }
     }
     Ok(())
 }
 
+/// Move `image`, a released image listed in `directory`, into the store's `.deleting` at
+/// `target` under a fresh name, and hand it to the gateway's cleanup at `cleanup`.
+#[cfg(target_os = "macos")]
+fn move_terminal_release(
+    image: &Path,
+    directory: &Path,
+    target: &Path,
+    cleanup: Option<&Path>,
+) -> Result<()> {
+    std::fs::create_dir_all(target).map_err(|error| release_failed("create", target, error))?;
+    let moved = target.join(format!(
+        "{}.{}",
+        crate::build_volume::BuildVolumeId::mint(),
+        cowshed_apfs::image::IMAGE_EXTENSION
+    ));
+    match std::fs::rename(image, &moved) {
+        Ok(()) => {}
+        // The gateway's cleanup, freeing it in place, unlinked it after the listing: it is released,
+        // with nothing left to move or hand over (`release::free_committed` reads the same absence as
+        // `Released::Absent`). A rename's ENOENT also names a missing destination parent, so only
+        // the source's own absence counts.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(image)
+                    .is_err_and(|absent| absent.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(release_failed("move the released image", image, error)),
+    }
+    for synced in [target, directory] {
+        cowshed_os::fsio::open_directory_nofollow(synced)
+            .and_then(|held| cowshed_os::fsio::sync_held_directory(&held))
+            .map_err(|error| release_failed("sync", synced, error))?;
+    }
+    match cleanup {
+        Some(socket) => crate::storage::apfs::deleter::hand_over(
+            socket,
+            &moved,
+            cowshed_gateway_types::ReleaseRecord::default(),
+        ),
+        None => crate::storage::apfs::deleter::say_no_cleanup(),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn release_failed(what: &str, path: &Path, error: std::io::Error) -> CowshedError {
+    CowshedError::environment_missing(
+        format!("cannot {what} {}: {error}", path.display()),
+        "check controller storage permissions and retry",
+    )
+}
+
 /// The project store trees an unbinding deletes once main is retired and its build volumes are
-/// released; they may hold nothing but empty directories and zero-length locks by then.
+/// released; they may hold nothing but empty directories and zero-length locks by then. In
+/// 02_workspaces.md's order, which puts `sessions/` before the checkpoints and temp dirs its
+/// images own, so a refusal names a live workspace's image rather than what that image keeps.
 #[cfg(target_os = "macos")]
 const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
     (
         crate::storage::recovery::STAGING_NAMESPACE,
         ReleasedFirst::Nothing,
+    ),
+    (
+        crate::repository::SESSIONS_DIRECTORY,
+        ReleasedFirst::Deleting,
     ),
     (
         crate::repository::CHECKPOINTS_DIRECTORY,
@@ -3386,14 +3422,53 @@ const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
         ReleasedFirst::MainsOwn,
     ),
     (
-        crate::repository::SESSIONS_DIRECTORY,
-        ReleasedFirst::Deleting,
-    ),
-    (
         crate::build_volume::IMAGES_DIRECTORY,
         ReleasedFirst::BuildVolumes,
     ),
 ];
+
+/// Refuses a main restore while a recovery image stands in `sessions/.trash`, naming it and the
+/// export that takes it out of the store (02_workspaces.md, "Recovering a recovery image"): it may
+/// hold the only copy of its workspace's work, which no gc reclaims, and it keeps that workspace's
+/// checkpoints and temp dir, which the terminal plan would otherwise name in its place.
+#[cfg(target_os = "macos")]
+fn require_no_recovery_image(project_root: &Path) -> Result<()> {
+    let trash = project_root
+        .join(crate::repository::SESSIONS_DIRECTORY)
+        .join(crate::storage::recovery::TRASH_NAMESPACE);
+    let failed = |error: std::io::Error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot enumerate recovery images in {}: {error}",
+                trash.display()
+            ),
+            "check controller storage permissions and retry",
+        )
+    };
+    let entries = match std::fs::read_dir(&trash) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failed(error)),
+    };
+    for entry in entries {
+        let image = entry.map_err(failed)?.path();
+        if let Ok((workspace, _)) = crate::storage::recovery_image::classify(&trash, &image) {
+            return Err(CowshedError::conflict(
+                format!(
+                    "main cannot be restored while {workspace}'s recovery image remains: {}",
+                    image.display()
+                ),
+                format!(
+                    "it may hold the only copy of {workspace}'s work and keeps its checkpoints and \
+                     temp dir; move it out of the store with cowshed gc --recover {} --to <dir>, \
+                     then retry",
+                    image.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Refuses a main restore whose terminal storage the unbinding could not delete: a live
 /// workspace's image, grants or temp dir, an unreclaimed retired image, a staged image, another
@@ -3405,6 +3480,7 @@ const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
 /// because the same refusal after it leaves a binding only a retry of the restore removes.
 #[cfg(target_os = "macos")]
 fn require_terminal_storage(project_root: &Path) -> Result<()> {
+    require_no_recovery_image(project_root)?;
     let mut plan = Vec::new();
     let planned = TERMINAL_STORAGE_TREES
         .into_iter()
@@ -4997,6 +5073,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                     YoungPolicy::Authorized,
                                 )
                                 .await?;
+                            } else if options.restore {
+                                // Only the restore finishes its unbinding, and this unfinished
+                                // record is what lets it (02_workspaces.md, `rm main --restore`):
+                                // completing it here would answer the restore's retry with
+                                // success while the binding stands.
+                                cowshed_os::eprintln!(
+                                    "cowshed: {workspace} was retired by a restore that has not unbound the project yet; cowshed rm main --restore finishes it"
+                                );
                             } else {
                                 self.complete_lifecycle_intent(
                                     &workspace,
@@ -8248,7 +8332,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // workspace is already gone.
         let was_pending = journaled
             || unfinished.is_some_and(|operation| operation.retires_same_session(&intent));
-        if let Some(report) = self.completed_retire_intent(&intent).cloned()
+        // A restore is never answered from its record: its retry must still unbind the project.
+        if !options.restore
+            && let Some(report) = self.completed_retire_intent(&intent).cloned()
             && self
                 .current(&workspace)
                 .await
@@ -27702,6 +27788,83 @@ mod terminal_project_cleanup_tests {
 
     const VOLUME: &str = "0123456789abcdef0123456789abcdef";
 
+    /// A recovery image keeps its workspace's checkpoints and temp dir until it is exported, so
+    /// main's restore names the image and the export that takes it out of the store, never what
+    /// it keeps.
+    #[test]
+    fn a_recovery_image_is_named_before_the_checkpoints_and_temp_dir_it_keeps() {
+        let (root, paths) = project("recovery-image");
+        let image = paths.sessions.join(format!(".trash/raven-{VOLUME}.dmg"));
+        for kept in [
+            image.clone(),
+            crate::metadata::sidecar_path(&image),
+            paths.exec_temp.join("raven/scratch"),
+            paths.checkpoints.join("raven/before.dmg"),
+        ] {
+            std::fs::create_dir_all(kept.parent().expect("parent")).expect("parent");
+            std::fs::write(&kept, b"retained").expect("kept");
+        }
+
+        let error = require_terminal_storage(&paths.project_root)
+            .expect_err("a recovery image refuses main's restore");
+        assert_eq!(error.code.as_str(), "conflict");
+        assert!(
+            error.message.contains(&image.display().to_string()),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .hint
+                .contains(&format!("cowshed gc --recover {}", image.display())),
+            "{}",
+            error.hint
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A live session's image owns that session's temp dir: the refusal names the image.
+    #[test]
+    fn a_live_sessions_image_is_named_before_its_temp_dir() {
+        let (root, paths) = project("live-session");
+        let image = paths.sessions.join("raven.dmg");
+        let scratch = paths.exec_temp.join("raven/scratch");
+        for kept in [&image, &scratch] {
+            std::fs::create_dir_all(kept.parent().expect("parent")).expect("parent");
+            std::fs::write(kept, b"retained").expect("kept");
+        }
+
+        let error = require_terminal_storage(&paths.project_root)
+            .expect_err("a live session refuses main's restore");
+        assert!(error.message.contains("raven.dmg"), "{}", error.message);
+        assert!(!error.message.contains("scratch"), "{}", error.message);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A released image the listing found but the gateway's cleanup already unlinked (it freed the
+    /// entry in place between the listing and the move) is released: nothing moves, and the
+    /// unbinding goes on.
+    #[test]
+    fn a_released_image_the_cleanup_already_unlinked_is_released() {
+        let (root, paths) = project("released-gone");
+        let deleting = paths.project_root.join("build/.deleting");
+        std::fs::create_dir_all(&deleting).expect("deleting directory");
+        let target = crate::storage::apfs::deleter::store_deleting(&paths.store_root);
+
+        super::move_terminal_release(
+            &deleting.join(format!("{VOLUME}.dmg")),
+            &deleting,
+            &target,
+            None,
+        )
+        .expect("an entry the cleanup already unlinked is released");
+        assert!(
+            std::fs::read_dir(&target).map_or(true, |mut entries| entries.next().is_none()),
+            "nothing moved"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
     /// Released build volumes leave `build/` with their zero-length holds (an orphan hold no
     /// collection lists too) and an empty `.staging`; none of it outlives the binding.
     #[test]
@@ -28135,6 +28298,11 @@ import("./compile-cache-lib.mjs").then((lib) => {
         // While it stands, the restore refuses and removes nothing.
         let error = require_terminal_storage(&project_root)
             .expect_err("a retained recovery workspace must refuse the restore");
+        assert!(
+            error.message.contains(&trash.display().to_string()),
+            "the refusal names the recovery image, not what it keeps: {}",
+            error.message
+        );
         assert_eq!(error.code.as_str(), "conflict");
         assert_eq!(
             files_under(&exec_temp),

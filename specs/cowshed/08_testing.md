@@ -150,16 +150,17 @@ No mounts, no root, no network — pure functions with table-driven cases:
   controller admits and observes 100 live jobs while project enumeration refuses its foreign inventory fault. Retirement
   fixtures prove clean landed sources are committed to `sessions/.deleting` before the removal reply, none to the
   recovery trash and no byte of one freed by the removal, a real immutable-file refusal of that release preserves source
-  grants/CA authority, and dirty, unlanded and only-copy ignored content survives in its live or recovery image, even
-  after the recovery sidecar is removed and startup/GC runs again. Cancellation and post-rename crash replay retain the
-  mutating intent until the release's owner metadata is removed; recovery-image rename fixtures still require complete
-  grants/CA at commit. The directory cutover runs the real controller and gateway with corrupt/missing sibling grants,
-  named mount/marker fences and held-lock recovery, plus prepared-retirement retry and post-commit recovery. Cold named
-  and removal opens ignore broken sibling sidecars, preserve session-origin validation, and still refuse selected
-  corruption; full Store/Inspect opens and project enumeration retain their malformed-inventory refusals. Ordinary
-  worker and trusted Gate exec share the core scoped preparation boundary. A fixture restarting a bare gateway
-  explicitly restores project sessions through maintenance before work; job admission never repairs port allocation.
-  These witnesses acquire no physical disk-image capability.
+  grants/CA authority, and dirty, unlanded and only-copy hidden content survives in its live or recovery image, even
+  after the recovery sidecar is removed and startup/GC runs again, while a tree whose only extra file is gitignored
+  retires with its image released. Cancellation and post-rename crash replay retain the mutating intent until the
+  release's owner metadata is removed; recovery-image rename fixtures still require complete grants/CA at commit. The
+  directory cutover runs the real controller and gateway with corrupt/missing sibling grants, named mount/marker fences
+  and held-lock recovery, plus prepared-retirement retry and post-commit recovery. Cold named and removal opens ignore
+  broken sibling sidecars, preserve session-origin validation, and still refuse selected corruption; full Store/Inspect
+  opens and project enumeration retain their malformed-inventory refusals. Ordinary worker and trusted Gate exec share
+  the core scoped preparation boundary. A fixture restarting a bare gateway explicitly restores project sessions through
+  maintenance before work; job admission never repairs port allocation. These witnesses acquire no physical disk-image
+  capability.
 - **MCP capability/auth codecs**: coordinator authority can be read only from the designated inherited FD/socketpair and
   never argv/environment/stderr; worker descriptors are 256-bit, 30-second, one-use, memory-only, atomic-consume,
   restart-invalidated, workspace/socket/peer-bound. Missing, expired, replayed, mismatched, or insufficient authority

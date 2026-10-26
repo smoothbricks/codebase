@@ -1790,7 +1790,7 @@ The reason is one line and may not be blank; the deletion log records it beside 
 be retired and deletes nothing.
 
 A removal that could not prove every source byte held elsewhere — a forced dirty or in-progress tree, abandoned commits,
-or an untracked file main's checkout lacks — keeps the complete image as a recovery image,
+or an untracked file no ignore rule covers and main's checkout lacks — keeps the complete image as a recovery image,
 `sessions/.trash/<ws>-<incarnation>.dmg`. No `gc` reclaims one, and removing the whole project refuses while one
 remains. Take it out of the store when you are ready to look at it:
 
@@ -1799,8 +1799,10 @@ cowshed gc --recover /private/cowshed/store/acme/api/sessions/.trash/raven-<inca
 ```
 
 The image, its grants sidecar and its CA companion move into `~/recovered/raven-<incarnation>/` beside `recovery.json`,
-which names the project, the workspace, its incarnation and why the removal kept it. Nothing is copied or deleted. The
-directory must be outside the store, on the store's filesystem; a retry after an interruption finishes the same move.
+which names the project, the workspace, its incarnation and why the removal kept it. On the store's filesystem nothing
+is copied or deleted: each file is renamed. On another filesystem each is copied, reading only its data regions and
+bypassing the page cache, verified byte for byte, and only then removed from the trash. The directory must be outside
+the store; a retry after an interruption finishes the same move.
 
 Every other image a command lets go of — a clean removal's image, the build volumes `rm`, `land`, `reseed` and `gc`
 release, the seeds a fork or land replaces, an orphan or expired image `gc` collects, the staged image a failed restore
