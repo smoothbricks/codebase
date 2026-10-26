@@ -108,6 +108,13 @@ export function formatDuration(ms: number): string {
     : `${whole}.${String(fraction).padStart(digits, '0').replace(/0+$/, '')}${unit}`;
 }
 
+/**
+ * One request to a remote HTTP service through its whole answer, and so the silence a remote stream may keep before its
+ * next bytes: smoothbricks specs/cowshed/05_gateway.md "Deadlines", the `remote-http` row (the slowest measured kind's
+ * p99 × 20).
+ */
+export const REMOTE_HTTP_MS = 17_000;
+
 /** Monotonic milliseconds, injected so a test moves time itself. */
 export interface Clock {
   now(): number;

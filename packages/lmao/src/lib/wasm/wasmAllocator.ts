@@ -460,6 +460,7 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
   const wasmPath = import.meta.url.includes('/dist/ts/')
     ? `../../../${WASM_ARTIFACT_NAME}`
     : `../../../dist/${WASM_ARTIFACT_NAME}`;
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the package's own wasm artifact beside this module, a static asset of the page's own origin in a browser, loaded the way its scripts are; a hung page load ends with the page
   const response = await fetch(new URL(wasmPath, import.meta.url));
   return response.arrayBuffer();
 }

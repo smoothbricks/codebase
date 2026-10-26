@@ -606,6 +606,10 @@ that bounds one wait with them. A wait on another process is a request or a long
   the heartbeat's bound from its last progress. Once the holder has been silent for the bound it answers
   `Err(SilentError)`, code `SILENT`, naming the holder, the silence, the whole wait and the last progress. There is no
   total ceiling.
+- `REMOTE_HTTP_MS` is the `remote-http` bound of smoothbricks specs/cowshed/05_gateway.md, "Deadlines" (17 s, measured).
+  A remote stream is an `idle` wait under it: lmao-inspector's archive source waits for the answer's head, and for each
+  read of its body, as one `idle` wait each, so an archive silent for the bound fails `SILENT` and the consumer's own
+  time between reads is never counted.
 - `wait.lost()` is `PeerLostError`, code `PEER_LOST`: the peer ended the connection before answering. A peer absent at
   connect is `Blocked.service(peer)`.
 
