@@ -105,7 +105,18 @@ function build(base: string): void {
   write(join(source, 'crates/api/src/lib.rs'), 'pub fn value() -> u8 { 1 }\n', SOURCES);
   git(provider, 'init', '-q');
   git(provider, 'add', '-A');
-  git(provider, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'fixture');
+  git(
+    provider,
+    '-c',
+    'user.name=fixture',
+    '-c',
+    'user.email=fixture@example.test',
+    '-c',
+    'maintenance.auto=false',
+    'commit',
+    '-qm',
+    'fixture',
+  );
   write(join(source, 'dist/js/index.js'), 'export const value = 1;\n', BUILT);
   // A leftover build info no build rewrites (the emit is not incremental): older than the sources, and never judged.
   write(join(source, 'dist/js/lib.tsbuildinfo'), '{}', SOURCES - 100);
