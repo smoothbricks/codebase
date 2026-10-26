@@ -436,7 +436,7 @@ describe('Cowshed attachment Node-API boundary', () => {
             if (!greeted) {
               greeted = true;
               assert.deepEqual(Object.keys(message).sort(), ['nonce', 'version']);
-              send({ version: message.version, nonce: message.nonce, repoId });
+              send({ version: message.version, nonce: message.nonce, repoId, pid: process.pid });
             } else if (message.binaryLength !== undefined) {
               assert.ok(Number.isSafeInteger(message.binaryLength));
               assert.ok(message.binaryLength >= 0 && message.binaryLength <= frameBytes);

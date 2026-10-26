@@ -209,7 +209,7 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
     const handle = (message) => {
       if (!greeted) {
         greeted = true;
-        send({ version: message.version, nonce: message.nonce, repoId: 'acme/widget' });
+        send({ version: message.version, nonce: message.nonce, repoId: 'acme/widget', pid: process.pid });
       } else if ('demand' in message) {
         heard.push(message.demand);
         if (message.demand === 'close') end(message.id);
@@ -829,7 +829,7 @@ async function scriptedPair(
     const handle = (message) => {
       if (!greeted) {
         greeted = true;
-        send({ version: message.version, nonce: message.nonce, repoId: 'acme/widget' });
+        send({ version: message.version, nonce: message.nonce, repoId: 'acme/widget', pid: process.pid });
       } else if (message.method in opened) {
         answer(message.id, opened[message.method]);
       } else if (!call(message)) {
