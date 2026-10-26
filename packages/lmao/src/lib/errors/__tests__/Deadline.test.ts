@@ -13,6 +13,8 @@ import {
   CONNECTED,
   Deadline,
   deadline,
+  describeProgress,
+  formatDuration,
   Idle,
   idle,
   PeerLostError,
@@ -115,7 +117,7 @@ describe('Deadline and Idle values', () => {
     });
     expect(expired.code).toBe('TIMEOUT');
     expect(expired.message).toBe(
-      'TIMEOUT: status on gateway /run/control.sock: no answer within its control bound of 5000ms; waited 5000ms, last progress: sent 18 bytes',
+      'TIMEOUT: status on gateway /run/control.sock: no answer within its control bound of 5s; waited 5s, last progress: sent 18 bytes',
     );
   });
 
@@ -141,8 +143,26 @@ describe('Deadline and Idle values', () => {
     ]);
     expect(silent.code).toBe('SILENT');
     expect(silent.message).toBe(
-      'SILENT: job terminal: supervisor pid 81200 showed no progress for 15000ms (idle bound 15000ms); waited 39000ms in all, last progress: heartbeat 2',
+      'SILENT: job terminal: supervisor pid 81200 showed no progress for 15s (idle bound 15s); waited 39s in all, last progress: heartbeat 2',
     );
+  });
+
+  it("prints a duration as Rust's Duration {:?} does", () => {
+    expect([5_000, 39_000, 1_200, 500, 1.5, 0.75, 0.000_01, 0, 60_000.000_001].map(formatDuration)).toEqual([
+      '5s',
+      '39s',
+      '1.2s',
+      '500ms',
+      '1.5ms',
+      '750µs',
+      '10ns',
+      '0ns',
+      '60.000000001s',
+    ]);
+  });
+
+  it("names a signal by its number, as lmao-core's Progress::Signalled prints it", () => {
+    expect(describeProgress({ kind: 'signalled', signal: 9 })).toBe('signalled 9');
   });
 
   it('accumulates a stream counter within one direction', () => {
@@ -210,7 +230,7 @@ describe('deadline()', () => {
     const answer = await pending;
     const failure = failureOf(answer, PeerLostError);
     expect(failure.message).toBe(
-      'PEER_LOST: status on gateway: the peer ended the connection after 1200ms; last progress: connected',
+      'PEER_LOST: status on gateway: the peer ended the connection after 1.2s; last progress: connected',
     );
     expect(timers.live).toBe(0);
   });

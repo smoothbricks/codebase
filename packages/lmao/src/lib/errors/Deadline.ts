@@ -50,7 +50,7 @@ export type Progress =
   | { readonly kind: 'sent'; readonly bytes: number }
   | { readonly kind: 'received'; readonly bytes: number }
   | { readonly kind: 'heartbeat'; readonly seq: number }
-  | { readonly kind: 'signalled'; readonly signal: string }
+  | { readonly kind: 'signalled'; readonly signal: number }
   /** A state the holder reported (`queued`, `running`, `draining`). */
   | { readonly kind: 'state'; readonly state: string };
 
@@ -84,6 +84,28 @@ export function describeProgress(progress: Progress): string {
     case 'state':
       return progress.state;
   }
+}
+
+/**
+ * `ms` as Rust's `Duration` `{:?}` prints it (`5s`, `1.2s`, `500ms`, `750µs`, `0ns`): the largest unit that is at
+ * least 1, its fraction exact to the nanosecond with trailing zeros dropped. Every failure line prints its durations
+ * this way, so a TS failure reads as the Rust one does.
+ */
+export function formatDuration(ms: number): string {
+  const nanos = Math.max(0, Math.round(ms * 1_000_000));
+  const [unit, scale, digits] =
+    nanos >= 1_000_000_000
+      ? (['s', 1_000_000_000, 9] as const)
+      : nanos >= 1_000_000
+        ? (['ms', 1_000_000, 6] as const)
+        : nanos >= 1_000
+          ? (['µs', 1_000, 3] as const)
+          : (['ns', 1, 0] as const);
+  const whole = Math.floor(nanos / scale);
+  const fraction = nanos % scale;
+  return fraction === 0
+    ? `${whole}${unit}`
+    : `${whole}.${String(fraction).padStart(digits, '0').replace(/0+$/, '')}${unit}`;
 }
 
 /** Monotonic milliseconds, injected so a test moves time itself. */
@@ -142,7 +164,7 @@ export class TimeoutError extends CodeError<'TIMEOUT', Expired> {
   constructor(data: Expired) {
     super('TIMEOUT', data);
     this.name = 'TimeoutError';
-    this.message = `TIMEOUT: ${data.op} on ${data.peer}: no answer within its ${data.class} bound of ${data.boundMs}ms; waited ${Math.round(data.elapsedMs)}ms, last progress: ${describeProgress(data.last)}`;
+    this.message = `TIMEOUT: ${data.op} on ${data.peer}: no answer within its ${data.class} bound of ${formatDuration(data.boundMs)}; waited ${formatDuration(data.elapsedMs)}, last progress: ${describeProgress(data.last)}`;
   }
 }
 
@@ -153,18 +175,21 @@ export class SilentError extends CodeError<'SILENT', Silent> {
   constructor(data: Silent) {
     super('SILENT', data);
     this.name = 'SilentError';
-    this.message = `SILENT: ${data.op}: ${data.holder} showed no progress for ${Math.round(data.silentForMs)}ms (idle bound ${data.idleMs}ms); waited ${Math.round(data.elapsedMs)}ms in all, last progress: ${describeProgress(data.last)}`;
+    this.message = `SILENT: ${data.op}: ${data.holder} showed no progress for ${formatDuration(data.silentForMs)} (idle bound ${formatDuration(data.idleMs)}); waited ${formatDuration(data.elapsedMs)} in all, last progress: ${describeProgress(data.last)}`;
   }
 }
 
-/** A peer that ended the connection before answering, so the outcome is unknown: code `PEER_LOST`, terminal. */
+/**
+ * A peer that ended the connection before answering, so the outcome is unknown: code `PEER_LOST`, terminal. Its message
+ * is the line cowshed-os's `WaitError::PeerLost` prints.
+ */
 export class PeerLostError extends CodeError<'PEER_LOST', PeerLost> {
   static readonly _tag = 'PEER_LOST';
 
   constructor(data: PeerLost) {
     super('PEER_LOST', data);
     this.name = 'PeerLostError';
-    this.message = `PEER_LOST: ${data.op} on ${data.peer}: the peer ended the connection after ${Math.round(data.elapsedMs)}ms; last progress: ${describeProgress(data.last)}`;
+    this.message = `PEER_LOST: ${data.op} on ${data.peer}: the peer ended the connection after ${formatDuration(data.elapsedMs)}; last progress: ${describeProgress(data.last)}`;
   }
 }
 

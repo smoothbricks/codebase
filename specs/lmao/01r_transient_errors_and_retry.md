@@ -616,10 +616,13 @@ the bound, the body's abort is its expected end, and any other rejection stays u
 the answer already given.
 
 `TimeoutError`, `SilentError` and `PeerLostError` extend `CodeError`, so `errorCodeOf` writes their code and their
-`message` is the line lmao-core's `Display` prints. All three are terminal: none is a `TransientError`, so the span
-retry loop never retries one. An Op returns the failure with `ctx.err(result.error)` and its span ends `span-err`.
-`Timers` (`now()` in monotonic milliseconds and `after(ms, fire)`) is the injected clock: production passes nothing and
-gets `performance.now()` with `setTimeout`, and a test moves its own clock and fires its own timers.
+`message` is the line Rust prints for the same failure: lmao-core's `Expired` and `Silent` (`deadline.rs`) for `TIMEOUT`
+and `SILENT`, cowshed-os's `WaitError::PeerLost` (`cowshed-os/src/deadline.rs`) for `PEER_LOST`, each duration in Rust's
+`Duration` `{:?}` form (`5s`, `1.2s`, `500ms`; `formatDuration`) and a `signalled` progress as its signal number. All
+three are terminal: none is a `TransientError`, so the span retry loop never retries one. An Op returns the failure with
+`ctx.err(result.error)` and its span ends `span-err`. `Timers` (`now()` in monotonic milliseconds and `after(ms, fire)`)
+is the injected clock: production passes nothing and gets `performance.now()` with `setTimeout`, and a test moves its
+own clock and fires its own timers.
 
 ## Integration Points <a id="smoo/lmao!n/op-retry.integration-points"></a>
 
