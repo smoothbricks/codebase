@@ -24023,6 +24023,18 @@ mod unresolved_retirement_tests {
         let mut ready = String::new();
         output.read_line(&mut ready).unwrap();
         assert_eq!(ready, "READY\n");
+        // The writer is read from the membership its running leader still proves,
+        // and its exit is watched on its own identity from here: once the leader is
+        // reaped nothing proves the survivor the job's.
+        let members = super::super::job_groups::job_members(
+            &super::super::job_groups::Birth::Observed(birth),
+        )
+        .unwrap();
+        let writer = members
+            .iter()
+            .find(|member| member.pid() != birth.pgid())
+            .expect("the writer holds the group with its leader");
+        let writer_exit = writer.watch_exit().expect("watch the writer's exit");
         assert!(child.wait_bounded().unwrap().success());
         let stopped = super::super::supervisor_socket::bind(&root.join("supervisor.sock"))
             .await
@@ -24048,17 +24060,13 @@ mod unresolved_retirement_tests {
         let mut tail = String::new();
         output.read_to_string(&mut tail).unwrap();
         assert_eq!(tail, "the writer is still alive\nRELEASED\n");
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !super::super::job_groups::unresolved(&ledger)
-            .unwrap()
-            .is_empty()
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the writer did not release its group"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        writer_exit.wait().unwrap();
+        assert!(
+            super::super::job_groups::unresolved(&ledger)
+                .unwrap()
+                .is_empty(),
+            "the writer released its group"
+        );
         require_lost_groups_released(&workspace, &stopped, "remove")
             .await
             .unwrap();
