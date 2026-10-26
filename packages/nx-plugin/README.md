@@ -11,6 +11,41 @@ The public plugin entry loads its transformed bootstrap product synchronously, m
 path in Node and Bun. A missing `dist/index.js` refuses by name and gives the `ttsc` bootstrap command; it never returns
 an empty graph or loads raw development source in place of transformed code.
 
+## Writing plugin code
+
+These rules govern every Nx plugin written in this repository or in a consuming repository, a plugin local to one
+workspace included. [Target Ownership](#target-ownership) lists what this plugin already infers; read it before adding
+inference.
+
+1. **Reuse Nx; never re-implement it.** Graph and target shapes (devkit's `ProjectGraph` and `TargetConfiguration`),
+   `dependsOn` normalization (`normalizeDependencyConfigDefinition`) and task-graph expansion (`createTaskGraph`) come
+   from Nx, imported from `nx/src/…` as this package's sources import them (`nx/src/devkit-exports.js` is the module
+   `@nx/devkit` publishes). A plugin carries no traversal of its own and no second `dependsOn` parser, and checks what
+   Nx already ships before adding a dependency. `dependsOn` takes `^`, wildcards such as `^*-js`, `project:target` and
+   object forms; a copy answers for the spellings its author thought of and drifts from the Nx that schedules the task,
+   and it never receives a repair of the pinned Nx ([Nx 23.2.1 Runtime Patch](#nx-2321-runtime-patch)).
+2. **Put each decision in the hook that sees its data.** `createNodesV2` infers targets for each project file it
+   matches, before any graph exists. `createDependencies` adds project edges and has no dependency graph yet.
+   `createMetadata` runs after both, with every project's merged targets and the edges the plugins added (Nx adds a
+   project's own `implicitDependencies` edges after it), so whole-graph validation belongs there, where a throw fails
+   graph construction. A check in an earlier hook judges a graph that is not built.
+3. **Derive inputs and outputs from the source of truth.** A target hashes exactly what determines its result and
+   declares every output a cache hit must restore. Where the plugin can compute a set, it reads it from the file that
+   owns it and keeps no hand list beside it (AGENTS.md, Done): a missing entry replays a stale result, and an extra one
+   misses the cache. Mutable tool state is never an output
+   ([Cowshed Build-State Output Policy](#cowshed-build-state-output-policy)).
+4. **Decide in a pure core.** A hook is a thin shell: it reads Nx's context and the files, calls a pure function over
+   plain values (a `ProjectGraph`, a `TargetConfiguration`, parsed manifest text) and returns the answer. Table-driven
+   tests call the function with in-memory devkit values, so its verdict is the same in every checkout and reproduces
+   without a workspace (AGENTS.md, Proof).
+5. **Refuse at graph time.** When a project, target or edge is wrong, or the plugin cannot tell, graph construction
+   fails with a typed error that names the project, the target, the edge and the fix. The plugin never warns and
+   continues, and never leaves the case to a gate or CI: a warning scrolls past while tasks run and cache results on a
+   graph the plugin could not judge, and a gate or CI finds the problem only after those results exist.
+6. **Test through devkit values, never an Nx process.** The plugin's contract is the value its hook returns; Nx's
+   behavior is Nx's to test (AGENTS.md, Proof). A wiring gets at most one `nx show project` smoke.
+   [Test Fixtures That Run Nx](#test-fixtures-that-run-nx) owns the rule and its fixtures.
+
 ## Target Ownership
 
 Official `@nx/js/typescript` inference is disabled because it cannot run the workspace's source transformers. A package
