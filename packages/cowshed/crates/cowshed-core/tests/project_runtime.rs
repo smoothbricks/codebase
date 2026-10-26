@@ -17,15 +17,16 @@ use cowshed_apfs::{
     CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
     store_lock::verify_no_symlinks,
 };
+use cowshed_core::api::capability::{ExecRequest, StdinSource};
 use cowshed_core::api::dto::{
     AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo,
     CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg, DefragmentResult,
-    DoctorReport, ExecClass, ExecCommand, ExecRequest, ExecScope, Finding, FindingSeverity,
-    ForkOptions, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo,
-    JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions, LandReport,
-    MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
-    RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    DoctorReport, ExecClass, ExecCommand, ExecScope, Finding, FindingSeverity, ForkOptions,
+    GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobState,
+    JobTail, JobTailBytes, JobTailLimits, LandOptions, LandReport, MirrorInfo, PortBlock,
+    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions,
+    RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume, RunSandboxMode, StepReport,
+    WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use cowshed_core::api::operations::{
     JobLogs, LogsRequest, Operation, OperationRequest, ReAdoption,
@@ -1334,7 +1335,7 @@ impl ProjectRuntimeHost for FakeHost {
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
         _session: Option<String>,
-        request: cowshed_core::api::dto::ExecRequest,
+        request: cowshed_core::api::capability::ExecRequest,
         source: AdmissionSource,
     ) -> Result<JobId> {
         self.require_incarnation(&workspace, &incarnation)?;

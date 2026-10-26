@@ -34,9 +34,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
+use crate::api::capability::{ExecRequest, StdinSource};
 use crate::api::dto::{
-    CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, JobInfo, RunSandboxMode, StdinSource,
-    WorkspacePath,
+    CommandArg, ExecCommand, ExitStatus, JobId, JobInfo, RunSandboxMode, WorkspacePath,
 };
 use crate::capabilities::nx;
 use crate::error::{CowshedError, Result};

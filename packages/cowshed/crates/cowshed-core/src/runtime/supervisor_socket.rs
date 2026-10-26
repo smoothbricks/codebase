@@ -32,10 +32,11 @@ use super::supervisor::{
     SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use super::wait_spans::{WaitFailure, peer_pid};
+use crate::api::capability::{ExecRequest, StdinSource};
 use crate::api::dto::{
-    AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobId, JobInfo,
-    JobJournalCursor, JobState, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand,
-    Sha256Digest, StdinSource, TraceContext, WorkspacePath,
+    AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecScope, JobId, JobInfo, JobJournalCursor,
+    JobState, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand, Sha256Digest,
+    TraceContext, WorkspacePath,
 };
 #[cfg(not(target_os = "macos"))]
 use crate::api::process::JobSubtreeRefusal;
