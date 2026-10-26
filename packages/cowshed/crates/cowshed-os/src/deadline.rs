@@ -1400,6 +1400,17 @@ mod tests {
         );
     }
 
+    /// The pid of the child a run failure names: every failure after the spawn names it.
+    fn started_child(failure: &RunError) -> Option<u32> {
+        match failure {
+            RunError::Spawn { .. } => None,
+            RunError::Reap(ReapError::Expired(expired))
+            | RunError::Output(OutputError::Held { expired, .. }) => Some(expired.peer.pid),
+            RunError::Reap(ReapError::Wait { pid, .. })
+            | RunError::Output(OutputError::Read { pid, .. }) => Some(*pid),
+        }
+    }
+
     #[test]
     fn a_child_that_never_exits_is_not_waited_for_past_its_bound() {
         let mut child = std::process::Command::new("sleep")
@@ -1506,10 +1517,14 @@ mod tests {
             &start("run probe", SHORT_REAP),
         )
         .expect_err("sleep 600 does not end within 50 ms");
+        // `output_within` hands a child it stopped waiting for to the background: its group is ended
+        // before any assertion can panic, whatever the failure, so a failed one leaves no sleeper behind.
+        if let Some(pid) = started_child(&failure) {
+            kill_group(pid);
+        }
         let RunError::Reap(ReapError::Expired(expired)) = &failure else {
             panic!("expected TIMEOUT, got {failure}");
         };
-        kill_group(expired.peer.pid);
         assert_eq!(expired.peer.role, "probe command");
         assert_eq!(failure.code(), "TIMEOUT");
     }
