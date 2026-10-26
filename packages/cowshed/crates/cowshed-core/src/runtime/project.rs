@@ -11509,6 +11509,64 @@ mod rebase_recovery_tests {
         run_git(root, &["commit", "-m", message]);
     }
 
+    /// A mirror's transfers run under their silence bound with their output in the mirror's
+    /// transfer log: a clone and the update after it succeed, each leaving git's output there, and
+    /// a clone git refuses fails with git's own words.
+    #[tokio::test]
+    async fn a_mirror_transfer_logs_its_progress_and_fails_with_gits_words() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-mirror-transfer",
+        );
+        let source = root.join("source");
+        std::fs::create_dir(&source).expect("create the source repository");
+        run_git(&source, &["init", "--initial-branch=main"]);
+        run_git(&source, &["config", "user.name", "Cowshed Test"]);
+        run_git(
+            &source,
+            &["config", "user.email", "cowshed@example.invalid"],
+        );
+        commit_file(&source, "base\n", "base");
+        let mirror = root.join("mirror.git");
+        let log = root.join("mirror.git.log");
+
+        let mut clone = std::process::Command::new("git");
+        clone
+            .args(["clone", "--mirror", "--progress"])
+            .arg(&source)
+            .arg(&mirror);
+        transfer_mirror("clone mirror", clone, &mirror)
+            .await
+            .expect("clone the mirror");
+        let cloned = std::fs::read_to_string(&log).expect("the clone's transfer log");
+        assert!(cloned.contains("Cloning into bare repository"), "{cloned}");
+
+        let mut update = std::process::Command::new("git");
+        update
+            .arg("-C")
+            .arg(&mirror)
+            .args(["fetch", "--prune", "--progress", "origin"]);
+        transfer_mirror("update mirror", update, &mirror)
+            .await
+            .expect("update the mirror");
+
+        let refused = root.join("refused.git");
+        let mut clone = std::process::Command::new("git");
+        clone
+            .args(["clone", "--mirror", "--progress"])
+            .arg(root.join("absent"))
+            .arg(&refused);
+        let error = transfer_mirror("clone mirror", clone, &refused)
+            .await
+            .expect_err("git refuses a clone of no repository");
+        assert!(
+            error.message.starts_with("clone mirror failed: ")
+                && error.message.contains("does not exist"),
+            "{}",
+            error.message
+        );
+    }
+
     #[tokio::test]
     async fn land_moves_only_the_branch_main_has_checked_out() {
         let store = crate::temp_root::FixtureStore::new();
@@ -16240,12 +16298,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if tokio::fs::try_exists(&root).await.map_err(|error| {
             CowshedError::environment_missing(error.to_string(), "check cache permissions")
         })? {
-            run_git(
-                self.git.store_root(),
-                &root,
-                ["remote", "update", "--prune"],
-            )
-            .await?;
+            let mut command = crate::git::sandboxed_git_command_at(self.git.store_root(), &root)?;
+            command.args(["fetch", "--prune", "--progress", "origin"]);
+            transfer_mirror("update mirror", command, &root).await?;
         } else {
             let parent = root
                 .parent()
@@ -16254,20 +16309,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             tokio::fs::create_dir_all(&parent).await.map_err(|error| {
                 CowshedError::environment_missing(error.to_string(), "check cache permissions")
             })?;
-            // WHY unbounded: debt: a network clone, which a silent remote stalls. Moves to an idle
-            // bound on git's progress output.
-            #[allow(clippy::disallowed_methods)]
-            let output = tokio::process::Command::new("git")
-                .arg("clone")
-                .arg("--mirror")
-                .arg(url.as_str())
-                .arg(&root)
-                .output_locked()
-                .await
-                .map_err(|error| {
-                    CowshedError::environment_missing(error.to_string(), "install git")
-                })?;
-            require_git_success("clone mirror", &output)?;
+            let mut command = std::process::Command::new("git");
+            command
+                .args(["clone", "--mirror", "--progress", url.as_str()])
+                .arg(&root);
+            transfer_mirror("clone mirror", command, &root).await?;
         }
         Ok(MirrorInfo {
             url: url.to_string(),
@@ -20426,11 +20472,69 @@ async fn run_git_fetch<const N: usize>(
     require_git_success("git operation", &output)
 }
 
+/// Run `command`, a git that moves `mirror`'s objects over the network with `--progress`, as a
+/// child whose output is its progress (05_gateway.md "Deadlines"): its output is appended to the
+/// mirror's transfer log (`<mirror>.log`, one transfer's), and each chunk restarts the heartbeat
+/// silence ([`cowshed_os::deadline::HEARTBEAT_SILENCE`]). git's progress meter redraws at most
+/// once a second while a phase moves, so a remote silent for the whole bound is one that stopped
+/// sending, and the transfer fails `SILENT` naming the git. A git that ends unsuccessfully is read
+/// as git's own words from the log, as every other git operation's are.
+#[cfg(target_os = "macos")]
+async fn transfer_mirror(
+    operation: &'static str,
+    mut command: std::process::Command,
+    mirror: &Path,
+) -> Result<()> {
+    let mut log = mirror.as_os_str().to_owned();
+    log.push(".log");
+    let log = PathBuf::from(log);
+    tokio::task::spawn_blocking(move || {
+        let written = std::fs::File::create(&log).map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot create the transfer log {}: {error}", log.display()),
+                "check cache permissions",
+            )
+        })?;
+        let status = cowshed_os::deadline::run_to_log(
+            "git",
+            &mut command,
+            written,
+            cowshed_os::deadline::HEARTBEAT_SILENCE,
+        )
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("{operation} failed: {error}"),
+                format!(
+                    "check that the remote answers; git's output is in {}",
+                    log.display()
+                ),
+            )
+        })?;
+        let stderr = std::fs::read(&log).map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot read the transfer log {}: {error}", log.display()),
+                "check cache permissions",
+            )
+        })?;
+        require_git_success(
+            operation,
+            &std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr,
+            },
+        )
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("the {operation} thread failed: {error}")))?
+}
+
 /// Repository-selected Git commands (including merge drivers and filters) run
 /// with a write boundary around the checkout, not with controller host reach.
 #[cfg(target_os = "macos")]
-// WHY unbounded: debt: repository-selected merge drivers and filters run inside it, and one that
-// stalls stalls this. Moves to an idle bound on its output.
+// WHY unbounded: git's exit ends it. The repository's own merge drivers, filters and hooks run
+// inside it for as long as that code takes, as under the operator's own git; the operator's
+// interrupt ends it.
 #[allow(clippy::disallowed_methods)]
 async fn invoke_git(
     store_root: &std::sync::Arc<Path>,

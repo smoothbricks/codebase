@@ -938,7 +938,10 @@ the handshake bound.
       come, and each chunk restarts its silence bound, which its caller names. A child that writes nothing for that
       silence fails `SILENT`, naming its pid, the state the kernel shows it in and the bytes it wrote; it is sent
       `SIGTERM` and reaped within the reap bound, and collected later past it. A child that ends its streams is reaped
-      within the reap bound and its status answers.
+      within the reap bound and its status answers. A repository mirror's transfers (`clone --mirror` and the
+      `fetch --prune` that updates it) run with `--progress` under the heartbeat silence (15 s, `HEARTBEAT_SILENCE`),
+      their output in the mirror's transfer log: git redraws its progress meter at most once a second while a phase
+      moves, so a remote silent that long has stopped sending.
   - **The gateway's drain reaps its Nx backends within one reap bound.** Once nothing is in flight, the drain sends
     `SIGTERM` to every Nx cache backend it started and waits for all of them within one reap bound
     (`cowshed-os::deadline::reap_async`). The actor is therefore parked at most that long, and the drain ends inside

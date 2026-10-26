@@ -5304,13 +5304,14 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     Ok(findings)
 }
 
-/// How long doctor waits for the sccache server, which took its request, to answer before it
-/// reports that server as unanswered (specs/cowshed/06_cli.md, "doctor"). The gateway heartbeats
+/// How long cowshed waits for the sccache server, which took its statistics request, to answer
+/// before it reports that server as unanswered (specs/cowshed/06_cli.md, "doctor"): doctor's bound,
+/// and the one `status`, `setup` and `start` read the statistics within. The gateway heartbeats
 /// its answers instead, and is unanswered at its silence bound (05_gateway.md, "Deadlines").
 /// Long rather than absent: a socket that takes a request and answers late may be a live,
 /// saturated server; a minute is still inside the 180 s a caller once gave a silent doctor before
 /// killing it.
-const DOCTOR_PEER_ANSWER: Duration = Duration::from_secs(60);
+pub(crate) const DOCTOR_PEER_ANSWER: Duration = Duration::from_secs(60);
 
 /// What to do about a gateway that took doctor's request and did not answer: it may be saturated
 /// and answer later, so look before restarting it, which would cut off every gate it serves.

@@ -376,11 +376,47 @@ pub(crate) async fn service_status(namespace: HostNamespace) -> Result<SccacheSt
     })
 }
 
-// WHY unbounded: debt: a live sccache server that stops answering stalls it; doctor's path is
-// bounded (`service_status_within`). Moves to that bound.
-#[allow(clippy::disallowed_methods)]
+/// The server's statistics for `status`, `setup` and `start`: [`stats_within`] the minute doctor
+/// gives it ([`crate::runtime::DOCTOR_PEER_ANSWER`]), an unanswered server said on stderr and read
+/// as no statistics.
 async fn read_stats(home: &Path, socket: &Path) -> Option<SccacheStats> {
-    parse_stats(stats_command(home, socket)?.output_locked().await.ok()?)
+    let (stats, unanswered) = stats_within(home, socket, crate::runtime::DOCTOR_PEER_ANSWER).await;
+    if let Some(unanswered) = unanswered {
+        cowshed_os::eprintln!(
+            "cowshed: {} at {} took the statistics request and gave no answer within {:?}",
+            unanswered.peer,
+            unanswered.socket.display(),
+            unanswered.within
+        );
+    }
+    stats
+}
+
+/// The server's statistics, from a server that must answer within `within`
+/// (specs/cowshed/06_cli.md, "doctor"): one that took the connection and stays silent is
+/// [`Unanswered`], and its `sccache --show-stats` child is killed.
+async fn stats_within(
+    home: &Path,
+    socket: &Path,
+    within: Duration,
+) -> (Option<SccacheStats>, Option<Unanswered>) {
+    let Some(mut command) = stats_command(home, socket) else {
+        return (None, None);
+    };
+    command.kill_on_drop(true);
+    // WHY unbounded: the `within` timeout around it ends it, and `kill_on_drop` ends the child.
+    #[allow(clippy::disallowed_methods)]
+    match tokio::time::timeout(within, command.output_locked()).await {
+        Ok(output) => (output.ok().and_then(parse_stats), None),
+        Err(_) => (
+            None,
+            Some(Unanswered {
+                peer: "the sccache server",
+                socket: socket.to_owned(),
+                within,
+            }),
+        ),
+    }
 }
 
 /// [`service_status`] for `doctor`, from a server that must answer its statistics within
@@ -391,25 +427,10 @@ pub(crate) async fn service_status_within(
     within: Duration,
 ) -> Result<(SccacheStatus, Option<Unanswered>)> {
     let (home, socket, installed, running) = observe_agent(namespace).await?;
-    let (stats, unanswered) = match stats_command(&home, &socket).filter(|_| running) {
-        None => (None, None),
-        Some(mut command) => {
-            command.kill_on_drop(true);
-            // WHY unbounded: the `within` timeout around it ends it, and `kill_on_drop` ends the
-            // child.
-            #[allow(clippy::disallowed_methods)]
-            match tokio::time::timeout(within, command.output_locked()).await {
-                Ok(output) => (output.ok().and_then(parse_stats), None),
-                Err(_) => (
-                    None,
-                    Some(Unanswered {
-                        peer: "the sccache server",
-                        socket: socket.clone(),
-                        within,
-                    }),
-                ),
-            }
-        }
+    let (stats, unanswered) = if running {
+        stats_within(&home, &socket, within).await
+    } else {
+        (None, None)
     };
     Ok((
         SccacheStatus {

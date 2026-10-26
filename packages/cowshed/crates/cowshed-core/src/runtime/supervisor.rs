@@ -1696,10 +1696,10 @@ impl SandboxEnvironment {
 /// Controller-owned discovery asks a project's tools through this rather than through the
 /// pre-activation environment: a checkout whose toolchain comes from its dev environment has
 /// none on the bootstrap PATH, or a different one, and a job only ever meets the activated one.
-// WHY unbounded: debt: a project's own tool runs as a job (Cargo's metadata for discovery, which
-// reports its wait every WAIT_REPORT naming Cargo's lock holders; `nx daemon --stop` at a land);
-// the operator's interrupt ends it, and a tool that stalls stalls its caller. Moves to a bounded
-// async run once one exists beside cowshed_os::deadline::output_within.
+// WHY unbounded: it runs the project's own tool exactly as a job of the workspace runs one, and a
+// job has no total ceiling (05_gateway.md "Deadlines"): the tool's exit ends it, or the operator's
+// interrupt. Its callers say what it waits for: discovery names Cargo's lock holders every
+// WAIT_REPORT, and the land's `nx daemon --stop` is its `stop-landing-nx` step.
 #[allow(clippy::disallowed_methods)]
 pub async fn run_as_job(
     sandbox: &SandboxConfig,

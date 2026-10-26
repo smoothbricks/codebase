@@ -29,9 +29,6 @@ use crate::code_signing::CODESIGN;
 /// so no assessment of the template or of an earlier probe answers for it. The probe runs
 /// `--version`, so its launch is the program's start and nothing else. The scratch directory is
 /// removed on every exit path.
-// WHY unbounded: debt: codesign and the probe's first launch wait on syspolicyd's scan, which can
-// stall the gateway's `first-launch` answer. Moves to output_within under an Ffi bound.
-#[allow(clippy::disallowed_methods)]
 pub fn measure(template: &Path) -> io::Result<FirstLaunch> {
     let scratch = Scratch::create()?;
     let probe = scratch.0.join("probe");
@@ -45,11 +42,18 @@ pub fn measure(template: &Path) -> io::Result<FirstLaunch> {
             ),
         )
     })?;
-    let signed = Command::new(CODESIGN)
-        .args(["--force", "--sign", "-", "--identifier"])
-        .arg(format!("dev.cowshed.first-launch.{}", scratch.1))
-        .arg(&probe)
-        .output_locked()?;
+    let signed = cowshed_os::deadline::output_within(
+        "codesign",
+        Command::new(CODESIGN)
+            .args(["--force", "--sign", "-", "--identifier"])
+            .arg(format!("dev.cowshed.first-launch.{}", scratch.1))
+            .arg(&probe),
+        &cowshed_os::deadline::start(
+            "sign the first-launch probe",
+            cowshed_os::deadline::CODESIGN,
+        ),
+    )
+    .map_err(io::Error::other)?;
     if !signed.status.success() {
         return Err(io::Error::other(format!(
             "{CODESIGN} could not sign the probe {} ({}): {}",
@@ -66,8 +70,11 @@ pub fn measure(template: &Path) -> io::Result<FirstLaunch> {
     })
 }
 
-// WHY unbounded: debt: the probe's first launch waits on syspolicyd's scan, the very latency it
-// measures; a stalled scan stalls it. Moves to output_within under an Ffi bound.
+// WHY unbounded: the wait is the reading. The probe's first launch waits on syspolicyd's scan,
+// the latency it measures, so a ceiling would cut off the measurement (05_gateway.md "Deadlines":
+// `first-launch` takes as long as its work and is never cut off; the gateway heartbeats it, and
+// doctor's `first-launch` step prints its start). syspolicyd's verdict ends it, after which the
+// probe prints its version and exits.
 #[allow(clippy::disallowed_methods)]
 fn launch(probe: &Path) -> io::Result<u64> {
     let started = Instant::now();
