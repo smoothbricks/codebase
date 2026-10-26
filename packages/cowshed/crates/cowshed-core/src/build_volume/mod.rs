@@ -787,20 +787,26 @@ impl BuildVolumeLayout {
     /// the image before it lets go of its claim, so a hold that waited for it finds no image, and
     /// the hold file it made is removed again. Every claimant takes its claim without waiting, so
     /// this waits for the claimant's own work, never for another hold.
-    // WHY unbounded: debt: an exclusive claimant (release, seed capture, reseed, cache clear) holds
-    // it across its own work. Moves to cowshed_os::flock.
+    // WHY unbounded: queued, not silent: an exclusive claimant (a release, seed capture, reseed or
+    // cache clear) holds it across its own work, and this hold names that claimant once per
+    // HOLDER_REPORT while it keeps its place; the claimant's release at its work's end, or the
+    // kernel's at its exit, ends the wait.
     #[allow(clippy::disallowed_methods)]
     pub fn hold(&self, id: &BuildVolumeId) -> io::Result<BuildVolumeHold> {
         let path = self.hold_path(id);
         let file = open_hold(&path)?;
-        loop {
-            match file.lock_shared() {
-                Ok(()) => break,
-                // A signal woke the wait; the claim it waits for is unchanged.
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
+        cowshed_os::flock::queued(
+            &path,
+            cowshed_os::flock::HOLDER_REPORT,
+            crate::held_lock::holders,
+            || loop {
+                match file.lock_shared() {
+                    // A signal woke the wait; the claim it waits for is unchanged.
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    taken => return taken,
+                }
+            },
+        )?;
         self.present(id, &path, file)
     }
 

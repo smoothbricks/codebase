@@ -64,17 +64,25 @@ impl InstallSlot {
                     path.display()
                 );
                 let waited = path.clone();
-                // WHY unbounded: an installer waits in line for as long as the install ahead of it
-                // runs, said on stderr first; the operator's interrupt ends it. debt: a holder that
-                // wedges stalls every later install. Moves to cowshed_os::flock::exclusive.
+                let slot = path.clone();
+                // WHY unbounded: queued, not silent: an installer waits in line behind the install
+                // ahead, said on stderr first and its holder named again once per HOLDER_REPORT; that
+                // install's release at its end, or the kernel's at its exit, ends the wait, and the
+                // operator may interrupt.
                 #[allow(clippy::disallowed_methods)]
                 let locked = tokio::task::spawn_blocking(move || {
-                    loop {
-                        match lock.lock() {
-                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                            taken => break taken.map(|()| lock),
-                        }
-                    }
+                    cowshed_os::flock::queued(
+                        &slot,
+                        cowshed_os::flock::HOLDER_REPORT,
+                        cowshed_core::held_lock::holders,
+                        || loop {
+                            match lock.lock() {
+                                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                                taken => return taken,
+                            }
+                        },
+                    )
+                    .map(|()| lock)
                 })
                 .await;
                 locked

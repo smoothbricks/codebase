@@ -936,9 +936,18 @@ the handshake bound.
   descriptor back, so nothing polls. At the bound the wait fails `TIMEOUT`, naming the lock path and its holders as the
   held-lock census reads them then (02_workspaces.md, "Held locks"); every caller (the supervisor, doctor's repair, a
   workspace's lineage read) answers it as a wait on another process, never as damage to the store. The holder is never
-  signalled, and a lock the helper takes after its waiter left is released at once. The image lease is held for one
-  disk-image command's run, so its wait is class `ffi` bounded by that command's own deadline, 120 s
-  (`DISK_CHILD_DEADLINE`), and it names the pid its holder recorded. The shell is `cowshed-os::flock::exclusive`.
+  signalled, and a lock the helper takes after its waiter left is released at once. The land queue's `.seq` (held to
+  number one ticket), a checkout's activation-record fence (one read and write) and the lifecycle intent journal's lock
+  (one read and write) are waited for within the control bound the same way. The image lease is held for one disk-image
+  command's run, so its wait is class `ffi` bounded by that command's own deadline, 120 s (`DISK_CHILD_DEADLINE`), and
+  it names the pid its holder recorded. The shell is `cowshed-os::flock::exclusive`.
+- **A lock held across its holder's work is queued, not silent.** A waiter behind a holder that keeps the lock for as
+  long as its work (an image's lifecycle lock, a project's retirement lock, a build volume's exclusive claim, the
+  install slot, a land's ticket ahead, the ref lock) has no ceiling: a bound would fail a waiter that is only queued. It
+  keeps its place in the kernel's queue on a helper thread and names the holder, as the held-lock census reads it, once
+  per report interval: 10 s (`HOLDER_REPORT`), and for the image lifecycle lock once per `DISK_CHILD_DEADLINE`, the
+  bound of each disk command its holder runs. The holder's release at its work's end, or the kernel's at its exit, ends
+  the wait; nothing signals the holder. The shell is `cowshed-os::flock::queued`.
 - **A launchctl or codesign call is an ffi call.** Every `launchctl` call cowshed runs as the user (the CLI's
   `LaunchctlCommand` and setup's mount-service probe) and every `codesign` of the gateway host runs to its end within
   its row's bound (`cowshed-os::deadline::output_within`). The calls setup makes through its privileged session

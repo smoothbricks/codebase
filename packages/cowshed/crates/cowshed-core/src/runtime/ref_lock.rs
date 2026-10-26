@@ -4,14 +4,11 @@
 //! the target head through the fast-forward and for nothing else, so a writer queued on it waits
 //! for that fence, never for a land's checks, cache initialization, adoption or retirement.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::api::dto::RefLockPath;
 use crate::held_lock::{self, HeldLock, Opened};
 use crate::{CowshedError, Result};
-
-/// How often a land that waits for the ref lock says who holds it.
-const WAIT_REPORT: Duration = Duration::from_secs(10);
 
 /// The held ref lock, recorded as this process's. The git that moves the target's ref under it is
 /// handed its descriptor ([`Self::descriptor`]), so the kernel keeps the lock until that git ends;
@@ -24,7 +21,7 @@ pub struct RefLock {
 impl RefLock {
     /// Take the ref lock at `path`, creating its file if no writer has yet. An uncontended lock is
     /// taken at once; a held one is waited for on a helper thread, and the wait says every
-    /// [`WAIT_REPORT`] how long it has waited and who held the file when it began, as the kernel
+    /// [`cowshed_os::flock::HOLDER_REPORT`] how long it has waited and who held the file when it began, as the kernel
     /// shows it ([`held_lock::observe`]): one look at the holders for the whole wait, never one per
     /// report. Nothing bounds the wait: the holder is a writer moving the same branch, which a land
     /// must follow, not overtake.
@@ -49,7 +46,10 @@ impl RefLock {
         tokio::pin!(waiter);
         let started = Instant::now();
         let held = held_lock::holders(path.as_path());
-        let mut report = tokio::time::interval_at(tokio::time::Instant::now(), WAIT_REPORT);
+        let mut report = tokio::time::interval_at(
+            tokio::time::Instant::now(),
+            cowshed_os::flock::HOLDER_REPORT,
+        );
         loop {
             tokio::select! {
                 answer = &mut waiter => {

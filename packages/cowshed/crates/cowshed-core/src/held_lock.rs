@@ -105,10 +105,13 @@ impl Opened {
     }
 
     /// Wait in `flock(2)` until the kernel grants the lock, then hold it. Nothing bounds the wait:
-    /// the holder ahead is a writer this one must follow.
-    // WHY unbounded: debt: the writer ahead holds the lock as long as its work; callers that bound
-    // the wait run it on a thread under their own deadline (land turn, ref lock). Moves to
-    // cowshed_os::flock.
+    /// the holder ahead is a writer this one must follow, and its caller keeps the wait queued, not
+    /// silent.
+    // WHY unbounded: queued, not silent, at every caller: the ref lock names the holder once per
+    // HOLDER_REPORT, the land turn tells its place and the holder at its cadence, `cowshed lock`
+    // names the holder once per HOLDER_REPORT and serves its operator's requests to end it, and the
+    // test censuses name the holder on stderr before they wait under the test runner's backstop.
+    // The holder's release at its work's end, or the kernel's at its exit, ends the wait.
     #[allow(clippy::disallowed_methods)]
     pub fn hold(self) -> io::Result<HeldLock> {
         loop {

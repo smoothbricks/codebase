@@ -1093,20 +1093,27 @@ impl<'a> Store<'a> {
         Ok(project.map(|project| (parent, project)))
     }
 
-    // WHY unbounded: debt: a retirement of the same project holds the lock across its own steps.
-    // Moves to cowshed_os::flock.
+    // WHY unbounded: queued, not silent: a retirement of the same project holds the lock across its
+    // own steps, and this one names that holder once per HOLDER_REPORT while it keeps its place;
+    // the holder's release at its end, or the kernel's at its exit, ends the wait.
     #[allow(clippy::disallowed_methods)]
     fn serialize(&self, owner: &File, names: &Names) -> Result<Fenced<File>> {
         let path = self.retirement_path(names, &names.serialization);
         let lock = open_lock(owner, &names.serialization)
             .map_err(|error| io_failure("open retirement lock", &path, error))?;
-        loop {
-            match lock.lock() {
-                Ok(()) => return Ok(lock),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(io_failure("take retirement lock", &path, error)),
-            }
-        }
+        cowshed_os::flock::queued(
+            &path,
+            cowshed_os::flock::HOLDER_REPORT,
+            crate::held_lock::holders,
+            || loop {
+                match lock.lock() {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    taken => return taken,
+                }
+            },
+        )
+        .map_err(|error| io_failure("take retirement lock", &path, error))?;
+        Ok(lock)
     }
 
     /// Lock `names`' project lease in `mode` without waiting; `None` while another holder

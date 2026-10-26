@@ -177,9 +177,10 @@ impl Drop for ImageLockGuard {
 }
 
 /// `flock` `file` with `operation`, again when a signal interrupts it.
-// WHY unbounded: debt: a try (`LOCK_NB`) returns at once; the blocking wait (`WAIT_LOCK_OPERATION`)
-// has no deadline of its own, its span names the holders once, and a holder that wedges stalls it.
-// Moves to cowshed_os::flock::exclusive.
+// WHY unbounded: a try (`LOCK_NB`) returns at once. The blocking wait (`WAIT_LOCK_OPERATION`) is
+// queued behind a live holder, never silent: it runs on `wait_for`'s helper while the waiter names
+// the holder once per `DISK_CHILD_DEADLINE`, and the holder's lifecycle operation ends it (it lets
+// go at its end, the kernel at its exit; each of its disk commands is bounded by that deadline).
 #[allow(clippy::disallowed_methods)]
 fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
     loop {
@@ -197,7 +198,9 @@ fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
 
 /// Wait for the lock `file` at `path`, which another holds, inside a lifecycle span: its start
 /// names the lock, a `holders` line names who holds it as the kernel shows it when the wait
-/// begins (one look per wait), and its end says how long it waited.
+/// begins, and its end says how long it waited. The wait is queued, not silent: the kernel's
+/// `flock` blocks on a helper thread while this one names the holder again on stderr once per
+/// [`crate::DISK_CHILD_DEADLINE`], keeping its place in the queue.
 fn wait_for(file: &File, path: &Path, taker: &dyn Taker) -> io::Result<()> {
     let step = format!("wait {}", path.display());
     cowshed_os::timing::timed("image-lock", format_args!("{step}"), || {
@@ -207,7 +210,12 @@ fn wait_for(file: &File, path: &Path, taker: &dyn Taker) -> io::Result<()> {
             "holders",
             taker.holders(path),
         );
-        flock(file, WAIT_LOCK_OPERATION)
+        cowshed_os::flock::queued(
+            path,
+            crate::DISK_CHILD_DEADLINE,
+            |path| taker.holders(path),
+            || flock(file, WAIT_LOCK_OPERATION),
+        )
     })
 }
 

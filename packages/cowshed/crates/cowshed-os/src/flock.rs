@@ -156,6 +156,45 @@ where
     }
 }
 
+/// How often a waiter queued behind a live holder names it again ([`queued`]).
+pub const HOLDER_REPORT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait for a lock a live holder keeps for as long as its work: queued, never silent. `take`, the
+/// kernel's blocking lock, runs on a helper thread while this thread says on stderr, once per
+/// `every`, that it still waits for `lock` and who holds it (`holder(lock)`, read anew each
+/// time), keeping its place in the kernel's queue. The holder's release, or the kernel's when the
+/// holder exits, ends the wait; nothing is signalled and nothing gives up its place.
+pub fn queued<T: Send>(
+    lock: &Path,
+    every: std::time::Duration,
+    holder: impl Fn(&Path) -> String,
+    take: impl FnOnce() -> io::Result<T> + Send,
+) -> io::Result<T> {
+    std::thread::scope(|scope| {
+        let (granted, grant) = mpsc::channel();
+        scope.spawn(move || {
+            // This thread waits for the answer below, so the send is never refused.
+            let _ = granted.send(take());
+        });
+        loop {
+            match grant.recv_timeout(every) {
+                Ok(taken) => return taken,
+                Err(mpsc::RecvTimeoutError::Timeout) => crate::eprintln!(
+                    "cowshed: still waiting for lock {}, held by {}",
+                    lock.display(),
+                    holder(lock)
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other(format!(
+                        "the waiter for lock {} ended without an answer",
+                        lock.display()
+                    )));
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -174,6 +213,47 @@ mod tests {
         ));
         File::create(&path).unwrap();
         path
+    }
+
+    /// A waiter queued behind a live holder names it at each bound and keeps waiting; once the
+    /// holder lets go (here, after its second naming), the waiter takes the lock.
+    #[test]
+    fn a_queued_waiter_names_its_holder_each_bound_and_takes_the_lock_once_it_is_let_go() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = lock_file("queued");
+        let holder = File::open(&path).unwrap();
+        assert!(
+            try_exclusive(&holder).unwrap(),
+            "the holder takes the free lock"
+        );
+        let (release, released) = mpsc::channel::<()>();
+        let releaser = std::thread::spawn(move || {
+            let _ = released.recv();
+            drop(holder);
+        });
+        let named = AtomicUsize::new(0);
+        let waiter = File::open(&path).unwrap();
+        queued(
+            &path,
+            Duration::from_millis(1),
+            |_| {
+                if named.fetch_add(1, Ordering::SeqCst) == 1 {
+                    let _ = release.send(());
+                }
+                "the test's holder".to_owned()
+            },
+            || flock(&waiter, libc::LOCK_EX),
+        )
+        .expect("the waiter takes the lock once the holder lets go");
+        assert!(
+            named.load(Ordering::SeqCst) >= 2,
+            "named at each bound while it waited"
+        );
+        releaser.join().unwrap();
+        let probe = File::open(&path).unwrap();
+        assert!(!try_exclusive(&probe).unwrap(), "the waiter holds the lock");
+        drop(waiter);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

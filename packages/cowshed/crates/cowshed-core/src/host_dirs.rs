@@ -69,16 +69,21 @@ pub fn wait_for_running_install(support_directory: &Path) -> std::io::Result<boo
         "cowshed: an install holds {}; waiting for it to finish",
         path.display()
     );
-    // WHY unbounded: a land step waits for the install in progress for as long as it runs, said on
-    // stderr first; the operator's interrupt ends it. debt: an install that wedges holding the slot
-    // stalls the step. Moves to cowshed_os::flock.
+    // WHY unbounded: queued, not silent: a land step waits for the install in progress, said on
+    // stderr first and its holder named again once per HOLDER_REPORT; the install's release when
+    // its gateway serves, or the kernel's at its exit, ends the wait, and the operator may interrupt.
     #[allow(clippy::disallowed_methods)]
-    loop {
-        match lock.lock_shared() {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            taken => break taken?,
-        }
-    }
+    cowshed_os::flock::queued(
+        &path,
+        cowshed_os::flock::HOLDER_REPORT,
+        crate::held_lock::holders,
+        || loop {
+            match lock.lock_shared() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                taken => return taken,
+            }
+        },
+    )?;
     Ok(true)
 }
 

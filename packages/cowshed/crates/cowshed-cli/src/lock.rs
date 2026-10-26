@@ -232,6 +232,10 @@ async fn take<W: Write, E: Write>(
             .map_err(write_failed)?;
     }
     let mut waiting = tokio::task::spawn_blocking(move || opened.hold());
+    let mut named = tokio::time::interval_at(
+        tokio::time::Instant::now() + cowshed_os::flock::HOLDER_REPORT,
+        cowshed_os::flock::HOLDER_REPORT,
+    );
     loop {
         tokio::select! {
             biased;
@@ -262,6 +266,11 @@ async fn take<W: Write, E: Write>(
                     })?,
                 }
             }
+            _ = named.tick() => cowshed_os::eprintln!(
+                "cowshed: still waiting for lock {}, held by {}",
+                path.display(),
+                held_lock::holders(path)
+            ),
         }
     }
 }

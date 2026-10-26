@@ -397,15 +397,20 @@ pub fn observe_all(
 /// Take a ticket under the `.seq` lock, numbered above every ticket present, and lock it before
 /// any other land can read it: written under a temporary name, then renamed into place.
 fn take_ticket(directory: &Path, workspace: &str, command: &str) -> io::Result<(Ticket, File)> {
+    let seq_path = directory.join(SEQ_NAME);
     let seq = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(directory.join(SEQ_NAME))?;
-    // WHY unbounded: debt: another land holds `.seq` only while it numbers one ticket; a holder
-    // stalled in the kernel stalls this. Moves to cowshed_os::flock.
-    #[allow(clippy::disallowed_methods)]
-    seq.lock()?;
+        .open(&seq_path)?;
+    // Another land holds `.seq` only while it numbers one ticket: a short lock, a request.
+    let seq = cowshed_os::flock::exclusive(
+        seq,
+        &seq_path,
+        &cowshed_os::deadline::start("land ticket", cowshed_os::deadline::CONTROL),
+        crate::held_lock::holders,
+    )
+    .map_err(io::Error::from)?;
     // A temporary ticket nobody locks is one whose taker died before renaming it: remove it.
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -532,9 +537,9 @@ pub fn take(
         // it was told at its cadence; the lock is released at once, since only its end matters.
         // The first telling is what `ahead_of` just read; each later one looks again.
         let mut first = true;
-        // WHY unbounded: debt: a land waits for the land ahead for as long as that land's turn runs,
-        // telling its place and the holder at its cadence; a land ahead that wedges holding its
-        // ticket stalls this one until the operator interrupts. Moves to cowshed_os::flock.
+        // WHY unbounded: queued, not silent: a land waits for the land ahead for as long as that
+        // land's turn runs, telling its place and the holder at its cadence; that land's release at
+        // its turn's end, or the kernel's at its exit, ends the wait, and the operator may interrupt.
         #[allow(clippy::disallowed_methods)]
         wait_telling(
             move || nearest.lock_shared(),

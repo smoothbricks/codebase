@@ -7,16 +7,13 @@
 
 use std::os::fd::RawFd;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::dto::LandTurnName;
 use crate::gateway_sessions::canonical_home;
 use crate::host_dirs::support_directory;
 use crate::land_turn::{self, OutsideHolders, Turn, Wait};
 use crate::{CowshedError, Result};
-
-/// How often a land that waits for the ref turn says who holds it: the ref lock's cadence.
-const WAIT_REPORT: Duration = Duration::from_secs(10);
 
 /// A held ref turn. The git that moves the target's ref under it is handed its ticket's
 /// descriptor ([`Self::descriptor`]), so the kernel keeps the turn until that git ends. Ending it
@@ -41,7 +38,7 @@ impl RefTurn {
     }
 
     /// [`Self::acquire`] in the land-turn root `root`. The queue is waited for on a blocking
-    /// thread, which reports every [`WAIT_REPORT`] who holds the turn and how many are ahead. A
+    /// thread, which reports every [`cowshed_os::flock::HOLDER_REPORT`] who holds the turn and how many are ahead. A
     /// land dropped while it waits leaves that thread its place: it takes the turn when its turn
     /// comes and drops it at once, so the queue behind it moves on.
     pub async fn acquire_in(root: &Path, queue: &LandTurnName, workspace: &str) -> Result<Self> {
@@ -50,11 +47,18 @@ impl RefTurn {
         let command = format!("cowshed land {workspace} (ref fence)");
         let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
         let mut taking = tokio::task::spawn_blocking(move || {
-            land_turn::take(&directory, &label, &command, None, WAIT_REPORT, |wait| {
-                // The receiver is read until this call returns; a send fails only once the land
-                // that would hear it is gone.
-                let _ = reports.send(wait.clone());
-            })
+            land_turn::take(
+                &directory,
+                &label,
+                &command,
+                None,
+                cowshed_os::flock::HOLDER_REPORT,
+                |wait| {
+                    // The receiver is read until this call returns; a send fails only once the land
+                    // that would hear it is gone.
+                    let _ = reports.send(wait.clone());
+                },
+            )
         });
         let started = Instant::now();
         let mut waited = false;
@@ -163,7 +167,7 @@ mod tests {
             "doc-commit",
             "git commit",
             None,
-            WAIT_REPORT,
+            cowshed_os::flock::HOLDER_REPORT,
             |_| panic!("the writer is first in the queue"),
         )
         .unwrap();
@@ -178,7 +182,7 @@ mod tests {
             if tickets.len() == 2 {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(
             tickets
