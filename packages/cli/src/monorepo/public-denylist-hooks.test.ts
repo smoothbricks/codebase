@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { mergeEnv } from '../lib/run.js';
-import { scanPublicCommitDenylist } from './public-denylist.js';
+import { type PublicDenylistScan, scanPublicCommitDenylist, scanPublicDenylist } from './public-denylist.js';
 
 const SMOO = fileURLToPath(new URL('../../bin/smoo', import.meta.url));
 const checkout = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -34,6 +34,17 @@ async function executable(path: string, text: string): Promise<void> {
 async function stage(text: string): Promise<void> {
   await writeFile(join(root, 'notes.txt'), text);
   git('add', 'notes.txt');
+}
+
+/** The commit message file the commit-msg hook hands smoo once the conventional formatter has rewritten it. */
+async function writeMessage(text: string): Promise<string> {
+  const path = join(root, '.git', 'COMMIT_EDITMSG');
+  await writeFile(path, `fix: neutral summary\n\n${text}\n`);
+  return path;
+}
+
+async function message(text: string) {
+  return scanPublicCommitDenylist(root, { kind: 'message', path: await writeMessage(text) }, env);
 }
 
 beforeEach(async () => {
@@ -177,13 +188,6 @@ describe('managed public denylist commit hooks', () => {
       for (const pattern of patterns) git('config', '--add', 'smoothbricks.commitMessageDenylist', pattern);
     });
 
-    /** Scans the message the commit-msg hook hands smoo once the conventional formatter has rewritten it. */
-    async function message(text: string) {
-      const path = join(root, '.git', 'COMMIT_EDITMSG');
-      await writeFile(path, `fix: neutral summary\n\n${text}\n`);
-      return scanPublicCommitDenylist(root, { kind: 'message', path }, env);
-    }
-
     it('refuses a commit message that trips each pattern', async () => {
       for (const line of ['see private-store/receipt.md', 'ran in /work/.cowshed/unit-a', 'asked SeatReviewer']) {
         expect(await message(line)).toEqual({ outcome: 'denied', matches: `message:3:${line}\n` });
@@ -198,6 +202,132 @@ describe('managed public denylist commit hooks', () => {
     it('never judges added lines: staged text with all three shapes is clean', async () => {
       await stage('private-store/receipt.md\n/work/.cowshed/unit-a\nSeatReviewer\n');
       expect(await scanPublicCommitDenylist(root, { kind: 'staged' }, env)).toEqual({ outcome: 'clean', patterns: 2 });
+    });
+  });
+
+  describe('committed shape patterns', () => {
+    // A refused sample is built from parts: the patterns judge this very file when it is committed or pushed, so it
+    // carries none of the shapes it proves refused.
+    const joined = (...parts: string[]): string => parts.join('');
+    const SHAPES = [
+      {
+        refused: [`ruled in ${joined('tg', '#', '6693')}`, `${joined('TG', '#', '11040')} said so`],
+        ordinary: ['issue #6693, and a tg# with no digits'],
+      },
+      {
+        refused: [
+          `${joined('Gr', 'ok')} review of the change`,
+          `written by ${joined('Gr', 'ok', 'Cleanup')}`,
+          `routed by ${joined('Sb', 'Queue', 'Op', 'us')}`,
+          `landed by ${joined('Ast', 'ra', 'Infra', '2')}`,
+        ],
+        ordinary: [
+          'ReleaseRecord, BuildVolumeRecord, Console, Resolve and ConsoleSolver',
+          'the .grok/skills directory and name "grok" keep their lowercase harness name',
+        ],
+      },
+      {
+        refused: [
+          `landed in ${joined('tra', 'in 5')}'s gate`,
+          `on the ${joined('Tra', 'in-6')} install`,
+          `the ${joined('sb-tra', 'in3')} job`,
+        ],
+        ordinary: ['a 72-commit train queued behind one land', 'the train folds units; retrain 3 models'],
+      },
+      {
+        refused: [
+          `runs ${joined('~', '/Dev/.land-lock.sh')}`,
+          `cd ${joined('$HOME', '/Dev/project')}`,
+          `cd ${joined('$', '{HOME}/Dev')}`,
+        ],
+        ordinary: ['~/.cargo/bin and $HOME/.config/x', '/Users/example/Dev/project and ~/Developer/Xcode'],
+      },
+    ] as const;
+    // Each sample is one numbered line, so a refused row names the sample it judged.
+    const numbered = (text: string, index: number): string => `sample ${index}: ${text}`;
+    const refused = SHAPES.flatMap((shape) => shape.refused);
+    const refusedLines = refused.map(numbered);
+    const ordinaryLines = SHAPES.flatMap((shape) => shape.ordinary).map((text, index) =>
+      numbered(text, refused.length + index),
+    );
+    const text = [...refusedLines, ...ordinaryLines].join('\n');
+
+    /** The values this repository commits for `smoothbricks.publicDenylist`, as git reads them from the file. */
+    function committed(): string[] {
+      const file = join(checkout, 'tooling', 'workspace.gitconfig');
+      return runGit(container, 'config', '--file', file, '--get-all', 'smoothbricks.publicDenylist')
+        .stdout.split('\n')
+        .filter((pattern) => pattern !== '');
+    }
+
+    type Judge = (scanEnv: Record<string, string>) => Promise<PublicDenylistScan>;
+    /** Each gate sets up the text it judges once, then judges it under any environment. */
+    const GATES: readonly { readonly gate: string; readonly prepare: () => Promise<Judge> }[] = [
+      {
+        gate: 'pre-commit: the staged lines',
+        prepare: async () => {
+          await stage(text);
+          return (scanEnv) => scanPublicCommitDenylist(root, { kind: 'staged' }, scanEnv);
+        },
+      },
+      {
+        gate: 'commit-msg: the message',
+        prepare: async () => {
+          const path = await writeMessage(text);
+          return (scanEnv) => scanPublicCommitDenylist(root, { kind: 'message', path }, scanEnv);
+        },
+      },
+      {
+        gate: 'pre-push: the pushed tree and message',
+        prepare: async () => {
+          await stage(text);
+          git('commit', '--quiet', '--no-verify', '-m', `fix: neutral summary\n\n${text}`);
+          return (scanEnv) => scanPublicDenylist(root, ['HEAD'], scanEnv);
+        },
+      },
+    ];
+
+    /** The sample lines a judgment refused: a refused row ends with the sample's own line. */
+    function refusedBy(scan: PublicDenylistScan): string[] {
+      if (scan.outcome === 'clean') return [];
+      if (scan.outcome !== 'denied') throw new Error(`the scan did not judge: ${JSON.stringify(scan)}`);
+      const rows = scan.matches.split('\n');
+      return [...refusedLines, ...ordinaryLines].filter((line) => rows.some((row) => row.endsWith(`:${line}`)));
+    }
+
+    it('refuses each shape through its own pattern at every gate and passes the ordinary text beside it', async () => {
+      const patterns = committed();
+      for (const { gate, prepare } of GATES) {
+        const judge = await prepare();
+        const alone = new Map<string, string[]>();
+        for (const pattern of patterns) {
+          alone.set(pattern, refusedBy(await judge({ ...env, SMOOTHBRICKS_PUBLIC_DENYLIST: pattern })));
+        }
+        const refusedByAny = new Set([...alone.values()].flat());
+        expect({
+          gate,
+          // A pattern that refuses no sample is dead, or has no sample here.
+          deadPatterns: patterns.filter((pattern) => !refusedLines.some((line) => alone.get(pattern)?.includes(line))),
+          // A shape no committed pattern refuses.
+          unrefused: refusedLines.filter((line) => !refusedByAny.has(line)),
+          // Ordinary text a committed pattern refuses.
+          overRefused: ordinaryLines.filter((line) => refusedByAny.has(line)),
+        }).toEqual({ gate, deadPatterns: [], unrefused: [], overRefused: [] });
+      }
+    });
+
+    it('reaches the real hooks through the workspace git config the clone includes', async () => {
+      git('config', 'include.path', join(checkout, 'tooling', 'workspace.gitconfig'));
+      await stage(text);
+      const staged = runGit(root, 'commit', '-m', 'fix: neutral summary');
+      expect(staged.exitCode).not.toBe(0);
+      for (const line of refusedLines) expect(staged.stderr).toContain(line);
+      for (const line of ordinaryLines) expect(staged.stderr).not.toContain(line);
+
+      await stage('neutral content\n');
+      const sent = runGit(root, 'commit', '-m', 'fix: neutral summary', ...refused.flatMap((line) => ['-m', line]));
+      expect(sent.exitCode).not.toBe(0);
+      for (const line of refused) expect(sent.stderr).toContain(line);
     });
   });
 

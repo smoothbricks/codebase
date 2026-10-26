@@ -924,7 +924,7 @@ reports offending message lines before refusing the commit, so private reference
 
 A message can also be held to patterns that do not apply to files: each value of `smoothbricks.commitMessageDenylist` is
 judged against the commit message only, never against staged lines or pushed trees. Use it for text a repository's files
-may name (a local evidence path, a generated agent name) but its history messages must not. Unlike
+may name (a local evidence path, a generated agent name) but its history messages must not. Unlike a private name in
 `smoothbricks.publicDenylist`, the list may be committed, through the workspace git config the shell includes
 (`tooling/workspace.gitconfig`), because it guards a private repository's own history rather than publication. Patterns
 are judged by `git grep -i -P` like the others; one that must be case-sensitive starts with `(?-i)`. A pattern git
@@ -940,14 +940,29 @@ smoo monorepo check-public-denylist --remote <remote> <pushed-sha...>
 It judges, never the working tree (a ref deletion publishes nothing), the tree of every pushed commit and the message of
 every commit the push adds: those `<remote>`'s remote-tracking branches do not already hold, so history that is already
 public is not judged again on every push. Run without `--remote`, it judges every commit behind the revisions. The
-patterns are kept outside the repository, so the guard never publishes what it guards: each value of this clone's local
-`smoothbricks.publicDenylist` git config, plus each line of `SMOOTHBRICKS_PUBLIC_DENYLIST`. Every pattern is a
-Perl-compatible regex matched case-insensitively by `git grep -i -P`: over text files (`-I`; binary files are not read)
-and over each line of each commit message, which is written to a scratch file so the same regex engine decides both. Any
-match refuses the push and prints each offending `<sha>:<path>:<line>:<text>`, or `<sha>:message:<line>:<text>` for a
-commit message. A pattern git cannot compile refuses the push too, so a typo cannot silently disable the guard. With no
-pattern configured the check passes silently, which is what CI and every clone that never set one see. Add a pattern
-with `git config --add smoothbricks.publicDenylist '<regex>'`; run the command bare to judge `HEAD` before pushing.
+patterns are kept outside the repository, so the guard never publishes what it guards: each value of the
+`smoothbricks.publicDenylist` git config this clone reads (its own, and the files it includes), plus each line of
+`SMOOTHBRICKS_PUBLIC_DENYLIST`. Every pattern is a Perl-compatible regex matched case-insensitively by `git grep -i -P`:
+over text files (`-I`; binary files are not read) and over each line of each commit message, which is written to a
+scratch file so the same regex engine decides both. Any match refuses the push and prints each offending
+`<sha>:<path>:<line>:<text>`, or `<sha>:message:<line>:<text>` for a commit message. A pattern git cannot compile
+refuses the push too, so a typo cannot silently disable the guard. With no pattern configured the check passes silently,
+which is what CI and every clone that never set one see. Add a pattern with
+`git config --add smoothbricks.publicDenylist '<regex>'`; run the command bare to judge `HEAD` before pushing.
+
+A shape is the exception to keeping patterns outside the repository. A pattern that names no private value, only a form
+of text no public repository carries, publishes nothing by being committed, so a repository may commit it as a
+`smoothbricks.publicDenylist` value in the workspace git config its clones include (`tooling/workspace.gitconfig`):
+every clone, shed and push then judges it at all three gates, with no per-clone setup. SmoothBricks commits four: a
+Telegram message id, an agent or reviewer named by its seat (the review model's bare name, or a CamelCase name that
+starts or ends with a seat name), a numbered lander train, and a home-relative path into the developer's `Dev`
+directory. Agent names with no seat are not matched, because the shapes that would match them also match code
+identifiers. A push judges every commit the remote does not hold yet, tree and message, so an in-flight branch whose
+unpushed commits already carry a shape is rewritten before it can be pushed; history the remote already holds is not
+judged again. `public-denylist-hooks.test.ts` reads the committed values and proves, for each one alone, that it refuses
+its samples at the pre-commit, commit-msg and pre-push judges and passes the ordinary text beside them, and that the
+real hooks refuse through the included file. Its samples are assembled from parts: a file that carried one would be
+refused by the shape it proves.
 
 The second gate runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin does not.
 This gate asks Nx for one target: it runs `direnv exec <checkout> nx run-many -t cargo-lint-cross`, in the checkout's

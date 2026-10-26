@@ -20,3 +20,19 @@
 
 [rebase]
 	autoStash = true
+
+[smoothbricks]
+	# Shapes no text of this public repository carries, judged as publicDenylist patterns by the pre-commit,
+	# commit-msg and pre-push hooks (packages/cli/README.md, "check-public-denylist"). A shape names no private
+	# value, so unlike a private project name it may be committed: every clone, shed and push then reads it.
+	# public-denylist-hooks.test.ts reads these values and proves that each one refuses and passes ordinary text.
+	# A chat message id.
+	publicDenylist = "tg#[0-9]+"
+	# An agent or reviewer named by its seat: the bare name of the review model, or a CamelCase name whose first or
+	# last part is a seat name. Seat-less agent names are not matched: the shapes that would match them also match
+	# code identifiers.
+	publicDenylist = "(?-i)(?<![A-Za-z0-9_])(?:Gro[k]|(?:Sol|Astra|Muse|Opus|Sonnet|Haiku|Gro[k]|Luna|Scout)[A-Z][A-Za-z0-9]*|[A-Z][A-Za-z0-9]*[a-z0-9](?:Sol|Astra|Muse|Opus|Sonnet|Haiku|Gro[k]|Luna|Scout)(?:R|[0-9]+)?)(?![A-Za-z0-9_])"
+	# A numbered lander train: the word, an optional separator, then a digit.
+	publicDenylist = "(?<![A-Za-z0-9])train[-_ ]?[0-9]"
+	# A path into the developer's Dev directory, spelled from the home directory with a tilde or HOME.
+	publicDenylist = "(?:~|[$]HOME|[$][{]HOME[}])/Dev(?![A-Za-z0-9_])"

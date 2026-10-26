@@ -149,14 +149,16 @@ is the host-installed CLI of `packages/cowshed`.
     below it. Test the span as `span-err`, not `span-exception`, with an observable test tracer, never a default no-op
     one; API-comparison and benchmark exceptions are stated where they apply. _Enforced by: review._
 12. **Portability.** When you write a path, a name, a dependency or a spawn → no home paths, private project names or
-    agent/session ids in committed text (write `~` or `<owner>`, use portable command placeholders, and normalise a
-    recorded fixture's root); an external dependency is pinned by git revision (`rev = "<sha>"`), never by a host path
-    (in-repo workspace crates use `path =` as usual); spawn tools by PATH name, never a Nix store path. Where platforms
-    differ, each platform's mechanism lives in its own file behind one interface, and callers never branch on the
-    platform; no test names a BSD-only tool (`lockf`, `pbcopy`, `sw_vers`). _Enforced by:
-    `smoo monorepo check-public-denylist` (`tooling/git-hooks`): commit-msg and pre-commit judge the home directory,
-    sibling project names and the clone's configured patterns, pre-push the configured patterns; agent and session ids
-    need a diff read._
+    agent/session ids in committed text (write `~` or `<owner>`, use portable command placeholders, normalise a recorded
+    fixture's root, and cite a ruling as "the owner's ruling, <date>", never by chat message id or name); an external
+    dependency is pinned by git revision (`rev = "<sha>"`), never by a host path (in-repo workspace crates use `path =`
+    as usual); spawn tools by PATH name, never a Nix store path. Where platforms differ, each platform's mechanism lives
+    in its own file behind one interface, and callers never branch on the platform; no test names a BSD-only tool
+    (`lockf`, `pbcopy`, `sw_vers`). _Enforced by: `smoo monorepo check-public-denylist` (`tooling/git-hooks`):
+    commit-msg and pre-commit judge the home directory, sibling project names and the configured patterns, pre-push the
+    configured patterns, and `tooling/workspace.gitconfig` commits four shapes every clone judges (chat message ids, the
+    review model's bare name and CamelCase agent names that start or end with a seat name, numbered trains,
+    home-relative paths into the developer's `Dev` directory); other agent and session ids need a diff read._
 13. **Hot paths.** When you write a warmed path (an LMAO buffer write, a StateBus render or reduce, a columine kernel)
     or claim a performance change → name the phase the claim covers (startup, setup, warmed write, slow path, flush). A
     warmed path allocates nothing and stays monomorphic: capacity is fixed at creation, growth happens only on an
