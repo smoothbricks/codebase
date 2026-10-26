@@ -11,9 +11,10 @@ use std::io;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use cowshed_core::CowshedError;
-use cowshed_core::runtime::wait_spans::{WaitFailure, WaitSpans};
+use cowshed_core::runtime::wait_spans::WaitSpans;
 use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
+use cowshed_types::wait::WaitFailure;
 
 use crate::capabilities::sccache;
 use crate::{

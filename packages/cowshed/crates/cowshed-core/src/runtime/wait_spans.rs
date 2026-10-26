@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
-use cowshed_os::deadline::{Expired, LatencyClass, Peer, PeerPid, Progress, Silent, WaitError};
+use cowshed_os::deadline::{Expired, Peer, PeerPid, Silent, WaitError};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -26,101 +26,69 @@ use crate::storage::trace_segment::{
     EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, TraceSegmentError,
     seal_segment, trace_batch,
 };
-use cowshed_types::trace_enum;
+use cowshed_types::wait::{WaitCode, WaitFailure};
 
 /// The name a wait span's start row carries; its `span-err` row carries the failure's sentence.
 pub const WAIT_SPAN_MESSAGE: &str = "cowshed.wait";
 /// A wait span is the only span of its own lmao thread.
 const WAIT_SPAN_ID: u32 = 1;
 
-trace_enum! {
-    /// The code an expired wait is reported under (05_gateway.md, "Deadlines", Codes).
-    pub enum WaitCode {
-        /// A request past its latency class's bound.
-        Timeout = "TIMEOUT",
-        /// A long wait whose holder showed no progress for its silence bound.
-        Silent = "SILENT",
-        /// The peer ended the connection before it answered.
-        PeerLost = "PEER_LOST",
-    }
-}
-
-/// An expired wait as its owning boundary records it: the facts its sentence states, as values.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WaitFailure {
-    pub code: WaitCode,
-    pub op: &'static str,
-    /// The peer or holder, named as the failure names it.
-    pub peer: String,
-    /// The pid the kernel reported for the peer; `None` when it reported none.
-    pub peer_pid: Option<i32>,
-    /// A `TIMEOUT`'s latency class; a silence or a loss has none.
-    pub class: Option<LatencyClass>,
-    /// A `TIMEOUT`'s request bound or a `SILENT`'s silence bound; a loss has none.
-    pub bound: Option<Duration>,
-    /// The whole wait, from its start to its end.
-    pub elapsed: Duration,
-    /// The last progress the waiter saw.
-    pub last: Progress,
-    /// The failure's own sentence, as the caller's error states it.
-    pub message: String,
-}
-
-impl WaitFailure {
-    /// `failure` as an expired wait; `None` for a peer that is absent or a call that failed,
-    /// neither of which is an expiry.
-    pub fn of(failure: &WaitError) -> Option<Self> {
-        match failure {
-            WaitError::Expired(expired) => Some(Self::expired(expired)),
-            WaitError::Silent(silent) => Some(Self::silent(silent, peer_pid(&silent.holder))),
-            WaitError::PeerLost {
-                op,
-                peer,
-                elapsed,
-                last,
-            } => Some(Self {
-                code: WaitCode::PeerLost,
-                op: *op,
-                peer: peer.to_string(),
-                peer_pid: peer_pid(peer),
-                class: None,
-                bound: None,
-                elapsed: *elapsed,
-                last: *last,
-                message: failure.to_string(),
-            }),
-            WaitError::Absent { .. } | WaitError::Io { .. } => None,
-        }
-    }
-
-    fn expired(expired: &Expired<Peer>) -> Self {
-        Self {
-            code: WaitCode::Timeout,
-            op: expired.op,
-            peer: expired.peer.to_string(),
-            peer_pid: peer_pid(&expired.peer),
-            class: Some(expired.class),
-            bound: Some(expired.bound),
-            elapsed: expired.elapsed,
-            last: expired.last,
-            message: expired.to_string(),
-        }
-    }
-
-    /// A long wait whose holder showed no progress for its silence bound. `holder_pid` is the pid
-    /// the kernel reported for the process the holder is reached through, if it reported one.
-    pub fn silent<P: fmt::Display>(silent: &Silent<P>, holder_pid: Option<i32>) -> Self {
-        Self {
-            code: WaitCode::Silent,
-            op: silent.op,
-            peer: silent.holder.to_string(),
-            peer_pid: holder_pid,
+/// `failure` as an expired wait; `None` for a peer that is absent or a call that failed,
+/// neither of which is an expiry.
+pub fn wait_failure_of(failure: &WaitError) -> Option<WaitFailure> {
+    match failure {
+        WaitError::Expired(expired) => Some(wait_failure_expired(expired)),
+        WaitError::Silent(silent) => Some(wait_failure_silent(silent, peer_pid(&silent.holder))),
+        WaitError::PeerLost {
+            op,
+            peer,
+            elapsed,
+            last,
+        } => Some(WaitFailure {
+            code: WaitCode::PeerLost,
+            op: *op,
+            peer: peer.to_string(),
+            peer_pid: peer_pid(peer),
             class: None,
-            bound: Some(silent.idle),
-            elapsed: silent.elapsed,
-            last: silent.last,
-            message: silent.to_string(),
-        }
+            bound: None,
+            elapsed: *elapsed,
+            last: *last,
+            message: failure.to_string(),
+        }),
+        WaitError::Absent { .. } | WaitError::Io { .. } => None,
+    }
+}
+
+fn wait_failure_expired(expired: &Expired<Peer>) -> WaitFailure {
+    WaitFailure {
+        code: WaitCode::Timeout,
+        op: expired.op,
+        peer: expired.peer.to_string(),
+        peer_pid: peer_pid(&expired.peer),
+        class: Some(expired.class),
+        bound: Some(expired.bound),
+        elapsed: expired.elapsed,
+        last: expired.last,
+        message: expired.to_string(),
+    }
+}
+
+/// A long wait whose holder showed no progress for its silence bound. `holder_pid` is the pid
+/// the kernel reported for the process the holder is reached through, if it reported one.
+pub fn wait_failure_silent<P: fmt::Display>(
+    silent: &Silent<P>,
+    holder_pid: Option<i32>,
+) -> WaitFailure {
+    WaitFailure {
+        code: WaitCode::Silent,
+        op: silent.op,
+        peer: silent.holder.to_string(),
+        peer_pid: holder_pid,
+        class: None,
+        bound: Some(silent.idle),
+        elapsed: silent.elapsed,
+        last: silent.last,
+        message: silent.to_string(),
     }
 }
 
@@ -271,6 +239,7 @@ fn micros(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::deadline::Progress;
 
     #[test]
     fn an_absent_peer_or_a_failed_call_is_no_expiry() {
@@ -287,15 +256,15 @@ mod tests {
             last: Progress::Connected,
             source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         };
-        assert_eq!(WaitFailure::of(&absent), None);
-        assert_eq!(WaitFailure::of(&failed), None);
+        assert_eq!(wait_failure_of(&absent), None);
+        assert_eq!(wait_failure_of(&failed), None);
         let lost = WaitError::PeerLost {
             op: "status",
             peer,
             elapsed: Duration::from_millis(7),
             last: Progress::Sent { bytes: 12 },
         };
-        let lost = WaitFailure::of(&lost).expect("a loss is recorded");
+        let lost = wait_failure_of(&lost).expect("a loss is recorded");
         assert_eq!(
             (lost.code, lost.op, lost.class, lost.bound),
             (WaitCode::PeerLost, "status", None, None)

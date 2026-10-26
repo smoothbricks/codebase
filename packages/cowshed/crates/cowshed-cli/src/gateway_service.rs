@@ -28,7 +28,7 @@ use cowshed_core::runtime::supervisor_manager::{
     self, ProgramSpawner, SocketPeers, SupervisorManager,
 };
 use cowshed_core::runtime::supervisor_socket;
-use cowshed_core::runtime::wait_spans::WaitFailure;
+use cowshed_core::runtime::wait_spans::wait_failure_of;
 use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::{
     CowshedError, ErrorCode, GatewayStoreBackend, NativeGatewayInventory, Result, StartupHealState,
@@ -45,6 +45,7 @@ use cowshed_os::namespace::HostNamespace;
 use cowshed_os::stdio::Blocking;
 use cowshed_types::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_types::repository::RepoId;
+use cowshed_types::wait::WaitFailure;
 use sha2::{Digest as _, Sha256};
 use std::convert::Infallible;
 use std::fs;
@@ -197,7 +198,7 @@ fn status_error(error: ControlError) -> GatewayStatusError {
 /// The wait `error` reports, when it is one that expired (05_gateway.md, "Deadlines", Spans).
 fn expired(error: &ControlError) -> Option<WaitFailure> {
     match error {
-        ControlError::Wait(failure) => WaitFailure::of(failure),
+        ControlError::Wait(failure) => wait_failure_of(failure),
         ControlError::InvalidSocketPath
         | ControlError::InvalidTcpEndpoint
         | ControlError::InvalidControllerCredential
