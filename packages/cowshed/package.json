@@ -252,10 +252,31 @@
           "api-check"
         ]
       },
+      "wait-why": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/*/clippy.toml",
+          "!{projectRoot}/**/target/**",
+          "{workspaceRoot}/packages/nx-plugin/src/wait-why-policy.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/rust-tokens.ts",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --version"
+          }
+        ],
+        "outputs": [],
+        "options": {
+          "comment": "WAIT-WHY (specs/cowshed/05_gateway.md, Deadlines, Enforcement): clippy refuses the waits each crate's clippy.toml disallows; this refuses a kept one without an adjacent // WHY unbounded: that says what ends it.",
+          "command": "bun packages/nx-plugin/src/wait-why-policy.ts packages/cowshed/crates",
+          "cwd": "{workspaceRoot}"
+        }
+      },
       "lint": {
         "dependsOn": [
           "...",
-          "api-check"
+          "api-check",
+          "wait-why"
         ]
       },
       "cli": {

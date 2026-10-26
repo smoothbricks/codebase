@@ -2062,6 +2062,17 @@ source, tests and scripts for direct disk-tool process calls. SmoothBricks runs 
 consumers wire the same guard into their root lint. Rust callers use `SystemCommandRunner` and `CommandRequest`; script
 callers use the CLI facade rather than introducing another disk-command runner.
 
+`bun node_modules/@smoothbricks/nx-plugin/src/wait-why-policy.ts <crates-directory...>` is WAIT-WHY
+(`specs/cowshed/05_gateway.md`, "Deadlines", Enforcement). Each crate's `clippy.toml` disallows every wait on another
+process (`WAIT_METHODS`: child waits and reaps, `output_locked`/`status_locked`, unix connects, `flock`, `waitpid`), so
+clippy refuses one that is not bounded through `cowshed_os::deadline`. A site kept unbounded suppresses
+`clippy::disallowed_methods` for its one item or statement, and WAIT-WHY refuses the suppression unless an adjacent
+`// WHY unbounded: <what ends the wait>` says why: on the comment lines directly above the attribute, on the attribute,
+or on the first line it covers. It also refuses a crate whose `clippy.toml` lacks one of the waits. Test code waits
+through `cowshed_os::test_backstop`'s helpers, each bounded by the no-progress backstop; a test keeps a raw wait, with
+its WHY, only where a helper thread would change what it measures. SmoothBricks runs it from `cowshed:wait-why`, which
+`cowshed:lint` depends on.
+
 Without an inherited parent pool, a `bounded-exec` command takes CPU tokens from cowshed's host budget before it starts,
 when the gateway answers on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on
 one host keep their runnable work near the core count instead of each sizing its runners to the whole machine. It asks
