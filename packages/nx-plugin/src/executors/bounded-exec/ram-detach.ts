@@ -118,6 +118,9 @@ export function detachGatewayRamDisk(
         listen();
         continue;
       }
+      // A line past the cap is refused before it is read, whatever chunk completed it.
+      if (Buffer.byteLength(line) > ANSWER_BYTES_MAX)
+        return finish(null, 'gateway detach reply exceeds its bounded output contract');
       const parsed = readDetachAnswer(line);
       if (parsed === null) finish(null, `gateway detach reply proves no terminal outcome: ${line.slice(0, 512)}`);
       else finish(parsed);
