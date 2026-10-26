@@ -116,10 +116,7 @@
           },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/**/*",
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
-          }
+          "cargoToolchain"
         ],
         "outputs": [
           "{projectRoot}/.cache/ram-fixture/"
@@ -149,10 +146,7 @@
           },
           "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/cowshed-api-gen/**/*",
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
-          }
+          "cargoToolchain"
         ],
         "outputs": [
           "{projectRoot}/.cache/api-generator/"
@@ -183,10 +177,7 @@
           "{projectRoot}/crates/cowshed-cli/src/args.rs",
           "{projectRoot}/package.json",
           "{workspaceRoot}/biome.json",
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
-          }
+          "cargoToolchain"
         ],
         "outputs": [
           "{projectRoot}/src/api.generated.ts",
@@ -234,10 +225,7 @@
           "{projectRoot}/crates/cowshed-core/src/api/served.generated.rs",
           "{projectRoot}/crates/cowshed-core/src/api/reader.generated.rs",
           "{projectRoot}/src/cli-parity.generated.ts",
-          "cargoToolchain",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
-          }
+          "cargoToolchain"
         ],
         "options": {
           "command": "packages/cowshed/.cache/api-generator/cowshed-api-gen check packages/cowshed",

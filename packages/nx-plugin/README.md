@@ -1277,6 +1277,11 @@ sandbox denies the operator's global git configuration (specs/cowshed/04_sandbox
 A FILE-only source plan does not perform a redundant installation census for absent runtime recipes; the complete
 producer tool/module and output SHA evidence is still captured and independently revalidated on every product probe.
 
+A declared target names `cargoToolchain` for its toolchain identity and spells no version command of its own: a bare
+`rustc -vV` through the wrapper is no generator recipe, so a receipt target whose task graph reaches one is refused as
+an unbounded runtime source closure. `ensure-built-receipt.test.ts` judges this repository's receipt targets on its own
+graph.
+
 Git source provenance is the committed tree and the producer's clean tracked source basis, not an unrelated untracked
 user file in its working directory. An actual FILE input outside HEAD, a modified tracked input, changed membership,
 opaque custom/native input proof or genuinely unbounded runtime source cannot be signed. Bounded runtime/env identity is

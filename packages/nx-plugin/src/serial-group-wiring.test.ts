@@ -1,13 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { spawnSync } from 'node:child_process';
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readdir, readFile } from 'node:fs/promises';
 import { join, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { parse as parseToml } from 'smol-toml';
 import typia from 'typia';
+import { REPOSITORY, runInRepositoryNx } from './__tests__/repository-nx.js';
 import { readCargoResolve } from './cargo-source-hash.js';
 import {
   type CargoWorkspacePackage,
@@ -21,8 +19,6 @@ import {
 import { COWSHED_EXECUTABLE_ENV } from './executors/bounded-exec/owned-subtree.js';
 import { isRecord } from './type-guards.js';
 
-/** The repository this package is built in: its own nextest config, nx.json and manifests are what these pin. */
-const REPOSITORY = fileURLToPath(new URL('../../..', import.meta.url));
 const ROOT_PROJECT = '@smoothbricks/codebase';
 const DEVICE_GROUP = 'cargo-test-group-real-apfs';
 const HOST_GROUP = 'cargo-test-group-real-apfs-host';
@@ -301,38 +297,13 @@ function records(value: unknown): Record<string, unknown>[] {
 }
 
 const parseProjectGraph = typia.json.createAssertParse<ProjectGraph>();
-// The child computes the graph outside this package's bunfig; it takes the same transform preload as the test runner.
-const VALIDATION_PRELOAD = fileURLToPath(import.meta.resolve('@smoothbricks/validation/bun/preload'));
 const GRAPH_SCRIPT = `const { createProjectGraphAsync } = await import('nx/src/project-graph/project-graph.js');
 const graph = await createProjectGraphAsync({ exitOnError: false });
 process.stdout.write(JSON.stringify({ nodes: graph.nodes, dependencies: graph.dependencies }));`;
 
-/**
- * The repository's own project graph, as Nx builds it with this plugin: computed daemonless, in a child that exits when
- * it is done, with plugins in its own process and workspace data of its own, so it neither starts a daemon nor writes
- * the checkout's graph cache.
- */
+/** The repository's own project graph, as Nx builds it with this plugin. */
 async function repositoryProjectGraph(): Promise<ProjectGraph> {
-  const data = await mkdtemp(join(tmpdir(), 'serial-group-graph-'));
-  try {
-    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NX_')));
-    const run = spawnSync(process.execPath, ['--preload', VALIDATION_PRELOAD, '-e', GRAPH_SCRIPT], {
-      cwd: REPOSITORY,
-      encoding: 'utf8',
-      maxBuffer: 256 * 1024 * 1024,
-      env: {
-        ...env,
-        NX_DAEMON: 'false',
-        NX_ISOLATE_PLUGINS: 'false',
-        NX_CACHE_PROJECT_GRAPH: 'false',
-        NX_WORKSPACE_DATA_DIRECTORY: data,
-      },
-    });
-    if (run.status !== 0) throw new Error(`the project graph child exited ${run.status}: ${run.stderr}`);
-    return parseProjectGraph(run.stdout);
-  } finally {
-    await rm(data, { recursive: true, force: true });
-  }
+  return parseProjectGraph(await runInRepositoryNx(GRAPH_SCRIPT));
 }
 
 let projectGraphOnce: Promise<ProjectGraph> | undefined;
