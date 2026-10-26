@@ -2107,14 +2107,31 @@ os._exit(0)
         monitor.watch(std::process::id()).unwrap();
         let origin = Instant::now();
         monitor.clock(origin).unwrap();
-        // A subscriber shortens the writer's ticks after its first.
-        let _events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
+        // A subscriber shortens the writer's ticks after its first, and every usage
+        // read those ticks make is an event on this subscription: the first closed
+        // window arrives as one, never found by re-reading the tree on a clock.
+        let mut events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
         let window = loop {
-            let usage = monitor.tree().unwrap().processes[0].usage;
-            if let Some(window) = usage.and_then(|usage| usage.cpu_window) {
-                break window;
+            use crate::api::process::JobProcessDelta;
+            match events.next().await {
+                Some(Ok(JobProcessEvent::Changed(JobProcessDelta::Usage { usage, .. }))) => {
+                    if let Some(window) = usage.cpu_window {
+                        break window;
+                    }
+                }
+                Some(Ok(
+                    JobProcessEvent::Born { process, .. }
+                    | JobProcessEvent::Exec { process, .. }
+                    | JobProcessEvent::Heartbeat { process, .. }
+                    | JobProcessEvent::Exited { process, .. },
+                )) => {
+                    if let Some(window) = process.usage.and_then(|usage| usage.cpu_window) {
+                        break window;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("the event stream ended before a window closed: {other:?}"),
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         };
         // The watch's own read came before the origin; the first window opened at a tick after it.
         assert!(window.opened_us > WallMicros::new(0).unwrap(), "{window:?}");
