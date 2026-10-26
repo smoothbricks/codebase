@@ -150,7 +150,7 @@ fn ensure_uuid_volume_password_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use security_framework::item::{ItemClass, ItemSearchOptions};
     use security_framework::os::macos::keychain::{CreateOptions, SecKeychain};
     use std::fs;
@@ -184,7 +184,7 @@ mod tests {
                     "--nocapture", "--test-threads=1",
                 ])
                 .env(CHILD, "1")
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(
                 output.status.success(),
@@ -291,7 +291,7 @@ mod tests {
         assert!(!error.to_string().contains("different-synthetic-password"));
         let metadata = Command::new(SECURITY)
             .args(["dump-keychain", "-a", keychain_path])
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(metadata.status.success());
         let metadata = String::from_utf8(metadata.stdout).unwrap();

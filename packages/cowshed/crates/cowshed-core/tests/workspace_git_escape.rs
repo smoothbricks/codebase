@@ -1,5 +1,6 @@
 #![cfg(target_os = "macos")]
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,7 +10,6 @@ use cowshed_core::metadata::PortBlock;
 use cowshed_core::sandbox::{
     RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
 };
-use cowshed_os::fork_lock::Run as _;
 
 fn git(root: &Path, args: &[&str]) {
     let output = git_command_at(root)
@@ -18,7 +18,7 @@ fn git(root: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output_locked()
+        .output_bounded()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -64,7 +64,7 @@ fn job(config: &SandboxConfig, script: &str) -> std::process::Output {
         .env("HOME", config.workspace_mount.join(".cowshed/home"))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output_locked()
+        .output_bounded()
         .expect("sandboxed job")
 }
 
@@ -116,7 +116,7 @@ fn workspace_hooks_cannot_run_as_controller_on_rebase() {
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
             .env("GIT_COMMITTER_NAME", "fixture")
             .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-            .output_locked()
+            .output_bounded()
             .expect("controller rebase");
         assert!(
             rebase.status.success(),
@@ -220,7 +220,7 @@ fn repository_filter_cannot_write_to_controller_home() {
         let output = sandboxed_git_command_at(&temp.join("store"), &checkout)
             .expect("sandboxed Git")
             .args(["checkout", "--", "data"])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed checkout");
         assert!(
             output.status.success(),

@@ -1,10 +1,10 @@
 //! The nx-cache-server ships as one bundle that Bun runs from PATH (tg#7504), and the manifest
 //! guard reads the repository at runtime rather than at compile time.
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use cowshed_os::fork_lock::Run as _;
 use serde_json::{Value, json};
 
 #[path = "support/temp_parent.rs"]
@@ -61,7 +61,7 @@ fn repository_root_resolves_the_manifest_at_runtime_not_at_compile_time() {
         ])
         .env("CARGO_MANIFEST_DIR", &manifest)
         .env(COWSHED_NX_BUNDLE_ROOT_PROBE, &probe)
-        .output_locked()
+        .output_bounded()
         .expect("run the root probe child");
     assert!(output.status.success(), "{}", text(&output));
     let resolved = std::fs::read(&probe)

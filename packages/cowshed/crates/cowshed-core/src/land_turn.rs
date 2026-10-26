@@ -402,6 +402,9 @@ fn take_ticket(directory: &Path, workspace: &str, command: &str) -> io::Result<(
         .truncate(false)
         .write(true)
         .open(directory.join(SEQ_NAME))?;
+    // WHY unbounded: debt: another land holds `.seq` only while it numbers one ticket; a holder
+    // stalled in the kernel stalls this. Moves to cowshed_os::flock.
+    #[allow(clippy::disallowed_methods)]
     seq.lock()?;
     // A temporary ticket nobody locks is one whose taker died before renaming it: remove it.
     for entry in fs::read_dir(directory)? {
@@ -435,7 +438,8 @@ fn take_ticket(directory: &Path, workspace: &str, command: &str) -> io::Result<(
         .create_new(true)
         .write(true)
         .open(&staged)?;
-    file.lock()?;
+    // A file this process just created is locked by nobody else: the lock is taken at once.
+    file.try_lock().map_err(io::Error::from)?;
     file.write_all(&serde_json::to_vec(&ticket).map_err(io::Error::other)?)?;
     let path = directory.join(ticket_name(number));
     fs::rename(&staged, &path)?;
@@ -528,6 +532,9 @@ pub fn take(
         // it was told at its cadence; the lock is released at once, since only its end matters.
         // The first telling is what `ahead_of` just read; each later one looks again.
         let mut first = true;
+        // WHY unbounded: a land waits for the land ahead for as long as that land's turn runs,
+        // telling its place at its cadence; the land ahead's exit or the operator's interrupt ends it.
+        #[allow(clippy::disallowed_methods)]
         wait_telling(
             move || nearest.lock_shared(),
             report_every,
@@ -577,6 +584,7 @@ pub fn take(
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::collections::BTreeMap;
 
     use proptest::prelude::*;
@@ -628,7 +636,7 @@ mod tests {
         let status = command
             .spawn_locked()
             .expect("start direct child")
-            .wait()
+            .wait_bounded()
             .expect("reap direct child, not its descendant");
         assert_eq!(status.code(), Some(exit_code));
 

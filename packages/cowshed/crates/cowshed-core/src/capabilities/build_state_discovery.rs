@@ -553,6 +553,7 @@ pub(crate) struct HostCargo;
 #[cfg(all(test, target_os = "macos"))]
 impl CargoRunner for HostCargo {
     fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>> {
+        use cowshed_os::test_backstop::CommandBackstop as _;
         let Some(first) = queries.first() else {
             return Ok(Vec::new());
         };
@@ -563,7 +564,7 @@ impl CargoRunner for HostCargo {
             // Where a job writes depends on the tracked project files, never a caller's shell.
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_TARGET_DIR")
-            .output_locked()
+            .output_bounded()
             .map_err(|error| CowshedError::internal(format!("cannot run bash: {error}")))?;
         Ok(driver_answers(&output, queries.len(), None))
     }
@@ -621,6 +622,9 @@ pub(super) fn expand_declared(
         let depth = selector.components().count();
         let mut pathspec = OsString::from(":(glob)");
         pathspec.push(selector.join("**"));
+        // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors
+        // and prompts off (`git_command_at`): it waits on no other process.
+        #[allow(clippy::disallowed_methods)]
         let output = crate::git::git_command_at(workspace)
             .args(["ls-files", "-z", "--"])
             .arg(&pathspec)
@@ -1050,6 +1054,9 @@ fn tracked_build_inputs(workspace: &Path) -> Result<Vec<u8>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(super::detection_error(&workspace.join(".git"), error)),
     }
+    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors and
+    // prompts off (`git_command_at`): it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = crate::git::git_command_at(workspace)
         .args([
             "ls-files",
@@ -1152,7 +1159,7 @@ mod driver_tests {
             .env("PATH", path)
             .env("HOST_PATH", host_path())
             .env("PROBE_ROOT", &fixture.root)
-            .output_locked()
+            .output_bounded()
             .unwrap()
     }
 
@@ -1215,6 +1222,7 @@ mod tests {
     use super::super::test_support::Fixture;
     use super::driver_tests::{bootstrap_links, executable, run_driver, run_driver_on};
     use super::*;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     fn write(fixture: &Fixture, relative: &str, content: &str) {
         let path = fixture.root.join(relative);
@@ -1225,7 +1233,7 @@ mod tests {
     fn git(fixture: &Fixture, args: &[&str]) {
         let output = crate::git::git_command_at(&fixture.root)
             .args(args)
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(
             output.status.success(),
@@ -1830,7 +1838,7 @@ printf '%s:%s\n' "$index" "$PWD"
         write(fixture, "vendor/upstream/build/build.ninja", "rule cc\n");
         let output = crate::git::git_command_at(&fixture.root.join("vendor/upstream"))
             .args(["init", "--quiet"])
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(output.status.success());
     }

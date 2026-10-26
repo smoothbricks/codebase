@@ -1764,6 +1764,9 @@ mod tests {
     use crate::capabilities::BuildStatePath;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use cowshed_os::fork_lock::Spawn as _;
+    use cowshed_os::test_backstop::ChildBackstop as _;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::UnixStreamBackstop as _;
 
     fn scratch(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1989,7 +1992,7 @@ mod tests {
             other => panic!("expected the open database to refuse: {other:?}"),
         }
         drop(child.stdin.take());
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         assert_eq!(close(&root, &state()).unwrap(), Ok(()));
         fs::remove_dir_all(&root).unwrap();
     }
@@ -2037,7 +2040,7 @@ mod tests {
             other => panic!("expected the open database to be named: {other:?}"),
         }
         drop(child.stdin.take());
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         assert_eq!(held_workspace_data(&data).unwrap(), Ok(()));
         fs::remove_dir_all(&root).unwrap();
     }
@@ -2071,7 +2074,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         drop(child.stdin.take());
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         let ours = held.iter().find(|holder| holder.pid == pid);
         assert!(
             ours.is_some_and(|holder| holder.command.contains("sh")),
@@ -2107,7 +2110,7 @@ mod tests {
         let outside = tree_holders(&sibling).unwrap();
         let missing = tree_holders(&root.join("missing")).unwrap();
         drop(child.stdin.take());
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         assert!(
             inside.iter().any(|holder| holder.pid == pid),
             "pid {pid} (cwd {}) is not among the {} holders of {}",
@@ -2191,7 +2194,7 @@ mod tests {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn_locked()
-                .and_then(std::process::Child::wait_with_output)
+                .and_then(std::process::Child::wait_with_output_bounded)
                 .expect("node runs");
             let text = format!(
                 "{}{}",
@@ -2431,7 +2434,7 @@ mod tests {
             let mut first = nx_opener(&stock);
             opened(&mut first);
             drop(first.stdin.take());
-            first.wait().unwrap();
+            first.wait_bounded().unwrap();
         }
         let [database]: [PathBuf; 1] = task_databases_in(&linked.from.join("nx/workspace-data"))
             .unwrap()
@@ -2471,7 +2474,7 @@ mod tests {
             database.display()
         );
         drop(opener.stdin.take());
-        opener.wait().unwrap();
+        opener.wait_bounded().unwrap();
     }
 
     /// A taken open lock is an Nx process opening its database: [`hold_opens`] answers that
@@ -2530,7 +2533,7 @@ mod tests {
             Ok(_) => panic!("a taken open lock is an opening"),
         }
         drop(opening.stdin.take());
-        opening.wait().unwrap();
+        opening.wait_bounded().unwrap();
         drop(
             hold_opens(&root, &state, &next)
                 .unwrap()
@@ -2601,7 +2604,7 @@ mod tests {
         }
         assert!(cowshed_os::process::sandboxed(sandboxed.id() as i32).unwrap());
         drop(sandboxed.stdin.take());
-        sandboxed.wait().unwrap();
+        sandboxed.wait_bounded().unwrap();
     }
 
     /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the
@@ -2697,7 +2700,7 @@ mod tests {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn_locked()
-                .and_then(std::process::Child::wait_with_output)
+                .and_then(std::process::Child::wait_with_output_bounded)
                 .expect("node runs");
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "nx show projects: {stderr}");
@@ -2851,7 +2854,7 @@ mod tests {
             "the record is not read"
         );
         assert!(
-            std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+            std::os::unix::net::UnixStream::connect_bounded(&socket).is_ok(),
             "held neither closes nor disturbs the live socket"
         );
         assert!(
@@ -2860,7 +2863,7 @@ mod tests {
         );
         drop(listener);
         drop(foreign.stdin.take());
-        foreign.wait().unwrap();
+        foreign.wait_bounded().unwrap();
     }
 
     /// A census asks nothing of a process a held lifecycle lease names with the unique id it has
@@ -2946,7 +2949,7 @@ mod tests {
 
         for child in [&mut lifecycle, &mut foreign] {
             drop(child.stdin.take());
-            child.wait().unwrap();
+            child.wait_bounded().unwrap();
         }
         fs::remove_dir_all(&root).unwrap();
     }

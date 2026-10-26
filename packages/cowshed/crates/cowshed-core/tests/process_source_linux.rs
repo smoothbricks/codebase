@@ -285,20 +285,17 @@ impl Exec {
             Creation::Clone => launch.start_clone(0),
         };
         assert!(pid > 0, "{born:?}: {}", io::Error::last_os_error());
-        let id = libc::id_t::try_from(pid).expect("pid");
-        // SAFETY: waiting for our own child without reaping it.
-        let waited = unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
-            libc::waitid(
-                libc::P_PID,
-                id,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT | libc::__WALL,
-            )
-        };
-        assert_eq!(waited, 0, "waitid: {}", io::Error::last_os_error());
+        // Its exit is watched through its pidfd and it stays unreaped: no helper thread joins the
+        // observed tree.
+        cowshed_os::deadline::await_exit(
+            "oracle grandchild",
+            u32::try_from(pid).expect("pid"),
+            &cowshed_os::deadline::start("test wait", cowshed_os::test_backstop::BACKSTOP),
+            cowshed_os::deadline::Progress::Nothing,
+        )
+        .expect("the grandchild exits");
         let start = start_time(pid).expect("an unreaped child's start time");
-        let wait_status = reap(pid);
+        let wait_status = reap_exited(pid);
         record(&OracleRecord::Reaped(Reaped {
             pid: u32::try_from(pid).expect("pid"),
             ppid: std::process::id(),
@@ -1221,6 +1218,10 @@ impl Tracer {
     fn run(&mut self) {
         loop {
             let mut status = 0;
+            // WHY unbounded: the tracer's own event loop, whose latency is what this test measures:
+            // a helper thread per wait would sit in that latency. The test runner's no-progress
+            // backstop ends a run whose tracees stop reporting.
+            #[allow(clippy::disallowed_methods)]
             // SAFETY: waiting for any tracee.
             let pid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
             if pid == -1 {
@@ -1724,10 +1725,18 @@ fn kill(pid: libc::pid_t) {
 
 /// Reap a child, whatever its exit signal, and return its wait status.
 fn reap(pid: libc::pid_t) -> c_int {
-    let mut status = 0;
-    // SAFETY: waiting for our own child.
-    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
-    assert_eq!(reaped, pid, "waitpid {pid}: {}", io::Error::last_os_error());
+    let (reaped, status) = cowshed_os::test_backstop::waitpid(pid, libc::__WALL)
+        .unwrap_or_else(|error| panic!("waitpid {pid}: {error}"));
+    assert_eq!(reaped, pid, "waitpid {pid}");
+    status
+}
+
+/// Reap `pid`, whose exit was already seen, without blocking: no helper thread joins the
+/// observed tree.
+fn reap_exited(pid: libc::pid_t) -> c_int {
+    let (reaped, status) = cowshed_os::test_backstop::waitpid(pid, libc::__WALL | libc::WNOHANG)
+        .unwrap_or_else(|error| panic!("waitpid {pid}: {error}"));
+    assert_eq!(reaped, pid, "waitpid {pid}: the exit seen is there to reap");
     status
 }
 

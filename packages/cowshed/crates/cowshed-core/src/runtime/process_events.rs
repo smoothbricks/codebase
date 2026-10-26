@@ -1159,6 +1159,7 @@ fn identity(record: &ProcessRecord) -> ProcessIdentity {
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
@@ -1296,7 +1297,7 @@ mod tests {
         drop(hold_write);
         let failures = until_exited(&mut observer, root);
         assert!(failures.is_empty(), "{failures:?}");
-        assert!(child.wait().unwrap().success());
+        assert!(child.wait_bounded().unwrap().success());
         std::fs::remove_file(&marker).unwrap();
 
         let nodes: Vec<_> = observer.fold().nodes().collect();
@@ -1357,7 +1358,7 @@ mod tests {
         drop(hold_write);
         let failures = until_exited(&mut observer, root);
         assert!(failures.is_empty(), "{failures:?}");
-        assert!(child.wait().unwrap().success());
+        assert!(child.wait_bounded().unwrap().success());
         std::fs::remove_file(&marker).unwrap();
         let nodes: Vec<_> = observer.fold().nodes().collect();
         assert_eq!(nodes.len(), 1);
@@ -1381,7 +1382,7 @@ mod tests {
         let (mut observer, mut child) = watched(&script, None);
         let root = child.id();
         let failures = until_exited(&mut observer, root);
-        assert!(child.wait().unwrap().success());
+        assert!(child.wait_bounded().unwrap().success());
         let nodes: Vec<_> = observer.fold().nodes().collect();
         let retained = nodes.len() - 1;
         for node in &nodes[1..] {
@@ -1704,7 +1705,7 @@ mod tests {
 
     fn release(mut child: Child) {
         drop(child.stdin.take());
-        child.wait().expect("reap");
+        child.wait_bounded().expect("reap");
     }
 
     /// The pid named another life after the registration than before it: nothing is adopted,
@@ -2018,7 +2019,7 @@ mod tests {
         );
         assert!(observer.withdraw(own).expect("withdraw own child"));
         drop(child.stdin.take());
-        assert!(child.wait().expect("reap cat").success());
+        assert!(child.wait_bounded().expect("reap cat").success());
     }
 
     /// An exit under a withheld watch is joined: the life ends, its registration with it, and its
@@ -2103,7 +2104,7 @@ wait $!";
                 .wait_custody(Duration::from_secs(3600))
                 .expect("custody joins every exit");
         }
-        child.wait().expect("reap the root");
+        child.wait_bounded().expect("reap the root");
         let exit = |process: ProcessIdentity| {
             observer
                 .fold()

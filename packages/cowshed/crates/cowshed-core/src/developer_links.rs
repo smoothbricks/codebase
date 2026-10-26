@@ -998,6 +998,8 @@ fn resolve(manager: &OsStr, path: Option<&OsStr>, wrapper: (u64, u64)) -> io::Re
 
 /// The version `program` prints for `--version`.
 fn reported_version(program: &Path) -> io::Result<String> {
+    // WHY unbounded: a package manager printing its version waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = Command::new(program)
         .arg("--version")
         .output_locked()
@@ -1127,6 +1129,9 @@ pub fn dispatch() -> io::Result<Option<ExitStatus>> {
     if let Some(path) = std::env::var_os(INSTALL_OBSERVED_ENV) {
         fs::write(path, b"observed\n")?;
     }
+    // WHY unbounded: the install is this wrapper's whole work, run in place of the package manager
+    // the job called; the job's own bounds end it.
+    #[allow(clippy::disallowed_methods)]
     let status = Command::new(program.path).args(arguments).status_locked();
     let restored = snapshot
         .restore(root, RestoreMode::CoveredInstall)
@@ -1153,8 +1158,8 @@ mod tests {
     use super::*;
     use crate::capabilities::bun::BUN_HOME as BUN;
     use crate::capabilities::pnpm::PNPM_HOME as PNPM;
-    use cowshed_os::fork_lock::Run;
     use cowshed_os::fsio::{Syncs, take_syncs};
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::os::unix::fs::symlink;
 
     /// The stores of the fixture home beside a checkout. No fixture link names a store root, so
@@ -1368,7 +1373,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1376,7 +1381,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1440,7 +1445,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(&root)
-                    .status_locked()
+                    .status_bounded()
                     .unwrap()
                     .success()
             );
@@ -1482,7 +1487,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1490,7 +1495,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1544,7 +1549,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1552,7 +1557,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1585,7 +1590,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1593,7 +1598,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1729,7 +1734,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1737,7 +1742,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1785,7 +1790,7 @@ mod tests {
                 Command::new("git")
                     .args(args)
                     .current_dir(&root)
-                    .status_locked()
+                    .status_bounded()
                     .unwrap()
                     .success()
             );
@@ -1961,7 +1966,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -1969,7 +1974,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2018,7 +2023,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2026,7 +2031,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2211,7 +2216,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2219,7 +2224,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2242,7 +2247,7 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(FIXTURE_ENV, &root)
-            .status_locked()
+            .status_bounded()
             .unwrap();
         assert!(status.success(), "sandboxed child failed: {status}");
         assert_eq!(
@@ -2263,7 +2268,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2271,7 +2276,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2378,7 +2383,7 @@ mod tests {
             Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2386,7 +2391,7 @@ mod tests {
             Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -2424,7 +2429,7 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(FIXTURE_ENV, &root)
-            .status_locked()
+            .status_bounded()
             .unwrap();
         assert!(status.success(), "sandboxed child failed: {status}");
         assert_eq!(

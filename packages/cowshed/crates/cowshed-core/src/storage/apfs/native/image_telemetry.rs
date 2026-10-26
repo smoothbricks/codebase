@@ -681,7 +681,7 @@ mod tests {
     use arrow_array::types::UInt8Type;
     use arrow_array::{Array, DictionaryArray, Int64Array, StringArray, UInt64Array};
     use arrow_ipc::reader::StreamReader;
-    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::fs::{self, File, OpenOptions};
     use std::io::Write;
     use std::os::unix::fs::FileExt;
@@ -783,7 +783,7 @@ mod tests {
                 .arg("-c")
                 .arg(&image)
                 .arg(&holder)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );

@@ -577,6 +577,9 @@ pub(crate) fn tracked_source(
     if paths.is_empty() {
         return Ok(None);
     }
+    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors and
+    // prompts off (`git_command_at`): it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = crate::git::git_command_at(checkout)
         .arg("--literal-pathspecs")
         .args(["ls-files", "-z", "--"])
@@ -795,6 +798,9 @@ impl BuildVolumeLayout {
     /// the image before it lets go of its claim, so a hold that waited for it finds no image, and
     /// the hold file it made is removed again. Every claimant takes its claim without waiting, so
     /// this waits for the claimant's own work, never for another hold.
+    // WHY unbounded: debt: an exclusive claimant (release, seed capture, reseed, cache clear) holds
+    // it across its own work. Moves to cowshed_os::flock.
+    #[allow(clippy::disallowed_methods)]
     pub fn hold(&self, id: &BuildVolumeId) -> io::Result<BuildVolumeHold> {
         let path = self.hold_path(id);
         let file = open_hold(&path)?;

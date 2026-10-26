@@ -8247,6 +8247,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"])
             .arg(&main_root)
             .args(refs.iter().map(|(name, _)| format!("{name}:{name}")));
+        // WHY unbounded: a sandboxed git fetching from a repository on this host's own disk: it
+        // waits on no other process.
+        #[allow(clippy::disallowed_methods)]
         let output = command.output_locked().await.map_err(|error| {
             CowshedError::environment_missing(
                 error.to_string(),
@@ -11508,13 +11511,15 @@ enum NativeAdoptRollbackState {
 mod rebase_recovery_tests {
     use super::*;
     use crate::error::FenceRefusal;
-    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::test_backstop::{
+        AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _,
+    };
 
     fn git(root: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("git")
             .args(args)
             .current_dir(root)
-            .output_locked()
+            .output_bounded()
             .expect("run fixture git command")
     }
 
@@ -11745,7 +11750,7 @@ mod rebase_recovery_tests {
                 .args(["clone", "--quiet"])
                 .arg(source)
                 .arg(&root)
-                .output_locked()
+                .output_bounded()
                 .expect("clone");
             assert!(output.status.success(), "{output:?}");
             Self::identify(&root);
@@ -12038,7 +12043,7 @@ mod rebase_recovery_tests {
             let probe = std::process::Command::new(&git)
                 .current_dir(lane)
                 .args(["maintenance", "run", "--task=worktree-prune"])
-                .output_locked()
+                .output_bounded()
                 .unwrap_or_else(|error| panic!("run the fence's git {git}: {error}"));
             assert!(
                 probe.status.success(),
@@ -12133,8 +12138,6 @@ mod rebase_recovery_tests {
     /// the gate's worktree, and it exits.
     #[tokio::test]
     async fn the_fence_git_holds_the_ref_lock_and_starts_no_maintenance_that_keeps_it() {
-        use cowshed_os::fork_lock::RunAsync as _;
-
         let lane = Lane::new("fence");
         let store_root = lane.store.shared();
         let unit = lane.unit("unit");
@@ -12188,7 +12191,7 @@ mod rebase_recovery_tests {
         let held = take();
         succeeded(
             fast_forward(&held_head, Some(held.descriptor()))
-                .output_locked()
+                .output_bounded()
                 .await
                 .expect("run the fence git"),
         );
@@ -12213,7 +12216,7 @@ mod rebase_recovery_tests {
         let inode = held.inode();
         let mut control = fast_forward(&control_head, None);
         crate::held_lock::hand_to(control.as_std_mut(), vec![held.descriptor()]);
-        succeeded(control.output_locked().await.expect("run the control git"));
+        succeeded(control.output_bounded().await.expect("run the control git"));
         assert_eq!(
             git_oid(store_root, &lane.lane).await.expect("lane head"),
             control_head
@@ -12262,18 +12265,12 @@ mod rebase_recovery_tests {
         /// has closed every descriptor it had, so what holds the lock then is the kernel's answer.
         fn kill_owner(&mut self) {
             self.0.kill().expect("kill the owner");
-            // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: waiting for this test's own child without reaping it.
-            let waited = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    self.0.id(),
-                    &mut info,
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+            cowshed_os::test_backstop::waitid(
+                libc::P_PID,
+                self.0.id(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+            .expect("wait for the owner's exit");
         }
     }
 
@@ -12291,7 +12288,7 @@ mod rebase_recovery_tests {
                 }
                 Err(error) => failures.push(format!("the fence owner's pid {pgid}: {error}")),
             }
-            if let Err(error) = self.0.wait() {
+            if let Err(error) = self.0.wait_bounded() {
                 failures.push(format!("reap the fence owner {pgid}: {error}"));
             }
             if failures.is_empty() {
@@ -16281,6 +16278,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             tokio::fs::create_dir_all(&parent).await.map_err(|error| {
                 CowshedError::environment_missing(error.to_string(), "check cache permissions")
             })?;
+            // WHY unbounded: debt: a network clone, which a silent remote stalls. Moves to an idle
+            // bound on git's progress output.
+            #[allow(clippy::disallowed_methods)]
             let output = tokio::process::Command::new("git")
                 .arg("clone")
                 .arg("--mirror")
@@ -19894,6 +19894,9 @@ fn fence_git_command(
 
 /// Run a [`fence_git_command`] to its end.
 #[cfg(target_os = "macos")]
+// WHY unbounded: a sandboxed git of this host's own repository, fetching only from one on this
+// host's disk: it waits on no other process.
+#[allow(clippy::disallowed_methods)]
 async fn fence_git(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -20320,6 +20323,9 @@ async fn run_git_fetch<const N: usize>(
     let mut command = tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(
         store_root, root, source,
     )?);
+    // WHY unbounded: a sandboxed git fetching from a repository on this host's own disk: it waits
+    // on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = command.args(args).output_locked().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
@@ -20332,6 +20338,9 @@ async fn run_git_fetch<const N: usize>(
 /// Repository-selected Git commands (including merge drivers and filters) run
 /// with a write boundary around the checkout, not with controller host reach.
 #[cfg(target_os = "macos")]
+// WHY unbounded: debt: repository-selected merge drivers and filters run inside it, and one that
+// stalls stalls this. Moves to an idle bound on its output.
+#[allow(clippy::disallowed_methods)]
 async fn invoke_git(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -23989,6 +23998,7 @@ pub(crate) async fn require_lost_groups_released(
 mod unresolved_retirement_tests {
     use super::*;
     use cowshed_os::fork_lock::Spawn as _;
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::process::CommandExt as _;
     use std::time::Duration;
@@ -24025,7 +24035,7 @@ mod unresolved_retirement_tests {
         let mut ready = String::new();
         output.read_line(&mut ready).unwrap();
         assert_eq!(ready, "READY\n");
-        assert!(child.wait().unwrap().success());
+        assert!(child.wait_bounded().unwrap().success());
         let stopped = super::super::supervisor_socket::bind(&root.join("supervisor.sock"))
             .await
             .unwrap();
@@ -25091,6 +25101,7 @@ mod git_worktree_tests {
         DetachedWorkspaceMetadata, GrantSet, Platform, PortBlock, PublicationState,
         SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole,
     };
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     fn sidecar(git_worktree: bool) -> DetachedWorkspaceMetadata {
         DetachedWorkspaceMetadata {
@@ -25170,7 +25181,6 @@ mod git_worktree_tests {
     /// runs, citing the include and the rule, rather than failing as an opaque exec denial.
     #[tokio::test]
     async fn a_lane_fetch_under_main_tree_include_grants_is_refused_by_name() {
-        use cowshed_os::fork_lock::Run as _;
         let store = crate::temp_root::FixtureStore::new();
         let store_root = store.shared();
         let scratch = crate::temp_root::TempRoot::new("cowshed-lane-include");
@@ -25185,7 +25195,7 @@ mod git_worktree_tests {
                     "user.email=test@example.invalid",
                 ])
                 .args(args)
-                .status_locked()
+                .status_bounded()
                 .expect("run git");
             assert!(status.success(), "git {args:?}");
         };
@@ -27473,6 +27483,7 @@ mod terminal_project_cleanup_tests {
         require_terminal_storage,
     };
     use crate::repository::{BoundIdentity, ProjectPaths, RepoId, RepositoryBinding};
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     fn root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -28105,7 +28116,6 @@ mod terminal_project_cleanup_tests {
             published_directory_trash,
         };
         use crate::storage::recovery_image::recover;
-        use cowshed_os::fork_lock::Run as _;
         use std::ffi::OsStr;
 
         fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -28253,7 +28263,7 @@ import("./compile-cache-lib.mjs").then((lib) => {
             for (name, entry) in &child {
                 command.env(name, entry);
             }
-            let output = command.output_locked().expect("run child runtime");
+            let output = command.output_bounded().expect("run child runtime");
             assert!(output.status.success(), "{}: {output:?}", program.display());
             let stdout = String::from_utf8(output.stdout).expect("runtime output");
             let reported = std::path::PathBuf::from(stdout.lines().next().expect("cache dir"));

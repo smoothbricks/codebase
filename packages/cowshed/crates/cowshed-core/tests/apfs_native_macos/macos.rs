@@ -1,3 +1,4 @@
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 use std::fs::{FileTimes, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1506,7 +1507,6 @@ fn malformed_session_sidecar_is_not_treated_as_a_missing_sidecar_orphan() {
 /// image's volume is mounted at its workspace mount point, another is attached without a mount.
 #[test]
 fn real_apfs_gc_reports_item_local_deferrals_and_reclaims_later_session_images() {
-    use std::os::fd::AsRawFd;
     let fixture = RealFixture::new("gc-session-deferrals");
     let layout = fixture.layout();
     std::fs::create_dir_all(&layout.project().sessions).expect("sessions directory");
@@ -1526,11 +1526,9 @@ fn real_apfs_gc_reports_item_local_deferrals_and_reclaims_later_session_images()
         .write(true)
         .open(locked_paths.lock())
         .expect("workspace lifecycle lock");
-    assert_eq!(
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0,
-        "hold the workspace lifecycle lock"
-    );
+    lock_file
+        .try_lock()
+        .expect("hold the workspace lifecycle lock");
 
     use std::os::unix::fs::symlink;
     let symlink_image = layout.project().sessions.join("y-symlink.sparseimage");
@@ -1558,7 +1556,7 @@ fn real_apfs_gc_reports_item_local_deferrals_and_reclaims_later_session_images()
         .stdout(Stdio::null())
         .spawn_locked()
         .expect("git init")
-        .wait()
+        .wait_bounded()
         .expect("wait for git init");
     assert!(status.success(), "git init the project checkout");
     let orphan_mountpoint = layout.project().mount_root.join("stray");
@@ -4514,7 +4512,6 @@ fn an_imageless_sibling_publication_is_reconciled_instead_of_failing_every_other
 #[test]
 fn a_workspace_release_is_reconciled_by_recovery_and_finished_by_the_next_deleter_pass() {
     use cowshed_core::storage::apfs::release::{DELETING_DIRECTORY, Opened, Release, StepExtents};
-    use cowshed_os::fork_lock::Run as _;
     use std::os::unix::fs::FileExt;
 
     let fixture = Fixture::new("release-journal-recovery");
@@ -4547,7 +4544,7 @@ fn a_workspace_release_is_reconciled_by_recovery_and_finished_by_the_next_delete
             .arg("-c")
             .arg(canonical.image())
             .arg(&holder)
-            .status_locked()
+            .status_bounded()
             .expect("cp -c")
             .success()
     );
@@ -6479,7 +6476,7 @@ fn independent_hosts_and_processes_serialize_and_crash_releases_the_lock() {
             "another process must own the lock"
         );
         std::fs::write(&release, b"release").expect("release helper");
-        let status = child.wait().expect("wait for helper");
+        let status = child.wait_bounded().expect("wait for helper");
         assert_eq!(status.success(), !crash);
         drop(
             first

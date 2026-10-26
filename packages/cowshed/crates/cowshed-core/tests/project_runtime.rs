@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+use cowshed_os::test_backstop::{
+    AsyncChildBackstop as _, ChildBackstop as _, CommandBackstop as _,
+};
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -2832,13 +2836,12 @@ struct DrainFixture {
 impl DrainFixture {
     async fn start(name: &str) -> Self {
         use cowshed_core::runtime::supervisor_socket;
-        use cowshed_os::fork_lock::Run as _;
         let root = test_root();
         let supervisor = system_supervisor(&root);
         assert!(
             std::process::Command::new("/usr/bin/mkfifo")
                 .arg(root.join("workspace").join("drain-gate"))
-                .status_locked()
+                .status_bounded()
                 .expect("create the gate FIFO")
                 .success()
         );
@@ -2882,7 +2885,7 @@ impl DrainFixture {
         }
         panic!(
             "the requester ended without admitting a job: {:?}",
-            child.wait().await
+            child.wait_bounded().await
         );
     }
 
@@ -3018,7 +3021,7 @@ async fn host_controller_a_drain_owes_no_end_to_a_requester_that_exited() {
     drop(requester.stdin.take());
     assert!(
         requester
-            .wait()
+            .wait_bounded()
             .await
             .expect("the requester exits")
             .success()
@@ -3072,7 +3075,7 @@ async fn host_controller_a_drain_ends_a_resident_whose_requester_exited() {
     drop(requester.stdin.take());
     assert!(
         requester
-            .wait()
+            .wait_bounded()
             .await
             .expect("the requester exits")
             .success()
@@ -3549,10 +3552,9 @@ async fn host_controller_a_real_child_s_tail_ends_at_its_journal_end_and_resumes
     let root = test_root();
     let jobs = SupervisedJobs::connect(&root, system_supervisor(&root)).await;
     let gate = root.join("workspace").join("gate");
-    use cowshed_os::fork_lock::Run as _;
     let made = std::process::Command::new("/usr/bin/mkfifo")
         .arg(&gate)
-        .status_locked()
+        .status_bounded()
         .expect("run mkfifo");
     assert!(made.success(), "mkfifo {}", gate.display());
     let job = jobs
@@ -3730,12 +3732,11 @@ async fn listening_job(
     workspace: &Path,
     worker: &cowshed_core::api::WorkspaceHandle,
 ) -> ListeningJob {
-    use cowshed_os::fork_lock::Run as _;
     std::fs::write(workspace.join("listen.pl"), LISTENER).expect("the listener program");
     let gate = workspace.join("gate");
     let made = std::process::Command::new("/usr/bin/mkfifo")
         .arg(&gate)
-        .status_locked()
+        .status_bounded()
         .expect("run mkfifo");
     assert!(made.success(), "mkfifo {}", gate.display());
     let job = exec_in(
@@ -3881,7 +3882,7 @@ async fn napi_job_read<T: serde::de::DeserializeOwned>(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn_locked()?
-            .wait_with_output()
+            .wait_with_output_bounded()
     })
     .await
     .expect("node task")
@@ -3906,7 +3907,6 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     use cowshed_core::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverage};
     use cowshed_core::api::resources::SampleInterval;
     use cowshed_core::runtime::{process_spans, supervisor_socket};
-    use cowshed_os::fork_lock::Run as _;
 
     let root = test_root();
     let mut config = supervisor_config(&root);
@@ -3935,7 +3935,7 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
         assert!(
             std::process::Command::new("/usr/bin/mkfifo")
                 .arg(gate)
-                .status_locked()
+                .status_bounded()
                 .expect("create the fixture FIFO")
                 .success()
         );
@@ -4252,7 +4252,6 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
     use cowshed_core::api::process::{JobProcessEvent, ProcessCoverage, ProcessCoverageGap};
     use cowshed_core::api::resources::JobAccounting;
     use cowshed_core::runtime::supervisor_socket;
-    use cowshed_os::fork_lock::Run as _;
 
     let root = test_root();
     let mut config = supervisor_config(&root);
@@ -4278,7 +4277,7 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
     assert!(
         std::process::Command::new("/usr/bin/mkfifo")
             .arg(&gate)
-            .status_locked()
+            .status_bounded()
             .expect("create the birth FIFO")
             .success()
     );
@@ -4796,21 +4795,9 @@ async fn resource_reads_refuse_unowned_then_observe_and_keep_the_sealed_sample()
     })
     .await
     .expect("release task");
-    // SAFETY: valid writable siginfo storage; wait for our child without reaping its identity.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    assert_eq!(
-        unsafe {
-            libc::waitid(
-                libc::P_PID,
-                leader,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        },
-        0,
-        "waitid: {}",
-        std::io::Error::last_os_error()
-    );
+    // Wait for our child without reaping its identity.
+    cowshed_os::test_backstop::waitid(libc::P_PID, leader, libc::WEXITED | libc::WNOWAIT)
+        .expect("waitid");
     end(&job, &events).await;
     let (sealed, _) = jobs.worker.sealed(job.id()).await.expect("sealed record");
     let terminal = job.resources().await.expect("the frozen resource sample");
@@ -4819,7 +4806,7 @@ async fn resource_reads_refuse_unowned_then_observe_and_keep_the_sealed_sample()
         (terminal.leader_pid, terminal.members.as_slice()),
         (leader, &[][..])
     );
-    assert!(child.wait().expect("reap the child").success());
+    assert!(child.wait_bounded().expect("reap the child").success());
     assert_eq!(
         job.resources().await.expect("the same sample after reap"),
         terminal,
@@ -4919,21 +4906,11 @@ async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_onc
     .expect("release task");
     // The leader stays unreaped until the job concludes, as a real parent holds it, so the
     // terminal sample can still read its rusage.
-    // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: waiting for the test's own child without reaping it.
-    let waited = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            leader,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT,
-        )
-    };
-    assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+    cowshed_os::test_backstop::waitid(libc::P_PID, leader, libc::WEXITED | libc::WNOWAIT)
+        .expect("waitid");
     end(&job, &process).await;
     let (sealed, _) = jobs.worker.sealed(job.id()).await.expect("sealed record");
-    assert!(child.wait().expect("reap the child").success());
+    assert!(child.wait_bounded().expect("reap the child").success());
     let sealed = sealed.resources.expect("a sealed terminal sample");
 
     let mut after = Vec::new();
@@ -4965,7 +4942,6 @@ async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_onc
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe_bytes() {
-    use cowshed_os::fork_lock::Run as _;
     use std::io::Write as _;
     use std::task::Poll;
 
@@ -4979,7 +4955,7 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
     for name in ["read-gate", "finish-gate"] {
         let made = std::process::Command::new("/usr/bin/mkfifo")
             .arg(workspace.join(name))
-            .status_locked()
+            .status_bounded()
             .expect("run mkfifo");
         assert!(made.success(), "mkfifo {name}");
     }
@@ -5132,7 +5108,6 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
-    use cowshed_os::fork_lock::Run as _;
     use std::io::Write as _;
     use std::task::Poll;
 
@@ -5142,7 +5117,7 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
     let gate = root.join("workspace").join("read-gate");
     let made = std::process::Command::new("/usr/bin/mkfifo")
         .arg(&gate)
-        .status_locked()
+        .status_bounded()
         .expect("mkfifo");
     assert!(made.success());
     let job = jobs

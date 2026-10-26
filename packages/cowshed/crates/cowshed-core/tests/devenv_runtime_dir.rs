@@ -6,6 +6,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::ErrorKind;
@@ -30,7 +31,6 @@ use cowshed_core::storage::job_artifact::StreamKind;
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_core::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV};
 use cowshed_gateway_types::WorkspaceToken;
-use cowshed_os::fork_lock::Run as _;
 
 #[path = "support/nx_reads.rs"]
 mod nx_dependencies;
@@ -1563,7 +1563,7 @@ async fn host_controller_cargo_discovery_asks_the_toolchain_the_dev_environment_
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(&mount)
-            .output_locked()
+            .output_bounded()
             .expect("git");
         assert!(
             output.status.success(),
@@ -2294,7 +2294,7 @@ async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_cach
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(mount)
-            .output_locked()
+            .output_bounded()
             .expect("track nested module");
         assert!(
             output.status.success(),
@@ -2331,7 +2331,7 @@ async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_cach
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(&dependency)
-            .output_locked()
+            .output_bounded()
             .expect("prepare git dependency");
         assert!(
             output.status.success(),
@@ -2358,7 +2358,7 @@ async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_cach
     let packed = std::process::Command::new("/usr/bin/tar")
         .args(["-czf", "dependency.tgz", "package"])
         .current_dir(mount)
-        .output_locked()
+        .output_bounded()
         .expect("pack Bun dependency");
     assert!(
         packed.status.success(),
@@ -2382,7 +2382,7 @@ async fn host_controller_nested_go_cargo_fetch_and_bun_install_write_shared_cach
         .current_dir(mount)
         .env("HOME", &sandbox.home)
         .env("BUN_INSTALL_CACHE_DIR", root.join("lockfile-cache"))
-        .output_locked()
+        .output_bounded()
         .expect("resolve Bun lockfile");
     assert!(
         locked.status.success(),

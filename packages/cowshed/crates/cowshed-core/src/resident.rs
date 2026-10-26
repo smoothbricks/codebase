@@ -431,6 +431,7 @@ mod tests {
     use crate::storage::recovery::{
         LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
     };
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::os::unix::fs::PermissionsExt as _;
 
     const RETIRED_SESSIONS: usize = 1000;
@@ -760,11 +761,10 @@ mod tests {
             BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
             link,
         };
-        use cowshed_os::fork_lock::Run as _;
         let checkout = &store.raven_mount;
         let init = crate::git::git_command_at(checkout)
             .args(["init", "--quiet"])
-            .output_locked()
+            .output_bounded()
             .expect("git init");
         assert!(init.status.success(), "git init: {init:?}");
         let layout = BuildVolumeLayout::new(store.layout.project()).expect("build layout");

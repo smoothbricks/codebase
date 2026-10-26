@@ -7,6 +7,7 @@
 //! author flags or `GIT_AUTHOR_*` / `GIT_COMMITTER_*` overrides. The recorded author and committer
 //! come from `git log`, not from echoing config.
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cowshed_core::git::{
     GitRepository, WORKSPACE_GIT_IDENTITY_CONFIG_PATH, workspace_git_identity_config,
 };
-use cowshed_os::fork_lock::Run as _;
 
 const INCLUDED_NAME: &str = "Included Identity";
 const INCLUDED_EMAIL: &str = "included@example.invalid";
@@ -157,7 +157,7 @@ where
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0");
-    command.output_locked().expect("run git")
+    command.output_bounded().expect("run git")
 }
 
 #[derive(Clone, Copy)]

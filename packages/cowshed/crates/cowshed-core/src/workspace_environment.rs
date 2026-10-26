@@ -327,6 +327,7 @@ fn write_shell_quoted(contents: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     #[test]
     fn workspace_env_var_names_are_the_sandbox_contract() {
@@ -391,8 +392,6 @@ mod tests {
 
     #[test]
     fn published_environment_strips_harness_ci_but_preserves_real_ci_and_compiler_identity() {
-        use cowshed_os::fork_lock::Run;
-
         /// Removes the fixture root however the test ends, a failed assertion included.
         struct Root(std::path::PathBuf);
         impl Drop for Root {
@@ -459,7 +458,7 @@ mod tests {
             if let Some(marker) = marker {
                 command.env("GITHUB_ACTIONS", marker);
             }
-            let output = command.output_locked().unwrap();
+            let output = command.output_bounded().unwrap();
             assert!(output.status.success());
             let ci = if marker == Some("true") {
                 "true"
@@ -483,7 +482,6 @@ mod tests {
     /// leaves the variable alone.
     #[test]
     fn a_cargo_projects_published_environment_records_each_unit_use() {
-        use cowshed_os::fork_lock::Run as _;
         let root =
             std::env::temp_dir().join(format!("cowshed-mtime-on-use-{}", uuid::Uuid::new_v4()));
         let mount = root.join("workspace");
@@ -518,7 +516,7 @@ mod tests {
                 .arg(mount.join(WORKSPACE_ENVIRONMENT_PATH))
                 .env_clear()
                 .env(crate::capabilities::cargo::MTIME_ON_USE_ENV, "false")
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(output.status.success(), "{label}: {output:?}");
             assert_eq!(
@@ -532,7 +530,6 @@ mod tests {
 
     #[test]
     fn served_cargo_path_uses_host_identity_after_home_is_rebound() {
-        use cowshed_os::fork_lock::Run as _;
         let root = std::env::temp_dir().join(format!("cowshed-host-path-{}", uuid::Uuid::new_v4()));
         let mount = root.join("workspace");
         let home = root.join("host's home $literal");
@@ -559,7 +556,7 @@ mod tests {
             .env_clear()
             .env("HOME", &private_home)
             .env("PATH", "/toolchain/bin:/usr/bin:/bin")
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(
@@ -581,7 +578,7 @@ mod tests {
             ])
             .arg(mount.join(WORKSPACE_ENVIRONMENT_PATH))
             .env("COWSHED_RUNTIME_LINK", "/tmp/stale-sibling")
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, b"unset");
@@ -590,7 +587,6 @@ mod tests {
 
     #[test]
     fn host_capability_values_are_shell_quoted_and_defaults_preserve_overrides() {
-        use cowshed_os::fork_lock::Run;
         let root =
             std::env::temp_dir().join(format!("cowshed-env-values-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".cowshed")).unwrap();
@@ -627,7 +623,7 @@ mod tests {
             if let Some(value) = override_value {
                 command.env("NX_MAX_CACHE_SIZE", value);
             }
-            let output = command.output_locked().unwrap();
+            let output = command.output_bounded().unwrap();
             assert!(output.status.success());
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
@@ -650,8 +646,6 @@ mod tests {
     /// cache at all. Foreign files in every cache the run could have touched survive.
     #[test]
     fn host_shells_compile_into_the_receiving_workspaces_private_cache() {
-        use cowshed_os::fork_lock::Run as _;
-
         /// Removes the fixture root however the test ends, a failed assertion included.
         struct Root(std::path::PathBuf);
         impl Drop for Root {
@@ -762,7 +756,7 @@ mod tests {
                 .env("TMPDIR", root.join("machine tmp"))
                 .env("XDG_CACHE_HOME", xdg_cache_home)
                 .env(NODE_COMPILE_CACHE_ENV, &caller_cache);
-            let output = command.output_locked().unwrap();
+            let output = command.output_bounded().unwrap();
             assert!(
                 output.status.success(),
                 "{} {}: {output:?}",

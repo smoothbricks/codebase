@@ -17,7 +17,6 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use super::cache::{SharedLayout, SharedToolHome};
@@ -171,13 +170,10 @@ pub fn try_lock_caches(cargo_home: &Path) -> io::Result<Option<CacheLock>> {
                 .truncate(false)
                 .open(cargo_home.join(name))?,
         );
-        // SAFETY: the descriptor is owned by `file`, which outlives the call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Ok(None);
-            }
-            return Err(error);
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
         }
         files.push(file);
     }

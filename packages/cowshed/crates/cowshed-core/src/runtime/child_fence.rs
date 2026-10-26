@@ -212,6 +212,8 @@ impl ChildFence {
         loop {
             let mut status = 0;
             // SAFETY: `pid` is this process's own child and `status` a valid out-pointer.
+            // WHY unbounded: `WNOHANG` returns at once.
+            #[allow(clippy::disallowed_methods)]
             let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
             if waited == self.pid {
                 let status = std::process::ExitStatus::from_raw(status);
@@ -339,6 +341,7 @@ fn exit_of(status: std::process::ExitStatus) -> Option<ExitStatus> {
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::io::Write as _;
 
     use proptest::prelude::*;
@@ -409,7 +412,7 @@ mod tests {
 
     impl Drop for Spawned {
         fn drop(&mut self) {
-            if let Err(error) = self.0.wait()
+            if let Err(error) = self.0.wait_bounded()
                 && error.raw_os_error() != Some(libc::ECHILD)
             {
                 cowshed_os::eprintln!("reap the test child {}: {error}", self.0.id());
@@ -475,7 +478,7 @@ mod tests {
                 ExitStatus::Exited { code: 7 }
             );
             prop_assert_eq!(fence.hold(), Hold::Reaped);
-            prop_assert_eq!(child.0.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+            prop_assert_eq!(child.0.wait_bounded().unwrap_err().raw_os_error(), Some(libc::ECHILD));
             let refused = matches!(fence.signal(0), Err(NotSignalled::Reaped { .. }));
             prop_assert!(refused, "no signal after the reap");
         });
@@ -518,9 +521,8 @@ mod tests {
         assert_ne!(own_group, pid);
         // The leader stops itself and its group; nothing it stopped is this process. A stop
         // report reaps nothing.
-        let mut status = 0;
-        // SAFETY: waits for this process's own fenced child to stop.
-        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        let (waited, status) = cowshed_os::test_backstop::waitpid(pid, libc::WUNTRACED)
+            .expect("wait for the leader's stop");
         assert_eq!(waited, pid);
         assert!(libc::WIFSTOPPED(status), "the leader stopped its group");
         fence
@@ -579,12 +581,9 @@ mod tests {
             .stdin(std::process::Stdio::null());
         let fence = ChildFence::spawn(leader).expect("spawn the leader");
         let id = libc::id_t::try_from(fence.pid()).expect("a pid");
-        // SAFETY: an all-zero `siginfo_t` is valid storage for the call to fill.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: waits for this process's own child to stop, leaving the report pending.
-        let stopped =
-            unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WSTOPPED | libc::WNOWAIT) };
-        assert_eq!(stopped, 0, "{}", io::Error::last_os_error());
+        // Waits for the leader's stop, leaving its report pending.
+        cowshed_os::test_backstop::waitid(libc::P_PID, id, libc::WSTOPPED | libc::WNOWAIT)
+            .expect("wait for the leader's stop");
         assert_eq!(
             job_groups::exit_unreaped(fence.pid()).expect("a stop is read without error"),
             None
@@ -628,7 +627,7 @@ mod tests {
                         cowshed_os::eprintln!("end owned signal-test group {pgid}: {error}");
                     }
                 }
-                if let Err(error) = self.0.wait()
+                if let Err(error) = self.0.wait_bounded()
                     && error.raw_os_error() != Some(libc::ECHILD)
                 {
                     cowshed_os::eprintln!("reap owned signal-test leader {pgid}: {error}");
@@ -728,7 +727,10 @@ mod tests {
         );
         let status = fence.wait().await.unwrap();
         // The fence, not std's handle, owns waitpid. A second reaper must find no child left.
-        assert_eq!(job.0.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(
+            job.0.wait_bounded().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
         done.store(true, Ordering::SeqCst);
         let outcomes = signaller.thread.take().unwrap().join().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
@@ -786,7 +788,10 @@ mod tests {
             .expect("the output ends with the descendant");
         assert!(rest.is_empty());
         fence.release().unwrap();
-        assert_eq!(job.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(
+            job.wait_bounded().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
         assert!(matches!(
             fence.signal(libc::SIGTERM),
             Err(NotSignalled::Reaped { .. })

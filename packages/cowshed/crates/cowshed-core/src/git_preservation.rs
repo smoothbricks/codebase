@@ -299,6 +299,9 @@ fn probe_with(
     for (key, value) in env {
         command.env(key, value);
     }
+    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors and
+    // prompts off (`git_command_at`): it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = command.output_locked().map_err(|error| {
         CowshedError::environment_missing(
             format!(
@@ -811,6 +814,7 @@ pub(crate) fn verify_copy(
 mod tests {
     use super::*;
     use crate::temp_root::TempRoot;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     struct Repository {
         scratch: TempRoot,
@@ -873,7 +877,7 @@ mod tests {
             let output = crate::git::git_command_at(&self.root)
                 .env("GIT_OPTIONAL_LOCKS", "0")
                 .args(args)
-                .output_locked()
+                .output_bounded()
                 .expect("run real git fixture command");
             assert!(
                 output.status.success(),
@@ -1573,7 +1577,7 @@ mod tests {
         // Ordinary Git runs the driver; the marker is what a probe run would leave behind.
         let ordinary = crate::git::git_command_at(&repository.root)
             .args(["hash-object", "--path=secret.txt", "secret.txt"])
-            .output_locked()
+            .output_bounded()
             .expect("run ordinary Git conversion");
         assert!(
             !ordinary.status.success(),
@@ -1586,7 +1590,7 @@ mod tests {
         crate::git::git_command_at(&repository.root)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(["status", "--porcelain=v2", "-z", "--ignore-submodules=none"])
-            .output_locked()
+            .output_bounded()
             .expect("run ordinary superproject status");
         assert!(
             marker.exists(),

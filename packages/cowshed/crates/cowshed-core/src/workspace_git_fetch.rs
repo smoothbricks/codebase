@@ -310,6 +310,8 @@ async fn collect_probe_output(
         .stderr
         .take()
         .expect("Git probe configured a stderr pipe");
+    // WHY unbounded: the 10 s timeout around it ends it.
+    #[allow(clippy::disallowed_methods)]
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::try_join!(
             read_probe_pipe(stdout),
@@ -328,7 +330,18 @@ async fn collect_probe_output(
         Ok(output) => Ok(output),
         Err(error) => {
             let killed = child.start_kill();
-            let reaped = child.wait().await;
+            let reaped = cowshed_os::deadline::reap_async(
+                "git discovery probe",
+                child,
+                &cowshed_os::deadline::start(
+                    "reap git discovery probe",
+                    cowshed_os::deadline::REAP,
+                ),
+                cowshed_os::deadline::Progress::Signalled {
+                    signal: libc::SIGKILL,
+                },
+            )
+            .await;
             match (killed, reaped) {
                 (Ok(()), Ok(_)) => Err(error),
                 (kill, reap) => Err(std::io::Error::other(format!(
@@ -463,9 +476,9 @@ pub async fn refresh_git_fetch_config(sandbox: &SandboxConfig) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
-    use cowshed_os::fork_lock::Run as _;
     use cowshed_os::fork_lock::Spawn as _;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     fn mapping(url: &str, path: &str) -> GitFetchMapping {
         GitFetchMapping {
@@ -719,7 +732,7 @@ mod tests {
             .env("PATH", "/usr/bin:/bin")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output_locked()
+            .output_bounded()
             .expect("git");
         assert!(
             output.status.success(),

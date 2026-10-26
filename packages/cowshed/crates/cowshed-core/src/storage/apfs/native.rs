@@ -7210,7 +7210,7 @@ pub(in crate::storage) fn clone_lineage_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     /// One journal/GC walk pins exact staging ownership, a stale pre-intent plan, completion,
     /// and retained-source bytes. It needs real Git evidence, not a disk-image setup or a mock.
@@ -7714,7 +7714,7 @@ mod tests {
             std::process::Command::new("git")
                 .args(["init", "-q"])
                 .arg(&checkout)
-                .status_locked()
+                .status_bounded()
                 .expect("git init")
                 .success()
         );
@@ -7752,7 +7752,7 @@ mod tests {
                     .arg("-C")
                     .arg(&checkout)
                     .args(args)
-                    .status_locked()
+                    .status_bounded()
                     .expect("git")
                     .success()
             );
@@ -7800,7 +7800,7 @@ mod tests {
             std::process::Command::new("git")
                 .args(["init", "-q"])
                 .arg(&checkout)
-                .status_locked()
+                .status_bounded()
                 .expect("git init")
                 .success()
         );

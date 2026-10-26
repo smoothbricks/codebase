@@ -1,3 +1,4 @@
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -405,7 +406,6 @@ fn a_retired_workspaces_read_only_compile_cache_is_reclaimed_with_its_temp_dir()
         EnvironmentMount, NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV,
         WORKSPACE_ENVIRONMENT_PATH, write_workspace_environment,
     };
-    use cowshed_os::fork_lock::Run as _;
 
     fn files_under(root: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -501,7 +501,7 @@ import("./compile-cache-lib.mjs").then((lib) => {
             .env("HOME", scratch.path())
             .env("XDG_CACHE_HOME", exec_temp.join("cache"))
             .env(NODE_COMPILE_CACHE_ENV, scratch.path().join("caller-cache"));
-        let output = command.output_locked().unwrap();
+        let output = command.output_bounded().unwrap();
         assert!(output.status.success(), "{}: {output:?}", program.display());
         let stdout = String::from_utf8(output.stdout).unwrap();
         let reported = PathBuf::from(stdout.lines().next().expect("cache dir"));
@@ -548,7 +548,6 @@ fn reclaiming_a_retained_image_removes_the_whole_exec_temp_tree() {
         EnvironmentMount, NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV,
         WORKSPACE_ENVIRONMENT_PATH, write_workspace_environment,
     };
-    use cowshed_os::fork_lock::Run as _;
 
     const COMPILE: &str = r#"const m = require("node:module");
 m.enableCompileCache();
@@ -609,7 +608,7 @@ import("./compile-cache-lib.mjs").then((lib) => {
         .env("HOME", scratch.path())
         .env("XDG_CACHE_HOME", exec_temp.join("cache"))
         .env(NODE_COMPILE_CACHE_ENV, scratch.path().join("caller-cache"));
-    let output = command.output_locked().unwrap();
+    let output = command.output_bounded().unwrap();
     assert!(output.status.success(), "bun: {output:?}");
     let owned = exec_temp.join("cache").join(NODE_COMPILE_CACHE_DIRECTORY);
     assert!(owned.is_dir(), "no read-only compile cache was written");

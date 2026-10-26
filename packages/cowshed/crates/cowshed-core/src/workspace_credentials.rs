@@ -538,6 +538,7 @@ fn invalid(kind: &'static str, path: &Path) -> WorkspaceCredentialError {
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use crate::workspace_environment::{
@@ -593,7 +594,6 @@ mod tests {
     /// Source the generated file with a controlled PATH and explicit inherited values;
     /// return child-observable stdout, never the file's wording.
     fn run_sourced(file: &Path, inherited: &[(&str, &str)], tail: &str) -> String {
-        use cowshed_os::fork_lock::Run as _;
         let mut command = std::process::Command::new("sh");
         command
             .env_clear()
@@ -603,7 +603,7 @@ mod tests {
         for (name, value) in inherited {
             command.env(name, value);
         }
-        let output = command.output_locked().expect("source environment");
+        let output = command.output_bounded().expect("source environment");
         assert!(output.status.success(), "{output:?}");
         String::from_utf8(output.stdout).expect("shell output")
     }

@@ -81,6 +81,7 @@ fn locks_in(target: &Path) -> io::Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
     use crate::capabilities::BuildStatePath;
+    use cowshed_os::test_backstop::FileBackstop as _;
 
     fn scratch(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -131,7 +132,7 @@ mod tests {
         let debug = lock_at(&root, "target/debug");
         let release = lock_at(&root, "target/release");
         let build = File::open(&release).unwrap();
-        build.lock_shared().unwrap();
+        build.lock_shared_bounded().unwrap();
         assert!(matches!(hold(&root, &state()).unwrap(), Err(lock) if lock == release));
         // The debug lock taken before the refusal was let go.
         let other = File::open(&debug).unwrap();

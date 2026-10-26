@@ -656,6 +656,9 @@ fn serving(
 const LOST_JOB_GRACE: Duration = Duration::from_secs(2);
 
 /// When a started supervisor ends: report how, and end any job it left running.
+// WHY unbounded: a detached task: nothing waits on it; it reports the supervisor's end whenever
+// that comes.
+#[allow(clippy::disallowed_methods)]
 fn watch_child(mut child: tokio::process::Child, socket: PathBuf) {
     let Some(pid) = child.id() else {
         return;
@@ -998,13 +1001,24 @@ fn same_build(request: &serde_json::Value) -> Result<()> {
     }))
 }
 
+/// Connect to the supervisor manager at `path` within the handshake bound: a manager that should
+/// already be running answers its connect at once, and one that never does is named.
+async fn connect_manager(path: &Path) -> io::Result<UnixStream> {
+    let budget = cowshed_os::deadline::start(
+        "supervisor manager connect",
+        cowshed_os::deadline::HANDSHAKE,
+    );
+    let peer = cowshed_os::deadline::Peer::unix("supervisor manager", path);
+    Ok(cowshed_os::deadline::connect_unix(&budget, &peer, path).await?)
+}
+
 /// Connect to the daemon socket at `path`. A refused connection while an install holds the slot
 /// in `support` is that install restarting the daemon: a positive signal, so the connection waits
 /// for the install and is made once more against the daemon it installed. Any other refusal is
 /// returned as it is (05_gateway.md, "A land step waits for an install in progress"). Measured
 /// 2026-10-20: a land step's connection made mid-restart was refused and failed the land.
 pub(crate) async fn connect_across_install(path: &Path, support: &Path) -> io::Result<UnixStream> {
-    let refused = match UnixStream::connect(path).await {
+    let refused = match connect_manager(path).await {
         Ok(stream) => return Ok(stream),
         Err(error) => error,
     };
@@ -1014,7 +1028,7 @@ pub(crate) async fn connect_across_install(path: &Path, support: &Path) -> io::R
             .await
             .map_err(io::Error::other)?;
     match waited {
-        Ok(true) => UnixStream::connect(path).await,
+        Ok(true) => connect_manager(path).await,
         Ok(false) => Err(refused),
         Err(error) => Err(io::Error::other(format!(
             "{refused}; and the install slot could not be read: {error}"
@@ -1090,7 +1104,7 @@ const SAME_BUILD_BOUND: Duration = Duration::from_secs(10);
 /// the verbs that need a daemon say so themselves.
 pub async fn require_same_build(store_root: &Path) -> Result<()> {
     let path = manager_socket_path(store_root);
-    let Ok(mut stream) = UnixStream::connect(&path).await else {
+    let Ok(mut stream) = connect_manager(&path).await else {
         return Ok(());
     };
     write_json(
@@ -1114,6 +1128,9 @@ pub async fn require_same_build(store_root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::{
+        AsyncChildBackstop as _, AsyncUnixStreamBackstop as _, FileBackstop as _,
+    };
     use std::io::Read as _;
     use std::os::fd::IntoRawFd as _;
     use tokio::net::UnixListener;
@@ -1197,7 +1214,7 @@ mod tests {
                     "the allowlisted report descriptor survives exec"
                 );
                 report.send(&reported).expect("send real startup report");
-                let mut control = UnixStream::connect(&socket)
+                let mut control = UnixStream::connect_bounded(&socket)
                     .await
                     .expect("connect to starter");
                 control
@@ -1237,7 +1254,7 @@ mod tests {
                 .write(true)
                 .open(&unrelated_path)
                 .expect("open unrelated descriptor");
-            unrelated.lock().expect("hold unrelated descriptor");
+            unrelated.lock_bounded().expect("hold unrelated descriptor");
             keep_across_exec(unrelated.as_raw_fd()).expect("make unrelated descriptor inheritable");
             let listener = UnixListener::bind(&socket).expect("starter control listener");
             let (report_read, report_write) = io::pipe().expect("startup report pipe");
@@ -1275,7 +1292,13 @@ mod tests {
                 "the live supervisor retained an arbitrary inheritable descriptor"
             );
             control.write_all(b"x").await.expect("release supervisor");
-            assert!(supervisor.wait().await.expect("reap supervisor").success());
+            assert!(
+                supervisor
+                    .wait_bounded()
+                    .await
+                    .expect("reap supervisor")
+                    .success()
+            );
             return;
         }
 
@@ -1309,7 +1332,13 @@ mod tests {
             .write_all(b"x")
             .await
             .expect("confirm parent released its copy");
-        assert!(starter.wait().await.expect("reap starter").success());
+        assert!(
+            starter
+                .wait_bounded()
+                .await
+                .expect("reap starter")
+                .success()
+        );
     }
 
     /// A daemon whose startup pass has finished.
@@ -1349,7 +1378,7 @@ mod tests {
             listener,
             SupervisorManager::new(&*store, Box::new(NoSpawner), healed()),
         ));
-        let mut stream = UnixStream::connect(&socket)
+        let mut stream = UnixStream::connect_bounded(&socket)
             .await
             .expect("reach the manager");
         write_json(
@@ -1409,7 +1438,7 @@ mod tests {
             .await
             .expect("the manager runs this build");
 
-        let mut stream = UnixStream::connect(&socket)
+        let mut stream = UnixStream::connect_bounded(&socket)
             .await
             .expect("reach the manager");
         write_json(
@@ -1680,7 +1709,7 @@ mod tests {
                 .kill_on_drop(true)
                 .spawn_locked()
                 .expect("start the supervisor of another build");
-        while UnixStream::connect(&socket).await.is_err() {
+        while UnixStream::connect_bounded(&socket).await.is_err() {
             if let Some(status) = supervisor.try_wait().expect("poll the supervisor") {
                 panic!("the supervisor of another build exited before serving: {status}");
             }
@@ -1711,10 +1740,17 @@ mod tests {
 
         assert_eq!(Some(stopped.pid), supervisor.id());
         assert_eq!(
-            supervisor.wait().await.expect("supervisor").signal(),
+            supervisor
+                .wait_bounded()
+                .await
+                .expect("supervisor")
+                .signal(),
             Some(libc::SIGTERM)
         );
-        assert_eq!(job.wait().await.expect("job").signal(), Some(libc::SIGTERM));
+        assert_eq!(
+            job.wait_bounded().await.expect("job").signal(),
+            Some(libc::SIGTERM)
+        );
         assert!(!ledger.exists(), "the ledger is taken");
         assert_eq!(stopped.socket.path(), socket);
         let held = std::fs::symlink_metadata(&socket)
@@ -1770,7 +1806,7 @@ mod tests {
                 .kill_on_drop(true)
                 .spawn_locked()
                 .expect("start the supervisor of another build");
-        while UnixStream::connect(&socket).await.is_err() {
+        while UnixStream::connect_bounded(&socket).await.is_err() {
             if let Some(status) = supervisor.try_wait().expect("poll the supervisor") {
                 panic!("the supervisor of another build exited before serving: {status}");
             }
@@ -1824,7 +1860,6 @@ mod tests {
     /// refused at once, waiting for nothing.
     #[tokio::test]
     async fn a_refused_daemon_connection_waits_for_a_running_install_only() {
-        use std::os::fd::AsRawFd as _;
         let root = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::scratch_parent(),
             "cowshed-across",
@@ -1840,11 +1875,7 @@ mod tests {
 
         let install = std::fs::File::create(support.join(crate::host_dirs::INSTALL_LOCK_NAME))
             .expect("the install's lock");
-        // SAFETY: a live descriptor.
-        assert_eq!(
-            unsafe { libc::flock(install.as_raw_fd(), libc::LOCK_EX) },
-            0
-        );
+        install.try_lock().expect("take the free install slot");
         let connecting = tokio::spawn({
             let (socket, support) = (socket.clone(), support.clone());
             async move { connect_across_install(&socket, &support).await }

@@ -107,6 +107,7 @@ impl Drop for ScratchRoot {
 mod tests {
     use super::*;
     use cowshed_os::fork_lock::Spawn as _;
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::io::BufRead;
     use std::process::{Command, Stdio};
 
@@ -173,9 +174,9 @@ mod tests {
         });
         let outside_running = other.try_wait().unwrap().is_none();
         other.kill().unwrap();
-        other.wait().unwrap();
+        other.wait_bounded().unwrap();
         assert!(failed.is_err());
-        assert!(!worker.wait().unwrap().success());
+        assert!(!worker.wait_bounded().unwrap().success());
         assert!(outside_running, "another root's worker must survive");
         assert!(!path.exists());
         assert!(

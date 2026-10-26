@@ -804,6 +804,8 @@ fn nx_parallel(caller: &BTreeMap<String, String>, tokens: usize) -> usize {
 #[cfg(test)]
 mod cpu_placement_tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::ChildBackstop as _;
 
     /// Only a start that activates a shell asks a resident's stake: a directory with no
     /// `.envrc` activates nothing, and a host that has activated waits ready.
@@ -1021,7 +1023,7 @@ mod cpu_placement_tests {
             .expect("a command to place");
         let placed = place_nice(child.id(), LOWEST_NICE);
         child.kill().expect("end the placed command");
-        child.wait().expect("reap the placed command");
+        child.wait_bounded().expect("reap the placed command");
         assert_eq!(
             placed.map_err(|failure| format!("{failure:?}")),
             Ok(LOWEST_NICE)
@@ -2129,6 +2131,11 @@ impl SandboxEnvironment {
 /// Controller-owned discovery asks a project's tools through this rather than through the
 /// pre-activation environment: a checkout whose toolchain comes from its dev environment has
 /// none on the bootstrap PATH, or a different one, and a job only ever meets the activated one.
+// WHY unbounded: debt: a project's own tool runs as a job (Cargo's metadata for discovery, which
+// reports its wait every WAIT_REPORT naming Cargo's lock holders; `nx daemon --stop` at a land);
+// the operator's interrupt ends it, and a tool that stalls stalls its caller. Moves to a bounded
+// async run once one exists beside cowshed_os::deadline::output_within.
+#[allow(clippy::disallowed_methods)]
 pub async fn run_as_job(
     sandbox: &SandboxConfig,
     cwd: &Path,
@@ -2848,7 +2855,20 @@ async fn spawn_fenced(
                 // SAFETY: this unreaped child leads its own group, made before its nice.
                 let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
                 let kill = (killed == -1).then(io::Error::last_os_error);
-                let waited = child.wait();
+                let waited = cowshed_os::deadline::reap(
+                    "command without a nice report",
+                    &mut child,
+                    &cowshed_os::deadline::start(
+                        "reap unobserved command",
+                        cowshed_os::deadline::REAP,
+                    ),
+                    cowshed_os::deadline::Progress::Signalled {
+                        signal: libc::SIGKILL,
+                    },
+                );
+                if waited.is_err() {
+                    cowshed_os::deadline::collect_later("command without a nice report", child);
+                }
                 return Err(CowshedError::internal(format!(
                     "the command started without a readable nice report ({report:?}); group \
                      kill {kill:?}; reap {waited:?}"
@@ -2982,7 +3002,20 @@ fn spawn_observed(
                 // SAFETY: this unreaped child leads its own group, established before the hold.
                 let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
                 let kill = (killed == -1).then(io::Error::last_os_error);
-                let waited = child.wait();
+                let waited = cowshed_os::deadline::reap(
+                    "held command",
+                    &mut child,
+                    &cowshed_os::deadline::start(
+                        "reap unobserved held command",
+                        cowshed_os::deadline::REAP,
+                    ),
+                    cowshed_os::deadline::Progress::Signalled {
+                        signal: libc::SIGKILL,
+                    },
+                );
+                if waited.is_err() {
+                    cowshed_os::deadline::collect_later("held command", child);
+                }
                 match placed {
                     Some(Err(failure)) => {
                         if kill.is_some() || waited.is_err() {
@@ -9164,7 +9197,7 @@ mod workspace_toolchain_tests {
     #[cfg(target_os = "macos")]
     use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
     #[cfg(target_os = "macos")]
-    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     // Only macOS tests build a sandbox; on the Linux cross lint the helper would be dead code.
     // The mount root is a sibling of the fixture's home and stores, as it is on a host: its deny
@@ -9672,8 +9705,7 @@ mod workspace_toolchain_tests {
             host.env_clear()
                 .args(["-c", ". \"$1\"; env", "host"])
                 .arg(mount.join(".cowshed/env"));
-            let output = cowshed_os::fork_lock::Run::output_locked(&mut host)
-                .expect("source host environment");
+            let output = host.output_bounded().expect("source host environment");
             assert!(output.status.success());
             let text = String::from_utf8(output.stdout).unwrap();
             for name in crate::capabilities::sccache::HOST_ENVIRONMENT
@@ -9867,7 +9899,7 @@ mod workspace_toolchain_tests {
                 ])
                 .env_clear()
                 .envs(environment.iter().copied())
-                .env(ENVIRONMENT_PROBE, &mount).output_locked()
+                .env(ENVIRONMENT_PROBE, &mount).output_bounded()
                 .expect("run the environment probe");
             assert!(
                 output.status.success(),
@@ -10443,7 +10475,7 @@ import("./compile-cache-lib.mjs").then((lib) => {
                 for (name, entry) in &child {
                     command.env(name, entry);
                 }
-                let output = command.output_locked().expect("run child runtime");
+                let output = command.output_bounded().expect("run child runtime");
                 assert!(
                     output.status.success(),
                     "{label} {}: {output:?}",
@@ -10950,7 +10982,7 @@ mod lifecycle_commitment_tests {
 #[cfg(test)]
 mod sandbox_environment_tests {
     use super::*;
-    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     fn scratch(label: &str) -> PathBuf {
         let root =
@@ -11171,7 +11203,7 @@ mod sandbox_environment_tests {
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .envs(environment)
-                .output_locked()
+                .output_bounded()
                 .expect("git config")
         };
         let control = run(injected
@@ -11529,6 +11561,7 @@ mod admission_environment_commitment_tests {
 #[cfg(test)]
 mod install_observation_tests {
     use super::*;
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -11612,7 +11645,6 @@ mod install_observation_tests {
     fn captured_checkout(
         scratch: &Path,
     ) -> (PathBuf, PathBuf, crate::developer_links::DeveloperLinks) {
-        use cowshed_os::fork_lock::Run as _;
         let root = scratch.join("checkout");
         fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
         fs::write(root.join("package.json"), "{}\n").unwrap();
@@ -11620,7 +11652,7 @@ mod install_observation_tests {
             std::process::Command::new("git")
                 .args(["init", "--quiet"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );
@@ -11628,7 +11660,7 @@ mod install_observation_tests {
             std::process::Command::new("git")
                 .args(["add", "package.json"])
                 .current_dir(&root)
-                .status_locked()
+                .status_bounded()
                 .unwrap()
                 .success()
         );

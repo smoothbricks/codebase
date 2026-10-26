@@ -356,16 +356,13 @@ fn refused(answer: JobserverAnswer) -> CowshedError {
     })
 }
 
-/// Connect to the gateway's control socket under the process fork fence. Darwin creates a socket
-/// then sets CLOEXEC: each poll is fenced, never an async wait, so no concurrently spawned child
-/// can keep the descriptor beyond exec.
+/// Connect to the gateway's control socket within the handshake bound (deadline::connect_unix):
+/// each poll is fenced, so no concurrently spawned child keeps the descriptor beyond exec. A
+/// socket that does not exist keeps its `NotFound`, the absent gateway's kind.
 async fn connect(socket: &Path) -> std::io::Result<UnixStream> {
-    let mut connect = std::pin::pin!(UnixStream::connect(socket));
-    std::future::poll_fn(|cx| {
-        cowshed_os::fork_lock::create(|| Ok(connect.as_mut().poll(cx)))
-            .expect("polling the connection runs an infallible closure")
-    })
-    .await
+    let budget = cowshed_os::deadline::start("gateway connect", cowshed_os::deadline::HANDSHAKE);
+    let peer = cowshed_os::deadline::Peer::unix("gateway", socket);
+    Ok(cowshed_os::deadline::connect_unix(&budget, &peer, socket).await?)
 }
 
 /// Connect to the gateway at `socket`, write `line`, and read its `queued` then `granted` or

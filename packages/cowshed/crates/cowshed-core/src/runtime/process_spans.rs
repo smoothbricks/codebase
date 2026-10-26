@@ -1037,6 +1037,8 @@ fn dictionary_entry(values: &ArrayRef, key: usize) -> Result<String, ProcessSpan
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use std::sync::Arc;
@@ -1827,7 +1829,7 @@ mod tests {
         while observer.fold().nodes().any(|node| node.exit.is_none()) {
             let _ = observer.wait();
         }
-        let _ = child.wait();
+        let _ = child.wait_bounded();
         let mut exit_rows = Vec::new();
         for (index, identity, parent, _) in &births {
             let row_index = usize::try_from(*index).expect("a process index");

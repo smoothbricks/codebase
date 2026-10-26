@@ -331,7 +331,20 @@ impl ProcessMonitor {
                 ))),
                 (observed, Ok(mut child)) => {
                     let killed = child.kill();
-                    let waited = child.wait();
+                    let waited = cowshed_os::deadline::reap(
+                        "activation root",
+                        &mut child,
+                        &cowshed_os::deadline::start(
+                            "reap unfenced activation root",
+                            cowshed_os::deadline::REAP,
+                        ),
+                        cowshed_os::deadline::Progress::Signalled {
+                            signal: libc::SIGKILL,
+                        },
+                    );
+                    if waited.is_err() {
+                        cowshed_os::deadline::collect_later("activation root", child);
+                    }
                     Err(io::Error::other(format!(
                         "activation started without its observation fence: {observed:?}; kill: {killed:?}; reap: {waited:?}"
                     )))
@@ -1270,6 +1283,7 @@ mod tests {
     use super::*;
     use crate::api::dto::{CommandArg, JobId, UtcTimestamp};
     use crate::api::process::JobProcessSample;
+    use cowshed_os::test_backstop::ChildBackstop as _;
 
     #[test]
     fn a_spare_activation_root_is_watched_and_retired_without_a_job() {
@@ -1304,7 +1318,7 @@ mod tests {
                 .iter()
                 .any(|process| process.pid == root.pid)
         );
-        assert!(!child.wait().unwrap().success());
+        assert!(!child.wait_bounded().unwrap().success());
         assert!(monitor.running_lives().is_empty());
     }
     use crate::api::process::ProcessCoverage;
@@ -1334,7 +1348,7 @@ mod tests {
                 }
             }
             if let Some(leader) = &mut self.leader
-                && let Err(error) = leader.wait()
+                && let Err(error) = leader.wait_bounded()
             {
                 cowshed_os::eprintln!("cannot reap subtree fixture leader {}: {error}", self.pid);
             }
@@ -1936,7 +1950,7 @@ os._exit(0)
         // The leader's exit was folded before anything was signalled: it gets no receipt.
         assert!(tree.processes[0].exit.is_some());
         assert_eq!(monitor.retire(birth, grace).unwrap(), proof);
-        assert!(leader.wait().unwrap().success());
+        assert!(leader.wait_bounded().unwrap().success());
     }
 
     #[test]
@@ -2039,7 +2053,7 @@ os._exit(0)
         monitor.watch(pid).unwrap();
         let own = native_life(pid);
         drop(child.stdin.take());
-        assert!(child.wait().unwrap().success());
+        assert!(child.wait_bounded().unwrap().success());
         monitor.finish().unwrap();
 
         assert_eq!(

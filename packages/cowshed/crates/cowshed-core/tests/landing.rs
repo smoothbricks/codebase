@@ -10,6 +10,7 @@
 //! alternates path load-bearing rather than decorative, and
 //! [`alternate_object_store_is_what_makes_the_comparison_possible`] pins it.
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,6 @@ use cowshed_core::api::{
 };
 use cowshed_core::landing::{annotate_listing, measure, resolve_target, unmatched_commits};
 use cowshed_core::repository::RepoId;
-use cowshed_os::fork_lock::Run as _;
 
 #[path = "support/temp_parent.rs"]
 mod temp_parent;
@@ -120,7 +120,7 @@ where
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -147,7 +147,7 @@ fn commit(root: impl AsRef<Path>, message: &str) {
         .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("run git commit");
     assert!(
         output.status.success(),
@@ -288,7 +288,7 @@ async fn content_that_reached_the_target_by_squash_or_rewrite_is_landed_without_
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             fixture.parent().join(".git/objects"),
         )
-        .output_locked()
+        .output_bounded()
         .expect("run merge-base");
     assert_eq!(
         ancestry.status.code(),
@@ -463,7 +463,7 @@ async fn an_empty_commit_carries_no_content_and_is_landed() {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("run git commit");
     assert!(output.status.success(), "empty commit");
 
@@ -514,7 +514,7 @@ fn pick_resolving(fixture: &Fixture, mount: &Path, oid: &str, file: &str, resolu
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("run git cherry-pick");
     assert!(!pick.status.success(), "the fixture depends on a conflict");
     fixture.write_parent(file, resolution);
@@ -808,7 +808,7 @@ async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_fi
         .args(["rebase", "FETCH_HEAD"])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("run git rebase");
     assert!(
         !rebase.status.success(),
@@ -826,7 +826,7 @@ async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_fi
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("run git rebase --continue");
     assert!(
         resolved.status.success(),
@@ -946,7 +946,7 @@ async fn alternate_object_store_is_what_makes_the_comparison_possible() {
         .arg("-C")
         .arg(&mount)
         .args(["cat-file", "-e", &tip])
-        .output_locked()
+        .output_bounded()
         .expect("run cat-file");
     assert!(
         !visible.status.success(),

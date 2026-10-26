@@ -1046,9 +1046,9 @@ mod tests {
             unsafe { libc::_exit(if placed && lowered { 0 } else { 1 }) }
         }
         drop((placed_write, lowered_write));
-        let mut status = 0;
-        // SAFETY: reaps the child forked above.
-        assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+        let (reaped, status) =
+            cowshed_os::test_backstop::waitpid(pid, 0).expect("reap the child forked above");
+        assert_eq!(reaped, pid);
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "the child placed itself at 10 and could not return to 0 (status {status})"

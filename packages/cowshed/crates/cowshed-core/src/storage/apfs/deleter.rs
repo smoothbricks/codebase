@@ -58,6 +58,10 @@ fn send(socket: &Path, entry: &Path, record: ReleaseRecord) -> io::Result<()> {
     let mut line =
         serde_json::to_vec(&ReleasedRequest::new(entry, record)).map_err(io::Error::other)?;
     line.push(b'\n');
+    // WHY unbounded: Darwin answers a unix connect in the call, refused when nothing listens or the
+    // queue is full, never parked (APFS images are released on macOS only); the exchange after it
+    // is bounded by ANSWER_WITHIN.
+    #[allow(clippy::disallowed_methods)]
     let stream = cowshed_os::fork_lock::Fenced::create(|| UnixStream::connect(socket))?;
     let mut connection: &UnixStream = &stream;
     connection.set_read_timeout(Some(ANSWER_WITHIN))?;

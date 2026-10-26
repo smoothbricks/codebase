@@ -716,6 +716,7 @@ fn storage_io(pid: libc::pid_t) -> io::Result<Option<ProcessStorageIo>> {
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -1213,7 +1214,7 @@ mod tests {
                     .stdout(Stdio::inherit())
                     .spawn_locked()
                     .expect("spawn the burner");
-                let status = burner.wait().expect("reap the burner");
+                let status = burner.wait_bounded().expect("reap the burner");
                 assert!(status.success(), "burner: {status}");
                 let children = rusage_us(libc::RUSAGE_CHILDREN);
                 writeln!(out, "{MARK} reaped {children}").expect("report");
@@ -1552,7 +1553,7 @@ mod tests {
         );
 
         drop(release);
-        let status = parent.wait().expect("reap the parent");
+        let status = parent.wait_bounded().expect("reap the parent");
         assert!(status.success(), "parent: {status}");
     }
 
@@ -1612,7 +1613,7 @@ mod tests {
         let pid = libc::pid_t::try_from(parent.id()).expect("pid");
         let ticks = rusage_ticks(pid).expect("read").expect("still held");
         let before = rusage_us(libc::RUSAGE_CHILDREN);
-        assert!(parent.wait().expect("reap the parent").success());
+        assert!(parent.wait_bounded().expect("reap the parent").success());
         let charged = rusage_us(libc::RUSAGE_CHILDREN) - before;
 
         // xnu snapshots an exiting process's rusage_info as its exit begins (`proc_prepareexit`),
@@ -1671,12 +1672,8 @@ mod tests {
     /// Wait for `child` to exit without reaping it.
     fn wait_unreaped(child: &std::process::Child) {
         let id = libc::id_t::try_from(child.id()).expect("pid");
-        // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: waiting for our own child without reaping it.
-        let waited =
-            unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
-        assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+        cowshed_os::test_backstop::waitid(libc::P_PID, id, libc::WEXITED | libc::WNOWAIT)
+            .expect("waitid");
     }
 
     /// An anchored life is read to its end: exited and unreaped, its final counters are still
@@ -1697,7 +1694,7 @@ mod tests {
         })
         .expect("its exit");
         assert_eq!(fold.gap(), None, "its final counters were read");
-        child.wait().expect("reap");
+        child.wait_bounded().expect("reap");
         assert_eq!(tick(&mut fold, &life), Sampled::Gone);
     }
 
@@ -1716,7 +1713,7 @@ mod tests {
             assert_eq!(tick(&mut fold, &life), Sampled::Unproven);
             assert_eq!(fold.usage(life.identity), None);
         }
-        child.wait().expect("reap");
+        child.wait_bounded().expect("reap");
     }
 
     /// A life reaped before its first read has no usage: never zeroes.
@@ -1725,7 +1722,7 @@ mod tests {
         let (mut child, stdin) = held_shell();
         let life = observed(child.id());
         exit_unreaped(&child, stdin);
-        child.wait().expect("reap");
+        child.wait_bounded().expect("reap");
         let pid = libc::pid_t::try_from(life.identity.pid).expect("pid");
         assert_eq!(
             own_counters(pid).expect("a reaped pid's read"),
@@ -1830,7 +1827,7 @@ mod tests {
         fn finish(mut self) {
             self.release.write_all(b"xx").expect("release");
             drop(self.release);
-            let status = self.child.wait().expect("reap");
+            let status = self.child.wait_bounded().expect("reap");
             assert!(status.success(), "allocator: {status}");
         }
     }

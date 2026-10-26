@@ -1,3 +1,4 @@
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use cowshed_core::storage::recovery::{
     IntentLease, IntentLeases, KeptAbandonBundles, LIFECYCLE_INTENTS_FILE, LifecycleIntent,
     LifecycleIntentCompletion, LifecycleIntentJournal, LifecycleIntentPhase, MintOptions,
 };
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::fork_lock::Spawn as _;
 
 const CHILD_MODE: &str = "COWSHED_LIFECYCLE_CRASH_CHILD";
 const CHILD_ROOT: &str = "COWSHED_LIFECYCLE_CRASH_ROOT";
@@ -311,7 +312,7 @@ fn crash_then_recover(operation: &str) {
         .args(["--exact", "lifecycle_intent_child", "--nocapture"])
         .env(CHILD_MODE, operation)
         .env(CHILD_ROOT, root.path())
-        .status_locked()
+        .status_bounded()
         .expect("spawn crash child");
     assert!(
         !status.success(),
@@ -617,7 +618,7 @@ fn a_killed_create_keeps_its_intent_when_another_process_updates_the_journal() {
         .args(["--exact", "lifecycle_intent_child", "--nocapture"])
         .env(CHILD_MODE, "create")
         .env(CHILD_ROOT, root.path())
-        .status_locked()
+        .status_bounded()
         .expect("spawn create child");
     assert!(!status.success(), "the create child is killed mid-flight");
 
@@ -700,7 +701,7 @@ fn recovery_leaves_a_running_removal_to_its_process_and_takes_it_over_once_that_
     );
 
     child.kill().expect("kill removal child");
-    child.wait().expect("reap removal child");
+    child.wait_bounded().expect("reap removal child");
     assert!(
         IntentLease::try_claim(&sessions, &name)
             .expect("claim lease")

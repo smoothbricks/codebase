@@ -1,3 +1,4 @@
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
@@ -32,7 +33,6 @@ use cowshed_core::storage::lifecycle::{
     MountState, OperationIdentity, Pin, RestoreMode, Revision, StorageGcOptions, Substrate,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
-use cowshed_os::fork_lock::Run as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
@@ -490,7 +490,7 @@ fn fragment_under_clone(image: &Path) -> Result<u64, Box<dyn Error>> {
         .arg("-c")
         .arg(image)
         .arg(&holder)
-        .status_locked()?;
+        .status_bounded()?;
     if !cloned.success() {
         return Err(format!("cp -c {} failed: {cloned}", image.display()).into());
     }

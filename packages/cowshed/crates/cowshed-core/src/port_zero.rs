@@ -45,7 +45,7 @@ pub fn loader_options(preload: &Path) -> Result<[(&'static str, String); 2], Uns
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowshed_os::fork_lock::Run as _;
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::process::Command;
 
     const SCENARIOS: &str = include_str!("../tests/fixtures/port_zero_scenarios.cjs");
@@ -125,7 +125,7 @@ mod tests {
                 .env("COWSHED_PORT_BLOCK_SIZE", size);
         }
         command
-            .output_locked()
+            .output_bounded()
             .unwrap_or_else(|error| panic!("run {runtime}: {error}"))
     }
 

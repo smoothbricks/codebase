@@ -164,6 +164,8 @@ fn refused(workspace: &str, wanted: Holding, holder: Option<&Holder>) -> Cowshed
 mod tests {
     use super::*;
     use crate::temp_root::TempRoot;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::fs;
 
     /// A private root holding an empty session directory, the only place a lease lives.
@@ -249,7 +251,7 @@ mod tests {
         assert_eq!(killed, 0, "kill the lockf process group");
         // `cat` reads this pipe: reaping lockf must not end it, only the kill may.
         let held = holder.stdin.take();
-        holder.wait().expect("reap lockf");
+        holder.wait_bounded().expect("reap lockf");
 
         // The lock drops when the `cat` child's descriptor closes, a moment after the kill.
         loop {

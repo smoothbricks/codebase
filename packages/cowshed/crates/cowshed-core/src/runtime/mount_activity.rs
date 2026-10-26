@@ -132,6 +132,7 @@ fn descends_from(pid: i32, roots: &[i32]) -> bool {
 mod tests {
     use super::*;
     use cowshed_os::fork_lock::Spawn as _;
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::fs;
 
     fn scratch(label: &str) -> PathBuf {
@@ -218,7 +219,7 @@ mod tests {
         let named = unaccounted(&mount, &accounted).unwrap();
         for child in [&mut working, &mut reading, &mut elsewhere] {
             drop(child.stdin.take());
-            child.wait().unwrap();
+            child.wait_bounded().unwrap();
         }
         let hold_of = |pid: i32| {
             held.iter()
@@ -282,7 +283,7 @@ mod tests {
         .unwrap();
         let record = job_groups::process_record(pid);
         drop(child.stdin.take());
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         assert!(
             !supervised
                 .iter()

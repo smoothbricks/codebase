@@ -18,6 +18,7 @@ pub fn script(body: &'static str) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::test_backstop::ChildBackstop as _;
 
     struct FixtureGuard(std::path::PathBuf);
 
@@ -67,7 +68,9 @@ mod tests {
             .expect("node stdin")
             .write_all(&script("openNxCache(process.argv[2]);"))
             .expect("send adapter script");
-        let output = child.wait_with_output().expect("collect node output");
+        let output = child
+            .wait_with_output_bounded()
+            .expect("collect node output");
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);

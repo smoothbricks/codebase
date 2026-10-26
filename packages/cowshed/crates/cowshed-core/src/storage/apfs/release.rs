@@ -797,6 +797,7 @@ pub fn released_in_store(
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::FileBackstop as _;
     use proptest::prelude::*;
 
     use super::*;
@@ -1036,7 +1037,9 @@ mod tests {
         let journal = entry.parent().expect("deleting directory").to_owned();
         assert!(commit_release(&image, &entry).expect("commit"));
         let committed = fs::File::open(&entry).expect("another deleter's descriptor");
-        committed.lock().expect("another deleter holds the entry");
+        committed
+            .lock_bounded()
+            .expect("another deleter holds the entry");
         assert!(!image.exists(), "the commit takes the image off its name");
         let length = fs::metadata(&entry).expect("stat").len();
         let beside_owner = drain(&journal, any).expect("a deleter beside the owner");
@@ -1249,7 +1252,7 @@ mod tests {
         assert!(commit_release(&image, &entry).expect("commit"));
         let length = fs::metadata(&entry).expect("the entry").len();
         let held = fs::File::open(&entry).expect("a releaser's descriptor");
-        held.lock().expect("the releaser holds the entry");
+        held.try_lock().expect("the releaser holds the entry");
         assert_eq!(
             free_committed(&entry).expect("a held entry"),
             Released::Busy
@@ -1314,7 +1317,9 @@ mod tests {
         fs::write(&image, vec![9_u8; 64 * 1024]).expect("image");
         fs::rename(&image, &entry).expect("a rename nobody synced");
         let releaser = fs::File::open(&entry).expect("the deleter's descriptor");
-        releaser.lock().expect("the deleter holds the entry");
+        releaser
+            .lock_bounded()
+            .expect("the deleter holds the entry");
         take_syncs();
         assert!(commit_release(&image, &entry).expect("the retry beside a held entry"));
         let syncs = take_syncs();

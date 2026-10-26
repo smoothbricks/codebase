@@ -40,6 +40,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
 mod tests {
     use super::*;
     use crate::capabilities::test_support::Fixture;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     #[test]
     fn the_directory_marker_contributes_the_whole_index_and_nothing_else() {
@@ -73,11 +74,10 @@ mod tests {
 
     #[test]
     fn a_nested_override_preserves_project_relative_state_and_can_be_disabled() {
-        use cowshed_os::fork_lock::Run as _;
         let fixture = Fixture::new();
         let initialized = crate::git::git_command_at(&fixture.root)
             .args(["init", "--quiet"])
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(initialized.status.success(), "{initialized:?}");
         std::fs::create_dir_all(fixture.root.join("packages/app/.codegraph")).unwrap();

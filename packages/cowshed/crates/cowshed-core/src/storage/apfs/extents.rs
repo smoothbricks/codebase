@@ -714,6 +714,7 @@ fn available_bytes(directory: &Path) -> Result<u64, ApfsStorageError> {
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod tests {
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::fs::{self, File, OpenOptions, Permissions};
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -721,7 +722,6 @@ pub(crate) mod tests {
     use super::{
         count_extents, next_data_region, punch_hole, rewrite_contiguously, rewrite_sibling,
     };
-    use cowshed_os::fork_lock::Run as _;
 
     const MIB: u64 = 1024 * 1024;
     const PAGE: u64 = 16 * 1024;
@@ -832,7 +832,7 @@ pub(crate) mod tests {
                 .arg("-c")
                 .arg(&path)
                 .arg(&holder)
-                .status_locked()
+                .status_bounded()
                 .expect("cp -c")
                 .success()
         );

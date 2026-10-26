@@ -12,6 +12,7 @@
 //! order and combination `NativeProjectRuntimeHost::repair_one_workspace_record` composes them, so
 //! the composition is exercised on a platform that does not need APFS images to reach it.
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,7 +28,6 @@ use cowshed_core::metadata::{
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
-use cowshed_os::fork_lock::Run as _;
 
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
 
@@ -226,7 +226,7 @@ impl Relocated {
             .arg("-C")
             .arg(&self.session)
             .args(["config", "--get", &format!("remote.{name}.url")])
-            .output_locked()
+            .output_bounded()
             .expect("run git config");
         output.status.success().then(|| {
             String::from_utf8_lossy(&output.stdout)
@@ -287,7 +287,7 @@ where
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -309,7 +309,7 @@ fn commit(root: &Path, message: &str) {
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("run git commit");
     assert!(
         output.status.success(),
@@ -339,7 +339,7 @@ async fn a_relocated_project_has_every_recorded_path_repaired() {
             .args(["ls-remote", "--exit-code", "main", "refs/heads/main"])
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output_locked()
+            .output_bounded()
             .expect("run git ls-remote")
             .status
             .code()

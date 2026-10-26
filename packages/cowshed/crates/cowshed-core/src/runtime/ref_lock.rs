@@ -86,6 +86,7 @@ fn failure(path: &RefLockPath, operation: &str, error: &std::io::Error) -> Cowsh
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::FileBackstop as _;
     use std::fs::{File, TryLockError};
 
     use super::*;
@@ -127,7 +128,7 @@ mod tests {
         let directory = crate::temp_root::TempRoot::new("ref-lock");
         let path = lock_path(&directory);
         let holder = File::create(path.as_path()).unwrap();
-        holder.lock().unwrap();
+        holder.lock_bounded().unwrap();
         let waiting = tokio::spawn({
             let path = path.clone();
             async move { RefLock::acquire(&path).await }

@@ -1093,6 +1093,9 @@ impl<'a> Store<'a> {
         Ok(project.map(|project| (parent, project)))
     }
 
+    // WHY unbounded: debt: a retirement of the same project holds the lock across its own steps.
+    // Moves to cowshed_os::flock.
+    #[allow(clippy::disallowed_methods)]
     fn serialize(&self, owner: &File, names: &Names) -> Result<Fenced<File>> {
         let path = self.retirement_path(names, &names.serialization);
         let lock = open_lock(owner, &names.serialization)

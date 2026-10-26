@@ -491,6 +491,9 @@ pub enum RecordError {
 /// back with a proof it never earned. Released when the returned file closes.
 fn lock_record(mount: &Path) -> Result<std::fs::File, RecordError> {
     let path = mount.join(SHELL_HOST_DIRECTORY).join(RECORD_LOCK_FILE);
+    // WHY unbounded: debt: the record's other writer (an activation or a certification) holds it
+    // across one read and write. Moves to cowshed_os::flock.
+    #[allow(clippy::disallowed_methods)]
     let locked = open_record_lock(&path).and_then(|file| file.lock().map(|()| file));
     locked.map_err(|source| RecordError::Lock { path, source })
 }

@@ -1,9 +1,9 @@
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::io::Read as _;
 use std::process::Command;
 
 use super::*;
 use crate::error::ErrorCode;
-use cowshed_os::fork_lock::Run as _;
 
 const CHILD: &str = "COWSHED_DIAGNOSTICS_NOFILE_CHILD";
 const TEST: &str = "runtime::shell_job::diagnostics_tests::descriptor_exhaustion_reports_the_diagnostics_clone_failure";
@@ -93,7 +93,7 @@ fn delegate_and_run() {
 
 fn run_isolated(mut command: Command) {
     let output = command
-        .output_locked()
+        .output_bounded()
         .expect("run isolated descriptor-limit supervisor");
     assert!(
         output.status.success(),

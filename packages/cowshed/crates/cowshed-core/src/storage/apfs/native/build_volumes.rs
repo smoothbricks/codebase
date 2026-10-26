@@ -1408,6 +1408,7 @@ mod tests {
     use cowshed_apfs::mounts::KernelMountSnapshot;
     use cowshed_apfs::{CommandRequest, SystemCommandRunner};
     use cowshed_os::namespace::{HostNamespace, TestNamespace};
+    use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
     use std::io::Read;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2155,12 +2156,11 @@ mod tests {
 
     /// Run `script` under `/bin/sh` in `cwd`, as a job's command runs, and require it to succeed.
     fn job(cwd: &Path, script: &str) {
-        use cowshed_os::fork_lock::Run as _;
         let status = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(script)
             .current_dir(cwd)
-            .status_locked()
+            .status_bounded()
             .expect("spawn the job");
         assert!(status.success(), "{script}: {status:?}");
     }
@@ -2414,23 +2414,13 @@ mod tests {
         let pgid = i32::try_from(leader.id()).unwrap();
         // SAFETY: the unreaped test child leads this group.
         assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
-        // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: waiting for our own child without reaping it.
-        let waited = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                leader.id(),
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+        cowshed_os::test_backstop::waitid(libc::P_PID, leader.id(), libc::WEXITED | libc::WNOWAIT)
+            .expect("waitid");
     }
 
     /// Reap a leader once nothing reads it any more: its interval closed, or its job concluded.
     fn reap(mut leader: std::process::Child) {
-        leader.wait().unwrap();
+        leader.wait_bounded().unwrap();
     }
 
     /// The job's volumes, each read: `(workspace, build)` deltas.

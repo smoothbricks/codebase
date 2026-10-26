@@ -1,3 +1,8 @@
+#[cfg(target_os = "macos")]
+use cowshed_os::test_backstop::CommandBackstop as _;
+use cowshed_os::test_backstop::{
+    AsyncUnixStreamBackstop as _, ChildBackstop as _, UnixStreamBackstop as _,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::future::Future;
@@ -33,8 +38,6 @@ use cowshed_core::storage::job_artifact::{
     AdmissionLookup, ArtifactConfig, ArtifactStore, FIRST_KEYED_LAYOUT, JobAdmission, JobEnding,
     JobScheduling, StreamKind,
 };
-#[cfg(target_os = "macos")]
-use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use tokio::sync::mpsc;
@@ -1067,7 +1070,7 @@ async fn host_controller_an_admitted_nix_bun_loads_icu_without_a_nix_project() {
     let libraries = std::process::Command::new("/usr/bin/otool")
         .arg("-L")
         .arg(&bun)
-        .output_locked()
+        .output_bounded()
         .unwrap();
     assert!(libraries.status.success(), "{libraries:?}");
     assert!(
@@ -2199,7 +2202,7 @@ impl SpawnSink for ReapedGroupSpawner {
         // SAFETY: the unreaped test child leads this group.
         assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
         use std::os::unix::process::ExitStatusExt as _;
-        assert_eq!(group.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(group.wait_bounded().unwrap().signal(), Some(libc::SIGKILL));
         self.spawned
             .send(Spawned {
                 request: request.clone(),
@@ -2388,7 +2391,7 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
     // The descendant reads this pipe: reaping the leader must not close it.
     let held = leaderless.stdin.take();
     leaderless.kill().unwrap();
-    leaderless.wait().unwrap();
+    leaderless.wait_bounded().unwrap();
     std::fs::write(
         &ledger,
         format!(r#"{{"supervisor":1,"groups":[{{"jobId":9,"pgid":{pgid},"leaderStart":null}}]}}"#),
@@ -3869,7 +3872,9 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
         }
     }))
     .unwrap();
-    let mut caller = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let mut caller = tokio::net::UnixStream::connect_bounded(&path)
+        .await
+        .unwrap();
     for frame in [&call[..], &b"payload"[..]] {
         caller
             .write_all(&u32::try_from(frame.len()).unwrap().to_be_bytes())
@@ -5572,23 +5577,13 @@ fn end_group(leader: &std::process::Child) {
 
 /// Wait for `child` to exit without reaping it.
 fn exited_unreaped(child: &std::process::Child) {
-    // SAFETY: an all-zero siginfo is a valid value of the plain C struct.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: waiting for our own child without reaping it.
-    let waited = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id(),
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT,
-        )
-    };
-    assert_eq!(waited, 0, "waitid: {}", std::io::Error::last_os_error());
+    cowshed_os::test_backstop::waitid(libc::P_PID, child.id(), libc::WEXITED | libc::WNOWAIT)
+        .expect("waitid");
 }
 
 /// Reap a leader once nothing reads it any more: its job concluded, or its interval closed.
 fn reap(mut leader: std::process::Child) {
-    leader.wait().unwrap();
+    leader.wait_bounded().unwrap();
 }
 
 /// `leader` as the job's owned process, identified while its parent holds it unreaped.
@@ -5878,7 +5873,7 @@ impl Holder {
     /// Close its stdin, and reap it once it exits: it holds nothing any more.
     fn release(mut self) {
         drop(self.0.stdin.take());
-        assert!(self.0.wait().unwrap().success());
+        assert!(self.0.wait_bounded().unwrap().success());
     }
 }
 
@@ -6228,12 +6223,9 @@ const BURN_SECONDS: f64 = 0.5;
 #[cfg(target_os = "macos")]
 fn reaped_cpu_us(leader: std::process::Child) -> u64 {
     let pid = libc::pid_t::try_from(leader.id()).unwrap();
-    // SAFETY: an all-zero rusage is a valid value of the plain C struct.
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    let mut status = 0;
-    // SAFETY: reaping the test's own exited child, which nothing else waits for.
-    let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
-    assert_eq!(reaped, pid, "wait4: {}", std::io::Error::last_os_error());
+    // Reaping the test's own exited child, which nothing else waits for.
+    let (reaped, _, usage) = cowshed_os::test_backstop::wait4(pid, 0).expect("wait4");
+    assert_eq!(reaped, pid);
     let micros = |time: libc::timeval| {
         u64::try_from(time.tv_sec).unwrap() * 1_000_000 + u64::try_from(time.tv_usec).unwrap()
     };
@@ -7249,11 +7241,11 @@ impl LiveDaemon {
 impl Drop for LiveDaemon {
     fn drop(&mut self) {
         let _ = self.process.kill();
-        let _ = self.process.wait();
+        let _ = self.process.wait_bounded();
         // The serving thread is blocked in `accept`: one connection wakes it to see the flag.
         self.closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+        let _ = std::os::unix::net::UnixStream::connect_bounded(&self.socket);
         if let Some(serving) = self.serving.take() {
             let _ = serving.join();
         }
@@ -7387,7 +7379,10 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 )
                 .expect("clean up the fixture's held group");
             }
-            let exit = self.child.wait().expect("reap the concluded job's leader");
+            let exit = self
+                .child
+                .wait_bounded()
+                .expect("reap the concluded job's leader");
             if let Err(error) = self.reaped.send(exit) {
                 cowshed_os::eprintln!("the job's exit observer is gone: {error}");
             }
@@ -7404,7 +7399,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 over_socket.then(|| TempRoot::new_in(&temp_parent::scratch_parent(), "cs-retire"));
             let mut daemon = LiveDaemon::start(&config.workspace_root);
             assert!(daemon.running(), "the foreign nominee starts alive");
-            std::os::unix::net::UnixStream::connect(&daemon.socket)
+            std::os::unix::net::UnixStream::connect_bounded(&daemon.socket)
                 .expect("the valid daemon record names a live socket");
             let ledger = root.join("supervisor.groups");
             config.group_ledger = Some(ledger.clone());
@@ -7505,12 +7500,12 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                         daemon.running(),
                         "{name}: controller-owned retirement must not signal a record nominee"
                     );
-                    std::os::unix::net::UnixStream::connect(&daemon.socket)
+                    std::os::unix::net::UnixStream::connect_bounded(&daemon.socket)
                         .expect("the surviving nominee's recorded socket still accepts");
                 }
                 NxDaemonRetirement::Recorded => {
                     assert_eq!(
-                        daemon.process.wait().unwrap().signal(),
+                        daemon.process.wait_bounded().unwrap().signal(),
                         Some(libc::SIGTERM),
                         "{name}: ordinary record cleanup still stops the fixture-owned nominee"
                     );
@@ -10978,7 +10973,7 @@ if not sibling_reaped:
     impl Drop for Held {
         fn drop(&mut self) {
             drop(self.0.stdin.take());
-            if let Err(error) = self.0.wait() {
+            if let Err(error) = self.0.wait_bounded() {
                 cowshed_os::eprintln!("fixture child wait: {error}");
             }
         }

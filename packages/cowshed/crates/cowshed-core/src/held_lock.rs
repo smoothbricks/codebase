@@ -106,6 +106,10 @@ impl Opened {
 
     /// Wait in `flock(2)` until the kernel grants the lock, then hold it. Nothing bounds the wait:
     /// the holder ahead is a writer this one must follow.
+    // WHY unbounded: debt: the writer ahead holds the lock as long as its work; callers that bound
+    // the wait run it on a thread under their own deadline (land turn, ref lock). Moves to
+    // cowshed_os::flock.
+    #[allow(clippy::disallowed_methods)]
     pub fn hold(self) -> io::Result<HeldLock> {
         loop {
             match self.file.lock() {
@@ -719,6 +723,7 @@ impl OwnedLives {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::test_backstop::ChildBackstop as _;
 
     /// Every record the properties judge: none, or one naming a pid of the domain or none of it,
     /// with no unique id, the live one, or another life's.
@@ -1110,7 +1115,7 @@ mod tests {
         // Collect the observation before ending the service, and assert only once it is reaped.
         let released = granted_while_running(&path, &mut service);
         service.kill().expect("end the service");
-        service.wait().expect("reap the service");
+        service.wait_bounded().expect("reap the service");
         assert!(
             released.expect("wait for the lock"),
             "a process cowshed started kept the lock its starter let go of: the kernel granted it only after the service ended"
@@ -1165,7 +1170,7 @@ mod tests {
                 })
             };
             drop(child.stdin.take());
-            let status = child.wait().expect("reap the reader");
+            let status = child.wait_bounded().expect("reap the reader");
             assert!(status.success(), "reader exit: {status}");
             assert_eq!(failure.expect("probe the lock"), None, "handed: {handed}");
             // The reader has exited, so the kernel grants the lock to the next waiter.

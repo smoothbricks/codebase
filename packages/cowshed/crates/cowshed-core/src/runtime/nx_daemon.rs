@@ -320,6 +320,9 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
 }
 
 /// The probe of `record`, and for a live daemon the pid and bytes of the read that verified it.
+// WHY unbounded: debt: Darwin answers a unix connect in the call; on Linux a full queue parks it
+// until the daemon accepts. Moves to a bounded blocking connect.
+#[allow(clippy::disallowed_methods)]
 fn read_and_probe(record: &Path) -> (Probe, Option<(libc::pid_t, Vec<u8>)>) {
     let bytes = match std::fs::read(record) {
         Ok(bytes) => bytes,
@@ -1092,14 +1095,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::os::unix::net::UnixListener;
 
     use proptest::prelude::*;
 
     use super::*;
-    #[cfg(target_os = "macos")]
-    use cowshed_os::fork_lock::Run as _;
-
     /// The default bound the keeper tests run against.
     const IDLE: Duration = NxDaemonIdle::DEFAULT.get();
 
@@ -1228,15 +1231,12 @@ mod tests {
         let dead = exited.id();
         // Exited, not yet reaped: a zombie, which the null signal still reaches. The socket is
         // still served, so only the process's own state can tell it is gone.
-        // SAFETY: an all-zero `siginfo_t` is a valid value of the plain C struct.
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        // SAFETY: `info` is a valid out-pointer; WNOWAIT leaves the child waitable.
-        let waited =
-            unsafe { libc::waitid(libc::P_PID, dead, &mut info, libc::WEXITED | libc::WNOWAIT) };
-        assert_eq!(waited, 0, "{}", io::Error::last_os_error());
+        // WNOWAIT leaves the child waitable.
+        cowshed_os::test_backstop::waitid(libc::P_PID, dead, libc::WEXITED | libc::WNOWAIT)
+            .expect("wait for the daemon's exit");
         write_record(&record, dead, &socket);
         assert_eq!(probe(&record), Probe::Dead, "a zombie daemon is gone");
-        exited.wait().expect("reap");
+        exited.wait_bounded().expect("reap");
         assert_eq!(probe(&record), Probe::Dead);
 
         // The socket file outlives its listener, so only a connect tells it is served.
@@ -1362,7 +1362,9 @@ mod tests {
         let mut starting =
             cowshed_os::fork_lock::Spawn::spawn_locked(&mut shell).expect("start a host run");
         let held = starting.stdin.take();
-        let started = starting.wait_with_output().expect("the shell exits");
+        let started = starting
+            .wait_with_output_bounded()
+            .expect("the shell exits");
         let run: i32 = String::from_utf8(started.stdout)
             .expect("a pid")
             .trim()
@@ -1691,7 +1693,7 @@ mod tests {
         );
         child.kill().unwrap();
         watch.wait().unwrap();
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         assert!(
             super::super::job_groups::Process::observe(pid)
                 .unwrap()
@@ -1829,11 +1831,11 @@ mod tests {
         let outcome = stop_owned_daemon(process, watch, || async {
             std::process::Command::new("/bin/sh")
                 .args(["-c", "exit 0"])
-                .output_locked()
+                .output_bounded()
         })
         .await
         .unwrap();
-        daemon.wait().unwrap();
+        daemon.wait_bounded().unwrap();
         let outlived = outlived(&worker);
         assert!(outcome.exited, "the daemon exits: {outcome:?}");
         assert!(
@@ -1857,7 +1859,7 @@ mod tests {
         let (mut daemon, worker) = sandboxed_daemon_with_worker();
         write_record(&data.join("d/server-process.json"), daemon.id(), &socket);
         let closed = crate::build_volume::nx::close_workspace_data(&data).unwrap();
-        daemon.wait().unwrap();
+        daemon.wait_bounded().unwrap();
         drop(listener);
         let outlived = outlived(&worker);
         assert_eq!(closed, Ok(()), "the daemon stops");
@@ -1903,7 +1905,7 @@ mod tests {
                 .is_ok(),
             "the watch reports the exit"
         );
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
     }
 
     /// A live process the ledger does not name is never signalled: a fresh, well-formed record
@@ -1925,7 +1927,7 @@ mod tests {
         let plan = prepare_daemon_stop(&record, &ledger).unwrap();
         let alive = foreign.try_wait().unwrap().is_none();
         foreign.kill().unwrap();
-        foreign.wait().unwrap();
+        foreign.wait_bounded().unwrap();
         let DaemonStopPlan::Unproven { pid, reason } = plan else {
             panic!("a sandboxed process the ledger does not name is unproven");
         };
@@ -1969,7 +1971,7 @@ mod tests {
         let outcome = stop_owned_daemon(process, watch, || async {
             std::process::Command::new("/bin/sh")
                 .args(["-c", "exit 0"])
-                .output_locked()
+                .output_bounded()
         })
         .await
         .unwrap();
@@ -1977,12 +1979,12 @@ mod tests {
         if !owned_exited {
             owned.kill().unwrap();
         }
-        owned.wait().unwrap();
+        owned.wait_bounded().unwrap();
         let foreign_alive = foreign.try_wait().unwrap().is_none();
         if foreign_alive {
             foreign.kill().unwrap();
         }
-        foreign.wait().unwrap();
+        foreign.wait_bounded().unwrap();
         assert_eq!(outcome.pid, owned_pid);
         assert!(
             outcome.exited && owned_exited,
@@ -2021,7 +2023,7 @@ mod tests {
             "a stale record signals nothing"
         );
         child.kill().unwrap();
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
     }
 
     /// A reaped leader names no process and proves nothing: its group id may belong to a later
@@ -2039,7 +2041,7 @@ mod tests {
         let record = scratch.join("server-process.json");
         write_record(&record, child.id(), &scratch.join("refusing.sock"));
         child.kill().unwrap();
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         assert!(
             super::super::job_groups::owned_process(&ledger, pid)
                 .unwrap()
@@ -2082,7 +2084,7 @@ mod tests {
         write_record(&record, leader.id(), &scratch.join("refusing.sock"));
         // The member reads this pipe: reaping the leader must not close it.
         let held = leader.stdin.take();
-        leader.wait().unwrap();
+        leader.wait_bounded().unwrap();
         assert!(
             super::super::job_groups::owned_process(&ledger, pid)
                 .unwrap()
@@ -2095,7 +2097,7 @@ mod tests {
         ));
         std::process::Command::new("/bin/kill")
             .args(["-KILL", &format!("-{pid}")])
-            .status_locked()
+            .status_bounded()
             .expect("kill the survivor's group");
         drop(held);
     }
@@ -2123,7 +2125,7 @@ mod tests {
         write_record(&record, 0, &scratch.join("refusing.sock"));
         let invalid_pid = prepare_daemon_stop(&record, &ledger);
         child.kill().unwrap();
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         let DaemonStopPlan::Unproven { reason, .. } = plan else {
             panic!("a settled nominee without a ledger is unproven");
         };
@@ -2182,7 +2184,7 @@ mod tests {
         let result = prepare_daemon_stop(&record, &ledger);
         let alive = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         assert_skip(malformed_record, "cannot parse daemon record", &record);
         assert_skip(unreadable_record, "cannot read daemon record", &record);
         assert_skip(
@@ -2234,13 +2236,13 @@ mod tests {
         stdout.read_line(&mut line).unwrap();
         assert_eq!(line.trim(), "EXECUTED");
         let outcome = stop_owned_daemon(process, watch, || async {
-            std::process::Command::new("/bin/true").output_locked()
+            std::process::Command::new("/bin/true").output_bounded()
         })
         .await
         .unwrap();
         let alive = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
-        child.wait().unwrap();
+        child.wait_bounded().unwrap();
         assert!(!outcome.signalled, "a stale identity signals nothing");
         assert!(!outcome.exited, "the exec'd process is still alive");
         assert!(
@@ -2259,11 +2261,14 @@ mod tests {
 /// pids, so the kernel's own refusal is part of each proof.
 #[cfg(all(test, target_os = "macos"))]
 mod lifecycle_authority_tests {
+    use cowshed_os::test_backstop::{
+        AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _,
+    };
     use std::os::unix::process::CommandExt as _;
 
     use super::*;
     use crate::runtime::job_groups::{GroupLeader, Recorder};
-    use cowshed_os::fork_lock::{Run as _, RunAsync, Spawn as _};
+    use cowshed_os::fork_lock::Spawn as _;
 
     const SELF_ONLY: &str = "(version 1)(allow default)(deny signal (target others))";
 
@@ -2313,7 +2318,7 @@ mod lifecycle_authority_tests {
                 "-c",
                 &format!("kill -TERM {pid}"),
             ])
-            .output_locked()
+            .output_bounded()
             .expect("the sandboxed kill runs")
     }
 
@@ -2352,7 +2357,7 @@ mod lifecycle_authority_tests {
         let outcome = stop_owned_daemon(process, watch, || async {
             let mut command = tokio::process::Command::new("/bin/sh");
             command.args(["-c", "exit 17"]);
-            RunAsync::output_locked(&mut command).await
+            command.output_bounded().await
         })
         .await
         .expect("a failed cleanup is a diagnostic, never an error");
@@ -2364,7 +2369,7 @@ mod lifecycle_authority_tests {
             outcome.diagnostics.iter().any(|line| line.contains("17")),
             "the failed cleanup is reported: {outcome:?}"
         );
-        child.wait().expect("reap the stopped process");
+        child.wait_bounded().expect("reap the stopped process");
     }
 
     #[test]
@@ -2385,7 +2390,7 @@ mod lifecycle_authority_tests {
         let pid_before_cleanup = foreign.id();
         let alive = foreign.try_wait().expect("poll").is_none();
         foreign.kill().expect("the test stops its own sleeper");
-        foreign.wait().expect("reap");
+        foreign.wait_bounded().expect("reap");
         match plan {
             DaemonStopPlan::Unproven { pid, reason } => {
                 assert_eq!(
@@ -2529,7 +2534,7 @@ mod lifecycle_authority_tests {
 
         // RED: the sandboxed stock stop is refused by the kernel, and the exit watch stays silent.
         let refused = sandboxed_nx_stop(&root, &node, &nx)
-            .output_locked()
+            .output_bounded()
             .expect("the sandboxed stop runs");
         let text = format!(
             "{}{}",
@@ -2546,7 +2551,7 @@ mod lifecycle_authority_tests {
 
         let outcome = stop_owned_daemon(process, watch, || async {
             let mut command = tokio::process::Command::from(sandboxed_nx_stop(&root, &node, &nx));
-            RunAsync::output_locked(&mut command).await
+            command.output_bounded().await
         })
         .await
         .expect("the controller stops its owned daemon");
@@ -2554,7 +2559,7 @@ mod lifecycle_authority_tests {
             outcome.exited,
             "the exact-identity SIGTERM ended the real daemon: {outcome:?}"
         );
-        daemon.wait().expect("reap the real daemon");
+        daemon.wait_bounded().expect("reap the real daemon");
     }
 
     /// Stops the daemon a `workspace-data` directory records when dropped, however the test ends.
@@ -2649,7 +2654,7 @@ mod lifecycle_authority_tests {
             Verdict::Release,
             "the shed went its whole bound unused"
         );
-        let status = daemon.wait().expect("reap the real daemon");
+        let status = daemon.wait_bounded().expect("reap the real daemon");
         let mut outlived = Vec::new();
         for worker in &workers {
             if worker.record().expect("read a plugin worker").is_some() {
@@ -2677,7 +2682,7 @@ mod lifecycle_authority_tests {
             .env("NX_DAEMON", "true")
             .env("NX_USE_LOCAL", "true")
             .current_dir(&root)
-            .output_locked()
+            .output_bounded()
             .expect("the Nx call runs");
         assert!(
             shown.status.success(),

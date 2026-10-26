@@ -5,8 +5,8 @@ use crate::repository::{ProjectPaths, RepoId};
 use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 use crate::storage::apfs::ApfsSubstrateConfig;
 use crate::storage::directory::DirectoryExecutionHost;
-use cowshed_os::fork_lock::Run as _;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::path::PathBuf;
 
 struct Scratch(PathBuf);
@@ -45,7 +45,7 @@ fn write(checkout: &Path, relative: &str, bytes: &str) {
 fn git(checkout: &Path, args: &[&str]) {
     let output = crate::git::git_command_at(checkout)
         .args(args)
-        .output_locked()
+        .output_bounded()
         .unwrap();
     assert!(
         output.status.success(),
@@ -452,7 +452,7 @@ fn target_only() -> Vec<BuildStatePath> {
 fn status(checkout: &Path) -> String {
     let output = crate::git::git_command_at(checkout)
         .args(["status", "--porcelain", "--untracked-files=all"])
-        .output_locked()
+        .output_bounded()
         .unwrap();
     assert!(output.status.success());
     String::from_utf8(output.stdout).unwrap()

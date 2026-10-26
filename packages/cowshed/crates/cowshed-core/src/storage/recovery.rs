@@ -912,6 +912,9 @@ impl LifecycleIntentJournal {
         let mut lock_path = path.as_os_str().to_owned();
         lock_path.push(".lock");
         let lock = open_lock_file(Path::new(&lock_path))?;
+        // WHY unbounded: debt: another process holds the journal lock for exactly one read and
+        // write. Moves to cowshed_os::flock.
+        #[allow(clippy::disallowed_methods)]
         lock.lock().map_err(|error| {
             CowshedError::environment_missing(
                 format!(

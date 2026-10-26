@@ -236,6 +236,9 @@ pub(crate) fn exclude_links(checkout: &Path, paths: &[BuildStatePath]) -> Result
         Err(error) => return Err(exclude_error(&checkout.join(".git"), &error)),
         Ok(_) => {}
     }
+    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors and
+    // prompts off (`git_command_at`): it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = crate::git::git_command_at(checkout)
         .args([
             "rev-parse",
@@ -463,6 +466,7 @@ fn link_error(path: &Path, error: &io::Error) -> CowshedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::test_backstop::CommandBackstop as _;
 
     struct Scratch(PathBuf);
 
@@ -588,14 +592,13 @@ mod tests {
     /// as untracked. Cowshed excludes its own links, and leaves the repository's lines alone.
     #[test]
     fn linked_checkouts_show_no_build_links_in_git_status() {
-        use cowshed_os::fork_lock::Run as _;
         let scratch = Scratch::new("status");
         let checkout = scratch.checkout();
         let volume = scratch.volume("volume-a");
         let git = |args: &[&str]| {
             let output = crate::git::git_command_at(&checkout)
                 .args(args)
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(
                 output.status.success(),

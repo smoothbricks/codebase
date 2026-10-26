@@ -1,3 +1,6 @@
+use cowshed_os::test_backstop::{
+    AsyncChildBackstop as _, ChildBackstop as _, CommandBackstop as _,
+};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -26,7 +29,7 @@ use cowshed_core::storage::recovery::{
     LifecycleIntentJournal, LifecycleIntentPhase, LifecycleIntentRecord,
 };
 use cowshed_core::{CowshedError, Result};
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::namespace::TestNamespace;
 use serde_json::{Value, json};
 
@@ -1096,7 +1099,7 @@ fn git(directory: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output_locked()
+        .output_bounded()
         .expect("git process");
     assert!(
         output.status.success(),
@@ -1309,7 +1312,7 @@ impl LockHolder {
     fn release(mut self) {
         drop(self.child.stdin.take());
         std::io::copy(&mut self.said, &mut std::io::sink()).expect("the holder's last output");
-        let status = self.child.wait().expect("wait for the lock holder");
+        let status = self.child.wait_bounded().expect("wait for the lock holder");
         assert!(status.success(), "the lock holder failed: {status}");
     }
 }
@@ -1461,7 +1464,7 @@ fn an_entry_wait_ends_when_the_watched_process_exits() {
         &scratch.path().join("never"),
         Some(child.id())
     ));
-    assert!(child.wait().expect("reap it").success());
+    assert!(child.wait_bounded().expect("reap it").success());
 }
 
 /// A workspace supervisor opens and serves while other processes hold main's image lock and its
@@ -1939,7 +1942,10 @@ async fn a_supervisor_waits_for_the_holder_of_its_unsettled_workspace_lock() {
     .await
     .expect("watch the socket directory and the supervisor");
     if !published {
-        let status = supervisor.wait().await.expect("wait for the supervisor");
+        let status = supervisor
+            .wait_bounded()
+            .await
+            .expect("wait for the supervisor");
         let rest = rest.await.expect("the supervisor's output");
         panic!("the supervisor ended before it served: {status}; it said: {transcript}{rest}");
     }
@@ -1955,7 +1961,10 @@ async fn a_supervisor_waits_for_the_holder_of_its_unsettled_workspace_lock() {
     supervisor_socket::drain(&socket)
         .await
         .expect("retire the supervisor");
-    let status = supervisor.wait().await.expect("wait for the supervisor");
+    let status = supervisor
+        .wait_bounded()
+        .await
+        .expect("wait for the supervisor");
     transcript.push_str(&rest.await.expect("the supervisor's output"));
     assert!(
         status.success(),
@@ -2755,7 +2764,7 @@ fn head(directory: &Path) -> String {
         .current_dir(directory)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("git process");
     assert!(output.status.success(), "git rev-parse HEAD");
     String::from_utf8(output.stdout)
@@ -3230,7 +3239,7 @@ fn git_bytes(directory: &Path, args: &[&str]) -> Vec<u8> {
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("git process");
     assert!(output.status.success(), "git {args:?}");
     output.stdout
@@ -3392,7 +3401,7 @@ fn porcelain(directory: &Path) -> String {
         .current_dir(directory)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output_locked()
+        .output_bounded()
         .expect("git process");
     assert!(output.status.success(), "git status --porcelain");
     String::from_utf8(output.stdout).expect("status is UTF-8")
@@ -3620,7 +3629,7 @@ impl GcProcess {
         self.said
             .read_to_string(&mut self.transcript)
             .expect("gc's last output");
-        let status = self.child.wait().expect("wait for gc");
+        let status = self.child.wait_bounded().expect("wait for gc");
         assert!(
             status.success(),
             "gc failed: {status}; it said: {}",

@@ -1050,6 +1050,9 @@ pub fn await_exit_unreaped(pid: i32) -> io::Result<ExitStatus> {
     })
 }
 
+// WHY unbounded: debt: `WNOHANG` returns at once; `await_exit_unreaped` waits for a child told to
+// exit, which an uninterruptible kernel call can stall. Moves to `deadline::await_exit`.
+#[allow(clippy::disallowed_methods)]
 fn read_exit(pid: i32, options: libc::c_int) -> io::Result<Option<ExitStatus>> {
     let id = libc::id_t::try_from(pid)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -1109,6 +1112,8 @@ fn read_exit(pid: i32, options: libc::c_int) -> io::Result<Option<ExitStatus>> {
 
 /// Take child `id`'s pending stop or continue report without reaping it: the wait asks for
 /// those states alone, never `WEXITED`, so an exited child stays unreaped for its fence.
+// WHY unbounded: `WNOHANG` returns at once.
+#[allow(clippy::disallowed_methods)]
 fn take_stop_report(id: libc::id_t) -> io::Result<()> {
     loop {
         // SAFETY: an all-zero `siginfo_t` is valid storage for the call to fill.
@@ -2120,14 +2125,15 @@ pub(crate) fn life_of(pid: i32) -> io::Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::CommandBackstop as _;
     use std::collections::BTreeSet;
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
     use super::{GroupLeader, Writer, end_recorded, ledger_path, names_groups, take_lost};
-    #[cfg(target_os = "macos")]
-    use cowshed_os::fork_lock::Run as _;
     use cowshed_os::fork_lock::Spawn as _;
 
     fn leader(pid: u32) -> GroupLeader {
@@ -2158,13 +2164,13 @@ mod tests {
         assert!(!watch.within(Duration::from_millis(50)).expect("poll"));
         leader.0.kill().expect("kill");
         watch.wait().expect("the exit is reported");
-        leader.0.wait().expect("reap");
+        leader.0.wait_bounded().expect("reap");
         assert!(
             super::ExitWatch::of(pid).expect("watch").is_none(),
             "a reaped pid names no process"
         );
         member.kill().expect("kill the member");
-        member.wait().expect("reap the member");
+        member.wait_bounded().expect("reap the member");
     }
 
     /// A job-shaped process tree: a group leader waiting for its child, which blocks reading the
@@ -2202,7 +2208,7 @@ mod tests {
             super::exit_unreaped(pid).expect("still unreaped"),
             Some(crate::api::dto::ExitStatus::Exited { code: 4 })
         );
-        assert_eq!(child.0.wait().expect("reap").code(), Some(4));
+        assert_eq!(child.0.wait_bounded().expect("reap").code(), Some(4));
     }
 
     /// ECHILD is not success on its own: this live process is never its own child.
@@ -2221,7 +2227,7 @@ mod tests {
             let pgid = i32::try_from(self.0.id()).expect("owned child pid");
             // SAFETY: this unreaped child is the group leader spawned by this test.
             unsafe { libc::killpg(pgid, libc::SIGKILL) };
-            let _ = self.0.wait();
+            let _ = self.0.wait_bounded();
         }
     }
 
@@ -2239,7 +2245,7 @@ mod tests {
                     unsafe {
                         libc::killpg(i32::try_from(child.id()).unwrap(), libc::SIGKILL);
                     }
-                    child.wait().expect("reap fixture root");
+                    child.wait_bounded().expect("reap fixture root");
                 }
             }
         }
@@ -2328,7 +2334,7 @@ os._exit(0)
                 .unwrap()
                 .write_all(b"x")
                 .unwrap();
-            assert!(root.0.take().unwrap().wait().unwrap().success());
+            assert!(root.0.take().unwrap().wait_bounded().unwrap().success());
             assert!(!super::group_has_live_members(i32::try_from(parent).unwrap()).unwrap());
             assert_eq!(
                 super::process_record(i32::try_from(child).unwrap())
@@ -2546,7 +2552,12 @@ os._exit(0)
         let mut stat = std::fs::File::open(format!("/proc/{}/stat", child.id()))
             .expect("open the live child's proc-stat inode");
         drop(child.stdin.take());
-        assert!(child.wait().expect("reap the departed child").success());
+        assert!(
+            child
+                .wait_bounded()
+                .expect("reap the departed child")
+                .success()
+        );
         let mut text = String::new();
         let read = stat.read_to_string(&mut text).map(|_| text);
         assert_eq!(
@@ -2574,7 +2585,7 @@ os._exit(0)
         drop(child.stdin.take());
         assert!(
             child
-                .wait()
+                .wait_bounded()
                 .expect("reap the child after its live reads")
                 .success()
         );
@@ -2603,7 +2614,7 @@ os._exit(0)
             pids(super::job_members(&birth).expect("an exited, unreaped leader proves its group")),
             Vec::<u32>::new()
         );
-        job.wait().expect("reap the leader");
+        job.wait_bounded().expect("reap the leader");
         assert_eq!(
             pids(super::job_members(&birth).expect("an id nothing holds names an empty group")),
             Vec::<u32>::new()
@@ -2663,7 +2674,7 @@ os._exit(0)
         let birth = super::Birth::of(job.id());
         // The child reads this pipe: reaping the leader must not close it.
         let held = job.stdin.take();
-        job.wait().expect("reap the leader");
+        job.wait_bounded().expect("reap the leader");
         let orphaned = super::job_members(&birth);
         // SAFETY: plain kill of the test's own orphaned grandchild.
         unsafe { libc::kill(i32::try_from(sleeper).unwrap(), libc::SIGKILL) };
@@ -2679,7 +2690,7 @@ os._exit(0)
         let pgid = i32::try_from(group.id()).unwrap();
         // SAFETY: this unreaped child leads the group spawned by this test.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
-        group.wait().expect("reap the group leader");
+        group.wait_bounded().expect("reap the group leader");
         assert!(members.is_err(), "{members:?}");
     }
 
@@ -2765,7 +2776,7 @@ os._exit(0)
 
         let ended = end_recorded(&ledger, Writer::Any, Duration::from_millis(200)).unwrap();
         assert_eq!(ended.signalled, vec![7]);
-        let _ = job.wait();
+        let _ = job.wait_bounded();
         while group_alive(pgid) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -2808,7 +2819,7 @@ os._exit(0)
             Duration::from_millis(100),
         )
         .unwrap();
-        let _ = job.wait();
+        let _ = job.wait_bounded();
     }
 
     /// A supervisor that retired in order left a ledger naming no group: its watcher has nothing
@@ -2836,7 +2847,7 @@ os._exit(0)
         assert!(!names_groups(&ledger, Writer::Process(std::process::id() + 1)).unwrap());
 
         end_recorded(&ledger, own, Duration::from_millis(100)).unwrap();
-        let _ = job.wait();
+        let _ = job.wait_bounded();
     }
 
     /// A ledger rewrite carries the identity a group's leader had when the job started. Here
@@ -2854,7 +2865,7 @@ os._exit(0)
                 .collect();
             // SAFETY: the unreaped test child leads this group; both members are pipe-held.
             assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
-            child.wait().unwrap();
+            child.wait_bounded().unwrap();
             for exit in exits {
                 assert!(exit.within(Duration::from_secs(2)).unwrap());
             }
@@ -2956,7 +2967,7 @@ os._exit(0)
             "a process under another version was signalled"
         );
         assert!(leader.signal(libc::SIGKILL).unwrap());
-        job.wait().unwrap();
+        job.wait_bounded().unwrap();
         assert!(
             !leader.signal(libc::SIGKILL).unwrap(),
             "a reaped process was signalled"
@@ -3091,7 +3102,7 @@ os._exit(0)
         assert_eq!(leaf.pid, leader_pid);
 
         assert!(leader.signal(libc::SIGKILL).unwrap());
-        job.wait().unwrap();
+        job.wait_bounded().unwrap();
         end_started_group(pgid);
     }
 
@@ -3113,7 +3124,7 @@ os._exit(0)
 
         assert!(leader.signal(libc::SIGTERM).unwrap());
         exit.wait().unwrap();
-        job.wait().unwrap();
+        job.wait_bounded().unwrap();
         assert!(
             leader.watch_exit().is_err(),
             "a reaped process's exit was watched"
@@ -3167,7 +3178,7 @@ os._exit(0)
             // The descendant reads this pipe: reaping the leader must not close it.
             let held = group.0.stdin.take();
             group.0.kill().unwrap();
-            group.0.wait().unwrap();
+            group.0.wait_bounded().unwrap();
             assert_eq!(super::start_time(pgid).unwrap(), None, "{label}");
             assert!(super::group_has_live_members(pgid).unwrap(), "{label}");
 
@@ -3364,7 +3375,7 @@ os._exit(0)
                     "runtime::job_groups::tests::permission_denials_preserve_the_owned_ledger_and_allow_retry",
                     "--nocapture",
                 ])
-                .env(LEDGER_ENV, &ledger).output_locked()
+                .env(LEDGER_ENV, &ledger).output_bounded()
                 .expect("real restricted cleanup process");
             let after = std::fs::read(&ledger).unwrap();
             let survived_refusal = group_alive(pgid);
@@ -3490,7 +3501,7 @@ os._exit(0)
                 let pgid = i32::try_from(self.leader.id()).expect("owned child pid");
                 // SAFETY: this unreaped child leads the group this test spawned.
                 unsafe { libc::killpg(pgid, libc::SIGKILL) };
-                let _ = self.leader.wait();
+                let _ = self.leader.wait_bounded();
             }
         }
     }
@@ -3602,7 +3613,7 @@ os._exit(0)
             super::job_listening_ports(&birth).expect("an exited, unreaped leader's group"),
             BTreeSet::new()
         );
-        job.leader.wait().expect("reap the leader");
+        job.leader.wait_bounded().expect("reap the leader");
         assert_eq!(
             super::job_listening_ports(&birth).expect("an id nothing holds"),
             BTreeSet::new()

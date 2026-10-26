@@ -48,7 +48,6 @@ pub const INSTALL_LOCK_NAME: &str = "install.lock";
 /// (05_gateway.md, "A land step waits for an install in progress"). Blocking: call it off the
 /// async workers. An install's own process must not call it, since it would wait on itself.
 pub fn wait_for_running_install(support_directory: &Path) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let path = support_directory.join(INSTALL_LOCK_NAME);
     let lock = match std::fs::OpenOptions::new()
@@ -61,26 +60,20 @@ pub fn wait_for_running_install(support_directory: &Path) -> std::io::Result<boo
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    let flock = |operation| loop {
-        // SAFETY: `lock` owns a live descriptor for the call; `flock` does not consume it.
-        if unsafe { libc::flock(lock.as_raw_fd(), operation) } == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    };
-    match flock(libc::LOCK_SH | libc::LOCK_NB) {
+    match lock.try_lock_shared() {
         Ok(()) => return Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-        Err(error) => return Err(error),
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
     cowshed_os::eprintln!(
         "cowshed: an install holds {}; waiting for it to finish",
         path.display()
     );
-    flock(libc::LOCK_SH)?;
+    // WHY unbounded: a land step waits for the install in progress for as long as it runs, said on
+    // stderr first; the operator's interrupt ends it. debt: an install that wedges holding the slot
+    // stalls the step. Moves to cowshed_os::flock.
+    #[allow(clippy::disallowed_methods)]
+    lock.lock_shared()?;
     Ok(true)
 }
 
@@ -104,7 +97,6 @@ mod install_wait_tests {
     /// it lets go. The wait itself holds nothing, so the next install takes the slot at once.
     #[test]
     fn a_wait_ends_with_the_running_install_and_holds_nothing_after() {
-        use std::os::fd::AsRawFd as _;
         let root =
             std::env::temp_dir().join(format!("cowshed-install-wait-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
@@ -117,11 +109,7 @@ mod install_wait_tests {
             !wait_for_running_install(&root).unwrap(),
             "a free slot: no install"
         );
-        // SAFETY: a live descriptor.
-        assert_eq!(
-            unsafe { libc::flock(install.as_raw_fd(), libc::LOCK_EX) },
-            0
-        );
+        install.try_lock().expect("take the free slot");
         let waiter = std::thread::spawn({
             let root = root.clone();
             move || wait_for_running_install(&root)
@@ -134,12 +122,8 @@ mod install_wait_tests {
         drop(install);
         assert!(waiter.join().unwrap().unwrap(), "an install was waited for");
         let next = std::fs::File::open(root.join(INSTALL_LOCK_NAME)).unwrap();
-        // SAFETY: a live descriptor.
-        assert_eq!(
-            unsafe { libc::flock(next.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-            "the waiter holds nothing once it returns"
-        );
+        next.try_lock()
+            .expect("the waiter holds nothing once it returns");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

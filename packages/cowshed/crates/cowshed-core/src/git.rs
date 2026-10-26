@@ -585,6 +585,9 @@ impl GitRepository {
                     // ordinary controller Git must not load the operator's config.
                     command.env_remove("GIT_CONFIG_GLOBAL");
                 }
+                // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager,
+                // editors and prompts off (`git_command_at`): it waits on no other process.
+                #[allow(clippy::disallowed_methods)]
                 let output = command
                     .output_locked()
                     .map_err(|error| git_spawn_error(&error))?;
@@ -658,6 +661,10 @@ impl GitRepository {
                     .open(&draft)
                     .map_err(|error| io_error("create Git identity draft", &draft, error))?;
                 for (key, value) in identity {
+                    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor,
+                    // pager, editors and prompts off (`git_command_at`): it waits on no other
+                    // process.
+                    #[allow(clippy::disallowed_methods)]
                     let output = git_command_at(&source_root)
                         .args([
                             OsStr::new("config"),
@@ -3732,6 +3739,9 @@ impl GitRepository {
     /// reading any answer deadlocks once the answers fill the stdout pipe. A write that fails
     /// because git exited early is not reported, git's status and answers are: a batch git did not
     /// read whole answers short, which its caller refuses.
+    // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
+    // Git sandbox (`git_command_with_objects`): it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     async fn run_input<I, S>(&self, args: I, input: Vec<u8>) -> Result<Output>
     where
         I: IntoIterator<Item = S>,
@@ -3787,6 +3797,9 @@ where
 /// controller writes and verifies bundles in its denied store, which no
 /// workspace profile can read. These object-only verbs do not check out files,
 /// run merge/filter drivers, use configured remotes, or invoke hooks (disabled here).
+// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace Git
+// sandbox (`git_command_with_objects`): it waits on no other process.
+#[allow(clippy::disallowed_methods)]
 async fn run_git_bundle_at<I, S>(
     root: &Path,
     alternate_objects: Option<&Path>,
@@ -4487,6 +4500,9 @@ fn sandboxed_git_command_with_paths(
     if linked {
         // Git's own reading of its config, under the same profile, names every driver it could
         // select; each is switched off for the command the caller runs.
+        // WHY unbounded: a workspace git with hooks off and drivers off or confined by the
+        // workspace Git sandbox (`git_command_with_objects`): it waits on no other process.
+        #[allow(clippy::disallowed_methods)]
         let listing = build()?
             .args(["config", "-z", "--name-only", "--list"])
             .output_locked()
@@ -4551,6 +4567,9 @@ fn git_command_with_objects(
     Ok(command)
 }
 
+// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace Git
+// sandbox (`git_command_with_objects`): it waits on no other process.
+#[allow(clippy::disallowed_methods)]
 async fn run_git_at_with_objects<I, S>(
     #[cfg(target_os = "macos")] store_root: &Path,
     root: &Path,
@@ -4792,6 +4811,9 @@ const CHECK_IGNORE_BATCH: &[&str] = &["check-ignore", "--stdin", "-z", "--no-ind
 /// all of the input before reading any answer deadlocks as soon as the answers fill the stdout
 /// pipe: git blocks writing its stdout, the caller blocks writing git's stdin, and neither
 /// returns. A write that fails because git exited early is not reported: git's status is.
+// WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace Git
+// sandbox (`git_command_with_objects`): it waits on no other process.
+#[allow(clippy::disallowed_methods)]
 fn git_batch_blocking(
     mut command: std::process::Command,
     args: &[&str],
@@ -5328,7 +5350,9 @@ fn parse_one_line<'a>(bytes: &'a [u8], description: &str) -> Result<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
-    use cowshed_os::fork_lock::Run as _;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::ChildBackstop as _;
+    use cowshed_os::test_backstop::{AsyncCommandBackstop as _, CommandBackstop as _};
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -5391,7 +5415,7 @@ mod tests {
             .args(["clone", "-q"])
             .arg(&main)
             .arg(&workspace)
-            .status_locked()
+            .status_bounded()
             .expect("clone workspace");
         assert!(cloned.success());
         let main = main.canonicalize().expect("canonical main");
@@ -5400,7 +5424,7 @@ mod tests {
         let denied = super::sandboxed_git_command_at(store.shared(), &workspace)
             .expect("narrow Git")
             .args(["fetch", "--no-tags", source])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed fetch");
         assert!(
             !denied.status.success(),
@@ -5409,7 +5433,7 @@ mod tests {
         let admitted = super::sandboxed_git_fetch_command(store.shared(), &workspace, &main)
             .expect("trusted read grant")
             .args(["fetch", "--no-tags", source])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed fetch");
         assert!(
             admitted.status.success(),
@@ -5443,14 +5467,14 @@ mod tests {
             .arg(&*main)
             .args(["worktree", "add", "-q", "--detach"])
             .arg(&workspace)
-            .status_locked()
+            .status_bounded()
             .expect("add linked worktree");
         assert!(added.success());
         let workspace = workspace.canonicalize().expect("canonical workspace");
         let output = super::sandboxed_git_command_at(store.shared(), &workspace)
             .expect("narrow Git")
             .args(["config", "core.abbrev"])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed Git");
         assert!(
             output.status.success(),
@@ -5461,7 +5485,7 @@ mod tests {
         let head = super::sandboxed_git_command_at(store.shared(), &workspace)
             .expect("narrow Git")
             .args(["rev-parse", "HEAD"])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed Git");
         assert!(
             head.status.success(),
@@ -5498,7 +5522,7 @@ mod tests {
             .arg(&*main)
             .args(["worktree", "add", "-q", "--detach"])
             .arg(&workspace)
-            .status_locked()
+            .status_bounded()
             .expect("add linked worktree");
         assert!(added.success());
         let workspace = workspace.canonicalize().expect("canonical workspace");
@@ -5510,7 +5534,7 @@ mod tests {
         let output = super::sandboxed_git_command_at(store_root, workspace)
             .expect("narrow Git")
             .args(["config", key])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed Git");
         assert!(
             output.status.success(),
@@ -5577,7 +5601,7 @@ mod tests {
                 .arg(&config)
                 .args(["include.path", target])
                 .current_dir("/")
-                .status_locked()
+                .status_bounded()
                 .expect("git config --file");
             assert!(status.success());
         };
@@ -5596,7 +5620,7 @@ mod tests {
         let fifo = main.join("tooling.fifo");
         let made = Command::new("mkfifo")
             .arg(&fifo)
-            .status_locked()
+            .status_bounded()
             .expect("mkfifo");
         assert!(made.success());
         include("../tooling.fifo");
@@ -5630,7 +5654,7 @@ mod tests {
         let added = super::sandboxed_git_command_at(store.shared(), &workspace)
             .expect("narrow Git")
             .args(["add", "README"])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed add");
         assert!(
             added.status.success(),
@@ -5681,7 +5705,7 @@ mod tests {
                 .arg("-C")
                 .arg(&*main)
                 .args(["rev-parse", spec])
-                .output_locked()
+                .output_bounded()
                 .expect("rev-parse");
             String::from_utf8(output.stdout)
                 .expect("oid")
@@ -5703,7 +5727,7 @@ mod tests {
             .expect("hash-object");
         std::io::Write::write_all(&mut hash.stdin.take().expect("stdin"), body.as_bytes())
             .expect("write commit");
-        let output = hash.wait_with_output().expect("hash-object output");
+        let output = hash.wait_with_output_bounded().expect("hash-object output");
         assert!(output.status.success());
         let forged = String::from_utf8(output.stdout)
             .expect("oid")
@@ -5730,14 +5754,14 @@ mod tests {
             // the sandbox can write isolates the exec rule as the only thing that stops it.
             .env("TMPDIR", &workspace)
             .args(["log", "-1", "--pretty=format:%H", &forged])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed log");
         assert!(!marker.exists(), "the controller's Git ran gpg.program");
         let _ = Command::new("git")
             .arg("-C")
             .arg(&workspace)
             .args(["log", "-1", "--pretty=format:%H", &forged])
-            .output_locked()
+            .output_bounded()
             .expect("unconfined log");
         assert!(
             marker.exists(),
@@ -5756,7 +5780,7 @@ mod tests {
             .expect("narrow Git")
             .env("TMPDIR", &workspace)
             .args(["merge", "--ff-only", &forged])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed merge");
         assert!(
             !merged.status.success(),
@@ -5811,7 +5835,7 @@ mod tests {
         fs::write(workspace.join("README"), "changed\n").expect("change README");
         let _ = command
             .args(["add", "README"])
-            .output_locked()
+            .output_bounded()
             .expect("sandboxed add");
         assert!(
             !marker.exists(),
@@ -5905,8 +5929,6 @@ mod tests {
     /// real bundle fetch through the bundle command shows the fetch's children and no maintenance.
     #[tokio::test]
     async fn a_bundle_fetch_starts_no_detached_maintenance() {
-        use cowshed_os::fork_lock::RunAsync as _;
-
         let source = repository();
         let scratch = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
@@ -5933,7 +5955,7 @@ mod tests {
             .args(["fetch", "--quiet", "--no-tags"])
             .arg(&bundle)
             .arg("HEAD:refs/recovered/0")
-            .output_locked()
+            .output_bounded()
             .await
             .expect("run git fetch");
         assert!(
@@ -6091,7 +6113,7 @@ mod tests {
         let status = Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .arg(root)
-            .status_locked()
+            .status_bounded()
             .expect("run git init");
         assert!(status.success());
         // A fork's capture is one descriptor clone of the live image, a crash-consistent snapshot
@@ -6115,7 +6137,7 @@ mod tests {
                 "add",
                 ".",
             ])
-            .status_locked()
+            .status_bounded()
             .expect("run git add");
         assert!(status.success());
         let status = Command::new("git")
@@ -6130,7 +6152,7 @@ mod tests {
                 "-qm",
                 "initial",
             ])
-            .status_locked()
+            .status_bounded()
             .expect("run git commit");
         assert!(status.success());
         fixture
@@ -6882,7 +6904,7 @@ mod tests {
             .arg("-C")
             .arg(&root)
             .args(["switch", "--detach", "--quiet", "HEAD"])
-            .status_locked()
+            .status_bounded()
             .expect("detach HEAD");
         assert!(status.success());
 
@@ -7008,7 +7030,7 @@ mod tests {
                 .arg("-C")
                 .arg(&root)
                 .args(["check-ignore", "-q", "--no-index", path])
-                .status_locked()
+                .status_bounded()
                 .expect("git check-ignore")
                 .success()
         };
@@ -7289,7 +7311,7 @@ mod tests {
                 "origin",
                 "https://example.invalid/private.git",
             ])
-            .status_locked()
+            .status_bounded()
             .expect("add inherited network remote");
         assert!(status.success());
         // A linked worktree of main: the registration a standalone clone inherits from it.
@@ -7299,7 +7321,7 @@ mod tests {
             .arg(&main)
             .args(["worktree", "add", "-q", "--detach"])
             .arg(&linked)
-            .status_locked()
+            .status_bounded()
             .expect("register inherited worktree");
         assert!(status.success());
         let source_registrations = registrations(&main);
@@ -7437,7 +7459,7 @@ mod tests {
         let session = mount.with_extension("session");
         let status = Command::new("cp")
             .args(["-R".as_ref(), mount.as_os_str(), session.as_os_str()])
-            .status_locked()
+            .status_bounded()
             .expect("clone the workspace image");
         assert!(status.success());
         GitRepository::from_root(store.shared(), &session)
@@ -7467,7 +7489,7 @@ mod tests {
             .arg("-C")
             .arg(&root)
             .args(["switch", "--quiet", "--detach"])
-            .status_locked()
+            .status_bounded()
             .expect("move HEAD off the workspace branch, the only branch preparation kept");
         assert!(switched.success());
         repo.prepare_workspace("raven", &root, &source, Some("main"), true)
@@ -7493,7 +7515,7 @@ mod tests {
         let mount = main.with_extension("workspace");
         let status = Command::new("cp")
             .args(["-R".as_ref(), main.as_os_str(), mount.as_os_str()])
-            .status_locked()
+            .status_bounded()
             .expect("clone image");
         assert!(status.success());
         mount
@@ -7512,7 +7534,7 @@ mod tests {
                 "user.email=test@example.invalid",
             ])
             .args(args)
-            .output_locked()
+            .output_bounded()
             .expect("run git");
         assert!(output.status.success(), "{args:?}");
         String::from_utf8(output.stdout).expect("git output is utf-8")
@@ -7898,7 +7920,7 @@ mod tests {
     fn copy_tree(from: &Path, to: &Path) {
         let status = Command::new("cp")
             .args(["-RP".as_ref(), from.as_os_str(), to.as_os_str()])
-            .status_locked()
+            .status_bounded()
             .expect("copy tree");
         assert!(status.success());
     }
@@ -8129,7 +8151,7 @@ mod tests {
             .arg("-C")
             .arg(&main)
             .args(["branch", "cowshed/raven"])
-            .status_locked()
+            .status_bounded()
             .expect("create colliding branch");
         assert!(status.success());
 
@@ -8342,7 +8364,7 @@ mod tests {
             .arg("-C")
             .arg(&root)
             .args(["remote", "get-url", MAIN_REMOTE])
-            .output_locked()
+            .output_bounded()
             .expect("read raw main remote");
         assert!(output.status.success());
         assert_eq!(
@@ -8414,7 +8436,7 @@ mod tests {
             .arg("-C")
             .arg(&host)
             .args(["update-ref", "refs/remotes/origin/main", host_head.as_str()])
-            .status_locked()
+            .status_bounded()
             .expect("write remote-tracking ref");
         assert!(status.success());
         assert!(
@@ -8429,7 +8451,7 @@ mod tests {
             .args(["clone", "-q"])
             .arg(&host)
             .arg(&session)
-            .status_locked()
+            .status_bounded()
             .expect("clone session");
         assert!(status.success());
         fs::write(session.join("session-only"), "unpublished\n").expect("write session change");
@@ -8444,7 +8466,7 @@ mod tests {
                 "add",
                 ".",
             ])
-            .status_locked()
+            .status_bounded()
             .expect("stage session change");
         assert!(status.success());
         let status = Command::new("git")
@@ -8459,7 +8481,7 @@ mod tests {
                 "-qm",
                 "session-only",
             ])
-            .status_locked()
+            .status_bounded()
             .expect("commit session change");
         assert!(status.success());
         let session_head = GitRepository::from_root(store.shared(), &session)
@@ -8477,7 +8499,7 @@ mod tests {
             .arg("-C")
             .arg(&session)
             .args(["push", "-q", "origin", "HEAD:refs/cowshed/raven/heads/main"])
-            .status_locked()
+            .status_bounded()
             .expect("publish preservation ref");
         assert!(status.success());
         assert!(
@@ -8569,7 +8591,7 @@ mod tests {
             .arg("-C")
             .arg(root)
             .args(["add", "."])
-            .status_locked()
+            .status_bounded()
             .expect("run git add");
         assert!(status.success());
         let status = Command::new("git")
@@ -8584,14 +8606,14 @@ mod tests {
                 "-qm",
                 label,
             ])
-            .status_locked()
+            .status_bounded()
             .expect("run git commit");
         assert!(status.success());
         let output = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["rev-parse", "HEAD"])
-            .output_locked()
+            .output_bounded()
             .expect("read head");
         assert!(output.status.success());
         String::from_utf8(output.stdout)
@@ -8612,7 +8634,7 @@ mod tests {
                 "user.email=test@example.invalid",
             ])
             .args(args)
-            .status_locked()
+            .status_bounded()
             .expect("run git");
         assert!(status.success(), "git {args:?}");
     }
@@ -8631,7 +8653,7 @@ mod tests {
             .arg("-C")
             .arg(&root)
             .args(["config", "--local", "--get", "core.ignorecase"])
-            .output_locked()
+            .output_bounded()
             .expect("read core.ignorecase");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"false\n");
@@ -8739,7 +8761,7 @@ mod tests {
             .args(["clone", "-q"])
             .arg(&main)
             .arg(&workspace)
-            .status_locked()
+            .status_bounded()
             .expect("clone workspace");
         assert!(status.success());
         git(&workspace, &["config", "user.name", "Cowshed Test"]);
@@ -8809,7 +8831,7 @@ mod tests {
             .arg(&recovery)
             .args(["bundle", "verify"])
             .arg(&bundle)
-            .output_locked()
+            .output_bounded()
             .expect("verify bundle in empty repository");
         assert!(
             verify.status.success(),

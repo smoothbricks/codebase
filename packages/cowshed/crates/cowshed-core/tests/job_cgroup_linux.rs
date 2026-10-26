@@ -51,8 +51,9 @@ use cowshed_core::runtime::supervisor::{
     SpawnSink as _, SystemSpawnSink, WorkspaceAuthoritySnapshot,
 };
 use cowshed_os::deadline::{Bound, LatencyClass, REAP};
-use cowshed_os::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::process::RunState;
+use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 use serde::{Deserialize, Serialize};
 
 const ROLE: &str = "COWSHED_JOB_CGROUP_ROLE";
@@ -236,7 +237,7 @@ fn a_job_owns_its_cgroup_from_before_its_first_instruction() {
         ])
         .arg(test_binary())
         .args(role_arguments())
-        .output_locked()
+        .output_bounded()
         .expect("run sudo");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -324,7 +325,7 @@ fn delegate(uid: u32, gid: u32) {
         )
         .env(STORAGE, &scratch.directory);
     let output = command
-        .output_locked()
+        .output_bounded()
         .expect("run the unprivileged controller");
     println!("{}", String::from_utf8_lossy(&output.stdout));
     cowshed_os::eprintln!("{}", String::from_utf8_lossy(&output.stderr));
@@ -368,7 +369,7 @@ fn work(workload: &Workload) {
         .iter()
         .map(|child| {
             let output = workload_command(child)
-                .output_locked()
+                .output_bounded()
                 .expect("run a child workload");
             assert!(output.status.success(), "child workload: {}", output.status);
             report_in(&String::from_utf8_lossy(&output.stdout))
@@ -437,7 +438,9 @@ fn lead(escapee: &Escapee) {
     ];
     wait_for_events(&mut watched, -1);
     if watched[1].revents != 0 {
-        let status = child.wait().expect("reap the unexpectedly exited escapee");
+        let status = child
+            .wait_bounded()
+            .expect("reap the unexpectedly exited escapee");
         panic!("the escapee ended while its leader was held: {status}");
     }
     // The released leader deliberately exits without waiting: the live child must outlast it.
@@ -1845,21 +1848,21 @@ fn report_in(output: &str) -> WorkloadReport {
 /// Linux wait4 includes the child's own CPU and that of descendants it already reaped.
 fn reap_workload(child: &Child) -> std::io::Result<(std::process::ExitStatus, u64)> {
     let pid = libc::pid_t::try_from(child.id()).expect("an owned child's pid fits pid_t");
-    let mut status = 0;
-    // SAFETY: an all-zero rusage is valid output storage.
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     loop {
-        // SAFETY: the selected child is owned by this caller and both output buffers are valid.
-        let waited = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
-        if waited == pid {
-            return Ok((
-                std::process::ExitStatus::from_raw(status),
-                rusage_cpu_us(&usage),
-            ));
-        }
-        let error = last_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
+        match cowshed_os::test_backstop::wait4(pid, 0) {
+            Ok((waited, status, usage)) if waited == pid => {
+                return Ok((
+                    std::process::ExitStatus::from_raw(status),
+                    rusage_cpu_us(&usage),
+                ));
+            }
+            Ok((waited, ..)) => {
+                return Err(std::io::Error::other(format!(
+                    "wait4 {pid} answered {waited}"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
 }
@@ -2787,7 +2790,7 @@ fn sudo(program: &str) -> Command {
 /// Run `command` to its end; a refusal is what it said.
 fn run(command: &mut Command) -> Result<(), String> {
     let output = command
-        .output_locked()
+        .output_bounded()
         .map_err(|error| format!("run {command:?}: {error}"))?;
     if output.status.success() {
         return Ok(());

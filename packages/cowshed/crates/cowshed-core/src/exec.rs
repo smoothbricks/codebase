@@ -339,6 +339,9 @@ pub(crate) fn classify_spawn_error(source: io::Error) -> SpawnFailure {
 }
 
 impl SpawnRunner for SystemSpawnRunner {
+    // WHY unbounded: the wrapped command is the whole work this runner does in the caller's place;
+    // it ends when the command does.
+    #[allow(clippy::disallowed_methods)]
     fn run(&self, plan: &SpawnPlan) -> Result<ExitStatus, SpawnFailure> {
         let mut command = Command::new(&plan.program);
         command

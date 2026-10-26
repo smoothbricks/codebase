@@ -2728,6 +2728,9 @@ fn nearness(checkout: &Path, recorded: Option<&GitOid>, tree: &GitOid) -> Nearne
     if recorded == tree {
         return Nearness::Equal;
     }
+    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors and
+    // prompts off (`git_command_at`): it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let compared = crate::git::git_command_at(checkout)
         .args(["diff-tree", "-r", "--no-renames", "--name-only", "-z"])
         .args([recorded.as_str(), tree.as_str()])
@@ -2763,6 +2766,9 @@ fn nearness(checkout: &Path, recorded: Option<&GitOid>, tree: &GitOid) -> Nearne
 /// The tree `checkout` has checked out, `HEAD^{tree}`.
 fn head_tree(checkout: &Path) -> std::result::Result<GitOid, String> {
     use cowshed_os::fork_lock::Run as _;
+    // WHY unbounded: a git of this host's own repository with hooks, fsmonitor, pager, editors and
+    // prompts off (`git_command_at`): it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = crate::git::git_command_at(checkout)
         .args(["rev-parse", "--verify", "HEAD^{tree}"])
         .output_locked()
@@ -3126,6 +3132,10 @@ pub(super) fn io(operation: &str, path: &Path, error: &std::io::Error) -> Cowshe
 mod tests {
     use super::*;
     use crate::repository::{ProjectPaths, RepoId};
+    use cowshed_os::test_backstop::{
+        AsyncChildBackstop as _, AsyncCommandBackstop as _, ChildBackstop as _,
+        CommandBackstop as _,
+    };
     use std::fs;
 
     struct Store {
@@ -3405,7 +3415,6 @@ mod tests {
 
     /// A git repository at `path` whose commit holds `files`, by its `HEAD^{tree}`.
     fn commit(path: &Path, files: &[(&str, &str)]) -> GitOid {
-        use cowshed_os::fork_lock::Run as _;
         let git = |args: &[&str]| {
             let output = crate::git::git_command_at(path)
                 .args([
@@ -3415,7 +3424,7 @@ mod tests {
                     "user.email=cowshed@example.invalid",
                 ])
                 .args(args)
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(output.status.success(), "git {args:?}: {output:?}");
             String::from_utf8(output.stdout).unwrap()
@@ -5456,7 +5465,7 @@ mod tests {
         mount: &Path,
         profile: &str,
     ) -> (tokio::process::Child, tokio::net::UnixStream, CargoWitness) {
-        use cowshed_os::fork_lock::{RunAsync as _, Spawn as _};
+        use cowshed_os::fork_lock::Spawn as _;
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
         use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -5503,8 +5512,8 @@ fn main() {
             .expect("run the real Cargo build");
         let (stream, _) = tokio::select! {
             connected = listener.accept() => connected.expect("Cargo build script connects"),
-            status = child.wait() => {
-                let output = child.wait_with_output().await.expect("Cargo diagnostics");
+            status = child.wait_bounded() => {
+                let output = child.wait_with_output_bounded().await.expect("Cargo diagnostics");
                 panic!("Cargo exited before its build script was ready: {status:?}; {output:?}");
             }
         };
@@ -5545,7 +5554,7 @@ fn main() {
         let started_pid = child.id().expect("the entry Cargo process is still live");
         let parent = tokio::process::Command::new("/bin/ps")
             .args(["-o", "ppid=,pgid=", "-p", &pid.to_string()])
-            .output_locked()
+            .output_bounded()
             .await
             .expect("the actual Cargo kernel parent and process group");
         assert!(parent.status.success(), "{parent:?}");
@@ -5646,7 +5655,7 @@ fn main() {
             .await;
         writer.write_all(b"G").await.unwrap();
         drop(writer);
-        let output = child.wait_with_output().await.unwrap();
+        let output = child.wait_with_output_bounded().await.unwrap();
         assert!(output.status.success(), "{output:?}");
         let kept_seed = scratch
             .layout
@@ -5804,7 +5813,7 @@ fn main() {
         let direct = capture(&*scratch.host, &scratch.layout, &target, &live, Some(tree));
         let kept = seeds_of(&scratch.layout, &target).unwrap();
         drop(opening.stdin.take());
-        opening.wait().unwrap();
+        opening.wait_bounded().unwrap();
         drop(locked);
         scratch.release_all();
         assert_eq!(kept, previous, "neither refusal replaces the seed");
@@ -5951,7 +5960,7 @@ fn main() {
             .seed_of(&target.name, &target.incarnation)
             .unwrap();
         holder.kill().unwrap();
-        holder.wait().unwrap();
+        holder.wait_bounded().unwrap();
         drop(quiet);
         drop(locked);
         scratch.release_all();
@@ -6030,7 +6039,7 @@ fn main() {
         let stopped = daemon.try_wait().unwrap();
         if stopped.is_none() {
             daemon.kill().unwrap();
-            daemon.wait().unwrap();
+            daemon.wait_bounded().unwrap();
         }
         drop(listener);
         drop(quiet);
@@ -6180,7 +6189,7 @@ fn main() {
             scratch.host.finish_build_releases(&scratch.layout),
         );
         holder.kill().unwrap();
-        holder.wait().unwrap();
+        holder.wait_bounded().unwrap();
         assert!(
             matches!(reseeded.unwrap(), Refresh::Reseeded { .. }),
             "the refresh completes while the superseded seed is held"
@@ -6261,7 +6270,6 @@ fn main() {
     async fn a_fork_of_an_unmoved_workspace_carries_its_build_volume<H: RuntimeStorageHost>(
         scratch: Scratch<H>,
     ) {
-        use cowshed_os::fork_lock::Run as _;
         let main = owner("main", '0');
         let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
         let behind = commit(&main_checkout, &[("lib.rs", "1")]);
@@ -6298,7 +6306,7 @@ fn main() {
             .args(["clone", "--quiet"])
             .arg(&main_checkout)
             .arg(&topic_checkout)
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(cloned.status.success(), "{cloned:?}");
         fs::create_dir_all(topic_checkout.join(".cowshed")).unwrap();
@@ -6362,7 +6370,7 @@ fn main() {
             .args(["clone", "--quiet"])
             .arg(&topic_checkout)
             .arg(&sibling_checkout)
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(cloned.status.success(), "{cloned:?}");
         fs::create_dir_all(sibling_checkout.join(".cowshed")).unwrap();
@@ -6776,7 +6784,7 @@ fn main() {
         let stopped = daemon.try_wait().unwrap();
         if stopped.is_none() {
             daemon.kill().unwrap();
-            daemon.wait().unwrap();
+            daemon.wait_bounded().unwrap();
         }
         let attempt = fs::read_to_string(&admission).unwrap_or_default();
         if let Some(child) = attempt.strip_prefix("admitted ") {
@@ -7063,7 +7071,6 @@ fn main() {
     /// asking `toml`, everything added to the index.
     #[cfg(target_os = "macos")]
     fn tracked_checkout(root: &Path, name: &str, toml: &str, tracked: &[&str]) -> PathBuf {
-        use cowshed_os::fork_lock::Run as _;
         let checkout = root.join(name);
         fs::create_dir_all(checkout.join(".cowshed")).unwrap();
         fs::write(checkout.join(".cowshed.toml"), toml).unwrap();
@@ -7075,7 +7082,7 @@ fn main() {
         for args in [&["init", "--quiet"][..], &["add", "--", "."][..]] {
             let output = crate::git::git_command_at(&checkout)
                 .args(args)
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(output.status.success(), "git {args:?}: {output:?}");
         }

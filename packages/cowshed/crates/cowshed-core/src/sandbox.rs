@@ -1601,9 +1601,9 @@ fn push_line(profile: &mut String, line: &str) {
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use cowshed_os::fork_lock::Run as _;
-    #[cfg(target_os = "macos")]
     use cowshed_os::fork_lock::Spawn as _;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
     use std::fs;
     #[cfg(target_os = "macos")]
     use std::io::Write as _;
@@ -1734,7 +1734,7 @@ mod tests {
                 .args(profile.args())
                 .arg("/usr/bin/touch")
                 .arg(path)
-                .output_locked()
+                .output_bounded()
                 .unwrap()
         };
         for path in ["target/cargo-output", ".nx/cache/nx-output"] {
@@ -1843,7 +1843,7 @@ mod tests {
         let ran = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(launch.args())
             .arg("/usr/bin/true")
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(
             ran.status.success(),
@@ -2005,7 +2005,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                 .arg("/usr/bin/env")
                 .args(["node", "-e", &script])
                 .current_dir(&sandbox.workspace_mount)
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(
                 output.status.success(),
@@ -2051,7 +2051,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/usr/bin/touch"])
                 .arg(path)
-                .output_locked()
+                .output_bounded()
                 .unwrap()
         };
         for path in [
@@ -3550,28 +3550,28 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
         }
         let host_name = std::process::Command::new("/usr/bin/id")
             .arg("-un")
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(host_name.status.success(), "{host_name:?}");
         let name = std::str::from_utf8(&host_name.stdout).unwrap().trim();
         let record = format!("/Users/{name}");
         let host_record = std::process::Command::new("/usr/bin/dscl")
             .args([".", "-read", &record, "UniqueID"])
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(host_record.status.success(), "{host_record:?}");
         let key = config.workspace_mount.join("identity-key");
         let generated = std::process::Command::new("/usr/bin/ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-f"])
             .arg(&key)
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(generated.status.success(), "{generated:?}");
         let public_key = key.with_extension("pub");
         let host_fingerprint = std::process::Command::new("/usr/bin/ssh-keygen")
             .arg("-lf")
             .arg(&public_key)
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(host_fingerprint.status.success(), "{host_fingerprint:?}");
         for role in [
@@ -3582,14 +3582,14 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             let profile = seatbelt_profile(&config, role).unwrap().into_text();
             let identity = std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/usr/bin/id", "-un"])
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(identity.status.success(), "{role:?}: {identity:?}");
             assert_eq!(identity.stdout, host_name.stdout, "{role:?}");
             let fingerprint = std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/usr/bin/ssh-keygen", "-lf"])
                 .arg(&public_key)
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(fingerprint.status.success(), "{role:?}: {fingerprint:?}");
             assert_eq!(fingerprint.stdout, host_fingerprint.stdout, "{role:?}");
@@ -3604,7 +3604,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                     &record,
                     "UniqueID",
                 ])
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(
                 !denied_record.status.success(),
@@ -3644,7 +3644,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
         // not what this proves.
         let found = std::process::Command::new("/usr/bin/xcrun")
             .args(["--find", "python3"])
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(found.status.success(), "{found:?}");
         let python = String::from_utf8(found.stdout).unwrap().trim().to_owned();
@@ -3653,7 +3653,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                 .args(["-p", profile, "--"])
                 .args(argv)
                 .current_dir(&config.workspace_mount)
-                .output_locked()
+                .output_bounded()
                 .unwrap()
         };
         for role in [
@@ -3679,7 +3679,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                 .args(["-p", &profile, "--", "/usr/bin/mktemp"])
                 .env("TMPDIR", &config.exec_temp_dir)
                 .current_dir(&config.workspace_mount)
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(
                 made.status.success()
@@ -3726,7 +3726,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                 .args(argv)
                 .env(name, value)
                 .current_dir(&config.workspace_mount)
-                .output_locked()
+                .output_bounded()
                 .unwrap()
         };
         for role in [
@@ -3798,25 +3798,25 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             .args(["-p", &supervisor, "--", "/usr/bin/touch"])
             .arg(&canonical_stream)
             .stderr(Stdio::null())
-            .status_locked()
+            .status_bounded()
             .unwrap();
         let child_write = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &child, "--", "/usr/bin/touch"])
             .arg(&child_stream)
             .stderr(Stdio::null())
-            .status_locked()
+            .status_bounded()
             .unwrap();
         let ordinary_write = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &child, "--", "/usr/bin/touch"])
             .arg(&workspace_file)
             .stderr(Stdio::null())
-            .status_locked()
+            .status_bounded()
             .unwrap();
         let hardlink_attempt = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &supervisor, "--", "/bin/ln"])
             .args([&canonical_stream, &hardlink])
             .stderr(Stdio::null())
-            .status_locked()
+            .status_bounded()
             .unwrap();
 
         for path in [&git_config, &git_alias] {
@@ -3824,7 +3824,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                 .args(["-p", &child, "--", "/usr/bin/tee"])
                 .arg(path)
                 .stdin(Stdio::null())
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(
                 !write.status.success(),
@@ -3836,7 +3836,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             .args(["-p", &child, "--", "/bin/mv"])
             .arg(config.workspace_mount.join(".cowshed"))
             .arg(config.workspace_mount.join("moved-metadata"))
-            .output_locked()
+            .output_bounded()
             .unwrap();
         assert!(
             !replace_parent.status.success(),
@@ -3899,7 +3899,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             .unwrap()
             .write_all(b"through the links\n")
             .unwrap();
-        let output = run.wait_with_output().unwrap();
+        let output = run.wait_with_output_bounded().unwrap();
         // usdt's proc macro, verbatim: the provider arrives on stdin, the header leaves on stdout.
         let mut dtrace = std::process::Command::new("/usr/bin/sandbox-exec")
             .args(["-p", &child, "--", "/usr/sbin/dtrace"])
@@ -3916,7 +3916,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             .unwrap()
             .write_all(b"provider cowshed_probe { probe ping(int); };\n")
             .unwrap();
-        let header = dtrace.wait_with_output().unwrap();
+        let header = dtrace.wait_with_output_bounded().unwrap();
 
         fs::remove_dir_all(&root).unwrap();
         assert!(
@@ -4029,7 +4029,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             .args(["-p", profile, "--"])
             .args(argv)
             .current_dir(workspace)
-            .output_locked()
+            .output_bounded()
             .unwrap()
     }
 
@@ -4287,7 +4287,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn_locked()
-            .and_then(std::process::Child::wait_with_output)
+            .and_then(std::process::Child::wait_with_output_bounded)
             .unwrap();
 
         fs::remove_dir_all(&root).unwrap();

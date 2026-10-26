@@ -1,3 +1,4 @@
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,7 +10,6 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
-use cowshed_os::fork_lock::Run as _;
 use cowshed_os::namespace::TestNamespace;
 use cowshed_os::timing::{Step, StepSink};
 use serde_json::{Value, json};
@@ -34,7 +34,7 @@ fn git(directory: &Path, args: &[&str]) {
             "user.email=cowshed@example.invalid",
         ])
         .args(args)
-        .output_locked()
+        .output_bounded()
         .expect("run git");
     assert!(
         output.status.success(),
@@ -160,7 +160,7 @@ async fn a_probe_that_waits_for_an_answer_is_the_doctor_step_its_call_is_in() {
     fs::remove_file(&marker).expect("remove the marker");
     let made = Command::new("/usr/bin/mkfifo")
         .arg(&marker)
-        .status_locked()
+        .status_bounded()
         .expect("run mkfifo");
     assert!(made.success(), "mkfifo {}", marker.display());
 

@@ -1943,6 +1943,7 @@ fn is_staged_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::io::{BufRead as _, BufReader, Read as _};
     use std::os::fd::{AsRawFd as _, RawFd};
     use std::process::{Command, Stdio};
@@ -2105,7 +2106,7 @@ mod tests {
         let ended =
             inherited.is_empty() && std::fs::File::from(read).read(&mut [0_u8]).unwrap() == 0;
         drop(child.stdin.take());
-        assert!(child.wait().unwrap().success());
+        assert!(child.wait_bounded().unwrap().success());
         assert_eq!(running, "running\n", "the child's command runs");
         assert_eq!(
             inherited,

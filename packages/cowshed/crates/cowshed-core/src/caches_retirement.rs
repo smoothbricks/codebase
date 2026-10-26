@@ -1020,6 +1020,8 @@ const COPY_TREE: (&str, &[&str]) = ("cp", &["-a"]);
 /// Copy the tree at `from` to the new path `to` with [`COPY_TREE`].
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     let (program, options) = COPY_TREE;
+    // WHY unbounded: a local copy of this host's own files: it waits on no other process.
+    #[allow(clippy::disallowed_methods)]
     let output = Command::new(program)
         .args(options)
         .arg(from)

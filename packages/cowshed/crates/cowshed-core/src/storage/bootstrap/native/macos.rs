@@ -144,6 +144,9 @@ impl BootstrapHost for SystemBootstrapHost {
         inspect_system_mountpoint(path)
     }
 
+    // WHY unbounded: a host tool other than diskutil (whose runs are bounded above) runs for
+    // `cowshed setup` or its uninstall, an operator's verbs; the operator's interrupt ends it.
+    #[allow(clippy::disallowed_methods)]
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
         ensure_supported_host()?;
         if is_diskutil_mount(command) {
@@ -1987,6 +1990,9 @@ fn mount_service_artifacts_present() -> Result<bool, HostError> {
     }
     mount_service_loaded()
 }
+// WHY unbounded: `security` reads the System keychain for `cowshed setup` or its uninstall, an
+// operator's verbs; the operator's interrupt ends it.
+#[allow(clippy::disallowed_methods)]
 fn volume_keychain_item_present(label: &str) -> Result<bool, HostError> {
     let command = HostCommand::new(
         SECURITY,
@@ -4105,6 +4111,7 @@ fn read_marker_no_follow(root: &Path) -> Result<Option<Vec<u8>>, HostError> {
 
 #[cfg(test)]
 mod tests {
+    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
@@ -4745,7 +4752,12 @@ mod tests {
             .expect("piped stdin")
             .write_all(&files.script)
             .expect("write generated script");
-        assert!(shell.wait().expect("wait for shell parser").success());
+        assert!(
+            shell
+                .wait_bounded()
+                .expect("wait for shell parser")
+                .success()
+        );
     }
 
     #[test]

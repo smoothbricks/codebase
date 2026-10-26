@@ -228,6 +228,8 @@ pub fn daemon_socket_at(entry: &Path) -> Result<Option<PathBuf>> {
 mod tests {
     use super::super::test_support::{Fixture, assert_switch};
     use super::*;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::CommandBackstop as _;
     #[test]
     fn a_flake_enables_nix() {
         assert_switch(&DETECTOR, &["flake.nix"]);
@@ -447,8 +449,6 @@ mod tests {
     #[test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     fn host_controller_nix_config_metadata_is_readable_and_nothing_else_in_etc() {
-        use cowshed_os::fork_lock::Run as _;
-
         let nix_conf = Path::new("/etc/nix/nix.conf");
         assert!(
             nix_conf.is_file(),
@@ -472,7 +472,7 @@ mod tests {
                 .arg(path)
                 .current_dir(&config.workspace_mount)
                 .stdin(std::process::Stdio::null())
-                .output_locked()
+                .output_bounded()
                 .unwrap()
         };
         let stderr =

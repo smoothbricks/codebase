@@ -3951,6 +3951,11 @@ mod process_demand_tests {
 mod socket_ownership_tests {
     use super::*;
     use cowshed_os::fork_lock::Spawn as _;
+    #[cfg(target_os = "macos")]
+    use cowshed_os::test_backstop::UnixStreamBackstop as _;
+    use cowshed_os::test_backstop::{
+        AsyncChildBackstop as _, AsyncUnixStreamBackstop as _, ChildBackstop as _,
+    };
 
     fn path() -> PathBuf {
         crate::temp_parent::scratch_parent()
@@ -4030,7 +4035,7 @@ mod socket_ownership_tests {
 
     /// `listener` takes a new connection made to `path`.
     async fn accepts(listener: &UnixListener, path: &Path) {
-        let client = UnixStream::connect(path).await.unwrap();
+        let client = UnixStream::connect_bounded(path).await.unwrap();
         listener.accept().await.unwrap();
         drop(client);
     }
@@ -4046,7 +4051,7 @@ mod socket_ownership_tests {
         held.bind(&path).unwrap();
         let before = inode(&path);
         assert_eq!(
-            UnixStream::connect(&path).await.unwrap_err().kind(),
+            UnixStream::connect_bounded(&path).await.unwrap_err().kind(),
             io::ErrorKind::ConnectionRefused
         );
 
@@ -4079,7 +4084,7 @@ mod socket_ownership_tests {
         let before = inode(&path);
         let mut queued = Vec::new();
         let refused = loop {
-            match std::os::unix::net::UnixStream::connect(&path) {
+            match std::os::unix::net::UnixStream::connect_bounded(&path) {
                 Ok(stream) => queued.push(stream),
                 Err(error) => break error,
             }
@@ -4174,7 +4179,7 @@ mod socket_ownership_tests {
             crate::ErrorCode::Conflict
         );
 
-        owner.kill().await.unwrap();
+        owner.kill_bounded().await.unwrap();
 
         assert_eq!(hello_if_present(&path).await.unwrap(), None);
         let socket = bind(&path).await.unwrap();
@@ -4215,7 +4220,7 @@ mod socket_ownership_tests {
                 .stderr(std::process::Stdio::null())
                 .spawn_locked()
                 .unwrap()
-                .wait()
+                .wait_bounded()
                 .unwrap()
                 .success()
         );
@@ -4242,10 +4247,10 @@ mod socket_ownership_tests {
             .unwrap();
         // The child that inherited the listener reads this until it is dropped.
         let holder_input = creator.stdin.take().unwrap();
-        assert!(creator.wait().await.unwrap().success());
+        assert!(creator.wait_bounded().await.unwrap().success());
         let held = inode(&path);
         drop(
-            UnixStream::connect(&path)
+            UnixStream::connect_bounded(&path)
                 .await
                 .expect("the inherited listener queues"),
         );
@@ -4404,6 +4409,7 @@ mod admission_source_tests {
 
 #[cfg(test)]
 mod drain_read_tests {
+    use cowshed_os::test_backstop::AsyncChildBackstop as _;
     use std::time::Duration;
 
     use super::*;
@@ -4599,7 +4605,13 @@ mod drain_read_tests {
             "job 9 is owed to its live requester once recorded"
         );
         drop(child.stdin.take());
-        assert!(child.wait().await.expect("the requester exits").success());
+        assert!(
+            child
+                .wait_bounded()
+                .await
+                .expect("the requester exits")
+                .success()
+        );
         let settled = tokio::time::timeout(Duration::from_secs(60), settle)
             .await
             .expect("whole-leg watchdog: the drain settles once job 9's requester exited");
@@ -4684,7 +4696,13 @@ mod drain_read_tests {
             Arc::clone(&owed).watch(watch);
         }
         drop(reader.stdin.take());
-        assert!(reader.wait().await.expect("the reader exits").success());
+        assert!(
+            reader
+                .wait_bounded()
+                .await
+                .expect("the reader exits")
+                .success()
+        );
         let settled = tokio::time::timeout(
             Duration::from_secs(60),
             owed.settle(Duration::from_secs(60 * 60)),

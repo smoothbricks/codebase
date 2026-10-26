@@ -11,6 +11,7 @@
 //! pre-cowshed tree are sentinel bytes at the exact paths the intent names: the journal must never
 //! rewrite them, and no disk image is attached or minted here.
 
+use cowshed_os::test_backstop::CommandBackstop as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,6 @@ use crate::metadata::{
 };
 use crate::repository::RepoId;
 use crate::temp_root::TempRoot;
-use cowshed_os::fork_lock::Run as _;
 
 use super::{
     LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentJournal,
@@ -240,7 +240,7 @@ fn git(root: &Path, args: &[&str]) -> Vec<u8> {
     let output = crate::git::git_command_at(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .output_locked()
+        .output_bounded()
         .expect("run real git fixture command");
     assert!(
         output.status.success(),
