@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use cowshed_core::api::dto::ExitStatus;
 use cowshed_core::host_dirs::support_directory;
-use cowshed_core::land_turn::{TurnEventKind, land_turn_root, observe, observe_all};
+use cowshed_core::land_turn::{land_turn_root, observe, observe_all};
 use cowshed_core::runtime::job_groups::{await_exit_unreaped, signal_unreaped_group};
+use cowshed_types::land_turn::TurnEventKind;
 
 const REPO: &str = "testrepo";
 const POLL: Duration = Duration::from_millis(20);

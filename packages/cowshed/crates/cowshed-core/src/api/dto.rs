@@ -1,10 +1,10 @@
 use crate::api::process::{JobContainment, OutlivedProcess};
 use crate::error::CowshedError;
-use crate::land_turn::Ticket;
 use crate::project_retirement::ProjectRetirementReport;
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use base64::Engine;
 use bytes::Bytes;
+use cowshed_types::land_turn::Ticket;
 use cowshed_types::lifecycle::{DerivedWorkspace, MountRefusal, MountState, Pin as LifecyclePin};
 use cowshed_types::metadata::DetachedWorkspaceMetadata;
 pub use cowshed_types::metadata::{
@@ -4676,7 +4676,7 @@ pub struct LandTurnQueue {
     pub repo: String,
     pub tickets: Vec<Ticket>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub abandoned: Vec<crate::land_turn::TurnEvent>,
+    pub abandoned: Vec<cowshed_types::land_turn::TurnEvent>,
 }
 
 /// The daemon and CLI executables, when their contents differ.

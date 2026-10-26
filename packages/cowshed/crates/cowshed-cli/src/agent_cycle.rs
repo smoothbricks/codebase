@@ -8,7 +8,8 @@ use std::fmt;
 use std::time::Duration;
 
 use cowshed_core::CowshedError;
-use cowshed_core::land_turn::{RepoTurns, Ticket};
+use cowshed_core::land_turn::RepoTurns;
+use cowshed_types::land_turn::Ticket;
 
 /// A loaded agent as `launchctl print` reports it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
