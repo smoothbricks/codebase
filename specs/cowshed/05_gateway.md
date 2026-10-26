@@ -925,20 +925,22 @@ the handshake bound.
   signalled, and a lock the helper takes after its waiter left is released at once. The image lease is held for one
   disk-image command's run, so its wait is class `ffi` bounded by that command's own deadline, 120 s
   (`DISK_CHILD_DEADLINE`), and it names the pid its holder recorded. The shell is `cowshed-os::flock::exclusive`.
-- **A launchctl or codesign call is an ffi call.** Every `launchctl` call cowshed makes (the CLI's `LaunchctlCommand`
-  and setup's mount-service probe) and every `codesign` of the gateway host runs to its end within its row's bound
-  (`cowshed-os::deadline::output_within`). Past it the call fails `TIMEOUT` naming the tool's pid and the state the
-  kernel shows it in, and the tool is left as it is. A failed call is a failure, never an answer: a probe whose
-  launchctl did not answer never reads as "not loaded". The bases, measured 2026-10-26 on an M5 Max (18 cores) at load
-  average 17: `print` and `bootstrap` answer from launchd's own state in at most 0.02 s (five `launchctl print` runs of
-  the gateway agent and one `bootstrap` of a test agent), so their bound is the 10 s starting value of the class. A
-  `bootout` returned in 0.01 s while launchd went on tearing the agent down, but launchctl may wait for the process, so
-  its bound is launchd's own deadline for the bootout: ET, the exit timeout `launchctl print` reports for the loaded
-  agent, plus the 1 s its unload may trail the kill (`agent_cycle::bootout_deadline`). A `kickstart -k` returns only
-  once the old process has exited and the new one has started: 9.03 s at ET 2 s and at ET 6 s (launchd's 10 s respawn
-  throttle, counted from the old start) and 12.02 s at ET 12 s, a test agent ignoring SIGTERM. So it is bounded as that
-  bootout and then one launchctl call. `codesign` signed a copy of the 48 MB gateway host in at most 0.15 s and verified
-  it in at most 0.06 s (three runs each).
+- **A launchctl or codesign call is an ffi call.** Every `launchctl` call cowshed runs as the user (the CLI's
+  `LaunchctlCommand` and setup's mount-service probe) and every `codesign` of the gateway host runs to its end within
+  its row's bound (`cowshed-os::deadline::output_within`). The calls setup makes through its privileged session
+  (`AuthorizationExecuteWithPrivileges`: the mount service's bootout, enable, bootstrap and kickstart) are read from
+  that session's pipe, which no bound covers yet. Past its bound a call fails `TIMEOUT` naming the tool's pid and the
+  state the kernel shows it in, and the tool is left as it is. A failed call is a failure, never an answer: a probe
+  whose launchctl did not answer never reads as "not loaded". The bases, measured 2026-10-26 on an M5 Max (18 cores) at
+  load average 17: `print` and `bootstrap` answer from launchd's own state in at most 0.02 s (five `launchctl print`
+  runs of the gateway agent and one `bootstrap` of a test agent), so their bound is the 10 s starting value of the
+  class. A `bootout` returned in 0.01 s while launchd went on tearing the agent down, but launchctl may wait for the
+  process, so its bound is launchd's own deadline for the bootout: ET, the exit timeout `launchctl print` reports for
+  the loaded agent, plus the 1 s its unload may trail the kill (`agent_cycle::bootout_deadline`). A `kickstart -k`
+  returns only once the old process has exited and the new one has started: 9.03 s at ET 2 s and at ET 6 s (launchd's 10
+  s respawn throttle, counted from the old start) and 12.02 s at ET 12 s, a test agent ignoring SIGTERM. So it is
+  bounded as that bootout and then one launchctl call. `codesign` signed a copy of the 48 MB gateway host in at most
+  0.15 s and verified it in at most 0.06 s (three runs each).
 - **Spans.** A failure reaches the boundary that owns the wait as a value. An owner that has a span ends it `span-err`
   with the failure's message.
 

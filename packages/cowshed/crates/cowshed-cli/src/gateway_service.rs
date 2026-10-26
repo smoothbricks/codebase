@@ -5783,6 +5783,16 @@ mod tests {
             let target =
                 LaunchAgentTarget::new(Path::new("/tmp"), "dev.cowshed.gateway").expect("target");
             let mut output = Output::new(Vec::new(), Vec::new(), false);
+            // One probe fails on the silence a gateway that never heartbeated is allowed, as
+            // `SILENT`: the probe is bounded by the silence, not cut short by a connect.
+            let probe = client.status().await;
+            assert!(
+                matches!(
+                    &probe,
+                    Err(ControlError::Wait(WaitError::Silent(silent))) if silent.op == "status"
+                ),
+                "{probe:?}"
+            );
             let started = tokio::time::Instant::now();
             let error = await_healthy(
                 &mut output,
