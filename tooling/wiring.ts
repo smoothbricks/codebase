@@ -1470,6 +1470,8 @@ class Judge {
   }
 
   scriptNamed(path: string): boolean {
+    // A published package's `bin` (or another entry its manifest exposes) is the script's caller.
+    if (this.#resolver.isManifestEntry(path)) return true;
     const base = posix.basename(path);
     const named = new RegExp(`(?:^|[\\s/'"\`=(])${escapeRegExp(base)}(?![\\w.-])`, 'm');
     for (const file of this.#production(this.#tree.filesHolding(base, false))) {

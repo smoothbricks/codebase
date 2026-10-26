@@ -270,6 +270,18 @@ expectFindings(
   ['script helper-writer.ts@tooling/helper-writer.ts:1'],
 );
 
+expectFindings(
+  "a script a published package's bin exposes through its emit passes; a private package's bin is no caller",
+  {
+    'packages/tool/package.json': '{ "name": "@w/tool", "bin": { "tool": "./dist/ts/bin/tool.js" } }\n',
+    'packages/tool/tsconfig.lib.json': '{ "compilerOptions": { "rootDir": "src", "outDir": "dist/ts" } }\n',
+    'packages/tool/src/bin/tool.ts': 'console.log(1);\n',
+    'packages/own/package.json': '{ "name": "@w/own", "private": true, "bin": { "own": "./dist/ts/bin/own.js" } }\n',
+    'packages/own/tsconfig.lib.json': '{ "compilerOptions": { "rootDir": "src", "outDir": "dist/ts" } }\n',
+    'packages/own/src/bin/own.ts': 'console.log(2);\n',
+  },
+  ['script own.ts@packages/own/src/bin/own.ts:1'],
+);
 // --- Nx targets -----------------------------------------------------------------------------------------------------
 
 const TARGETS = (targets: string): string =>
