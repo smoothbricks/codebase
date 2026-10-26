@@ -20,7 +20,7 @@ import {
   type UnitTime,
 } from './land-pick.ts';
 
-// The pick's decisions as plain calls (land-host.test.ts keeps the one real run through the script). The fixture is a
+// The pick's decisions as plain calls; no script runs the pick until `cowshed land` does (land-pick.ts). The fixture is a
 // three-member chain: app depends on core, core on os, and os reaches the registry package ring@0.17.14.
 
 const os: Member = { name: 'os', dir: 'crates/os', dependents: ['core'], registry: new Set(['ring@0.17.14']) };

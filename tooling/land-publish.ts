@@ -1,8 +1,9 @@
 // The land's publish of the gate's Nx results. A land publishes only after its gate passed, so the localhost Nx cache
 // holds only task results a verified tree produced. Sheds read that cache and never write it (05_gateway.md,
 // "/nx/v1/cache/{hash}", accepted-project Nx artifacts; the owner's ruling, 2026-10-10: every shed reads the local remote
-// cache, and only a land publishes). land-host.sh runs this twice: 'hashes' right after the gate passes, while the Nx
-// run summary still belongs to the gate, and 'publish' once the Linux cross check passes.
+// cache, and only a land publishes). land-host.sh runs 'hashes' right after the gate passes, while the Nx
+// run summary still belongs to the gate, and again once the Linux cross check has written one of its own; 'publish' runs
+// for each list once the cross check passes.
 //
 //   land-publish.ts hashes RUN_JSON SINCE     print the distinct task hashes of the run's succeeded tasks, refusing a
 //                                             summary whose run began before SINCE (epoch seconds): an earlier run's

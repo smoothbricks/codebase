@@ -15,3 +15,28 @@
 # Nx cache restores them. `.cache/statebus-packages` is an uncached verification run's report,
 # read back by nothing, and its consumer lockfiles name the checkout.
 state = [".cache/ttsc"]
+
+[land]
+# The declared land (specs/cowshed/02_workspaces.md "A declared land"): `cowshed land <ws>` takes this land turn,
+# rebases <ws> onto main, runs the gate below on the host in main's pure environment, fast-forwards main under the ref
+# turn smoothbricks.ref (rebasing and gating again when main moved) and retires <ws>, then pushes main to codebase and
+# runs the after commands, detached.
+turn = "smoothbricks"
+gate = ["sh", "tooling/land-host.sh", "--gate", "{workspace}"]
+push = "codebase"
+# First main's built products (the ordinary compiler outputs and the host's development CLI and addon), which developer
+# links in other checkouts run; Nx restores the outputs the gate cached for the same tree. Then the install of a land
+# that changed cowshed.
+after = [
+  ["bun", "nx", "run-many", "-t", "build", "cli-native", "napi-native", "--outputStyle=static-failures-only"],
+  ["sh", "tooling/land-install.sh", "smoothbricks", "{before}", "{head}"],
+]
+
+[doc]
+# `cowshed doc-commit`: Markdown reaches main under the ref turn with no shed and no gate of its own; the next land
+# gates any task that hashes it. The check runs in main with the edit's paths appended, before they are staged, and
+# refuses an edit that leaves a code reference in a spec naming nothing in the tree the commit holds (the refusal root
+# lint's spec-links gives every land's gate) or that carries a file a crate compiles in, which a code task hashes
+# (tooling/checks/doc-lane.ts). The commit's pre-commit hook formats the Markdown.
+paths = ["*.md", "*.markdown", "*.mdx"]
+check = ["bun", "tooling/checks/doc-lane.ts"]

@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
-// The land's build-volume pick (specs/cowshed/16_build_volumes.md, "Picking a land's build volume"). Before the gate,
-// land-host.sh prices the two images the gate could build on: the workspace's own build volume and main's latest seed,
-// the one image `cowshed reseed <ws> --from main` would clone. Nx cacheable work is not priced: the localhost Nx cache
+// The land's build-volume pick (specs/cowshed/16_build_volumes.md, "Picking a land's build volume"). Before the gate, a
+// land prices the two images the gate could build on: the workspace's own build volume and main's latest seed, the one
+// image `cowshed reseed <ws> --from main` would clone. No script runs it today: the declared gate (land-host.sh --gate)
+// builds on the workspace's own volume, and the pick is to move into `cowshed land`, which ports this pricing; until
+// then land-pick.test.ts keeps the spec's rules. Nx cacheable work is not priced: the localhost Nx cache
 // serves both, and a seed's gate entries reached it when its land published them. What differs is Cargo: a unit is
 // rebuilt when its sources differ from the tree its target directory was built at. The price of an image is the
 // compile seconds of the workspace units the gate tree makes dirty in it, closed over the units that depend on them.

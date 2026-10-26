@@ -668,10 +668,12 @@ not a container-free-space measurement.
 ### Picking a land's build volume
 
 Before its gate, a land picks the image the gate builds on: the workspace's own build volume, or a clone of main's
-latest seed, the image `cowshed reseed <ws> --from main` clones. Today the land wrapper picks (SmoothBricks:
-`tooling/land-host.sh` through `tooling/land-pick.ts`), after the rebase and before the gate, and again before every
-re-gate after main moved; the pick is to move into `cowshed land`. With the land and rebase carries gone, a land's Nx
-hits come only from the image it gates on and the shared cache, so the price is the Cargo term above.
+latest seed, the image `cowshed reseed <ws> --from main` clones. No land makes this choice yet: SmoothBricks's declared
+gate (`tooling/land-host.sh --gate`) runs after `cowshed land`'s rebase and builds on the workspace's own volume, so a
+land whose own volume is far from main's seed compiles more Cargo units than the pick would have left it. The pick is to
+move into `cowshed land`, which makes it after the rebase and before every gate, and again before every re-gate after
+main moved; `tooling/land-pick.ts` holds the pricing it ports. With the land and rebase carries gone, a land's Nx hits
+come only from the image it gates on and the shared cache, so the price is the Cargo term above.
 
 An image's price is the compile seconds of the workspace's Cargo units it would rebuild for the rebased tree:
 
@@ -731,11 +733,8 @@ dirty-unit rules named exactly the 18 packages that rebuilt.
 
 - **Enforced by**: `tooling/land-pick.test.ts` (ownership, test-only reach, closure, registry reach through a member
   cycle, lock and configuration changes in meaning and not, pricing, the tie, space and unpriced-member rules, compile
-  and build-script run timing, an unreadable target directory, the preview's seed and refusal code) and
-  `tooling/land-host.test.ts` (a land reseeds onto the seed it priced, and picks again before a re-gate after main
-  moved; keeps its own volume when that prices cheaper, when main's seed changed after the price, when the pricing
-  fails, and when the preview finds no seed or fails otherwise, each said apart; and says a reseed that did not finish;
-  every one of them gates and lands).
+  and build-script run timing, an unreadable target directory, the preview's seed and refusal code). No script runs the
+  pick until `cowshed land` does, so no script test covers a reseed.
 
 ### Clearing a checkout's Nx state
 

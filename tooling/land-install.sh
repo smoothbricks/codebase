@@ -23,10 +23,12 @@
 # 5. Run the staged build's setup once. A refusal it answers is told apart from a build it will not install by a fresh
 #    status: work that began after the first read defers the install too.
 #
-# stdout carries only land-status lines, one per outcome, for the operator's wrapper to append to its land-status
-# record: '<UTC time> <head> install attended|unverified|deferred|installed|failed|skipped ...' (land-install.ts,
-# landStatusLine). Every other word goes to stderr. Nothing here waits for the host: an install it cannot take now is
-# deferred with the command to rerun, and whoever sees the named work end reruns it.
+# stdout carries only land-status lines, one per outcome: '<UTC time> <head> install attended|unverified|deferred|
+# installed|failed|skipped ...' (land-install.ts, landStatusLine). Run as the declared after-land command, they are kept
+# with every other word (stderr) in the land's records, lands/<head>.after<n>.log beside lands.log (specs/cowshed/
+# 02_workspaces.md "A declared land", step 6): there whoever watches the install reads them. Nothing here waits for the
+# host: an install it cannot take now is deferred with the command to rerun, and whoever sees the named work end
+# reruns it.
 # Nx and setup run through 'direnv exec <main>', whatever environment started the script: setup installs the PATH of the
 # shell it runs in and its build-state discovery runs cargo, neither of which a pure environment has.
 set -eu

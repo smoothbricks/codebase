@@ -14,21 +14,20 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { judgeHistory, PRE_REWRITE_MAIN } from './land-history.ts';
 import type { Call } from './land-host.plan.ts';
 
-// Behavioural tests of tooling/land-host.sh: the script runs for real, against real git repositories for main and the
-// workspace and the real ancestry guard, failure reporter and attribution (land-attribution.ts). Four things are
-// stand-ins on PATH, because they are this machine's operator tooling and the gate itself: `cowshed` (a workspace is a
-// git clone of main; rebase and land and their fences are git operations; the gate must run as
-// `exec <ws> --class gate --host --`, at the workspace root, where the job names Nx's cache directory in
-// NX_CACHE_DIRECTORY), `direnv` (runs the command it is given) and `bun nx` (land-host.fake-nx.ts plays back the calls
-// a scenario scripts: its exact output, exit status and run summary rows). A scenario names every nx call the land may
-// make, in order: a call it did not script fails the land. node runs the publisher, recording what land-publish.ts gave
-// it and refusing when FIX_PUBLISH says so, and the workspace's tooling/land-inputs.mts, recording the tasks it was asked
-// about and printing the inputs the fixture keeps in inputs.json. The build-volume pick runs land-pick.ts for real but for
-// its `price` verb, which reads Cargo's fingerprints and the store's seed sidecars (land-pick.test.ts's): a scenario
-// that names a price (FIX_PRICE) is answered with it, and main's reseed preview and reseed answer as the scenario says.
+// Behavioural tests of tooling/land-host.sh, the declared `[land] gate` (specs/cowshed/02_workspaces.md "A declared
+// land", step 4): the script runs for real, against real git repositories for main and the workspace and the real
+// failure reporter and attribution (land-attribution.ts). Four things are stand-ins on PATH, because they are this
+// machine's operator tooling and the gate itself: `cowshed` (a workspace is a git clone of main, already rebased as
+// cowshed's route leaves it; it answers `path`, logs every call and refuses any other, so a gate that asked for a
+// rebase or a land fails; the gate must run as `exec <ws> --class gate --host --`, at the workspace root, where the job
+// names Nx's cache directory in NX_CACHE_DIRECTORY), `direnv` (runs the command it is given) and `bun nx`
+// (land-host.fake-nx.ts plays back the calls a scenario scripts: its exact output, exit status and run summary rows). A
+// scenario names every nx call the gate may make, in order: a call it did not script fails the gate. node runs the
+// publisher, recording what land-publish.ts gave it and refusing when FIX_PUBLISH says so, and the workspace's
+// tooling/land-inputs.mts, recording the tasks it was asked about and printing the inputs the fixture keeps in
+// inputs.json.
 
 const tooling = import.meta.dir;
 const repo = dirname(tooling);
@@ -43,9 +42,8 @@ const TASK = 'cowshed:cargo-test-cowshed-core-shard1';
 const CORES = String(spawnSync('sysctl', ['-n', 'hw.ncpu'], { encoding: 'utf8' }).stdout).trim();
 const GATE = ['run-many', '-t', 'gate', `--parallel=${CORES}`, '--nx-bail=false', '--outputStyle=static-failures-only'];
 const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
-/** Main restores the ordinary outputs plus its source-selected host CLI and addon after a successful land. */
-const MAIN_BUILD = ['run-many', '-t', 'build', 'cli-native', 'napi-native', '--outputStyle=static-failures-only'];
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
+/** The shipping seam after the Linux cross check: the host production CLI, then cowshed:release-check on its bytes. */
 const SHIPPING_PRODUCER = ['run', 'cowshed:cli-native:production', '--outputStyle=static-failures-only'];
 const SHIPPING_CHECK = ['run', 'cowshed:release-check', '--outputStyle=static-failures-only'];
 const SHIPPING_PRODUCER_PASSED: Call = {
@@ -57,6 +55,14 @@ const SHIPPING_CHECK_PASSED: Call = {
   run: [{ taskId: 'cowshed:release-check', hash: 'shipping-check-hash', status: 0 }],
 };
 const SHIPPING = [SHIPPING_PRODUCER_PASSED, SHIPPING_CHECK_PASSED];
+const SHIPPING_NX = SHIPPING.map((call) => call.args.join(' '));
+
+/** The Linux cross check as an Nx run of its own: its run summary names the task the pre-push hook asks Nx for. */
+const CROSS = ['run-many', '-t', 'cargo-lint-cross'];
+const CROSS_PASSED: Call = {
+  ...passingRun(CROSS),
+  run: [{ taskId: 'cowshed:cargo-lint-cross', hash: 'cross-hash', status: 0 }],
+};
 /** A whole gate that passed: its run summary carries the root aggregate's row, the hash a land publishes. */
 const GATE_PASSED: Call = {
   ...passingRun(GATE),
@@ -64,7 +70,7 @@ const GATE_PASSED: Call = {
 };
 /** The files Nx hashes for each task and the tasks it waits for: the workspace's one commit writes change.txt. */
 const INPUTS = { 'lib:lint': ['change.txt', 'lib/src/index.ts'], 'lib:test': ['lib/src/index.ts'] };
-/** The diff-scoped wiring check the land runs before the gate, against the main head it rebased onto; `*` is any. */
+/** The diff-scoped wiring check the gate runs first, against the commit the workspace was rebased onto; `*` is any. */
 const WIRING = (base: string) => [
   'run',
   '@smoothbricks/codebase:wiring',
@@ -105,7 +111,7 @@ case $1 in
   ;;
 esac
 cat >"$FIX_STATE/publish.program"
-printf '%s\\n' "$@" >"$FIX_STATE/publish.args"
+printf '%s\\n' "$@" >>"$FIX_STATE/publish.args"
 [ "$FIX_PUBLISH" = refuse ] && { echo 'the publish was refused' >&2; exit 1; }
 echo '{"published":1,"existing":0,"skipped":0}'
 `,
@@ -120,98 +126,23 @@ exit 64
   bun: `#!/bin/sh
 case $1 in
 nx) shift; exec "$FIX_BUN" "$FIX_FAKE_NX" "$@" ;;
-*/land-pick.ts)
-  if [ "$2" = price ] && [ -n "$FIX_PRICE" ]; then
-    [ "$FIX_PRICE" = fail ] && { echo 'land-pick: the scenario refuses to price' >&2; exit 1; }
-    echo "$FIX_PRICE"
-    exit 0
-  fi
-  ;;
 esac
 exec "$FIX_BUN" "$@"
 `,
   cowshed: `#!/bin/sh
-[ "$1" = --json ] && shift
+# Every call is logged as its subcommand and first argument: the gate's route is cowshed's, so a gate asks for no
+# rebase and no land, and anything but 'path' and 'exec' is refused.
+printf '%s %s\\n' "$1" "$2" >>"$FIX_STATE/cowshed.log"
 cmd=$1
 shift
-fence() {
-  printf '{"ok":false,"error":{"code":"conflict","fence":{"reason":"%s","observed":"%s"}}}\\n' "$1" "$2"
-  exit 1
-}
 case $cmd in
 path) if [ "$1" = main ]; then echo "$FIX_MAIN"; else echo "$FIX_WS"; fi ;;
-rebase)
-  shift
-  [ "$1" = --expected-onto-head ] || exit 64
-  now=$(git -C "$FIX_MAIN" rev-parse HEAD)
-  [ "$2" = "$now" ] || fence ontoMoved "$now"
-  git -C "$FIX_WS" fetch -q "$FIX_MAIN" main
-  git -C "$FIX_WS" rebase -q FETCH_HEAD >&2
-  echo '{"ok":true}'
-  ;;
-land)
-  shift
-  while [ "$#" -gt 0 ]; do
-    case $1 in
-    --expected-target-head) target=$2; shift 2 ;;
-    --expected-source-head) source=$2; shift 2 ;;
-    *) shift ;;
-    esac
-  done
-  if [ -f "$FIX_STATE/move-main" ]; then
-    rm "$FIX_STATE/move-main"
-    (cd "$FIX_MAIN" && echo moved >moved.txt && git add moved.txt && git commit -q -m 'chore: main moves')
-  fi
-  now=$(git -C "$FIX_MAIN" rev-parse HEAD)
-  [ "$target" = "$now" ] || fence targetMoved "$now"
-  head=$(git -C "$FIX_WS" rev-parse HEAD)
-  [ "$source" = "$head" ] || fence sourceMoved "$head"
-  git -C "$FIX_MAIN" fetch -q "$FIX_WS" HEAD
-  git -C "$FIX_MAIN" merge -q --ff-only FETCH_HEAD
-  echo '{"ok":true}'
-  ;;
 exec)
   [ -n "$1" ] && [ "$2" = --class ] && [ "$3" = gate ] && [ "$4" = --host ] && [ "$5" = -- ] || exit 64
   shift 5
   # The job names the directory its Nx writes the run summary into, as the workspace supervisor does.
   export NX_CACHE_DIRECTORY="$FIX_WS/.nx/cache"
   cd "$FIX_WS" && exec "$@"
-  ;;
-reseed)
-  printf '%s\\n' "$*" >>"$FIX_STATE/reseed.log"
-  case " $* " in
-  *' --dry-run '*)
-    # Main has no seed unless the scenario seeds it; a conflict stands for any other refused preview. Codes and exit
-    # statuses are cowshed's (ErrorCode in cowshed-core's error.rs). seed-then-conflict answers once, then refuses.
-    case $FIX_PREVIEW in
-    seed) printf '{"ok":true,"result":{"seed":"%s","dryRun":true}}\\n' "$FIX_SEED" ;;
-    seed-then-conflict)
-      if [ ! -f "$FIX_STATE/previewed" ]; then
-        : >"$FIX_STATE/previewed"
-        printf '{"ok":true,"result":{"seed":"%s","dryRun":true}}\\n' "$FIX_SEED"
-        exit 0
-      fi
-      printf '{"ok":false,"error":{"code":"conflict","message":"lifecycle/image lock held"}}\\n'
-      exit 4
-      ;;
-    conflict)
-      printf '{"ok":false,"error":{"code":"conflict","message":"unfinished lifecycle journal entry"}}\\n'
-      exit 4
-      ;;
-    *)
-      printf '{"ok":false,"error":{"code":"not-found","message":"main has no seed"}}\\n'
-      exit 3
-      ;;
-    esac
-    ;;
-  *)
-    if [ "$FIX_RESEED" = fail ]; then
-      printf '{"ok":false,"error":{"code":"io","message":"release the superseded build volume"}}\\n'
-      exit 1
-    fi
-    printf '{"ok":true,"result":{"seed":"%s","dryRun":false}}\\n' "$FIX_SEED"
-    ;;
-  esac
   ;;
 *) exit 64 ;;
 esac
@@ -252,36 +183,36 @@ function git(directory: string, ...args: string[]): string {
   return run.stdout.trim();
 }
 
-interface LandRun {
+interface GateRun {
   readonly status: number;
   /** What the script said on stderr. */
   readonly log: string;
   /** The nx calls it made, in order. */
   readonly nx: readonly string[];
+  /** The cowshed calls it made, in order, each as its subcommand and first argument. */
+  readonly cowshed: readonly string[];
   /** Arguments received by the planted unavailable replay tool, when this fixture uses it. */
   readonly replayArgs?: readonly string[];
-  /** The arguments of each `cowshed reseed` the land ran, in order. */
-  readonly reseeds: readonly string[];
 }
 
-/** Main's seed in a scenario that has one. */
-const SEED = 'a895a1ce6c80439484c0edd59a646063';
-
-/** What a land's build-volume pick meets: main's reseed preview, what land-pick.ts prices, and the reseed itself. */
-interface PickScenario {
-  readonly preview?: 'seed' | 'seed-then-conflict' | 'conflict';
-  /** land-pick.ts price's stdout (`own`, `seed <id>`), or `fail` for a pricing that exits 1. */
-  readonly price?: string;
-  readonly reseed?: 'fail';
-}
-
-interface Land {
+interface GateFixture {
   readonly main: string;
   readonly ws: string;
   /** Where the fake tools record what they were given: the publisher's program and arguments. */
   readonly state: string;
-  /** Runs tooling/land-host.sh over the nx calls `plan` scripts; `moveMain` has main gain a commit as the land begins. */
-  land(plan: readonly Call[], moveMain?: boolean): LandRun;
+  /** Runs tooling/land-host.sh with `args` (`--gate ws` unless given) over the nx calls `plan` scripts. */
+  gate(plan: readonly Call[], args?: readonly string[]): GateRun;
+}
+
+interface FixtureOptions {
+  /** The bounded replay tool fails. */
+  readonly replayFails?: boolean;
+  /** The publisher refuses. */
+  readonly publishFails?: boolean;
+  /** The Linux cross check exits 5. */
+  readonly linuxFails?: boolean;
+  /** The Linux cross check is an Nx run of its own, which the scenario scripts. */
+  readonly crossRuns?: boolean;
 }
 
 const roots: string[] = [];
@@ -291,8 +222,13 @@ afterEach(() => {
   }
 });
 
-/** A main repository carrying the land tooling, and a workspace one commit ahead of it. */
-function fixture(replayFails = false, publishFails = false, pick: PickScenario = {}): Land {
+/** A main repository carrying the gate tooling, and a workspace one commit ahead of it, as cowshed's rebase leaves it. */
+function fixture({
+  replayFails = false,
+  publishFails = false,
+  linuxFails = false,
+  crossRuns = false,
+}: FixtureOptions = {}): GateFixture {
   const root = mkdtempSync(join(tmpdir(), 'land-host-'));
   roots.push(root);
   const main = join(root, 'main');
@@ -308,8 +244,6 @@ function fixture(replayFails = false, publishFails = false, pick: PickScenario =
     'land-host.sh',
     'land-attribution.ts',
     'land-decide.ts',
-    'land-history.ts',
-    'land-pick.ts',
     'land-publish.ts',
     'land-cargo-env.ts',
   ]) {
@@ -325,8 +259,13 @@ function fixture(replayFails = false, publishFails = false, pick: PickScenario =
   mkdirSync(join(main, 'packages'), { recursive: true });
   symlinkSync(join(repo, 'packages/failure-summary'), join(main, 'packages/failure-summary'));
   writeFileSync(join(main, 'nx.json'), '{}\n');
-  // The land cross-lints the gated tree for Linux after the gate; the fixture's check passes.
-  writeFileSync(join(main, 'package.json'), '{"scripts":{"check:linux":"echo linux cross check passed"}}\n');
+  // The gate cross-lints the gated tree for Linux after the gate; the fixture's check passes unless it is told to fail.
+  const linux = linuxFails
+    ? 'echo linux cross check failed; exit 5'
+    : crossRuns
+      ? 'bun nx run-many -t cargo-lint-cross'
+      : 'echo linux cross check passed';
+  writeFileSync(join(main, 'package.json'), `${JSON.stringify({ scripts: { 'check:linux': linux } })}\n`);
   writeFileSync(join(main, '.envrc'), '# approved\n');
   writeFileSync(join(main, '.gitignore'), 'node_modules\n.nx\n');
   git(main, 'init', '-q', '-b', 'main');
@@ -351,12 +290,9 @@ function fixture(replayFails = false, publishFails = false, pick: PickScenario =
     main,
     ws,
     state,
-    land(plan, moveMain = false) {
+    gate(plan, args = ['--gate', 'ws']) {
       writeFileSync(join(state, 'plan.json'), JSON.stringify(plan));
-      if (moveMain) {
-        writeFileSync(join(state, 'move-main'), '');
-      }
-      const run = spawnSync('sh', [join(main, 'tooling/land-host.sh'), 'ws'], {
+      const run = spawnSync('sh', [join(main, 'tooling/land-host.sh'), ...args], {
         cwd: root,
         encoding: 'utf8',
         env: {
@@ -369,11 +305,7 @@ function fixture(replayFails = false, publishFails = false, pick: PickScenario =
           FIX_PUBLISH: publishFails ? 'refuse' : 'accept',
           FIX_MAIN: main,
           FIX_WS: ws,
-          FIX_PREVIEW: pick.preview ?? 'notFound',
-          FIX_SEED: SEED,
-          FIX_PRICE: pick.price ?? '',
-          FIX_RESEED: pick.reseed ?? 'ok',
-          // The land's temporary files, so a case can prove none is left behind.
+          // The gate's temporary files, so a case can prove none is left behind.
           TMPDIR: join(state, 'tmp'),
         },
       });
@@ -383,109 +315,88 @@ function fixture(replayFails = false, publishFails = false, pick: PickScenario =
       }
       const nxLog = join(state, 'nx.log');
       const replayLog = join(state, 'replay.args');
-      const reseedLog = join(state, 'reseed.log');
+      const cowshedLog = join(state, 'cowshed.log');
       return {
         status: run.status ?? -1,
         log: run.stderr,
         nx: existsSync(nxLog) ? readFileSync(nxLog, 'utf8').trimEnd().split('\n') : [],
         replayArgs: existsSync(replayLog) ? readFileSync(replayLog, 'utf8').trimEnd().split('\n') : undefined,
-        reseeds: existsSync(reseedLog) ? readFileSync(reseedLog, 'utf8').trimEnd().split('\n') : [],
+        cowshed: existsSync(cowshedLog) ? readFileSync(cowshedLog, 'utf8').trimEnd().split('\n') : [],
       };
     },
   };
 }
 
-describe('land-host.sh', () => {
-  it('refuses old ancestry, accepts an explicit onto rebase, then gates once and lands exactly the gated commit', () => {
-    const land = fixture();
-    const oldMain = git(land.main, 'rev-parse', 'HEAD');
-    const sourceBefore = git(land.ws, 'rev-parse', 'HEAD');
-    const newMain = git(land.main, 'commit-tree', 'HEAD^{tree}', '-m', 'chore: rewritten base');
-    git(land.main, 'update-ref', 'refs/heads/main', newMain, oldMain);
-    expect(PRE_REWRITE_MAIN).toBe('e9e596563bfaa8b337893bb7df9937f9f65d06ea');
-    expect(judgeHistory(land.ws, newMain, oldMain)).toEqual({
-      kind: 'refused',
-      why: `source ancestry contains pre-rewrite main ${oldMain}`,
-      remedy: `git rebase --onto ${newMain} ${oldMain.slice(0, 9)}`,
-    });
-    expect(git(land.ws, 'rev-parse', 'HEAD')).toBe(sourceBefore);
-    git(land.ws, 'fetch', '-q', land.main, newMain);
-    git(land.ws, 'rebase', '--onto', newMain, oldMain);
-    expect(judgeHistory(land.ws, newMain, oldMain)).toEqual({ kind: 'clean' });
-    expect(judgeHistory(join(land.ws, 'missing'), newMain, oldMain).kind).toBe('unavailable');
-
-    // The land rebases, stops the daemon, gates once without bailing, captures directly to one file and replays
-    // exactly its final 64 KiB, fast-forwards main to exactly the gated commit, then builds main's outputs.
-    const gated = git(land.ws, 'rev-parse', 'HEAD');
+describe('land-host.sh --gate', () => {
+  it('gates once, replays exactly its final 64 KiB, and moves neither main nor the workspace', () => {
+    const gate = fixture();
+    const base = git(gate.main, 'rev-parse', 'HEAD');
+    const gated = git(gate.ws, 'rev-parse', 'HEAD');
+    // The gate stops the daemon, checks wiring, gates once without bailing, captures directly to one file and replays
+    // exactly its final 64 KiB. The rebase before it and the fast-forward after it are cowshed's route, never this
+    // script's: its cowshed calls are paths and gate jobs, and the stand-in refuses any other.
     const suffix = '\ncapture-suffix\n';
-    const run = land.land([
+    const run = gate.gate([
       DAEMON_STOP,
-      passingRun(WIRING(newMain)),
+      passingRun(WIRING(base)),
       {
         ...passingRun(GATE),
         requireFileOutput: true,
         output: `capture-prefix\n${'x'.repeat(70_000)}${suffix.slice(0, -1)}`,
       },
       ...SHIPPING,
-      passingRun(MAIN_BUILD),
     ]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('gating');
-    expect(run.log).toContain("the reseed preview found nothing to price; the gate builds on ws's own build volume");
-    expect(run.reseeds).toEqual(['ws --from main --dry-run']);
-    expect(run.nx).toEqual([
-      'daemon --stop',
-      WIRING(newMain).join(' '),
-      GATE.join(' '),
-      ...SHIPPING.map((call) => call.args.join(' ')),
-      MAIN_BUILD.join(' '),
-    ]);
-    expect(run.log).toContain("building main's outputs");
+    expect(run.nx).toEqual(['daemon --stop', WIRING(base).join(' '), GATE.join(' '), ...SHIPPING_NX]);
+    expect(new Set(run.cowshed.map((call) => call.split(' ')[0]))).toEqual(new Set(['path', 'exec']));
     expect(run.log).not.toContain('capture-prefix');
     expect(run.log).toContain('capture-suffix');
     expect(run.log.match(/x{1000,}/)?.[0]?.length).toBe(65_536 - suffix.length);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
-    expect(existsSync(join(land.ws, 'agent-todo/land-ledger.md'))).toBe(false);
+    expect(git(gate.main, 'rev-parse', 'HEAD')).toBe(base);
+    expect(git(gate.ws, 'rev-parse', 'HEAD')).toBe(gated);
+    expect(existsSync(join(gate.ws, 'agent-todo/land-ledger.md'))).toBe(false);
   });
 
-  it('names the build-script environment the shed recorded and the land shell does not give, and lands anyway', () => {
-    const land = fixture();
-    const before = git(land.main, 'rev-parse', 'HEAD');
-    const fingerprint = join(land.ws, 'target/debug/build/ring/0123456789abcdef/fingerprint');
+  it('names the commit the workspace was rebased onto, not the main that gained a commit since', () => {
+    const gate = fixture();
+    const base = git(gate.main, 'rev-parse', 'HEAD');
+    // A doc commit reaches main after the rebase: the fast-forward will refuse it, and cowshed rebases and gates again.
+    writeFileSync(join(gate.main, 'doc.md'), 'doc\n');
+    git(gate.main, 'add', 'doc.md');
+    git(gate.main, 'commit', '-q', '-m', 'docs: a doc commit lands');
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING(base)), passingRun(GATE), ...SHIPPING]);
+    expect(run.status, run.log).toBe(0);
+    expect(run.nx).toEqual(['daemon --stop', WIRING(base).join(' '), GATE.join(' '), ...SHIPPING_NX]);
+  });
+
+  it('names the build-script environment the shed recorded and the gate shell does not give, and passes anyway', () => {
+    const gate = fixture();
+    const base = git(gate.main, 'rev-parse', 'HEAD');
+    const fingerprint = join(gate.ws, 'target/debug/build/ring/0123456789abcdef/fingerprint');
     mkdirSync(fingerprint, { recursive: true });
     writeFileSync(
       join(fingerprint, 'run-build-script-build-script-build.json'),
       JSON.stringify({ deps: [], local: [{ RerunIfEnvChanged: { var: 'SMOO_LAND_PROBE', val: '/usr/bin/clang' } }] }),
     );
-    const run = land.land([
-      DAEMON_STOP,
-      passingRun(WIRING(before)),
-      passingRun(GATE),
-      ...SHIPPING,
-      passingRun(MAIN_BUILD),
-    ]);
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING(base)), passingRun(GATE), ...SHIPPING]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain(
       'cargo-build-script-env: SMOO_LAND_PROBE: 1 build-script run(s) of ring recorded "/usr/bin/clang"; Cargo now sees unset',
     );
-    expect(run.nx).toEqual([
-      'daemon --stop',
-      WIRING(before).join(' '),
-      GATE.join(' '),
-      ...SHIPPING.map((call) => call.args.join(' ')),
-      MAIN_BUILD.join(' '),
-    ]);
+    expect(run.nx).toEqual(['daemon --stop', WIRING(base).join(' '), GATE.join(' '), ...SHIPPING_NX]);
   });
-  // Which diagnostics the summary keeps is the failure-summary package's; this land proves what the script does with them.
-  it('stops immediately on a failed gate, reporting its complete captured failure once, without rerunning or committing a ledger', () => {
-    const land = fixture();
-    const before = git(land.main, 'rev-parse', 'HEAD');
-    const gated = git(land.ws, 'rev-parse', 'HEAD');
+
+  // Which diagnostics the summary keeps is the failure-summary package's; this gate proves what the script does with them.
+  it('exits with a failed gate status, reporting its complete captured failure once, without rerunning or committing a ledger', () => {
+    const gate = fixture();
+    const before = git(gate.main, 'rev-parse', 'HEAD');
+    const gated = git(gate.ws, 'rev-parse', 'HEAD');
     const message =
       'error: expect(received).toEqual(expected)\n\nExpected: []\nReceived: ["orphan"]\n    at fixture.test.ts:206:43';
     const failed = failedRun(message, 7);
     // The summary precedes more than the 64 KiB replay suffix of the captured output.
-    const run = land.land([
+    const run = gate.gate([
       DAEMON_STOP,
       passingRun(WIRING(before)),
       { ...failed, requireFileOutput: true, output: `${failed.output}\n${'x'.repeat(70_000)}\ncapture-suffix` },
@@ -497,52 +408,48 @@ describe('land-host.sh', () => {
     // This gate left no run summary, so no failed task is read and no commit named; the verdict stands.
     expect(run.log).toContain('could not read which tasks the gate failed');
     expect(run.nx).toEqual(['daemon --stop', WIRING(before).join(' '), GATE.join(' ')]);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
-    expect(git(land.ws, 'rev-parse', 'HEAD')).toBe(gated);
-    expect(existsSync(join(land.ws, 'agent-todo/land-ledger.md'))).toBe(false);
+    expect(git(gate.main, 'rev-parse', 'HEAD')).toBe(before);
+    expect(git(gate.ws, 'rev-parse', 'HEAD')).toBe(gated);
+    expect(existsSync(join(gate.ws, 'agent-todo/land-ledger.md'))).toBe(false);
     const output = /complete output: (.+)/.exec(run.log)?.[1];
     expect(output).toBeDefined();
     if (output !== undefined) expect(readFileSync(output, 'utf8')).toContain(message);
   });
 
-  it('refuses to land when bounded replay fails after a successful gate', () => {
-    const land = fixture(true);
-    const before = git(land.main, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(WIRING(before)), { ...passingRun(GATE), requireFileOutput: true }]);
+  it('fails when bounded replay fails after a successful gate', () => {
+    const gate = fixture({ replayFails: true });
+    const before = git(gate.main, 'rev-parse', 'HEAD');
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING(before)), { ...passingRun(GATE), requireFileOutput: true }]);
     expect(run.status, run.log).toBe(1);
     expect(run.log).toContain('could not replay the gate output');
     expect(run.replayArgs?.slice(0, -1)).toEqual(['--kill-after=1s', '10s', 'tail', '-c', '65536']);
     expect(run.nx).toEqual(['daemon --stop', WIRING(before).join(' '), GATE.join(' ')]);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 
   it('stops before the gate when the wiring check refuses what the rebased tree adds', () => {
-    const land = fixture();
-    const before = git(land.main, 'rev-parse', 'HEAD');
+    const gate = fixture();
+    const before = git(gate.main, 'rev-parse', 'HEAD');
     const refusal = 'error[WIRING] packages/w/src/lone.ts:1 export lone: no non-test module imports it';
-    const run = land.land([DAEMON_STOP, { args: WIRING(before), exit: 1, output: refusal }]);
+    const run = gate.gate([DAEMON_STOP, { args: WIRING(before), exit: 1, output: refusal }]);
     expect(run.status, run.log).toBe(1);
     expect(run.nx).toEqual(['daemon --stop', WIRING(before).join(' ')]);
     expect(run.log).toContain(refusal);
     expect(run.log).toContain('the wiring check exited 1; the land stops');
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
+
   it('stops if the daemon cannot be stopped, without starting the gate', () => {
-    const land = fixture();
-    const before = git(land.main, 'rev-parse', 'HEAD');
-    const run = land.land([{ args: ['daemon', '--stop'], exit: 1, output: 'daemon stop refused' }]);
+    const gate = fixture();
+    const run = gate.gate([{ args: ['daemon', '--stop'], exit: 1, output: 'daemon stop refused' }]);
     expect(run.status, run.log).toBe(1);
     expect(run.nx).toEqual(['daemon --stop']);
     expect(run.log).toContain('could not stop');
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 
   it('keeps the failing gate status and raw diagnostics when the reporter is unavailable', () => {
-    const land = fixture();
-    const before = git(land.main, 'rev-parse', 'HEAD');
-    rmSync(join(land.main, 'packages/failure-summary'));
+    const gate = fixture();
+    rmSync(join(gate.main, 'packages/failure-summary'));
     const failed = failedRun('error: original failure', 9);
-    const run = land.land([
+    const run = gate.gate([
       DAEMON_STOP,
       passingRun(WIRING('*')),
       { ...failed, requireFileOutput: true, output: `${failed.output}\n${'x'.repeat(70_000)}\ncapture-suffix` },
@@ -555,84 +462,80 @@ describe('land-host.sh', () => {
     const output = /complete gate output: (.+)/.exec(run.log)?.[1];
     expect(output).toBeDefined();
     if (output !== undefined) expect(readFileSync(output, 'utf8')).toContain('error: original failure');
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 
-  it('rebases and gates again when main moved while it gated, lands the new gate, and keeps it when the build fails', () => {
-    const land = fixture();
-    const run = land.land(
-      [
-        DAEMON_STOP,
-        passingRun(WIRING('*')),
-        passingRun(GATE),
-        ...SHIPPING,
-        DAEMON_STOP,
-        passingRun(WIRING('*')),
-        passingRun(GATE),
-        ...SHIPPING,
-        { args: MAIN_BUILD, exit: 1 },
-      ],
-      true,
-    );
-    expect(run.log).toContain('main moved while the gate ran');
-    expect(run.status, run.log).toBe(0);
-    expect(run.nx).toHaveLength(11);
-    // Each pass checks wiring against the main head it rebased onto: the start, then the commit main moved to.
-    expect(run.nx.filter((call) => call.startsWith('run @smoothbricks/codebase:wiring'))).toEqual([
-      WIRING(git(land.main, 'rev-parse', 'HEAD~2')).join(' '),
-      WIRING(git(land.main, 'rev-parse', 'HEAD~1')).join(' '),
+  it.each([
+    { phase: 'host production producer', calls: [{ args: SHIPPING_PRODUCER, exit: 17 }], status: 17 },
+    { phase: 'shipping guard', calls: [SHIPPING_PRODUCER_PASSED, { args: SHIPPING_CHECK, exit: 19 }], status: 19 },
+  ])('stops before publishing when the $phase fails', ({ calls, status }) => {
+    const gate = fixture({ crossRuns: true });
+    const base = git(gate.main, 'rev-parse', 'HEAD');
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING(base)), GATE_PASSED, CROSS_PASSED, ...calls]);
+    expect(run.status, run.log).toBe(status);
+    expect(run.log).toContain('the land stops');
+    expect(run.nx).toEqual([
+      'daemon --stop',
+      WIRING(base).join(' '),
+      GATE.join(' '),
+      CROSS.join(' '),
+      ...calls.map((call) => call.args.join(' ')),
     ]);
-    expect(run.log).toContain("main's build exited 1; the land stands");
-    expect(existsSync(join(land.main, 'moved.txt'))).toBe(true);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(git(land.ws, 'rev-parse', 'HEAD'));
+    expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
+    expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
   });
 
-  it('publishes the gate task results once the Linux cross check passes, and lands', () => {
-    const land = fixture();
-    const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, ...SHIPPING, passingRun(MAIN_BUILD)]);
+  it('exits with the Linux cross check status when it fails after a passing gate, and publishes nothing', () => {
+    const gate = fixture({ linuxFails: true });
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED]);
+    expect(run.status, run.log).toBe(5);
+    expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
+  });
+
+  it('publishes the gate task results once the Linux cross check passes', () => {
+    const gate = fixture();
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, ...SHIPPING]);
     expect(run.status, run.log).toBe(0);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
     // The publisher gets the cowshed bridge as one program, then the checkout and the gate's succeeded task hashes.
     const bridge = join(repo, BRIDGE);
     const program = `${readFileSync(join(bridge, 'cache_adapter.js'), 'utf8')}\n${readFileSync(join(bridge, 'nx_publish.js'), 'utf8')}`;
-    expect(readFileSync(join(land.state, 'publish.program'), 'utf8')).toBe(program);
-    expect(readFileSync(join(land.state, 'publish.args'), 'utf8')).toBe(`-\n${land.ws}\n["gate-hash"]\n`);
+    expect(readFileSync(join(gate.state, 'publish.program'), 'utf8')).toBe(program);
+    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(`-\n${gate.ws}\n["gate-hash"]\n`);
   });
 
-  it('lands even when the publish is refused, and says so', () => {
-    const land = fixture(false, true);
-    const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, ...SHIPPING, passingRun(MAIN_BUILD)]);
+  it("publishes the Linux cross check's own task results beside the gate's, so main finds cargo-lint-cross cached", () => {
+    const gate = fixture({ crossRuns: true });
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, CROSS_PASSED, ...SHIPPING]);
+    expect(run.status, run.log).toBe(0);
+    expect(run.nx.slice(-3)).toEqual([CROSS.join(' '), ...SHIPPING_NX]);
+    // One publisher run per list: the gate's hashes, then the cross check's.
+    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
+      `-\n${gate.ws}\n["gate-hash"]\n-\n${gate.ws}\n["cross-hash"]\n`,
+    );
+  });
+
+  it('passes when the publish is refused, and says so', () => {
+    const gate = fixture({ publishFails: true });
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), GATE_PASSED, ...SHIPPING]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain('the publish was refused');
     expect(run.log).toContain('failed (status 1); the land goes on');
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
   });
 
-  it('lands without publishing when the gate passes without a readable run summary, and leaves no temporary file', () => {
-    const land = fixture();
-    const gated = git(land.ws, 'rev-parse', 'HEAD');
-    const run = land.land([
-      DAEMON_STOP,
-      passingRun(WIRING('*')),
-      passingRun(GATE),
-      ...SHIPPING,
-      passingRun(MAIN_BUILD),
-    ]);
+  it('passes without publishing when the gate passes without a readable run summary, and leaves no temporary file', () => {
+    const gate = fixture();
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), passingRun(GATE), ...SHIPPING]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain("could not read the gate's task hashes");
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
-    expect(existsSync(join(land.state, 'publish.args'))).toBe(false);
-    expect(readdirSync(join(land.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+    expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
+    expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
   });
 
   it('names, for each task a red gate failed, the commits of the land that change its inputs, and keeps the verdict', () => {
-    const land = fixture();
-    const change = git(land.ws, 'rev-parse', 'HEAD');
-    const before = git(land.main, 'rev-parse', 'HEAD');
-    const run = land.land([
+    const gate = fixture();
+    const change = git(gate.ws, 'rev-parse', 'HEAD');
+    const before = git(gate.main, 'rev-parse', 'HEAD');
+    const run = gate.gate([
       DAEMON_STOP,
       passingRun(WIRING(before)),
       {
@@ -646,7 +549,7 @@ describe('land-host.sh', () => {
     ]);
     expect(run.status, run.log).toBe(3);
     expect(run.log).toContain(
-      `land-host: lib:lint failed; 1 of the land's 1 commits change its inputs: ${change.slice(0, 10)} feat(tooling): the change\n`,
+      `land-host: lib:lint failed; 1 of the land\'s 1 commits change its inputs: ${change.slice(0, 10)} feat(tooling): the change\n`,
     );
     expect(run.log).toContain(
       "land-host: lib:test failed; none of the land's 1 commits changes a file Nx hashes for it or for a task it waits for (a commit that only deletes files is not seen)",
@@ -655,50 +558,41 @@ describe('land-host.sh', () => {
       run.log.indexOf('gate exited 3; the land stops'),
     );
     // Nx is asked for the input files of the failed tasks alone, by the workspace's own land-inputs.mts.
-    expect(readFileSync(join(land.state, 'inputs.args'), 'utf8')).toBe(
-      `${join(land.ws, 'tooling/land-inputs.mts')}\ngate\nlib:lint\nlib:test\n`,
+    expect(readFileSync(join(gate.state, 'inputs.args'), 'utf8')).toBe(
+      `${join(gate.ws, 'tooling/land-inputs.mts')}\ngate\nlib:lint\nlib:test\n`,
     );
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
   });
 
-  it('publishes nothing from a run summary an earlier invocation wrote, and lands', () => {
-    const land = fixture();
-    const gated = git(land.ws, 'rev-parse', 'HEAD');
-    mkdirSync(join(land.ws, '.nx/cache'), { recursive: true });
+  it('publishes nothing from a run summary an earlier invocation wrote, and passes', () => {
+    const gate = fixture();
+    mkdirSync(join(gate.ws, '.nx/cache'), { recursive: true });
     writeFileSync(
-      join(land.ws, '.nx/cache/run.json'),
+      join(gate.ws, '.nx/cache/run.json'),
       JSON.stringify({
         run: { command: 'nx run-many -t gate', startTime: '2026-01-01T00:00:00.000Z', endTime: '', inner: false },
         tasks: [{ taskId: '@smoothbricks/codebase:gate', hash: 'stale-hash', status: 0 }],
       }),
     );
-    const run = land.land([
-      DAEMON_STOP,
-      passingRun(WIRING('*')),
-      passingRun(GATE),
-      ...SHIPPING,
-      passingRun(MAIN_BUILD),
-    ]);
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), passingRun(GATE), ...SHIPPING]);
     expect(run.status, run.log).toBe(0);
     expect(run.log).toContain(
       'the run summary is of an invocation that began at 2026-01-01T00:00:00.000Z, before this gate',
     );
     expect(run.log).toContain('the land goes on without publishing: the cache never blocks a land');
-    expect(existsSync(join(land.state, 'publish.args'))).toBe(false);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
+    expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
   });
 
   it('names no commit from a run summary an earlier invocation wrote', () => {
-    const land = fixture();
-    mkdirSync(join(land.ws, '.nx/cache'), { recursive: true });
+    const gate = fixture();
+    mkdirSync(join(gate.ws, '.nx/cache'), { recursive: true });
     writeFileSync(
-      join(land.ws, '.nx/cache/run.json'),
+      join(gate.ws, '.nx/cache/run.json'),
       JSON.stringify({
         run: { command: 'nx run-many -t gate', startTime: '2026-01-01T00:00:00.000Z', endTime: '', inner: false },
         tasks: [{ taskId: 'lib:lint', hash: 'lib-lint', status: 1 }],
       }),
     );
-    const run = land.land([DAEMON_STOP, passingRun(WIRING('*')), failedRun('error: no summary written')]);
+    const run = gate.gate([DAEMON_STOP, passingRun(WIRING('*')), failedRun('error: no summary written')]);
     expect(run.status, run.log).toBe(1);
     expect(run.log).toContain(
       'the run summary is of an invocation that began at 2026-01-01T00:00:00.000Z, before this gate',
@@ -707,138 +601,16 @@ describe('land-host.sh', () => {
     expect(run.log).not.toContain('land-host: lib:lint failed');
   });
 
-  it.each([
-    { phase: 'host production producer', calls: [{ args: SHIPPING_PRODUCER, exit: 17 }], status: 17 },
-    { phase: 'shipping guard', calls: [SHIPPING_PRODUCER_PASSED, { args: SHIPPING_CHECK, exit: 19 }], status: 19 },
-  ])('stops before landing when the $phase fails', ({ calls, status }) => {
-    const land = fixture();
-    const before = git(land.main, 'rev-parse', 'HEAD');
-    const run = land.land([DAEMON_STOP, passingRun(WIRING(before)), GATE_PASSED, ...calls]);
-    expect(run.status, run.log).toBe(status);
-    expect(run.log).toContain('the land stops');
-    expect(run.nx).toEqual([
-      'daemon --stop',
-      WIRING(before).join(' '),
-      GATE.join(' '),
-      ...calls.map((call) => call.args.join(' ')),
-    ]);
-    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(before);
-    expect(existsSync(join(land.state, 'publish.args'))).toBe(false);
-  });
-
-  describe('build-volume pick', () => {
-    const PREVIEW = 'ws --from main --dry-run';
-    const RESEED = 'ws --from main';
-    const passing = (): Call[] => [
-      DAEMON_STOP,
-      passingRun(WIRING('*')),
-      passingRun(GATE),
-      ...SHIPPING,
-      passingRun(MAIN_BUILD),
-    ];
-
-    it('reseeds onto the seed it priced when that seed leaves less to compile, then gates and lands', () => {
-      const land = fixture(false, false, { preview: 'seed', price: `seed ${SEED}` });
-      const gated = git(land.ws, 'rev-parse', 'HEAD');
-      const run = land.land(passing());
-      expect(run.status, run.log).toBe(0);
-      expect(run.reseeds).toEqual([PREVIEW, PREVIEW, RESEED]);
-      expect(run.log).toContain(`reseeding ws from main's seed ${SEED}`);
-      expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
-    });
-
-    it('keeps its own build volume when that prices cheaper', () => {
-      const land = fixture(false, false, { preview: 'seed', price: 'own' });
-      const run = land.land(passing());
-      expect(run.status, run.log).toBe(0);
-      expect(run.reseeds).toEqual([PREVIEW]);
-      expect(run.log).not.toContain('reseeding');
-    });
-
-    it('keeps its own build volume when main seed changed after it was priced', () => {
-      const priced = '0'.repeat(32);
-      const land = fixture(false, false, { preview: 'seed', price: `seed ${priced}` });
-      const run = land.land(passing());
-      expect(run.status, run.log).toBe(0);
-      expect(run.reseeds).toEqual([PREVIEW, PREVIEW]);
-      expect(run.log).toContain(
-        `main's seed changed after it was priced (priced ${priced}, now ${SEED}); the gate builds on ws's own build volume`,
-      );
-    });
-
-    it('gates on its own build volume when the pricing fails, and says so', () => {
-      const land = fixture(false, false, { preview: 'seed', price: 'fail' });
-      const run = land.land(passing());
-      expect(run.status, run.log).toBe(0);
-      expect(run.reseeds).toEqual([PREVIEW]);
-      expect(run.log).toContain('land-pick: the scenario refuses to price');
-      expect(run.log).toContain("could not price ws's build volumes; the gate builds on its own");
-    });
-
-    it('says a reseed that did not finish, and still gates and lands', () => {
-      const land = fixture(false, false, { preview: 'seed', price: `seed ${SEED}`, reseed: 'fail' });
-      const gated = git(land.ws, 'rev-parse', 'HEAD');
-      const run = land.land(passing());
-      expect(run.status, run.log).toBe(0);
-      expect(run.reseeds).toEqual([PREVIEW, PREVIEW, RESEED]);
-      expect(run.log).toContain('release the superseded build volume');
-      expect(run.log).toContain(
-        'the reseed did not finish (cowshed exited 1); the gate builds on whichever build volume it left linked to ws',
-      );
-      expect(run.log).not.toContain("the gate builds on ws's own build volume");
-      expect(git(land.main, 'rev-parse', 'HEAD')).toBe(gated);
-    });
-
-    it('picks again, and reseeds again, before the re-gate after main moved', () => {
-      const land = fixture(false, false, { preview: 'seed', price: `seed ${SEED}` });
-      const run = land.land(
-        [
-          DAEMON_STOP,
-          passingRun(WIRING('*')),
-          passingRun(GATE),
-          ...SHIPPING,
-          DAEMON_STOP,
-          passingRun(WIRING('*')),
-          passingRun(GATE),
-          ...SHIPPING,
-          passingRun(MAIN_BUILD),
-        ],
-        true,
-      );
-      expect(run.status, run.log).toBe(0);
-      expect(run.log).toContain('main moved while the gate ran');
-      expect(run.reseeds).toEqual([PREVIEW, PREVIEW, RESEED, PREVIEW, PREVIEW, RESEED]);
-      expect(run.log.split(`reseeding ws from main's seed ${SEED}`)).toHaveLength(3);
-      expect(git(land.main, 'rev-parse', 'HEAD')).toBe(git(land.ws, 'rev-parse', 'HEAD'));
-    });
-    it('tells a failed reseed preview from a missing seed', () => {
-      const land = fixture(false, false, { preview: 'conflict' });
-      const run = land.land(passing());
-      expect(run.status, run.log).toBe(0);
-      expect(run.reseeds).toEqual([PREVIEW]);
-      expect(run.log).toContain('unfinished lifecycle journal entry');
-      expect(run.log).toContain(
-        "the reseed preview failed (cowshed exited 4); the gate builds on ws's own build volume",
-      );
-      expect(run.log).not.toContain('found nothing to price');
-    });
-
-    it('says a failed preview before the reseed as a failed preview, and reseeds nothing', () => {
-      const land = fixture(false, false, { preview: 'seed-then-conflict', price: `seed ${SEED}` });
-      const run = land.land(passing());
-      expect(run.status, run.log).toBe(0);
-      expect(run.reseeds).toEqual([PREVIEW, PREVIEW]);
-      expect(run.log).toContain('lifecycle/image lock held');
-      expect(run.log).toContain(
-        "the reseed preview before the reseed failed (cowshed exited 4); the gate builds on ws's own build volume",
-      );
-      expect(run.log).not.toContain("main's seed changed");
-    });
-  });
-  it('refuses to land main itself', () => {
-    const land = fixture();
-    const run = spawnSync('sh', [join(land.main, 'tooling/land-host.sh'), 'main'], { encoding: 'utf8' });
-    expect(run.status).toBe(64);
-    expect(run.stderr).toContain('main is not a workspace to land');
+  it('refuses main itself, and any call that is not --gate <workspace>', () => {
+    const gate = fixture();
+    const main = gate.gate([], ['--gate', 'main']);
+    expect(main.status, main.log).toBe(64);
+    expect(main.log).toContain('main is not a workspace to land');
+    for (const args of [[], ['ws'], ['--gate'], ['--gate', 'ws', 'extra']]) {
+      const run = gate.gate([], args);
+      expect(run.status, run.log).toBe(64);
+      expect(run.log).toContain('usage: land-host.sh --gate <workspace>');
+    }
+    expect(main.nx).toEqual([]);
   });
 });

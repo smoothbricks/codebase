@@ -1,25 +1,23 @@
 #!/bin/sh
-# The host half of a land: `land-host.sh <workspace> [cowshed land args...]`. A host that lands many workspaces runs
-# this under one lock per repository, so lands gate one at a time; nothing here takes a lock. The steps:
+# The repository's declared land gate: main's .cowshed.toml names it as `[land] gate`, and `cowshed land <ws>` runs
+# `sh tooling/land-host.sh --gate <ws>` in main's checkout and main's pure environment once it holds the land turn and
+# has rebased <ws> onto main (specs/cowshed/02_workspaces.md "A declared land", step 4). The route around the gate is
+# cowshed's: the turn, the rebase, the fast-forward (and the re-gate when main moved), retiring the workspace, the push
+# and the after-land commands, main's build among them. This script checks the rebased tree and nothing else: it moves
+# neither main nor the workspace, and its exit status is the gate's verdict. The steps:
 #
-# 1. Rebase <workspace> onto main's head. A conflict stops the land and leaves <workspace> as it was. Main can move
-#    between reading its head and the rebase; cowshed fences on the head it was told, and a fence that fired for
-#    that reason alone is retried against the newer head.
-# 2. Pick the build volume the gate builds on (16_build_volumes.md, "Picking a land's build volume"): the workspace's
-#    own, or a clone of main's latest seed, whichever leaves fewer Cargo compile seconds for the rebased tree
-#    (tooling/land-pick.ts), reseeding only onto the seed it priced. A pick that cannot be priced is said and the gate
-#    builds on the workspace's own volume; a reseed that fails is said, and the gate builds on whichever volume it left
-#    linked: the pick decides where the gate starts, never whether the tree lands.
-# 3. Stop <workspace>'s Nx daemon. Its file map can be stale across a rebase (fseventsd drops events), and a gate
-#    that hashes a tree other than the rebased one proves nothing about it. The gate starts a fresh daemon.
-# 4. Gate the rebased tree on the host: `nx run-many -t gate --nx-bail=false`. The root Nx graph owns
+# 1. Approve <workspace>'s .envrc for direnv only when it is main's approved one, or the operator approved it by hand.
+# 2. Stop <workspace>'s Nx daemon. Its file map can be stale across a rebase (fseventsd drops events), and a gate
+#    that hashes a tree other than the rebased one proves nothing about it. The gate job starts no daemon of its own
+#    (every job runs with NX_DAEMON_START=never, specs/cowshed/04_sandbox.md), so after the stop it has no stale map.
+# 3. Gate the rebased tree on the host: `nx run-many -t gate --nx-bail=false`. The root Nx graph owns
 #    every project's lint/test/build and the host-e2e aggregate. Cached tasks replay unless their inputs changed.
-#    The host, unlike the land sandbox, can run the real-APFS tests. Any nonzero gate exit stops the land.
-#    Before the gate, the wiring check refuses what the rebased tree adds since main's head that no production code
-#    reaches (AGENTS.md rule 7); a refusal stops the land.
+#    The host, unlike the land sandbox, can run the real-APFS tests. Any nonzero gate exit is this script's exit.
+#    Before the gate, the wiring check refuses what the rebased tree adds since the commit it was rebased onto that no
+#    production code reaches (AGENTS.md rule 7); a refusal is this script's exit.
 #    A failure summary keeps unique tasks and exact diagnostics; the complete failed output is retained. The reporter
-#    is main's native build of @smoothbricks/failure-summary (dist/bin/<platform>/smoo-nx-failures), which step 5
-#    keeps current.
+#    is main's native build of @smoothbricks/failure-summary (dist/bin/<platform>/smoo-nx-failures), which the
+#    declared after-land build keeps current.
 #    The gate runs as a cowshed gate job (`cowshed exec --class gate --host`): it is never CPU-capped, and its class's
 #    priority outranks background execs, not every class (05_gateway.md, "Host scheduling", "Classes").
 #    A red names, for each task the gate failed, the commits of the land that change a file Nx hashes for it or for a
@@ -29,23 +27,27 @@
 #    tree whose Linux cross check is not cached, so a land that skipped it would leave main unpushable.
 #    The shipping seam then builds this host's production CLI and runs cowshed:release-check on those dist bytes.
 #    The guard remains uncached and dependency-free; both phases report their wall time and refuse a red land.
-#    After the gate and the Linux cross check pass, the gate run's task results are published to the
-#    project's localhost Nx cache, the only writer to it (sheds only read it). The cache never blocks a land: task
-#    hashes that cannot be read from the gate's run summary, or a publish that fails, are said and the land goes on.
-# 5. `cowshed land` fast-forwards main to exactly the gated commit and retires the workspace. If main moved
-#    meanwhile, rebase and gate the new tree; this is a source fence, never a retry of a red gate.
-# 6. Build main's outputs at the landed commit (nx run-many -t build cli-native napi-native in main). The ordinary
-#    compiler outputs and the host's development CLI/addon are what developer links run; until restored they lag the
-#    sources the land just moved main to, and those links refuse. Each producer restores its artifacts and input receipts
-#    from the cache when its inputs match, compiling only changed inputs. A failed build is said; the land stands.
+#    After the gate, the Linux cross check and the shipping seam pass, the gate run's task results, and the cross
+#    check's own when it wrote a run summary, are published to the project's localhost Nx cache, the only writer to
+#    it (sheds only read it): the pre-push hook asks Nx for cargo-lint-cross, which main finds cached only by
+#    adopting this workspace's build volume, and a held target refuses that adoption. The cache never blocks a land:
+#    task hashes that cannot be read from a run summary, or a publish that fails, are said and the land goes on.
+#
+# The gate builds on the workspace's own build volume. Choosing between it and a clone of main's latest seed
+# (16_build_volumes.md, "Picking a land's build volume") is to move into `cowshed land`; until it does, a land whose
+# own volume is far from the seed compiles more Cargo units than the pick would have left it.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here/.."
 
-# The first argument is the workspace; land-decide.ts refuses a missing one and main itself (a tested call).
+# The only call is `--gate <workspace>`. land-decide.ts refuses anything else with the usage line, and main itself (a
+# tested call); a call without `--gate` reaches it with no arguments, which is usage.
+case ${1-} in
+--gate) shift ;;
+*) set -- ;;
+esac
 workspace=$(bun "$here/land-decide.ts" workspace "$@")
-shift
 main=$(cowshed path main)
 checkout=$(cowshed path "$workspace")
 # The failure reporter's platform directory, named as the native tool packages name dist/bin/<platform>.
@@ -57,33 +59,16 @@ Linux-x86_64) platform=linux-x64 ;;
 *) platform="unsupported-$(uname -s)-$(uname -m)" ;;
 esac
 failure_summary="$here/../packages/failure-summary/dist/bin/$platform/smoo-nx-failures"
+head=$(git -C "$checkout" rev-parse HEAD)
+# The commit <workspace> was rebased onto, where its own commits begin. Main may have gained a doc commit since: the
+# fast-forward then refuses, and cowshed rebases onto it and gates again. The workspace holds no object main gained
+# after the rebase, so main's objects are read beside its own (an alternate, never a fetch: this script moves neither).
+base=$(GIT_ALTERNATE_OBJECT_DIRECTORIES="$(git -C "$main" rev-parse --absolute-git-dir)/objects" git -C "$checkout" merge-base HEAD "$(git -C "$main" rev-parse HEAD)")
 started=$(date +%s)
 
 
 say() {
   echo "land-host: $*" >&2
-}
-
-# Rebases <workspace> onto main's head and sets $base to that head and $head to the rebased commit. $built_tree is the
-# tree the checkout had before: the tree its build volume was last built at, by its own builds or the previous gate.
-rebase_onto_main() {
-  built_tree=$(git -C "$checkout" rev-parse 'HEAD^{tree}')
-  while :; do
-    base=$(git -C "$main" rev-parse HEAD)
-    # The old range must be explicitly cut off, never replayed by this ordinary rebase.
-    (cd "$main" && direnv exec "$main" bun "$here/land-history.ts" "$checkout" "$base") || return 1
-    if outcome=$(cowshed --json rebase "$workspace" --expected-onto-head "$base"); then
-      printf '%s\n' "$outcome" >&2
-      head=$(git -C "$checkout" rev-parse HEAD)
-      return 0
-    fi
-    printf '%s\n' "$outcome" >&2
-    verdict=$(bun "$here/land-decide.ts" after-rebase "$outcome")
-    case $verdict in
-    retry) say "main moved past $base before the rebase began; rebasing onto its new head" ;;
-    *) return 1 ;;
-    esac
-  done
 }
 
 # direnv trusts an .envrc by its content. The operator approved main's; a workspace's is approved here only when it is
@@ -108,49 +93,7 @@ allow_envrc() {
   esac
 }
 
-# Points <workspace> at the build volume that leaves the gate least to compile for $head: its own, or a clone of main's
-# latest seed. Only where the gate starts is chosen here. A preview that fails, a failed pricing and a seed that changed
-# after it was priced are said, and the gate builds on the workspace's own volume. A reseed that fails is said with
-# cowshed's status, and the gate builds on whichever volume it left linked: a reseed links its clone before it records
-# and releases the old volume (16_build_volumes.md, "Workspace reseed").
-pick_build_volume() {
-  preview=$(cowshed --json reseed "$workspace" --from main --dry-run) || {
-    status=$?
-    printf '%s\n' "$preview" >&2
-    case $(bun "$here/land-pick.ts" refusal "$preview") in
-    not-found) say "the reseed preview found nothing to price; the gate builds on $workspace's own build volume" ;;
-    *) say "the reseed preview failed (cowshed exited $status); the gate builds on $workspace's own build volume" ;;
-    esac
-    return 0
-  }
-  choice=$(cd "$checkout" && direnv exec "$checkout" bun "$here/land-pick.ts" price "$checkout" "$built_tree" "$preview" </dev/null) || {
-    say "could not price $workspace's build volumes; the gate builds on its own"
-    return 0
-  }
-  case $choice in
-  "seed "*) priced=${choice#seed } ;;
-  *) return 0 ;;
-  esac
-  # The reseed clones main's latest seed as it then stands, and a fork or land can publish another while the pick
-  # prices: reseed only onto the seed that was priced.
-  again=$(cowshed --json reseed "$workspace" --from main --dry-run) || {
-    status=$?
-    printf '%s\n' "$again" >&2
-    say "the reseed preview before the reseed failed (cowshed exited $status); the gate builds on $workspace's own build volume"
-    return 0
-  }
-  current=$(bun "$here/land-pick.ts" seed "$again") || current=
-  if [ "$current" != "$priced" ]; then
-    say "main's seed changed after it was priced (priced $priced, now ${current:-unreadable}); the gate builds on $workspace's own build volume"
-    return 0
-  fi
-  say "reseeding $workspace from main's seed $priced: it leaves less to compile for $head"
-  cowshed --json reseed "$workspace" --from main >&2 || {
-    status=$?
-    say "the reseed did not finish (cowshed exited $status); the gate builds on whichever build volume it left linked to $workspace"
-  }
-}
-# `nx <args>` in <workspace>'s own devenv. A gate takes no input, and a task that reads stdin must not eat a loop's.
+# `nx <args>` in <workspace>'s own devenv. A gate takes no input, and a task that reads stdin must not eat the caller's.
 workspace_nx() {
   (cd "$checkout" && direnv exec "$checkout" bun nx "$@" </dev/null)
 }
@@ -204,10 +147,10 @@ gate_workspace() {
     say "could not stop $workspace's Nx daemon; a stale file map could gate a tree other than $head"
     exit 1
   }
-  # The shed's Cargo build-script records against the gate's shell, the shell main's seed is built in (build_main): a
-  # variable they disagree on is one the shed's own shells carried, and this gate reruns every build script that read it
-  # and rebuilds what depends on them (16_build_volumes.md, "One Cargo environment on every path"). Said, never a reason
-  # to stop: drift costs the gate time, not correctness.
+  # The shed's Cargo build-script records against the gate's shell, the shell main's seed is built in (the declared
+  # after-land build): a variable they disagree on is one the shed's own shells carried, and this gate reruns every
+  # build script that read it and rebuilds what depends on them (16_build_volumes.md, "One Cargo environment on every
+  # path"). Said, never a reason to stop: drift costs the gate time, not correctness.
   (cd "$checkout" && direnv exec "$checkout" bun "$here/land-cargo-env.ts" "$checkout") >&2 ||
     say "comparing $workspace's Cargo build-script environment with the land shell failed (status $?); the land goes on"
   # Done means the production path calls what the change adds (AGENTS.md rule 7): the wiring check refuses each item
@@ -246,6 +189,8 @@ gate_workspace() {
     rm "$hashes"
     hashes=
   }
+  gate_summary=$(cksum <"$checkout/.nx/cache/run.json" 2>/dev/null || :)
+  cross_began=$(date +%s)
   say "cross-linting $head for Linux"
   gate_job bun run check:linux >"$output" 2>&1 || {
     linux_status=$?
@@ -255,12 +200,25 @@ gate_workspace() {
     exit "$linux_status"
   }
   rm "$output"
+  # The pre-push hook asks Nx for cargo-lint-cross, the cross check's own run and not the gate's: main finds it cached
+  # by adopting this workspace's build volume, which a held target refuses, and a green land is then unpushable. When
+  # the cross check wrote a run summary of its own, its task hashes are read the way the gate's were and published too.
+  cross_hashes=
+  if [ "$(cksum <"$checkout/.nx/cache/run.json" 2>/dev/null || :)" != "$gate_summary" ]; then
+    cross_hashes=$(mktemp "${TMPDIR:-/tmp}/land-hashes.XXXXXX")
+    bun "$here/land-publish.ts" hashes "$checkout/.nx/cache/run.json" "$cross_began" >"$cross_hashes" || {
+      say "could not read the Linux cross check's task hashes (status $?); the land goes on without publishing them: the cache never blocks a land"
+      rm "$cross_hashes"
+      cross_hashes=
+    }
+  fi
   shipping_started=$(date +%s)
   say "building the host production CLI for shipping verification"
   gate_job bun nx run cowshed:cli-native:production --outputStyle=static-failures-only >&2 || {
     shipping_status=$?
     say "host production CLI exited $shipping_status after $(($(date +%s) - shipping_started))s; the land stops"
     [ -z "$hashes" ] || rm "$hashes"
+    [ -z "$cross_hashes" ] || rm "$cross_hashes"
     exit "$shipping_status"
   }
   shipping_built=$(date +%s)
@@ -269,50 +227,20 @@ gate_workspace() {
     shipping_status=$?
     say "shipping release-check exited $shipping_status after $(($(date +%s) - shipping_built))s; the land stops"
     [ -z "$hashes" ] || rm "$hashes"
+    [ -z "$cross_hashes" ] || rm "$cross_hashes"
     exit "$shipping_status"
   }
   shipping_checked=$(date +%s)
   say "shipping verification: producer $((shipping_built - shipping_started))s, release-check $((shipping_checked - shipping_built))s, total $((shipping_checked - shipping_started))s"
-  [ -n "$hashes" ] || return 0
-  # The gate and the Linux cross check passed, so the gate's task results are the land's to publish. The cache never
-  # blocks a land: a failed publish is said, and the land goes on.
-  gate_job bun "$here/land-publish.ts" publish "$checkout" "$hashes" >&2 || say "publishing the gate's Nx results failed (status $?); the land goes on: the cache never blocks a land"
-  rm "$hashes"
+  # The gate and the Linux cross check passed, so their task results are the land's to publish. The cache never blocks
+  # a land: a failed publish is said, and the land goes on.
+  for list in "$hashes" "$cross_hashes"; do
+    [ -n "$list" ] || continue
+    gate_job bun "$here/land-publish.ts" publish "$checkout" "$list" >&2 || say "publishing Nx results failed (status $?); the land goes on: the cache never blocks a land"
+    rm "$list"
+  done
 }
 
-# Builds main's outputs at the commit the land moved it to. The land already happened, so a failure is said, not undone.
-build_main() {
-  say "building main's outputs at $head"
-  build_status=0
-  (cd "$main" && direnv exec "$main" bun nx run-many -t build cli-native napi-native --outputStyle=static-failures-only </dev/null) >&2 || build_status=$?
-  if [ "$build_status" -ne 0 ]; then
-    say "main's build exited $build_status; the land stands, but main's built outputs lag its sources until it passes"
-  fi
-}
-rebase_onto_main
-rebased=$(date +%s)
 allow_envrc
-pick_build_volume
-picked=$(date +%s)
 gate_workspace
-gated=$(date +%s)
-say "rebase $((rebased - started))s, pick $((picked - rebased))s, gate $((gated - picked))s"
-
-while :; do
-  if outcome=$(cd "$main" && cowshed --json land "$workspace" --expected-target-head "$base" --expected-source-head "$head" "$@"); then
-    printf '%s\n' "$outcome" >&2
-    build_main
-    exit 0
-  fi
-  printf '%s\n' "$outcome" >&2
-  verdict=$(bun "$here/land-decide.ts" after-land "$outcome")
-  case $verdict in
-  gateAgain) ;;
-  *) exit 1 ;;
-  esac
-  say "main moved while the gate ran; rebasing onto its new head and gating again"
-  rebase_onto_main
-  allow_envrc
-  pick_build_volume
-  gate_workspace
-done
+say "gate passed for $head in $(($(date +%s) - started))s"

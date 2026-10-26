@@ -156,7 +156,7 @@
           "{workspaceRoot}/**/*"
         ],
         "options": {
-          "command": "bun tooling/checks/spec-links.fixtures.ts && bun tooling/checks/spec-links.ts",
+          "command": "bun tooling/checks/spec-links.fixtures.ts && bun tooling/checks/compiled-in-docs.fixtures.ts && bun tooling/checks/spec-links.ts",
           "cwd": "{workspaceRoot}"
         }
       },

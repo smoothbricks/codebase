@@ -2286,8 +2286,8 @@ runner, or with two (they would write one report), is judged by its exit alone.
 `smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in Nx's `cacheDir`, the directory
 `StoreRunInformationLifeCycle` writes: the checkout's own `.nx/cache` under smoo's workspace policy) against those
 records and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for
-that task's hash, is a `bound`; a failed task without one is not. This diagnostic is not land acceptance. The land
-wrapper, `tooling/land-host.sh`, requires `nx run-many -t gate` to exit zero: bounds, assertions and infrastructure
+that task's hash, is a `bound`; a failed task without one is not. This diagnostic is not land acceptance. The land gate,
+`tooling/land-host.sh --gate`, requires `nx run-many -t gate` to exit zero: bounds, assertions and infrastructure
 failures all stop the land without a retry or waiver. `smoo-nx-failures OUTPUT`, from `@smoothbricks/failure-summary`,
 reports unique failing tasks and deduplicated exact diagnostics from that invocation's retained output, not a shared
 last-run record. That package's `summarizeFailures(output)` and `runFailureSummary(args)` are the one parser;

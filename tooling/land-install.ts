@@ -256,9 +256,10 @@ export type Outcome =
   | { readonly kind: 'attended' | 'unverified' | 'deferred'; readonly why: string; readonly command: string };
 
 /**
- * The line an install appends to the land-status record of a land: a UTC timestamp, the landed commit, then
- * 'install' and the outcome. attended and unverified name the command to run by hand, deferred the one to rerun once the
- * named work has ended: 'deferred: BLOCKER; BLOCKER; rerun COMMAND', split at its last '; rerun '.
+ * The line an install prints for a land, which the declared after-land command's log keeps
+ * (lands/<head>.after<n>.log): a UTC timestamp, the landed commit, then 'install' and the outcome. attended and
+ * unverified name the command to run by hand, deferred the one to rerun once the named work has ended:
+ * 'deferred: BLOCKER; BLOCKER; rerun COMMAND', split at its last '; rerun '.
  */
 export function landStatusLine(timestamp: string, commit: string, outcome: Outcome): string {
   return `${timestamp} ${commit} install ${describe(outcome)}`;

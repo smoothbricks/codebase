@@ -27,10 +27,11 @@ is the host-installed CLI of `packages/cowshed`.
   and test threads it starts. Work started outside it has neither, so it competes with every job unweighted and
   unbounded. Host targets that a sandbox can't run (`host-e2e`) use `cowshed exec <ws> --host -- direnv exec . <cmd>`.
 - **Land**: the land command (see Commands). Under the repository's **land turn** (a FIFO queue per repo, holder named),
-  it rebases the shed onto `main`, refuses what the rebased tree adds that no production code reaches
-  (`@smoothbricks/codebase:wiring`), runs the repo's gate (`tooling/land-host.sh`: `nx run-many -t gate`, the root
-  aggregate of every project's lint, test and build plus `host-e2e`; then `bun run check:linux`), fast-forwards `main`
-  on green and retires the shed.
+  it rebases the shed onto `main`, runs the gate main's `.cowshed.toml` declares (`tooling/land-host.sh --gate`: it
+  refuses what the rebased tree adds that no production code reaches (`@smoothbricks/codebase:wiring`), then runs
+  `nx run-many -t gate`, the root aggregate of every project's lint, test and build plus `host-e2e`, and
+  `bun run check:linux`), fast-forwards `main` on green and retires the shed, then pushes `main` and runs the declared
+  after-land commands.
 - **Nx**: the build and test runner. `@smoothbricks/nx-plugin` infers most targets.
 - **LMAO spans**: the traces `@smoothbricks/lmao` records. Tests flush them to each package's SQLite sink
   (`<package>/.cache/lmao/trace-results.db`); `TraceQuery` or the `sqlite3` CLI reads them
@@ -212,13 +213,17 @@ is the host-installed CLI of `packages/cowshed`.
   of the fleet. Bare `cargo` or `bun test` may diagnose a runner and never replaces Nx acceptance. For
   platform-conditional Rust, run `bun run check:linux` before the final land or push; it proves Linux compilation, not
   Linux test execution.
-- **Land:** `<land-command> land <ws>`, where `<land-command>` is the operator-configured host entry that takes the
-  repository's land turn; your lead gives you its path, it is not in this repository. It invokes `tooling/land-host.sh`,
-  which owns acceptance of the rebased tree; do not invoke its internals directly or reconstruct its retry/waiver
-  taxonomy in this file.
-- **Doc commit (Markdown only):** `<land-command> git -C <main> commit --only -m 'docs: summary' -- <paths>` (new files
-  first: `<land-command> git -C <main> add -- <paths>`). It takes the land turn briefly and runs no gate of its own; the
-  next land re-gates what the Markdown reaches. Conventional commits, no trailers.
+- **Land:** `cowshed land <ws>` from the trusted host shell. Main's `.cowshed.toml` declares the route (`[land]`):
+  cowshed takes the land turn, rebases `<ws>` onto main, runs the declared gate `tooling/land-host.sh --gate <ws>`,
+  which owns acceptance of the rebased tree (do not invoke it directly or reconstruct its retry/waiver taxonomy in this
+  file), fast-forwards main under the ref turn (rebasing and gating again when main moved), retires `<ws>`, then pushes
+  and runs the declared after-land commands, detached. `--no-push` skips the push.
+- **Doc commit (Markdown only):** `cowshed doc-commit -m 'docs: summary' (--patch <file> | --icm <program>)` from
+  `main`; the edit is the input, never main's tree. It takes only the ref turn and runs no gate of its own, and it
+  refuses a path that is not Markdown or that main holds uncommitted. The declared `[doc] check` also refuses an edit
+  that root lint's `spec-links` would refuse (a code reference in a spec that names nothing in this tree) and a file a
+  crate compiles in (`include_str!` or `include_bytes!`): that is a code task's input, so land it as code through a
+  shed. The next land re-gates the rest of what the Markdown reaches. Conventional commits, no trailers.
 - **Build state:** cowshed owns Nx state paths and the Nx daemon. Declare restorable outputs as Nx outputs, one producer
   per checkout; never redirect state paths ad hoc. Keep caches warm: an unexplained miss is a missing or wrong input,
   output or dependency declaration, fixed where it is found, never by wiping the cache. Infer targets and read their
@@ -239,7 +244,7 @@ conversion. The specs below own the rest, not a handwritten API or enum inventor
 - `specs/cowshed/16_build_volumes.md`: workspace-owned build state, warm forks, seed compaction and adoption.
 - `packages/cowshed/skills/cowshed/SKILL.md`: the shed workflow: fork, exec, land, and what to do when `rm` refuses.
 - `packages/cowshed/docs/agents.md`: workspace ownership and the agent-facing CLI workflow.
-- `tooling/land-host.sh` and `tooling/land-host.test.ts`: current landing mechanics and refusal evidence.
+- `tooling/land-host.sh` and `tooling/land-host.test.ts`: the declared land gate and its refusal evidence.
 
 ## Documentation custody
 
