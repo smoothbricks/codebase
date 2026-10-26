@@ -506,6 +506,7 @@ impl ControlRequest {
             Self::NxCacheClear { .. } => "nx-cache-clear",
             Self::RamDetach { .. } => RAM_DETACH_OP,
             Self::FirstLaunch => FIRST_LAUNCH_OP,
+            Self::Released { .. } => cowshed_gateway_types::RELEASED_OP,
         }
     }
 }
