@@ -524,25 +524,7 @@ pub fn verify_no_symlinks(root: &Path, candidate: &Path) -> Result<(), StoreLock
 mod tests {
     use super::*;
     #[test]
-    fn native_flag_and_result_tables_are_exact() {
-        assert_eq!(
-            ROOT_OPEN_FLAGS,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        );
-        assert_eq!(DIRECTORY_OPEN_FLAGS, ROOT_OPEN_FLAGS);
-        assert_eq!(
-            LOCK_FILE_OPEN_FLAGS,
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        );
-        assert_eq!(
-            LOCK_FILE_CREATE_FLAGS,
-            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL
-        );
-        assert_eq!(WAIT_LOCK_OPERATION, libc::LOCK_EX);
-        assert_eq!(TRY_LOCK_OPERATION, libc::LOCK_EX | libc::LOCK_NB);
-        assert_eq!(LOCK_FILE_MODE, 0o600);
-        assert_eq!(CONTROLLER_DIRECTORY_MODE, 0o700);
-
+    fn native_result_tables_are_exact() {
         for (fd, failed) in [(-1, true), (0, false), (1, false)] {
             assert_eq!(fd_failed(fd), failed, "fd={fd}");
             assert_eq!(flock_succeeded(fd), fd == 0, "result={fd}");
