@@ -84,6 +84,12 @@ enum Role {
     Leader(Escapee),
     /// A background descendant of a job's leader: it outlives the leader's stdio, not the job.
     Escapee(Escapee),
+    /// Root: mint a scratch root, report it, and hold it until stdin closes or the
+    /// process is killed (the killed run of the next-start reclaim proof).
+    ScratchHolder {
+        uid: u32,
+        gid: u32,
+    },
 }
 
 /// What a workload process does, in order.
@@ -268,6 +274,7 @@ fn job_cgroup_role() {
         Role::Workload(workload) => work(&workload),
         Role::Leader(escapee) => lead(&escapee),
         Role::Escapee(escapee) => escape(&escapee),
+        Role::ScratchHolder { uid, gid } => hold_scratch(uid, gid),
     }
 }
 
@@ -309,6 +316,7 @@ fn delegate(uid: u32, gid: u32) {
     // Keep this parent root until the controller ends: it owns the mount even when a scenario
     // panics or the controller cannot be spawned. Only the controller drops privilege.
     scratch_cleanup_survives_failure(uid, gid);
+    scratch_next_start_reclaims_a_killed_run(uid, gid);
     let mut scratch = Scratch::make(uid, gid);
     let mut command = Command::new(find_program("setpriv"));
     command
@@ -2131,7 +2139,9 @@ fn in_scratch(name: &str) -> PathBuf {
 const SCRATCH_IMAGE_BYTES: u64 = 512 << 20;
 
 /// One run's scratch storage, owned by the root Delegate parent and removed on normal exit or
-/// unwind. Without usable loop devices, tmpfs proves shmem charging, not regular-file cache or I/O.
+/// unwind; a run killed before either is reclaimed by the next start, which proves its mount
+/// from the owner record the root carries. Without usable loop devices, tmpfs proves shmem
+/// charging, not regular-file cache or I/O.
 struct Scratch {
     /// Owned by this run alone: holds the image and its mountpoint, or is the tmpfs directory.
     root: PathBuf,
@@ -2162,6 +2172,7 @@ impl Scratch {
     }
 
     fn prepare(root: PathBuf, uid: u32, gid: u32) -> Self {
+        Self::reclaim_dead_runs();
         std::fs::create_dir(&root)
             .unwrap_or_else(|error| panic!("create {}: {error}", root.display()));
         let image = root.join("ext4.img");
@@ -2189,6 +2200,7 @@ impl Scratch {
         scratch.loop_association = Some(
             associate_scratch_loop(device, &image).unwrap_or_else(|refusal| panic!("{refusal}")),
         );
+        scratch.record_owner();
         scratch
     }
 
@@ -2250,8 +2262,288 @@ impl Scratch {
             "{} is on tmpfs: f_type {f_type:#x}",
             scratch.directory.display()
         );
+        scratch.record_owner();
         scratch
     }
+}
+
+/// The owner record a scratch root carries from its making until its cleanup: the next
+/// start proves a dead run's mount from it against the live kernel state, never from
+/// the root's name alone.
+const OWNER_RECORD: &str = "owner";
+
+/// Whether `pid` still names a live process (or one this process may not inspect).
+fn process_live(pid: i32) -> bool {
+    // SAFETY: signal zero checks one positive pid without delivering a signal.
+    !(unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+}
+
+impl Scratch {
+    /// Record this process as the root's owner, with the loop device and backing
+    /// identity when one is associated, for the next start's dead-run reclaim.
+    fn record_owner(&self) {
+        let mut record = format!("pid={}\n", std::process::id());
+        if let Some(association) = &self.loop_association {
+            record.push_str(&format!(
+                "device={}\nbacking={}:{}\n",
+                association.device.display(),
+                association.backing.0,
+                association.backing.1
+            ));
+        }
+        std::fs::write(self.root.join(OWNER_RECORD), record).unwrap_or_else(|error| {
+            panic!("record scratch owner in {}: {error}", self.root.display())
+        });
+    }
+
+    /// Reclaim every dead prior run's root in both scratch parents before this process
+    /// mints its own: a privileged owner that was killed never reached its Drop, so its
+    /// mount and loop association outlive it. A root whose recorded owner is alive,
+    /// this process included, is left alone; a root whose mount cannot be proven from
+    /// its record is kept and named, never unmounted or deleted on a guess.
+    fn reclaim_dead_runs() {
+        let mut kept = Vec::new();
+        for parent in [std::env::temp_dir(), PathBuf::from("/dev/shm")] {
+            let entries = match std::fs::read_dir(&parent) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    panic!("list dead scratch roots in {}: {error}", parent.display())
+                }
+            };
+            for entry in entries {
+                let entry =
+                    entry.unwrap_or_else(|error| panic!("read {}: {error}", parent.display()));
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("cowshed-job-cgroup-"))
+                    .and_then(|pid| pid.parse::<i32>().ok())
+                    .filter(|pid| *pid > 0)
+                else {
+                    continue;
+                };
+                if pid == i32::try_from(std::process::id()).expect("this process's pid")
+                    || process_live(pid)
+                {
+                    continue;
+                }
+                if let Err(refusal) = Self::reclaim_dead_root(&entry.path(), pid) {
+                    kept.push(refusal);
+                }
+            }
+        }
+        assert!(
+            kept.is_empty(),
+            "dead scratch runs kept for a manual look: {}",
+            kept.join("; ")
+        );
+    }
+
+    /// Remove one dead run's root. With nothing mounted through it, removal is safe
+    /// once its owner is dead (an association whose descriptors died with the owner is
+    /// the kernel's AUTOCLEAR to retire). With a mount, the recorded device must still
+    /// back the recorded image and be the mount's device; the unmount is fenced by the
+    /// backing file's final close, exactly as the live cleanup's is.
+    fn reclaim_dead_root(root: &Path, owner_pid: i32) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let directory = root.join("mnt");
+        let root_identity = mount_identity(root)
+            .map_err(|error| format!("mount identity of {}: {error}", root.display()))?;
+        let mount = match mount_identity(&directory) {
+            Ok(target) if target.id != root_identity.id => Some(target),
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "mount identity of {}: {error}",
+                    directory.display()
+                ));
+            }
+        };
+        let Some(mount) = mount else {
+            return std::fs::remove_dir_all(root)
+                .map_err(|error| format!("remove dead scratch {}: {error}", root.display()));
+        };
+        let (device, backing) = Self::recorded_association(root, owner_pid)?;
+        let device_file = std::fs::File::open(&device)
+            .map_err(|error| format!("open recorded {}: {error}", device.display()))?;
+        let current = loop_backing(&device_file)
+            .map_err(|error| format!("read recorded {}'s backing: {error}", device.display()))?;
+        if current != backing {
+            return Err(format!(
+                "dead scratch {}'s recorded {} now backs {current:?}, not {backing:?}: kept",
+                root.display(),
+                device.display()
+            ));
+        }
+        let rdev = device_file
+            .metadata()
+            .map_err(|error| format!("stat recorded {}: {error}", device.display()))?
+            .rdev();
+        if mount.device != (libc::major(rdev), libc::minor(rdev)) {
+            return Err(format!(
+                "dead scratch {}'s mount is on {:?}, not its recorded {}: kept",
+                root.display(),
+                mount.device,
+                device.display()
+            ));
+        }
+        let image = root.join("ext4.img");
+        let image_file = std::fs::File::open(&image)
+            .map_err(|error| format!("open dead scratch image {}: {error}", image.display()))?;
+        let image_backing = image_file
+            .metadata()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+            .map_err(|error| format!("stat dead scratch image {}: {error}", image.display()))?;
+        if image_backing != backing {
+            return Err(format!(
+                "dead scratch {}'s image is {image_backing:?}, not its recorded backing {backing:?}: kept",
+                root.display()
+            ));
+        }
+        let closed = BackingClose::arm(&image_file)
+            .map_err(|error| format!("watch dead scratch backing close: {error}"))?;
+        run(Command::new("umount").arg(&directory))?;
+        match mount_identity(&directory) {
+            Ok(target) if target.id != root_identity.id => {
+                return Err(format!(
+                    "dead scratch {}'s mount {target:?} remains after umount: kept",
+                    root.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "verify dead scratch {} unmounted: {error}",
+                    root.display()
+                ));
+            }
+        }
+        closed
+            .wait()
+            .map_err(|error| format!("await dead scratch backing close: {error}"))?;
+        match std::fs::File::open(&device).and_then(|file| loop_backing(&file)) {
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
+            Ok(after) if after != backing => {}
+            Ok(_) => {
+                return Err(format!(
+                    "dead scratch {}'s loop association remains attached: kept",
+                    root.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "verify dead scratch {}'s association cleared: {error}",
+                    root.display()
+                ));
+            }
+        }
+        std::fs::remove_dir_all(root)
+            .map_err(|error| format!("remove dead scratch {}: {error}", root.display()))
+    }
+
+    /// The loop device and backing identity a dead root's owner record names, proven to
+    /// belong to the pid its root is named for.
+    fn recorded_association(root: &Path, owner_pid: i32) -> Result<(PathBuf, (u64, u64)), String> {
+        let text = std::fs::read_to_string(root.join(OWNER_RECORD)).map_err(|error| {
+            format!(
+                "dead scratch {} is mounted with no readable owner record: {error}",
+                root.display()
+            )
+        })?;
+        let (mut pid, mut device, mut backing) = (None, None, None);
+        for line in text.lines() {
+            match line.split_once('=') {
+                Some(("pid", value)) => pid = value.parse().ok(),
+                Some(("device", value)) => device = Some(PathBuf::from(value)),
+                Some(("backing", value)) => {
+                    backing = value
+                        .split_once(':')
+                        .and_then(|(dev, ino)| Some((dev.parse().ok()?, ino.parse().ok()?)));
+                }
+                _ => {
+                    return Err(format!(
+                        "dead scratch {} has a malformed owner record line {line:?}: kept",
+                        root.display()
+                    ));
+                }
+            }
+        }
+        if pid != Some(owner_pid) {
+            return Err(format!(
+                "dead scratch {} records owner {pid:?}, not {owner_pid}: kept",
+                root.display()
+            ));
+        }
+        match (device, backing) {
+            (Some(device), Some(backing)) => Ok((device, backing)),
+            _ => Err(format!(
+                "dead scratch {} records no loop association but is mounted: kept",
+                root.display()
+            )),
+        }
+    }
+}
+
+/// Mint a scratch root, report it, and hold it until stdin closes or this process is
+/// killed: the killed run of [`scratch_next_start_reclaims_a_killed_run`].
+fn hold_scratch(uid: u32, gid: u32) {
+    let scratch = Scratch::make(uid, gid);
+    println!("{REPORT}scratch {} held", scratch.root.display());
+    std::io::stdout().flush().expect("report the held scratch");
+    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("hold the scratch");
+}
+
+/// A run killed after minting its scratch never reaches Drop, so its root -- mount and
+/// all -- outlives it. The next start reclaims that exact root, proving the mount from
+/// the dead run's record, before it mints its own.
+fn scratch_next_start_reclaims_a_killed_run(uid: u32, gid: u32) {
+    let mut holder = Command::new(test_binary())
+        .args(role_arguments())
+        .env(
+            ROLE,
+            serde_json::to_string(&Role::ScratchHolder { uid, gid }).expect("role"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn_locked()
+        .expect("start the scratch holder");
+    let mut lines = BufReader::new(holder.stdout.take().expect("holder stdout")).lines();
+    let root = loop {
+        let line = lines
+            .next()
+            .expect("the holder reports its root before it holds it")
+            .expect("the holder's report line");
+        if let Some(root) = line
+            .strip_prefix(REPORT)
+            .and_then(|rest| rest.strip_prefix("scratch "))
+            .and_then(|rest| rest.strip_suffix(" held"))
+        {
+            break PathBuf::from(root);
+        }
+    };
+    holder.kill().expect("SIGKILL the scratch holder");
+    let status = holder.wait_bounded().expect("reap the scratch holder");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the holder died by SIGKILL, before any Drop: {status}"
+    );
+    assert!(
+        root.is_dir(),
+        "the killed run's root outlived it: {}",
+        root.display()
+    );
+    Scratch::reclaim_dead_runs();
+    assert!(
+        !root.exists(),
+        "the next start reclaimed the killed run's root {}",
+        root.display()
+    );
+    println!("scratch cleanup: a killed run's root was reclaimed by the next start");
 }
 
 /// Consume the runner's declared finite device pool. GET_FREE can select a globally free loop
