@@ -122,7 +122,8 @@ attribute_failures() {
     say "could not name the commits that reach the failed tasks (status $?)"
     return 0
   }
-  # Task ids hold no whitespace, so each failed one is one argument.
+  # Task ids hold no whitespace, so each failed one is one argument: the split is intended.
+  # shellcheck disable=SC2086
   if gate_job node "$checkout/tooling/land-inputs.mts" gate $failed >"$inputs" &&
     attribution=$(printf '%s\n' "$failed" | (cd "$checkout" && bun "$here/land-attribution.ts" attribute --base "$base" --head "$head" --inputs "$inputs")); then
     printf '%s\n' "$attribution" | while IFS= read -r line; do say "$line"; done
