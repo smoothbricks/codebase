@@ -518,7 +518,9 @@ async fn a_sccache_host_connection_serves_the_sccache_rows_and_no_other_role() {
             "{refused:?}"
         );
         assert!(
-            refused.message.contains("launchctl Print could not start"),
+            refused
+                .message
+                .contains("launchctl print: launchctl could not be started"),
             "{refused:?}"
         );
         assert_eq!(

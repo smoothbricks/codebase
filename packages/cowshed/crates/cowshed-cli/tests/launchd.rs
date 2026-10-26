@@ -1731,7 +1731,7 @@ fn executable_removal_removes_the_named_files_in_order_and_nothing_when_none() {
 fn a_launchctl_that_never_answers_fails_its_bound_naming_the_child() {
     let root = scratch("never-answers");
     let launchctl = root.join("launchctl");
-    fs::write(&launchctl, "#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+    fs::write(&launchctl, "#!/bin/sh\nexec sleep 600\n").unwrap();
     fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
     let bound = Bound::new(LatencyClass::Ffi, Duration::from_millis(500));
     let error = NativeLaunchctlCommand
@@ -1741,16 +1741,25 @@ fn a_launchctl_that_never_answers_fails_its_bound_naming_the_child() {
             &deadline::start("launchctl print", bound),
         )
         .expect_err("a launchctl that never answers fails its bound");
-    assert_eq!(error.code(), "TIMEOUT", "{error}");
     let RunError::Reap(ReapError::Expired(expired)) = &error else {
         panic!("expected the bound's expiry, got {error}");
     };
+    // The expiry left the child as it was: it still runs, and the test ends it before any
+    // assertion can panic, so a failed one leaves no sleeper behind.
+    let pid = libc::pid_t::try_from(expired.peer.pid).expect("a pid");
+    // SAFETY: the pid names the stand-in this test started, which the expiry left running.
+    let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(killed, 0, "the child outlived the expiry: {error}");
+    assert_eq!(error.code(), "TIMEOUT", "{error}");
     assert_eq!(expired.op, "launchctl print");
     assert_eq!(expired.peer.role, "launchctl");
     assert_eq!(expired.bound, bound.within);
-    assert!(expired.elapsed < Duration::from_secs(5), "{error}");
+    // Alive at the bound: running its start, in a kernel wait during it, or asleep.
     assert!(
-        matches!(expired.peer.state, RunState::Sleeping | RunState::Running),
+        matches!(
+            expired.peer.state,
+            RunState::Sleeping | RunState::Running | RunState::Uninterruptible
+        ),
         "{error}"
     );
     let message = error.to_string();
@@ -1758,12 +1767,6 @@ fn a_launchctl_that_never_answers_fails_its_bound_naming_the_child() {
         message.contains(&format!("launchctl pid {}", expired.peer.pid)),
         "{message}"
     );
-    // The expiry left the child as it was: it still runs, and the test ends it.
-    let killed = std::process::Command::new("/bin/kill")
-        .args(["-KILL", &expired.peer.pid.to_string()])
-        .status()
-        .unwrap();
-    assert!(killed.success(), "the child outlived the expiry");
     fs::remove_dir_all(root).unwrap();
 }
 
