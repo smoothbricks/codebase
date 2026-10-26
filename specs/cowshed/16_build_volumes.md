@@ -700,9 +700,9 @@ finding nothing to price said apart from any other), a pricing failure and a see
 each said, and the gate builds on the workspace's own volume. A reseed that fails is said with cowshed's status, and the
 gate builds on whichever volume the build link then names: a refused reseed (a held lock, main's image lock under a
 fork, a land or a seed compaction included; an admitted job's hold) leaves the own volume linked, while one that fails
-after publication leaves the seed's clone linked (Workspace reseed). A seed compaction changes no price: its copy is
-published at the copied seed's tree with that seed's bytes ("Seed compaction"), so a reseed that clones it gates on what
-was priced.
+after publication leaves the seed's clone linked (Workspace reseed). A seed compaction changes no price: it publishes a
+new seed at the tree of the seed whose bytes it holds, caught up or not ("Seed compaction"), so the pick prices it as
+that seed, and one published after the price is a seed that changed after it was priced.
 
 Measured 2026-10-25 on SmoothBricks (`cargo test --no-run --workspace` at tree `e5578ec`, each candidate a clone of a
 seed): main's seed (1 path apart) rebuilt 94 units, 1151-1290 serial s and 123-154 s wall, from a host shell that set
