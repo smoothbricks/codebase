@@ -1779,10 +1779,16 @@ mod tests {
         )
         .expect("a killed child exits");
         use std::os::unix::process::ExitStatusExt as _;
-        let status = child
-            .try_wait()
-            .expect("read the exit")
-            .expect("the exit await_exit saw is still there to collect");
+        let status = collect_exited(
+            "probe child",
+            pid,
+            &start("collect probe", REAP),
+            Progress::Signalled {
+                signal: libc::SIGKILL,
+            },
+            || child.try_wait(),
+        )
+        .expect("the exit await_exit saw is collected within the reap bound");
         assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
