@@ -6301,8 +6301,7 @@ impl SupervisorActor {
         let (read_write, _) = self
             .policy
             .child(crate::api::dto::RunSandboxMode::ReadWrite);
-        let Some(project_root) = super::nx_daemon::kept_project(read_write).map(Path::to_path_buf)
-        else {
+        let Some(project_root) = super::nx_daemon::kept_project(read_write) else {
             keeper.settled = true;
             for (_, reply) in self.nx_keeper_stops.drain(..) {
                 let _ = reply.send(Ok(()));
@@ -6314,9 +6313,10 @@ impl SupervisorActor {
         };
         // A grant advance can change the Nx root while the read is in flight. Its result
         // belongs only to the root it observed; the next probe reads the current authority.
-        if probed_root != project_root {
+        if probed_root.as_path() != project_root {
             return false;
         }
+        let project_root = probed_root;
         while let Some((job_id, reply)) = self.nx_keeper_stops.pop() {
             if daemon == Probe::Live {
                 let _ = reply.send(Ok(()));
