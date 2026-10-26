@@ -777,9 +777,28 @@ impl CpuPlacement {
                     environment.push((OsString::from(name), OsString::from(tokens.to_string())));
                 }
             }
+            if sized_by_this_grant {
+                let tasks = OsString::from(nx_parallel(caller, tokens).to_string());
+                environment.push((OsString::from("NX_PARALLEL"), tasks.clone()));
+                environment.push((
+                    OsString::from(crate::workspace_environment::NX_PARALLEL_RESTORE_ENV),
+                    tasks,
+                ));
+            }
         }
         environment
     }
+}
+
+/// How many Nx tasks a command holding `tokens` runs at once: a caller's count below the grant,
+/// else the grant. A percentage, or anything else that is not a count, is the grant: Nx reads a
+/// percentage of the host's cores, which the grant already bounds.
+fn nx_parallel(caller: &BTreeMap<String, String>, tokens: usize) -> usize {
+    caller
+        .get("NX_PARALLEL")
+        .and_then(|count| count.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .map_or(tokens, |count| count.min(tokens))
 }
 
 #[cfg(test)]
@@ -846,8 +865,41 @@ mod cpu_placement_tests {
                 ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
                 ("RUST_TEST_THREADS", "3"),
                 ("NEXTEST_TEST_THREADS", "3"),
+                ("NX_PARALLEL", "3"),
+                ("COWSHED_NX_PARALLEL", "3"),
             ])
         );
+    }
+
+    /// Nx's task fan-out is the grant's. Measured 2026-10-26: `cowshed exec <ws> -- nx run-many`
+    /// on 2 tokens ran 11 task processes at once (16 GB RSS, host load 39), since the devenv
+    /// shell's `NX_PARALLEL=100%` let Nx start a task per core whatever the job held. A
+    /// grant-sized class exports `NX_PARALLEL` as its count, below any larger caller count and in
+    /// place of a percentage, and `COWSHED_NX_PARALLEL`, which `.cowshed/env` restores after a
+    /// devenv shell sets its own; a gate exports neither, since its tasks ask the host one by one.
+    #[test]
+    fn nx_task_fan_out_is_the_grants() {
+        let nx = |placement: &CpuPlacement, caller: &[(&str, &str)]| {
+            let exported = exported(placement, caller);
+            (
+                exported.get("NX_PARALLEL").cloned(),
+                exported.get("COWSHED_NX_PARALLEL").cloned(),
+            )
+        };
+        let count = |n: &str| (Some(n.to_owned()), Some(n.to_owned()));
+        assert_eq!(nx(&placement(Some(2)), &[]), count("2"));
+        assert_eq!(
+            nx(&placement(Some(2)), &[("NX_PARALLEL", "100%")]),
+            count("2")
+        );
+        assert_eq!(nx(&placement(Some(2)), &[("NX_PARALLEL", "8")]), count("2"));
+        assert_eq!(nx(&placement(Some(4)), &[("NX_PARALLEL", "3")]), count("3"));
+        let gate = CpuPlacement {
+            class: ExecClass::Gate,
+            ..placement(Some(1))
+        };
+        assert_eq!(nx(&gate, &[]), (None, None));
+        assert_eq!(nx(&placement(None), &[]), (None, None));
     }
 
     /// A gate's pool is a relay that lends nothing: every runner its command starts asks the host
@@ -889,6 +941,8 @@ mod cpu_placement_tests {
                 ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
                 ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
                 ("NEXTEST_TEST_THREADS", "2"),
+                ("NX_PARALLEL", "2"),
+                ("COWSHED_NX_PARALLEL", "2"),
             ])
         );
     }

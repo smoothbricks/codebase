@@ -1265,7 +1265,12 @@ core count.
   `--jobs` and `CARGO_MUTANTS_JOBS` lowered to at most it, and each of its cargo processes `⌊limit / jobs⌋`, at least
   one, as `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS`; `--jobs` is never added, since
   cargo-mutants refuses it beside `--in-place`. Every command receives the actual held grant as
-  `BOUNDED_EXEC_CPU_TOKENS`; the sub-ledger and telemetry report held tokens, not a fabricated runner count.
+  `BOUNDED_EXEC_CPU_TOKENS`; the sub-ledger and telemetry report held tokens, not a fabricated runner count. Nx's task
+  fan-out is the grant's too. Measured 2026-10-26: `cowshed exec <ws> -- nx run-many` on 2 tokens ran 11 task processes
+  at once (16 GB RSS, host load 39), since the devenv shell's `NX_PARALLEL=100%` let Nx start a task per core. A job
+  granted outside a gate therefore exports `NX_PARALLEL` as its count (a caller's lower count kept, a percentage
+  replaced) and `COWSHED_NX_PARALLEL`, which `.cowshed/env` restores after a devenv shell sets its own; an explicit
+  `--parallel=N` stays the caller's. A gate exports neither: its tasks ask the host one by one ("Gate admission").
 - **Nested runners use a parent-held sub-ledger.** A granted executor serves its T tokens on a private socket and
   publishes that endpoint as `BOUNDED_EXEC_CPU_POOL`, beside its `BOUNDED_EXEC_CPU_TOKENS` count and the pool's make
   jobserver fifo ("Cargo reads its holder's jobserver" below). A default nested executor connects to its immediate

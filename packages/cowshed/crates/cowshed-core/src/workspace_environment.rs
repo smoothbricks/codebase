@@ -9,6 +9,10 @@ use zeroize::Zeroizing;
 use crate::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
 
 pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
+
+/// The variable `.cowshed/env` restores `NX_PARALLEL` from after a devenv shell sets its own: a
+/// granted job's Nx fan-out (05_gateway.md "Sized to the grant").
+pub const NX_PARALLEL_RESTORE_ENV: &str = "COWSHED_NX_PARALLEL";
 pub const WORKSPACE_TOKEN_ENV: &str = "COWSHED_WORKSPACE_TOKEN";
 pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 /// The workspace's current port block size: `base+1 … base+size-1` are its service ports.
@@ -193,6 +197,7 @@ pub(crate) fn write_workspace_environment(
                 .map_or(0, |(temp_dir, _)| temp_dir.len() * 5),
     ));
     contents.push_str(DEV_CI_POLICY);
+    contents.push_str(&nx_parallel_restore());
     // No bare `COWSHED_WORKSPACE_TOKEN`: every shell that sources this file would hand it to every
     // child. `.cowshed/workspace.json` is what marks a workspace.
     if let Some(block) = port_block {
@@ -291,6 +296,14 @@ pub(crate) fn write_workspace_environment(
     Ok(())
 }
 
+/// The line that puts a granted job's Nx fan-out back after a devenv shell sourced before
+/// `.cowshed/env` set its own `NX_PARALLEL` (05_gateway.md "Sized to the grant").
+fn nx_parallel_restore() -> String {
+    format!(
+        "if [ -n \"${{{NX_PARALLEL_RESTORE_ENV}-}}\" ]; then export NX_PARALLEL=\"${NX_PARALLEL_RESTORE_ENV}\"; fi\n"
+    )
+}
+
 /// The capability-contributed variables a host shell sources from `.cowshed/env` as its jobs get them: the
 /// compiler-cache client's, a Cargo project's recording of unit use, and Nx's cache size.
 fn host_capability_names() -> impl Iterator<Item = &'static str> {
@@ -327,6 +340,30 @@ mod tests {
             crate::capabilities::cargo::MTIME_ON_USE_ENV,
             "CARGO_UNSTABLE_MTIME_ON_USE"
         );
+    }
+
+    /// A granted job's `NX_PARALLEL` survives the devenv shell sourced before `.cowshed/env`; a
+    /// shell no grant marked keeps its own.
+    #[test]
+    fn the_grants_nx_fan_out_is_restored_over_a_devenv_shells() {
+        let run = |granted: Option<&str>| {
+            let mut shell = std::process::Command::new("/bin/sh");
+            shell
+                .arg("-c")
+                .arg(format!(
+                    "{}printf %s \"$NX_PARALLEL\"",
+                    nx_parallel_restore()
+                ))
+                .env("NX_PARALLEL", "100%")
+                .env_remove(NX_PARALLEL_RESTORE_ENV);
+            if let Some(granted) = granted {
+                shell.env(NX_PARALLEL_RESTORE_ENV, granted);
+            }
+            let output = cowshed_os::fork_lock::Run::output_locked(&mut shell).expect("run sh");
+            String::from_utf8(output.stdout).expect("UTF-8")
+        };
+        assert_eq!(run(Some("2")), "2");
+        assert_eq!(run(None), "100%");
     }
 
     #[test]
