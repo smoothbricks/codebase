@@ -12,8 +12,8 @@ describe('WAIT-WHY', () => {
       `fn reap(child: &mut Child) {\n    ${allow}\n    child.wait().unwrap();\n}`,
       `${allow}\nfn run(command: &mut Command) -> Output {\n    command.output_locked().unwrap()\n}`,
       `#[expect(clippy::disallowed_methods, reason = "fine")]\nfn lock(fd: i32) { unsafe { libc::flock(fd, 2) }; }`,
-      `#![allow(dead_code, clippy::disallowed_methods)]\nfn hold(path: &Path) { UnixStream::connect(path); }`,
-      `#[cfg_attr(test, allow(clippy::disallowed_methods))]\nfn reap(pid: i32) { libc::waitpid(pid, null_mut(), 0); }`,
+      '#![allow(dead_code, clippy::disallowed_methods)]\nfn hold(path: &Path) { UnixStream::connect(path); }',
+      '#[cfg_attr(test, allow(clippy::disallowed_methods))]\nfn reap(pid: i32) { libc::waitpid(pid, null_mut(), 0); }',
       `${allow}\nlet output = Command::new("git").arg("status").output()?;`,
       `// WHY unbounded:\n${allow}\nlet status = child.wait();`,
     ]) {
@@ -29,7 +29,7 @@ describe('WAIT-WHY', () => {
       `/// Doc.\n// WHY unbounded: the operator's interrupt ends it.\n#[inline]\n${allow}\nfn run(c: &mut Command) { c.status_locked(); }`,
       `${allow} // WHY unbounded: LOCK_NB never waits.\nunsafe { libc::flock(fd, LOCK_EX | LOCK_NB) };`,
       `${allow}\n// WHY unbounded: the test runner's no-progress bound ends a stalled test.\nmod tests { fn f() { child.wait(); } }`,
-      `#[allow(\n    // WHY unbounded: tokio reaps it once the pipes close.\n    clippy::disallowed_methods\n)]\nlet output = child.wait_with_output().await;`,
+      '#[allow(\n    // WHY unbounded: tokio reaps it once the pipes close.\n    clippy::disallowed_methods\n)]\nlet output = child.wait_with_output().await;',
     ]) {
       expect(unexplainedWaitAllows(source), source).toEqual([]);
     }

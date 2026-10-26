@@ -267,10 +267,10 @@
         ],
         "outputs": [],
         "options": {
-          "comment": "WAIT-WHY (specs/cowshed/05_gateway.md, Deadlines, Enforcement): clippy refuses the waits each crate's clippy.toml disallows; this refuses a kept one without an adjacent // WHY unbounded: that says what ends it.",
           "command": "bun packages/nx-plugin/src/wait-why-policy.ts packages/cowshed/crates",
           "cwd": "{workspaceRoot}"
-        }
+        },
+        "//": "WAIT-WHY (specs/cowshed/05_gateway.md, Deadlines, Enforcement): clippy refuses the waits each crate's clippy.toml disallows; this refuses a kept one without an adjacent // WHY unbounded: that says what ends it. The note is not an option: nx:run-commands forwards every option it does not know to the command as an argument, and the check reads each argument as a crates directory."
       },
       "lint": {
         "dependsOn": [

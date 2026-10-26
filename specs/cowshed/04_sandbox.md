@@ -1295,7 +1295,7 @@ the pinned 23.2.1; line numbers are those of commit `d2dc2aaef9`.
   Linux has no sandbox in code ("Linux enforcement (ZFS substrate)"), so this reason is macOS's.
 - **Held-lock commands.** `cowshed lock` and `land-turn` hand their command the lock's descriptor, which the kernel
   releases only once every process holding it has closed it (`held_lock.rs:12-15`). A client there that starts a daemon
-  holds the lock until the daemon and its workers end (`build_volume/nx.rs:2962-2980`), so a land turn waits on an idle
+  holds the lock until the daemon and its workers end (`build_volume/nx.rs:2759-2777`), so a land turn waits on an idle
   daemon. They run with `NX_DAEMON_START=never` (`held_lock.rs:232-259`; `02_workspaces.md:1815-1826`), because the
   alternative, `NX_DAEMON=false`, is forbidden for a normal run (`16_build_volumes.md:1277`).
 - **Racing starters.** Two clients that both find no daemon each start one. Stock Nx writes the record unconditionally
