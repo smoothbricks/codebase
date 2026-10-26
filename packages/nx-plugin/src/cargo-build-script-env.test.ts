@@ -40,7 +40,11 @@ afterAll(async () => {
 
 /** Build the probe with `SMOO_DRIFT_PROBE` as given; whether Cargo rebuilt its library. */
 async function libraryRebuilt(probe: string | undefined): Promise<boolean> {
-  const env = { ...cargoEnv(), CARGO_TARGET_DIR: join(root, 'target'), SMOO_FORCED_PROBE: 'ambient' };
+  const env: NodeJS.ProcessEnv = {
+    ...cargoEnv(),
+    CARGO_TARGET_DIR: join(root, 'target'),
+    SMOO_FORCED_PROBE: 'ambient',
+  };
   delete env.SMOO_DRIFT_PROBE;
   delete env.CARGO_SMOO_PROBE;
   if (probe !== undefined) env.SMOO_DRIFT_PROBE = probe;
