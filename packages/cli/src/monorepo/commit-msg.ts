@@ -93,6 +93,7 @@ export function validateBreakingDisclosure(message: string, deletedPublicPackage
 
 /** Manifests of `npm:public` packages deleted in the staged change, relative to HEAD. */
 export function stagedDeletedPublicPackages(root: string): string[] {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git diff of the index: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const deleted = spawnSync('git', ['diff', '--cached', '--diff-filter=D', '--name-only'], {
     cwd: root,
     encoding: 'utf8',
@@ -107,6 +108,7 @@ export function stagedDeletedPublicPackages(root: string): string[] {
   const names: string[] = [];
   for (const manifest of manifests) {
     // The manifest is gone from the worktree, so its tags are only readable at HEAD.
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git read of one blob at HEAD: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
     const shown = spawnSync('git', ['show', `HEAD:${manifest}`], { cwd: root, encoding: 'utf8' });
     if (shown.status !== 0) {
       continue;
@@ -165,6 +167,7 @@ export function formatCommitMessage(message: string, options: FormatCommitMessag
 }
 
 function wrapBodyWithFmt(paragraph: string): string {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: fmt filters the text on its stdin and exits at its end; it waits on no other process
   const result = spawnSync('fmt', ['-w', '72'], { input: `${paragraph}\n`, encoding: 'utf8' });
   if (result.error) {
     throw new Error(

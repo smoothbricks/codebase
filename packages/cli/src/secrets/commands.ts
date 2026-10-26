@@ -15,7 +15,8 @@
  * hunting for a secret that is already set.
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { describeRemoteHttpTimeout, remoteChild } from '../lib/remote-http.js';
 import { getWorkspacePackages } from '../lib/workspace.js';
 import {
   fetchLocalSecret,
@@ -84,21 +85,32 @@ export function describeNeed(row: SecretRow): string {
  * that environment's own secrets, which are the values a bound job reads
  * first.
  */
-export function readRepositorySecrets(
+export async function readRepositorySecrets(
   repo: string | undefined,
   environment?: string,
-): { ok: true; names: string[] } | { ok: false; reason: string } {
+): Promise<{ ok: true; names: string[] } | { ok: false; reason: string }> {
   const args = ['secret', 'list', '--json', 'name'];
   if (repo) args.push('--repo', repo);
   if (environment) args.push('--env', environment);
-  const result = spawnSync('gh', args, { encoding: 'utf8' });
-  if (result.status !== 0) {
+  const child = spawn('gh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+    stderr += chunk;
+  });
+  // One GitHub API request through gh: the remote-http bound ends a stalled one (05_gateway.md, "Deadlines").
+  const closed = await remoteChild(`gh ${args.join(' ')}`, child);
+  if (!closed.ok) return { ok: false, reason: describeRemoteHttpTimeout(closed.error) };
+  if (closed.value.code !== 0) {
     return {
       ok: false,
-      reason: `gh ${args.join(' ')} exited ${result.status ?? 'without status'}: ${result.stderr.trim()}`,
+      reason: `gh ${args.join(' ')} exited ${closed.value.code ?? `on ${closed.value.signal}`}: ${stderr.trim()}`,
     };
   }
-  const parsed: unknown = JSON.parse(result.stdout);
+  const parsed: unknown = JSON.parse(stdout);
   if (!Array.isArray(parsed)) {
     return { ok: false, reason: 'gh secret list did not return a list' };
   }
@@ -125,12 +137,12 @@ export async function writeRepositorySecret(
   if (environment) args.push('--env', environment);
   const child = spawn('gh', args, { stdio: ['pipe', 'inherit', 'inherit'] });
   child.stdin.end(value);
-  const status = await new Promise<number | null>((resolvePromise) => {
-    child.on('close', (code) => resolvePromise(code));
-  });
-  return status === 0
+  // gh fetches the repository's public key and writes the sealed value: the remote-http bound ends a stalled one.
+  const closed = await remoteChild(`gh ${args.join(' ')}`, child);
+  if (!closed.ok) return { ok: false, reason: describeRemoteHttpTimeout(closed.error) };
+  return closed.value.code === 0
     ? { ok: true }
-    : { ok: false, reason: `gh ${args.join(' ')} exited ${status ?? 'without status'}` };
+    : { ok: false, reason: `gh ${args.join(' ')} exited ${closed.value.code ?? `on ${closed.value.signal}`}` };
 }
 
 function collectSources(
@@ -189,7 +201,7 @@ async function gatherSecretsStatus(
   const resolved = resolveRepository(root, options.repo);
   if (!resolved.ok) return resolved;
   const { repo, source } = resolved.choice;
-  const repositorySecrets = readRepositorySecrets(repo);
+  const repositorySecrets = await readRepositorySecrets(repo);
   if (!repositorySecrets.ok) return repositorySecrets;
   // The workflows decide which environments a job reads; an explicitly asked
   // for one is shown too, so an operator can inspect a scope before a workflow
@@ -200,7 +212,7 @@ async function gatherSecretsStatus(
   const environments: SecretsStatusEnvironment[] = [];
   for (const name of [...boundEnvironments, ...asked]) {
     const bound = boundEnvironments.includes(name);
-    const held = readRepositorySecrets(repo, name);
+    const held = await readRepositorySecrets(repo, name);
     // An environment that cannot be read is reported, never assumed empty:
     // guessing produces a refusal about a value that may well be set.
     if (!held.ok) {
@@ -381,14 +393,14 @@ export async function secretsSet(
   const environment = options.env;
   if (name !== undefined) return setOne(name, name, repo, environment);
 
-  const held = readRepositorySecrets(repo);
+  const held = await readRepositorySecrets(repo);
   if (!held.ok) {
     console.error(held.reason);
     return 1;
   }
   const environmentSecrets: Record<string, string[]> = {};
   if (environment !== undefined) {
-    const inEnvironment = readRepositorySecrets(repo, environment);
+    const inEnvironment = await readRepositorySecrets(repo, environment);
     if (!inEnvironment.ok) {
       console.error(inEnvironment.reason);
       return 1;

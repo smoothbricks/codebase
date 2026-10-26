@@ -93,6 +93,7 @@ export class BunProcessRunner implements ProcessRunner {
       stderr: 'pipe',
     });
     const [exitCode, stdout, stderr] = await Promise.all([
+      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a wrangler deploy (upload and rollout) lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
       child.exited,
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),

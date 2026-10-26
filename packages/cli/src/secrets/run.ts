@@ -90,6 +90,7 @@ async function runWithSecrets(
   args: readonly string[],
   values: Readonly<Record<string, string>>,
 ): Promise<number> {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the operator's own program, run with its stdio inherited, lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
   return await new Promise<number>((resolve) => {
     const child = spawn(program, [...args], { stdio: 'inherit', env: { ...process.env, ...values } });
     child.on('error', (error: Error) => {

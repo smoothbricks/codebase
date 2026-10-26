@@ -13,6 +13,7 @@ import {
   parseStringArrayText,
   readSmooGithub,
 } from '../lib/json.js';
+import { RemoteHttpTimeoutError, remoteChild } from '../lib/remote-http.js';
 import { printCommandOutput, runStatus, runText } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
@@ -626,8 +627,7 @@ export interface GithubApiProcessRunner {
 }
 
 export class NodeGithubApiProcessRunner implements GithubApiProcessRunner {
-  run(args: string[], input: string, cwd: string): Promise<GithubApiProcessResult> {
-    const { promise, resolve, reject } = Promise.withResolvers<GithubApiProcessResult>();
+  async run(args: string[], input: string, cwd: string): Promise<GithubApiProcessResult> {
     const child = spawn('gh', args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
@@ -639,14 +639,16 @@ export class NodeGithubApiProcessRunner implements GithubApiProcessRunner {
     child.stderr.on('data', (chunk: string) => {
       stderr += chunk;
     });
-    child.once('error', (error) => {
-      reject(new Error(`gh ${args.join(' ')} failed to start`, { cause: error }));
-    });
-    child.once('close', (code) => {
-      resolve({ exitCode: code ?? -1, stdout, stderr });
-    });
     child.stdin.end(input);
-    return promise;
+    // One GitHub API request through gh: the remote-http bound ends a stalled one (05_gateway.md, "Deadlines").
+    let closed: Awaited<ReturnType<typeof remoteChild>>;
+    try {
+      closed = await remoteChild(`gh ${args.join(' ')}`, child);
+    } catch (error) {
+      throw new Error(`gh ${args.join(' ')} failed to start`, { cause: error });
+    }
+    if (!closed.ok) throw new RemoteHttpTimeoutError(closed.error);
+    return { exitCode: closed.value.code ?? -1, stdout, stderr };
   }
 }
 
@@ -792,11 +794,11 @@ async function getGithubStepUrl(step: string): Promise<string | null> {
   if (!runnerName) throw new Error('Cannot link GitHub Actions logs without RUNNER_NAME.');
   const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
   for (let page = 1; ; page++) {
-    const response = await ciApiRequest(
+    const listing = await ciApiRequest(
       `/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=100&page=${page}`,
       'GET',
     );
-    const { jobs } = typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(await response.text());
+    const { jobs } = typia.json.assertParse<{ jobs: GithubWorkflowJob[] }>(listing);
     const url = githubStepUrlForJobs(jobs, runnerName, step);
     if (url) return url;
     if (jobs.length < 100) {

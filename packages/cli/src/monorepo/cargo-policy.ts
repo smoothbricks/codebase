@@ -111,6 +111,7 @@ export interface CargoHakariShell {
 
 const defaultHakariShell: CargoHakariShell = {
   run(directory, args) {
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: cargo hakari resolves the workspace and may wait on Cargo's package-cache lock behind another cargo, which it names on stderr; that cargo's end, or the operator's interrupt, ends the wait
     const result = spawnSync('cargo', ['hakari', ...args], { cwd: directory, encoding: 'utf8' });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
     // cargo itself exists; a missing subcommand is cargo's own error, not ENOENT.

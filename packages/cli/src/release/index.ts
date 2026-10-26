@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -9,6 +10,7 @@ import { assertCollectedOutputsApplied } from '../github-ci/outputs.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
 import { parsePackageJsonText } from '../lib/json.js';
+import { describeRemoteHttpTimeout, RemoteHttpTimeoutError, remoteChild, remoteRequest } from '../lib/remote-http.js';
 import { decode, run, runInteractiveCapturingStderr, runInteractiveStatus, runResult } from '../lib/run.js';
 import {
   getWorkspacePackages,
@@ -1253,11 +1255,21 @@ function releaseRetagShell(root: string, remote: string) {
     dispatchPublishWorkflow: async (workflow: string, branch: string) => {
       const source = resolveSourceRepository(root);
       if (source.kind === 'github') {
-        await run('gh', ['workflow', 'run', workflow, '--ref', branch, '-f', 'bump=auto', '-f', 'dry_run=false'], root);
+        const args = ['workflow', 'run', workflow, '--ref', branch, '-f', 'bump=auto', '-f', 'dry_run=false'];
+        // One GitHub API request through gh: the remote-http bound ends a stalled one.
+        const dispatched = await remoteChild(
+          `gh ${args.join(' ')}`,
+          spawn('gh', args, { cwd: root, stdio: 'inherit' }),
+        );
+        if (!dispatched.ok) throw new RemoteHttpTimeoutError(dispatched.error);
+        if (dispatched.value.code !== 0) {
+          throw new Error(`gh ${args.join(' ')} exited ${dispatched.value.code ?? `on ${dispatched.value.signal}`}`);
+        }
         return;
       }
       const endpoint = requireSourceReleaseEndpoint(source, root);
-      const response = await fetch(
+      const dispatched = await remoteRequest(
+        `dispatch source publish workflow ${workflow}`,
         `${endpoint.repositoryApi}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`,
         {
           method: 'POST',
@@ -1268,8 +1280,10 @@ function releaseRetagShell(root: string, remote: string) {
           }),
         },
       );
+      if (!dispatched.ok) throw new RemoteHttpTimeoutError(dispatched.error);
+      const response = dispatched.value;
       if (response.status < 200 || response.status >= 300) {
-        const body = await response.text();
+        const body = response.body;
         throw new Error(
           `Unable to dispatch source publish workflow ${workflow} (HTTP ${response.status}).${
             body.trim() ? `\n${body.trim().slice(0, 500)}` : ''
@@ -1438,7 +1452,7 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
   const lookupBody = lookup.body;
   const releaseExists = requireDurableState(lookup.probe, `release ${currentTag}`, SOURCE_RELEASE_QUESTION);
   if (!releaseExists) {
-    const response = await fetch(`${endpoint.repositoryApi}/releases`, {
+    const created = await remoteRequest(`create source release ${currentTag}`, `${endpoint.repositoryApi}/releases`, {
       method: 'POST',
       headers: forgejoAuthHeaders(endpoint.token),
       body: JSON.stringify({
@@ -1448,8 +1462,10 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
         prerelease: pkg.version.includes('-'),
       }),
     });
+    if (!created.ok) throw new RemoteHttpTimeoutError(created.error);
+    const response = created.value;
     if (response.status !== 201) {
-      const body = await response.text();
+      const body = response.body;
       throw new Error(
         `Unable to create source release ${currentTag} (HTTP ${response.status}).${
           body.trim() ? `\n${body.trim().slice(0, 500)}` : ''
@@ -1467,17 +1483,23 @@ async function createGithubRelease(root: string, pkg: ReleasePackage, dryRun: bo
     if (typeof releaseId !== 'number' || !Number.isSafeInteger(releaseId)) {
       throw new Error(`Unable to inspect source release ${currentTag}: response did not contain a valid release id.`);
     }
-    const response = await fetch(`${endpoint.repositoryApi}/releases/${releaseId}`, {
-      method: 'PATCH',
-      headers: forgejoAuthHeaders(endpoint.token),
-      body: JSON.stringify({
-        name: currentTag,
-        body: contents,
-        prerelease: pkg.version.includes('-'),
-      }),
-    });
+    const updated = await remoteRequest(
+      `update source release ${currentTag}`,
+      `${endpoint.repositoryApi}/releases/${releaseId}`,
+      {
+        method: 'PATCH',
+        headers: forgejoAuthHeaders(endpoint.token),
+        body: JSON.stringify({
+          name: currentTag,
+          body: contents,
+          prerelease: pkg.version.includes('-'),
+        }),
+      },
+    );
+    if (!updated.ok) throw new RemoteHttpTimeoutError(updated.error);
+    const response = updated.value;
     if (response.status !== 200) {
-      const body = await response.text();
+      const body = response.body;
       throw new Error(
         `Unable to update source release ${currentTag} (HTTP ${response.status}).${
           body.trim() ? `\n${body.trim().slice(0, 500)}` : ''
@@ -1801,8 +1823,10 @@ async function fetchSourceRelease(
   token: string,
 ): Promise<Result<{ status: number; body: string }, string>> {
   try {
-    const response = await fetch(url, { headers: forgejoAuthHeaders(token) });
-    return { ok: true, value: { status: response.status, body: await response.text() } };
+    const answer = await remoteRequest(`read source release ${url}`, url, { headers: forgejoAuthHeaders(token) });
+    return answer.ok
+      ? { ok: true, value: { status: answer.value.status, body: answer.value.body } }
+      : { ok: false, error: describeRemoteHttpTimeout(answer.error) };
   } catch (error) {
     const detail = transportFailureDetail(error);
     if (detail === null) {

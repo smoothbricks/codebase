@@ -841,6 +841,7 @@ function isMissingPathError(error: unknown): boolean {
 }
 
 function sha256File(path: string): Promise<string> {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a read of a local file to its end; no other process is on the far side, and the stream's 'error' settles it as well
   return new Promise((resolveHash, reject) => {
     const hash = createHash('sha256');
     const stream = createReadStream(path);

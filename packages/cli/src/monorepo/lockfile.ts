@@ -79,6 +79,7 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
   if (updated > 0) {
     writeFileSync(lockfilePath, lockfile);
     if (options.stage) {
+      // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git index update: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
       const result = spawnSync('git', ['add', 'bun.lock'], { cwd: root, stdio: 'inherit' });
       if (result.error) {
         throw new Error(`git add bun.lock failed to start: ${result.error.message}`);
@@ -154,6 +155,7 @@ function lockfileTargetVersion(
 function latestStableTagVersion(root: string, projectName: string): string | null {
   const args = ['tag', '--list', `${projectName}@*`, '--sort=-v:refname'];
   const command = `git ${args.join(' ')}`;
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git tag listing: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
   if (result.error) {
     printCommandOutput(result.stdout ?? '', result.stderr ?? '');

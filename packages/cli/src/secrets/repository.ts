@@ -111,6 +111,7 @@ export function chooseRepository(inputs: {
 }
 
 function git(root: string, args: readonly string[]): string | null {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git read of this repository's config and refs: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const result = spawnSync('git', [...args], { cwd: root, encoding: 'utf8' });
   return result.status === 0 ? result.stdout.trim() : null;
 }

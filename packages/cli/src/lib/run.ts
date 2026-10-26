@@ -42,6 +42,7 @@ export async function runInteractiveStatus(
   unsetEnv?: readonly string[],
 ): Promise<number> {
   const invocation = resolveCommandInvocation(cwd, command, args);
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a command the operator's terminal runs (a build, a push, a publish) with its stdio inherited lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
   return new Promise((resolve, reject) => {
     const child = spawn(invocation.command, invocation.args, {
       cwd,
@@ -73,6 +74,7 @@ export async function runInteractiveCapturingStderr(
   unsetEnv?: readonly string[],
 ): Promise<{ exitCode: number; stderr: string }> {
   const invocation = resolveCommandInvocation(cwd, command, args);
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a command the operator's terminal runs (a build, a push, a publish) with its stdin and stdout inherited lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
   const { promise, resolve, reject } = Promise.withResolvers<{ exitCode: number; stderr: string }>();
   const child = spawn(invocation.command, invocation.args, {
     cwd,

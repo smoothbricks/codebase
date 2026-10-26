@@ -193,6 +193,7 @@ function grep(cwd: string, args: string[], env: Environment, subject: string): J
 // Bun.spawnSync rather than the shared runResult: the scan's environment is the whole child
 // environment, not an overlay on this process's, so a caller can withhold inherited git variables.
 function git(root: string, args: string[], env: Environment): { exitCode: number; stdout: string; stderr: string } {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a local git query of the index and the work tree: it asks no remote, and a held index.lock fails it at once rather than waiting, so only the operator's interrupt ends a hung one
   const child = Bun.spawnSync(['git', ...args], { cwd: root, env });
   return { exitCode: child.exitCode, stdout: child.stdout.toString(), stderr: child.stderr.toString() };
 }

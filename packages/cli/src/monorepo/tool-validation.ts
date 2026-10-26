@@ -12,6 +12,7 @@ import {
   setStringProperty,
   writeJsonObject,
 } from '../lib/json.js';
+import { describeRemoteHttpTimeout, remoteRequest } from '../lib/remote-http.js';
 import { type PackageJson, readPackageJsonObject } from '../lib/workspace.js';
 
 interface RequiredDependency {
@@ -665,13 +666,8 @@ async function resolvePublishedCliDependencyRange(configuredCliRange: string | n
 }
 
 async function fetchLatestStableVersion(packageName: string): Promise<string | null> {
-  const url = `https://registry.npmjs.org/${encodeURIComponent(packageName).replace('%40', '@')}`;
-  const response = await fetch(url, { headers: { accept: 'application/vnd.npm.install-v1+json' } });
-  if (!response.ok) {
-    return null;
-  }
-  const body: unknown = await response.json();
-  if (!isRegistryPackument(body)) {
+  const body = await fetchRegistryPackument(packageName);
+  if (body === null) {
     return null;
   }
   const tagged = body['dist-tags']?.latest;
@@ -696,16 +692,32 @@ async function fetchLatestStableVersion(packageName: string): Promise<string | n
 
 async function fetchLatestPatchVersion(packageName: string, minimumVersion: string): Promise<string | null> {
   const minorRange = sameMajorMinorRange(minimumVersion);
-  const url = `https://registry.npmjs.org/${encodeURIComponent(packageName).replace('%40', '@')}`;
-  const response = await fetch(url, { headers: { accept: 'application/vnd.npm.install-v1+json' } });
-  if (!response.ok) {
-    return null;
-  }
-  const body: unknown = await response.json();
-  if (!isRegistryPackument(body)) {
+  const body = await fetchRegistryPackument(packageName);
+  if (body === null) {
     return null;
   }
   return latestVersionInSameMajorMinor(Object.keys(body.versions), minorRange);
+}
+
+/**
+ * The npm registry's abbreviated packument of `packageName`, or null when the registry has none for it or gave no whole
+ * answer within the remote-http bound (specs/cowshed/05_gateway.md, "Deadlines"), which says so on stderr: both read
+ * as "registry unavailable" to the callers, whose fallback is stated beside each.
+ */
+async function fetchRegistryPackument(packageName: string): Promise<RegistryPackument | null> {
+  const url = `https://registry.npmjs.org/${encodeURIComponent(packageName).replace('%40', '@')}`;
+  const answer = await remoteRequest(`read the npm packument of ${packageName}`, url, {
+    headers: { accept: 'application/vnd.npm.install-v1+json' },
+  });
+  if (!answer.ok) {
+    console.error(`${describeRemoteHttpTimeout(answer.error)}; the registry counts as unavailable`);
+    return null;
+  }
+  if (!answer.value.ok) {
+    return null;
+  }
+  const body: unknown = JSON.parse(answer.value.body);
+  return isRegistryPackument(body) ? body : null;
 }
 
 function sameMajorMinorRange(minimumVersion: string): Version | null {

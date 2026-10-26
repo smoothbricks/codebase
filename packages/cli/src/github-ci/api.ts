@@ -1,4 +1,5 @@
 import typia from 'typia';
+import { RemoteHttpTimeoutError, remoteRequest } from '../lib/remote-http.js';
 import { forgejoAuthHeaders } from '../release/source-release.js';
 
 export function ciApiContext(environment: NodeJS.ProcessEnv = process.env) {
@@ -39,32 +40,41 @@ export function ciApiContext(environment: NodeJS.ProcessEnv = process.env) {
   return { forgejo, apiBase, htmlBase, repository };
 }
 
+/**
+ * One CI forge API request, answered with its whole body, within the remote-http bound. A request past the bound
+ * throws `RemoteHttpTimeoutError`; an answer that is not 2xx throws its status.
+ */
 export async function ciApiRequest(
   path: string,
   method: 'GET' | 'POST',
   body?: unknown,
   environment: NodeJS.ProcessEnv = process.env,
-): Promise<Response> {
+): Promise<string> {
   const context = ciApiContext(environment);
   const token = environment.FORGEJO_TOKEN || environment.GH_TOKEN || environment.GITHUB_TOKEN;
   if (!token) throw new Error('CI API access requires FORGEJO_TOKEN, GH_TOKEN, or GITHUB_TOKEN.');
-  const response = await fetch(`${context.apiBase}/repos/${context.repository}${path}`, {
-    method,
-    headers: context.forgejo
-      ? forgejoAuthHeaders(token)
-      : {
-          Authorization: `Bearer ${token}`,
-          Accept: 'application/vnd.github+json',
-          'Content-Type': 'application/json',
-        },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    redirect: 'error',
-  });
-  if (!response.ok) {
+  const answer = await remoteRequest(
+    `CI API ${method} ${path}`,
+    `${context.apiBase}/repos/${context.repository}${path}`,
+    {
+      method,
+      headers: context.forgejo
+        ? forgejoAuthHeaders(token)
+        : {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github+json',
+            'Content-Type': 'application/json',
+          },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      redirect: 'error',
+    },
+  );
+  if (!answer.ok) throw new RemoteHttpTimeoutError(answer.error);
+  if (!answer.value.ok) {
     // Do not print response bodies: a proxy can echo credentials or request headers.
-    throw new Error(`CI API ${method} ${path} failed with HTTP ${response.status}.`);
+    throw new Error(`CI API ${method} ${path} failed with HTTP ${answer.value.status}.`);
   }
-  return response;
+  return answer.value.body;
 }
 
 export async function dispatchCiWorkflow(workflow: string, ref: string): Promise<void> {
@@ -80,13 +90,14 @@ export async function ensureCiPullRequest(options: {
 }): Promise<void> {
   const { repository } = ciApiContext();
   for (let page = 1; ; page += 1) {
-    const response = await ciApiRequest(`/pulls?state=open&limit=50&per_page=50&page=${page}`, 'GET');
-    const pulls = typia.json.assertParse<
-      Array<{
-        head: { ref: string; repo: { full_name: string } | null };
-        base: { ref: string };
-      }>
-    >(await response.text());
+    const listing = await ciApiRequest(`/pulls?state=open&limit=50&per_page=50&page=${page}`, 'GET');
+    const pulls =
+      typia.json.assertParse<
+        Array<{
+          head: { ref: string; repo: { full_name: string } | null };
+          base: { ref: string };
+        }>
+      >(listing);
     if (
       pulls.some(
         (pull) =>

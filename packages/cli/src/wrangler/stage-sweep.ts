@@ -139,8 +139,7 @@ export async function fetchPullRequestState(
   pr: number,
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<PullRequestState> {
-  const response = await ciApiRequest(`/pulls/${pr}`, 'GET', undefined, environment);
-  const body: unknown = await response.json();
+  const body: unknown = JSON.parse(await ciApiRequest(`/pulls/${pr}`, 'GET', undefined, environment));
   if (!isPullRequestReply(body)) throw new Error(`The forge answered pull request ${pr} in an unexpected shape.`);
   return {
     state: body.state,

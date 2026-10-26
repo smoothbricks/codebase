@@ -209,6 +209,7 @@ export function fetchLocalSecret(
     return { ok: false, reason: `smoo.secrets declares no command for ${name}` };
   }
   const [command, ...args] = declared.command;
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the repository's declared secret command, which may ask the operator to unlock a password manager; the operator answers it or interrupts it
   const result = spawnSync(command, args, { encoding: 'utf8' });
   if (result.status !== 0) {
     // Name the command, never its output: a failing secret fetch prints
