@@ -23,7 +23,7 @@
 
 use crate::api::process::{ProcessCoverage, ProcessCoverageGap};
 use crate::api::resources::{JobAccounting, UsageReconciliation};
-use crate::storage::trace_columns::trace_enum;
+use cowshed_types::trace_enum;
 
 /// The message of the unattributed-usage row: with its entry type, the row's fixed kind.
 pub const JOB_UNATTRIBUTED_MESSAGE: &str = "job.unattributed";
@@ -117,7 +117,7 @@ mod tests {
         ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, CpuMicrosDelta, CpuTotals,
         StorageIoBytes, StorageIoBytesDelta, StorageIoTotals,
     };
-    use crate::storage::trace_columns::TraceEnum as _;
+    use cowshed_types::trace_enum::TraceEnum as _;
 
     const GAPS: [ProcessCoverageGap; 7] = [
         ProcessCoverageGap::EventsLost,

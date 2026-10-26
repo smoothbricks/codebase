@@ -27,6 +27,7 @@ use arrow_array::{ArrayRef, DictionaryArray, StringArray};
 use arrow_schema::{ArrowError, DataType};
 
 use super::trace_segment::dict_type;
+use cowshed_types::trace_enum::TraceEnum;
 
 /// How one kind of cell is encoded, whether or not a column may leave it null.
 pub trait TraceValue {
@@ -234,19 +235,6 @@ dictionary_value!(
     Text
 );
 
-/// A fixed set of names, encoded as lmao's `S.enum`: `u16` keys into a dictionary of every name.
-/// Declare one with `trace_enum!`.
-pub trait TraceEnum: Copy {
-    /// Every name, indexed by its key.
-    const NAMES: &'static [&'static str];
-
-    fn key(self) -> u16;
-
-    fn name(self) -> &'static str {
-        Self::NAMES[usize::from(self.key())]
-    }
-}
-
 /// `S.enum` over `E`'s names.
 pub struct Enum<E>(PhantomData<E>);
 
@@ -272,52 +260,6 @@ impl<E: TraceEnum> TraceValue for Enum<E> {
             Arc::new(StringArray::from_iter_values(E::NAMES.iter().copied())),
         )?))
     }
-}
-
-/// Declares a fixed set of names once: the enum, its dictionary and its keys are generated from
-/// this one list, in this order.
-///
-/// ```text
-/// trace_enum! {
-///     /// What a process waits on.
-///     pub enum BlockedOn { None = "none", Lock = "lock" }
-/// }
-/// ```
-macro_rules! trace_enum {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident {
-            $($(#[doc = $doc:literal])* $variant:ident = $text:literal,)+
-        }
-    ) => {
-        $(#[$meta])*
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        $vis enum $name {
-            $($(#[doc = $doc])* $variant,)+
-        }
-
-        impl $name {
-            /// Every value, in declaration order: the order of its dictionary's names.
-            pub const ALL: &'static [Self] = &[$(Self::$variant,)+];
-        }
-
-        impl $crate::storage::trace_columns::TraceEnum for $name {
-            const NAMES: &'static [&'static str] = &[$($text,)+];
-
-            fn key(self) -> u16 {
-                let position = Self::ALL
-                    .iter()
-                    .position(|value| *value == self)
-                    .expect("every value is listed in ALL");
-                u16::try_from(position).expect("a declared enum has fewer than 2^16 names")
-            }
-        }
-
-        const _: () = assert!(
-            <$name as $crate::storage::trace_columns::TraceEnum>::NAMES.len() <= 1 << 16,
-            "an S.enum's keys are u16"
-        );
-    };
 }
 
 /// Declares a span kind's custom columns once: the row struct, the Arrow fields and the encoder
@@ -384,7 +326,6 @@ macro_rules! trace_columns {
 }
 
 pub(crate) use trace_columns;
-pub(crate) use trace_enum;
 
 #[cfg(test)]
 mod tests {
@@ -394,6 +335,7 @@ mod tests {
     use arrow_schema::{Field, Schema};
 
     use super::*;
+    use cowshed_types::trace_enum;
 
     trace_enum! {
         /// A test enum whose declaration order is its key order.

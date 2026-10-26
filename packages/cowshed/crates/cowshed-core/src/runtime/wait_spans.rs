@@ -20,12 +20,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::api::dto::{SpanId, TraceContext, TraceId};
+use crate::storage::trace_columns::trace_columns;
 use crate::storage::trace_columns::{Enum, Optional, Required, U32, U64, Utf8};
-use crate::storage::trace_columns::{trace_columns, trace_enum};
 use crate::storage::trace_segment::{
     EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, TraceSegmentError,
     seal_segment, trace_batch,
 };
+use cowshed_types::trace_enum;
 
 /// The name a wait span's start row carries; its `span-err` row carries the failure's sentence.
 pub const WAIT_SPAN_MESSAGE: &str = "cowshed.wait";
