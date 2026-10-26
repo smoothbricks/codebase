@@ -2,7 +2,11 @@ import { expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { localPluginPath, pluginsAffectedByChanges } from 'nx/src/project-graph/plugins/local-plugin-source.js';
+import {
+  localPluginPath,
+  pluginsAffectedByChanges,
+  pluginsAffectedBySourceHashes,
+} from 'nx/src/project-graph/plugins/local-plugin-source.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /** Guards the plugin-load aggregation hunk of patches/nx@23.2.1.patch against the actual Bun-installed Nx. */
@@ -37,6 +41,29 @@ for (const fixture of [
 ]) {
   it(`classifies the resolved plugin module ${fixture.file}`, () => {
     expect(localPluginPath('/checkout', fixture.file)).toBe(fixture.expected);
+  });
+}
+
+for (const fixture of [
+  { file: 'ignored/shared.mjs', hash: 'loaded', expected: [] },
+  { file: 'ignored/shared.mjs', hash: 'changed', expected: ['a', 'b'] },
+  { file: 'ignored/shared.mjs', hash: null, expected: ['a', 'b'] },
+  { file: 'ignored/only-a.cjs', hash: 'changed', expected: ['a'] },
+  { file: 'ignored/not-imported.mjs', hash: 'changed', expected: [] },
+]) {
+  it(`judges observed ignored module bytes for ${fixture.file}: ${fixture.hash}`, () => {
+    const closures = new Map([
+      [
+        'a',
+        new Map([
+          ['ignored/shared.mjs', 'loaded'],
+          ['ignored/only-a.cjs', 'loaded'],
+        ]),
+      ],
+      ['b', new Map([['ignored/shared.mjs', 'loaded']])],
+      ['steady', new Map([['ignored/steady.mjs', 'loaded']])],
+    ]);
+    expect(pluginsAffectedBySourceHashes(closures, new Map([[fixture.file, fixture.hash]]))).toEqual(fixture.expected);
   });
 }
 
@@ -117,6 +144,16 @@ throw {
       'tuple failure',
       'tuple cause',
     ],
+    repeated: undefined,
+  },
+  {
+    name: 'circular serialized objects',
+    source: `
+const failure = { message: 'circular serialized failure' };
+failure.cause = failure;
+throw failure;
+`,
+    messages: ['circular serialized failure', '[Circular error]'],
     repeated: undefined,
   },
   {

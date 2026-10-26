@@ -268,22 +268,28 @@ function cjsLocalHelper(target: string): string {
   return `exports.target = ${JSON.stringify(target)};`;
 }
 
-/** The local ESM plugin's entry: as the CJS one, for a module the ESM cache cannot evict. */
+/** The local ESM plugin's entry: it counts its load as the CJS one does, then reaches its helper lazily, through a
+ * bridge, from an ignored directory — the lazy, transitive, ignored member of the walk, a module the ESM cache
+ * cannot evict. */
 const ESM_LOCAL_PLUGIN = `import { appendFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { target } from './esm-helper.mjs';
 appendFileSync(join(dirname(fileURLToPath(import.meta.url)), 'esm-evals.log'), 'x');
 export const name = 'local-esm-plugin';
 export const createNodesV2 = [
   '**/project.json',
-  (configFiles) =>
-    configFiles.map((file) => [
+  async (configFiles) => {
+    const { target } = await import('./bridge.mjs');
+    return configFiles.map((file) => [
       file,
       { projects: { [file.slice(0, file.lastIndexOf('/'))]: { targets: { [target]: { command: 'true' } } } } },
-    ]),
+    ]);
+  },
 ];
 `;
+
+/** The bridge the ESM entry imports lazily: the ignored helper enters the loaded closure through it, transitively. */
+const ESM_BRIDGE = "export { target } from './ignored/esm-helper.mjs';";
 
 /** The local ESM plugin's helper: `target` alone sets the target its plugin infers. */
 function esmLocalHelper(target: string): string {
@@ -1109,7 +1115,9 @@ it('restarts a daemon once a plugin linked from outside the workspace changes it
  * A plugin that lives in the checkout is part of the graph's identity: once a file it loaded changes, the same daemon
  * must serve a graph from the new code, with no reset and no restart, and a local plugin none of whose files changed
  * must not be reloaded either. The fixture environment sets NX_ISOLATE_PLUGINS=false, so the walk also proves a local
- * plugin is never kept in the daemon's own process, where a loaded ESM module cannot be evicted at all.
+ * plugin is never kept in the daemon's own process, where a loaded ESM module cannot be evicted at all. The ESM plugin's
+ * helper sits under an ignored directory: no content-filtered watcher batch ever reports it, so its change can only
+ * be judged on the raw watcher stream, against the digest recorded when the worker loaded it.
  */
 it('reloads only the local plugins whose loaded files changed, in the same daemon', async () => {
   await withNxFixture(
@@ -1118,6 +1126,8 @@ it('reloads only the local plugins whose loaded files changed, in the same daemo
       await fixtureWorkspace(workspace);
       const tooling = join(workspace, 'tooling');
       await mkdir(tooling);
+      await mkdir(join(tooling, 'ignored'));
+      await writeFile(join(workspace, '.gitignore'), 'tooling/ignored/\n');
       await writeFile(
         join(tooling, 'cjs-plugin.cjs'),
         cjsLocalPlugin('local-cjs-plugin', './cjs-helper.cjs', 'cjs-evals.log'),
@@ -1127,9 +1137,10 @@ it('reloads only the local plugins whose loaded files changed, in the same daemo
         cjsLocalPlugin('local-steady-plugin', './steady-helper.cjs', 'steady-evals.log'),
       );
       await writeFile(join(tooling, 'esm-plugin.mjs'), ESM_LOCAL_PLUGIN);
+      await writeFile(join(tooling, 'bridge.mjs'), ESM_BRIDGE);
       await writeFile(join(tooling, 'cjs-helper.cjs'), cjsLocalHelper('cjs-one'));
       await writeFile(join(tooling, 'steady-helper.cjs'), cjsLocalHelper('steady'));
-      await writeFile(join(tooling, 'esm-helper.mjs'), esmLocalHelper('esm-one'));
+      await writeFile(join(tooling, 'ignored', 'esm-helper.mjs'), esmLocalHelper('esm-one'));
       await writeFile(
         join(workspace, 'nx.json'),
         JSON.stringify({
@@ -1143,6 +1154,11 @@ it('reloads only the local plugins whose loaded files changed, in the same daemo
         return Object.keys(typia.json.assertParse<ShownProject>(json).targets).sort();
       };
       const evals = async (log: string): Promise<number> => (await readFile(join(tooling, log), 'utf8')).length;
+
+      const daemonLog = async (): Promise<string> =>
+        (await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8').catch(() => 'unreadable')).slice(
+          -8000,
+        );
       const daemon = await startDaemon(workspace, env);
       expect(targets(), 'the first graph does not come from the three local plugins').toEqual([
         'cjs-one',
@@ -1156,13 +1172,21 @@ it('reloads only the local plugins whose loaded files changed, in the same daemo
           details: [],
         });
         await writeFile(join(tooling, 'cjs-helper.cjs'), cjsLocalHelper('cjs-two'));
-        await writeFile(join(tooling, 'esm-helper.mjs'), esmLocalHelper('esm-two'));
+        await writeFile(join(tooling, 'ignored', 'esm-helper.mjs'), esmLocalHelper('esm-two'));
+        await writeFile(join(tooling, 'source-change-marker.txt'), 'changed');
+        // The marker is written last and the watcher reports events in stream order, so once the marker is
+        // reported, the ignored helper's raw event ahead of it was judged too. The ignored helper itself is
+        // never a client watcher notification, so it cannot be awaited directly.
         const seen = new Set<string>();
-        while (!seen.has('tooling/cjs-helper.cjs') || !seen.has('tooling/esm-helper.mjs')) {
+        while (!seen.has('tooling/cjs-helper.cjs') || !seen.has('tooling/source-change-marker.txt')) {
           const event = await client.next('the file watcher reporting the changed local helpers');
-          expect(event.kind, `a changed local plugin stopped the daemon: ${JSON.stringify(client.seen)}`).toBe(
-            'changed',
-          );
+          expect(
+            event.kind,
+            'a changed local plugin stopped the daemon: ' +
+              JSON.stringify(client.seen) +
+              ' daemon log tail: ' +
+              (event.kind === 'changed' ? '' : await daemonLog()),
+          ).toBe('changed');
           for (const path of event.details) seen.add(path);
         }
       } finally {
@@ -1178,6 +1202,53 @@ it('reloads only the local plugins whose loaded files changed, in the same daemo
       expect(await evals('cjs-evals.log'), 'the CJS local plugin was not reloaded once its helper changed').toBe(2);
       expect(await evals('esm-evals.log'), 'the ESM local plugin was not reloaded once its helper changed').toBe(2);
       expect(await evals('steady-evals.log'), 'a local plugin whose files did not change was reloaded').toBe(1);
+
+      // A reload that fails must neither poison the daemon nor disturb the workers it reuses: break the CJS
+      // helper, watch the graph request fail naming its refusal, then mend it and watch the same daemon serve
+      // the new code with the ESM and steady plugins never reloaded.
+      const awaitMarker = async (watcher: ReturnType<typeof watchClient>, what: string): Promise<void> => {
+        for (;;) {
+          const event = await watcher.next(what);
+          expect(
+            event.kind,
+            'a changed local plugin stopped the daemon: ' +
+              JSON.stringify(watcher.seen) +
+              ' daemon log tail: ' +
+              (event.kind === 'changed' ? '' : await daemonLog()),
+          ).toBe('changed');
+          if (event.details.includes('tooling/source-change-marker.txt')) return;
+        }
+      };
+      const second = watchClient(workspace, env);
+      try {
+        expect(await second.next('the file watcher registering before the CJS helper breaks')).toEqual({
+          kind: 'ready',
+          details: [],
+        });
+        await writeFile(join(tooling, 'cjs-helper.cjs'), "throw new Error('local-cjs-helper-refuses');");
+        await writeFile(join(tooling, 'source-change-marker.txt'), 'refusing');
+        await awaitMarker(second, 'the file watcher reporting the marker after the CJS helper broke');
+        const refused = spawnSync('bun', [nxEntry, 'show', 'project', 'p', '--json'], {
+          cwd: workspace,
+          env: { ...env, NX_DAEMON: 'true' },
+          encoding: 'utf8',
+        });
+        const printed = refused.stdout + refused.stderr;
+        expect(refused.status, `the graph request succeeded on a refusing plugin: ${printed}`).not.toBe(0);
+        expect(printed, 'the failure does not name the refusing helper').toContain('local-cjs-helper-refuses');
+        await writeFile(join(tooling, 'cjs-helper.cjs'), cjsLocalHelper('cjs-three'));
+        await writeFile(join(tooling, 'source-change-marker.txt'), 'restored');
+        await awaitMarker(second, 'the file watcher reporting the marker after the CJS helper was mended');
+      } finally {
+        await second.end();
+      }
+      expect(targets(), 'the graph after the CJS helper was mended').toEqual(['cjs-three', 'esm-two', 'steady']);
+      expect(await recordedPid(workspace), 'a failed local plugin reload replaced the daemon').toBe(
+        daemon.record.processId,
+      );
+      expect(isRunning(daemon.record.processId), 'a failed local plugin reload stopped the daemon').toBe(true);
+      expect(await evals('esm-evals.log'), 'the ESM local plugin was reloaded by a CJS failure and mend').toBe(2);
+      expect(await evals('steady-evals.log'), 'the steady local plugin was reloaded by a CJS failure and mend').toBe(1);
     },
     FIXTURE_WORKSPACE,
   );

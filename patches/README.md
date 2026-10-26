@@ -362,9 +362,13 @@ of being served until its next change. From then on, every watcher batch reaches
 the native workspace context having dropped same-byte rewrites when it hashed the batch. The changed paths are
 intersected with each local plugin's closure — a pure decision, which changed paths reload which plugin — and only a
 plugin whose closure they touch has its worker retired and reloaded and the cached plugin set's identity generation
-advanced, so the recompute that batch already schedules builds the graph from the new code. The daemon itself is not
-restarted and keeps its process; every other plugin keeps the worker and state it had. Bun has no module customization
-hooks, so a daemon whose CLI runs under Bun spawns these workers with the `node` on PATH rather than its own executable.
+advanced, so the recompute that batch already schedules builds the graph from the new code. A closure member under an
+ignored path never reaches that filtered batch, so an observed member like it is judged on the raw watcher stream
+instead: the event's file is compared with the digest recorded when the worker loaded it, the same bytes keep the
+worker, and changed bytes retire it and invalidate the graph. Only ignored closure members are judged this way, each
+against its own recorded digest; no other file is hashed for it. The daemon itself is not restarted and keeps its
+process; every other plugin keeps the worker and state it had. Bun has no module customization hooks, so a daemon whose
+CLI runs under Bun spawns these workers with the `node` on PATH rather than its own executable.
 `nx-daemon-validity.test.ts` walks the reload end to end in one daemon: a CJS and an ESM local plugin whose helpers
 change, and a third local plugin that must not reload.
 

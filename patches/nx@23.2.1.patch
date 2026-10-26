@@ -1402,10 +1402,18 @@ index ef00ae3212498e75d6bb6371aec4b113970c0c68..06eb2bf7436cc20dad1d646be44ba990
          logger_1.serverLogger.log('[LATEST-NX]: Reusing cached Nx installation from', latestNxTmpPath);
          return latestNxTmpPath;
 diff --git a/dist/src/daemon/server/project-graph-incremental-recomputation.js b/dist/src/daemon/server/project-graph-incremental-recomputation.js
-index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2bc478691 100644
+index c2a2f8f70fe71940e47c97931c5925bac1fbd480..00774360849ccb5f0ed64ba4cf6d572d11c44493 100644
 --- a/dist/src/daemon/server/project-graph-incremental-recomputation.js
 +++ b/dist/src/daemon/server/project-graph-incremental-recomputation.js
-@@ -27,6 +27,7 @@ const file_watcher_sockets_1 = require("./file-watching/file-watcher-sockets");
+@@ -15,6 +15,7 @@ const error_types_1 = require("../../project-graph/error-types");
+ const file_map_utils_1 = require("../../project-graph/file-map-utils");
+ const nx_deps_cache_1 = require("../../project-graph/nx-deps-cache");
+ const get_plugins_1 = require("../../project-graph/plugins/get-plugins");
++const local_plugin_source_1 = require("../../project-graph/plugins/local-plugin-source");
+ const retrieve_workspace_files_1 = require("../../project-graph/utils/retrieve-workspace-files");
+ const fileutils_1 = require("../../utils/fileutils");
+ const workspace_context_1 = require("../../utils/workspace-context");
+@@ -27,6 +28,7 @@ const file_watcher_sockets_1 = require("./file-watching/file-watcher-sockets");
  const project_graph_listener_sockets_1 = require("./project-graph-listener-sockets");
  const watcher_1 = require("./watcher");
  const logger_1 = require("../logger");
@@ -1413,7 +1421,32 @@ index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2
  let cachedSerializedProjectGraphPromise;
  // Maps file path to a version counter that increments on each modification.
  // This lets us detect mid-flight re-modifications when clearing processed files.
-@@ -241,6 +242,11 @@ function scheduleProjectGraphRecomputation(createdFiles, updatedFiles, deletedFi
+@@ -76,7 +78,7 @@ function kickOffRecompute() {
+             // the plugin loader's) into one, so the snap hash and the plugin
+             // set the compute uses always reflect the same disk state.
+             const nxJson = (0, nx_json_1.readNxJson)(workspace_root_1.workspaceRoot);
+-            const myPluginsHash = (0, file_hasher_1.hashObject)(nxJson.plugins ?? []);
++            const myPluginsHash = (0, get_plugins_1.getPluginsConfigurationHash)(nxJson, workspace_root_1.workspaceRoot);
+             const plugins = await (0, get_plugins_1.getPluginsSeparated)(nxJson, workspace_root_1.workspaceRoot);
+             // Plugin set we just loaded may already be stale vs disk.
+             if (isStale(myPluginsHash))
+@@ -114,13 +116,13 @@ function isStale(expectedHash) {
+  * pointer so awaiters chain onto it.
+  */
+ function chainToSuccessor(myPromise) {
+-    logger_1.serverLogger.log('Discarding stale recompute result (nx.json plugins changed mid-compute).');
++    logger_1.serverLogger.log('Discarding stale recompute result (plugin configuration or local source changed mid-compute).');
+     if (cachedSerializedProjectGraphPromise === myPromise)
+         kickOffRecompute();
+     return cachedSerializedProjectGraphPromise;
+ }
+ function readNxJsonPluginsHash() {
+-    return (0, file_hasher_1.hashObject)((0, nx_json_1.readNxJson)(workspace_root_1.workspaceRoot).plugins ?? []);
++    return (0, get_plugins_1.getPluginsConfigurationHash)((0, nx_json_1.readNxJson)(workspace_root_1.workspaceRoot), workspace_root_1.workspaceRoot);
+ }
+ async function getCachedSerializedProjectGraphPromise(socket) {
+     // Subscribe the requesting client to the graph-construction topic
+@@ -241,6 +243,12 @@ function scheduleProjectGraphRecomputation(createdFiles, updatedFiles, deletedFi
          : {};
      perf_hooks_1.performance.mark('hash-watched-changes-end');
      perf_hooks_1.performance.measure('hash changed files from watcher', 'hash-watched-changes-start', 'hash-watched-changes-end');
@@ -1422,10 +1455,11 @@ index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2
 +        (0, restart_checks_1.restartDaemonIfLockFilesChanged)(deletedFiles)) {
 +        return;
 +    }
++    (0, local_plugin_source_1.invalidateLocalPluginSources)(workspace_root_1.workspaceRoot, [...changedPaths, ...deletedFiles]);
      for (const [f, hash] of Object.entries(changedFileHashes)) {
          collectedDeletedFiles.delete(f);
          collectedUpdatedFiles.set(f, { version: fileChangeCounter, hash });
-@@ -251,7 +257,7 @@ function scheduleProjectGraphRecomputation(createdFiles, updatedFiles, deletedFi
+@@ -251,7 +259,7 @@ function scheduleProjectGraphRecomputation(createdFiles, updatedFiles, deletedFi
      }
      // The native watcher already coalesces a burst of events into one batch,
      // so socket + listener notifications dispatch immediately.
@@ -2333,10 +2367,10 @@ index 05661e2b3b8e2e84e2f914479eda5d3f12446e83..fb3c1afb74c8fd40179f783971cd5aa9
   * NOTE: An event type of "create" will also apply to the case where the user has restored
   * an original version of a file after modifying/deleting it by using git, so we adjust
 diff --git a/dist/src/daemon/server/watcher.js b/dist/src/daemon/server/watcher.js
-index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..851e1efbe2e624a5049c153b028117ae4f88a312 100644
+index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..860117066547fd32188c35bea16bd16a9ee75445 100644
 --- a/dist/src/daemon/server/watcher.js
 +++ b/dist/src/daemon/server/watcher.js
-@@ -1,25 +1,115 @@
+@@ -1,25 +1,116 @@
  "use strict";
  Object.defineProperty(exports, "__esModule", { value: true });
  exports.watchWorkspace = watchWorkspace;
@@ -2362,6 +2396,7 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..851e1efbe2e624a5049c153b028117ae
 +const path_2 = require("../../utils/path");
 +const logger_1 = require("../logger");
 +const ignore = require("ignore");
++const local_plugin_source_1 = require("../../project-graph/plugins/local-plugin-source");
 +// Captured by watchWorkspace so proveWatcherCurrent can route force-flushed
 +// events through the same handling as the async callback.
  // Definite-assignment: dispatchWorkspaceChanges only runs after
@@ -2461,7 +2496,7 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..851e1efbe2e624a5049c153b028117ae
              // If the ignore files themselves have changed we need to dynamically
              // update our cached ignoreGlobs
              (0, shutdown_utils_1.handleServerProcessTermination)({
-@@ -29,59 +119,326 @@ function dispatchWorkspaceChanges(events) {
+@@ -29,59 +120,338 @@ function dispatchWorkspaceChanges(events) {
              });
          }
      }
@@ -2586,9 +2621,7 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..851e1efbe2e624a5049c153b028117ae
 +/** Whether the walker reads the directory holding `path`, and so its ignore files. */
 +function inWalkedDirectory(path) {
 +    return !excludedDirectory((0, ignore_1.posixDirname)(path));
- }
--async function watchWorkspace(server, cb) {
--    const { Watcher } = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
++}
 +// macOS only: a probe is an empty file the daemon writes and waits to see come
 +// back through its stream. It lives where no walker and no `git status` look,
 +// in a directory physically inside the watched tree (a cowshed shed links its
@@ -2660,12 +2693,26 @@ index cbc34a1a9c7650ddd50ee7309a0b487f1837e88a..851e1efbe2e624a5049c153b028117ae
 +        return Promise.resolve();
 +    }
 +    outputsChangesCallback(null, changes);
-+    const workspaceChanges = changes.filter((event) => isWorkspaceFile(event.path));
++    const workspaceChanges = [];
++    const ignoredFiles = [];
++    for (const event of changes) {
++        if (isWorkspaceFile(event.path)) workspaceChanges.push(event);
++        else ignoredFiles.push(event.path);
++    }
 +    const ignoreFileChanges = changes.filter((event) => isIgnoreFile(event.path) && inWalkedDirectory(event.path));
++    if ((0, local_plugin_source_1.invalidateIgnoredLocalPluginSources)(workspace_root_1.workspaceRoot, ignoredFiles)) {
++        const recomputation = require('./project-graph-incremental-recomputation');
++        recomputation.invalidateGraphCache();
++        if (workspaceChanges.length === 0 && ignoreFileChanges.length === 0) {
++            recomputation.scheduleProjectGraphRecomputation([], [], []);
++        }
++    }
 +    return workspaceChanges.length === 0 && ignoreFileChanges.length === 0
 +        ? Promise.resolve()
 +        : dispatchWorkspaceChanges(workspaceChanges, ignoreFileChanges);
-+}
+ }
+-async function watchWorkspace(server, cb) {
+-    const { Watcher } = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
 +async function watchWorkspace(server, cb, outputsCb) {
 +    const native = await (0, handle_import_1.handleImport)('../../native/index.js', __dirname);
 +    const { Watcher } = native;
@@ -3393,19 +3440,145 @@ index a880a6620cd7ac46e4bd189bc2034ce58825769a..ef3c99a115e7114ea78da379316a0478
          return cached !== notCached;
      })) {
          return true;
+diff --git a/dist/src/project-graph/plugins/get-plugins.d.ts b/dist/src/project-graph/plugins/get-plugins.d.ts
+index ed7ae5d82d4c6981375ad71c3a57573376d76ab8..5d00f2ecaa695085618d838b512273af28f1f96c 100644
+--- a/dist/src/project-graph/plugins/get-plugins.d.ts
++++ b/dist/src/project-graph/plugins/get-plugins.d.ts
+@@ -1,5 +1,5 @@
+ import { NxJsonConfiguration, PluginConfiguration } from '../../config/nx-json';
+-import type { LoadedNxPlugin } from './loaded-nx-plugin';
++import type { LoadedNxPlugin, PluginLoadResult } from './loaded-nx-plugin';
+ export interface SeparatedPlugins {
+     specifiedPlugins: LoadedNxPlugin[];
+     defaultPlugins: LoadedNxPlugin[];
+@@ -21,12 +21,13 @@ export declare function resetIsolationFallbackForTesting(): void;
+  * threw is rethrown, because rerunning it in-process would bury its actual
+  * error.
+  */
+-export declare const loadingMethod: (plugin: PluginConfiguration, root: string, index?: number) => Promise<readonly [Promise<LoadedNxPlugin>, () => void]>;
++export declare const loadingMethod: (plugin: PluginConfiguration, root: string, index?: number) => Promise<PluginLoadResult>;
+ /**
+  * Returns all plugins (specified + default) as a flat list.
+  * Specified plugins come first, followed by default plugins.
+  */
+ export declare function getPlugins(nxJson: NxJsonConfiguration, root?: string): Promise<LoadedNxPlugin[]>;
++export declare function getPluginsConfigurationHash(nxJson: NxJsonConfiguration, root?: string): string;
+ /**
+  * Returns specified plugins (from nx.json) and default plugins (project.json,
+  * package.json, etc.) as separate arrays. This separation is needed for
 diff --git a/dist/src/project-graph/plugins/get-plugins.js b/dist/src/project-graph/plugins/get-plugins.js
-index df153050063fa81b915d3004d3a87cd397f73b19..ddc9b044fd4b74e7d25d95f6f636c1b721a301eb 100644
+index df153050063fa81b915d3004d3a87cd397f73b19..d7f256bda99c1d380974a81b8a920ba7c42ea154 100644
 --- a/dist/src/project-graph/plugins/get-plugins.js
 +++ b/dist/src/project-graph/plugins/get-plugins.js
-@@ -22,6 +22,7 @@ const is_sandbox_1 = require("../../utils/is-sandbox");
+@@ -4,6 +4,7 @@ exports.loadingMethod = void 0;
+ exports.resetIsolationFallbackForTesting = resetIsolationFallbackForTesting;
+ exports.getPlugins = getPlugins;
+ exports.getPluginsSeparated = getPluginsSeparated;
++exports.getPluginsConfigurationHash = getPluginsConfigurationHash;
+ exports.getOnlyDefaultPlugins = getOnlyDefaultPlugins;
+ exports.getPluginsIfLoadedOrLoading = getPluginsIfLoadedOrLoading;
+ exports.cleanupPlugins = cleanupPlugins;
+@@ -22,10 +23,14 @@ const is_sandbox_1 = require("../../utils/is-sandbox");
  const native_1 = require("../../native");
  const output_1 = require("../../utils/output");
  const transpiler_1 = require("./transpiler");
 +const error_types_1 = require("../error-types");
++const local_plugin_source_1 = require("./local-plugin-source");
++const installation_directory_1 = require("../../utils/installation-directory");
  /**
   * Stuff for specified NX Plugins.
   */
-@@ -296,7 +297,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
+ let currentPluginsConfigurationHash;
++let specifiedPluginsConfigurationHash;
+ let loadedPlugins;
+ let cachedSeparatedPlugins;
+ let pendingPluginsPromise;
+@@ -71,16 +76,31 @@ function resetIsolationFallbackForTesting() {
+  * error.
+  */
+ const loadingMethod = async (plugin, root, index) => {
+-    if (!(0, enabled_1.isIsolationEnabled)() || isolationRefusedInThisProcess) {
++    const moduleName = typeof plugin === 'string' ? plugin : plugin.plugin;
++    let resolved;
++    try {
++        resolved = await (0, resolve_plugin_1.resolveNxPlugin)(moduleName, root, (0, installation_directory_1.getNxRequirePaths)(root));
++    }
++    catch (error) {
++        throw new error_types_1.LoadPluginError(moduleName, error);
++    }
++    const local = (0, local_plugin_source_1.localPluginPath)(root, resolved.pluginPath) !== null;
++    // ESM modules cannot be evicted in-process. Local source therefore needs a
++    // restartable worker even when installed plugins run in this process.
++    if (!local && (!(0, enabled_1.isIsolationEnabled)() || isolationRefusedInThisProcess)) {
+         return (0, in_process_loader_1.loadNxPlugin)(plugin, root, index);
+     }
+-    const [isolatedPlugin, cleanup] = await (0, isolation_1.loadIsolatedNxPlugin)(plugin, root, index);
++    const [isolatedPlugin, cleanup, created] = await (0, isolation_1.loadIsolatedNxPlugin)(plugin, root, index, resolved);
+     // Awaited here rather than handed on, because the worker failure surfaces on
+     // this promise and the fallback has to happen before the caller sees it.
+     try {
+-        return [Promise.resolve(await isolatedPlugin), cleanup];
++        return [Promise.resolve(await isolatedPlugin), cleanup, created];
+     }
+     catch (e) {
++        if (local) {
++            if (created) cleanup();
++            throw e;
++        }
+         // Proof, kept separate from policy. The errno the worker saw is what makes
+         // the message certain; whether that errno is also grounds for degrading is a
+         // different question, and conflating them made the warning assert a sandbox
+@@ -92,7 +112,7 @@ const loadingMethod = async (plugin, root, index) => {
+             !((provenRefusal && (0, native_1.isAiAgent)()) || (0, is_sandbox_1.isSandbox)())) {
+             throw e;
+         }
+-        cleanup();
++        if (created) cleanup();
+         // Read and set in one synchronous step. Concurrently loaded plugins each
+         // arrive here with their own failure, so testing the latch after setting it
+         // is what keeps the advice to one copy.
+@@ -120,6 +140,9 @@ const loadingMethod = async (plugin, root, index) => {
+     }
+ };
+ exports.loadingMethod = loadingMethod;
++function getPluginsConfigurationHash(nxJson, root = workspace_root_1.workspaceRoot) {
++    return (0, file_hasher_1.hashObject)({ root, plugins: nxJson.plugins ?? [], localSources: (0, local_plugin_source_1.getLocalPluginGeneration)() });
++}
+ /**
+  * Returns all plugins (specified + default) as a flat list.
+  * Specified plugins come first, followed by default plugins.
+@@ -140,8 +163,9 @@ async function getPlugins(nxJson, root = workspace_root_1.workspaceRoot) {
+  */
+ async function getPluginsSeparated(nxJson, root = workspace_root_1.workspaceRoot) {
+     const pluginsConfiguration = nxJson.plugins ?? [];
+-    const pluginsConfigurationHash = (0, file_hasher_1.hashObject)(pluginsConfiguration);
+-    // If the plugins configuration has not changed, reuse the current plugins
++    const configurationHash = (0, file_hasher_1.hashObject)({ root, pluginsConfiguration });
++    const pluginsConfigurationHash = getPluginsConfigurationHash(nxJson, root);
++    // Configuration and loaded local source must both match the cached set.
+     if (cachedSeparatedPlugins &&
+         pluginsConfigurationHash === currentPluginsConfigurationHash) {
+         return cachedSeparatedPlugins;
+@@ -152,12 +176,12 @@ async function getPluginsSeparated(nxJson, root = workspace_root_1.workspaceRoot
+     if (pendingSeparatedPlugins?.hash === pluginsConfigurationHash) {
+         return pendingSeparatedPlugins.promise;
+     }
+-    // Plugins config changed (e.g. `nx add @nx/maven` updated nx.json). The
+-    // cached SeparatedPlugins is invalidated by the early-return above, but
+-    // pendingPluginsPromise — the in-flight load — would otherwise be reused
+-    // by the `??=` below and serve the previous plugin set forever. Tear
+-    // down the old workers and force a fresh load.
+-    cleanupSpecifiedPlugins?.();
++    // A local source change evicts only its worker. A configuration change
++    // tears down the previous set; unchanged workers otherwise stay resident.
++    if (specifiedPluginsConfigurationHash !== configurationHash) {
++        cleanupSpecifiedPlugins?.();
++        specifiedPluginsConfigurationHash = configurationHash;
++    }
+     pendingPluginsPromise = undefined;
+     const loadPromise = (async () => {
+         const results = await Promise.allSettled([
+@@ -296,7 +320,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
              fn();
          }
          const errorMessage = errors
@@ -3414,7 +3587,39 @@ index df153050063fa81b915d3004d3a87cd397f73b19..ddc9b044fd4b74e7d25d95f6f636c1b7
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} default Nx plugin(s):\n${errorMessage}`);
      }
-@@ -361,7 +362,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+@@ -316,11 +340,6 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
+     return ret;
+ }
+ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_root_1.workspaceRoot) {
+-    // Returning existing plugins is handled by getPlugins,
+-    // so, if we are here and there are existing plugins, they are stale
+-    if (cleanupSpecifiedPlugins) {
+-        cleanupSpecifiedPlugins();
+-    }
+     performance.mark('loadSpecifiedNxPlugins:start');
+     pluginsConfigurations ??= [];
+     // Drop the cached workspace-layout snapshot local-plugin resolution uses:
+@@ -328,11 +347,13 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+     // resolve it to the workspace root. Runs only when the plugin set changed.
+     (0, resolve_plugin_1.resetResolvePluginCache)();
+     const cleanupFunctions = [];
++    const createdCleanupFunctions = [];
+     const results = await Promise.allSettled(pluginsConfigurations.map(async (plugin, index) => {
+         const pluginPath = typeof plugin === 'string' ? plugin : plugin.plugin;
+         performance.mark(`Load Nx Plugin: ${pluginPath} - start`);
+-        const [loadedPluginPromise, cleanup] = await (0, exports.loadingMethod)(plugin, root, index);
++        const [loadedPluginPromise, cleanup, created] = await (0, exports.loadingMethod)(plugin, root, index);
+         cleanupFunctions.push(cleanup);
++        if (created) createdCleanupFunctions.push(cleanup);
+         const res = await loadedPluginPromise;
+         performance.mark(`Load Nx Plugin: ${pluginPath} - end`);
+         performance.measure(`Load Nx Plugin: ${pluginPath}`, `Load Nx Plugin: ${pluginPath} - start`, `Load Nx Plugin: ${pluginPath} - end`);
+@@ -357,11 +378,11 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+         }
+     }
+     if (errors.length > 0) {
+-        for (const fn of cleanupFunctions) {
++        for (const fn of createdCleanupFunctions) {
              fn();
          }
          const errorMessage = errors
@@ -3423,7 +3628,7 @@ index df153050063fa81b915d3004d3a87cd397f73b19..ddc9b044fd4b74e7d25d95f6f636c1b7
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} Nx plugin(s):\n${errorMessage}`);
      }
-@@ -385,6 +386,12 @@ function reasonToError(reason) {
+@@ -385,6 +406,12 @@ function reasonToError(reason) {
          if ('stack' in reason) {
              error.stack = String(reason.stack);
          }
@@ -3436,8 +3641,77 @@ index df153050063fa81b915d3004d3a87cd397f73b19..ddc9b044fd4b74e7d25d95f6f636c1b7
          return error;
      }
      return new Error(String(reason));
+diff --git a/dist/src/project-graph/plugins/in-process-loader.d.ts b/dist/src/project-graph/plugins/in-process-loader.d.ts
+index b0824c89a9e318a26d00b18b2ef71acbed4541ef..2237a7ed8b05b60b999f4862760633010ac0c532 100644
+--- a/dist/src/project-graph/plugins/in-process-loader.d.ts
++++ b/dist/src/project-graph/plugins/in-process-loader.d.ts
+@@ -1,10 +1,10 @@
+ import { ProjectConfiguration } from '../../config/workspace-json-project-json';
+ import { PackageJson } from '../../utils/package-json';
+ import type { PluginConfiguration } from '../../config/nx-json';
+-import type { LoadedNxPlugin } from './loaded-nx-plugin';
++import type { LoadedNxPlugin, PluginLoadResult } from './loaded-nx-plugin';
+ export declare function readPluginPackageJson(pluginName: string, projects: Record<string, ProjectConfiguration>, paths?: string[]): {
+     path: string;
+     json: PackageJson;
+ };
+-export declare function loadNxPlugin(plugin: PluginConfiguration, root: string, index?: number): readonly [Promise<LoadedNxPlugin>, () => void];
++export declare function loadNxPlugin(plugin: PluginConfiguration, root: string, index?: number): PluginLoadResult;
+ export declare function loadNxPluginAsync(pluginConfiguration: PluginConfiguration, paths: string[], root: string, index?: number): Promise<LoadedNxPlugin>;
+diff --git a/dist/src/project-graph/plugins/in-process-loader.js b/dist/src/project-graph/plugins/in-process-loader.js
+index 2b80ddcfe7de5140519b427ac0b88c13798b6c8d..c3d2ad157201991290026701de45f0673a376b32 100644
+--- a/dist/src/project-graph/plugins/in-process-loader.js
++++ b/dist/src/project-graph/plugins/in-process-loader.js
+@@ -12,6 +12,7 @@ const path = require("node:path/posix");
+ const resolve_plugin_1 = require("./resolve-plugin");
+ const transpiler_1 = require("./transpiler");
+ const handle_import_1 = require("../../utils/handle-import");
++const NOOP = () => {};
+ function readPluginPackageJson(pluginName, projects, paths = (0, installation_directory_1.getNxRequirePaths)()) {
+     try {
+         const result = (0, package_json_1.readModulePackageJsonWithoutFallbacks)(pluginName, paths);
+@@ -40,7 +41,8 @@ function readPluginPackageJson(pluginName, projects, paths = (0, installation_di
+ function loadNxPlugin(plugin, root, index) {
+     return [
+         loadNxPluginAsync(plugin, (0, installation_directory_1.getNxRequirePaths)(root), root, index),
+-        () => { },
++        NOOP,
++        false,
+     ];
+ }
+ async function loadNxPluginAsync(pluginConfiguration, paths, root, index) {
+diff --git a/dist/src/project-graph/plugins/isolation/isolated-plugin.d.ts b/dist/src/project-graph/plugins/isolation/isolated-plugin.d.ts
+index 4e0a466144f0bbb35105041f5271e8d8de3ef2d6..de78990d19fd2d3209494e0228e09fb1fd44ec63 100644
+--- a/dist/src/project-graph/plugins/isolation/isolated-plugin.d.ts
++++ b/dist/src/project-graph/plugins/isolation/isolated-plugin.d.ts
+@@ -7,6 +7,8 @@ import { LoadedNxPlugin } from '../loaded-nx-plugin';
+ import type { CreateDependenciesContext, CreateMetadataContext, CreateNodesContext, CreateNodesResult, PostTasksExecutionContext, PreTasksExecutionContext, ProjectsMetadata } from '../public-api';
+ import type { PluginWorkerLoadResult } from './messaging';
+ import { Hook, Phase } from './plugin-lifecycle-manager';
++import type { resolveNxPlugin } from '../resolve-plugin';
++import type { LocalPluginSource } from '../local-plugin-source';
+ export type LoadResultPayload = Extract<PluginWorkerLoadResult['payload'], {
+     success: true;
+ }>;
+@@ -39,7 +41,7 @@ export declare class IsolatedPlugin implements LoadedNxPlugin {
+     /**
+      * Creates and loads an isolated plugin worker.
+      */
+-    static load(plugin: PluginConfiguration, root: string, index?: number): Promise<IsolatedPlugin>;
++    static load(plugin: PluginConfiguration, root: string, index?: number, resolved?: Awaited<ReturnType<typeof resolveNxPlugin>>, localSource?: LocalPluginSource): Promise<IsolatedPlugin>;
+     private constructor();
+     private spawnAndConnect;
+     /**
+@@ -67,6 +69,7 @@ export declare class IsolatedPlugin implements LoadedNxPlugin {
+     setWorkerEnv(env: Record<string, string>): Promise<void>;
+     notifyPhaseAborted(phase: Phase, lastCompletedHook: Hook): void;
+     shutdown(): void;
++    retire(): void;
+     private registerProcessMetrics;
+ }
+ export declare function getPluginWorkerSocketId(): string;
 diff --git a/dist/src/project-graph/plugins/isolation/isolated-plugin.js b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
-index 07648586a78fad6c986f537e042e94e65b0dcc61..d7079a756fda379a7c6898de2b08ff917bf214bb 100644
+index 07648586a78fad6c986f537e042e94e65b0dcc61..08ff3ea458ec16ab873c539079f0ad714267a7e4 100644
 --- a/dist/src/project-graph/plugins/isolation/isolated-plugin.js
 +++ b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
 @@ -11,6 +11,7 @@ const crypto_1 = require("crypto");
@@ -3448,7 +3722,81 @@ index 07648586a78fad6c986f537e042e94e65b0dcc61..d7079a756fda379a7c6898de2b08ff91
  const sandbox_socket_hint_1 = require("../../../daemon/sandbox-socket-hint");
  const socket_refused_exit_code_1 = require("../../../utils/socket-refused-exit-code");
  const socket_utils_1 = require("../../../daemon/socket-utils");
-@@ -210,7 +211,7 @@ class IsolatedPlugin {
+@@ -23,6 +24,7 @@ const progress_topics_1 = require("../../../utils/progress-topics");
+ const wait_for_socket_connection_1 = require("../../../utils/wait-for-socket-connection");
+ const workspace_root_1 = require("../../../utils/workspace-root");
+ const resolve_plugin_1 = require("../resolve-plugin");
++const local_plugin_source_1 = require("../local-plugin-source");
+ const messaging_1 = require("./messaging");
+ const plugin_lifecycle_manager_1 = require("./plugin-lifecycle-manager");
+ const PLUGIN_TIMEOUT_HINT_TEXT = 'As a last resort, you can set NX_PLUGIN_NO_TIMEOUTS=true to bypass this timeout.';
+@@ -39,13 +41,20 @@ class IsolatedPlugin {
+     /**
+      * Creates and loads an isolated plugin worker.
+      */
+-    static async load(plugin, root, index) {
++    static async load(plugin, root, index, resolved, localSource) {
+         const moduleName = typeof plugin === 'string' ? plugin : plugin.plugin;
+-        const { name, pluginPath, shouldRegisterTSTranspiler } = await (0, resolve_plugin_1.resolveNxPlugin)(moduleName, root, (0, installation_directory_1.getNxRequirePaths)(root));
++        const { name, pluginPath, shouldRegisterTSTranspiler } = resolved ?? await (0, resolve_plugin_1.resolveNxPlugin)(moduleName, root, (0, installation_directory_1.getNxRequirePaths)(root));
+         const instance = new IsolatedPlugin(plugin, root, name, pluginPath, shouldRegisterTSTranspiler, index);
+-        const loadResult = await instance.spawnAndConnect();
+-        instance.setupHooks(loadResult);
+-        return instance;
++        instance.localSource = localSource;
++        try {
++            const loadResult = await instance.spawnAndConnect();
++            instance.setupHooks(loadResult);
++            return instance;
++        }
++        catch (error) {
++            instance.shutdown();
++            throw error;
++        }
+     }
+     constructor(plugin, root, name, pluginPath, shouldRegisterTSTranspiler, index) {
+         this.index = index;
+@@ -80,6 +89,14 @@ class IsolatedPlugin {
+             }
+             const pending = this.responseHandlers.get(message.tx);
+             if (pending) {
++                try {
++                    (0, local_plugin_source_1.recordLocalPluginSources)(this.localSource, message.payload.localPluginSources);
++                }
++                catch (error) {
++                    this.failPendingRequests(error);
++                    this.retire();
++                    return;
++                }
+                 this.responseHandlers.delete(message.tx);
+                 pending.onMessage(message);
+             }
+@@ -91,7 +108,7 @@ class IsolatedPlugin {
+         this.shouldRegisterTSTranspiler = shouldRegisterTSTranspiler;
+     }
+     async spawnAndConnect() {
+-        const { worker, socket } = await startPluginWorker(this.name);
++        const { worker, socket } = await startPluginWorker(this.name, !!this.localSource);
+         this.worker = worker;
+         this.socket = socket;
+         this.registerProcessMetrics();
+@@ -149,6 +166,7 @@ class IsolatedPlugin {
+      * so that only one worker is ever spawned at a time.
+      */
+     async ensureAlive() {
++        if (this.disposed) throw new Error(`Local Nx plugin "${this.name}" was retired because its source changed.`);
+         if (this._alive) {
+             return;
+         }
+@@ -199,6 +217,7 @@ class IsolatedPlugin {
+                     name: this.name,
+                     pluginPath: this.pluginPath,
+                     shouldRegisterTSTranspiler: this.shouldRegisterTSTranspiler,
++                    trackLocalSources: !!this.localSource,
+                 },
+                 tx,
+             });
+@@ -210,7 +229,7 @@ class IsolatedPlugin {
          this.include = loadResult.include;
          this.exclude = loadResult.exclude;
          const registeredHooks = hooks(loadResult.createNodesPattern && 'createNodes', loadResult.hasCreateDependencies && 'createDependencies', loadResult.hasCreateMetadata && 'createMetadata', loadResult.hasPreTasksExecution && 'preTasksExecution', loadResult.hasPostTasksExecution && 'postTasksExecution');
@@ -3457,6 +3805,179 @@ index 07648586a78fad6c986f537e042e94e65b0dcc61..d7079a756fda379a7c6898de2b08ff91
          const shutdown = (hookName) => this.shutdownIfInactive(hookName);
          const wrap = (hook, hookFn) => this.lifecycle.wrapHook(hook, async (...args) => {
              await this.ensureAlive();
+@@ -291,12 +310,14 @@ class IsolatedPlugin {
+             const timeout = setTimeout(() => {
+                 this.responseHandlers.delete(tx);
+                 this.pendingCount--;
++                    if (this.disposed && this.pendingCount === 0) this.shutdown();
+                 reject(new Error(`${this.name} timed out after ${MINUTES} minutes during ${type}. ${PLUGIN_TIMEOUT_HINT_TEXT}`));
+             }, MAX_MESSAGE_WAIT);
+             this.responseHandlers.set(tx, {
+                 onMessage: (msg) => {
+                     clearTimeout(timeout);
+                     this.pendingCount--;
++                    if (this.disposed && this.pendingCount === 0) this.shutdown();
+                     if (msg.type !== expectedResultType) {
+                         reject(new Error(`Expected ${expectedResultType}, got ${msg.type}`));
+                         return;
+@@ -306,6 +327,7 @@ class IsolatedPlugin {
+                 onError: (error) => {
+                     clearTimeout(timeout);
+                     this.pendingCount--;
++                    if (this.disposed && this.pendingCount === 0) this.shutdown();
+                     reject(error);
+                 },
+             });
+@@ -338,8 +360,12 @@ class IsolatedPlugin {
+             this.shutdownIfInactive(lastCompletedHook);
+         }
+     }
++    retire() {
++        this.disposed = true;
++        if (this.pendingCount === 0) this.shutdown();
++    }
+     shutdown() {
+-        if (!this._alive)
++        if (!this.worker && !this.socket)
+             return;
+         this._alive = false;
+         this._connectPromise = null;
+@@ -385,7 +411,7 @@ function getPluginWorkerSocketId() {
+     const counter = global.nxPluginWorkerCount++;
+     return `${process.pid}-${counter.toString(36)}-${(0, crypto_1.randomBytes)(4).toString('hex')}`;
+ }
+-async function startPluginWorker(name) {
++async function startPluginWorker(name, local) {
+     performance.mark(`start-plugin-worker:${name}`);
+     const isWorkerTypescript = path.extname(__filename) === '.ts';
+     const workerPath = path.join(__dirname, isWorkerTypescript ? 'plugin-worker.ts' : 'plugin-worker.js');
+@@ -405,7 +431,7 @@ async function startPluginWorker(name) {
+     // keeps the socket path inside the 95-character budget `assertValidSocketPath`
+     // enforces.
+     const ipcPath = (0, socket_utils_1.getPluginOsSocketPath)(getPluginWorkerSocketId());
+-    const worker = (0, child_process_1.spawn)(process.execPath, [
++    const worker = (0, child_process_1.spawn)(local ? 'node' : process.execPath, [
+         // Spawn the worker with the same resolve conditions Nx uses for plugin
+         // entries so the plugin's transitive workspace imports resolve to source.
+         ...(0, typescript_1.getPluginResolveConditionNodeArgs)(),
+@@ -449,6 +475,12 @@ async function startPluginWorker(name) {
+ async function connectToWorker(worker, ipcPath, name) {
+     const abortController = new AbortController();
+     let earlyExitError = null;
++    worker.once('error', (error) => {
++        if (!abortController.signal.aborted) {
++            earlyExitError = markWorkerStartupFailure(new Error(`Failed to start plugin worker for "${name}": ${error.message}`, { cause: error }));
++            abortController.abort();
++        }
++    });
+     // If the worker exits before we connect, abort polling immediately
+     // rather than burning through attempts against a dead socket.
+     worker.once('exit', (code, signal) => {
+diff --git a/dist/src/project-graph/plugins/isolation/load-isolated-plugin.d.ts b/dist/src/project-graph/plugins/isolation/load-isolated-plugin.d.ts
+index 0856bb195da971ba2e9a83ded3b05aa6b9597d34..4679cc175a5a7078ea0b692356940307603935d3 100644
+--- a/dist/src/project-graph/plugins/isolation/load-isolated-plugin.d.ts
++++ b/dist/src/project-graph/plugins/isolation/load-isolated-plugin.d.ts
+@@ -1,3 +1,4 @@
+ import { PluginConfiguration } from '../../../config/nx-json';
+-import type { LoadedNxPlugin } from '../loaded-nx-plugin';
+-export declare function loadIsolatedNxPlugin(plugin: PluginConfiguration, root: string, index?: number): Promise<[Promise<LoadedNxPlugin>, () => void]>;
++import type { PluginLoadResult } from '../loaded-nx-plugin';
++import type { resolveNxPlugin } from '../resolve-plugin';
++export declare function loadIsolatedNxPlugin(plugin: PluginConfiguration, root: string, index?: number, resolved?: Awaited<ReturnType<typeof resolveNxPlugin>>): Promise<PluginLoadResult>;
+diff --git a/dist/src/project-graph/plugins/isolation/load-isolated-plugin.js b/dist/src/project-graph/plugins/isolation/load-isolated-plugin.js
+index adb92a77fc7d0e0e930f00d5c496a8ae43f22bac..3ae7c22c59ad9d63af722864f024dbb6dfb4f023 100644
+--- a/dist/src/project-graph/plugins/isolation/load-isolated-plugin.js
++++ b/dist/src/project-graph/plugins/isolation/load-isolated-plugin.js
+@@ -2,23 +2,33 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.loadIsolatedNxPlugin = loadIsolatedNxPlugin;
+ const isolated_plugin_1 = require("./isolated-plugin");
++const local_plugin_source_1 = require("../local-plugin-source");
+ const isolatedPluginCache = (global['isolatedPluginCache'] ??= new Map());
+-async function loadIsolatedNxPlugin(plugin, root, index) {
++async function loadIsolatedNxPlugin(plugin, root, index, resolved) {
+     const cacheKey = JSON.stringify({ plugin, root });
+-    if (isolatedPluginCache.has(cacheKey)) {
+-        return [isolatedPluginCache.get(cacheKey), () => { }];
++    const cached = isolatedPluginCache.get(cacheKey);
++    if (cached) return [cached.promise, cached.cleanup, false];
++    let source;
++    const entry = {
++        retired: false,
++        cleanup() {
++            if (isolatedPluginCache.get(cacheKey) === entry) isolatedPluginCache.delete(cacheKey);
++            source?.dispose();
++            entry.retired = true;
++            entry.instance?.retire();
++        },
++    };
++    if (resolved && (0, local_plugin_source_1.localPluginPath)(root, resolved.pluginPath)) {
++        source = (0, local_plugin_source_1.createLocalPluginSource)(root, entry.cleanup);
+     }
+-    const pluginPromise = isolated_plugin_1.IsolatedPlugin.load(plugin, root, index).catch((err) => {
+-        // Remove failed entries from cache so subsequent calls can retry
+-        isolatedPluginCache.delete(cacheKey);
+-        throw err;
++    entry.promise = isolated_plugin_1.IsolatedPlugin.load(plugin, root, index, resolved, source).then((instance) => {
++        entry.instance = instance;
++        if (entry.retired) instance.retire();
++        return instance;
++    }, (error) => {
++        entry.cleanup();
++        throw error;
+     });
+-    isolatedPluginCache.set(cacheKey, pluginPromise);
+-    const cleanup = async () => {
+-        const instancePromise = isolatedPluginCache.get(cacheKey);
+-        isolatedPluginCache.delete(cacheKey);
+-        const instance = await instancePromise;
+-        instance?.shutdown();
+-    };
+-    return [pluginPromise, cleanup];
++    isolatedPluginCache.set(cacheKey, entry);
++    return [entry.promise, entry.cleanup, true];
+ }
+diff --git a/dist/src/project-graph/plugins/isolation/messaging.d.ts b/dist/src/project-graph/plugins/isolation/messaging.d.ts
+index 08d65f5009598dd0ef6638cadd1d0c8225665624..869a09e33dee94c1e14208c9198425f2d975506d 100644
+--- a/dist/src/project-graph/plugins/isolation/messaging.d.ts
++++ b/dist/src/project-graph/plugins/isolation/messaging.d.ts
+@@ -5,6 +5,10 @@ import type { ProjectGraph } from '../../../config/project-graph';
+ import type { LoadedNxPlugin } from '../loaded-nx-plugin';
+ import type { CreateDependenciesContext, CreateMetadataContext, CreateNodesContext, PostTasksExecutionContext, PreTasksExecutionContext } from '../public-api';
+ import type { AllMessages, AllResults, DefineMessages, Handlers, ResultOf, WithResult } from './message-types';
++import type { LocalPluginSourceReceipt } from '../local-plugin-source';
++type LocalPluginSourceResult = {
++    payload: { localPluginSources?: LocalPluginSourceReceipt[] };
++};
+ /**
+  * All plugin worker message definitions in one place.
+  * Each entry defines:
+@@ -19,6 +23,7 @@ type PluginMessageDefs = DefineMessages<{
+             name: string;
+             pluginPath: string;
+             shouldRegisterTSTranspiler: boolean;
++            trackLocalSources?: boolean;
+         };
+         result: {
+             name: string;
+@@ -123,14 +128,14 @@ export type WorkspaceStampedMessage = {
+ /** Union of all plugin worker message types */
+ export type PluginWorkerMessage = AllMessages<PluginMessageDefs> & WorkspaceStampedMessage;
+ /** Union of all plugin worker result types */
+-export type PluginWorkerResult = AllResults<PluginMessageDefs> & WorkspaceStampedMessage;
++export type PluginWorkerResult = AllResults<PluginMessageDefs> & WorkspaceStampedMessage & LocalPluginSourceResult;
+ /** Result type for the load message */
+-export type PluginWorkerLoadResult = ResultOf<PluginMessageDefs, 'load'>;
++export type PluginWorkerLoadResult = ResultOf<PluginMessageDefs, 'load'> & LocalPluginSourceResult;
+ /**
+  * Maps a message type to its result type.
+  * e.g., MessageResult<'createNodes'> gives the createNodes result type
+  */
+-export type MessageResult<T extends PluginWorkerMessage['type']> = ResultOf<PluginMessageDefs, T & WithResult<PluginMessageDefs>>;
++export type MessageResult<T extends PluginWorkerMessage['type']> = ResultOf<PluginMessageDefs, T & WithResult<PluginMessageDefs>> & LocalPluginSourceResult;
+ export type PluginWorkerEmitLogNotification = {
+     type: 'emitLog';
+     level: 'log' | 'warn' | 'error';
 diff --git a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts b/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts
 index 3a6df86646a11f371525fca978edf0fc318bf848..1e73ad21751964e3c6839e44eb43488677a9cec3 100644
 --- a/dist/src/project-graph/plugins/isolation/plugin-lifecycle-manager.d.ts
@@ -3531,6 +4052,255 @@ index 3659fdd1955d56e60cc0158d19ac55d59916d78e..92e6700adfc52a380b3e9e37b655fbc9
      }
      /**
       * Returns the current session count for a phase. Useful for testing.
+diff --git a/dist/src/project-graph/plugins/isolation/plugin-worker.js b/dist/src/project-graph/plugins/isolation/plugin-worker.js
+index f2d4d02f44a6e03d69b88d5ea5571fe4ddad6bc6..b8d745610eb53f84cebc1c29b2b34939498a679d 100644
+--- a/dist/src/project-graph/plugins/isolation/plugin-worker.js
++++ b/dist/src/project-graph/plugins/isolation/plugin-worker.js
+@@ -26,6 +26,7 @@ node_perf_hooks_1.performance.measure(`plugin worker ${process.pid} code loading
+ global.NX_GRAPH_CREATION = true;
+ global.NX_PLUGIN_WORKER = true;
+ let plugin;
++let takeLocalPluginSources;
+ const socketPath = process.argv[2];
+ const expectedPluginName = process.argv[3];
+ // The host's root, passed explicitly rather than re-resolved: a host that set
+@@ -74,10 +75,11 @@ const server = (0, net_1.createServer)((socket) => {
+             return;
+         }
+         return (0, messaging_1.consumeMessage)(socket, message, {
+-            load: async ({ plugin: pluginConfiguration, root, name, pluginPath, shouldRegisterTSTranspiler, }) => {
++            load: async ({ plugin: pluginConfiguration, root, name, pluginPath, shouldRegisterTSTranspiler, trackLocalSources, }) => {
+                 loadErrorTimeout?.clear();
+                 process.chdir(root);
+                 return withErrorHandling(async () => {
++                    if (trackLocalSources) takeLocalPluginSources = require('../local-plugin-source').trackLocalPluginLoads(root);
+                     const { loadResolvedNxPluginAsync } = await Promise.resolve(require(require.resolve('../load-resolved-plugin')));
+                     // Register the ts-transpiler if we are pointing to a
+                     // plain ts file that's not part of a plugin project
+@@ -168,16 +170,18 @@ server.listen(socketPath, () => {
+     logger_1.logger.verbose(`[plugin-worker] "${expectedPluginName}" (pid: ${process.pid}) listening on ${socketPath}`);
+ });
+ async function withErrorHandling(cb) {
++    let result;
+     try {
+-        const result = await cb();
+-        return result ?? { success: true };
++        result = (await cb()) ?? { success: true };
+     }
+     catch (e) {
+-        return {
++        result = {
+             success: false,
+             error: (0, serializable_error_1.createSerializableError)(e),
+         };
+     }
++    const localPluginSources = takeLocalPluginSources?.();
++    return localPluginSources?.length ? { ...result, localPluginSources } : result;
+ }
+ function setErrorTimeout(timeoutMs, errorMessage) {
+     if (environment.NX_PLUGIN_NO_TIMEOUTS === 'true') {
+diff --git a/dist/src/project-graph/plugins/loaded-nx-plugin.d.ts b/dist/src/project-graph/plugins/loaded-nx-plugin.d.ts
+index f229abe26e7d23baaeff9949d648c8cf7906d50d..4ec12a7f8546f2fcd8d8d8bf06fd907ddbcfe730 100644
+--- a/dist/src/project-graph/plugins/loaded-nx-plugin.d.ts
++++ b/dist/src/project-graph/plugins/loaded-nx-plugin.d.ts
+@@ -2,6 +2,7 @@ import type { ProjectGraph } from '../../config/project-graph';
+ import { type PluginConfiguration } from '../../config/nx-json';
+ import type { RawProjectGraphDependency } from '../project-graph-builder';
+ import type { CreateDependenciesContext, CreateMetadataContext, CreateNodesContext, CreateNodesResult, NxPlugin, PostTasksExecutionContext, PreTasksExecutionContext, ProjectsMetadata } from './public-api';
++export type PluginLoadResult = readonly [plugin: Promise<LoadedNxPlugin>, cleanup: () => void, created: boolean];
+ /**
+  * NOTE: Avoid using `import type` with this class. It causes issues with
+  * jest's module resolution when running tests in projects that import
+diff --git a/dist/src/project-graph/plugins/local-plugin-source.d.ts b/dist/src/project-graph/plugins/local-plugin-source.d.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c23bd14f2a28d660876423283d97fa833a057454
+--- /dev/null
++++ b/dist/src/project-graph/plugins/local-plugin-source.d.ts
+@@ -0,0 +1,20 @@
++export interface LocalPluginSourceReceipt {
++    readonly path: string;
++    readonly hash: string;
++}
++export interface LocalPluginSource {
++    readonly root: string;
++    readonly files: ReadonlyMap<string, string>;
++    readonly active: boolean;
++    invalidate(): void;
++    dispose(): void;
++}
++export declare function localPluginPath(root: string, file: string): string | null;
++export declare function pluginsAffectedByChanges<Key>(closures: ReadonlyMap<Key, ReadonlySet<string> | ReadonlyMap<string, string>>, changedFiles: readonly string[]): Key[];
++export declare function pluginsAffectedBySourceHashes<Key>(closures: ReadonlyMap<Key, ReadonlyMap<string, string>>, currentHashes: ReadonlyMap<string, string | null>): Key[];
++export declare function createLocalPluginSource(root: string, onInvalidate: () => void): LocalPluginSource;
++export declare function recordLocalPluginSources(source: LocalPluginSource | undefined, loaded: readonly LocalPluginSourceReceipt[] | undefined): void;
++export declare function invalidateLocalPluginSources(root: string, changedFiles: readonly string[]): void;
++export declare function invalidateIgnoredLocalPluginSources(root: string, changedFiles: readonly string[]): boolean;
++export declare function getLocalPluginGeneration(): number;
++export declare function trackLocalPluginLoads(root: string): () => LocalPluginSourceReceipt[];
+diff --git a/dist/src/project-graph/plugins/local-plugin-source.js b/dist/src/project-graph/plugins/local-plugin-source.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6b40a520844b6e0ac46cc09c230cf805d586804
+--- /dev/null
++++ b/dist/src/project-graph/plugins/local-plugin-source.js
+@@ -0,0 +1,158 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.localPluginPath = localPluginPath;
++exports.pluginsAffectedByChanges = pluginsAffectedByChanges;
++exports.createLocalPluginSource = createLocalPluginSource;
++exports.recordLocalPluginSources = recordLocalPluginSources;
++exports.invalidateLocalPluginSources = invalidateLocalPluginSources;
++exports.getLocalPluginGeneration = () => generation;
++exports.invalidateIgnoredLocalPluginSources = invalidateIgnoredLocalPluginSources;
++exports.pluginsAffectedBySourceHashes = pluginsAffectedBySourceHashes;
++exports.trackLocalPluginLoads = trackLocalPluginLoads;
++const { createHash } = require("node:crypto");
++const { readFileSync } = require("node:fs");
++const { relative, resolve, sep, isAbsolute } = require("node:path");
++const { fileURLToPath } = require("node:url");
++const sourcesByRoot = new Map();
++let generation = 0;
++// A resolved package-manager link into workspace source is local; installed
++// packages and links into another checkout retain their installation policy.
++function localPluginPath(root, file) {
++    const path = relative(resolve(root), resolve(file));
++    return path && !isAbsolute(path) && path !== '..' && !path.startsWith('..' + sep) &&
++        !path.split(sep).includes('node_modules') ? path.split(sep).join('/') : null;
++}
++// Pure policy: watcher paths already exclude same-byte rewrites. No census,
++// parsing, clock or filesystem operation belongs in this decision.
++function pluginsAffectedByChanges(closures, changedFiles) {
++    const affected = [];
++    for (const [key, files] of closures) {
++        for (const file of changedFiles) {
++            if (files.has(file)) {
++                affected.push(key);
++                break;
++            }
++        }
++    }
++    return affected;
++}
++function createLocalPluginSource(root, onInvalidate) {
++    root = resolve(root);
++    const sources = sourcesByRoot.get(root) ?? new Map();
++    sourcesByRoot.set(root, sources);
++    const source = {
++        root,
++        files: new Map(),
++        active: true,
++        invalidate() {
++            if (!source.active) return;
++            source.dispose();
++            ++generation;
++            onInvalidate();
++        },
++        dispose() {
++            if (!source.active) return;
++            source.active = false;
++            sources.delete(source);
++            if (sources.size === 0) sourcesByRoot.delete(root);
++        },
++    };
++    sources.set(source, source.files);
++    return source;
++}
++function digest(bytes) {
++    return createHash('sha256').update(bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes).digest('hex');
++}
++function recordLocalPluginSources(source, loaded) {
++    if (!source?.active || !loaded) return;
++    for (const { path, hash } of loaded) {
++        // Publish membership before the check. Any subsequent watcher batch now
++        // sees this file; this first check closes the load-before-registration race.
++        source.files.set(path, hash);
++        let current;
++        try {
++            current = digest(readFileSync(resolve(source.root, path)));
++        }
++        catch (error) {
++            if (error.code !== 'ENOENT') {
++                source.invalidate();
++                throw error;
++            }
++        }
++        if (current !== hash) {
++            source.invalidate();
++            return;
++        }
++    }
++}
++function invalidateLocalPluginSources(root, changedFiles) {
++    const sources = sourcesByRoot.get(resolve(root));
++    if (!sources) return;
++    const affected = pluginsAffectedByChanges(sources, changedFiles);
++    for (const source of affected) source.invalidate();
++}
++// The native stream also sees gitignored modules, but they are not part of
++// its workspace file index. Judge only those observed closure members by the
++// loaded-byte receipts, never by a directory scan or a second repository hash.
++function pluginsAffectedBySourceHashes(closures, currentHashes) {
++    const affected = [];
++    for (const [key, files] of closures) {
++        for (const [file, hash] of currentHashes) {
++            if (files.has(file) && files.get(file) !== hash) {
++                affected.push(key);
++                break;
++            }
++        }
++    }
++    return affected;
++}
++function invalidateIgnoredLocalPluginSources(root, changedFiles) {
++    const sources = sourcesByRoot.get(resolve(root));
++    if (!sources) return false;
++    const currentHashes = new Map();
++    for (const source of sources.keys()) {
++        for (const file of changedFiles) {
++            if (!source.files.has(file) || currentHashes.has(file)) continue;
++            let hash = null;
++            try {
++                hash = digest(readFileSync(resolve(source.root, file)));
++            }
++            catch (error) {
++                if (error.code !== 'ENOENT') {
++                    require('../../daemon/logger').serverLogger.log(
++                        `Cannot read loaded local Nx plugin source "${resolve(source.root, file)}"; invalidating its worker: ${error.message}`);
++                }
++            }
++            currentHashes.set(file, hash);
++        }
++    }
++    const affected = pluginsAffectedBySourceHashes(sources, currentHashes);
++    for (const source of affected) source.invalidate();
++    return affected.length > 0;
++}
++// The worker is the module-cache lifetime, including Node's non-evictable ESM
++// cache. Observe actual loads (computed and lazy imports included), not guessed
++// static imports or every file beside the entry. Each source receipt is sent once.
++function trackLocalPluginLoads(root) {
++    const pending = [];
++    const seen = new Set();
++    const { registerHooks } = require('node:module');
++    if (typeof registerHooks !== 'function') {
++        throw new Error('Local Nx plugins require Node.js with node:module.registerHooks to reload their module closure.');
++    }
++    registerHooks({
++        load(url, context, nextLoad) {
++            const result = nextLoad(url, context);
++            if (url.startsWith('file:')) {
++                const file = fileURLToPath(url);
++                const path = localPluginPath(root, file);
++                if (path && !seen.has(path)) {
++                    seen.add(path);
++                    pending.push({ path, hash: digest(result.source ?? readFileSync(file)) });
++                }
++            }
++            return result;
++        },
++    });
++    return () => pending.splice(0);
++}
 diff --git a/dist/src/project-graph/plugins/tasks-execution-hooks.js b/dist/src/project-graph/plugins/tasks-execution-hooks.js
 index 83c97768834e3f56083d5e5c2ff52806f55e95a3..eb2a4b563448079be79b58540290f41c53d0025d 100644
 --- a/dist/src/project-graph/plugins/tasks-execution-hooks.js
@@ -5455,6 +6225,59 @@ index 7adf7fe48dbde78fa770ad37c5714985d78a7b8c..13e1858e5487a7d308a84cba1f379cde
      if (!path) {
          return null;
      }
+diff --git a/dist/src/utils/serializable-error.js b/dist/src/utils/serializable-error.js
+index a1454a531c930ded0fe9de7e219bda61bfba09b2..121a38294d442426bfb165ac46bcc76ccfb1089e 100644
+--- a/dist/src/utils/serializable-error.js
++++ b/dist/src/utils/serializable-error.js
+@@ -5,29 +5,24 @@ exports.createSerializableError = createSerializableError;
+  * This function transforms an error into an object which can be properly serialized and deserialized to be sent between processes.
+  */
+ function createSerializableError(error) {
+-    const res = {};
+-    Object.getOwnPropertyNames(error).forEach((k) => {
+-        let value = error[k];
+-        // If an error has an error as a property such as cause, it will be transformed into a serializable error
+-        if (typeof value === 'object' && value instanceof Error) {
+-            value = createSerializableError(value);
+-        }
+-        // If an error has an array of errors as a property, they will be transformed into serializable errors
+-        if (Array.isArray(value)) {
+-            value = value.map((v) => {
+-                if (typeof v === 'object' && v instanceof Error) {
+-                    return createSerializableError(v);
+-                    // Support for AggregateCreateNodesError
+-                }
+-                else if (Array.isArray(v) &&
+-                    v.length === 2 &&
+-                    v[1] instanceof Error) {
+-                    return [v[0], createSerializableError(v[1])];
+-                }
+-                return v;
+-            });
++    return serializableValue(error, new Set());
++}
++function serializableValue(value, ancestors) {
++    if (value === null || typeof value !== 'object') return value;
++    if (ancestors.has(value)) return { message: '[Circular error]' };
++    // Keep JSON-native values (e.g. Date) on their existing wire path.
++    if (!(value instanceof Error) && typeof value.toJSON === 'function') return value;
++    ancestors.add(value);
++    try {
++        if (Array.isArray(value)) return value.map((item) => serializableValue(item, ancestors));
++        const result = {};
++        for (const key of Object.getOwnPropertyNames(value)) {
++            result[key] = serializableValue(value[key], ancestors);
+         }
+-        res[k] = value;
+-    });
+-    return res;
++        return result;
++    }
++    finally {
++        // Path-scoped, not global: the same child in two branches is not a cycle.
++        ancestors.delete(value);
++    }
+ }
 diff --git a/dist/src/utils/sync-generators.js b/dist/src/utils/sync-generators.js
 index d753d65ac4e40380a4dda94a34bc60e0d233f452..796630a927c81afefc9a0ec8d4edb7a274cbe217 100644
 --- a/dist/src/utils/sync-generators.js

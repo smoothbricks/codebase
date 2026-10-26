@@ -1032,9 +1032,10 @@ whatever that flag says, and with no in-process fallback: a worker that cannot s
 local source in the daemon. An installed plugin keeps its existing fallback. A module loaded into the daemon's own
 process cannot be evicted (Node cannot unload an ESM module), so a local plugin loaded there would keep serving its
 first-loaded code after its source changed; in a worker, only the affected plugin is retired and reloaded once a file it
-loaded changes, while the daemon keeps serving (`patches/README.md`, "Event-driven daemon validity"). Where isolation is
-on, as in a fixture that asks for it, and for these workers alike, socket placement is still a Cowshed runtime binding,
-not a per-project flag or filesystem grant.
+loaded changes — a file the workspace ignores included, judged against the digest recorded when it was loaded — while
+the daemon keeps serving (`patches/README.md`, "Event-driven daemon validity"). Where isolation is on, as in a fixture
+that asks for it, and for these workers alike, socket placement is still a Cowshed runtime binding, not a per-project
+flag or filesystem grant.
 
 A TypeScript fixture running inside that job keeps its workspace outside every checkout in the job's private `TMPDIR`.
 Its short socket parent alias lies in the already-admitted runtime namespace and points to real leaves in the fixture's
