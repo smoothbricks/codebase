@@ -160,6 +160,7 @@ export class DescriptorEvents<T extends { readonly kind: string }> implements As
   ) {
     this.#onEvent = hooks.onEvent ?? (() => {});
     this.#onEnd = hooks.onAbandon ?? (() => {});
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: the launched verb holds its event descriptor close-on-exec (lock.rs, hold.rs, subtree.rs), so no process it starts keeps it and the descriptor closes when the verb ends
     const { promise, resolve } = Promise.withResolvers<void>();
     this.drained = promise;
     const take = (decoded: Decoded<T>[]) => {
@@ -247,6 +248,7 @@ export class DescriptorEvents<T extends { readonly kind: string }> implements As
 async function launch(argv: readonly string[], stdio: StdioOptions): Promise<ChildProcess> {
   const launcher = launcherPath(packageRootFromModule(import.meta.url));
   const child = spawn(launcher, [...argv], { stdio });
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: Node emits 'spawn' or 'error' once the exec of the launcher returns; no other process is awaited
   const { promise, resolve, reject } = Promise.withResolvers<ChildProcess>();
   child.once('spawn', () => resolve(child));
   child.once('error', (error) =>
@@ -263,6 +265,7 @@ async function launch(argv: readonly string[], stdio: StdioOptions): Promise<Chi
 
 /** The process's real status once it has exited. */
 function status(child: ChildProcess): Promise<LauncherStatus> {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a launched cowshed verb (a lock wait, a hold, a run) lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
   return new Promise((resolve, reject) => {
     child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
       if (signal !== null) {

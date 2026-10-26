@@ -31,6 +31,7 @@ export function launcherPath(packageRoot: string): string {
  * its behalf.
  */
 export function runLauncher(packageRoot: string, argv: readonly string[]): Promise<number> {
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a cowshed verb the operator runs, with its stdio inherited and its signals forwarded, lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
   const { promise, resolve: resolveExit, reject } = Promise.withResolvers<number>();
   const child = spawn(launcherPath(packageRoot), [...argv], { stdio: 'inherit' });
   const forwarded = FORWARDED_SIGNALS.map((signal) => {
