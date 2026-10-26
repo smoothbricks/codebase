@@ -305,10 +305,12 @@
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
+        "smoo-nx-cargo-toolchain": "./dist/bin/smoo-nx-cargo-toolchain.js",
         "smoo-nx-nextest-timings": "./dist/bin/smoo-nx-nextest-timings.js",
         "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
         "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
         "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
+        "smoo-nx-forbidden-spellings": "./dist/bin/smoo-nx-forbidden-spellings.js",
       },
       "dependencies": {
         "@nx/js": "23.2.1",

@@ -297,7 +297,6 @@
         "dependsOn": [
           "cli-native"
         ],
-        "//": "Runs the package launcher, not dist/bin/darwin-arm64 directly: bin/cowshed resolves the host's native binary, so this works on every arch instead of only Apple Silicon. The note is not an option: nx:run-commands forwards every option it does not know to the command as an argument.",
         "options": {
           "cwd": "{projectRoot}",
           "command": "bin/cowshed {args}"

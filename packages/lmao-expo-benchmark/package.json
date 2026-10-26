@@ -123,6 +123,7 @@
           }
         ],
         "dependsOn": [
+          "^build",
           {
             "projects": [
               "lmao"

@@ -1,5 +1,8 @@
 import { fileURLToPath } from 'node:url';
 
+/** Provenance used by the copied developer-link helper; its schema remains owned by build-inputs. */
+export type { BuildInputProducer } from '@smoothbricks/build-inputs';
+
 /** Packaged assets, independent of the consumer's cwd and node_modules layout. */
 export const managedAssetsRoot = fileURLToPath(new URL('../managed/', import.meta.url));
 

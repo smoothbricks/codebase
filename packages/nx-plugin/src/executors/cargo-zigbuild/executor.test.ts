@@ -207,9 +207,11 @@ describe('cargo-zigbuild executor', () => {
       const depInfoText = `${built}: /elsewhere/clone/crates/cli/src/main.rs\n`;
       await writeFile(depInfo, depInfoText);
       const producer = { project: 'cli', target: 'cli-x64-linux' };
+      const expected = cargoBuildInputs(root, depInfoText, root, producer);
+      if (expected === null) throw new Error('The fixture dep-info must name its tracked source');
       expect(buildInputsOf(built, manifest, root, producer)).toEqual({
         ok: true,
-        value: cargoBuildInputs(root, depInfoText, root, producer),
+        value: expected,
       });
     });
   });

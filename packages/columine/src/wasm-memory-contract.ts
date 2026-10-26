@@ -1,3 +1,4 @@
+/// <reference types="node" />
 export const WASM_PAGE_BYTES = 64 * 1024;
 export const WASM_MAX_PAGES = 4096;
 export const WASM_MAX_BYTES = WASM_PAGE_BYTES * WASM_MAX_PAGES;

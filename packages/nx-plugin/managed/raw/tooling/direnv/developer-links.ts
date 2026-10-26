@@ -123,8 +123,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-import type { BuildInputProducer } from '@smoothbricks/build-inputs';
-import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
+import type { BuildInputProducer, KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 import {
   type ProducerProbe,
   packedFiles,
