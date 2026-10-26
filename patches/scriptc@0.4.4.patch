@@ -1,0 +1,23 @@
+diff --git a/scripts/install-native.mjs b/scripts/install-native.mjs
+index 84eb846bcb2e1706ec8053e8d6da9d100b47ea31..60d737ec6301d9f9c1089e99db9ce31f7ec83ad1 100644
+--- a/scripts/install-native.mjs
++++ b/scripts/install-native.mjs
+@@ -11,7 +11,7 @@ import {
+   writeFileSync,
+ } from "node:fs";
+ import { createRequire } from "node:module";
+-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
++import { dirname, isAbsolute, join, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+ 
+ export function nativeCliPackage(platform, architecture, libc) {
+@@ -39,7 +39,8 @@ function hostLibc() {
+ 
+ export function relocateToolchain(manifest, sourceDirectory, destinationDirectory) {
+   const relocated = { ...manifest };
+-  const pathFrom = (value) => relative(destinationDirectory, resolve(sourceDirectory, value));
++  const source = realpathSync(sourceDirectory);
++  const pathFrom = (value) => resolve(source, value);
+   for (const name of [
+     "ts7",
+     "tsc_ts",

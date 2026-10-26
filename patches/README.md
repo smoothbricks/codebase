@@ -17,6 +17,19 @@ upstream declaration preserves the same contract.
 Flechette 2.7 builds Date64 metadata from numeric millisecond inputs. The Compact fixture seeds only that schema with a
 number; its physical payload remains `BigInt64Array`, with the same i64 round-trip assertions.
 
+## scriptc's installed toolchain
+
+`scriptc@0.4.4.patch` records the toolchain sidecar's payload paths from the platform package's canonical absolute
+source directory, not relative to the checkout's installed compiler. Bun's isolated packages live in its shared
+link-target cache (`specs/cowshed/03_caches.md`, "The discriminator"); a warm checkout at another depth must still reach
+that same payload. Bare linker commands stay on PATH, and the upstream installer's copy and executable-mode
+normalization stay unchanged. No consumer overrides the compiler or rewrites its sidecar.
+
+The installer regression in `tooling/direnv/scriptc-install.test.ts` exercises the actual pinned relocator through a
+symlinked cache and two checkout depths. The native targets described in `packages/nx-plugin/README.md` exercise the
+installed compiler. Sidecars remain installed dependencies, never committed source or Nx outputs. Retire this patch when
+the upstream installer publishes depth-independent payload paths.
+
 ## typia output scriptc compiles
 
 scriptc compiles a package's ttsc-emitted JavaScript to a native executable (`scriptc-<arch>-<family>`,

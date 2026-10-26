@@ -302,7 +302,8 @@
     "@nx/js@23.2.1": "patches/@nx%2Fjs@23.2.1.patch",
     "ttsc@0.34.1": "patches/ttsc@0.34.1.patch",
     "typia@15.2.1": "patches/typia@15.2.1.patch",
-    "@typia/interface@15.2.1": "patches/@typia%2Finterface@15.2.1.patch"
+    "@typia/interface@15.2.1": "patches/@typia%2Finterface@15.2.1.patch",
+    "scriptc@0.4.4": "patches/scriptc@0.4.4.patch"
   },
   "overrides": {
     "typia": "15.2.1",
