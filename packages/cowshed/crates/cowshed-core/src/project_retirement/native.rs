@@ -119,7 +119,7 @@ mod macos {
         repo: &RepoId,
         workspace: &WorkspaceName,
     ) -> Result<supervisor_socket::BoundSocket> {
-        let path = supervisor_socket::socket_path(store, repo, workspace);
+        let path = cowshed_types::supervisor_socket::socket_path(store, repo, workspace);
         let present = match supervisor_socket::hello_if_present(&path).await {
             Ok(Some(hello)) => {
                 if hello.authority.repo_id != *repo || hello.authority.workspace != *workspace {

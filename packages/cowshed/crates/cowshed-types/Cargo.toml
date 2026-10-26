@@ -12,6 +12,7 @@ cowshed-os = { path = "../cowshed-os" }
 lmao-core.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
+sha2 = "0.10"
 thiserror = "2"
 
 [dev-dependencies]

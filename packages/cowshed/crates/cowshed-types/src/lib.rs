@@ -10,5 +10,6 @@ pub mod image;
 pub mod lifecycle;
 pub mod metadata;
 pub mod repository;
+pub mod supervisor_socket;
 pub mod trace_enum;
 pub mod wait;

@@ -575,7 +575,11 @@ mod native {
                 .linked(&mount)
                 .map_err(|error| text(&error))?
                 .filter(|id| mounted.contains(&builds.mount(id)));
-            let socket = supervisor_socket::socket_path(storage.store(), &repo.repo_id, &name);
+            let socket = cowshed_types::supervisor_socket::socket_path(
+                storage.store(),
+                &repo.repo_id,
+                &name,
+            );
             let occupancy =
                 if name.is_main() {
                     Occupancy::Busy(Busy::Main)
@@ -636,7 +640,7 @@ mod native {
     ) -> Option<Busy> {
         let name = attached.workspace.name();
         let repo = &project.repo.repo_id;
-        let socket = supervisor_socket::socket_path(storage.store(), repo, name);
+        let socket = cowshed_types::supervisor_socket::socket_path(storage.store(), repo, name);
         let _lease = match supervisor_socket::lease_unserved(&socket) {
             Ok(Some(lease)) => lease,
             Ok(None) => return Some(Busy::Supervisor),

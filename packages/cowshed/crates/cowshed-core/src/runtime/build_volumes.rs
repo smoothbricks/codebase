@@ -4436,7 +4436,7 @@ mod tests {
         async fn stopped(&self, checkout: &Path) -> super::super::supervisor_socket::BoundSocket {
             let workspace =
                 WorkspaceName::new(checkout.file_name().unwrap().to_str().unwrap()).unwrap();
-            let socket = super::super::supervisor_socket::socket_path(
+            let socket = cowshed_types::supervisor_socket::socket_path(
                 &self.root.path().join("store"),
                 &RepoId::parse("acme/widget").unwrap(),
                 &workspace,

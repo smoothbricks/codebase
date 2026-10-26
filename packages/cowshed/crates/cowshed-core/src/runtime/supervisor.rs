@@ -70,13 +70,13 @@ use crate::runtime::nx_daemon::{NxDaemonKeeper, Probe, Verdict};
 use crate::runtime::process_monitor::ProcessMonitor;
 use crate::runtime::process_stream::JobProcessStream;
 use crate::runtime::retirement_refusal::{AtEnd, Refusal, RetirementRun, at_end};
-use crate::runtime::supervisor_socket::AdmissionSource;
 use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, VolumeMountpoint};
 use crate::storage::job_artifact::{
     AdmissionLookup, AdmittedSession, AdmittedStdin, ArtifactConfig, ArtifactError, ArtifactStore,
     CompletedJobArtifacts, JobAdmission, JobEnding, JobScheduling, OutputTargets,
     SealedCheckpointManifest, StreamKind,
 };
+use cowshed_types::supervisor_socket::AdmissionSource;
 
 #[cfg(test)]
 const DEFAULT_ACTOR_CAPACITY: usize = 64;
@@ -5556,7 +5556,7 @@ impl SupervisorActor {
                     Ok(())
                 }
             })?;
-        source.admit(request.class, request.scope)?;
+        super::supervisor_socket::admit(source, request.class, request.scope)?;
         // The host boundary takes no session overlay a worker controls. Environment names do
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
@@ -5729,7 +5729,7 @@ impl SupervisorActor {
         // of it, so it is dropped here — at the one place every job's environment is settled.
         merged_env.retain(|name, _| !self.credential_env_names.contains(name));
         // Callers cannot redirect a job's capability requests to another endpoint.
-        merged_env.remove(super::supervisor_socket::MEMBERSHIP_SOCKET_ENV);
+        merged_env.remove(cowshed_types::supervisor_socket::MEMBERSHIP_SOCKET_ENV);
         if let Some(socket) = &self.membership_socket {
             let socket = socket.to_str().ok_or_else(|| {
                 CowshedError::integrity(
@@ -5738,7 +5738,7 @@ impl SupervisorActor {
                 )
             })?;
             merged_env.insert(
-                super::supervisor_socket::MEMBERSHIP_SOCKET_ENV.to_owned(),
+                cowshed_types::supervisor_socket::MEMBERSHIP_SOCKET_ENV.to_owned(),
                 socket.to_owned(),
             );
         }

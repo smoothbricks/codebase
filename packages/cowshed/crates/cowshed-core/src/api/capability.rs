@@ -33,13 +33,14 @@ use super::server::{
     MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
 };
 use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
-use crate::runtime::supervisor_socket::AdmissionSource;
+use crate::runtime::supervisor_socket::admit;
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(unix)]
 use cowshed_os::deadline::{self, Idle, Peer, Progress, Silent};
 use cowshed_types::metadata::WorkspaceName;
 use cowshed_types::repository::{ProjectPaths, RepoId, RepositoryBinding};
+use cowshed_types::supervisor_socket::AdmissionSource;
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::fmt;
@@ -359,7 +360,7 @@ impl ControllerRuntime for ActorRuntime {
         request: ExecRequest,
         source: AdmissionSource,
     ) -> Result<JobId> {
-        source.admit(request.class, request.scope)?;
+        admit(source, request.class, request.scope)?;
         request.command.validate().map_err(|error| {
             CowshedError::usage(error.to_string(), "provide a valid bounded command")
         })?;
@@ -4884,7 +4885,7 @@ mod tests {
         let (runtime, other_build) = spawn_controller_actor(reader, writer, controller());
         let coordinator = coordinator_over(runtime, other_build);
         let refused = OtherBuild {
-            daemon: crate::runtime::supervisor_socket::BuildId::current()
+            daemon: crate::runtime::supervisor_socket::current_build()
                 .unwrap()
                 .clone(),
             caller: None,

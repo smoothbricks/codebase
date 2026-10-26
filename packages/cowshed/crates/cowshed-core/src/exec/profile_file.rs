@@ -160,7 +160,7 @@ pub fn collect_profiles(store_root: &Path) -> io::Result<usize> {
 /// Only a supervisor's own socket counts ([`is_socket_name`]): the manager's `manager.sock` lives
 /// as long as the daemon, and a supervisor's `.members.sock` twin is the same supervisor.
 ///
-/// [`is_socket_name`]: crate::runtime::supervisor_socket::is_socket_name
+/// [`is_socket_name`]: cowshed_types::supervisor_socket::is_socket_name
 fn oldest_live_supervisor(run: &Path) -> io::Result<Option<SystemTime>> {
     let entries = match fs::read_dir(run) {
         Ok(entries) => entries,
@@ -170,7 +170,7 @@ fn oldest_live_supervisor(run: &Path) -> io::Result<Option<SystemTime>> {
     let mut oldest: Option<SystemTime> = None;
     for entry in entries {
         let entry = entry?;
-        if !crate::runtime::supervisor_socket::is_socket_name(&entry.file_name()) {
+        if !cowshed_types::supervisor_socket::is_socket_name(&entry.file_name()) {
             continue;
         }
         if let Some(started) = crate::runtime::supervisor_socket::serving_since(&entry.path())? {
@@ -259,7 +259,7 @@ mod tests {
 
     /// Where the supervisor of `workspace` of `acme/widget` listens in `store`.
     fn supervisor_socket(store: &Path, workspace: &str) -> PathBuf {
-        crate::runtime::supervisor_socket::socket_path(
+        cowshed_types::supervisor_socket::socket_path(
             store,
             &cowshed_types::repository::RepoId::parse("acme/widget").unwrap(),
             &cowshed_types::metadata::WorkspaceName::new(workspace).unwrap(),

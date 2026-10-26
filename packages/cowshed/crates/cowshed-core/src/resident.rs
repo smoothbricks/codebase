@@ -325,7 +325,7 @@ pub async fn resolve(
     };
     let build_volume = build_volume_grant(project, workspace, &mount, probe)?;
     drop(workspace_span);
-    let socket = supervisor_socket::socket_path(store_root, &repo, workspace);
+    let socket = cowshed_types::supervisor_socket::socket_path(store_root, &repo, workspace);
     let hello = cowshed_os::timing::spanned("resident", "hello", probe.hello(&socket))
         .await
         .map_err(|_| Decline::Unserved)?;
@@ -637,7 +637,7 @@ mod tests {
     fn probe(store: &Store, serving: WorkspaceAuthoritySnapshot) -> Probe {
         Probe {
             mounted: vec![store.checkout.clone(), store.raven_mount.clone()],
-            socket: supervisor_socket::socket_path(&store.store, &repo(), &raven()),
+            socket: cowshed_types::supervisor_socket::socket_path(&store.store, &repo(), &raven()),
             serving,
         }
     }

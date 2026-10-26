@@ -1084,7 +1084,7 @@ impl CliService for ActorBridge {
                 CowshedError::internal("the CLI project runtime has already been shut down")
             })?
             .descriptor();
-        let socket = cowshed_core::runtime::supervisor_socket::socket_path(
+        let socket = cowshed_types::supervisor_socket::socket_path(
             descriptor.storage.store(),
             &descriptor.repo_id,
             worker.name(),

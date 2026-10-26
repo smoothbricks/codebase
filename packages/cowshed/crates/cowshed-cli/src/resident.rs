@@ -192,7 +192,7 @@ async fn run(
     let link = JobLink::new(resident);
     // The CLI is the coordinator route (07_api.md, "CLI and API exec parity"), on this path as
     // through the controller: the route is who asks, never the class asked for.
-    let source = cowshed_core::runtime::supervisor_socket::AdmissionSource::Coordinator;
+    let source = cowshed_types::supervisor_socket::AdmissionSource::Coordinator;
 
     // Admission is where a refusal can still mean nothing ran; after it, every failure is this
     // job's and is reported, never retried through the controller.
