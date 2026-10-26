@@ -702,7 +702,13 @@ impl IncarnationCgroups {
             if cowshed_os::process::running(controller).map_err(failed("stat", &entry.path()))? {
                 continue;
             }
-            RunCgroup::open(entry.path())?.retire(reap)?;
+            match RunCgroup::open(entry.path()) {
+                Ok(stale) => stale.retire(reap)?,
+                // Another run of this incarnation retired it first.
+                Err(CgroupError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                }
+                Err(error) => return Err(error),
+            }
         }
         // SAFETY: getpid takes nothing and cannot fail.
         let controller = unsafe { libc::getpid() };
@@ -740,6 +746,23 @@ pub struct RunCgroup {
 }
 
 impl RunCgroup {
+    /// A fresh leaf named `name` inside `parent`, the cgroup this process runs in: an after-land
+    /// job's leaf for one command (02_workspaces.md "A declared land" step 6). It must not exist.
+    /// `parent` enables no controller for its children, so it may hold processes and leaves alike.
+    pub fn inside(parent: &Path, name: &str) -> Result<Self> {
+        let path = parent.join(name);
+        if !make_directory(&path)? {
+            return Err(CgroupError::AlreadyExists { path });
+        }
+        Self::open(path.clone()).map_err(|opening| match fs::remove_dir(&path) {
+            Ok(()) => opening,
+            Err(source) => CgroupError::AdmissionCleanup {
+                path,
+                admission: Box::new(opening),
+                source,
+            },
+        })
+    }
     fn open(path: PathBuf) -> Result<Self> {
         let directory = open_directory(&path)?;
         let kill =
@@ -771,11 +794,12 @@ impl RunCgroup {
     /// named, and the leaf is left as it is.
     pub fn retire(self, reap: Bound) -> Result<()> {
         let deadline = deadline::start("run cgroup kill", reap);
-        let events = read_at(&self.directory, c"cgroup.events").map_err(failed_in(
-            "read",
-            &self.path,
-            "cgroup.events",
-        ))?;
+        let events = match read_at(&self.directory, c"cgroup.events") {
+            Ok(events) => events,
+            // Another run of this incarnation retired it already.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(failed_in("read", &self.path, "cgroup.events")(error)),
+        };
         let last = if populated(&self.path, &events)? {
             // SAFETY: one byte from a live buffer to the leaf's cgroup.kill.
             if unsafe { libc::write(self.kill.as_raw_fd(), c"1".as_ptr().cast(), 1) } != 1 {
@@ -812,7 +836,13 @@ impl RunCgroup {
                 beside: Vec::new(),
             });
         }
-        remove_empty_hierarchy(&self.path)
+        match remove_empty_hierarchy(&self.path) {
+            // Another run retired this leaf between its emptiness and its removal.
+            Err(CgroupError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            removed => removed,
+        }
     }
 }
 

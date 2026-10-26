@@ -579,13 +579,10 @@ fn cgroup_file(cgroup: std::os::fd::BorrowedFd<'_>, name: &std::ffi::CStr) -> io
     Ok(text)
 }
 
-/// The members of `cgroup` (its `cgroup.procs`), without `except`: every process in it, whatever
-/// parent it was reparented to.
+/// The members of `cgroup` (its `cgroup.procs`): every process in it, whatever parent it was
+/// reparented to.
 #[cfg(target_os = "linux")]
-fn cgroup_pids(
-    cgroup: std::os::fd::BorrowedFd<'_>,
-    except: Option<libc::pid_t>,
-) -> io::Result<Vec<libc::pid_t>> {
+fn cgroup_pids(cgroup: std::os::fd::BorrowedFd<'_>) -> io::Result<Vec<libc::pid_t>> {
     cgroup_file(cgroup, c"cgroup.procs")?
         .lines()
         .map(|line| {
@@ -596,7 +593,6 @@ fn cgroup_pids(
                 )
             })
         })
-        .filter(|pid| pid.as_ref().map_or(true, |pid| Some(*pid) != except))
         .collect()
 }
 
@@ -609,47 +605,22 @@ fn usage_usec(stat: &str) -> Option<u64> {
 }
 
 /// The CPU every process of `cgroup` has used, live or exited, in microseconds (`cpu.stat`'s
-/// `usage_usec`), less this process's own when `except_self`: a waiter inside the cgroup it
-/// reads, whose own looks must never count as its run's progress.
+/// `usage_usec`).
 #[cfg(target_os = "linux")]
-pub fn cgroup_cpu(cgroup: std::os::fd::BorrowedFd<'_>, except_self: bool) -> io::Result<u64> {
+pub fn cgroup_cpu(cgroup: std::os::fd::BorrowedFd<'_>) -> io::Result<u64> {
     let stat = cgroup_file(cgroup, c"cpu.stat")?;
-    let usage = usage_usec(&stat).ok_or_else(|| {
+    usage_usec(&stat).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("cpu.stat holds no usage_usec: {stat:?}"),
         )
-    })?;
-    if !except_self {
-        return Ok(usage);
-    }
-    // SAFETY: an all-zero rusage is valid storage for getrusage to fill.
-    let mut own: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: RUSAGE_SELF with a live output buffer.
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut own) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let micros = |time: libc::timeval| {
-        u64::try_from(time.tv_sec)
-            .unwrap_or(0)
-            .saturating_mul(1_000_000)
-            .saturating_add(u64::try_from(time.tv_usec).unwrap_or(0))
-    };
-    Ok(usage.saturating_sub(micros(own.ru_utime).saturating_add(micros(own.ru_stime))))
+    })
 }
 
-/// The running members of `cgroup`, without this process when `except_self`, each named by its
-/// command line (`cmdline`) and its state.
+/// The running members of `cgroup`, each named by its command line (`cmdline`) and its state.
 #[cfg(target_os = "linux")]
-pub fn cgroup_members(
-    cgroup: std::os::fd::BorrowedFd<'_>,
-    except_self: bool,
-) -> io::Result<Vec<GroupMember>> {
-    let except = except_self.then(|| {
-        // SAFETY: getpid takes nothing and cannot fail.
-        unsafe { libc::getpid() }
-    });
-    Ok(cgroup_pids(cgroup, except)?
+pub fn cgroup_members(cgroup: std::os::fd::BorrowedFd<'_>) -> io::Result<Vec<GroupMember>> {
+    Ok(cgroup_pids(cgroup)?
         .into_iter()
         .filter_map(|pid| {
             let state = run_state(pid);
@@ -675,19 +646,11 @@ pub fn cgroup_members(
         .collect())
 }
 
-/// Send `signal` to every member of `cgroup` but this process when `except_self`; a member that
-/// exited since the listing is passed over.
+/// Send `signal` to every member of `cgroup`; a member that exited since the listing is passed
+/// over.
 #[cfg(target_os = "linux")]
-pub fn signal_cgroup(
-    cgroup: std::os::fd::BorrowedFd<'_>,
-    except_self: bool,
-    signal: libc::c_int,
-) -> io::Result<()> {
-    let except = except_self.then(|| {
-        // SAFETY: getpid takes nothing and cannot fail.
-        unsafe { libc::getpid() }
-    });
-    for pid in cgroup_pids(cgroup, except)? {
+pub fn signal_cgroup(cgroup: std::os::fd::BorrowedFd<'_>, signal: libc::c_int) -> io::Result<()> {
+    for pid in cgroup_pids(cgroup)? {
         // SAFETY: plain integers; a member that already exited answers ESRCH.
         if unsafe { libc::kill(pid, signal) } != 0 {
             let error = io::Error::last_os_error();
@@ -699,23 +662,23 @@ pub fn signal_cgroup(
     Ok(())
 }
 
-/// This process's own cgroup v2 directory (`/proc/self/cgroup`'s unified line under
-/// `/sys/fs/cgroup`), opened: a job's cgroup, for a waiter inside a job.
+/// This process's own cgroup v2 directory: `/proc/self/cgroup`'s unified line under
+/// `/sys/fs/cgroup`. A job's, for a process running as one.
 #[cfg(target_os = "linux")]
-pub fn own_cgroup() -> io::Result<std::os::fd::OwnedFd> {
-    let membership = std::fs::read_to_string("/proc/self/cgroup")?;
+pub fn own_cgroup() -> io::Result<std::path::PathBuf> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").map_err(|error| {
+        io::Error::new(error.kind(), format!("read /proc/self/cgroup: {error}"))
+    })?;
     let path = membership
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("this process is in no cgroup v2: {membership:?}"),
+                format!("/proc/self/cgroup names no cgroup v2 membership: {membership:?}"),
             )
         })?;
-    let directory =
-        std::path::Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/'));
-    Ok(std::fs::File::open(directory)?.into())
+    Ok(std::path::Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/')))
 }
 /// A process's exit, watched from a moment it ran. The kernel reports it only once the process
 /// has released what it held, every descriptor included (measured on Darwin: a listener it alone

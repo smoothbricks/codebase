@@ -121,8 +121,9 @@ fn run(request: &AfterRequest) {
 }
 
 /// Run one command, `role`, in main's pure environment, its output appended to `log` as it comes
-/// and its silence bounded by [`SILENCE`]. Its members are its own process group on Darwin, and
-/// on Linux this after-land job's own cgroup, which holds the command and all it starts.
+/// and its silence bounded by [`SILENCE`]. Its members are its own process group on Darwin, and on
+/// Linux a cgroup leaf of its own inside this after-land job's cgroup, named for its log and
+/// retired once it ends, so nothing an earlier command left behind is counted as this one's.
 fn execute(
     role: &'static str,
     request: &AfterRequest,
@@ -139,18 +140,44 @@ fn execute(
         File::create(log).map_err(|error| format!("cannot open {}: {error}", log.display()))?;
     let mut command = crate::declared_land::declared_command(&request.main, &argv, &environment)
         .map_err(|error| error.message)?;
-    #[cfg(target_os = "linux")]
-    let own = cowshed_os::process::own_cgroup()
-        .map_err(|error| format!("cannot open this job's own cgroup: {error}"))?;
-    #[cfg(target_os = "linux")]
-    let members = {
-        use std::os::fd::AsFd as _;
-        cowshed_os::deadline::Members::Enclosing(own.as_fd())
-    };
     #[cfg(target_os = "macos")]
-    let members = cowshed_os::deadline::Members::OwnGroup;
-    cowshed_os::deadline::run_to_log(role, &mut command, members, output, SILENCE)
-        .map_err(|error| error.to_string())
+    return cowshed_os::deadline::run_to_log(
+        role,
+        &mut command,
+        cowshed_os::deadline::Members::OwnGroup,
+        output,
+        SILENCE,
+    )
+    .map_err(|error| error.to_string());
+    #[cfg(target_os = "linux")]
+    {
+        let own = cowshed_os::process::own_cgroup().map_err(|error| error.to_string())?;
+        let name = format!(
+            "after-{}",
+            log.file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+        );
+        let leaf = cowshed_core::runtime::job_cgroup::RunCgroup::inside(&own, &name)
+            .map_err(|error| error.to_string())?;
+        let ran = cowshed_os::deadline::run_to_log(
+            role,
+            &mut command,
+            cowshed_os::deadline::Members::Leaf {
+                cgroup: leaf.directory(),
+                path: leaf.path(),
+            },
+            output,
+            SILENCE,
+        )
+        .map_err(|error| error.to_string());
+        match (ran, leaf.retire(cowshed_os::deadline::REAP)) {
+            (ran, Ok(())) => ran,
+            (Ok(_), Err(unretired)) => Err(format!("its cgroup leaf was not retired: {unretired}")),
+            (Err(failed), Err(unretired)) => Err(format!(
+                "{failed}; and its cgroup leaf was not retired: {unretired}"
+            )),
+        }
+    }
 }
 
 fn note(request: &AfterRequest, event: LandEvent, detail: String) {

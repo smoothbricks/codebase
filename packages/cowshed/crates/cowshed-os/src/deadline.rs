@@ -286,6 +286,13 @@ impl From<RunError> for io::Error {
     fn from(failure: RunError) -> Self {
         match failure {
             RunError::Spawn { source, .. } => source,
+            entered @ RunError::Enter { .. } => {
+                let kind = match &entered {
+                    RunError::Enter { source, .. } => source.kind(),
+                    _ => io::ErrorKind::Other,
+                };
+                io::Error::new(kind, entered)
+            }
             RunError::Reap(failure) => failure.into(),
             RunError::Output(failure) => failure.into(),
             silent @ RunError::Silent(_) => io::Error::new(io::ErrorKind::TimedOut, silent),
@@ -785,11 +792,22 @@ pub enum RunError {
         #[source]
         source: io::Error,
     },
+    /// A run whose child enters a cgroup leaf before it executes ([`Members::Leaf`]) could not be
+    /// started: the leaf's `cgroup.procs` could not be opened, or the spawn failed, the child's
+    /// entry through that file one of its steps (code `IO`).
+    #[error("{op}: {role} could not be started in cgroup {} (it enters through {}/cgroup.procs before it executes): {source}", cgroup.display(), cgroup.display())]
+    Enter {
+        op: &'static str,
+        role: &'static str,
+        cgroup: std::path::PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// A run that went silent ([`RunError::Silent`]): the silence, naming the child, and the running
-/// members of its process group as the kernel showed them, the hung process among them, each by
-/// pid, command and state. When the group's CPU could not be read, why.
+/// members of its source ([`Members`]) as the kernel showed them, the hung process among them,
+/// each by pid, command and state. When the members' CPU could not be read, why.
 #[derive(Debug)]
 pub struct SilentRun {
     pub silent: Silent<ChildPeer>,
@@ -801,24 +819,22 @@ impl fmt::Display for SilentRun {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{}; no CPU advanced in its process group",
+            "{}; no CPU advanced among its members",
             self.silent
         )?;
         if let Some(error) = &self.cpu_unread {
-            write!(formatter, " (its CPU could not be read: {error})")?;
+            write!(formatter, " (their CPU could not be read: {error})")?;
         }
         match &self.group {
-            Ok(members) if members.is_empty() => {
-                formatter.write_str("; its group has no running process")
-            }
+            Ok(members) if members.is_empty() => formatter.write_str("; it has no running member"),
             Ok(members) => {
-                formatter.write_str("; its group's running processes:")?;
+                formatter.write_str("; its running members:")?;
                 for member in members {
                     write!(formatter, " {member};")?;
                 }
                 Ok(())
             }
-            Err(error) => write!(formatter, "; its group could not be listed: {error}"),
+            Err(error) => write!(formatter, "; its members could not be listed: {error}"),
         }
     }
 }
@@ -853,6 +869,7 @@ impl RunError {
             Self::Output(failure) => failure.code(),
             Self::Silent(_) => "SILENT",
             Self::Log { .. } => "IO",
+            Self::Enter { .. } => "IO",
         }
     }
 }
@@ -902,13 +919,13 @@ pub enum Members<'a> {
     /// The child leads a process group of its own, which Darwin lists (`proc_listpgrppids`).
     #[cfg(target_os = "macos")]
     OwnGroup,
-    /// A cgroup v2 leaf of this run alone, which the child enters before it executes.
+    /// A cgroup v2 leaf of this run alone, `path` opened as `cgroup`, which the child enters
+    /// before it executes: a controller run's leaf, or one an after-land job makes for each command.
     #[cfg(target_os = "linux")]
-    Leaf(std::os::fd::BorrowedFd<'a>),
-    /// The caller's own cgroup (a job's, for a waiter inside it): the child is a member already;
-    /// the waiter is not one of the run's, so its pid is passed over and its CPU is no progress.
-    #[cfg(target_os = "linux")]
-    Enclosing(std::os::fd::BorrowedFd<'a>),
+    Leaf {
+        cgroup: std::os::fd::BorrowedFd<'a>,
+        path: &'a std::path::Path,
+    },
     /// No source borrows on this platform: the lifetime's uninhabited carrier.
     #[doc(hidden)]
     #[cfg(not(target_os = "linux"))]
@@ -916,6 +933,18 @@ pub enum Members<'a> {
 }
 
 impl Members<'_> {
+    /// The leaf a run's child enters, for an error to name.
+    fn leaf(self) -> Option<std::path::PathBuf> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::OwnGroup => None,
+            #[cfg(target_os = "linux")]
+            Self::Leaf { path, .. } => Some(path.to_path_buf()),
+            #[cfg(not(target_os = "linux"))]
+            Self::Unborrowed(never, _) => match never {},
+        }
+    }
+
     /// Make `command`'s child a member before it executes anything.
     fn admit(self, command: &mut std::process::Command) -> io::Result<()> {
         use std::os::unix::process::CommandExt as _;
@@ -926,7 +955,7 @@ impl Members<'_> {
                 Ok(())
             }
             #[cfg(target_os = "linux")]
-            Self::Leaf(cgroup) => {
+            Self::Leaf { cgroup, .. } => {
                 use std::os::fd::{AsRawFd as _, FromRawFd as _};
                 // SAFETY: a NUL-terminated name relative to a live directory descriptor.
                 let procs = unsafe {
@@ -954,8 +983,6 @@ impl Members<'_> {
                 }
                 Ok(())
             }
-            #[cfg(target_os = "linux")]
-            Self::Enclosing(_) => Ok(()),
             #[cfg(not(target_os = "linux"))]
             Self::Unborrowed(never, _) => match never {},
         }
@@ -969,9 +996,7 @@ impl Members<'_> {
             #[cfg(target_os = "macos")]
             Self::OwnGroup => crate::process::group_cpu(group_of(child)?),
             #[cfg(target_os = "linux")]
-            Self::Leaf(cgroup) => crate::process::cgroup_cpu(cgroup, false),
-            #[cfg(target_os = "linux")]
-            Self::Enclosing(cgroup) => crate::process::cgroup_cpu(cgroup, true),
+            Self::Leaf { cgroup, .. } => crate::process::cgroup_cpu(cgroup),
             #[cfg(not(target_os = "linux"))]
             Self::Unborrowed(never, _) => match never {},
         }
@@ -985,9 +1010,7 @@ impl Members<'_> {
             #[cfg(target_os = "macos")]
             Self::OwnGroup => crate::process::group_members(group_of(child)?),
             #[cfg(target_os = "linux")]
-            Self::Leaf(cgroup) => crate::process::cgroup_members(cgroup, false),
-            #[cfg(target_os = "linux")]
-            Self::Enclosing(cgroup) => crate::process::cgroup_members(cgroup, true),
+            Self::Leaf { cgroup, .. } => crate::process::cgroup_members(cgroup),
             #[cfg(not(target_os = "linux"))]
             Self::Unborrowed(never, _) => match never {},
         }
@@ -1004,12 +1027,8 @@ impl Members<'_> {
                 }
             }
             #[cfg(target_os = "linux")]
-            Self::Leaf(cgroup) => {
-                let _ = crate::process::signal_cgroup(cgroup, false, libc::SIGTERM);
-            }
-            #[cfg(target_os = "linux")]
-            Self::Enclosing(cgroup) => {
-                let _ = crate::process::signal_cgroup(cgroup, true, libc::SIGTERM);
+            Self::Leaf { cgroup, .. } => {
+                let _ = crate::process::signal_cgroup(cgroup, libc::SIGTERM);
             }
             #[cfg(not(target_os = "linux"))]
             Self::Unborrowed(never, _) => match never {},
@@ -1103,21 +1122,26 @@ pub fn run_by_progress(
     use crate::fork_lock::Spawn as _;
     const OP: &str = "run to log";
 
-    members.admit(command).map_err(|source| RunError::Spawn {
-        op: OP,
-        role,
-        source,
-    })?;
+    let failed = |source: io::Error| match members.leaf() {
+        Some(cgroup) => RunError::Enter {
+            op: OP,
+            role,
+            cgroup,
+            source,
+        },
+        None => RunError::Spawn {
+            op: OP,
+            role,
+            source,
+        },
+    };
+    members.admit(command).map_err(failed)?;
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn_locked()
-        .map_err(|source| RunError::Spawn {
-            op: OP,
-            role,
-            source,
-        })?;
+        .map_err(failed)?;
     let pid = child.id();
     let read_cpu = || members.cpu(pid);
     let mut cpu = read_cpu().ok();
@@ -2019,7 +2043,7 @@ mod tests {
     /// The pid of the child a run failure names: every failure after the spawn names it.
     fn started_child(failure: &RunError) -> Option<u32> {
         match failure {
-            RunError::Spawn { .. } => None,
+            RunError::Spawn { .. } | RunError::Enter { .. } => None,
             RunError::Reap(ReapError::Expired(expired))
             | RunError::Output(OutputError::Held { expired, .. }) => Some(expired.peer.pid),
             RunError::Reap(ReapError::Wait { pid, .. })

@@ -1702,7 +1702,10 @@ impl SandboxEnvironment {
 /// `queued` names, which the tool waits in line behind. One that shows none for `silence` fails
 /// `SILENT`, naming its running members, which are ended. Its members are its own process group
 /// on Darwin, and on Linux a run leaf of `incarnation`'s cgroups (07_api.md), which it enters
-/// before it executes and which is retired within the reap bound once the run ends.
+/// before it executes and which is retired within the reap bound however the run ended: a run that
+/// failed and a leaf left with members are both said. Linux has no sandbox in code (04_sandbox.md,
+/// "Linux enforcement"), so there the one-shot plan's `sandbox-exec` is refused at its exec, after
+/// the child entered its leaf, and the run fails naming it.
 pub async fn run_as_job(
     sandbox: &SandboxConfig,
     incarnation: &crate::metadata::WorkspaceIncarnation,
@@ -1734,7 +1737,10 @@ pub async fn run_as_job(
         #[cfg(target_os = "macos")]
         let members = cowshed_os::deadline::Members::OwnGroup;
         #[cfg(target_os = "linux")]
-        let members = cowshed_os::deadline::Members::Leaf(run.directory());
+        let members = cowshed_os::deadline::Members::Leaf {
+            cgroup: run.directory(),
+            path: run.path(),
+        };
         let output = cowshed_os::deadline::output_by_progress(
             "project tool",
             &mut command,
@@ -1760,9 +1766,17 @@ pub async fn run_as_job(
             format!("{}: {error}", program.display()),
             "the named process stopped making progress: see what it waits for, then retry",
         ),
-    })?;
-    retired?;
-    Ok(output)
+    });
+    match (output, retired) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Ok(_), Err(unretired)) | (Err(unretired), Ok(())) => Err(unretired),
+        (Err(failed), Err(unretired)) => Err(failed.reworded(|message| {
+            format!(
+                "{message}; and its run leaf was not retired: {}",
+                unretired.message
+            )
+        })),
+    }
 }
 
 /// Prepare the workspace's private environment host-side and describe the child environment.
