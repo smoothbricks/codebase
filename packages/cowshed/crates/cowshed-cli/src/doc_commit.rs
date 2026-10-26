@@ -4,20 +4,23 @@
 //! in one hold of the repository's ref turn it is applied, its paths judged by
 //! [`cowshed_core::declared_land::admit`], checked and committed, or put back.
 //!
-//! Host-only like `land-turn`: no daemon and no gateway. Main is the checkout the caller names,
-//! and a doc edit needs only main's tree and its ref turn; resolving main through the gateway held
-//! every doc commit for as long as the gateway hung (20 to 60+ minutes on 2026-10-22).
+//! Host-only like `land-turn`: no daemon, and of the gateway only the ref turn, which holds every
+//! command the hold runs. Main is the checkout the caller names, and a doc edit needs only main's
+//! tree and its ref turn; resolving main through the gateway held every doc commit for as long as
+//! the gateway hung (20 to 60+ minutes on 2026-10-22).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::{Read as _, Write};
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use cowshed_core::api::dto::{DocCommitReport, GitOid};
 use cowshed_core::declared_land::{self as declared, DocDeclaration, DocRefusal, StatusEntry};
+use cowshed_core::runtime::ref_turn::{RefTurn, RefWriter};
+use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::{CowshedError, Result};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::args::{DocCommitArgs, DocEdit, DocMessage};
 use crate::output::Output;
@@ -64,7 +67,7 @@ where
             )
         })?,
     };
-    let main = main_checkout(&start)?;
+    let main = main_checkout(&start).await?;
     let config = cowshed_core::storage::bootstrap::main_cowshed_config(&main)?;
     let (Some(land), Some(doc)) = (config.land(), config.doc()) else {
         return Err(CowshedError::environment_missing(
@@ -92,23 +95,18 @@ where
     let state = Scratch::new()?;
     std::fs::write(state.path("message"), &message)
         .map_err(|error| state.failed("write the commit message", &error))?;
-    let root =
-        cowshed_core::land_turn::land_turn_root(&cowshed_core::host_dirs::support_directory(
-            &cowshed_core::gateway_sessions::canonical_home()?,
-        ));
-    let turn = cowshed_core::runtime::ref_turn::RefTurn::acquire_in(
-        &root,
-        land.ref_turn(),
-        cowshed_core::runtime::ref_turn::RefWriter::DocCommit,
-    )
-    .await?;
-    let hold = Hold {
+    let socket = args
+        .gateway_socket
+        .clone()
+        .unwrap_or_else(|| CanonicalRoots::global().control_socket());
+    let mut turn = RefTurn::acquire_in(&socket, land.ref_turn(), RefWriter::DocCommit).await?;
+    let mut hold = Hold {
         main: &main,
         environment: &environment,
-        descriptor: turn.descriptor(),
+        turn: &mut turn,
         state: &state,
     };
-    let held = hold.run(&edit, icm.as_deref(), doc, output);
+    let held = hold.run(&edit, icm.as_deref(), doc, output).await;
     match &held {
         Ok(report) => turn.end(format!("committed {}", report.commit.as_str())),
         Err(error) => turn.end(format!("refused: {}", error.message)),
@@ -173,17 +171,19 @@ fn icm_program() -> Result<PathBuf> {
 
 /// Main's checkout: the git top level at `start`, when cowshed's in-checkout marker gives it no
 /// role other than main. A doc edit in a shed is refused: commit in the shed and land it.
-fn main_checkout(start: &Path) -> Result<PathBuf> {
-    let top = git(start, &["rev-parse", "--show-toplevel"], &[], None).map_err(|error| {
-        CowshedError::usage(
-            format!(
-                "{} is not in a checkout: {}",
-                start.display(),
-                error.message
-            ),
-            "run cowshed doc-commit in main's checkout, or name it with --project",
-        )
-    })?;
+async fn main_checkout(start: &Path) -> Result<PathBuf> {
+    let top = git(start, &["rev-parse", "--show-toplevel"], &[], None)
+        .await
+        .map_err(|error| {
+            CowshedError::usage(
+                format!(
+                    "{} is not in a checkout: {}",
+                    start.display(),
+                    error.message
+                ),
+                "run cowshed doc-commit in main's checkout, or name it with --project",
+            )
+        })?;
     let main = PathBuf::from(String::from_utf8_lossy(&top).trim());
     let marker = main.join(cowshed_core::storage::WORKSPACE_MARKER_PATH);
     match cowshed_core::metadata::WorkspaceMarker::read_from(&marker) {
@@ -331,29 +331,29 @@ impl Entry {
     }
 }
 
-/// Everything the ref-turn hold runs with.
+/// Everything the ref-turn hold runs with: every command it runs is bound to the turn.
 struct Hold<'a> {
     main: &'a Path,
     environment: &'a [(OsString, OsString)],
-    descriptor: RawFd,
+    turn: &'a mut RefTurn,
     state: &'a Scratch,
 }
 
 impl Hold<'_> {
-    fn run<W: Write + Send, E: Write + Send>(
-        &self,
+    async fn run<W: Write + Send, E: Write + Send>(
+        &mut self,
         edit: &Edit,
         icm: Option<&Path>,
         doc: &DocDeclaration,
         output: &mut Output<W, E>,
     ) -> Result<DocCommitReport> {
         let head = self.head()?;
-        let before = self.status()?;
+        let before = self.status().await?;
         let held_before = declared::paths(&before);
         match edit {
             // A patch is judged by git's account before main's tree is touched.
             Edit::Patch(patch) => {
-                let paths = declared::admit(self.patch_paths(patch)?, &held_before, doc)
+                let paths = declared::admit(self.patch_paths(patch).await?, &held_before, doc)
                     .map_err(|refusal| refused(self.main, &refusal))?;
                 self.apply_and_commit(
                     &Basis {
@@ -367,17 +367,19 @@ impl Hold<'_> {
                     doc,
                     output,
                 )
+                .await
             }
             // A program is judged by what it wrote; every held path's bytes are kept first.
             Edit::Icm(_) => {
-                let kept = self.keep(&held_before)?;
+                let kept = self.keep(&held_before).await?;
                 self.apply_and_commit(&Basis { head, before, kept }, &[], edit, icm, doc, output)
+                    .await
             }
         }
     }
 
-    fn apply_and_commit<W: Write + Send, E: Write + Send>(
-        &self,
+    async fn apply_and_commit<W: Write + Send, E: Write + Send>(
+        &mut self,
         basis: &Basis,
         judged: &[String],
         edit: &Edit,
@@ -387,10 +389,10 @@ impl Hold<'_> {
     ) -> Result<DocCommitReport> {
         let Basis { head, before, kept } = basis;
         let mut touched: BTreeSet<String> = judged.iter().cloned().collect();
-        let committed = (|| {
+        let committed: Result<Vec<String>> = async {
             let paths = match (edit, icm) {
                 (Edit::Patch(patch), _) => {
-                    self.git(&["apply", "-"], Some(patch))?;
+                    self.git(&["apply", "-"], Some(patch)).await?;
                     judged.to_vec()
                 }
                 (Edit::Icm(program), Some(icm)) => {
@@ -406,8 +408,9 @@ impl Hold<'_> {
                             OsString::from("--json"),
                         ],
                         None,
-                    );
-                    let written = self.written(before, kept)?;
+                        )
+                        .await;
+                    let written = self.written(before, kept).await?;
                     touched.extend(written.iter().cloned());
                     let (status, stdout) = ran?;
                     if !status.success() {
@@ -434,8 +437,8 @@ impl Hold<'_> {
             if let Some(check) = &doc.check {
                 let mut argv: Vec<OsString> = check.iter().map(OsString::from).collect();
                 argv.extend(paths.iter().map(OsString::from));
-                let (status, stdout) = self.declared(&argv, None)?;
-                let after_check = self.written(before, kept)?;
+                let (status, stdout) = self.declared(&argv, None).await?;
+                let after_check = self.written(before, kept).await?;
                 touched.extend(after_check.iter().cloned());
                 if !status.success() {
                     return Err(CowshedError::conflict(
@@ -466,7 +469,7 @@ impl Hold<'_> {
             }
             let mut add: Vec<&str> = vec!["--literal-pathspecs", "add", "-A", "--"];
             add.extend(paths.iter().map(String::as_str));
-            self.git(&add, None)?;
+            self.git(&add, None).await?;
             let message = self.state.path("message");
             let mut argv: Vec<OsString> = ["git", "--literal-pathspecs", "commit", "--only", "-F"]
                 .map(OsString::from)
@@ -474,7 +477,7 @@ impl Hold<'_> {
             argv.push(message.into_os_string());
             argv.push(OsString::from("--"));
             argv.extend(paths.iter().map(OsString::from));
-            let (status, stdout) = self.declared(&argv, None)?;
+            let (status, stdout) = self.declared(&argv, None).await?;
             if !status.success() {
                 return Err(CowshedError::conflict(
                     format!(
@@ -486,7 +489,8 @@ impl Hold<'_> {
                 ));
             }
             Ok(paths)
-        })();
+        }
+        .await;
         match committed {
             Ok(paths) => Ok(DocCommitReport {
                 commit: self.head()?,
@@ -503,7 +507,7 @@ impl Hold<'_> {
                         .map_err(output_error)?;
                     return Err(error);
                 }
-                self.put_back(&touched, kept, output)?;
+                self.put_back(&touched, kept, output).await?;
                 Err(error)
             }
         }
@@ -511,29 +515,33 @@ impl Hold<'_> {
 
     /// The paths a patch writes, by git's own account: applied to a scratch index of HEAD, never
     /// to main, with both sides of a rename. A patch that does not apply is refused here.
-    fn patch_paths(&self, patch: &[u8]) -> Result<BTreeSet<String>> {
+    async fn patch_paths(&mut self, patch: &[u8]) -> Result<BTreeSet<String>> {
         let index = self.state.path("index");
         let scratch = [(OsString::from("GIT_INDEX_FILE"), index.into_os_string())];
-        self.git_with(&["read-tree", "HEAD"], None, &scratch)?;
+        self.git_with(&["read-tree", "HEAD"], None, &scratch)
+            .await?;
         self.git_with(&["apply", "--cached", "-"], Some(patch), &scratch)
+            .await
             .map_err(|error| {
                 CowshedError::conflict(
                     format!("the patch does not apply to main's HEAD: {}", error.message),
                     "make the patch against main's current HEAD, then run cowshed doc-commit again",
                 )
             })?;
-        let names = self.git_with(
-            &[
-                "diff",
-                "--cached",
-                "--no-renames",
-                "--name-only",
-                "-z",
-                "HEAD",
-            ],
-            None,
-            &scratch,
-        )?;
+        let names = self
+            .git_with(
+                &[
+                    "diff",
+                    "--cached",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    "HEAD",
+                ],
+                None,
+                &scratch,
+            )
+            .await?;
         names
             .split(|&byte| byte == 0)
             .filter(|name| !name.is_empty())
@@ -550,32 +558,34 @@ impl Hold<'_> {
 
     /// The directory entry and the index entries (`git ls-files -s -z`) of each path main held
     /// uncommitted, kept so an edit that writes one is seen and that path put back exactly.
-    fn keep(&self, held: &BTreeSet<String>) -> Result<Vec<Kept>> {
-        held.iter()
-            .map(|path| {
-                let file = self.main.join(path);
-                let entry = Entry::read(&file).map_err(|error| {
-                    CowshedError::internal(format!(
-                        "cannot keep a copy of {} before the edit: {error}",
-                        file.display()
-                    ))
-                })?;
-                let index = self.git(
+    async fn keep(&mut self, held: &BTreeSet<String>) -> Result<Vec<Kept>> {
+        let mut kept = Vec::with_capacity(held.len());
+        for path in held {
+            let file = self.main.join(path);
+            let entry = Entry::read(&file).map_err(|error| {
+                CowshedError::internal(format!(
+                    "cannot keep a copy of {} before the edit: {error}",
+                    file.display()
+                ))
+            })?;
+            let index = self
+                .git(
                     &["--literal-pathspecs", "ls-files", "-s", "-z", "--", path],
                     None,
-                )?;
-                Ok(Kept {
-                    path: path.clone(),
-                    entry,
-                    index,
-                })
-            })
-            .collect()
+                )
+                .await?;
+            kept.push(Kept {
+                path: path.clone(),
+                entry,
+                index,
+            });
+        }
+        Ok(kept)
     }
 
     /// What main's tree differs in from the read before the edit.
-    fn written(&self, before: &[StatusEntry], kept: &[Kept]) -> Result<BTreeSet<String>> {
-        let after = self.status()?;
+    async fn written(&mut self, before: &[StatusEntry], kept: &[Kept]) -> Result<BTreeSet<String>> {
+        let after = self.status().await?;
         let rewritten = kept
             .iter()
             .filter(|kept| {
@@ -588,8 +598,8 @@ impl Hold<'_> {
 
     /// Put `paths` back as HEAD has them, and each kept path back as it was; every path is
     /// attempted and each one that fails is said.
-    fn put_back<W: Write + Send, E: Write + Send>(
-        &self,
+    async fn put_back<W: Write + Send, E: Write + Send>(
+        &mut self,
         paths: &BTreeSet<String>,
         kept: &[Kept],
         output: &mut Output<W, E>,
@@ -599,7 +609,7 @@ impl Hold<'_> {
             if let Some(kept) = kept.iter().find(|kept| &kept.path == path) {
                 // The index first, then the entry: `--index-info` takes the kept stages back
                 // exactly, a conflict's included, after the path's current ones are removed.
-                let restored = self
+                let removed = self
                     .git(
                         &[
                             "--literal-pathspecs",
@@ -610,15 +620,16 @@ impl Hold<'_> {
                         ],
                         None,
                     )
-                    .and_then(|_| {
-                        if kept.index.is_empty() {
-                            Ok(Vec::new())
-                        } else {
-                            self.git(&["update-index", "-z", "--index-info"], Some(&kept.index))
-                        }
-                    })
-                    .is_ok()
-                    && kept.entry.restore(&self.main.join(path)).is_ok();
+                    .await;
+                let indexed = match removed {
+                    Ok(_) if kept.index.is_empty() => Ok(Vec::new()),
+                    Ok(_) => {
+                        self.git(&["update-index", "-z", "--index-info"], Some(&kept.index))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let restored = indexed.is_ok() && kept.entry.restore(&self.main.join(path)).is_ok();
                 if !restored {
                     failed.push(path.clone());
                 }
@@ -636,6 +647,7 @@ impl Hold<'_> {
                     ],
                     None,
                 )
+                .await
                 .map(|listed| !listed.is_empty());
             let tracked = match tracked {
                 Ok(tracked) => tracked,
@@ -658,6 +670,7 @@ impl Hold<'_> {
                     ],
                     None,
                 )
+                .await
                 .is_ok()
             } else {
                 self.git(
@@ -672,6 +685,7 @@ impl Hold<'_> {
                     ],
                     None,
                 )
+                .await
                 .is_ok()
                     && match std::fs::remove_file(self.main.join(path)) {
                         Ok(()) => true,
@@ -708,27 +722,29 @@ impl Hold<'_> {
         crate::declared_land::main_head(self.main)
     }
 
-    fn status(&self) -> Result<Vec<StatusEntry>> {
-        let bytes = self.git(
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--no-renames",
-            ],
-            None,
-        )?;
+    async fn status(&mut self) -> Result<Vec<StatusEntry>> {
+        let bytes = self
+            .git(
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--no-renames",
+                ],
+                None,
+            )
+            .await?;
         declared::parse_status(&bytes).map_err(CowshedError::internal)
     }
 
-    fn git(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
-        self.git_with(args, stdin, &[])
+    async fn git(&mut self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+        self.git_with(args, stdin, &[]).await
     }
 
-    /// Plain git in main, in the pure environment, holding the turn's descriptor.
-    fn git_with(
-        &self,
+    /// Plain git in main, in the pure environment, bound to the ref turn.
+    async fn git_with(
+        &mut self,
         args: &[&str],
         stdin: Option<&[u8]>,
         extra: &[(OsString, OsString)],
@@ -738,38 +754,37 @@ impl Hold<'_> {
             args,
             self.environment,
             Some(Held {
-                descriptor: self.descriptor,
+                turn: &mut *self.turn,
                 stdin,
                 extra,
             }),
         )
+        .await
     }
 
-    /// A command in main's pure environment (`direnv exec` when main has an `.envrc`), holding
-    /// the turn's descriptor; answers its status and its stdout and stderr together.
-    fn declared(
-        &self,
+    /// A command in main's pure environment (`direnv exec` when main has an `.envrc`), bound to
+    /// the ref turn; answers its status and its stdout and stderr together.
+    async fn declared(
+        &mut self,
         argv: &[OsString],
         stdin: Option<&[u8]>,
     ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
-        let mut command =
-            crate::declared_land::declared_command(self.main, argv, self.environment)?;
-        cowshed_core::held_lock::hand_to(&mut command, vec![self.descriptor]);
-        run(&mut command, stdin, true)
+        let command = crate::declared_land::declared_command(self.main, argv, self.environment)?;
+        run(command, stdin, true, &mut *self.turn).await
     }
 }
 
-/// What a git run under the ref turn carries: the turn's descriptor, its stdin and the variables
+/// What a git run under the ref turn carries: the turn it is bound to, its stdin and the variables
 /// it adds to the pure environment.
 struct Held<'a> {
-    descriptor: RawFd,
+    turn: &'a mut RefTurn,
     stdin: Option<&'a [u8]>,
     extra: &'a [(OsString, OsString)],
 }
 /// Run `git -C <dir> <args>`: in `environment` (the caller's when empty) and, when `held` is
-/// given, holding its descriptor with its stdin and extra variables. A nonzero exit is an error
-/// naming git's stderr.
-fn git(
+/// given, bound to its turn with its stdin and extra variables. A nonzero exit is an error naming
+/// git's stderr.
+async fn git(
     directory: &Path,
     args: &[&str],
     environment: &[(OsString, OsString)],
@@ -785,19 +800,14 @@ fn git(
             .map_err(CowshedError::internal)?;
         command.envs(policy.iter().map(|(name, value)| (&**name, &**value)));
     }
-    let stdin = match held {
-        Some(Held {
-            descriptor,
-            stdin,
-            extra,
-        }) => {
-            cowshed_core::held_lock::hand_to(&mut command, vec![descriptor]);
+    let (stdin, turn) = match held {
+        Some(Held { turn, stdin, extra }) => {
             command.envs(extra.iter().map(|(name, value)| (name, value)));
-            stdin
+            (stdin, Some(turn))
         }
-        None => None,
+        None => (None, None),
     };
-    let (status, stdout, stderr) = run_split(&mut command, stdin)?;
+    let (status, stdout, stderr) = run_split(command, stdin, turn).await?;
     if status.success() {
         return Ok(stdout);
     }
@@ -812,21 +822,28 @@ fn git(
     ))
 }
 
-fn run(
-    command: &mut std::process::Command,
+async fn run(
+    command: std::process::Command,
     stdin: Option<&[u8]>,
     merge: bool,
+    turn: &mut RefTurn,
 ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
-    let (status, mut stdout, stderr) = run_split(command, stdin)?;
+    let (status, mut stdout, stderr) = run_split(command, stdin, Some(turn)).await?;
     if merge {
         stdout.extend_from_slice(&stderr);
     }
     Ok((status, stdout))
 }
 
-fn run_split(
-    command: &mut std::process::Command,
+/// Run `command` and answer its status, stdout and stderr. Under the ref turn it binds itself to
+/// the turn as it starts ([`RefTurn::bind_at_exec`]), so the turn is held until it exits, however
+/// this process ends. One the gateway does not bind, one whose stdin cannot be written and one
+/// still running when the turn is lost are sent SIGTERM, and the hold fails once it has ended, so
+/// nothing runs in main beside the next writer and nothing is put back while it runs.
+async fn run_split(
+    mut command: std::process::Command,
     stdin: Option<&[u8]>,
+    mut turn: Option<&mut RefTurn>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     let program = command.get_program().to_string_lossy().into_owned();
     command
@@ -837,26 +854,95 @@ fn run_split(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        CowshedError::environment_missing(
-            format!("cannot run {program}: {error}"),
-            "install it, or put it on the bootstrap PATH",
-        )
-    })?;
-    if let Some(bytes) = stdin
-        && let Some(mut pipe) = child.stdin.take()
-    {
-        pipe.write_all(bytes).map_err(|error| {
-            CowshedError::internal(format!("cannot write to {program}: {error}"))
-        })?;
+    if let Some(turn) = turn.as_deref() {
+        turn.bind_at_exec(&mut command);
     }
-    // WHY unbounded: the command is this doc commit's own work under its ref turn; it ends with the
-    // command, which holds the turn's descriptor.
-    #[allow(clippy::disallowed_methods)]
-    let finished = child
-        .wait_with_output()
-        .map_err(|error| CowshedError::internal(format!("cannot wait for {program}: {error}")))?;
-    Ok((finished.status, finished.stdout, finished.stderr))
+    let mut child = tokio::process::Command::from(command)
+        .spawn()
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot run {program}: {error}"),
+                "install it, or put it on the bootstrap PATH",
+            )
+        })?;
+    let pid = crate::land_turn::spawned_pid(&child);
+    if let Some(turn) = turn.as_deref_mut()
+        && let Err(error) = turn.bound(pid.unsigned_abs()).await
+    {
+        return Err(stopped(&mut child, pid, &program, &error.message).await);
+    }
+    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(stopped(
+            &mut child,
+            pid,
+            &program,
+            "its output pipes were not opened",
+        )
+        .await);
+    };
+    let input = child.stdin.take();
+    let outcome = {
+        let work = async {
+            let write = async {
+                if let (Some(bytes), Some(mut pipe)) = (stdin, input) {
+                    // Dropping the pipe once written closes the command's stdin.
+                    pipe.write_all(bytes)
+                        .await
+                        .map_err(|error| format!("cannot write to {program}: {error}"))?;
+                }
+                Ok::<(), String>(())
+            };
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let read = async {
+                tokio::try_join!(out.read_to_end(&mut stdout), err.read_to_end(&mut stderr))
+                    .map_err(|error| format!("cannot read the output of {program}: {error}"))
+            };
+            tokio::try_join!(write, read)?;
+            // WHY unbounded: the command is this doc commit's own work, after its output has ended;
+            // the ref turn's loss ends the wait, and the command is then stopped and reaped.
+            #[allow(clippy::disallowed_methods)]
+            let status = child
+                .wait()
+                .await
+                .map_err(|error| format!("cannot wait for {program}: {error}"))?;
+            Ok::<_, String>((status, stdout, stderr))
+        };
+        match turn {
+            Some(turn) => tokio::select! {
+                finished = work => finished,
+                error = turn.lost() => Err(format!("the ref turn was lost: {error}")),
+            },
+            None => work.await,
+        }
+    };
+    match outcome {
+        Ok(finished) => Ok(finished),
+        Err(reason) => Err(stopped(&mut child, pid, &program, &reason).await),
+    }
+}
+
+/// Send SIGTERM to the command `pid` for `reason`, reap it within the reap bound, and answer the
+/// error that says so: the reason, the signal and how the command ended; a signal that did not
+/// reach it is said instead of the signal.
+async fn stopped(
+    child: &mut tokio::process::Child,
+    pid: libc::pid_t,
+    program: &str,
+    reason: &str,
+) -> CowshedError {
+    let signalled = crate::land_turn::forward(pid, libc::SIGTERM, program);
+    let ended = format!(
+        " and {}",
+        crate::land_turn::reap_stopped("doc-commit command", child, signalled.is_ok()).await
+    );
+    let signal = match signalled {
+        Ok(()) => format!("{program} was sent SIGTERM"),
+        Err(error) => format!("SIGTERM did not reach {program} ({})", error.message),
+    };
+    CowshedError::environment_missing(
+        format!("{reason}; {signal}{ended}"),
+        "check the host gateway (`cowshed gateway status`), then run cowshed doc-commit again",
+    )
 }
 
 fn refused(main: &Path, refusal: &DocRefusal) -> CowshedError {

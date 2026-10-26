@@ -148,6 +148,11 @@ struct FakeControl {
 
 #[async_trait]
 impl GatewayControl for FakeControl {
+    async fn land_turns(
+        &self,
+    ) -> std::result::Result<Vec<cowshed_core::api::dto::LandTurnQueue>, GatewayStatusError> {
+        Ok(Vec::new())
+    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.status
             .lock()
@@ -960,6 +965,11 @@ impl FencedGateway {
 
 #[async_trait]
 impl GatewayControl for FencedGateway {
+    async fn land_turns(
+        &self,
+    ) -> std::result::Result<Vec<cowshed_core::api::dto::LandTurnQueue>, GatewayStatusError> {
+        Ok(Vec::new())
+    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.status_read.store(true, Ordering::SeqCst);
         Ok(status(

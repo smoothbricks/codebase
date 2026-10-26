@@ -6,7 +6,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::fd::{AsFd as _, RawFd};
+use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -16,6 +16,7 @@ use cowshed_core::api::dto::{
 use cowshed_core::declared_land::{
     self as declared, AfterFastForward, AfterRequest, LandDeclaration, LandEvent, LandRecord,
 };
+use cowshed_core::land_turn::{Turn, TurnAsk};
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use cowshed_os::fork_lock::Run as _;
 
@@ -100,11 +101,13 @@ where
             land.workspace
         )));
     };
-    let turn = crate::land_turn::take_turn(
-        turn_directory.clone(),
-        declaration.turn().as_str(),
-        land.workspace,
-        format!("cowshed land {}", land.workspace),
+    let mut turn = crate::land_turn::take_turn(
+        &service.control_socket()?,
+        TurnAsk {
+            repo: declaration.turn().clone(),
+            workspace: land.workspace.to_owned(),
+            command: format!("cowshed land {}", land.workspace),
+        },
         None,
         output,
     )
@@ -116,7 +119,7 @@ where
         &land,
         &preflight.target_branch,
         &environment,
-        &turn.descriptors(),
+        &mut turn,
         output,
     )
     .await;
@@ -271,7 +274,7 @@ async fn route<S, W, E>(
     land: &DeclaredLand<'_>,
     branch: &str,
     environment: &[(OsString, OsString)],
-    descriptors: &[RawFd],
+    turn: &mut Turn,
     output: &mut Output<W, E>,
 ) -> Result<Routed>
 where
@@ -282,7 +285,13 @@ where
     let workspace = land.workspace;
     let mut regated = 0_u32;
     loop {
-        let (base, head) = rebase(service, main, workspace, output).await?;
+        let (base, head) = holding(
+            turn,
+            declaration.turn(),
+            "the rebase",
+            rebase(service, main, workspace, output),
+        )
+        .await?;
         say(
             output,
             &format!(
@@ -292,7 +301,17 @@ where
                 declaration.gate().program()
             ),
         )?;
-        gate(main, declaration, workspace, environment, descriptors).await?;
+        if let Some(lost) = lost_now(turn).await {
+            return Err(turn_lost(declaration.turn(), "before the gate", &lost));
+        }
+        gate(main, declaration, workspace, environment, turn).await?;
+        if let Some(lost) = lost_now(turn).await {
+            return Err(turn_lost(
+                declaration.turn(),
+                "before the fast-forward",
+                &lost,
+            ));
+        }
         let fast_forward = service
             .land(
                 workspace,
@@ -349,6 +368,56 @@ where
     }
 }
 
+/// Run `work`, the land step `step` under `turn`, to its end; should the turn be lost meanwhile,
+/// the land stops once the step has ended and never goes on to the next, and a turn already lost
+/// starts no step: not knowing whether another land runs is no permission to run beside it
+/// (05_gateway.md "Land turns").
+async fn holding<T>(
+    turn: &mut Turn,
+    name: &cowshed_core::api::dto::LandTurnName,
+    step: &str,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if let Some(lost) = lost_now(turn).await {
+        return Err(turn_lost(name, &format!("before {step}"), &lost));
+    }
+    let mut work = std::pin::pin!(work);
+    let lost = tokio::select! {
+        biased;
+        lost = turn.lost() => lost,
+        done = &mut work => return done,
+    };
+    let ended = match work.await {
+        Ok(_) => "it completed".to_owned(),
+        Err(error) => format!("it failed: {}", error.message),
+    };
+    Err(turn_lost(
+        name,
+        &format!("during {step}, which ran to its end ({ended})"),
+        &lost,
+    ))
+}
+
+/// The turn's loss, when the gateway has already closed its connection: polled once, never awaited.
+async fn lost_now(turn: &mut Turn) -> Option<std::io::Error> {
+    tokio::select! {
+        biased;
+        lost = turn.lost() => Some(lost),
+        () = std::future::ready(()) => None,
+    }
+}
+
+fn turn_lost(
+    name: &cowshed_core::api::dto::LandTurnName,
+    when: &str,
+    lost: &std::io::Error,
+) -> CowshedError {
+    CowshedError::environment_missing(
+        format!("land turn {name} was lost {when}: {lost}; the land stops before its next step"),
+        "check the host gateway (`cowshed gateway status`), then land again",
+    )
+}
+
 /// Rebase `workspace` onto main's head, again whenever main moved before the rebase began.
 /// Answers that head and the rebased head.
 async fn rebase<S, W, E>(
@@ -390,13 +459,18 @@ where
     }
 }
 
-/// Run the declared gate holding the turn's descriptors; its exit status is the land's verdict.
+/// Run the declared gate bound to the land turn: it binds itself to the turn as it starts
+/// ([`Turn::bind_at_exec`]), so the gateway holds the turn until the gate has exited however this
+/// process ends, and a land killed before its spawn started no gate (02_workspaces.md "A declared
+/// land" step 2). Its exit status is the land's verdict. A gate the gateway does not bind, or whose
+/// turn is lost while it runs, is sent SIGTERM and stops the land once it has ended, so no gate
+/// runs beside the next land.
 async fn gate(
     main: &Path,
     declaration: &LandDeclaration,
     workspace: &str,
     environment: &[(OsString, OsString)],
-    descriptors: &[RawFd],
+    turn: &mut Turn,
 ) -> Result<()> {
     let argv = declaration.gate().argv(workspace);
     let mut command = declared_command(main, &argv, environment)?;
@@ -404,20 +478,48 @@ async fn gate(
         .stdin(Stdio::null())
         .stdout(stderr()?)
         .stderr(stderr()?);
-    cowshed_core::held_lock::hand_to(&mut command, descriptors.to_vec());
-    let mut command = tokio::process::Command::from(command);
     let shown = shown(&argv);
-    // WHY unbounded: the gate is the land's own work and runs as long as it does; it holds the turn's
-    // descriptors, so no other land runs beside it.
-    #[allow(clippy::disallowed_methods)]
-    let status = command
+    turn.bind_at_exec(&mut command);
+    let mut child = tokio::process::Command::from(command)
         .spawn()
-        .map_err(|error| crate::land_turn::spawn_error(declaration.gate().program(), &error))?
-        .wait()
-        .await
-        .map_err(|error| {
-            CowshedError::internal(format!("cannot wait for the gate {shown}: {error}"))
-        })?;
+        .map_err(|error| crate::land_turn::spawn_error(declaration.gate().program(), &error))?;
+    let pid = crate::land_turn::spawned_pid(&child);
+    // WHY unbounded: the gate is the land's own work and runs as long as it does; the turn's loss
+    // ends the wait, and the gate is then sent SIGTERM and reaped within the reap bound.
+    #[allow(clippy::disallowed_methods)]
+    let held = match turn.bound(pid.unsigned_abs()).await {
+        Ok(()) => tokio::select! {
+            status = child.wait() => Ok(status),
+            error = turn.lost() => Err(format!("land turn {} was lost: {error}", declaration.turn())),
+        },
+        Err(error) => Err(format!(
+            "the gateway did not bind it to land turn {}: {error}",
+            declaration.turn()
+        )),
+    };
+    let status = match held {
+        Ok(status) => status,
+        Err(reason) => {
+            let stopped = crate::land_turn::forward(pid, libc::SIGTERM, &shown);
+            let ended = format!(
+                "; it {}",
+                crate::land_turn::reap_stopped("declared gate", &mut child, stopped.is_ok()).await
+            );
+            let signal = match stopped {
+                Ok(()) => "was sent SIGTERM".to_owned(),
+                Err(error) => format!("was not reached by SIGTERM ({})", error.message),
+            };
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "the gate `{shown}` {signal}: {reason}{ended}; the land stops and {workspace} stays as it is"
+                ),
+                "check the host gateway (`cowshed gateway status`), then land again",
+            ));
+        }
+    }
+    .map_err(|error| {
+        CowshedError::internal(format!("cannot wait for the gate {shown}: {error}"))
+    })?;
     if status.success() {
         return Ok(());
     }

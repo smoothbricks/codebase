@@ -1,8 +1,9 @@
 //! `cowshed land-turn`, run as the binary a land runs: the lands of one repository take turns in
 //! the order they asked, a waiter killed in line leaves the queue, and a holder killed mid-land
 //! hands the turn on. Each land's command appends its workspace to an order file, then blocks
-//! until the test writes to its fifo, so the test decides when each land ends and reads the queue
-//! with `observe` while they wait.
+//! until the test writes to its fifo, so the test decides when each land ends. The queue is the
+//! gateway's state: each test runs its own gateway and reads the queue with `land-turns` while
+//! the lands wait.
 #![cfg(unix)]
 
 use cowshed_os::test_backstop::ChildBackstop as _;
@@ -17,15 +18,27 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use cowshed_core::api::dto::ExitStatus;
-use cowshed_core::host_dirs::support_directory;
-use cowshed_core::land_turn::{TurnEventKind, land_turn_root, observe, observe_all};
+use cowshed_core::api::dto::{ExitStatus, LandTurnQueue};
 use cowshed_core::runtime::job_groups::{await_exit_unreaped, signal_unreaped_group};
+
+#[path = "../../cowshed-core/tests/support/temp_parent.rs"]
+mod temp_parent;
+#[path = "../../cowshed-core/tests/support/temp_root.rs"]
+mod temp_root;
+
+#[path = "support/test_gateway.rs"]
+mod test_gateway;
+
+use test_gateway::TestGateway;
 
 const REPO: &str = "testrepo";
 const POLL: Duration = Duration::from_millis(20);
+/// How long a test waits for any one step before it fails naming that step: the run's no-progress
+/// backstop, the one bound that decides a hang (`cowshed_os::test_backstop`), never a deadline of
+/// the test's own.
+const BACKSTOP: Duration = cowshed_os::test_backstop::NO_PROGRESS;
 
 /// The `cowshed` binary under test, read when the test runs (see `disk_command.rs`).
 fn cowshed() -> PathBuf {
@@ -36,9 +49,10 @@ fn cowshed() -> PathBuf {
 }
 
 /// A fresh HOME for one test: a directory under the granted temporary directory, removed when the
-/// test ends. It holds no socket, so its length does not matter.
+/// test ends, and the gateway whose land-turn queue its lands join.
 struct Home {
     path: PathBuf,
+    gateway: TestGateway,
 }
 
 impl Home {
@@ -51,16 +65,14 @@ impl Home {
         // cowshed requires HOME to be canonical; the temporary directory may be spelled through a
         // link (macOS's /tmp is one to /private/tmp).
         let path = fs::canonicalize(&path).expect("canonicalize the test HOME");
-        Self { path }
+        Self {
+            path,
+            gateway: TestGateway::start(),
+        }
     }
 
     fn order(&self) -> PathBuf {
         self.path.join("order")
-    }
-
-    /// The repository's directory, where its tickets live.
-    fn repo_dir(&self) -> PathBuf {
-        land_turn_root(&support_directory(&self.path)).join(REPO)
     }
 }
 
@@ -148,7 +160,9 @@ impl Land {
         let mut command = Command::new(cowshed());
         command
             .env("HOME", &home.path)
-            .args(["land-turn", repo, "--workspace", workspace]);
+            .args(["land-turn", repo, "--workspace", workspace])
+            .arg("--gateway-socket")
+            .arg(&home.gateway.socket);
         if let Some(lock) = outside {
             command.arg("--outside-lock").arg(lock);
         }
@@ -191,9 +205,9 @@ impl Land {
             .fifo
             .as_ref()
             .expect("a gated land has a fifo to release");
+        let deadline = Instant::now() + BACKSTOP;
         loop {
-            // Non-blocking, so a fifo with no reader yet fails with ENXIO instead of hanging; the
-            // command reaches it, and a land that never does is the runner's timeout to report.
+            // Non-blocking, so a fifo with no reader yet fails with ENXIO instead of hanging.
             match OpenOptions::new()
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK)
@@ -203,7 +217,16 @@ impl Land {
                     writer.write_all(b"\n").expect("write the release line");
                     return;
                 }
-                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => thread::sleep(POLL),
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{}: its command never opened {} to be released in {BACKSTOP:?}; stderr was {:?}",
+                        self.workspace,
+                        fifo.display(),
+                        self.seen
+                    );
+                    thread::sleep(POLL);
+                }
                 Err(error) => panic!("open {}: {error}", fifo.display()),
             }
         }
@@ -255,16 +278,24 @@ impl Land {
         }
     }
 
-    /// The first stderr line containing `needle`, waiting for it.
+    /// The first stderr line containing `needle`, waiting up to [`BACKSTOP`] for it.
     fn stderr_line(&mut self, needle: &str) -> String {
+        let deadline = Instant::now() + BACKSTOP;
         loop {
             if let Some(line) = self.seen.iter().find(|line| line.contains(needle)) {
                 return line.clone();
             }
-            match self.stderr.recv() {
+            match self
+                .stderr
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
                 Ok(line) => self.seen.push(line),
-                Err(error) => panic!(
-                    "{}: stderr ended with no line containing {needle:?} ({error}); stderr was {:?}",
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "{}: no stderr line containing {needle:?} in {BACKSTOP:?}; stderr was {:?}",
+                    self.workspace, self.seen
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "{}: stderr ended with no line containing {needle:?}; stderr was {:?}",
                     self.workspace, self.seen
                 ),
             }
@@ -296,30 +327,38 @@ fn order(home: &Home) -> Vec<String> {
     }
 }
 
-/// The workspaces of the live tickets in the repository's queue, in turn order.
-fn queue(home: &Home) -> Vec<String> {
-    observe(&home.repo_dir())
-        .expect("observe the queue")
-        .into_iter()
-        .map(|ticket| ticket.workspace)
-        .collect()
+/// The land queues the host gateway holds, read through its `land-turns` op: every queue with a
+/// live ticket, and every queue with an abandonment at or after `abandoned_since_unix_ms`.
+fn queues(home: &Home, abandoned_since_unix_ms: u64) -> Vec<LandTurnQueue> {
+    home.gateway.land_turns(abandoned_since_unix_ms)
 }
 
-/// Every `*.ticket` file left in the repository's directory.
-fn ticket_files(home: &Home) -> Vec<String> {
-    fs::read_dir(home.repo_dir())
-        .expect("read the repository directory")
-        .map(|entry| {
-            let entry = entry.expect("read a directory entry");
-            entry.file_name().to_string_lossy().into_owned()
+/// The workspaces of the live tickets in the repository's queue, in turn order.
+fn queue(home: &Home) -> Vec<String> {
+    queues(home, u64::MAX)
+        .into_iter()
+        .find(|turns| turns.repo.as_str() == REPO)
+        .map_or_else(Vec::new, |turns| {
+            turns
+                .tickets
+                .into_iter()
+                .map(|ticket| ticket.workspace)
+                .collect()
         })
-        .filter(|name| name.ends_with(".ticket"))
-        .collect()
 }
 
 /// Waits until the queue's workspaces, in turn order, are exactly `expected`.
 fn wait_for_queue(home: &Home, expected: &[&str]) {
-    while queue(home) != expected {
+    let deadline = Instant::now() + BACKSTOP;
+    loop {
+        let queued = queue(home);
+        if queued == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queue was not {expected:?} in {BACKSTOP:?}: it is {queued:?}"
+        );
         thread::sleep(POLL);
     }
 }
@@ -327,6 +366,7 @@ fn wait_for_queue(home: &Home, expected: &[&str]) {
 /// Waits until the order file holds exactly `expected`. A line that is not the next one expected
 /// is a wrong turn, and fails at once.
 fn wait_for_order(home: &Home, expected: &[&str]) {
+    let deadline = Instant::now() + BACKSTOP;
     loop {
         let ran = order(home);
         assert!(
@@ -336,6 +376,11 @@ fn wait_for_order(home: &Home, expected: &[&str]) {
         if ran.len() == expected.len() {
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "the lands ran {ran:?} of {expected:?} in {BACKSTOP:?}; the queue is {:?}",
+            queue(home)
+        );
         thread::sleep(POLL);
     }
 }
@@ -410,21 +455,12 @@ fn a_waiter_killed_in_line_blocks_no_later_land() {
     wait_for_order(&home, &["H", "W2", "W3"]);
     last.release();
     last.wait_success();
-    assert!(
-        queue(&home).is_empty(),
-        "all ticket descriptors have closed"
-    );
-    assert_eq!(
-        ticket_files(&home),
-        Vec::<String>::new(),
-        "tickets left behind"
-    );
+    assert!(queue(&home).is_empty(), "tickets left in the queue");
 }
 
 /// Measured 2026-10-21: a land queued for 635 s vanished with its agent's session and nothing
 /// recorded it, so it read as running while it did not exist. A waiter killed in line is
-/// recorded as abandoned by the next reader of the queue, and `gateway status` lists it; the
-/// holder's turn is recorded from its place in line to how its command ended.
+/// recorded as abandoned, and `gateway status` lists it.
 #[test]
 fn a_waiter_killed_in_line_is_recorded_as_abandoned() {
     let home = Home::new();
@@ -434,16 +470,14 @@ fn a_waiter_killed_in_line_is_recorded_as_abandoned() {
     wait_for_queue(&home, &["H", "W1"]);
     let killed_pid = killed.pid();
     killed.kill_hard();
+    wait_for_queue(&home, &["H"]);
     holder.release();
     holder.wait_success();
 
-    // No land asked after W1, so the status read is the first to find its dead ticket.
-    let root = home.repo_dir();
-    let root = root.parent().expect("the land-turn root");
-    let turns = observe_all(root, Some(0)).expect("observe the queues");
+    let turns = queues(&home, 0);
     let repo = turns
         .iter()
-        .find(|turns| turns.repo == REPO)
+        .find(|turns| turns.repo.as_str() == REPO)
         .expect("the repository is listed for its abandoned ticket");
     assert!(repo.tickets.is_empty(), "no live ticket: {repo:?}");
     let [abandoned] = repo.abandoned.as_slice() else {
@@ -453,23 +487,11 @@ fn a_waiter_killed_in_line_is_recorded_as_abandoned() {
         (abandoned.ticket.workspace.as_str(), abandoned.ticket.pid),
         ("W1", killed_pid)
     );
-    assert_eq!(abandoned.event, TurnEventKind::Abandoned);
-
-    let log = fs::read_to_string(home.repo_dir().join("turns.log")).expect("the turn log");
-    let holder_events: Vec<serde_json::Value> = log
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("a JSON line"))
-        .filter(|event: &serde_json::Value| event["ticket"]["workspace"] == "H")
-        .collect();
-    let kinds: Vec<&str> = holder_events
-        .iter()
-        .map(|event| event["event"].as_str().expect("an event kind"))
-        .collect();
-    assert_eq!(kinds, ["queued", "taken", "finished"], "{log}");
-    assert_eq!(holder_events[2]["outcome"], "exited 0", "{log}");
+    assert_eq!(abandoned.reason, "it left the queue before its turn");
 }
 
-/// The line a waiting land prints names the holder, its pid, and how many lands are ahead.
+/// The line a waiting land prints names the holder, its pid, its bound command's pid, how many
+/// lands are ahead, and when the holder asked.
 #[test]
 fn the_waiting_line_names_the_holder() {
     let home = Home::new();
@@ -477,11 +499,11 @@ fn the_waiting_line_names_the_holder() {
     wait_for_order(&home, &["H"]);
     let mut waiter = Land::gated(&home, "W1");
     let line = waiter.stderr_line(&format!(
-        "cowshed: land turn testrepo: 1 ahead; H holds it (pid {}, asked ",
+        "cowshed: land turn testrepo: 1 ahead; H holds it (pid {}, command pid ",
         holder.pid()
     ));
     assert!(
-        line.ends_with(')'),
+        line.contains(", asked ") && line.ends_with(')'),
         "the line ends with the asked time: {line}"
     );
     holder.release();
@@ -513,7 +535,8 @@ fn a_head_waiting_for_the_outside_lock_names_the_process_holding_it() {
         "the outside wait names the holder's pid: {line}"
     );
     assert!(
-        line.contains("land-turn otherrepo --workspace H --outside-lock"),
+        line.contains("land-turn otherrepo --workspace H ")
+            && line.contains(&format!("--outside-lock {} -- sh -c", lock.display())),
         "the holder's command is named: {line}"
     );
     holder.release();
@@ -646,14 +669,17 @@ fn a_land_refuses_invalid_git_config_before_asking_for_a_turn() {
     );
     assert_eq!(queue(&home), ["H"], "invalid command took a queue place");
     assert!(!ran.exists(), "invalid configuration started the command");
-    let log = fs::read_to_string(home.repo_dir().join("turns.log")).expect("turn log");
-    assert!(
-        log.lines().all(|line| {
-            let event: serde_json::Value = serde_json::from_str(line).expect("turn event");
-            event["ticket"]["workspace"] != "invalid"
-        }),
-        "invalid configuration entered the turn history: {log}"
-    );
+    let entered = queues(&home, 0).iter().any(|turns| {
+        turns
+            .tickets
+            .iter()
+            .any(|ticket| ticket.workspace == "invalid")
+            || turns
+                .abandoned
+                .iter()
+                .any(|abandoned| abandoned.ticket.workspace == "invalid")
+    });
+    assert!(!entered, "invalid configuration entered the land queue");
     holder.release();
     holder.wait_success();
 }
@@ -671,18 +697,43 @@ fn a_land_spawn_failure_records_that_no_command_started() {
     assert_eq!(land.wait_exit(), ExitStatus::Exited { code: 104 });
     land.finish_stderr();
     assert!(queue(&home).is_empty(), "failed spawn retained its ticket");
-    let log = fs::read_to_string(home.repo_dir().join("turns.log")).expect("turn log");
-    let events: Vec<serde_json::Value> = log
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("turn event"))
-        .collect();
-    let finished = events.last().expect("recorded turn outcome");
-    assert_eq!(finished["event"], "finished", "{log}");
+    let was_abandoned = queues(&home, 0).iter().any(|turns| {
+        turns
+            .abandoned
+            .iter()
+            .any(|abandoned| abandoned.ticket.workspace == "missing")
+    });
+    assert!(!was_abandoned, "a failed spawn was abandoned, not ended");
+}
+
+/// A process the land's command leaves running holds no turn: the command exits, its descendant
+/// keeps running, and the next land takes the turn at once.
+#[test]
+fn a_process_the_command_leaves_running_holds_no_turn() {
+    let home = Home::new();
+    let descendant = home.path.join("descendant");
+    let script = format!(
+        "sleep 600 </dev/null >/dev/null 2>&1 & echo $! > {}; exit 0",
+        descendant.display()
+    );
+    let mut first = Land::spawn(&home, "first", &script);
+    first.wait_success();
+    let pid = fs::read_to_string(&descendant)
+        .expect("read the descendant's pid")
+        .trim()
+        .parse::<u32>()
+        .expect("the descendant's pid");
+    let mut second = Land::spawn(&home, "second", "true");
+    second.wait_success();
+    // SAFETY: kill(2) with signal 0 sends nothing and takes no pointers; it only reports whether
+    // `pid` exists.
+    let alive = unsafe { libc::kill(i32::try_from(pid).expect("a pid fits in pid_t"), 0) } == 0;
+    if alive {
+        send(pid, libc::SIGKILL);
+    }
+    assert!(alive, "the first land's command left no process running");
     assert!(
-        finished["outcome"]
-            .as_str()
-            .expect("recorded outcome")
-            .starts_with("did not start: cannot run "),
-        "{log}"
+        queue(&home).is_empty(),
+        "a finished land left a ticket in the queue"
     );
 }

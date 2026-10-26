@@ -106,12 +106,53 @@ pub(crate) fn seconds_since(at: SystemTime) -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// Why a compaction's copy waits for lands, from the queues the gateway answered
+/// ([`crate::gateway_sessions::GatewayControl::land_turns`]; 05_gateway.md "Land turns"):
+/// `Ok(None)` when no repository's turn is held, and a gateway that is not running holds none,
+/// since the turns are its own state; `Err`, why the copy stops, when they cannot be read.
+pub(crate) fn lands_hold(
+    turns: std::result::Result<
+        Vec<crate::api::dto::LandTurnQueue>,
+        crate::gateway_sessions::GatewayStatusError,
+    >,
+) -> std::result::Result<Option<String>, String> {
+    use crate::gateway_sessions::GatewayStatusError;
+    let queues = match turns {
+        Ok(queues) => queues,
+        Err(GatewayStatusError::Absent) => return Ok(None),
+        Err(GatewayStatusError::Waited(failure)) => {
+            return Err(format!(
+                "whether a land holds a turn cannot be read: {}",
+                failure.message
+            ));
+        }
+        Err(GatewayStatusError::Control(error)) => {
+            return Err(format!(
+                "whether a land holds a turn cannot be read: {error}"
+            ));
+        }
+    };
+    let held = queues
+        .iter()
+        .filter_map(|queue| {
+            let (holder, waiting) = queue.tickets.split_first()?;
+            Some(format!(
+                "{} by {} (pid {}, {} waiting)",
+                queue.repo,
+                holder.workspace,
+                holder.pid,
+                waiting.len()
+            ))
+        })
+        .collect::<Vec<_>>();
+    Ok((!held.is_empty()).then(|| format!("lands hold turns: {}", held.join(", "))))
+}
+
 /// Start `program __compact-seed <project_root>` in a session of its own, so the land's terminal
 /// and process group end nothing of it, with its stdout discarded and its stderr appended to the
 /// log in `compacting`, which is created first: the first compaction of a project finds none. It
-/// inherits no descriptor but its stdio: a land run under `cowshed land-turn` holds its
-/// repository's turn through an inherited descriptor, and a compaction that kept it would hold
-/// the turn for the whole copy. Returns the process and its log.
+/// inherits no descriptor but its stdio: a held lock the land's command inherited (02_workspaces.md
+/// "Held locks") would otherwise stay held for the whole copy. Returns the process and its log.
 pub(crate) fn start_compaction(
     program: &Path,
     project_root: &Path,
@@ -488,6 +529,43 @@ mod tests {
     use cowshed_os::test_backstop::ChildBackstop as _;
 
     const HOUR: Duration = Duration::from_secs(60 * 60);
+
+    #[test]
+    fn a_gateway_that_is_not_running_holds_no_land_turn_and_one_unread_stops_the_copy() {
+        use crate::api::dto::{LandTurnName, LandTurnQueue};
+        use crate::gateway_sessions::GatewayStatusError;
+        use crate::land_turn::Ticket;
+        let ticket = |number, workspace: &str| Ticket {
+            number,
+            pid: 40 + u32::try_from(number).unwrap(),
+            workspace: workspace.to_owned(),
+            asked_unix_ms: 0,
+            command: format!("land {workspace}"),
+            bound: Vec::new(),
+        };
+        let queue = |repo: &str, tickets| LandTurnQueue {
+            repo: LandTurnName::new(repo).unwrap(),
+            tickets,
+            abandoned: Vec::new(),
+        };
+        assert_eq!(lands_hold(Err(GatewayStatusError::Absent)), Ok(None));
+        assert_eq!(lands_hold(Ok(Vec::new())), Ok(None));
+        assert_eq!(lands_hold(Ok(vec![queue("idle", Vec::new())])), Ok(None));
+        assert_eq!(
+            lands_hold(Ok(vec![
+                queue("acme", vec![ticket(1, "topic"), ticket(2, "next")]),
+                queue("other", vec![ticket(3, "fix")]),
+            ])),
+            Ok(Some(
+                "lands hold turns: acme by topic (pid 41, 1 waiting), other by fix (pid 43, 0 waiting)"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            lands_hold(Err(GatewayStatusError::Control("refused".to_owned()))),
+            Err("whether a land holds a turn cannot be read: refused".to_owned())
+        );
+    }
 
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)

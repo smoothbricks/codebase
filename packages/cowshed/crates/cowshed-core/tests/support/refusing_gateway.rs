@@ -13,6 +13,13 @@ pub fn connect(_: &ValidatedHostStorage) -> Result<Box<dyn GatewayControl>> {
 
 #[async_trait]
 impl GatewayControl for RefusingGateway {
+    async fn land_turns(
+        &self,
+    ) -> std::result::Result<Vec<cowshed_core::api::dto::LandTurnQueue>, GatewayStatusError> {
+        Err(GatewayStatusError::Control(
+            "lifecycle-only fixture unexpectedly requested the land turns".to_owned(),
+        ))
+    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         Err(GatewayStatusError::Control(
             "lifecycle-only fixture unexpectedly requested gateway status".to_owned(),

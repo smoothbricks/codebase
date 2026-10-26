@@ -1652,7 +1652,7 @@ impl Process {
 /// held from before it, but keeps the unique id, so a life is found again after one.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Life {
+pub struct Life {
     pub(crate) pid: i32,
     pub(crate) unique_id: u64,
 }
@@ -1668,6 +1668,22 @@ impl Life {
                 pid: self.pid,
                 version: identity.id_version.cast_unsigned(),
             }))
+    }
+
+    /// The life `pid` names now; `None` once it has exited, reaped or not.
+    pub fn of(pid: i32) -> io::Result<Option<Self>> {
+        Ok(running_identity(pid)?.map(|identity| Self {
+            pid,
+            unique_id: identity.unique_id,
+        }))
+    }
+
+    /// Its exit, watched from now through any exec; `Before` once it has exited: a later process
+    /// given its pid is never taken for it ([`Process::watch_life`]).
+    pub fn exit(&self) -> io::Result<ProcessExit> {
+        Ok(self
+            .watch_exit()?
+            .map_or(ProcessExit::Before, ProcessExit::Watching))
     }
 
     /// Watch this life's exit from now, through any exec; `None` once it has exited. The pid's
@@ -1733,7 +1749,7 @@ pub(crate) fn owned_process(path: &Path, pid: i32) -> io::Result<Option<OwnedGro
 /// How a process's exit was seen ([`Process::exited`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum ExitObserved {
+pub enum ExitObserved {
     /// The exit watch registered while it ran reported its exit.
     Watched,
     /// It had exited, or begun to, before a watch could name it.
@@ -1784,9 +1800,41 @@ impl Process {
     }
 }
 
+/// A process followed by its pidfd, which names it across every exec ([`Process::watch_life`]).
+#[cfg(target_os = "linux")]
+pub struct Life(Process);
+
+#[cfg(target_os = "linux")]
+impl Life {
+    /// The life `pid` names now; `None` once it has exited.
+    pub fn of(pid: i32) -> io::Result<Option<Self>> {
+        Ok(Process::observe(pid)?.map(Self))
+    }
+
+    /// Its exit, watched from now; `Before` once it has exited.
+    pub fn exit(&self) -> io::Result<ProcessExit> {
+        self.0.exit()
+    }
+}
+
+impl Process {
+    /// The life `pid` names now and its exit, watched from now; `None` once it has exited: a
+    /// child that binds itself to a land turn between its fork and its exec is watched across that
+    /// exec ([`Life::exit`]).
+    pub fn watch_life(pid: i32) -> io::Result<Option<(Life, ProcessExit)>> {
+        let Some(life) = Life::of(pid)? else {
+            return Ok(None);
+        };
+        Ok(match life.exit()? {
+            ProcessExit::Before => None,
+            watching => Some((life, watching)),
+        })
+    }
+}
+
 impl Process {
     /// Watch this process's exit from now, so an exit after this call is never missed.
-    pub(crate) fn exit(&self) -> io::Result<ProcessExit> {
+    pub fn exit(&self) -> io::Result<ProcessExit> {
         Ok(self
             .watch_running()?
             .map_or(ProcessExit::Before, ProcessExit::Watching))
@@ -1794,7 +1842,7 @@ impl Process {
 }
 
 /// A process's exit, watched from the moment [`Process::exit`] was asked.
-pub(crate) enum ProcessExit {
+pub enum ProcessExit {
     /// Its exit watch, registered while it ran.
     Watching(ExitWatch),
     /// It had exited, or begun to, before a watch could name it.
@@ -1805,7 +1853,7 @@ impl ProcessExit {
     /// The exit, awaited without a thread of its own: the watch's descriptor is readable once
     /// the kernel reports the exit (`NOTE_EXIT`, a readable pidfd), never a poll of the process
     /// table.
-    pub(crate) async fn observed(self) -> io::Result<ExitObserved> {
+    pub async fn observed(self) -> io::Result<ExitObserved> {
         let watch = match self {
             Self::Watching(watch) => watch,
             Self::Before => return Ok(ExitObserved::BeforeWatch),

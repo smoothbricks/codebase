@@ -6591,27 +6591,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// Why a seed compaction's copy waits now (16_build_volumes.md, "Seed compaction"): a land holds
     /// or waits for a repository's turn. `Err` is why it stops: the turns cannot be read, and not
-    /// knowing is no permission.
+    /// knowing is no permission. No gateway holds no land turn: the turns are its state.
     async fn why_compaction_waits(&self) -> std::result::Result<Option<String>, String> {
-        let root =
-            crate::land_turn::land_turn_root(&crate::host_dirs::support_directory(&self.home));
-        let turns = crate::land_turn::observe_all(&root, None)
-            .map_err(|error| format!("whether a land holds a turn cannot be read: {error}"))?;
-        let held = turns
-            .iter()
-            .filter_map(|repo| {
-                repo.tickets.first().map(|holder| {
-                    format!(
-                        "{} by {} (pid {}, {} waiting)",
-                        repo.repo,
-                        holder.workspace,
-                        holder.pid,
-                        repo.tickets.len() - 1
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        Ok((!held.is_empty()).then(|| format!("lands hold turns: {}", held.join(", "))))
+        super::build_volumes::lands_hold(self.gateway_control.land_turns().await)
     }
     /// Fork step 2's aim (16_build_volumes.md, "Which volume a seed holds"): the tree a fork of
     /// `target` checks out, `revision`'s or else the target's own, and, when that is the target's
@@ -16016,13 +15998,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             ),
             None => None,
         };
-        let ref_turn = match options.ref_turn.as_ref() {
+        let mut ref_turn = match options.ref_turn.as_ref() {
             Some(queue) => Some(
                 timed_async(
                     "land",
                     "ref-turn-wait",
                     super::ref_turn::RefTurn::acquire_in(
-                        &self.descriptor.storage.land_turn_root(),
+                        &self.descriptor.storage.control_socket(),
                         queue,
                         super::ref_turn::RefWriter::Land {
                             workspace: workspace.as_str(),
@@ -16033,10 +16015,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             ),
             None => None,
         };
-        let fence = ref_lock
+        let mut fence = ref_lock
             .as_ref()
-            .map(super::ref_lock::RefLock::descriptor)
-            .or_else(|| ref_turn.as_ref().map(super::ref_turn::RefTurn::descriptor));
+            .map(|lock| Fence::Lock(lock.descriptor()))
+            .or_else(|| ref_turn.as_mut().map(Fence::Turn));
         let delivered = timed_async("land", "delivery", async {
             // Read again under the fence: the checks run for minutes, and the target can move
             // meanwhile through a writer that holds this fence while it moves it.
@@ -16053,7 +16035,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 },
                 &target_branch,
                 plan,
-                fence,
+                fence.as_mut(),
             )
             .await
         })
@@ -19768,7 +19750,7 @@ async fn deliver_into(
     source: NativeLandingSource<'_>,
     target_branch: &str,
     plan: LandPlan,
-    fence: Option<std::os::fd::RawFd>,
+    mut fence: Option<&mut Fence<'_>>,
 ) -> Result<()> {
     let NativeLandingSource {
         mount: source_mount,
@@ -19791,7 +19773,7 @@ async fn deliver_into(
                 .ok_or_else(|| CowshedError::internal("workspace mount path is not valid UTF-8"))?,
             &format!("+refs/heads/{source_branch}:{preservation_ref}"),
         ],
-        fence,
+        fence.as_deref_mut(),
     )
     .await
     .and_then(|output| require_git_success("git operation", &output))?;
@@ -19862,6 +19844,14 @@ async fn deliver_into(
     Err(refused)
 }
 
+/// What holds the target's ref while git moves it (02_workspaces.md "`cowshed land`" step 3): the
+/// land's ref lock, handed to git as a held descriptor, or its ref turn, which git is bound to.
+#[cfg(target_os = "macos")]
+enum Fence<'a> {
+    Lock(std::os::fd::RawFd),
+    Turn(&'a mut super::ref_turn::RefTurn),
+}
+
 /// A git child of the ref fence, which moves refs: handed the land's ref lock (`fence`) through the
 /// one held-command boundary ([`crate::held_lock::hand_to`]), so the kernel keeps the lock until
 /// git ends, a cowshed killed mid-fast-forward never leaves git moving the ref outside it, and no
@@ -19889,7 +19879,10 @@ fn fence_git_command(
     Ok(tokio::process::Command::from(command))
 }
 
-/// Run a [`fence_git_command`] to its end.
+/// Run a [`fence_git_command`] to its end under `fence`: a ref lock git inherits, or a ref turn
+/// git binds itself to as it starts (`RefTurn::bind_at_exec`), so the gateway holds the turn until
+/// it exits however this process ends. A bind the gateway refuses, or the turn's loss while git
+/// runs, stops the git before it moves anything it has not moved yet.
 #[cfg(target_os = "macos")]
 // WHY unbounded: a sandboxed git of this host's own repository, fetching only from one on this
 // host's disk: it waits on no other process.
@@ -19899,17 +19892,118 @@ async fn fence_git(
     root: &Path,
     fetch_source: Option<&Path>,
     args: &[&str],
-    fence: Option<std::os::fd::RawFd>,
+    fence: Option<&mut Fence<'_>>,
 ) -> Result<std::process::Output> {
-    fence_git_command(store_root, root, fetch_source, args, fence)?
-        .output_locked()
-        .await
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                error.to_string(),
-                "restore /usr/bin/git and sandbox-exec",
-            )
-        })
+    use cowshed_os::fork_lock::Spawn as _;
+    let git_missing = |error: std::io::Error| {
+        CowshedError::environment_missing(
+            error.to_string(),
+            "restore /usr/bin/git and sandbox-exec",
+        )
+    };
+    let lock = match fence.as_deref() {
+        Some(Fence::Lock(descriptor)) => Some(*descriptor),
+        Some(Fence::Turn(_)) | None => None,
+    };
+    let mut command = fence_git_command(store_root, root, fetch_source, args, lock)?;
+    if let Some(Fence::Turn(turn)) = fence.as_deref() {
+        turn.bind_at_exec(command.as_std_mut());
+    }
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .map_err(git_missing)?;
+    let Some(Fence::Turn(turn)) = fence else {
+        return child.wait_with_output().await.map_err(git_missing);
+    };
+    let pid = child
+        .id()
+        .ok_or_else(|| CowshedError::internal("a git the ref fence just started has no pid"))?;
+    if let Err(error) = turn.bound(pid).await {
+        return Err(CowshedError::environment_missing(
+            format!(
+                "{}; {}",
+                error.message,
+                stop_fence_git(&mut child, pid).await
+            ),
+            error.hint,
+        ));
+    }
+    let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(CowshedError::internal(format!(
+            "the ref fence's git opened no output pipes; {}",
+            stop_fence_git(&mut child, pid).await
+        )));
+    };
+    let finished = {
+        let work = async {
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            tokio::try_join!(
+                tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout),
+                tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr),
+            )?;
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        };
+        tokio::select! {
+            output = work => Ok(output),
+            lost = turn.lost() => Err(lost),
+        }
+    };
+    match finished {
+        Ok(output) => output.map_err(git_missing),
+        Err(lost) => Err(CowshedError::environment_missing(
+            format!(
+                "the ref turn was lost while `git {}` ran: {lost}; {}",
+                args.join(" "),
+                stop_fence_git(&mut child, pid).await
+            ),
+            "check the host gateway (`cowshed gateway status`), then land again",
+        )),
+    }
+}
+
+/// Send SIGTERM to the ref fence's git `pid`, a child of this process not yet reaped, so git
+/// removes its lock files as it ends; reap it within the reap bound; and say what became of it. A
+/// git whose reap expires is named and left to tokio's orphan reaper when its child is dropped.
+#[cfg(target_os = "macos")]
+async fn stop_fence_git(child: &mut tokio::process::Child, pid: u32) -> String {
+    let (signal, last) = match libc::pid_t::try_from(pid) {
+        // SAFETY: kill takes plain integers; `pid` is this process's unreaped child.
+        Ok(pid) if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 => (
+            "git was sent SIGTERM".to_owned(),
+            cowshed_os::deadline::Progress::Signalled {
+                signal: libc::SIGTERM,
+            },
+        ),
+        Ok(_) => (
+            format!(
+                "SIGTERM did not reach git ({})",
+                std::io::Error::last_os_error()
+            ),
+            cowshed_os::deadline::Progress::Nothing,
+        ),
+        Err(error) => (
+            format!("git's pid {pid} names no process ({error})"),
+            cowshed_os::deadline::Progress::Nothing,
+        ),
+    };
+    let reaped = cowshed_os::deadline::reap_async(
+        "ref fence git",
+        child,
+        &cowshed_os::deadline::start("reap the ref fence's git", cowshed_os::deadline::REAP),
+        last,
+    )
+    .await;
+    match reaped {
+        Ok(status) => format!("{signal} and ended ({status})"),
+        Err(error) => format!("{signal}, and its end was not reaped: {error}"),
+    }
 }
 
 /// Preserve the workspace branch `source_branch` in main's repository at `main_root`, as

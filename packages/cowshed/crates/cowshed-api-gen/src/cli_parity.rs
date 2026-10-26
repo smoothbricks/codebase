@@ -327,6 +327,7 @@ pub const PARITY: &[Row] = &[
     row("doc-commit", "file", input(argument("spawnDocCommit", 0, "messageFile"))),
     row("doc-commit", "patch", input(argument("spawnDocCommit", 0, "patch"))),
     row("doc-commit", "icm", input(argument("spawnDocCommit", 0, "icm"))),
+    row("doc-commit", "gateway-socket", input(argument("spawnDocCommit", 0, "gatewaySocket"))),
 
     row("doctor", "", field(&[("coordinator.doctor", "")], &[member("Coordinator.doctor")])),
     row("doctor", "repair", Counterpart::Composed { recipe: "doctor() then gc({}): the one sweep the CLI's repair runs (06_cli.md, \"Onboarding and repair\")", facade: &[member("Coordinator.doctor"), member("Coordinator.gc")] }),
@@ -342,6 +343,7 @@ pub const PARITY: &[Row] = &[
     row("land-turn", "repo", input(argument("spawnLandTurn", 0, "repo"))),
     row("land-turn", "workspace", input(argument("spawnLandTurn", 0, "workspace"))),
     row("land-turn", "outside-lock", input(argument("spawnLandTurn", 0, "outsideLock"))),
+    row("land-turn", "gateway-socket", input(argument("spawnLandTurn", 0, "gatewaySocket"))),
     row("land-turn", "argv", input(argument("spawnLandTurn", 0, "argv"))),
     
 

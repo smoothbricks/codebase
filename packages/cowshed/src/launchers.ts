@@ -495,11 +495,13 @@ export async function spawnSubtreeRoot(options: SpawnSubtreeRootOptions): Promis
   return { admission, exit: ended(child, [handle], () => []) };
 }
 
-/** `land-turn <repo> [--workspace] [--outside-lock] -- <argv…>`. */
+/** `land-turn <repo> [--workspace] [--outside-lock] [--gateway-socket] -- <argv…>`. */
 export type SpawnLandTurnOptions = {
   readonly repo: string;
   readonly workspace?: string;
   readonly outsideLock?: string;
+  /** The gateway whose queue to join; absent asks the host gateway. */
+  readonly gatewaySocket?: string;
   readonly argv: readonly [string, ...string[]];
 };
 
@@ -515,6 +517,7 @@ export async function spawnLandTurn(options: SpawnLandTurnOptions): Promise<Land
       options.repo,
       ...(options.workspace === undefined ? [] : ['--workspace', options.workspace]),
       ...(options.outsideLock === undefined ? [] : ['--outside-lock', options.outsideLock]),
+      ...(options.gatewaySocket === undefined ? [] : ['--gateway-socket', options.gatewaySocket]),
       '--',
       ...options.argv,
     ],
@@ -533,8 +536,13 @@ export type DocCommitEdit =
   | { readonly patch: string; readonly icm?: never }
   | { readonly icm: string; readonly patch?: never };
 
-/** `doc-commit (-m | -F) (--patch | --icm)`, in main's checkout `project`. */
-export type SpawnDocCommitOptions = { readonly project?: string } & DocCommitMessage & DocCommitEdit;
+/** `doc-commit (-m | -F) (--patch | --icm) [--gateway-socket]`, in main's checkout `project`. */
+export type SpawnDocCommitOptions = {
+  readonly project?: string;
+  /** The gateway whose ref turn to take; absent asks the host gateway. */
+  readonly gatewaySocket?: string;
+} & DocCommitMessage &
+  DocCommitEdit;
 
 /** A running `cowshed doc-commit`: the ref turn is held until it ends; its stdout is the commit. */
 export interface DocCommitRun {
@@ -548,6 +556,7 @@ export async function spawnDocCommit(options: SpawnDocCommitOptions): Promise<Do
       'doc-commit',
       ...(options.message === undefined ? ['-F', options.messageFile] : ['-m', options.message]),
       ...(options.patch === undefined ? ['--icm', options.icm] : ['--patch', options.patch]),
+      ...(options.gatewaySocket === undefined ? [] : ['--gateway-socket', options.gatewaySocket]),
     ],
     'inherit',
   );

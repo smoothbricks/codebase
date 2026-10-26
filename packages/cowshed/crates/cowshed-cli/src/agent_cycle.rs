@@ -8,7 +8,8 @@ use std::fmt;
 use std::time::Duration;
 
 use cowshed_core::CowshedError;
-use cowshed_core::land_turn::{RepoTurns, Ticket};
+use cowshed_core::api::dto::{LandTurnName, LandTurnQueue};
+use cowshed_core::land_turn::Ticket;
 
 /// A loaded agent as `launchctl print` reports it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,7 +183,7 @@ pub const fn reload(held: Held) -> Reload {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Busy {
     /// A land holds its repository's turn: the restart would refuse its next step's connection.
-    LandTurn { repo: String, holder: Ticket },
+    LandTurn { repo: LandTurnName, holder: Ticket },
 }
 
 impl fmt::Display for Busy {
@@ -200,7 +201,7 @@ impl fmt::Display for Busy {
 /// Everything a restart of the gateway would cut off now: the holder of each repository's land
 /// turn (its first live ticket; a queued land behind it runs nothing yet, and its first step
 /// waits for the install slot).
-pub fn restart_blockers(turns: &[RepoTurns]) -> Vec<Busy> {
+pub fn restart_blockers(turns: &[LandTurnQueue]) -> Vec<Busy> {
     turns
         .iter()
         .filter_map(|queue| {
@@ -279,10 +280,11 @@ mod tests {
             workspace,
             asked_unix_ms: 0,
             command: "land".to_owned(),
+            bound: Vec::new(),
         })
     }
 
-    fn queues() -> impl Strategy<Value = Vec<RepoTurns>> {
+    fn queues() -> impl Strategy<Value = Vec<LandTurnQueue>> {
         proptest::collection::vec(
             ("[a-z]{1,8}", proptest::collection::vec(ticket(), 0..4)),
             0..4,
@@ -290,8 +292,8 @@ mod tests {
         .prop_map(|queues| {
             queues
                 .into_iter()
-                .map(|(repo, tickets)| RepoTurns {
-                    repo,
+                .map(|(repo, tickets)| LandTurnQueue {
+                    repo: LandTurnName::new(repo).expect("a generated queue name is valid"),
                     tickets,
                     abandoned: Vec::new(),
                 })

@@ -43,6 +43,22 @@ export type AbandonedWork = {
   readonly bundle: string;
 };
 
+/**
+ * A land that left its queue without ending its turn: its asker closed its connection, was
+ * killed or crashed before it recorded how its command ended.
+ */
+export type Abandonment = {
+  /**
+   * When the gateway found it gone, in milliseconds since the Unix epoch.
+   */
+  readonly atUnixMs: number & tags.Type<'uint64'>;
+  readonly ticket: Ticket;
+  /**
+   * Whether it held the turn or still waited when it went.
+   */
+  readonly reason: string;
+};
+
 export type AdmissionCommitment = {
   readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly order: number & tags.Type<'uint64'>;
@@ -1060,8 +1076,8 @@ export type GatewayStatus = {
    */
   readonly pendingInstall?: boolean;
   /**
-   * The land queues with live tickets, one per repository, each first ticket holding its turn.
-   * Read without taking a turn; empty when no land is queued or the queues could not be read.
+   * The gateway's land queues with a ticket, one per repository, each first ticket holding its
+   * turn. Read without taking a turn; empty when no land is queued or the queues could not be read.
    */
   readonly landTurns?: ReadonlyArray<LandTurnQueue>;
   /**
@@ -2021,13 +2037,13 @@ export type LandSeedCompaction =
 export type LandTurnName = string;
 
 /**
- * One repository's land queue as `gateway status` observes it: its live tickets in turn order,
- * the first of which holds the turn, and the tickets found abandoned in the last day.
+ * One repository's land queue as the gateway lists it (05_gateway.md "Land turns"): its tickets in
+ * turn order, the first of which holds the turn, and the tickets abandoned in the last day.
  */
 export type LandTurnQueue = {
-  readonly repo: string;
+  readonly repo: LandTurnName;
   readonly tickets: ReadonlyArray<Ticket>;
-  readonly abandoned?: ReadonlyArray<TurnEvent>;
+  readonly abandoned?: ReadonlyArray<Abandonment>;
 };
 
 export type LandedReport = {
@@ -3525,7 +3541,7 @@ export type TerminalCommitment = {
 };
 
 /**
- * One land's place in its repository's queue, as its ticket file records it.
+ * One land's place in its repository's queue, as the gateway records it.
  */
 export type Ticket = {
   /**
@@ -3533,7 +3549,7 @@ export type Ticket = {
    */
   readonly number: number & tags.Type<'uint64'>;
   /**
-   * The process that waits for or holds the turn.
+   * The process that asked for the turn, as the kernel named its connection's peer.
    */
   readonly pid: number & tags.Type<'uint32'>;
   /**
@@ -3548,6 +3564,11 @@ export type Ticket = {
    * The command the turn runs.
    */
   readonly command: string;
+  /**
+   * The commands bound to the turn that have not exited, by pid: each holds the turn until it
+   * exits, and nothing it starts holds it.
+   */
+  readonly bound?: ReadonlyArray<number & tags.Type<'uint32'>>;
 };
 
 export type TraceContext = {
@@ -3583,24 +3604,6 @@ export type TreeHolder = {
  * they are UTF-8 and canonical standard base64 otherwise, so no path is lost or refused.
  */
 export type TreePath = TaggedBytesRef;
-
-/**
- * One line of a repository's turn log.
- */
-export type TurnEvent = {
-  /**
-   * When it was recorded, in milliseconds since the Unix epoch.
-   */
-  readonly atUnixMs: number & tags.Type<'uint64'>;
-  readonly event: TurnEventKind;
-  readonly ticket: Ticket;
-  readonly outcome?: string;
-};
-
-/**
- * What happened to a ticket, as the turn log records it.
- */
-export type TurnEventKind = 'queued' | 'taken' | 'finished' | 'abandoned';
 
 /**
  * A workspace supervisor socket whose job list could not be read, and why.

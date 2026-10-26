@@ -12,6 +12,7 @@ type ReaderName =
   | 'ABANDONED_PRESERVATION__NOTHING_TO_PRESERVE'
   | 'ABANDONED_PRESERVATION__PRESERVED'
   | 'ABANDONED_WORK'
+  | 'ABANDONMENT'
   | 'ADOPTION'
   | 'ADOPTION_CHECK'
   | 'ADOPTION_SKIP'
@@ -233,6 +234,7 @@ type ReaderName =
   | 'SCRIPT_COMMAND'
   | 'SCRIPT_VALUE'
   | 'SEALED_JOB_REF'
+  | 'SEQ__ABANDONMENT'
   | 'SEQ__BOUND_IDENTITY'
   | 'SEQ__BRANCH_LANDING'
   | 'SEQ__BUILD_STATE_LINK'
@@ -266,7 +268,6 @@ type ReaderName =
   | 'SEQ__TAGGED_BYTES_REF'
   | 'SEQ__TICKET'
   | 'SEQ__TREE_HOLDER'
-  | 'SEQ__TURN_EVENT'
   | 'SEQ__UNANSWERED_SUPERVISOR'
   | 'SEQ__UNATTRIBUTED_CHECK'
   | 'SEQ__UNLANDED_PATH'
@@ -295,8 +296,6 @@ type ReaderName =
   | 'TRACE_CONTEXT'
   | 'TREE_HOLDER'
   | 'TREE_HOLD_KIND'
-  | 'TURN_EVENT'
-  | 'TURN_EVENT_KIND'
   | 'UNANSWERED_SUPERVISOR'
   | 'UNATTRIBUTED_CHECK'
   | 'UNATTRIBUTED_RUN'
@@ -357,6 +356,14 @@ const READERS: Readers<ReaderName> = {
       ['branches', 'SEQ__BRANCH_LANDING'],
       ['preserved', 'ABANDONED_PRESERVATION'],
       ['bundle', 'LEAF'],
+    ],
+  },
+  ABANDONMENT: {
+    kind: 'record',
+    fields: [
+      ['atUnixMs', 'LEAF'],
+      ['ticket', 'TICKET'],
+      ['reason', 'LEAF'],
     ],
   },
   ADOPTION: {
@@ -1266,7 +1273,7 @@ const READERS: Readers<ReaderName> = {
     fields: [
       ['repo', 'LEAF'],
       ['tickets', 'SEQ__TICKET'],
-      ['abandoned', 'SEQ__TURN_EVENT'],
+      ['abandoned', 'SEQ__ABANDONMENT'],
     ],
   },
   LEAF: { kind: 'leaf' },
@@ -1798,6 +1805,7 @@ const READERS: Readers<ReaderName> = {
       ['outlivedIncomplete', 'LEAF'],
     ],
   },
+  SEQ__ABANDONMENT: { kind: 'seq', element: 'ABANDONMENT' },
   SEQ__BOUND_IDENTITY: { kind: 'seq', element: 'BOUND_IDENTITY' },
   SEQ__BRANCH_LANDING: { kind: 'seq', element: 'BRANCH_LANDING' },
   SEQ__BUILD_STATE_LINK: { kind: 'seq', element: 'BUILD_STATE_LINK' },
@@ -1831,7 +1839,6 @@ const READERS: Readers<ReaderName> = {
   SEQ__TAGGED_BYTES_REF: { kind: 'seq', element: 'TAGGED_BYTES_REF' },
   SEQ__TICKET: { kind: 'seq', element: 'TICKET' },
   SEQ__TREE_HOLDER: { kind: 'seq', element: 'TREE_HOLDER' },
-  SEQ__TURN_EVENT: { kind: 'seq', element: 'TURN_EVENT' },
   SEQ__UNANSWERED_SUPERVISOR: { kind: 'seq', element: 'UNANSWERED_SUPERVISOR' },
   SEQ__UNATTRIBUTED_CHECK: { kind: 'seq', element: 'UNATTRIBUTED_CHECK' },
   SEQ__UNLANDED_PATH: { kind: 'seq', element: 'UNLANDED_PATH' },
@@ -1956,6 +1963,7 @@ const READERS: Readers<ReaderName> = {
       ['workspace', 'LEAF'],
       ['askedUnixMs', 'LEAF'],
       ['command', 'LEAF'],
+      ['bound', 'LEAF'],
     ],
   },
   TRACE_CONTEXT: {
@@ -1982,24 +1990,6 @@ const READERS: Readers<ReaderName> = {
       ['executable', 'LEAF'],
       ['open-file', 'LEAF'],
       ['mapped-file', 'LEAF'],
-    ],
-  },
-  TURN_EVENT: {
-    kind: 'record',
-    fields: [
-      ['atUnixMs', 'LEAF'],
-      ['event', 'TURN_EVENT_KIND'],
-      ['ticket', 'TICKET'],
-      ['outcome', 'LEAF'],
-    ],
-  },
-  TURN_EVENT_KIND: {
-    kind: 'external',
-    arms: [
-      ['queued', 'LEAF'],
-      ['taken', 'LEAF'],
-      ['finished', 'LEAF'],
-      ['abandoned', 'LEAF'],
     ],
   },
   UNANSWERED_SUPERVISOR: {

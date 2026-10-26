@@ -2,22 +2,21 @@
 //! command as this repository's land turn, in the order the lands asked (05_gateway.md "Land
 //! turns").
 //!
-//! Host-only like `disk-command`: no project, no daemon, no runtime. The queue is
-//! [`cowshed_core::land_turn`]; this module adds the wait reports a caller reads on stderr, the
-//! child's run under the turn, and the termination signals that reach the child.
+//! Host-only like `disk-command`: no project, no workspace daemon, no runtime. The queue is the
+//! gateway's ([`cowshed_core::land_turn`]); this module adds the wait reports a caller reads on
+//! stderr, the child's run under the turn, and the termination signals that reach the child.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::fd::RawFd;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use cowshed_core::gateway_sessions::canonical_home;
 use cowshed_core::held_lock;
-use cowshed_core::host_dirs::support_directory;
 use cowshed_core::land_turn::{self as queue, OutsideHolders, Wait};
+use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::{CowshedError, ErrorCode};
 
 use crate::args::LandTurnArgs;
@@ -68,8 +67,10 @@ where
         ));
     };
     let command = PreparedCommand::prepare(program, rest)?;
-    let home = canonical_home()?;
-    let directory = queue::land_turn_root(&support_directory(&home)).join(args.repo.as_str());
+    let socket = args
+        .gateway_socket
+        .clone()
+        .unwrap_or_else(|| CanonicalRoots::global().control_socket());
     let description = args
         .argv
         .iter()
@@ -77,11 +78,13 @@ where
         .collect::<Vec<_>>()
         .join(" ");
 
-    let turn = take_turn(
-        directory,
-        args.repo.as_str(),
-        &args.workspace,
-        description,
+    let mut turn = take_turn(
+        &socket,
+        queue::TurnAsk {
+            repo: args.repo.clone(),
+            workspace: args.workspace.clone(),
+            command: description,
+        },
         args.outside_lock.clone(),
         output,
     )
@@ -90,9 +93,8 @@ where
     // on reaches the child, and the turn is held until the child ends.
     let mut interrupts = policy.arm_forwarding();
 
-    // The child inherits the turn's descriptors: the kernel keeps the turn until the child has
-    // ended too, even if this process is killed first.
-    let held = match command.spawn(turn.descriptors()) {
+    // The child inherits the outside lock's descriptor and binds itself to the turn as it starts.
+    let held = match command.spawn(turn.outside_descriptor().into_iter().collect(), Some(&turn)) {
         Ok(held) => held,
         Err(error) => {
             turn.end(format!("did not start: {}", error.message));
@@ -100,36 +102,74 @@ where
         }
     };
     let program_name = held.name.clone();
-    let (status, relay) = held.wait(&mut interrupts).await;
+    if let Err(error) = turn.bound(held.pid.unsigned_abs()).await {
+        // A command the turn does not hold must not run beside the next land: it is stopped.
+        let (stopped, ended) = held.stop().await;
+        turn.end(format!("stopped: the gateway did not bind it: {error}"));
+        return Err(CowshedError::environment_missing(
+            format!(
+                "the gateway did not bind {program_name} to land turn {}: {error}; {}; it {ended}",
+                args.repo,
+                sigterm(&program_name, stopped),
+            ),
+            "start the host gateway (`cowshed gateway start`), then run it again",
+        ));
+    }
+    let (ended, relay) = held.wait_holding(&mut interrupts, &mut turn).await;
     // The turn ends with the child, never before it, recording how the child ended.
-    let status = match status {
-        Ok(status) => {
-            let outcome = match (status.code(), status.signal()) {
-                (Some(code), _) => format!("exited {code}"),
-                (None, Some(signal)) => format!("killed by signal {signal}"),
-                (None, None) => "ended with neither an exit code nor a signal".to_owned(),
-            };
-            turn.end(outcome);
-            status
-        }
-        Err(error) => {
+    let status = match ended {
+        Held::Exited(Ok(status)) => status,
+        Held::Exited(Err(error)) => {
             return Err(CowshedError::internal(format!(
                 "cannot wait for {program_name}: {error}"
             )));
         }
+        Held::Lost {
+            error: lost,
+            stopped,
+            ended,
+        } => {
+            let relayed = match &relay {
+                Ok(()) => String::new(),
+                Err(error) => format!(
+                    "; an interrupt did not reach {program_name} ({})",
+                    error.message
+                ),
+            };
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "land turn {} was lost: {lost}; {}; it {ended}{relayed}",
+                    args.repo,
+                    sigterm(&program_name, stopped),
+                ),
+                "check the host gateway (`cowshed gateway status`), then land again",
+            ));
+        }
     };
+    let outcome = match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exited {code}"),
+        (None, Some(signal)) => format!("killed by signal {signal}"),
+        (None, None) => "ended with neither an exit code nor a signal".to_owned(),
+    };
+    turn.end(outcome);
     relay?;
     exit_code(status)
 }
 
-/// Take the turn of the queue in `directory` for a land of `workspace`, saying on `output` who
-/// holds it and how many are ahead while it waits, and how long it waited once it is taken. `label`
-/// names the queue in those lines. A report that cannot be written ends the turn unstarted.
+/// What became of the SIGTERM sent to `program`, in the words of a refusal.
+fn sigterm(program: &str, stopped: Result<(), CowshedError>) -> String {
+    match stopped {
+        Ok(()) => format!("{program} was sent SIGTERM"),
+        Err(error) => format!("SIGTERM did not reach {program} ({})", error.message),
+    }
+}
+
+/// Take `ask`'s turn from the gateway at `socket`, saying on `output` who holds it and how many
+/// are ahead while it waits, and how long it waited once it is taken. A report that cannot be
+/// written ends the turn unstarted.
 pub(crate) async fn take_turn<W, E>(
-    directory: PathBuf,
-    label: &str,
-    workspace: &str,
-    description: String,
+    socket: &Path,
+    ask: queue::TurnAsk,
     outside: Option<PathBuf>,
     output: &mut Output<W, E>,
 ) -> Result<queue::Turn, CowshedError>
@@ -138,47 +178,30 @@ where
     E: Write + Send,
 {
     let started = Instant::now();
-    let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let workspace = workspace.to_owned();
-    let mut taking = tokio::task::spawn_blocking(move || {
-        queue::take(
-            &directory,
-            &workspace,
-            &description,
-            outside.as_deref(),
-            LAND_TURN_REPORT_EVERY,
-            |wait| {
-                // The receiver is read until this call returns, so no report is lost; a send
-                // fails only once the receiver is gone, and then no caller is left to hear it.
-                let _ = reports.send(wait.clone());
-            },
-        )
-    });
-
+    let label = ask.repo.to_string();
     let mut waited = false;
-    // A report that cannot be written is kept, not returned: returning while the take still waits
-    // would make the runtime's shutdown wait for the queue with nothing left to report to.
+    // A report that cannot be written is kept, not returned: the turn is ended unstarted once the
+    // wait is over, never left queued with nothing to report to.
     let mut written: Result<(), CowshedError> = Ok(());
-    let joined = loop {
-        tokio::select! {
-            Some(wait) = received.recv() => {
-                waited = true;
-                written = written.and(report(output, label, &wait));
+    let taken = queue::take(
+        socket,
+        &ask,
+        outside.as_deref(),
+        LAND_TURN_REPORT_EVERY,
+        |wait| {
+            waited = true;
+            if written.is_ok() {
+                written = report(output, &label, wait);
             }
-            joined = &mut taking => break joined,
-        }
-    };
-    while let Ok(wait) = received.try_recv() {
-        waited = true;
-        written = written.and(report(output, label, &wait));
-    }
-    let turn = joined
-        .map_err(|error| {
-            CowshedError::internal(format!("the land turn thread for {label} failed: {error}"))
-        })?
-        .map_err(|error| {
-            CowshedError::internal(format!("cannot take the land turn for {label}: {error}"))
-        })?;
+        },
+    )
+    .await;
+    let turn = taken.map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot take the land turn {label}: {error}"),
+            "start the host gateway (`cowshed gateway start`), then run it again",
+        )
+    })?;
     let reported = written.and_then(|()| {
         if waited {
             output
@@ -218,17 +241,23 @@ impl PreparedCommand {
         Ok(Self { command, name })
     }
 
-    pub(crate) fn spawn(mut self, descriptors: Vec<RawFd>) -> Result<HeldCommand, CowshedError> {
+    /// Spawn the command handing it `descriptors`, armed to bind itself to `turn`, when given, as
+    /// it starts ([`queue::Turn::bind_at_exec`]): the gateway's answer is read by
+    /// [`queue::Turn::bound`].
+    pub(crate) fn spawn(
+        mut self,
+        descriptors: Vec<RawFd>,
+        turn: Option<&queue::Turn>,
+    ) -> Result<HeldCommand, CowshedError> {
         held_lock::hand_to(self.command.as_std_mut(), descriptors);
+        if let Some(turn) = turn {
+            turn.bind_at_exec(self.command.as_std_mut());
+        }
         let child = self
             .command
             .spawn()
             .map_err(|error| spawn_error(&self.name, &error))?;
-        // A newly spawned, unpolled child always has its kernel pid, which fits pid_t.
-        let pid = child
-            .id()
-            .and_then(|pid| libc::pid_t::try_from(pid).ok())
-            .expect("a newly spawned child has a pid_t process id");
+        let pid = spawned_pid(&child);
         Ok(HeldCommand {
             child,
             pid,
@@ -268,6 +297,59 @@ impl HeldCommand {
         };
         (status, relay)
     }
+
+    /// [`Self::wait`] for a command bound to `turn`: should the gateway close the turn's
+    /// connection first, the turn is lost, and the command is stopped ([`Self::stop`]).
+    async fn wait_holding(
+        mut self,
+        interrupts: &mut Interrupts,
+        turn: &mut queue::Turn,
+    ) -> (Held, Result<(), CowshedError>) {
+        let mut relay: Result<(), CowshedError> = Ok(());
+        // WHY unbounded: the command is this verb's own work, bound to the turn; it lasts as long as
+        // the command, which the caller's forwarded signals end. The turn's loss ends the wait, and
+        // the command is then stopped within the reap bound.
+        #[allow(clippy::disallowed_methods)]
+        let error = loop {
+            tokio::select! {
+                status = self.child.wait() => return (Held::Exited(status), relay),
+                signal = interrupts.received() => {
+                    relay = relay.and(forward(self.pid, signal, &self.name));
+                }
+                error = turn.lost() => break error,
+            }
+        };
+        let (stopped, ended) = self.stop().await;
+        (
+            Held::Lost {
+                error,
+                stopped,
+                ended,
+            },
+            relay,
+        )
+    }
+
+    /// Send the command SIGTERM and reap it within the reap bound ([`reap_stopped`]): whether the
+    /// signal reached it, and how it ended or why it was not reaped.
+    async fn stop(mut self) -> (Result<(), CowshedError>, String) {
+        let stopped = forward(self.pid, libc::SIGTERM, &self.name);
+        let ended = reap_stopped("land-turn command", &mut self.child, stopped.is_ok()).await;
+        (stopped, ended)
+    }
+}
+
+/// How a command bound to a land turn ended its wait ([`HeldCommand::wait_holding`]).
+enum Held {
+    /// It exited first.
+    Exited(io::Result<ExitStatus>),
+    /// The turn was lost first: the command was sent SIGTERM, whether it reached it is `stopped`,
+    /// and `ended` says how it ended or why it was not reaped.
+    Lost {
+        error: io::Error,
+        stopped: Result<(), CowshedError>,
+        ended: String,
+    },
 }
 
 /// One wait report, in the words a caller reads on stderr.
@@ -278,9 +360,14 @@ fn report<W: Write, E: Write>(
 ) -> Result<(), CowshedError> {
     let line = match wait {
         Wait::Queued { holder, ahead } => format!(
-            "land turn {repo}: {ahead} ahead; {} holds it (pid {}, asked {})",
+            "land turn {repo}: {ahead} ahead; {} holds it (pid {}{}, asked {})",
             holder.workspace,
             holder.pid,
+            holder
+                .bound
+                .iter()
+                .map(|pid| format!(", command pid {pid}"))
+                .collect::<String>(),
             local_clock(holder.asked_unix_ms),
         ),
         Wait::Outside { lock, holders } => {
@@ -310,7 +397,7 @@ fn report<W: Write, E: Write>(
 
 /// Send one termination signal to the child. The child may have ended as the signal arrived;
 /// then there is nothing left to signal, and its exit status is the answer.
-fn forward(pid: libc::pid_t, signal: i32, program: &str) -> Result<(), CowshedError> {
+pub(crate) fn forward(pid: libc::pid_t, signal: i32, program: &str) -> Result<(), CowshedError> {
     // SAFETY: `kill` sends `signal` to `pid` and reads or writes no memory of this process.
     if unsafe { libc::kill(pid, signal) } == -1 {
         let error = io::Error::last_os_error();
@@ -323,6 +410,36 @@ fn forward(pid: libc::pid_t, signal: i32, program: &str) -> Result<(), CowshedEr
     Ok(())
 }
 
+/// The pid of a child just spawned: a newly spawned, unpolled child always has its kernel pid,
+/// which fits `pid_t`.
+pub(crate) fn spawned_pid(child: &tokio::process::Child) -> libc::pid_t {
+    child
+        .id()
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .expect("a newly spawned child has a pid_t process id")
+}
+
+/// Reap `child`, just sent SIGTERM (`signalled`) or not, within the reap bound, and say how it
+/// ended: its status in words, or why its end was not reaped. A child whose reap expires is named
+/// and left to tokio's orphan reaper once it is dropped; nothing waits for it.
+pub(crate) async fn reap_stopped(
+    role: &'static str,
+    child: &mut tokio::process::Child,
+    signalled: bool,
+) -> String {
+    let last = if signalled {
+        cowshed_os::deadline::Progress::Signalled {
+            signal: libc::SIGTERM,
+        }
+    } else {
+        cowshed_os::deadline::Progress::Nothing
+    };
+    let budget = cowshed_os::deadline::start("reap a stopped command", cowshed_os::deadline::REAP);
+    match cowshed_os::deadline::reap_async(role, child, &budget, last).await {
+        Ok(status) => crate::declared_land::describe(status),
+        Err(error) => format!("was not reaped: {error}"),
+    }
+}
 /// The exit code a shell reports for the child's end: its own code, or 128 plus the signal that
 /// ended it.
 pub(crate) fn exit_code(status: ExitStatus) -> Result<i32, CowshedError> {

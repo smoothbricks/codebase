@@ -1377,10 +1377,10 @@ impl ValidatedHostStorage {
         &self.roots
     }
 
-    /// Where this home's land-turn queues live (05_gateway.md "Land turns"): `land-turn` in its
-    /// support directory, the queues every `cowshed land-turn` and doc commit run with this
-    /// `HOME` take. A fixture's home is its scratch root, so no test queues beside the host's
-    /// lands.
+    /// Where this home's land records live (02_workspaces.md "A declared land"): `land-turn` in
+    /// its support directory, a declared land's `lands.log` and its commands' output. A fixture's
+    /// home is its scratch root, so no test records anything beside the host's lands. The queues
+    /// themselves are the gateway's (05_gateway.md "Land turns").
     pub fn land_turn_root(&self) -> PathBuf {
         crate::land_turn::land_turn_root(&crate::host_dirs::support_directory(&self.home))
     }

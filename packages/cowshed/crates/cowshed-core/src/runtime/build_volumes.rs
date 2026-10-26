@@ -52,6 +52,7 @@ pub(crate) use compaction::{
 };
 pub(crate) use reseed::ReseedWorkspace;
 
+pub(crate) use compaction::lands_hold;
 /// A workspace at one incarnation: whose seed a seed is.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Owner {

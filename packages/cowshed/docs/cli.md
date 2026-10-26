@@ -1310,8 +1310,9 @@ moved (exit 4); the caller rebases and lands again.
 `--ref-turn <queue>` names instead the land-turn queue every other writer of the target branch takes while it moves it,
 as an operator's Markdown commit into main takes `cowshed land-turn <repo>.ref -- <commit>`. Land takes that turn for
 the same span as `--ref-lock`, in the order the writers asked: a land that finds it held says on stderr every 10 s how
-many are ahead and which workspace and pid hold it, and the fast-forward's git inherits the turn's ticket, so the kernel
-keeps the turn until that git ends. `--ref-lock` and `--ref-turn` are exclusive.
+many are ahead and which workspace and pid hold it, and the fast-forward's git binds itself to the turn as it starts, so
+the gateway keeps the turn until that git ends, and a git still running when the turn is lost is sent SIGTERM.
+`--ref-lock` and `--ref-turn` are exclusive.
 
 Post-land output restoration never reruns `--check` commands. Checks pass once in the landing workspace; only their
 attributed Nx task graphs may be hashed and restored from the adopted local cache. Missing or uncacheable results are
@@ -1330,7 +1331,7 @@ while the gate ran, a doc commit say, sends it back to the rebase and the gate, 
 task those commits do not reach. A failing gate exits 4 and keeps the workspace. Once the turn has ended it starts a
 detached child that pushes main to `[land] push` (`--no-push` skips it) and then runs each `[land] after` command with
 `{before}` and `{head}` replaced; a refused retire still starts it, since main has moved. The land never waits for that
-child; every outcome is one JSON line of `lands.log` beside the turn's tickets in
+child; every outcome is one JSON line of `lands.log` in the turn's records directory
 `~/Library/Application Support/dev.cowshed/land-turn/<turn>/`, and each command's output is kept in `lands/` beside it.
 The primitive's own fences and checks (`--check`, `--target`, `--expected-*`, `--ref-lock`, `--ref-turn`, `--push-only`,
 `--ungated`) are refused there (exit 2), since the route pins its own.
@@ -1357,7 +1358,8 @@ is the input: a patch `git apply` takes, or an ICM program, which runs as `icm r
 `<[land] turn>.ref` it applies the edit, refuses any path `[doc] paths` does not admit or that main held uncommitted,
 runs `[doc] check` with the paths, and commits exactly those paths with the repository's hooks; anything that stops it
 first puts main's tree back as it was (exit 4). Run it in main's checkout or name it with `--project`; a workspace is
-refused. It asks no daemon and no gateway. Stdout is the commit; `--json` returns `{commit, paths}`.
+refused. It asks no daemon; the ref turn is the host gateway's, or the one `--gateway-socket <path>` names, and every
+command the hold runs is bound to it until that command exits. Stdout is the commit; `--json` returns `{commit, paths}`.
 
 ```
 $ cowshed doc-commit -m 'docs: name the ref turn' --patch fix.diff

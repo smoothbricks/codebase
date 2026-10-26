@@ -119,6 +119,19 @@ impl GatewayControlClient {
         .ok_or(ControlError::InvalidResponse)
     }
 
+    /// Every repository's land turns (05_gateway.md "Land turns"): its tickets in turn order, the
+    /// holder first, and the tickets abandoned at or after `abandoned_since_unix_ms`.
+    pub async fn land_turns(
+        &self,
+        abandoned_since_unix_ms: u64,
+    ) -> Result<Vec<cowshed_core::api::dto::LandTurnQueue>, ControlError> {
+        self.send(&ControlRequest::LandTurns {
+            abandoned_since_unix_ms,
+        })
+        .await?
+        .land_turns
+        .ok_or(ControlError::InvalidResponse)
+    }
     /// Clear the project's Nx accepted-task store (03_caches.md, "Nx accepted-task artifact
     /// service"). A refusal while the project's Nx work is in flight is [`ControlFailureCode::Busy`]
     /// and names that work.
@@ -420,6 +433,11 @@ enum ControlRequest {
         unit: String,
         outcome: TaskOutcome,
     },
+    /// Every repository's land turns, and the abandonments at or after a time.
+    LandTurns {
+        #[serde(rename = "abandonedSinceUnixMs")]
+        abandoned_since_unix_ms: u64,
+    },
     /// The task server's queue.
     TaskQueue,
     /// Clear one project's Nx accepted-task store.
@@ -459,6 +477,7 @@ impl ControlRequest {
             Self::RamDetach { .. } => RAM_DETACH_OP,
             Self::FirstLaunch => FIRST_LAUNCH_OP,
             Self::Released => cowshed_gateway_types::RELEASED_OP,
+            Self::LandTurns { .. } => cowshed_core::land_turn::LAND_TURNS_OP,
         }
     }
 }
@@ -476,6 +495,11 @@ enum Incoming {
         class: DiskClass,
         share: PhaseShare,
         command: String,
+    },
+    /// A land's place in its repository's queue, held for as long as its connection is open
+    /// (05_gateway.md "Land turns").
+    LandTurn {
+        ask: cowshed_core::land_turn::TurnAsk,
     },
     TaskAdmit {
         unit: String,
@@ -566,6 +590,9 @@ struct ControlResponse {
     /// What an `nx-cache-clear` deleted.
     #[serde(skip_serializing_if = "Option::is_none")]
     nx_cache_cleared: Option<cowshed_core::api::NxStoreClearResult>,
+    /// Every repository's land turns, as `land-turns` lists them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    land_turns: Option<Vec<cowshed_core::api::dto::LandTurnQueue>>,
     /// The whole disk a `ram-lease` attached and the registry entry it registers as.
     #[serde(skip_serializing_if = "Option::is_none")]
     ram_disk: Option<RamDiskAttached>,
@@ -823,6 +850,7 @@ pub(crate) struct ControlServices {
     pub audit_tail: Option<AuditTailHandle>,
     pub startup: Option<Arc<dyn StartupProbe>>,
     pub disk_leases: DiskLeases,
+    pub land_turns: crate::land_turn::LandTurns,
     pub task_server: crate::task_server::TaskServer,
     pub ram_disks: Option<Arc<dyn RamDisks>>,
     pub ram_leases: crate::ram_lease::Records,
@@ -855,6 +883,7 @@ impl fmt::Debug for ControlServices {
             .field("audit_tail", &self.audit_tail)
             .field("startup", &self.startup)
             .field("disk_leases", &self.disk_leases)
+            .field("land_turns", &self.land_turns)
             .field("task_server", &self.task_server)
             .field("ram_disks", &self.ram_disks)
             .field("ram_leases", &self.ram_leases)
@@ -915,8 +944,18 @@ pub(crate) async fn serve_control_unix(stream: UnixStream, services: ControlServ
         .peer_cred()
         .ok()
         .and_then(|credentials| credentials.pid());
+    // The descriptor stays open while either half lives, which is for as long as `serve` runs.
+    let socket = std::os::fd::AsRawFd::as_raw_fd(&stream);
     let (reader, writer) = stream.into_split();
-    serve(reader, writer, pid, parse_control_request, services).await;
+    serve(
+        reader,
+        writer,
+        pid,
+        Some(socket),
+        parse_control_request,
+        services,
+    )
+    .await;
 }
 
 pub(crate) async fn serve_control_tcp(
@@ -934,7 +973,7 @@ pub(crate) async fn serve_control_tcp(
         envelope.controller_credential.zeroize();
         parse_control_request_value(envelope.request)
     };
-    serve(reader, writer, None, parse, services).await;
+    serve(reader, writer, None, None, parse, services).await;
 }
 
 /// Read the connection's one request line and answer it. A one-shot request must be followed by
@@ -943,6 +982,7 @@ async fn serve<R, W>(
     mut reader: R,
     writer: W,
     pid: Option<i32>,
+    peer_socket: Option<std::os::fd::RawFd>,
     parse: impl FnOnce(&[u8]) -> Result<Incoming, ControlError>,
     services: ControlServices,
 ) where
@@ -1027,6 +1067,20 @@ async fn serve<R, W>(
                 scheduler_stopped,
             )
             .await;
+        }
+        Ok(Incoming::LandTurn { ask }) => {
+            // The asker is the process the kernel names at the connection's other end; a TCP
+            // client names none, and is refused.
+            let asker = peer_socket.and_then(|socket| {
+                cowshed_core::runtime::job_groups::Process::of_socket_peer(&socket)
+                    .map_err(|error| {
+                        cowshed_os::eprintln!(
+                            "cowshed: a land turn's asking process cannot be named: {error}"
+                        );
+                    })
+                    .ok()
+            });
+            crate::land_turn::hold(reader, writer, asker, ask, services.land_turns.clone()).await;
         }
         Ok(Incoming::Request(request)) => {
             let request = expect_eof(&mut reader).await.map(|()| request);
@@ -1113,6 +1167,8 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "sim-approve" => &["op", "approval"],
         "sim-list" => &["op", "repoId"],
         "sim-boot" => &["op", "repoId", "device"],
+        cowshed_core::land_turn::LAND_TURNS_OP => &["op", "abandonedSinceUnixMs"],
+        cowshed_core::land_turn::LAND_TURN_OP => &["op", "repo", "workspace", "command"],
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
         "nx-cache-clear" => &["op", "repoId"],
@@ -1147,6 +1203,26 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         ));
     }
     let encoding = |error: serde_json::Error| ControlError::Encoding(error.to_string());
+    if op == cowshed_core::land_turn::LAND_TURN_OP {
+        #[derive(Deserialize)]
+        struct LandTurnIn {
+            repo: cowshed_core::api::dto::LandTurnName,
+            workspace: String,
+            command: String,
+        }
+        let LandTurnIn {
+            repo,
+            workspace,
+            command,
+        } = serde_json::from_value(value).map_err(encoding)?;
+        return Ok(Incoming::LandTurn {
+            ask: cowshed_core::land_turn::TurnAsk {
+                repo,
+                workspace,
+                command,
+            },
+        });
+    }
     if op == RAM_LEASE_OP {
         #[derive(Deserialize)]
         struct RamLeaseIn {
@@ -1220,6 +1296,8 @@ async fn serve_request<W>(
     W: AsyncWrite + Unpin,
 {
     let (response, mut subscription) = match request {
+        // `land-turns` answers from the queues at once, so it is never heartbeated.
+        Ok(request @ ControlRequest::LandTurns { .. }) => dispatch(request, &services).await,
         Ok(request) => answered(&mut writer, &services.handle, dispatch(request, &services)).await,
         Err(error) => {
             let code = if matches!(error, ControlError::Unauthorized) {
@@ -1502,6 +1580,21 @@ async fn dispatch(
             match services.sim_broker.boot_device(repo_id, device).await {
                 Ok(()) => success(),
                 Err(error) => sim_rejected(error),
+            },
+            None,
+        ),
+        ControlRequest::LandTurns {
+            abandoned_since_unix_ms,
+        } => (
+            match services.land_turns.queues(abandoned_since_unix_ms).await {
+                Some(queues) => ControlResponse {
+                    land_turns: Some(queues),
+                    ..success()
+                },
+                None => failure(
+                    ControlFailureCode::Rejected,
+                    "the gateway's land turns have stopped".to_owned(),
+                ),
             },
             None,
         ),
@@ -1930,6 +2023,7 @@ fn success() -> ControlResponse {
         task_grant: None,
         task_queue: None,
         nx_cache_cleared: None,
+        land_turns: None,
         ram_disk: None,
         ram_detach: None,
         first_launch: None,

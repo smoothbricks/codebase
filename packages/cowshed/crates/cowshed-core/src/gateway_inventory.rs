@@ -4347,6 +4347,14 @@ mod tests {
 
     #[async_trait]
     impl crate::gateway_sessions::GatewayControl for RecordingControl {
+        async fn land_turns(
+            &self,
+        ) -> std::result::Result<
+            Vec<crate::api::dto::LandTurnQueue>,
+            crate::gateway_sessions::GatewayStatusError,
+        > {
+            Ok(Vec::new())
+        }
         async fn status(
             &self,
         ) -> std::result::Result<

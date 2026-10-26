@@ -4667,8 +4667,8 @@ pub struct GatewayStatus {
     /// taking it (05_gateway.md "A pending install is visible"). Absent on the wire while free.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending_install: bool,
-    /// The land queues with live tickets, one per repository, each first ticket holding its turn.
-    /// Read without taking a turn; empty when no land is queued or the queues could not be read.
+    /// The gateway's land queues with a ticket, one per repository, each first ticket holding its
+    /// turn. Read without taking a turn; empty when no land is queued or the queues could not be read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub land_turns: Vec<LandTurnQueue>,
     /// Why `land_turns` could not be read, when reading it failed; the rest of the status is still
@@ -4677,15 +4677,15 @@ pub struct GatewayStatus {
     pub land_turns_error: Option<String>,
 }
 
-/// One repository's land queue as `gateway status` observes it: its live tickets in turn order,
-/// the first of which holds the turn, and the tickets found abandoned in the last day.
+/// One repository's land queue as the gateway lists it (05_gateway.md "Land turns"): its tickets in
+/// turn order, the first of which holds the turn, and the tickets abandoned in the last day.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LandTurnQueue {
-    pub repo: String,
+    pub repo: LandTurnName,
     pub tickets: Vec<Ticket>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub abandoned: Vec<crate::land_turn::TurnEvent>,
+    pub abandoned: Vec<crate::land_turn::Abandonment>,
 }
 
 /// The daemon and CLI executables, when their contents differ.

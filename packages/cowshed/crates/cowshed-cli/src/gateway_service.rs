@@ -21,8 +21,6 @@ use cowshed_core::api::{
     EmptyResult, ExecClass, GatewayStatus as CliGatewayStatus, HostJobs, HostScheduling,
     ImageCleanup, JobCount, JobState, LandTurnQueue, StaleDaemonBinary, UnansweredSupervisor,
 };
-use cowshed_core::host_dirs::support_directory;
-use cowshed_core::land_turn as turns;
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
 use cowshed_core::repository::RepoId;
@@ -141,6 +139,12 @@ impl ControlSocket {
 
 #[async_trait]
 impl GatewayControl for ControlSocket {
+    async fn land_turns(
+        &self,
+    ) -> std::result::Result<Vec<cowshed_core::api::dto::LandTurnQueue>, GatewayStatusError> {
+        // No abandonment is at or after the last millisecond: the live queues alone.
+        self.0.land_turns(u64::MAX).await.map_err(status_error)
+    }
     async fn status(&self) -> std::result::Result<DaemonStatus, GatewayStatusError> {
         self.0.status().await.map_err(status_error)
     }
@@ -860,7 +864,7 @@ where
     // Activation restarts a gateway that runs; one that answers is refused the restart while a
     // land runs, before the install changes anything.
     if client.status().await.is_ok() {
-        refuse_restart_while_busy(slot, &home)?;
+        refuse_restart_while_busy(slot, &client, &mut Blocking::new(io::stderr())).await?;
     }
     install_nx_cache_server(&mut executor, &home, &candidate.source)?;
     let spec =
@@ -1276,7 +1280,7 @@ pub(crate) fn remove_path_entries(stable: &Path) -> Result<RemovalOutcome> {
 pub(crate) async fn stop_for_host_move(slot: &InstallSlot, roots: &CanonicalRoots) -> Result<()> {
     let client = GatewayControlClient::new(roots.control_socket()).map_err(control_error)?;
     if client.status().await.is_ok() {
-        refuse_restart_while_busy(slot, &canonical_home()?)?;
+        refuse_restart_while_busy(slot, &client, &mut Blocking::new(io::stderr())).await?;
     }
     stop_service(roots.namespace(), false).map(|_| ())
 }
@@ -1413,7 +1417,7 @@ where
     } else {
         None
     };
-    let (land_turns, land_turns_error) = observe_land_turns(&home);
+    let (land_turns, land_turns_error) = observe_land_turns(&socket, installed).await;
     let scheduling = read_scheduling(roots.store()).await;
     let cli_sha256 = executable_digest(&running_executable()?)?;
     Ok(Ok(CliGatewayStatus {
@@ -1428,31 +1432,29 @@ where
 /// How far back `gateway status` lists tickets found abandoned: a day of lands.
 const LAND_TURN_ABANDONED_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The land queues on this host and the tickets found abandoned in the last day, read without
-/// taking a turn. A queue that cannot be read is the status's error string, not a failed status:
-/// the rest of the status still answers.
-fn observe_land_turns(home: &Path) -> (Vec<LandTurnQueue>, Option<String>) {
+/// The land queues the gateway at `socket` keeps and the tickets abandoned in the last day, read
+/// without taking a turn; none when no gateway is loaded, since the queues live in it. A gateway
+/// that does not answer `land-turns` is the status's error string, not a failed status: the rest
+/// of the status still answers.
+async fn observe_land_turns(
+    socket: &Path,
+    installed: bool,
+) -> (Vec<LandTurnQueue>, Option<String>) {
+    if !installed {
+        return (Vec::new(), None);
+    }
     let since = std::time::SystemTime::now()
         .checked_sub(LAND_TURN_ABANDONED_WINDOW)
         .and_then(|since| since.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
-    match turns::observe_all(
-        &turns::land_turn_root(&support_directory(home)),
-        Some(since),
-    ) {
-        Ok(queues) => (
-            queues
-                .into_iter()
-                .map(|turns| LandTurnQueue {
-                    repo: turns.repo,
-                    tickets: turns.tickets,
-                    abandoned: turns.abandoned,
-                })
-                .collect(),
-            None,
-        ),
+    let listed = match GatewayControlClient::new(socket.to_path_buf()) {
+        Ok(client) => client.land_turns(since).await,
+        Err(error) => Err(error),
+    };
+    match listed {
+        Ok(queues) => (queues, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     }
 }
@@ -1590,20 +1592,25 @@ fn read_image_cleanup(store: &Path) -> ImageCleanup {
 ///
 /// A restart between a land's steps refused its next step's connection. Checked under the install
 /// slot, which every later land step waits for, so nothing this check did not see starts before
-/// the restart. The land turns are read from their tickets without taking a turn; a queue that
-/// cannot be read refuses too, since not knowing whether a land runs is no permission.
-fn refuse_restart_while_busy(_slot: &InstallSlot, home: &Path) -> Result<()> {
-    let root = turns::land_turn_root(&support_directory(home));
-    let lands = turns::observe_all(&root, None).map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "this install cannot tell whether a land runs, so it installed and restarted \
-                 nothing: the land turns in {} cannot be read: {error}",
-                root.display()
-            ),
-            format!("make {} readable, then rerun", root.display()),
-        )
-    })?;
+/// the restart. The land turns are the gateway's own state, read without taking a turn. A gateway
+/// that does not answer `land-turns`, a build from before them, names no land turn, and that is
+/// said.
+async fn refuse_restart_while_busy(
+    _slot: &InstallSlot,
+    client: &GatewayControlClient,
+    stderr: &mut impl Write,
+) -> Result<()> {
+    let lands = match client.land_turns(u64::MAX).await {
+        Ok(lands) => lands,
+        Err(error) => {
+            writeln!(
+                stderr,
+                "cowshed: the running gateway does not answer land-turns, so no land turn of it is known: {error}"
+            )
+            .map_err(output_error)?;
+            Vec::new()
+        }
+    };
     match agent_cycle::refusal(&agent_cycle::restart_blockers(&lands)) {
         Some(refusal) => Err(refusal),
         None => Ok(()),
@@ -2093,10 +2100,7 @@ pub fn emit_gateway_status<W: Write, E: Write>(
                     abandoned.ticket.pid,
                     local_clock(abandoned.at_unix_ms),
                     local_clock(abandoned.ticket.asked_unix_ms),
-                    abandoned
-                        .outcome
-                        .as_deref()
-                        .unwrap_or("no outcome recorded")
+                    abandoned.reason
                 ))
                 .map_err(output_error)?;
         }
@@ -2119,9 +2123,14 @@ fn land_turn_line(queue: &LandTurnQueue) -> String {
         return format!("land turn {}: no live ticket", queue.repo);
     };
     let holds = format!(
-        "{} holds it (pid {}, asked {})",
+        "{} holds it (pid {}{}, asked {})",
         holder.workspace,
         holder.pid,
+        holder
+            .bound
+            .iter()
+            .map(|pid| format!(", command pid {pid}"))
+            .collect::<String>(),
         local_clock(holder.asked_unix_ms)
     );
     if waiting.is_empty() {
@@ -3065,7 +3074,10 @@ pub async fn refresh_gateway_binary(
         None => None,
     };
     // Only a daemon that answers is one a restart would cut a land off from.
-    let answering = daemon.is_some().then_some(slot);
+    let answering = client
+        .as_ref()
+        .filter(|_| daemon.is_some())
+        .map(|client| (slot, client));
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     // Held until the restarted gateway serves (`await_healthy` below).
     let _carrying = carry_listeners(&socket, downgrade);
@@ -3112,8 +3124,8 @@ struct IncomingBuild<'a> {
     basis: Result<()>,
 }
 
-/// [`refresh_gateway_binary`] with its inputs given. `answering` is the install slot when a
-/// daemon answered: every refresh that gets past the no-op return activates the agent, which
+/// [`refresh_gateway_binary`] with its inputs given. `answering` is the install slot and the
+/// client of a daemon that answered: every refresh that gets past the no-op return activates the agent, which
 /// restarts that daemon, so it is first refused while a land runs
 /// ([`refuse_restart_while_busy`]). `bun` is asked only when a gateway agent is installed: a host
 /// without one needs no interpreter.
@@ -3126,7 +3138,7 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     home: &Path,
     incoming: IncomingBuild<'_>,
     daemon: Option<&DaemonStatus>,
-    answering: Option<&InstallSlot>,
+    answering: Option<(&InstallSlot, &GatewayControlClient)>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
     bun: impl FnOnce() -> Result<BunDirectory>,
     identity: impl FnOnce() -> Result<SigningIdentity>,
@@ -3179,8 +3191,8 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     let restarts = binary_is_stale || daemon_is_stale || !plan.is_noop();
     // Before anything is installed: a refusal leaves the installed cowshed and the gateway as
     // they were.
-    if restarts && let Some(slot) = answering {
-        refuse_restart_while_busy(slot, home)?;
+    if restarts && let Some((slot, client)) = answering {
+        refuse_restart_while_busy(slot, client, &mut Blocking::new(io::stderr())).await?;
     }
     // The packaged Nx cache server is part of this build's install. A current agent is still
     // repaired, so this runs before the no-op return and before any activation: a missing
@@ -5157,6 +5169,8 @@ mod tests {
         };
 
         use super::*;
+        use cowshed_core::host_dirs::support_directory;
+        use cowshed_core::land_turn as turns;
 
         struct NoCredentials;
 
@@ -5278,7 +5292,7 @@ mod tests {
         /// as `run_daemon` composes them, under `root` with the socket of the supervisor of each
         /// of `workspaces` under `run`. The root goes with the daemon on every exit path.
         struct Daemon {
-            _root: crate::temp_root::TempRoot,
+            root: crate::temp_root::TempRoot,
             socket: PathBuf,
             gateway: Gateway,
             recovery: Recovery,
@@ -5328,7 +5342,7 @@ mod tests {
             .await
             .expect("start the gateway");
             Daemon {
-                _root: root,
+                root,
                 socket,
                 gateway,
                 recovery,
@@ -5456,28 +5470,37 @@ mod tests {
         /// anything, while a land holds its turn, naming it; with none it goes on. It never waits.
         #[tokio::test]
         async fn an_install_refuses_while_a_land_turn_runs() {
-            let home = super::scratch_root("install-refuses-land");
+            let heal = Arc::new(StartupHealState::mounting(0));
+            heal.restored();
+            let daemon = daemon(gateway_root("csinstland"), &[], heal).await;
+            let client = GatewayControlClient::new(daemon.socket.clone()).expect("client");
+            let home = daemon.root.to_path_buf();
             let support = support_directory(&home);
             fs::create_dir_all(&support).expect("support directory");
             let slot = InstallSlot::take(&support).await.expect("the slot");
-            refuse_restart_while_busy(&slot, &home).expect("nothing runs");
+            let mut said = Vec::new();
+            refuse_restart_while_busy(&slot, &client, &mut said)
+                .await
+                .expect("nothing runs");
+            assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
 
-            let queue = turns::land_turn_root(&support).join("acme-widget");
-            let turn = tokio::task::spawn_blocking(move || {
-                turns::take(
-                    &queue,
-                    "widget-land",
-                    "land",
-                    None,
-                    Duration::from_secs(90),
-                    |_| {},
-                )
-            })
+            let turn = turns::take(
+                &daemon.socket,
+                &turns::TurnAsk {
+                    repo: cowshed_core::api::dto::LandTurnName::new("acme-widget")
+                        .expect("a queue name"),
+                    workspace: "widget-land".to_owned(),
+                    command: "land".to_owned(),
+                },
+                None,
+                Duration::from_secs(90),
+                |_| {},
+            )
             .await
-            .expect("the turn task")
             .expect("the turn");
-            let refused =
-                refuse_restart_while_busy(&slot, &home).expect_err("a land holds its turn");
+            let refused = refuse_restart_while_busy(&slot, &client, &mut said)
+                .await
+                .expect_err("a land holds its turn");
             assert_eq!(refused.code, ErrorCode::Conflict);
             assert!(
                 refused
@@ -5487,9 +5510,25 @@ mod tests {
                 refused.message
             );
             drop(turn);
-            refuse_restart_while_busy(&slot, &home).expect("nothing runs any more");
-            drop(slot);
-            fs::remove_dir_all(home).ok();
+            // The gateway ends the turn once it reads the connection's close.
+            tokio::time::timeout(cowshed_os::test_backstop::NO_PROGRESS, async {
+                while !client
+                    .land_turns(u64::MAX)
+                    .await
+                    .expect("the land turns")
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the gateway ended the turn before the no-progress backstop");
+            refuse_restart_while_busy(&slot, &client, &mut said)
+                .await
+                .expect("nothing runs any more");
+            assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
+
+            daemon.gateway.drain().await.expect("drain the gateway");
         }
 
         /// A gateway that takes the connection and never answers fails each status probe on its

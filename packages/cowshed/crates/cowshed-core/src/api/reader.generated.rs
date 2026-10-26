@@ -27,6 +27,8 @@ static ABANDONED_WORK: Reader = Reader::Record(&[
     ("preserved", &ABANDONED_PRESERVATION),
     ("bundle", &LEAF),
 ]);
+static ABANDONMENT: Reader =
+    Reader::Record(&[("atUnixMs", &LEAF), ("ticket", &TICKET), ("reason", &LEAF)]);
 static ADOPTION: Reader = Reader::Internal {
     tag: "kind",
     arms: &[
@@ -586,7 +588,7 @@ static LAND_SEED__UNCHANGED: Reader = Reader::Record(&[]);
 static LAND_TURN_QUEUE: Reader = Reader::Record(&[
     ("repo", &LEAF),
     ("tickets", &SEQ__TICKET),
-    ("abandoned", &SEQ__TURN_EVENT),
+    ("abandoned", &SEQ__ABANDONMENT),
 ]);
 static LEAF: Reader = Reader::Leaf;
 static LOAD_AVERAGES: Reader =
@@ -933,6 +935,7 @@ static SEALED_JOB_REF: Reader = Reader::Record(&[
     ("outlived", &SEQ__OUTLIVED_PROCESS),
     ("outlivedIncomplete", &LEAF),
 ]);
+static SEQ__ABANDONMENT: Reader = Reader::Seq(&ABANDONMENT);
 static SEQ__BOUND_IDENTITY: Reader = Reader::Seq(&BOUND_IDENTITY);
 static SEQ__BRANCH_LANDING: Reader = Reader::Seq(&BRANCH_LANDING);
 static SEQ__BUILD_STATE_LINK: Reader = Reader::Seq(&BUILD_STATE_LINK);
@@ -963,7 +966,6 @@ static SEQ__SIM_VERB: Reader = Reader::Seq(&SIM_VERB);
 static SEQ__SKILL_INSTALL: Reader = Reader::Seq(&SKILL_INSTALL);
 static SEQ__TAGGED_BYTES_REF: Reader = Reader::Seq(&TAGGED_BYTES_REF);
 static SEQ__TICKET: Reader = Reader::Seq(&TICKET);
-static SEQ__TURN_EVENT: Reader = Reader::Seq(&TURN_EVENT);
 static SEQ__UNANSWERED_SUPERVISOR: Reader = Reader::Seq(&UNANSWERED_SUPERVISOR);
 static SEQ__UNATTRIBUTED_CHECK: Reader = Reader::Seq(&UNATTRIBUTED_CHECK);
 static SEQ__UNLANDED_PATH: Reader = Reader::Seq(&UNLANDED_PATH);
@@ -1025,6 +1027,7 @@ static TICKET: Reader = Reader::Record(&[
     ("workspace", &LEAF),
     ("askedUnixMs", &LEAF),
     ("command", &LEAF),
+    ("bound", &LEAF),
 ]);
 static TRACE_CONTEXT: Reader = Reader::Record(&[("traceId", &LEAF), ("spanId", &LEAF)]);
 static TREE_HOLDER: Reader = Reader::Record(&[
@@ -1039,18 +1042,6 @@ static TREE_HOLD_KIND: Reader = Reader::External(&[
     ("executable", &LEAF),
     ("open-file", &LEAF),
     ("mapped-file", &LEAF),
-]);
-static TURN_EVENT: Reader = Reader::Record(&[
-    ("atUnixMs", &LEAF),
-    ("event", &TURN_EVENT_KIND),
-    ("ticket", &TICKET),
-    ("outcome", &LEAF),
-]);
-static TURN_EVENT_KIND: Reader = Reader::External(&[
-    ("queued", &LEAF),
-    ("taken", &LEAF),
-    ("finished", &LEAF),
-    ("abandoned", &LEAF),
 ]);
 static UNANSWERED_SUPERVISOR: Reader = Reader::Record(&[("socket", &LEAF), ("error", &LEAF)]);
 static UNATTRIBUTED_CHECK: Reader = Reader::Record(&[

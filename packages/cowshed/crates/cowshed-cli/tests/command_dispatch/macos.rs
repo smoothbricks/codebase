@@ -3446,23 +3446,10 @@ async fn directory_a_land_fences_the_target_head_under_the_writers_ref_turn_subs
     let mut fixture = Fixture::directory();
     let mut service = serve_project(&mut fixture, &[]).await;
     let main = fixture.checkout.clone();
-    // The queue `cowshed land-turn` and the land's fence share: the store's land-turn root, under
-    // a name no other run takes, removed at the end.
+    // The queue `cowshed land-turn` and the land's fence share on the fixture's gateway, under a
+    // name no other run takes.
     let queue = format!("dispatch-ref-turn-{}", std::process::id());
-    let directory = fixture.storage.land_turn_root().join(&queue);
-    // Removed however the case ends, a failed assertion included.
-    struct RemoveQueue(PathBuf);
-    impl Drop for RemoveQueue {
-        fn drop(&mut self) {
-            if let Err(error) = fs::remove_dir_all(&self.0) {
-                cowshed_os::eprintln!(
-                    "cannot remove the test's ref turn queue {}: {error}",
-                    self.0.display()
-                );
-            }
-        }
-    }
-    let _remove_queue = RemoveQueue(directory.clone());
+    let socket = fixture.storage.control_socket();
     let topic = new_workspace(&mut service, "topic").await;
     fs::write(topic.join("topic.txt"), b"topic\n").unwrap();
     git(&topic, &["add", "topic.txt"]);
@@ -3471,36 +3458,51 @@ async fn directory_a_land_fences_the_target_head_under_the_writers_ref_turn_subs
     let checked = topic.join(".git/ref-fence-checked");
 
     let writer = cowshed_core::land_turn::take(
-        &directory,
-        "doc-commit",
-        "git commit",
+        &socket,
+        &cowshed_core::land_turn::TurnAsk {
+            repo: cowshed_core::api::dto::LandTurnName::new(queue.clone()).expect("a queue name"),
+            workspace: "doc-commit".to_owned(),
+            command: "git commit".to_owned(),
+        },
         None,
         Duration::from_secs(10),
         |_| panic!("the writer is first in its queue"),
     )
+    .await
     .expect("the writer took the ref turn");
-    let land = run(
-        &mut service,
-        [
-            "--json",
-            "land",
-            "topic",
-            "--ref-turn",
-            &queue,
-            "--expected-target-head",
-            &main_head,
-            "--check",
-            "/usr/bin/touch .git/ref-fence-checked",
-        ],
-    );
-    let doc_commit = async {
-        eventually(|| checked.exists()).await;
+    let (result, stderr) = {
+        let land = run(
+            &mut service,
+            [
+                "--json",
+                "land",
+                "topic",
+                "--ref-turn",
+                &queue,
+                "--expected-target-head",
+                &main_head,
+                "--check",
+                "/usr/bin/touch .git/ref-fence-checked",
+            ],
+        );
+        let mut land = std::pin::pin!(land);
+        tokio::select! {
+            ended = &mut land => {
+                let (result, _, stderr) = ended;
+                panic!(
+                    "the land ended before its check ran, so the writer never committed: {result:?}\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            () = eventually(|| checked.exists()) => {}
+        }
         fs::write(main.join("doc.md"), b"doc\n").unwrap();
         git(&main, &["add", "doc.md"]);
         git(&main, &["commit", "-q", "-m", "doc"]);
         writer.end("committed".to_owned());
+        let (result, _, stderr) = land.await;
+        (result, stderr)
     };
-    let ((result, _, stderr), ()) = tokio::join!(land, doc_commit);
     let error = result.expect_err("a land whose target moved under the ref turn landed");
     assert!(
         matches!(
@@ -3534,9 +3536,9 @@ async fn directory_a_land_fences_the_target_head_under_the_writers_ref_turn_subs
     .await;
     assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), rebased);
     assert_eq!(
-        cowshed_core::land_turn::observe(&directory).expect("read the ref turn's queue"),
+        settled_land_turn(&socket, &queue).await,
         [],
-        "a land kept the ref turn after it returned"
+        "the writer and the land each ended the ref turn, neither abandoned it"
     );
     service
         .shutdown()
@@ -7908,7 +7910,7 @@ impl DeclaredLand {
             format!(
                 "echo \"$1\" >> '{gates}'\n\
                  if [ \"$(wc -l < '{gates}')\" -eq 1 ]; then\n\
-                 HOME='{home}' '{cowshed}' --project '{main}' doc-commit -m 'docs: race the gate' --patch '{patch}' || exit 9\n\
+                 HOME='{home}' '{cowshed}' --project '{main}' doc-commit -m 'docs: race the gate' --patch '{patch}' --gateway-socket '{socket}' || exit 9\n\
                  fi\n\
                  exit {gate_exit}\n",
                 gates = gates.display(),
@@ -7916,6 +7918,7 @@ impl DeclaredLand {
                 cowshed = cowshed().display(),
                 main = main.display(),
                 patch = patch.display(),
+                socket = fixture.storage.control_socket().display(),
             ),
         )
         .expect("write the gate");
@@ -7959,16 +7962,59 @@ impl DeclaredLand {
             .unwrap_or_default()
     }
 
-    /// Waits for the detached after-land child to have recorded `count` lines.
+    /// Waits for the detached after-land child to have recorded `count` lines. Nothing announces
+    /// that child's writes: it runs detached in a session of its own, is no child of the test's,
+    /// and holds nothing the test can wait on, so the log is read again until the no-progress
+    /// backstop.
     fn wait_for_lands(&self, count: usize) -> Vec<cowshed_core::declared_land::LandRecord> {
+        let backstop = Instant::now() + cowshed_os::test_backstop::NO_PROGRESS;
         loop {
             let lands = self.lands();
             if lands.len() >= count {
                 return lands;
             }
+            assert!(
+                Instant::now() < backstop,
+                "the after-land child recorded {} of {count} lands.log lines before the no-progress backstop: {lands:?}",
+                lands.len()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// The tickets the fixture gateway at `socket` recorded abandoned in the land turn `turn`, read
+/// while a probe holds that turn: the gateway gives the probe the turn only once it has processed
+/// the departure of every ticket asked before it. A land ends its turn with its outcome, so none
+/// is abandoned.
+async fn settled_land_turn(socket: &Path, turn: &str) -> Vec<cowshed_core::land_turn::Abandonment> {
+    let probe = tokio::time::timeout(
+        cowshed_os::test_backstop::NO_PROGRESS,
+        cowshed_core::land_turn::take(
+            socket,
+            &cowshed_core::land_turn::TurnAsk {
+                repo: cowshed_core::api::dto::LandTurnName::new(turn).expect("a land turn name"),
+                workspace: "probe".to_owned(),
+                command: "probe".to_owned(),
+            },
+            None,
+            Duration::from_secs(90),
+            |_| {},
+        ),
+    )
+    .await
+    .expect("the probe holds the land turn before the no-progress backstop")
+    .expect("the probe takes the land turn");
+    let queue = cowshed_gateway::GatewayControlClient::new(socket.to_owned())
+        .expect("a gateway client")
+        .land_turns(0)
+        .await
+        .expect("read the land turns")
+        .into_iter()
+        .find(|queue| queue.repo.as_str() == turn)
+        .expect("the probe's land turn is listed");
+    probe.end("probed".to_owned());
+    queue.abandoned
 }
 
 /// A declared land is the whole route in one verb: it rebases, runs the repository's gate, finds
@@ -8043,10 +8089,10 @@ async fn directory_a_declared_land_regates_over_a_racing_doc_commit_lands_and_pu
         fs::read_to_string(&declared.after).expect("the after command ran"),
         format!("{} {head}\n", before.as_str())
     );
-    let turns = fs::read_to_string(declared.turn.join("turns.log")).expect("the land turn's log");
-    assert!(
-        turns.contains(&format!("landed {head}")),
-        "the land ended its turn recording what landed: {turns}"
+    assert_eq!(
+        settled_land_turn(&fixture.storage.control_socket(), &turn).await,
+        [],
+        "the land ended its turn with what landed, never abandoned it"
     );
     service
         .shutdown()
@@ -8116,6 +8162,161 @@ async fn directory_a_declared_land_with_no_push_and_no_retire_records_unpushed_a
         .expect("stop the real directory project");
 }
 
+/// A declared land of a workspace with no commit of its own, when main has already moved to the
+/// head the workspace is rebased onto: the land records main's head before it and the head it
+/// lands, both the same, so it pushes nothing, though its after-land command still runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_of_a_head_main_already_holds_pushes_nothing_substrate_lifecycle()
+{
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-held-{}", std::process::id());
+    let declared = DeclaredLand::declare(&fixture, &turn, 0);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let declared_head = git_stdout(&declared.main, &["rev-parse", "HEAD"]);
+    let topic = new_workspace(&mut service, "topic").await;
+
+    let (stdout, stderr) = succeed(&mut service, ["--json", "land", "topic"]).await;
+    let envelope: JsonEnvelope<LandReport> =
+        serde_json::from_slice(&stdout).expect("the land prints its report");
+    let Some(LandReport::Landed(landed)) = envelope.result() else {
+        panic!("a declared land answers a landed report: {envelope:?}\n{stderr}");
+    };
+    assert_eq!(
+        declared.gated(),
+        ["topic", "topic"],
+        "the racing doc commit sent the land back to gate again\n{stderr}"
+    );
+    let head = git_stdout(&declared.main, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        landed.landed_head.as_str(),
+        head,
+        "main is at the landed head"
+    );
+    assert_eq!(
+        git_stdout(
+            &declared.main,
+            &["log", "--format=%s", &format!("{declared_head}..HEAD")]
+        ),
+        "docs: race the gate",
+        "the workspace had no commit of its own to land"
+    );
+    assert!(landed.retired, "the land retired its workspace: {landed:?}");
+    assert!(!topic.exists(), "the retired workspace is gone");
+
+    let lands = declared.wait_for_lands(2);
+    use cowshed_core::declared_land::LandEvent;
+    assert_eq!(
+        lands.iter().map(|record| record.event).collect::<Vec<_>>(),
+        [LandEvent::Landed, LandEvent::AfterExited],
+        "{lands:?}"
+    );
+    assert!(lands.iter().all(|record| record.head.as_str() == head));
+    let before = lands[0]
+        .before
+        .as_ref()
+        .expect("a land records main's head before it");
+    assert_eq!(
+        before.as_str(),
+        head,
+        "main already held the head the land lands"
+    );
+    assert_eq!(
+        git_stdout(&declared.remote, &["for-each-ref", "--format=%(refname)"]),
+        "",
+        "main already held the land's head, so nothing was pushed"
+    );
+    assert_eq!(
+        fs::read_to_string(&declared.after).expect("the after command ran"),
+        format!("{head} {head}\n")
+    );
+    assert_eq!(
+        settled_land_turn(&fixture.storage.control_socket(), &turn).await,
+        [],
+        "the land ended its turn with what landed, never abandoned it"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+/// A declared land whose retire is refused still lands and pushes: a process cowshed does not run
+/// holds the workspace's mount, so the retire the land ends with is refused and the workspace is
+/// kept, yet main moved, so the land records it landed, pushes it, and runs its after-land command.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_whose_retire_is_refused_still_pushes_substrate_lifecycle() {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-kept-{}", std::process::id());
+    let declared = DeclaredLand::declare(&fixture, &turn, 0);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let declared_head = git_stdout(&declared.main, &["rev-parse", "HEAD"]);
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    // The land's rebase and fast-forward take no census of the mount; only the retire does, and it
+    // refuses to remove a mount that a process cowshed does not run still holds.
+    let mut holders = HostProcesses(Vec::new());
+    let holder = holders.start(&topic, None);
+
+    let (refused, _, stderr) = run(&mut service, ["--json", "land", "topic"]).await;
+    let refused = refused.expect_err(&format!(
+        "a process cowshed does not run holds the mount, so the retire is refused; {}",
+        String::from_utf8_lossy(&stderr)
+    ));
+    assert_eq!(refused.code, ErrorCode::Conflict, "{refused}");
+    assert!(
+        refused.message.contains("but workspace topic was kept")
+            && refused.message.contains("cowshed does not run")
+            && refused.message.contains(&format!("pid {holder} (")),
+        "{}",
+        refused.message
+    );
+    assert!(topic.exists(), "the held workspace was kept");
+    let head = git_stdout(&declared.main, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git_stdout(
+            &declared.main,
+            &["log", "--format=%s", &format!("{declared_head}..HEAD")]
+        ),
+        "topic\ndocs: race the gate",
+        "the workspace landed rebased onto the doc commit"
+    );
+    assert!(declared.main.join("topic.txt").is_file());
+
+    let lands = declared.wait_for_lands(3);
+    use cowshed_core::declared_land::LandEvent;
+    assert_eq!(
+        lands.iter().map(|record| record.event).collect::<Vec<_>>(),
+        [LandEvent::Landed, LandEvent::Pushed, LandEvent::AfterExited],
+        "{lands:?}"
+    );
+    assert!(lands.iter().all(|record| record.head.as_str() == head));
+    let before = lands[0]
+        .before
+        .as_ref()
+        .expect("a land records main's head before it");
+    assert_eq!(
+        git_stdout(&declared.remote, &["rev-parse", "main"]),
+        head,
+        "the after-land child pushed main although the retire was refused"
+    );
+    assert_eq!(
+        fs::read_to_string(&declared.after).expect("the after command ran"),
+        format!("{} {head}\n", before.as_str())
+    );
+    assert_eq!(
+        settled_land_turn(&fixture.storage.control_socket(), &turn).await,
+        [],
+        "the land ended its turn with what landed, never abandoned it"
+    );
+    holders.end();
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
 /// A declared gate that fails stops the land: exit 4 naming the gate, main where it was, the
 /// workspace kept, and the turn ended with the refusal.
 #[tokio::test(flavor = "multi_thread")]
@@ -8148,8 +8349,11 @@ async fn directory_a_declared_land_whose_gate_fails_keeps_main_and_the_workspace
         declared.lands().is_empty(),
         "nothing landed, so nothing is recorded"
     );
-    let turns = fs::read_to_string(declared.turn.join("turns.log")).expect("the land turn's log");
-    assert!(turns.contains("refused: the declared gate"), "{turns}");
+    assert_eq!(
+        settled_land_turn(&fixture.storage.control_socket(), &turn).await,
+        [],
+        "the refused land ended its turn, never abandoned it"
+    );
 
     // The primitive's fences are the route's own.
     let (result, _, _) = run(&mut service, ["land", "topic", "--check", "true"]).await;

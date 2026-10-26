@@ -221,8 +221,6 @@ describe('canCancelOwner', () => {
 describe('Fixture', () => {
   it('releases a run that opens its fifo only after disposal began', async () => {
     const fixture = await Fixture.create('cowshed-launch-fixture-');
-    const previous = process.env.HOME;
-    process.env.HOME = fixture.root;
     try {
       const started = fixture.fifo('started', 0);
       const gate = fixture.fifo('gate', 1);
@@ -230,8 +228,8 @@ describe('Fixture', () => {
       // The child opens `later` only after disposal hands `gate` its line, so that open happens
       // after the peers exist, whatever the scheduling.
       const run = fixture.own(
-        await spawnLandTurn({
-          repo: 'fixture-witness',
+        await spawnLock({
+          path: join(fixture.root, 'lock'),
           argv: ['sh', '-c', 'echo started > "$1"; read x < "$2"; read y < "$3"', 'sh', started, gate, later],
         }),
         nothing,
@@ -241,7 +239,6 @@ describe('Fixture', () => {
       expect(await run.exit).toEqual(exited(0));
     } finally {
       await fixture.dispose();
-      process.env.HOME = previous;
     }
   });
 });
@@ -392,47 +389,22 @@ describe('spawnSubtreeRoot', () => {
 });
 
 describe('spawnLandTurn', () => {
-  it('starts a land only after the turn ahead of it ended with its child', async () => {
+  it('fails with a wrapper exit code when its gateway does not answer', async () => {
     const fixture = await Fixture.create('cowshed-launch-land-');
-    const previous = process.env.HOME;
-    process.env.HOME = fixture.root;
     try {
-      const log = join(fixture.root, 'log');
-      const started = fixture.fifo('started', 0);
-      const release = fixture.fifo('release', 1);
-      // A land's turn ends with its child, so releasing the fifos ends both at disposal.
-      const first = fixture.own(
+      // Nothing listens at absent.sock, so the verb cannot take the turn: it ends with its
+      // environment-missing wrapper code (104) and never starts the command.
+      const run = fixture.own(
         await spawnLandTurn({
           repo: 'launcher-witness',
-          workspace: 'first',
-          argv: [
-            'sh',
-            '-c',
-            'echo A-start >> "$1"; echo started > "$2"; read x < "$3"; echo A-end >> "$1"',
-            'sh',
-            log,
-            started,
-            release,
-          ],
+          gatewaySocket: join(fixture.root, 'absent.sock'),
+          argv: ['true'],
         }),
         nothing,
       );
-      expect(await heard(started, first)).toBe('started\n');
-      const second = fixture.own(
-        await spawnLandTurn({
-          repo: 'launcher-witness',
-          workspace: 'second',
-          argv: ['sh', '-c', 'echo B >> "$1"', 'sh', log],
-        }),
-        nothing,
-      );
-      await writeFile(release, 'go\n');
-      expect(await first.exit).toEqual(exited(0));
-      expect(await second.exit).toEqual(exited(0));
-      expect(await readFile(log, 'utf8')).toBe('A-start\nA-end\nB\n');
+      expect(await run.exit).toEqual(exited(104));
     } finally {
       await fixture.dispose();
-      process.env.HOME = previous;
     }
   });
 });

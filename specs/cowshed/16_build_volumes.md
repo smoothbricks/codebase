@@ -525,11 +525,12 @@ faster than it catches up, is started again by the next land that freezes main's
   published, for a catch-up to read which blocks a newer seed still shares with it. Forks and lands of main proceed
   throughout the copy and clone the seed as it stands.
 - **It holds for lands.** After its first chunk and every GiB after that, the copy, and a catch-up's writes and its
-  punches of at most 8 MiB alike, ask whether a land holds or waits for any repository's turn (05_gateway.md, "Land
-  turns"); a land that starts the compaction still holds its own turn. A gate-class job outside a land does not hold it:
-  a class is a nice, not a lock (05_gateway.md, "Classes"). While a land runs, the writer holds where it is, says once
-  in its log what it waits for, and checks again every **15 s**; it says how long it waited when it goes on. If the land
-  turns cannot be read, it stops, and the copy is removed. The seed is left as it was.
+  punches of at most 8 MiB alike, ask the gateway whether a land holds or waits for any repository's turn
+  (05_gateway.md, "Land turns"); a land that starts the compaction still holds its own turn. A gate-class job outside a
+  land does not hold it: a class is a nice, not a lock (05_gateway.md, "Classes"). While a land runs, the writer holds
+  where it is, says once in its log what it waits for, and checks again every **15 s**; it says how long it waited when
+  it goes on. If the gateway's answer cannot be read, it stops, and the copy is removed. The seed is left as it was. A
+  gateway that is not running holds no land turn: the turns are its own state.
 - **Publication.** Under main's image lock again, main's seed is refreshed once more exactly as a fork of main refreshes
   it, so a write main's live volume took during the copy reaches the seed now rather than at the next fork. The copy is
   published only if the seed it holds is still main's latest. It is registered as a new seed of main at that seed's tree

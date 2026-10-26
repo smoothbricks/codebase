@@ -95,6 +95,12 @@ pub trait GatewayControl: Send + Sync {
         workspace_id: &str,
         expected_revision: u64,
     ) -> std::result::Result<(), ControlRefusal>;
+    /// The land queues the gateway keeps, each first ticket holding its turn (05_gateway.md "Land
+    /// turns"), without the abandoned ones: a seed compaction's copy holds while any turn is held
+    /// (16_build_volumes.md, "Seed compaction"). No daemon holds none: the turns are its state.
+    async fn land_turns(
+        &self,
+    ) -> std::result::Result<Vec<crate::api::dto::LandTurnQueue>, GatewayStatusError>;
 }
 
 /// The composition root constructs one owned control client from validated host storage.

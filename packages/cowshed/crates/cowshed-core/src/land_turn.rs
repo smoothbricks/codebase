@@ -7,14 +7,14 @@
 //! 72-commit train queued behind one land, and when that land released, a land that had asked
 //! after the train took the turn and held it for 36 minutes.
 //!
-//! So a land takes a numbered ticket and waits for its turn. Each ticket is a file in the
-//! repository's directory, exclusively locked for as long as the land or any process handed its
-//! descriptor holds or waits for the turn. The kernel drops the lock when the last inherited
-//! description closes; a ticket whose lock is free is dead and is removed by whoever finds it.
-//! Numbers are given out under the directory's `.seq` lock, each above every ticket present, so
-//! the live tickets are in the order their lands asked. The lowest number holds the turn; every other
-//! waits on the lock of the live ticket just ahead of it and, when that ends, looks again. Nothing
-//! polls, and nobody but the next in line is woken.
+//! So a land asks the gateway, whose actor keeps every repository's queue: first asked, first
+//! served, the head holding the turn. The gateway names the asker by the kernel's identity of its
+//! connection's peer and tells it who holds the turn and how many are ahead until the turn is its
+//! own. A turn is held by processes, never by descriptors: by its asker until the asker ends it,
+//! closes its connection or exits, and by each command the asker binds to it until that command
+//! exits. Measured 2026-10-25: tickets held through an inherited `flock(2)` description kept a turn
+//! held for as long as any descendant of the land lived, the image cleanup's deletion children
+//! among them, and listed tickets whose processes had exited.
 //!
 //! The head then takes the outside lock, the file lands took before every caller asked for turns.
 //! A process outside the queue holding it records nothing, so while the head waits it names the
@@ -22,32 +22,50 @@
 //! land waited 1002 s behind an outside holder having said once that "a land that did not ask
 //! for a turn" held it, and nothing named the process.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, RawFd};
-use std::os::unix::fs::FileExt as _;
+use std::io;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use cowshed_os::fork_lock::Fenced;
 use cowshed_os::process::Holder;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+use tokio::net::UnixStream;
 
+use crate::api::dto::LandTurnName;
 use crate::held_lock::{HeldLock, Opened};
 
-/// The directory holding every repository's land turns: beside the install slot, in the host's
-/// support directory, which only this user writes.
+/// The gateway control operation that asks for a land turn: the connection that asks it is the
+/// asker's place in the queue for as long as it is open.
+pub const LAND_TURN_OP: &str = "land-turn";
+/// The one-shot gateway control operation that lists every repository's land turns.
+pub const LAND_TURNS_OP: &str = "land-turns";
+
+/// The directory of every repository's land records: a declared land's `lands.log` and its
+/// commands' output (02_workspaces.md "A declared land"), beside the install slot in the host's
+/// support directory, which only this user writes. The queues themselves are the gateway's.
 pub fn land_turn_root(support_directory: &Path) -> PathBuf {
     support_directory.join("land-turn")
 }
 
-/// One land's place in its repository's queue, as its ticket file records it.
+/// What a land asks for: its repository's queue, the workspace it lands, and the command its turn
+/// runs, which the queue names to whoever waits behind it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnAsk {
+    pub repo: LandTurnName,
+    pub workspace: String,
+    pub command: String,
+}
+
+/// One land's place in its repository's queue, as the gateway records it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Ticket {
     /// The order the land asked in: lower holds the turn first.
     pub number: u64,
-    /// The process that waits for or holds the turn.
+    /// The process that asked for the turn, as the kernel named its connection's peer.
     pub pid: u32,
     /// The workspace the land lands.
     pub workspace: String,
@@ -55,12 +73,57 @@ pub struct Ticket {
     pub asked_unix_ms: u64,
     /// The command the turn runs.
     pub command: String,
+    /// The commands bound to the turn that have not exited, by pid: each holds the turn until it
+    /// exits, and nothing it starts holds it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bound: Vec<u32>,
 }
 
-/// What a waiting land is told: who holds the turn and how many live tickets are ahead of its own.
+/// A land that left its queue without ending its turn: its asker closed its connection, was
+/// killed or crashed before it recorded how its command ended.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Abandonment {
+    /// When the gateway found it gone, in milliseconds since the Unix epoch.
+    pub at_unix_ms: u64,
+    pub ticket: Ticket,
+    /// Whether it held the turn or still waited when it went.
+    pub reason: String,
+}
+
+/// What an asker sends on its connection once its turn is held.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "step", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum TurnStep {
+    /// Bind the command `pid` to the turn: it holds the turn until it exits.
+    Bind { pid: u32 },
+    /// End the asker's hold, recording how its command ended.
+    End { outcome: String },
+}
+
+/// What the gateway answers on a land-turn connection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "turn", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum TurnAnswer {
+    /// The asker waits behind `ahead` tickets, the first of which, `holder`, holds the turn: said
+    /// when it asks and whenever its queue changes.
+    Queued {
+        ticket: Ticket,
+        holder: Ticket,
+        ahead: usize,
+    },
+    /// The turn is the asker's.
+    Held { ticket: Ticket },
+    /// The command `pid` holds the turn until it exits.
+    Bound { pid: u32 },
+    /// The gateway refuses the ask or the step, and why.
+    Refused { error: String },
+}
+
+/// What a waiting land is told: who holds the turn and how many tickets are ahead of its own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Wait {
-    /// Behind `ahead` live tickets, the first of which, `holder`, holds the turn.
+    /// Behind `ahead` tickets, the first of which, `holder`, holds the turn.
     Queued { holder: Ticket, ahead: usize },
     /// At the head, waiting for `lock`, which a process outside the queue holds: a land started
     /// before every caller asked for turns, or anything else that took the file.
@@ -83,7 +146,6 @@ pub enum OutsideHolders {
     /// The census could not be taken, and why.
     Unknown(String),
 }
-
 /// What the land `me`, waiting for the outside lock with its own descriptor open on it, says holds
 /// that lock, given one census `open` of the processes with the file open. Pure: the census is
 /// the caller's.
@@ -103,399 +165,202 @@ pub fn outside_holders(me: i32, open: Result<Vec<Holder>, String>) -> OutsideHol
     }
 }
 
-/// A held turn. Ending it records how the land's command ended. The ticket remains discoverable
-/// until every inherited holder closes it; a later queue scan removes it once its lock is free.
-/// A turn dropped without an explicit end is then recorded as abandoned, not finished.
+/// A held turn, the asker's connection to the gateway. The gateway holds the turn for as long as
+/// the asker holds this, or any command bound to it ([`Self::bind`]) runs. Ending it records how
+/// the land's command ended; dropping it, or this process's exit, ends the asker's hold without an
+/// outcome, which the gateway records as an abandonment.
 #[derive(Debug)]
 pub struct Turn {
-    directory: PathBuf,
     ticket: Ticket,
-    held_ticket: File,
+    connection: Lines<BufReader<Fenced<UnixStream>>>,
+    /// The connection's descriptor, open for as long as `connection` is: a child armed by
+    /// [`Self::bind_at_exec`] writes its bind to it before its exec.
+    socket: RawFd,
     outside: Option<HeldLock>,
 }
 
 impl Turn {
-    /// End the turn, recording `outcome` (how the command ended) in the repository's turn log.
-    pub fn end(self, outcome: String) {
-        // The original JSON has no trailing newline. Append one byte as the completion marker:
-        // every prefix is still valid ticket JSON, including a concurrent reader's snapshot.
-        // The inherited description's cursor is not ours, so never write through that cursor.
-        let marked = self
-            .held_ticket
-            .metadata()
-            .and_then(|metadata| self.held_ticket.write_all_at(b"\n", metadata.len()));
-        if let Err(error) = marked {
+    /// The ticket that holds the turn, as the gateway numbered it.
+    pub fn ticket(&self) -> &Ticket {
+        &self.ticket
+    }
+
+    /// Arm `command` to bind itself to the turn as it starts: between its fork and its exec the
+    /// child writes the bind step naming its own pid on the turn's connection, which it shares
+    /// until its exec closes it (close-on-exec). The gateway reads that step before this process's
+    /// end, which follows it on the connection, so a land killed at any point after the fork leaves
+    /// the command holding the turn, and one killed before the fork started nothing. A child that
+    /// cannot write the step fails before its exec, so its spawn fails and the command never runs.
+    /// The gateway's answer is read by [`Self::bound`] once the spawn has returned; a spawn that
+    /// fails after the child wrote its step leaves that answer unread, so its caller ends the turn.
+    pub fn bind_at_exec(&self, command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt as _;
+
+        let socket = self.socket;
+        // SAFETY: the hook runs in the forked child before its exec and calls only getpid and
+        // write(2), both async-signal-safe, on a stack buffer; it allocates nothing.
+        unsafe {
+            command.pre_exec(move || write_bind(socket, std::process::id()));
+        }
+    }
+
+    /// The gateway's answer to the bind the command `pid`, armed by [`Self::bind_at_exec`] and
+    /// just spawned, wrote: `Ok` once the gateway holds the turn for it until it exits. A command
+    /// that exited before the gateway could watch it holds nothing.
+    pub async fn bound(&mut self, pid: u32) -> io::Result<()> {
+        match answer(&mut self.connection).await? {
+            TurnAnswer::Bound { pid: bound } if bound == pid => Ok(()),
+            TurnAnswer::Refused { error } => Err(io::Error::other(format!(
+                "the gateway refused to bind pid {pid} to land turn ticket {}: {error}",
+                self.ticket.number
+            ))),
+            other => Err(unexpected(&other, "a bind")),
+        }
+    }
+
+    /// End the asker's hold, recording `outcome` (how the command ended). The turn passes on once
+    /// every command bound to it has exited too. An end that cannot be sent is said on stderr; the
+    /// connection then closes without it and the gateway records the turn abandoned.
+    pub fn end(mut self, outcome: String) {
+        let sent = line(&TurnStep::End {
+            outcome: outcome.clone(),
+        })
+        .and_then(
+            |line| match self.connection.get_mut().get_ref().try_write(&line) {
+                Ok(written) if written == line.len() => Ok(()),
+                Ok(written) => Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("{written} of its {} bytes were written", line.len()),
+                )),
+                Err(error) => Err(error),
+            },
+        );
+        if let Err(error) = sent {
             cowshed_os::eprintln!(
-                "cowshed: land turn {}: ticket {} completion marker not written: {error}",
-                self.directory.display(),
+                "cowshed: land turn ticket {}: its end ({outcome}) was not sent to the gateway: \
+                 {error}; the gateway records the turn abandoned",
                 self.ticket.number,
             );
         }
-        // Mark first: a failed log append must not turn an explicitly ended ticket into an
-        // abandonment on the next scan. Neither operation releases an inherited holder.
-        record(
-            &self.directory,
-            &self.ticket,
-            TurnEventKind::Finished,
-            Some(outcome),
-        );
     }
 
-    /// The descriptor of this turn's ticket alone, for a command that holds the turn and no outside
-    /// lock ([`crate::runtime::ref_turn::RefTurn`]).
-    pub fn ticket_descriptor(&self) -> RawFd {
-        self.held_ticket.as_raw_fd()
+    /// The outside lock's descriptor, for the command to inherit
+    /// ([`crate::held_lock::keep_across_exec`]): the kernel keeps that lock until the command, and
+    /// every process it hands the descriptor to, has closed it.
+    pub fn outside_descriptor(&self) -> Option<RawFd> {
+        self.outside.as_ref().map(HeldLock::descriptor)
     }
 
-    /// The descriptors that hold this turn: its ticket's lock and the outside lock's. A command
-    /// handed them ([`crate::held_lock::keep_across_exec`]) holds the turn with this process, so
-    /// the kernel keeps the turn until the command has ended too, however this process ends: no
-    /// command runs outside its turn.
-    pub fn descriptors(&self) -> Vec<RawFd> {
-        std::iter::once(self.held_ticket.as_raw_fd())
-            .chain(self.outside.as_ref().map(HeldLock::descriptor))
-            .collect()
-    }
-}
-
-const TICKET_SUFFIX: &str = ".ticket";
-const SEQ_NAME: &str = ".seq";
-/// The repository's turn log: one JSON line per ticket event, appended, never rewritten.
-const LOG_NAME: &str = "turns.log";
-
-/// What happened to a ticket, as the turn log records it.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TurnEventKind {
-    /// The land asked and took its place in line.
-    Queued,
-    /// The land holds the turn.
-    Taken,
-    /// The land's command ended; `outcome` says how.
-    Finished,
-    /// The land ended without recording an outcome, found unlocked by whoever read the queue
-    /// next. It may have been dropped on an error, killed, crashed, or lost with its session.
-    Abandoned,
-}
-
-/// One line of a repository's turn log.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TurnEvent {
-    /// When it was recorded, in milliseconds since the Unix epoch.
-    pub at_unix_ms: u64,
-    pub event: TurnEventKind,
-    pub ticket: Ticket,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<String>,
-}
-
-fn now_unix_ms() -> u64 {
-    u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
-}
-
-/// Append one event to `directory`'s turn log. A log that cannot be written is said on stderr
-/// and never stops a land: the turn is the kernel's, the log its account.
-fn record(directory: &Path, ticket: &Ticket, event: TurnEventKind, outcome: Option<String>) {
-    let line = TurnEvent {
-        at_unix_ms: now_unix_ms(),
-        event,
-        ticket: ticket.clone(),
-        outcome,
-    };
-    let written = serde_json::to_vec(&line)
-        .map_err(io::Error::other)
-        .and_then(|mut bytes| {
-            bytes.push(b'\n');
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(directory.join(LOG_NAME))?
-                .write_all(&bytes)
-        });
-    if let Err(error) = written {
-        cowshed_os::eprintln!(
-            "cowshed: land turn {}: ticket {} {event:?} not recorded in {}: {error}",
-            directory.display(),
-            ticket.number,
-            directory.join(LOG_NAME).display()
-        );
-    }
-}
-
-/// The `abandoned` events of `directory`'s turn log recorded at or after `since_unix_ms`, oldest
-/// first.
-pub fn abandoned_since(directory: &Path, since_unix_ms: u64) -> io::Result<Vec<TurnEvent>> {
-    let text = match fs::read_to_string(directory.join(LOG_NAME)) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let mut abandoned = Vec::new();
-    for line in text.lines() {
-        let event: TurnEvent = serde_json::from_str(line).map_err(|error| {
-            io::Error::new(
+    /// Resolves once the gateway has closed the connection that holds the turn, and never before:
+    /// the turn is lost with it. Cancel-safe, so a holder waits on it beside its command.
+    pub async fn lost(&mut self) -> io::Error {
+        match self.connection.next_line().await {
+            Ok(None) => io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the gateway closed the connection that holds the turn",
+            ),
+            Ok(Some(line)) => io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "land turn log {}: {error}",
-                    directory.join(LOG_NAME).display()
-                ),
-            )
-        })?;
-        if event.event == TurnEventKind::Abandoned && event.at_unix_ms >= since_unix_ms {
-            abandoned.push(event);
+                format!("the gateway sent {line:?} to a held turn that asked nothing"),
+            ),
+            Err(error) => error,
         }
     }
-    Ok(abandoned)
 }
 
-fn ticket_name(number: u64) -> String {
-    format!("{number:020}{TICKET_SUFFIX}")
+/// One JSON line.
+fn line(value: &impl Serialize) -> io::Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(value).map_err(io::Error::other)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
-fn ticket_number(name: &str) -> Option<u64> {
-    name.strip_suffix(TICKET_SUFFIX)?.parse().ok()
+async fn send(stream: &mut Fenced<UnixStream>, value: &impl Serialize) -> io::Result<()> {
+    stream.write_all(&line(value)?).await
 }
 
-/// Every ticket file in `directory` by number, lowest first, live or not.
-fn ticket_files(directory: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
-    let mut tickets = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if let Some(number) = entry.file_name().to_str().and_then(ticket_number) {
-            tickets.push((number, entry.path()));
-        }
-    }
-    tickets.sort_unstable_by_key(|(number, _)| *number);
-    Ok(tickets)
-}
-
-/// A ticket file opened to read, or `None` once it is gone.
-fn open_ticket(path: &Path) -> io::Result<Option<File>> {
-    match File::open(path) {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// Whether `file`'s owner still holds it. A ticket whose lock is free is dead, and is removed
-/// while this caller holds that lock shared, so no live ticket is ever removed.
-fn live(file: &File, path: &Path) -> io::Result<bool> {
-    match file.try_lock_shared() {
-        Ok(()) => {
-            // Only explicit end appends the completion marker. A dropped turn or a process
-            // killed before ending remains unmarked until its last inherited holder closes.
-            if let (Some(directory), Ok((ticket, false))) = (path.parent(), read_ticket(file, path))
-            {
-                record(
-                    directory,
-                    &ticket,
-                    TurnEventKind::Abandoned,
-                    Some("its land ended without recording an outcome".to_owned()),
-                );
-            }
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            Ok(false)
-        }
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(error),
-    }
-}
-
-fn read_ticket(mut file: &File, path: &Path) -> io::Result<(Ticket, bool)> {
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let finished = bytes.last() == Some(&b'\n');
-    serde_json::from_slice(&bytes)
-        .map(|ticket| (ticket, finished))
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("land turn ticket {}: {error}", path.display()),
-            )
-        })
-}
-
-/// The live tickets of `directory` in turn order, the first holding the turn; dead ones found on
-/// the way are removed. Takes no turn: `gateway status` reads queues this way.
-pub fn observe(directory: &Path) -> io::Result<Vec<Ticket>> {
-    let tickets = match ticket_files(directory) {
-        Ok(tickets) => tickets,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let mut queue = Vec::new();
-    for (_, path) in tickets {
-        let Some(file) = open_ticket(&path)? else {
-            continue;
-        };
-        if live(&file, &path)? {
-            queue.push(read_ticket(&file, &path)?.0);
-        }
-    }
-    Ok(queue)
-}
-
-/// A repository's live tickets, the holder first, and the tickets recently found abandoned.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RepoTurns {
-    pub repo: String,
-    pub tickets: Vec<Ticket>,
-    pub abandoned: Vec<TurnEvent>,
-}
-
-/// Every repository with a live ticket or, when `abandoned_since_unix_ms` is given, a ticket
-/// abandoned at or after it, as `observe` and `abandoned_since` read each. `None` reads no
-/// repository's log: the live tickets alone.
-pub fn observe_all(
-    root: &Path,
-    abandoned_since_unix_ms: Option<u64>,
-) -> io::Result<Vec<RepoTurns>> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let mut repositories = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let Some(repo) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        // Read the queue first: a dead ticket it finds is recorded as abandoned, and then shown.
-        let tickets = observe(&entry.path())?;
-        let abandoned = match abandoned_since_unix_ms {
-            Some(since) => abandoned_since(&entry.path(), since)?,
-            None => Vec::new(),
-        };
-        if !tickets.is_empty() || !abandoned.is_empty() {
-            repositories.push(RepoTurns {
-                repo,
-                tickets,
-                abandoned,
-            });
-        }
-    }
-    repositories.sort_unstable_by(|left, right| left.repo.cmp(&right.repo));
-    Ok(repositories)
-}
-
-/// Take a ticket under the `.seq` lock, numbered above every ticket present, and lock it before
-/// any other land can read it: written under a temporary name, then renamed into place.
-fn take_ticket(directory: &Path, workspace: &str, command: &str) -> io::Result<(Ticket, File)> {
-    let seq_path = directory.join(SEQ_NAME);
-    let seq = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&seq_path)?;
-    // Another land holds `.seq` only while it numbers one ticket: a short lock, a request.
-    let seq = cowshed_os::flock::exclusive(
-        seq,
-        &seq_path,
-        &cowshed_os::deadline::start("land ticket", cowshed_os::deadline::CONTROL),
-        crate::held_lock::holders,
-    )
-    .map_err(io::Error::from)?;
-    // A temporary ticket nobody locks is one whose taker died before renaming it: remove it.
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.ends_with(".tmp"))
-        {
-            fs::remove_file(entry.path())?;
-        }
-    }
-    let number = ticket_files(directory)?
-        .last()
-        .map_or(1, |(number, _)| number + 1);
-    let ticket = Ticket {
-        number,
-        pid: std::process::id(),
-        workspace: workspace.to_owned(),
-        asked_unix_ms: u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX),
-        command: command.to_owned(),
-    };
-    let staged = directory.join(format!(".{number:020}.tmp"));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&staged)?;
-    // A file this process just created is locked by nobody else: the lock is taken at once.
-    file.try_lock().map_err(io::Error::from)?;
-    file.write_all(&serde_json::to_vec(&ticket).map_err(io::Error::other)?)?;
-    let path = directory.join(ticket_name(number));
-    fs::rename(&staged, &path)?;
-    drop(seq);
-    record(directory, &ticket, TurnEventKind::Queued, None);
-    Ok((ticket, file))
-}
-
-/// The live ticket just ahead of `number` and the live tickets before it, or `None` at the head.
-fn ahead_of(directory: &Path, number: u64) -> io::Result<Option<(File, Vec<Ticket>)>> {
-    let mut ahead = Vec::new();
-    let mut nearest = None;
-    for (_, path) in ticket_files(directory)?
-        .into_iter()
-        .filter(|(other, _)| *other < number)
-    {
-        let Some(file) = open_ticket(&path)? else {
-            continue;
-        };
-        if live(&file, &path)? {
-            ahead.push(read_ticket(&file, &path)?.0);
-            nearest = Some(file);
-        }
-    }
-    Ok(nearest.map(|file| (file, ahead)))
-}
-
-/// Run `blocking` on a thread of its own and answer what it answers, calling `tell` once it has
-/// started and every `every` until then: a lock wait that keeps saying what it waits for. The wait
-/// starts first, so however long a `tell` takes, it never delays taking the lock.
-fn wait_telling<T: Send + 'static>(
-    blocking: impl FnOnce() -> io::Result<T> + Send + 'static,
-    every: Duration,
-    mut tell: impl FnMut() -> io::Result<()>,
-) -> io::Result<T> {
-    let (ended, end) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = ended.send(blocking());
-    });
-    tell()?;
+/// Write the bind step of `pid`, `{"step":"bind","pid":<pid>}` and a newline, to `socket`, with
+/// no allocation on any path: it runs in a forked child before its exec ([`Turn::bind_at_exec`]),
+/// and a failed write answers the kernel's errno ([`io::Error::last_os_error`], stored inline),
+/// which the spawn reports to the parent.
+fn write_bind(socket: RawFd, pid: u32) -> io::Result<()> {
+    const PREFIX: &[u8] = br#"{"step":"bind","pid":"#;
+    let mut line = [0_u8; PREFIX.len() + 10 + 2];
+    line[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut digits = [0_u8; 10];
+    let mut count = 0;
+    let mut rest = pid;
     loop {
-        match end.recv_timeout(every) {
-            Ok(result) => return result,
-            Err(mpsc::RecvTimeoutError::Timeout) => tell()?,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::other(
-                    "the land turn wait thread ended unanswered",
-                ));
+        // The remainder is below ten, so its low byte is the digit.
+        digits[count] = b'0' + (rest % 10).to_le_bytes()[0];
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let mut end = PREFIX.len();
+    for digit in digits[..count].iter().rev() {
+        line[end] = *digit;
+        end += 1;
+    }
+    line[end..end + 2].copy_from_slice(b"}\n");
+    end += 2;
+    let mut written = 0;
+    while written < end {
+        let rest = &line[written..end];
+        // SAFETY: `rest` is a live stack buffer of `rest.len()` bytes.
+        let wrote = unsafe { libc::write(socket, rest.as_ptr().cast(), rest.len()) };
+        match usize::try_from(wrote) {
+            Ok(wrote) => written += wrote,
+            Err(_) => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
         }
     }
+    Ok(())
+}
+
+/// The gateway's next answer. A gateway that refuses the request before it reads it as a land turn
+/// (an older build, which does not know the operation) answers a control failure,
+/// `{"ok":false,…}`, which is returned as that refusal.
+async fn answer(connection: &mut Lines<BufReader<Fenced<UnixStream>>>) -> io::Result<TurnAnswer> {
+    let Some(line) = connection.next_line().await? else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the gateway closed the land turn's connection",
+        ));
+    };
+    decode(&line)
+}
+
+fn decode(line: &str) -> io::Result<TurnAnswer> {
+    #[derive(Deserialize)]
+    struct Failure {
+        ok: bool,
+        error: Option<String>,
+    }
+    serde_json::from_str::<TurnAnswer>(line).or_else(|error| {
+        match serde_json::from_str::<Failure>(line) {
+            Ok(Failure { ok: false, error }) => Ok(TurnAnswer::Refused {
+                error: error.unwrap_or_else(|| "it gave no reason".to_owned()),
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the gateway answered the land turn with {line:?}: {error}"),
+            )),
+        }
+    })
+}
+
+fn unexpected(answer: &TurnAnswer, step: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the gateway answered {step} with {answer:?}"),
+    )
 }
 
 /// The outside wait of the land `me`, from one census of the processes with `lock` open
@@ -509,293 +374,180 @@ fn outside_wait(lock: &Path, me: i32) -> Wait {
     }
 }
 
-/// Wait in `directory`'s queue for this process's turn to land `workspace` with `command`, then
-/// take `outside` exclusively too when given: the lock file of lands that do not ask for turns,
-/// kept and never removed. `waiting` is told who holds the turn and how many are ahead, or which
-/// processes have the outside lock open, whenever that changes and every `report_every` while it
-/// does not. The turn is held until the last inherited copy of its ticket descriptor closes.
-pub fn take(
-    directory: &Path,
-    workspace: &str,
-    command: &str,
+/// Ask the gateway at `socket` for `ask`'s turn and wait for it, then take `outside` exclusively
+/// too when given: the lock file of lands that do not ask for turns, kept and never removed.
+/// `waiting` is told who holds the turn and how many are ahead, or which processes have the
+/// outside lock open, whenever that changes and every `report_every` while it does not.
+pub async fn take(
+    socket: &Path,
+    ask: &TurnAsk,
     outside: Option<&Path>,
     report_every: Duration,
     mut waiting: impl FnMut(&Wait),
 ) -> io::Result<Turn> {
-    fs::create_dir_all(directory)?;
-    let (ticket, file) = take_ticket(directory, workspace, command)?;
-    while let Some((nearest, ahead)) = ahead_of(directory, ticket.number)? {
-        let holder = ahead
-            .first()
-            .cloned()
-            .expect("a nearest live ticket is one of those ahead");
-        let mut told = Wait::Queued {
-            holder,
-            ahead: ahead.len(),
-        };
-        // The wait on the ticket just ahead runs on its own thread, so this one can repeat what
-        // it was told at its cadence; the lock is released at once, since only its end matters.
-        // The first telling is what `ahead_of` just read; each later one looks again.
-        let mut first = true;
-        // WHY unbounded: queued, not silent: a land waits for the land ahead for as long as that
-        // land's turn runs, telling its place and the holder at its cadence; that land's release at
-        // its turn's end, or the kernel's at its exit, ends the wait, and the operator may interrupt.
-        #[allow(clippy::disallowed_methods)]
-        wait_telling(
-            move || nearest.lock_shared(),
-            report_every,
-            || {
-                if !first {
-                    let now = observe(directory)?;
-                    let mine = now.iter().position(|live| live.number == ticket.number);
-                    if let (Some(holder), Some(ahead)) = (now.first(), mine) {
-                        told = Wait::Queued {
-                            holder: holder.clone(),
-                            ahead,
-                        };
-                    }
-                }
-                first = false;
-                waiting(&told);
-                Ok(())
-            },
-        )?;
+    #[derive(Serialize)]
+    struct Asking<'a> {
+        op: &'static str,
+        #[serde(flatten)]
+        ask: &'a TurnAsk,
     }
+    let budget = cowshed_os::deadline::start("land-turn connect", cowshed_os::deadline::HANDSHAKE);
+    let peer = cowshed_os::deadline::Peer::unix("gateway", socket);
+    let stream = cowshed_os::deadline::connect_unix(&budget, &peer, socket)
+        .await
+        .map_err(|error| {
+            let error = io::Error::from(error);
+            io::Error::new(
+                error.kind(),
+                format!("cannot reach the gateway at {}: {error}", socket.display()),
+            )
+        })?;
+    let descriptor = std::os::fd::AsRawFd::as_raw_fd(&stream);
+    let mut stream = Fenced::new(stream);
+    send(
+        &mut stream,
+        &Asking {
+            op: LAND_TURN_OP,
+            ask,
+        },
+    )
+    .await?;
+    let mut connection = BufReader::new(stream).lines();
+    let mut told: Option<Wait> = None;
+    let start = tokio::time::Instant::now() + report_every;
+    let mut cadence = tokio::time::interval_at(start, report_every);
+    let ticket = loop {
+        tokio::select! {
+            answered = answer(&mut connection) => match answered? {
+                TurnAnswer::Held { ticket } => break ticket,
+                TurnAnswer::Queued { holder, ahead, .. } => {
+                    let wait = Wait::Queued { holder, ahead };
+                    if told.as_ref() != Some(&wait) {
+                        waiting(&wait);
+                        cadence.reset();
+                    }
+                    told = Some(wait);
+                }
+                TurnAnswer::Refused { error } => {
+                    return Err(io::Error::other(format!(
+                        "the gateway at {} refused the land turn {}: {error}",
+                        socket.display(),
+                        ask.repo,
+                    )));
+                }
+                other @ TurnAnswer::Bound { .. } => return Err(unexpected(&other, "an ask")),
+            },
+            _ = cadence.tick() => {
+                if let Some(wait) = &told {
+                    waiting(wait);
+                }
+            }
+        }
+    };
     // The outside lock is the held lock every other holder of it takes, recorded on its inode.
+    // Its wait runs on a thread of its own before the first census, so no census delays it.
     let outside = match outside {
         None => None,
         Some(lock) => Some(match Opened::open(lock)?.try_hold()? {
             Ok(held) => held,
             Err(opened) => {
                 let me = i32::try_from(std::process::id()).map_err(io::Error::other)?;
-                wait_telling(
-                    move || opened.hold(),
-                    report_every,
-                    || {
-                        waiting(&outside_wait(lock, me));
-                        Ok(())
-                    },
-                )?
+                let mut holding = tokio::task::spawn_blocking(move || opened.hold());
+                let mut cadence = tokio::time::interval(report_every);
+                loop {
+                    tokio::select! {
+                        held = &mut holding => break held.map_err(io::Error::other)??,
+                        _ = cadence.tick() => {
+                            let lock = lock.to_path_buf();
+                            let wait = tokio::task::spawn_blocking(move || outside_wait(&lock, me))
+                                .await
+                                .map_err(io::Error::other)?;
+                            waiting(&wait);
+                        }
+                    }
+                }
             }
         }),
     };
-    record(directory, &ticket, TurnEventKind::Taken, None);
     Ok(Turn {
-        directory: directory.to_path_buf(),
         ticket,
-        held_ticket: file,
+        connection,
+        socket: descriptor,
         outside,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use cowshed_os::test_backstop::ChildBackstop as _;
     use std::collections::BTreeMap;
 
     use proptest::prelude::*;
 
     use super::*;
 
-    fn events(directory: &Path) -> Vec<TurnEvent> {
-        fs::read_to_string(directory.join(LOG_NAME))
-            .expect("read turn history")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("a turn event"))
-            .collect()
+    fn ticket(number: u64) -> Ticket {
+        Ticket {
+            number,
+            pid: 41,
+            workspace: "topic".to_owned(),
+            asked_unix_ms: 7,
+            command: "land".to_owned(),
+            bound: vec![42],
+        }
     }
 
-    /// The direct child exits, but its descendant retains the ticket until the parent releases a
-    /// pipe. The next turn must wait on that ticket, without an outside lock to hide early unlink.
-    fn descendant_keeps_turn(finish: bool, exit_code: i32) {
-        use cowshed_os::fork_lock::Spawn as _;
-        use std::process::{Command, Stdio};
-
-        let root = crate::temp_root::TempRoot::new("land-descendant");
-        let turn = take(
-            &root,
-            "first",
-            "foreground",
-            None,
-            Duration::from_secs(5),
-            |_| {
-                panic!("the first turn has no predecessor");
+    #[test]
+    fn an_answer_and_a_control_failure_both_decode_and_anything_else_is_invalid() {
+        let held = TurnAnswer::Held { ticket: ticket(3) };
+        let line = String::from_utf8(line(&held).unwrap()).unwrap();
+        assert_eq!(decode(line.trim_end()).unwrap(), held);
+        assert_eq!(
+            decode(
+                r#"{"ok":false,"code":"invalid-request","error":"unknown gateway control operation"}"#
+            )
+            .unwrap(),
+            TurnAnswer::Refused {
+                error: "unknown gateway control operation".to_owned()
             },
-        )
-        .expect("take first turn");
-        let first = turn.ticket.clone();
-        let path = root.join(ticket_name(first.number));
-        let descendant_done = root.join("descendant-done");
-        let (release_read, mut release_write) = io::pipe().expect("descendant release pipe");
-        let mut command = Command::new("sh");
-        command
-            .args([
-                "-c",
-                r#"sh -c 'IFS= read -r release; : > "$1"' descendant "$1" <&0 & exit "$2""#,
-                "land-direct",
-            ])
-            .arg(&descendant_done)
-            .arg(exit_code.to_string())
-            .stdin(Stdio::from(release_read))
-            .stdout(Stdio::null());
-        crate::held_lock::hand_to(&mut command, turn.descriptors());
-        let status = command
-            .spawn_locked()
-            .expect("start direct child")
-            .wait_bounded()
-            .expect("reap direct child, not its descendant");
-        assert_eq!(status.code(), Some(exit_code));
-
-        if finish {
-            turn.end(format!("exit {exit_code}"));
-        } else {
-            drop(turn);
-        }
-        assert!(
-            path.exists(),
-            "the descendant's locked inode must stay discoverable"
         );
         assert_eq!(
-            observe(&root)
-                .expect("observe the descendant's turn")
-                .as_slice(),
-            std::slice::from_ref(&first)
+            decode(r#"{"ok":true}"#).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
-        assert!(
-            abandoned_since(&root, 0)
-                .expect("read abandonments")
-                .is_empty()
-        );
+    }
 
-        let (waiting_tx, waiting_rx) = mpsc::channel();
-        let (taken_tx, taken_rx) = mpsc::channel();
-        let directory = root.to_path_buf();
-        let waiter = std::thread::spawn(move || {
-            let mut first_wait = Some(waiting_tx);
-            let next = take(
-                &directory,
-                "next",
-                "next foreground",
-                None,
-                Duration::from_millis(20),
-                |wait| {
-                    if let Some(sender) = first_wait.take() {
-                        sender.send(wait.clone()).expect("report the queued turn");
-                    }
-                },
+    #[test]
+    fn a_step_names_its_kind_and_a_ticket_without_bound_commands_omits_them() {
+        assert_eq!(
+            serde_json::to_string(&TurnStep::Bind { pid: 9 }).unwrap(),
+            r#"{"step":"bind","pid":9}"#
+        );
+        let mut free = ticket(1);
+        free.bound.clear();
+        assert!(!serde_json::to_string(&free).unwrap().contains("bound"));
+    }
+
+    #[test]
+    fn the_bind_a_child_writes_before_its_exec_is_the_bind_step() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+
+        for pid in [0, 7, 41_235, u32::MAX] {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            write_bind(theirs.as_raw_fd(), pid).unwrap();
+            drop(theirs);
+            let mut written = String::new();
+            (&ours).read_to_string(&mut written).unwrap();
+            let step = written.strip_suffix('\n').expect("one line");
+            assert_eq!(
+                serde_json::from_str::<TurnStep>(step).unwrap(),
+                TurnStep::Bind { pid }
             );
-            taken_tx.send(next).expect("return the next turn");
-        });
-        assert_eq!(
-            waiting_rx.recv().expect("next turn queues"),
-            Wait::Queued {
-                holder: first.clone(),
-                ahead: 1
-            },
-        );
-        assert!(
-            matches!(
-                File::open(&path)
-                    .expect("open the descendant's ticket")
-                    .try_lock(),
-                Err(std::fs::TryLockError::WouldBlock)
-            ),
-            "a direct child's exit must not release its descendant's turn",
-        );
-        assert!(path.exists(), "scanning a locked ticket must not unlink it");
-        assert!(
-            !descendant_done.exists(),
-            "the descendant still waits for release"
-        );
-
-        release_write
-            .write_all(b"release\n")
-            .expect("release descendant");
-        drop(release_write);
-        let next = taken_rx
-            .recv()
-            .expect("next turn starts after the descendant closes")
-            .expect("take next turn");
-        waiter.join().expect("join next turn waiter");
-        assert!(descendant_done.exists(), "the descendant reached its end");
-        assert!(
-            !path.exists(),
-            "the unlocked predecessor is cleaned by the queue"
-        );
-        next.end("exit 0".to_owned());
-        assert!(
-            observe(&root)
-                .expect("clean the ended next turn")
-                .is_empty()
-        );
-        let first_events: Vec<_> = events(&root)
-            .into_iter()
-            .filter(|event| event.ticket == first)
-            .map(|event| (event.event, event.outcome))
-            .collect();
-        let terminal = if finish {
-            (TurnEventKind::Finished, Some(format!("exit {exit_code}")))
-        } else {
-            (
-                TurnEventKind::Abandoned,
-                Some("its land ended without recording an outcome".to_owned()),
-            )
-        };
-        assert_eq!(
-            first_events,
-            [
-                (TurnEventKind::Queued, None),
-                (TurnEventKind::Taken, None),
-                terminal,
-            ],
-        );
-        assert!(ticket_files(&root).expect("ticket cleanup").is_empty());
-    }
-
-    #[test]
-    fn every_terminal_outcome_waits_for_descendants_after_the_direct_child_exits() {
-        for finish in [true, false] {
-            for exit_code in [0, 7] {
-                descendant_keeps_turn(finish, exit_code);
-            }
+            assert_eq!(
+                step,
+                serde_json::to_string(&TurnStep::Bind { pid }).unwrap()
+            );
         }
-    }
-
-    #[test]
-    fn a_failed_take_leaves_an_unmarked_ticket_for_the_queue_to_clean() {
-        let root = crate::temp_root::TempRoot::new("land-take-error");
-        let directory = root.join("queue");
-        // A directory cannot be opened as a writable outside lock.
-        assert!(
-            take(
-                &directory,
-                "failed",
-                "never started",
-                Some(&root),
-                Duration::from_secs(5),
-                |_| panic!("the invalid outside lock must fail, not wait"),
-            )
-            .is_err()
-        );
-        assert_eq!(
-            ticket_files(&directory).expect("error leaves ticket").len(),
-            1
-        );
-        assert!(
-            observe(&directory)
-                .expect("clean abandoned ticket")
-                .is_empty()
-        );
-        assert!(
-            ticket_files(&directory)
-                .expect("cleaned tickets")
-                .is_empty()
-        );
-        let kinds: Vec<_> = events(&directory)
-            .into_iter()
-            .map(|event| event.event)
-            .collect();
-        assert_eq!(kinds, [TurnEventKind::Queued, TurnEventKind::Abandoned]);
     }
 
     proptest! {

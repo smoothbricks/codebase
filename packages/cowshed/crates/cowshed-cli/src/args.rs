@@ -259,13 +259,16 @@ pub struct DiskCommandArgs {
     pub gateway_socket: Option<PathBuf>,
 }
 
-/// `land-turn <repo> [--workspace <ws>] [--outside-lock <path>] -- <cmd...>`: the repository whose
-/// land queue the command joins, the workspace the land is for, and the command run under its turn.
+/// `land-turn <repo> [--workspace <ws>] [--outside-lock <path>] [--gateway-socket <path>] -- <cmd...>`:
+/// the repository whose land queue the command joins, the workspace the land is for, the gateway
+/// that keeps the queue, and the command run under its turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LandTurnArgs {
     pub repo: LandTurnName,
     pub workspace: String,
     pub outside_lock: Option<PathBuf>,
+    /// An explicitly selected gateway; absent asks the host gateway.
+    pub gateway_socket: Option<PathBuf>,
     pub argv: Vec<OsString>,
 }
 
@@ -690,11 +693,13 @@ pub struct LandArgs {
     pub push: bool,
 }
 
-/// `doc-commit (-m <msg> | -F <file>) (--patch <file> | --icm <program>)`.
+/// `doc-commit (-m <msg> | -F <file>) (--patch <file> | --icm <program>) [--gateway-socket <path>]`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocCommitArgs {
     pub message: DocMessage,
     pub edit: DocEdit,
+    /// The gateway whose ref turn the commit takes; `None` is the host gateway.
+    pub gateway_socket: Option<PathBuf>,
 }
 
 /// The commit message: given, or read from a file (`-` is stdin).
@@ -1107,6 +1112,7 @@ pub fn cli_command() -> ClapCommand {
             value("file").short('F'),
             value("patch"),
             value("icm"),
+            value("gateway-socket"),
         ]))
         .subcommand(leaf("doctor").args([flag("repair")]))
         .subcommand(
@@ -1128,6 +1134,7 @@ pub fn cli_command() -> ClapCommand {
                 .arg(positional("repo", 0..=1))
                 .arg(value("workspace"))
                 .arg(value("outside-lock"))
+                .arg(value("gateway-socket"))
                 .arg(
                     Arg::new("argv")
                         .value_parser(value_parser!(OsString))
@@ -1795,8 +1802,8 @@ const LAND_TURN: CommandSpec = CommandSpec {
     summary: "run a command as a land turn",
     about: &[
         "Takes this repository's land turn and runs `<cmd...>` under it. The command is argv, never a shell string, and it inherits cowshed's standard streams and environment. Turns are granted first come, first served per repository: a land that asks while another holds the turn waits behind it and says on stderr who holds it, how many are ahead, and when the holder asked. The report repeats every 90 s, the land watchdog's cadence, and `taken after N s` says how long the wait was.",
-        "The turn is released only after the command ends, so an interrupted land still waits for the command's real end. The command inherits the descriptors of its ticket and of the outside lock, so the kernel keeps the turn until the command ends even if cowshed is killed first. SIGINT, SIGHUP and SIGTERM that cowshed receives are forwarded to the command; a signal that arrives while the turn is still queued ends cowshed and gives up its place. The command's exit status is cowshed's, and a signal ends it with 128 + the signal.",
-        "It needs no project and asks no daemon: a land script calls it from any directory. `--json` is refused, since its output is the command's own bytes and cowshed's stderr lines.",
+        "The turn is released only after the command ends, so an interrupted land still waits for the command's real end. The host gateway keeps the queue and holds the turn by processes: cowshed binds the command to it by its pid as soon as it has started, so the turn is held until the command exits even if cowshed is killed first, and nothing the command starts holds it. The command inherits the outside lock's descriptor. A turn whose gateway connection closes is lost: cowshed says so, forwards SIGTERM to the command and, once it has ended, fails with a wrapper exit code. SIGINT, SIGHUP and SIGTERM that cowshed receives are forwarded to the command; a signal that arrives while the turn is still queued ends cowshed and gives up its place. The command's exit status is cowshed's, and a signal ends it with 128 + the signal.",
+        "It needs no project and asks no workspace daemon, only the gateway: a land script calls it from any directory. `--json` is refused, since its output is the command's own bytes and cowshed's stderr lines.",
     ],
     options: &[
         Opt {
@@ -1806,6 +1813,10 @@ const LAND_TURN: CommandSpec = CommandSpec {
         Opt {
             spelling: "--outside-lock <path>",
             meaning: "the lock file that lands which do not ask for turns hold; once the turn reaches the head of the queue it waits for that lock, then holds it exclusively until the command ends",
+        },
+        Opt {
+            spelling: "--gateway-socket <absolute path>",
+            meaning: "before -- only: the gateway whose queue to join instead of the host gateway",
         },
     ],
 };
@@ -1849,11 +1860,22 @@ fn parse_land_turn(matches: &ArgMatches, global: &GlobalOptions) -> Result<Comma
                 )
             })?,
     };
+    let gateway_socket = os(matches, "gateway-socket").map(PathBuf::from);
+    if gateway_socket
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(UsageError::new(
+            "--gateway-socket must be an absolute path",
+            USAGE,
+        ));
+    }
     let argv = command_argv(matches, USAGE)?;
     Ok(Command::LandTurn(LandTurnArgs {
         repo,
         workspace,
         outside_lock: os(matches, "outside-lock").map(PathBuf::from),
+        gateway_socket,
         argv,
     }))
 }
@@ -4076,12 +4098,12 @@ const LAND: CommandSpec = CommandSpec {
 const DOC_COMMIT: CommandSpec = CommandSpec {
     name: "doc-commit",
     missing: "doc-commit needs a message (-m <msg> or -F <file>) and an edit (--patch <file> or --icm <program>)",
-    args: "(-m <msg> | -F <file>) (--patch <file> | --icm <program>)",
+    args: "(-m <msg> | -F <file>) (--patch <file> | --icm <program>) [--gateway-socket <path>]",
     trailing: "",
     summary: "commit a documentation edit to main",
     about: &[
         "Commits one documentation edit straight to main, with no workspace and no gate of its own, without waiting for a land's gate. The edit is the input, never main's working tree: a `git apply` patch, or an ICM program run as `icm run <program> --root <main>` with the icm on your PATH. In one hold of the repository's ref turn (`<[land] turn>.ref`, first come, first served, its holder named), it applies the edit, refuses any path `[doc] paths` in main's .cowshed.toml does not admit or that main held uncommitted, runs `[doc] check` on the paths, and commits exactly them with the repository's hooks on; whatever stops it first puts main's tree back as it was.",
-        "Main is the checkout --project names, else the working directory's; a workspace is refused. Either file may be `-`, stdin, but only one of them. It asks no daemon and no gateway. It prints the commit, or with --json `{commit, paths}`.",
+        "Main is the checkout --project names, else the working directory's; a workspace is refused. Either file may be `-`, stdin, but only one of them. It asks no daemon. The ref turn is the host gateway's, or the one --gateway-socket names, and every command the hold runs is bound to it, so the turn is held until that command exits however cowshed ends. It prints the commit, or with --json `{commit, paths}`.",
     ],
     options: &[
         Opt {
@@ -4099,6 +4121,10 @@ const DOC_COMMIT: CommandSpec = CommandSpec {
         Opt {
             spelling: "--icm <program>",
             meaning: "the edit as an ICM program file; `-` is stdin",
+        },
+        Opt {
+            spelling: "--gateway-socket <absolute path>",
+            meaning: "the gateway whose ref turn to take instead of the host gateway",
         },
     ],
 };
@@ -4140,7 +4166,21 @@ fn parse_doc_commit(matches: &ArgMatches) -> Result<Command, UsageError> {
             USAGE,
         ));
     }
-    Ok(Command::DocCommit(DocCommitArgs { message, edit }))
+    let gateway_socket = os(matches, "gateway-socket").map(PathBuf::from);
+    if gateway_socket
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(UsageError::new(
+            "--gateway-socket must be an absolute path",
+            USAGE,
+        ));
+    }
+    Ok(Command::DocCommit(DocCommitArgs {
+        message,
+        edit,
+        gateway_socket,
+    }))
 }
 
 fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {

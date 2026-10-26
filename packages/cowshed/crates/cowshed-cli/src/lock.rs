@@ -122,7 +122,7 @@ where
     // Armed once the lock is held and before the command starts, so a signal from here on reaches
     // the command, and the lock is held until the command ends.
     let mut interrupts = policy.arm_forwarding();
-    let command = command.spawn(vec![held.descriptor()])?;
+    let command = command.spawn(vec![held.descriptor()], None)?;
     // Spawn has succeeded. The state descriptor was CLOEXEC, so only this parent still owns it.
     // Relinquish stdio before acknowledging acquisition: a caller may now wait for the command's
     // output EOF before releasing a command-side hold. Retaining our copies would deadlock it.

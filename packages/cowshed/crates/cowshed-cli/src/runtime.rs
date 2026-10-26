@@ -200,9 +200,13 @@ pub trait CliService: Send {
     async fn reconcile_gateway(&mut self) -> Result<()> {
         Ok(())
     }
-    /// Where this project's store keeps its land-turn queues ([`CanonicalRoots::land_turn_root`]):
-    /// a declared land's turns and its `lands.log` (02_workspaces.md "A declared land").
+    /// Where this project's store keeps its land records (`ValidatedHostStorage::land_turn_root`):
+    /// a declared land's `lands.log` and its commands' output (02_workspaces.md "A declared land").
+    /// The land-turn queues themselves are the gateway's.
     fn land_turn_root(&self) -> Result<PathBuf>;
+    /// The gateway control socket of this project's store, where a declared land asks for its land
+    /// turn (05_gateway.md "Land turns").
+    fn control_socket(&self) -> Result<PathBuf>;
     /// The cowshed a declared land's after-land child runs as: the store's installed one,
     /// `<support>/bin/cowshed` (05_gateway.md "The installed cowshed"), the gateway's own program.
     /// `None` when this store's home has none installed.
@@ -914,6 +918,10 @@ impl CliService for ActorBridge {
 
     fn land_turn_root(&self) -> Result<PathBuf> {
         Ok(self.storage()?.land_turn_root())
+    }
+
+    fn control_socket(&self) -> Result<PathBuf> {
+        Ok(self.storage()?.control_socket())
     }
 
     fn background_program(&self) -> Result<Option<PathBuf>> {

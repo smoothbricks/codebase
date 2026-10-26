@@ -2,25 +2,32 @@
 //! `.cowshed.toml` declares `[land]` and `[doc]` (02_workspaces.md "`cowshed doc-commit`"): an
 //! edit is applied and committed in one hold of the ref turn, a path that is not documentation or
 //! that main held uncommitted is refused with main's tree put back, and a doc commit waits in line
-//! behind the turn's holder.
+//! behind the turn's holder. The ref turn is the gateway's: each test runs its own.
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
 
-use cowshed_core::host_dirs::support_directory;
-use cowshed_core::land_turn::{land_turn_root, observe};
+use cowshed_core::api::dto::LandTurnQueue;
+
+#[path = "../../cowshed-core/tests/support/temp_parent.rs"]
+mod temp_parent;
+#[path = "../../cowshed-core/tests/support/temp_root.rs"]
+mod temp_root;
+#[path = "support/test_gateway.rs"]
+mod test_gateway;
+
+use test_gateway::TestGateway;
 
 const TURN: &str = "docrepo";
-const POLL: Duration = Duration::from_millis(20);
 
 fn cowshed() -> PathBuf {
     PathBuf::from(
@@ -30,9 +37,11 @@ fn cowshed() -> PathBuf {
 }
 
 /// A fresh HOME and a main checkout beside it: a git repository with one commit holding
-/// `README.md`, `src/lib.rs` and the `.cowshed.toml` of `config`.
+/// `README.md`, `src/lib.rs` and the `.cowshed.toml` of `config`, and the gateway whose ref turn
+/// its doc commits take.
 struct Repo {
     root: PathBuf,
+    gateway: TestGateway,
 }
 
 impl Repo {
@@ -44,7 +53,10 @@ impl Repo {
         fs::create_dir_all(root.join("home")).expect("create the test HOME");
         fs::create_dir_all(root.join("bin")).expect("create the test PATH directory");
         let root = fs::canonicalize(&root).expect("canonicalize the test root");
-        let repo = Self { root };
+        let repo = Self {
+            root,
+            gateway: TestGateway::start(),
+        };
         let main = repo.main();
         fs::create_dir_all(main.join("src")).expect("create main");
         git(&main, &["init", "-q", "-b", "main"]);
@@ -70,9 +82,59 @@ impl Repo {
         self.root.join("home")
     }
 
-    /// The ref turn's queue directory under this HOME.
-    fn ref_turn(&self) -> PathBuf {
-        land_turn_root(&support_directory(&self.home())).join(format!("{TURN}.ref"))
+    /// How many tickets the gateway holds in the ref turn `<TURN>.ref`.
+    fn ref_tickets(&self) -> usize {
+        let queue = format!("{TURN}.ref");
+        self.gateway
+            .land_turns(u64::MAX)
+            .into_iter()
+            .find(|turns| turns.repo.as_str() == queue)
+            .map_or(0, |turns| turns.tickets.len())
+    }
+
+    /// Every land-turn queue the gateway lists, the probe's ticket left out, read while a probe
+    /// holds the ref turn `<TURN>.ref`: the gateway gives the probe the turn only once it has
+    /// processed the departure of every ticket asked before it, which reaches it after their
+    /// processes exit.
+    fn settled_turns(&self) -> Vec<LandTurnQueue> {
+        let (mut probe, _said) = self.hold_ref_turn("probe");
+        let mut turns = self.gateway.land_turns(0);
+        for queue in &mut turns {
+            queue.tickets.retain(|ticket| ticket.workspace != "probe");
+        }
+        turns.retain(|queue| !queue.tickets.is_empty() || !queue.abandoned.is_empty());
+        assert!(probe.wait_bounded().expect("the probe ends").success());
+        turns
+    }
+
+    /// `cowshed land-turn <TURN>.ref` as `workspace`, answered once it holds the turn: its command
+    /// says so on stdout as it starts and holds the turn until its stdin closes. The receiver of
+    /// the rest of its stdout goes with it, so nothing it prints later meets a closed pipe.
+    fn hold_ref_turn(&self, workspace: &str) -> (Child, mpsc::Receiver<String>) {
+        let mut holder = self
+            .command(&[
+                "land-turn",
+                &format!("{TURN}.ref"),
+                "--gateway-socket",
+                self.gateway.socket.to_str().unwrap(),
+                "--workspace",
+                workspace,
+                "--",
+                "sh",
+                "-c",
+                "echo held && exec cat >/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the ref turn's holder");
+        let said = lines(holder.stdout.take().expect("stdout is piped"));
+        let held = said
+            .recv_timeout(cowshed_os::test_backstop::NO_PROGRESS)
+            .expect("the holder's command starts before the no-progress backstop");
+        assert_eq!(held, "held", "the holder's command says it holds the turn");
+        (holder, said)
     }
 
     /// A file in the test's own directory.
@@ -105,8 +167,16 @@ impl Repo {
         command
     }
 
+    /// `cowshed <args>`, a doc-commit with its verb and any global flag before it, on this test's
+    /// gateway.
+    fn doc_commit(&self, args: &[&str]) -> Command {
+        let mut command = self.command(args);
+        command.arg("--gateway-socket").arg(&self.gateway.socket);
+        command
+    }
+
     fn run(&self, args: &[&str]) -> Output {
-        self.command(args)
+        self.doc_commit(args)
             .output_bounded()
             .expect("run cowshed doc-commit")
     }
@@ -173,8 +243,8 @@ const NOTES_PATCH: &str = "diff --git a/docs/notes.md b/docs/notes.md\nnew file 
 const README_PATCH: &str = "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # readme\n+more\n";
 const CODE_PATCH: &str = "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # readme\n+more\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n fn lib() {}\n+fn more() {}\n";
 
-/// A Markdown patch is committed as exactly that commit, the ref turn's log records the hold, and
-/// main's tree is clean after it.
+/// A Markdown patch is committed as exactly that commit, the hold ends its ref turn rather than
+/// abandoning it, and main's tree is clean after it.
 #[test]
 fn a_markdown_patch_commits_exactly_its_paths_under_the_ref_turn() {
     let repo = Repo::new("paths = [\"*.md\"]\n");
@@ -211,21 +281,11 @@ fn a_markdown_patch_commits_exactly_its_paths_under_the_ref_turn() {
         "docs: add notes\n\ndocs/notes.md"
     );
     assert_eq!(repo.status(), "", "main's tree is clean after the commit");
-    let log = fs::read_to_string(repo.ref_turn().join("turns.log")).expect("the turn's log");
-    let events: Vec<serde_json::Value> = log
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("a turn log line"))
-        .collect();
     assert_eq!(
-        events
-            .iter()
-            .map(|event| event["event"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["queued", "taken", "finished"],
-        "{log}"
+        repo.settled_turns(),
+        [],
+        "the doc commit ended its ref turn with its outcome"
     );
-    assert_eq!(events[2]["ticket"]["workspace"], "doc-commit");
-    assert_eq!(events[2]["outcome"], format!("committed {head}"));
 }
 
 /// A patch that also writes code is refused before main's tree is touched.
@@ -383,37 +443,28 @@ fn an_icm_program_commits_what_it_wrote_after_the_declared_check() {
     assert_eq!(repo.status(), "");
 }
 
+/// The lines `stream` carries, read to its end on a thread of its own, so the test waits for each
+/// within the no-progress backstop (`recv_timeout`).
+fn lines(stream: impl std::io::Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (lines, heard) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    heard
+}
 /// A doc commit asks for the ref turn in line: while another writer holds it, the doc commit
 /// says who and waits, and it commits once the holder ends.
 #[test]
 fn a_doc_commit_waits_in_line_behind_the_ref_turn_holder() {
     let repo = Repo::new("paths = [\"*.md\"]\n");
-    let release = repo.root.join("release");
-    let mut holder: Child = repo
-        .command(&[
-            "land-turn",
-            &format!("{TURN}.ref"),
-            "--workspace",
-            "holder",
-            "--",
-            "sh",
-            "-c",
-            &format!("while [ ! -e {} ]; do sleep 0.02; done", release.display()),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the ref turn's holder");
-    while observe(&repo.ref_turn())
-        .map(|tickets| tickets.len())
-        .unwrap_or(0)
-        != 1
-    {
-        thread::sleep(POLL);
-    }
+    let (mut holder, _holder_said) = repo.hold_ref_turn("holder");
     let patch = repo.file("notes.diff", NOTES_PATCH);
     let mut doc = repo
-        .command(&[
+        .doc_commit(&[
             "doc-commit",
             "-m",
             "docs: waited",
@@ -424,24 +475,28 @@ fn a_doc_commit_waits_in_line_behind_the_ref_turn_holder() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the doc commit");
-    let mut stderr = BufReader::new(doc.stderr.take().unwrap());
-    let mut line = String::new();
-    stderr
-        .read_line(&mut line)
-        .expect("the doc commit reports its wait");
+    // The doc commit's stderr, line by line, so its wait is read within a bound.
+    let heard = lines(doc.stderr.take().expect("stderr is piped"));
+    let line = heard
+        .recv_timeout(cowshed_os::test_backstop::NO_PROGRESS)
+        .expect("the doc commit reports its wait before the no-progress backstop");
     assert!(line.contains("holder"), "the wait names the holder: {line}");
     let before = repo.head();
     assert_eq!(
-        observe(&repo.ref_turn()).unwrap().len(),
+        repo.ref_tickets(),
         2,
         "the doc commit waits behind the holder"
     );
-    fs::File::create(&release)
-        .and_then(|mut file| file.write_all(b"go"))
-        .expect("release the holder");
+    // The holder's command ends once its stdin closes, and with it the holder's turn.
+    drop(holder.stdin.take());
     assert!(holder.wait_bounded().expect("the holder ends").success());
     let output = doc.wait_with_output_bounded().expect("the doc commit ends");
-    assert!(output.status.success(), "{}", said(&output));
+    assert!(
+        output.status.success(),
+        "{}\nstderr: {:?}",
+        said(&output),
+        heard.try_iter().collect::<Vec<_>>()
+    );
     assert_ne!(repo.head(), before);
     assert_eq!(
         stdout(&repo.main(), &["log", "-1", "--format=%s"]),

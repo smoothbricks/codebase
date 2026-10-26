@@ -1120,24 +1120,25 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    outside cowshed — an operator's Markdown commit straight into main, say — order themselves by a lock file of their
    own, and the land joins them when its caller names that file with `--ref-lock <file>`, or the land-turn queue they
    take instead with `--ref-turn <queue>` (05_gateway.md "A ref turn"), which it takes for exactly the span below, its
-   ticket handed to the fence's git as the lock's descriptor is. With `--ref-lock`, it takes the file as a held lock
-   ("Held locks" below), the exclusive `flock(2)` lockf(1) also takes, re-reads the target head, revalidates the
-   expected target head against it, fetches and fast-forwards, and lets go. The fetch and the fast-forward's git are
-   handed the lock's descriptor, so the kernel keeps the lock until that git ends: a land killed mid-fast-forward never
-   leaves git moving the ref outside it. Git's automatic gc and maintenance are off for them (`gc.auto=0`,
-   `maintenance.auto=false`; hooks and the fsmonitor are off for every controller git), so neither detaches holding the
-   lock, and no other process the land starts inherits it. A program the target repository's own configuration selects
-   (a filter or merge driver) that outlives git holds the lock like any held command's descendant ("Held locks" below):
-   until it closes it or exits, never unlocked around. Nothing else runs under it: the check (step 2) before it, and the
-   build-volume adoption and retirement after it (steps 4 and 5), run unlocked, so a writer queued on the lock waits for
-   this fence, never for a land's minutes of other work. A land that finds the lock held waits for it without bound —
-   its holder is a writer of the same branch, which the land follows rather than overtakes — and says on stderr every 10
-   s how long it has waited and who held the file when the wait began, as the kernel shows it (`lock-holders`): one look
-   at the holders per wait, never one per report. Its `delivery` span is the hold. Measured 2026-10-20 with the whole
-   land under such a lock: an operator's land held its ref lock for 82 to 85 s per land, about 56 to 63 s of it
-   build-volume adoption, and one land held it 45 minutes, so every Markdown commit queued behind work the lock does not
-   protect. Without `--ref-lock` or `--ref-turn`, git's own ref and index locks are the only fence against such writers,
-   and the head is still re-read and revalidated just before the fast-forward.
+   fence's git binding itself to the turn as it starts and stopped should the turn be lost while it runs (05_gateway.md
+   "Land turns"). With `--ref-lock`, it takes the file as a held lock ("Held locks" below), the exclusive `flock(2)`
+   lockf(1) also takes, re-reads the target head, revalidates the expected target head against it, fetches and
+   fast-forwards, and lets go. The fetch and the fast-forward's git are handed the lock's descriptor, so the kernel
+   keeps the lock until that git ends: a land killed mid-fast-forward never leaves git moving the ref outside it. Git's
+   automatic gc and maintenance are off for them (`gc.auto=0`, `maintenance.auto=false`; hooks and the fsmonitor are off
+   for every controller git), so neither detaches holding the lock, and no other process the land starts inherits it. A
+   program the target repository's own configuration selects (a filter or merge driver) that outlives git holds the lock
+   like any held command's descendant ("Held locks" below): until it closes it or exits, never unlocked around. Nothing
+   else runs under it: the check (step 2) before it, and the build-volume adoption and retirement after it (steps 4 and
+   5), run unlocked, so a writer queued on the lock waits for this fence, never for a land's minutes of other work. A
+   land that finds the lock held waits for it without bound — its holder is a writer of the same branch, which the land
+   follows rather than overtakes — and says on stderr every 10 s how long it has waited and who held the file when the
+   wait began, as the kernel shows it (`lock-holders`): one look at the holders per wait, never one per report. Its
+   `delivery` span is the hold. Measured 2026-10-20 with the whole land under such a lock: an operator's land held its
+   ref lock for 82 to 85 s per land, about 56 to 63 s of it build-volume adoption, and one land held it 45 minutes, so
+   every Markdown commit queued behind work the lock does not protect. Without `--ref-lock` or `--ref-turn`, git's own
+   ref and index locks are the only fence against such writers, and the head is still re-read and revalidated just
+   before the fast-forward.
 
    **Land has no branch-name contract.** It fetches whatever branch the workspace has checked out — `cowshed/<ws>` is
    what `fork` creates, but an agent may have made `wt/<ws>` or anything else, and land neither assumes nor requires the
@@ -1280,13 +1281,14 @@ unchanged.
 1. **Refuse early.** The land runs `land --preflight`'s fences first, so a land that would refuse after its gate (a
    dirty tree, a retired binding) refuses before it asks for a turn.
 2. **The land turn.** It takes its repository's turn, the queue `[land] turn` (05_gateway.md "Land turns"), in this
-   process, and holds it through step 5 and its retire: its wait reports, ticket and `turns.log` lines are
-   `land-turn`'s, with `<ws>` as the ticket's workspace. The gate (step 4) inherits the ticket's descriptor, as a
-   `land-turn` command does, so the kernel keeps the turn until the gate has ended too, however this process ends: a
-   land killed alone leaves its gate holding the turn, never a second land beside it.
+   process, and holds it through step 5 and its retire: its wait reports, ticket and the gateway's log lines are
+   `land-turn`'s, with `<ws>` as the ticket's workspace. The gate (step 4) binds itself to the turn as `land-turn`'s
+   command does, from its start, so the gateway keeps the turn until the gate has ended too, however this process ends:
+   a land killed alone leaves its gate holding the turn, never a second land beside it.
 3. **Rebase.** It rebases `<ws>` onto main's head as `cowshed rebase <ws> --expected-onto-head <head>` does, and again
    onto the newer head when main moved before the rebase began (`OntoMoved`). A conflict stops the land with the
-   rebase's own refusal and the workspace as it was.
+   rebase's own refusal and the workspace as it was. A turn lost while the rebase runs stops the land once the rebase
+   has ended, and one found lost before the fast-forward (step 5) stops it before main moves.
 4. **The declared gate.** It runs `[land] gate`, `{workspace}` replaced by `<ws>`, on the host in main's pure
    environment (below), its stdout and stderr on the land's stderr. A nonzero exit stops the land (exit 4, naming the
    gate and how it ended) and keeps the workspace. The gate checks the tree; it moves neither main nor the workspace,
@@ -1304,7 +1306,7 @@ unchanged.
    refusal stops the land. Lock order is always the land turn, then the ref turn; nothing holds a ref turn and then asks
    for a land turn, so the two never deadlock.
 6. **After the turn.** The turn ends once the fast-forward's retire has. Then, outside it: the landed head is recorded
-   in `lands.log` beside the turn's tickets (`{atUnixMs, event, head, before?, detail?}`, `event` one of `landed`,
+   in `lands.log` in the turn's records directory (`{atUnixMs, event, head, before?, detail?}`, `event` one of `landed`,
    `unpushed`, `pushed`, `push-failed`, `after-exited`; appended, never rewritten), and cowshed starts `__land-after`, a
    child run as the store's installed cowshed (05_gateway.md "The installed cowshed", the gateway's own program) in a
    session of its own, which pushes the landed branch to `[land] push` and then runs each `[land] after` command in
@@ -1341,11 +1343,16 @@ main's tree is never dirty outside the ref turn. The edit is the input, never ma
 input, paths relative to main) or an ICM program (what `icm run` takes). Either file may be `-`, stdin, as may the
 message file, and stdin serves one of them at most. Main is the checkout `--project` names, else the working
 directory's, when cowshed's in-checkout marker (`.cowshed/workspace.json`, 01_storage.md) gives it no other role: a doc
-edit in a workspace is refused, since it is committed there and landed. The verb asks no daemon and no gateway; it needs
-main's `.cowshed.toml` to declare `[doc]` (which paths are documentation) and `[land]` (whose `turn` names the ref turn
+edit in a workspace is refused, since it is committed there and landed. The verb asks no daemon; its ref turn is the
+host gateway's ("Land turns"), or the one `--gateway-socket <path>` names, as for `land-turn`. It needs main's
+`.cowshed.toml` to declare `[doc]` (which paths are documentation) and `[land]` (whose `turn` names the ref turn
 `<turn>.ref`).
 
-Both inputs are read first. Then, in one hold of the ref turn (FIFO, its holder named, "Land turns"):
+Both inputs are read first. Then, in one hold of the ref turn (FIFO, its holder named, "Land turns"), each command the
+hold runs (git, the ICM program, the check, the commit) binds itself to the turn as it starts, so the gateway keeps the
+turn until it exits, however this process ends; one the gateway does not bind, one whose stdin cannot be written and one
+still running when the turn is lost are sent SIGTERM, nothing is put back while it runs, and the doc commit fails once
+it has ended:
 
 1. Main's `git status --porcelain=v1 -z --untracked-files=all` is read: the paths main holds uncommitted.
 2. The edit's paths come from the edit's own account. A patch is judged before main's tree is touched: applied to a
@@ -1891,12 +1898,13 @@ it, stay. A holder that finds the path naming another inode once granted refuses
   each argument decoded lossily and joined by spaces, so an argument that is not UTF-8 never stops the record; it is for
   a person to read, never an identity, and nothing a held command runs is taken from it: the command's argv is passed
   byte-exact. The record is a claim, never proof: a reader believes it only as far as the kernel confirms it.
-- **The command holds the lock with cowshed.** `lock` and `land-turn` hand their command the lock's descriptor (and
-  `land-turn` its ticket's): the lock belongs to the open file description, so the kernel releases it only once cowshed,
-  the command, every process the command handed the descriptor to and every short-lived copy the spawn's PATH search
-  made, which the kernel closes moments after the spawn returns, have closed it; a waiter's grant, never a probe at the
-  spawn's return or at the command's exit, proves the release. Killing cowshed alone never lets another holder in while
-  its command runs. A waiter killed before the grant takes its pending request with it.
+- **The command holds the lock with cowshed.** `lock` hands its command the lock's descriptor, and `land-turn` its
+  outside lock's (its turn it binds by pid, 05_gateway.md "Land turns"): the lock belongs to the open file description,
+  so the kernel releases it only once cowshed, the command, every process the command handed the descriptor to and every
+  short-lived copy the spawn's PATH search made, which the kernel closes moments after the spawn returns, have closed
+  it; a waiter's grant, never a probe at the spawn's return or at the command's exit, proves the release. Killing
+  cowshed alone never lets another holder in while its command runs. A waiter killed before the grant takes its pending
+  request with it.
 - **No daemon cowshed launches holds it; the command's descendants do.** Every daemon cowshed launches (a workspace
   supervisor, through the supervisor manager's program spawner; a job; the kept Nx daemon inside one) is spawned through
   the descriptor seal, which marks every inherited descriptor close-on-exec but standard input, output and error (and a

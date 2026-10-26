@@ -5,12 +5,11 @@
 //! else, so a writer queued behind it waits for that fence alone, in the order the writers asked,
 //! and is told who holds the turn.
 
-use std::os::fd::RawFd;
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::dto::LandTurnName;
-use crate::land_turn::{self, OutsideHolders, Turn, Wait};
+use crate::land_turn::{self, OutsideHolders, Turn, TurnAsk, Wait};
 use crate::{CowshedError, Result};
 
 /// Who takes a ref turn: a land's ref fence, for its workspace, or a doc commit. It names the
@@ -44,71 +43,52 @@ impl RefWriter<'_> {
     }
 }
 
-/// A held ref turn. The git that moves the target's ref under it is handed its ticket's
-/// descriptor ([`Self::descriptor`]), so the kernel keeps the turn until that git ends. Ending it
+/// A held ref turn. The git that moves the target's ref under it binds itself to it as it starts
+/// ([`Self::bind_at_exec`]),
+/// so the gateway keeps the turn until that git exits, whatever becomes of this process. Ending it
 /// records how the fence ended; dropping it without an end leaves the turn to be recorded as
-/// abandoned by the next queue scan.
+/// abandoned.
 pub struct RefTurn {
     turn: Turn,
 }
 
 impl RefTurn {
-    /// Take the ref turn `queue` for `writer` in the land-turn root `root`: the
-    /// store's (`ValidatedHostStorage::land_turn_root`), where `cowshed land-turn <queue>` and
-    /// `cowshed doc-commit` take it too. Nothing bounds the wait: the holder is a writer moving the
-    /// same branch, which a land follows, never overtakes. The queue is waited for on a blocking
-    /// thread, which reports every [`cowshed_os::flock::HOLDER_REPORT`] who holds the turn and how
-    /// many are ahead. A land dropped while it waits leaves that thread its place: it takes the
-    /// turn when its turn comes and drops it at once, so the queue behind it moves on.
+    /// Take the ref turn `queue` for `writer` from the gateway at `socket`, where
+    /// `cowshed land-turn <queue>` and `cowshed doc-commit` take it too. Nothing bounds the wait:
+    /// the holder is a writer moving the same branch, which a land follows, never overtakes. The
+    /// wait reports every [`cowshed_os::flock::HOLDER_REPORT`] who holds the turn and how many are
+    /// ahead. A land dropped while it waits closes its connection, and the gateway takes its place
+    /// out of the queue.
     pub async fn acquire_in(
-        root: &Path,
+        socket: &Path,
         queue: &LandTurnName,
         writer: RefWriter<'_>,
     ) -> Result<Self> {
-        let directory = root.join(queue.as_str());
-        let label = writer.workspace();
-        let command = writer.command();
+        let ask = TurnAsk {
+            repo: queue.clone(),
+            workspace: writer.workspace(),
+            command: writer.command(),
+        };
         let verb = writer.verb();
-        let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let mut taking = tokio::task::spawn_blocking(move || {
-            land_turn::take(
-                &directory,
-                &label,
-                &command,
-                None,
-                cowshed_os::flock::HOLDER_REPORT,
-                |wait| {
-                    // The receiver is read until this call returns; a send fails only once the land
-                    // that would hear it is gone.
-                    let _ = reports.send(wait.clone());
-                },
-            )
-        });
         let started = Instant::now();
         let mut waited = false;
-        let joined = loop {
-            tokio::select! {
-                Some(wait) = received.recv() => {
-                    waited = true;
-                    report(queue, verb, &wait);
-                }
-                joined = &mut taking => break joined,
-            }
-        };
-        while let Ok(wait) = received.try_recv() {
-            waited = true;
-            report(queue, verb, &wait);
-        }
-        let turn = joined
-            .map_err(|error| {
-                CowshedError::internal(format!("the waiter for ref turn {queue} failed: {error}"))
-            })?
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!("cannot take the ref turn {queue}: {error}"),
-                    "the land-turn directory in this user's support directory must be writable",
-                )
-            })?;
+        let turn = land_turn::take(
+            socket,
+            &ask,
+            None,
+            cowshed_os::flock::HOLDER_REPORT,
+            |wait| {
+                waited = true;
+                report(queue, verb, wait);
+            },
+        )
+        .await
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot take the ref turn {queue}: {error}"),
+                "start the host gateway (`cowshed gateway start`), then retry",
+            )
+        })?;
         if waited {
             cowshed_os::eprintln!(
                 "cowshed: {verb} took the ref turn {queue} after {}s",
@@ -118,13 +98,29 @@ impl RefTurn {
         Ok(Self { turn })
     }
 
-    /// The descriptor that holds the turn, for the fence's git to inherit
-    /// ([`crate::held_lock::keep_across_exec`]).
-    pub fn descriptor(&self) -> RawFd {
-        self.turn.ticket_descriptor()
+    /// Arm `command`, the git this process is about to start to move the ref, to bind itself to the
+    /// turn as it starts ([`Turn::bind_at_exec`]): the gateway holds the turn until it exits.
+    pub fn bind_at_exec(&self, command: &mut std::process::Command) {
+        self.turn.bind_at_exec(command);
     }
 
-    /// End the turn, recording `outcome` (how the fence ended) in the queue's turn log.
+    /// The gateway's answer to the bind of the git `pid` just spawned ([`Turn::bound`]).
+    pub async fn bound(&mut self, pid: u32) -> Result<()> {
+        self.turn.bound(pid).await.map_err(|error| {
+            CowshedError::environment_missing(
+                format!("the ref turn could not hold the git that moves the ref: {error}"),
+                "start the host gateway (`cowshed gateway start`), then retry",
+            )
+        })
+    }
+
+    /// Resolves once the gateway has closed the connection that holds the turn ([`Turn::lost`]).
+    /// Cancel-safe, so a holder waits on it beside its git.
+    pub async fn lost(&mut self) -> std::io::Error {
+        self.turn.lost().await
+    }
+
+    /// End the turn, recording `outcome` (how the fence ended) with the gateway.
     pub fn end(self, outcome: String) {
         self.turn.end(outcome);
     }
@@ -159,73 +155,4 @@ fn seconds_since(unix_ms: u64) -> u64 {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
     now.saturating_sub(unix_ms) / 1000
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn queue() -> LandTurnName {
-        LandTurnName::new("repo.ref").unwrap()
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_land_takes_a_free_ref_turn_and_the_next_writer_takes_it_once_ended() {
-        let root = crate::temp_root::TempRoot::new("ref-turn");
-        let held = RefTurn::acquire_in(&root, &queue(), RefWriter::Land { workspace: "topic" })
-            .await
-            .unwrap();
-        let tickets = land_turn::observe(&root.join("repo.ref")).unwrap();
-        assert_eq!(tickets.len(), 1, "the land holds one ticket: {tickets:?}");
-        assert_eq!(tickets[0].workspace, "topic");
-        assert_eq!(tickets[0].pid, std::process::id());
-        held.end("delivered".to_owned());
-        let next = RefTurn::acquire_in(&root, &queue(), RefWriter::DocCommit).await;
-        next.expect("an ended ref turn stayed held")
-            .end("committed".to_owned());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_land_that_asks_for_a_held_ref_turn_holds_it_once_the_writer_ends() {
-        let root = crate::temp_root::TempRoot::new("ref-turn");
-        let writer = land_turn::take(
-            &root.join("repo.ref"),
-            "doc-commit",
-            "git commit",
-            None,
-            cowshed_os::flock::HOLDER_REPORT,
-            |_| panic!("the writer is first in the queue"),
-        )
-        .unwrap();
-        let waiting = tokio::spawn({
-            let root = root.to_path_buf();
-            async move {
-                RefTurn::acquire_in(&root, &queue(), RefWriter::Land { workspace: "topic" }).await
-            }
-        });
-        // The land queues behind the writer: two live tickets, the writer's first.
-        let mut tickets = Vec::new();
-        for _ in 0..200 {
-            tickets = land_turn::observe(&root.join("repo.ref")).unwrap();
-            if tickets.len() == 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            tickets
-                .iter()
-                .map(|ticket| ticket.workspace.as_str())
-                .collect::<Vec<_>>(),
-            ["doc-commit", "topic"],
-            "the land did not queue behind the writer"
-        );
-        assert!(!waiting.is_finished(), "the land took a held ref turn");
-        writer.end("committed".to_owned());
-        let held = waiting
-            .await
-            .unwrap()
-            .expect("the land never took the released turn");
-        held.end("delivered".to_owned());
-    }
 }
