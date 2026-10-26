@@ -2,7 +2,7 @@
 // WIRING: what a change adds is reached by production code.
 //
 // A component that is built, tested and accepted but that no production path calls is dead weight that reads as a
-// feature (AGENTS.md rule 13). This check reads only what a diff adds and asks, of each
+// feature (AGENTS.md rule 7). This check reads only what a diff adds and asks, of each
 // added item, whether non-test code in the post-change tree reaches it:
 //
 //   export  a TS/JS exported value: a non-test module imports it through an import that resolves to its module

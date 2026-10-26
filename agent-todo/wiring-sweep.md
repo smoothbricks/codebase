@@ -1,8 +1,8 @@
 # Wiring sweep: wire or delete every unreached item, then tag the project
 
-Owner of the root lint's scope (`@smoothbricks/codebase:wiring-lint`, `tooling/wiring.ts --tree`; AGENTS.md rule 13).
-The root lint judges every item of each Nx project tagged `wiring:enforced` and nothing else, so it landed enforcing the
-15 projects that were already clean. This brief is the work list for the rest; there is no ledger or exemption file in
+Owner of the root lint's scope (`@smoothbricks/codebase:wiring-lint`, `tooling/wiring.ts --tree`; AGENTS.md rule 7). The
+root lint judges every item of each Nx project tagged `wiring:enforced` and nothing else, so it landed enforcing the 15
+projects that were already clean. This brief is the work list for the rest; there is no ledger or exemption file in
 code. The land's diff check (`@smoothbricks/codebase:wiring`, run by `tooling/land-host.sh` before the gate) already
 refuses any new unreached item in every project, tagged or not.
 

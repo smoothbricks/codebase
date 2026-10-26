@@ -26,7 +26,8 @@ is the host-installed CLI of `packages/cowshed`.
   work by CPU tokens so host load stays schedulable. Work started outside it holds no token and starves everyone. Host
   targets that a sandbox can't run (`host-e2e`) use `cowshed exec <ws> --host -- direnv exec . <cmd>`.
 - **Land**: the land command (see Commands). Under the repository's **land turn** (a FIFO queue per repo, holder named),
-  it rebases the shed onto `main`, runs the repo's gate (`tooling/land-host.sh`: `nx run-many -t gate`, the root
+  it rebases the shed onto `main`, refuses what the rebased tree adds that no production code reaches
+  (`@smoothbricks/codebase:wiring`), runs the repo's gate (`tooling/land-host.sh`: `nx run-many -t gate`, the root
   aggregate of every project's lint, test and build plus `host-e2e`; then `bun run check:linux`), fast-forwards `main`
   on green and retires the shed.
 - **Nx**: the build and test runner. `@smoothbricks/nx-plugin` infers most targets.
@@ -105,7 +106,9 @@ is the host-installed CLI of `packages/cowshed`.
    migrating every caller in the same unit and deleting the old path. Fix the defects you touch; an unrelated code
    defect gets its evidence and an owner, without replacing your goal. Update the spec in the same unit, never by
    dropping a specified capability. Done means a production (non-test) call site plus a smoke run that exercises it;
-   otherwise wire it or delete it. _Enforced by: review._
+   otherwise wire it or delete it. _Enforced by: `tooling/wiring.ts`, which refuses each added item no production code
+   reaches (`@smoothbricks/codebase:wiring`, run by `tooling/land-host.sh` before the gate) and every unreached item of
+   a project tagged `wiring:enforced` (`wiring-lint`, in the root `lint`); review for the rest._
 8. **Byproducts.** When you choose a data structure, a storage or wire format, a log or trace shape, or a pass over
    data, or when you are about to add a cache, an index, a copy or a second pass → among designs with the same
    performance, pick the one whose necessary work has the most other uses, then thread it through everywhere. That
