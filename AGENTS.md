@@ -72,19 +72,25 @@ is the host-installed CLI of `packages/cowshed`.
 5. **Proof.** When you are about to run host work → run it through `cowshed exec` (`--host` for host targets). When you
    choose a test → pick the cheapest check that goes red when this contract is wrong, at the smallest real boundary, in
    the module that owns the contract. Reuse a valid proof until its relevant inputs change; use a directory or owned
-   fixture, not a mounted image, when it proves the same contract. Never re-run a dependency's suite in a consumer,
-   never assert that the OS behaves like the OS or Nx like Nx, and never fake our own code: use its real in-memory
-   implementation. Exercise our real OS, process or network integration where that behavior matters. A decision (event
-   handling, ordering, timeouts, retries as policy, recovery) lives in a pure core and gets a table-driven test with
-   injected events and an injected clock: no real I/O, no sleeps. The I/O shell holds no decisions: it maps OS events
-   into core inputs and executes core outputs; it gets one simple mock integration check plus actual runs, and no test
-   drives core logic through real watchers, timers or a load generator. Every test advances on readiness, completion and
-   progress, never on a sleep or a per-test deadline. A missing test, an infrastructure error or a timeout is never the
-   intended red. A race gets a real interleaving, never serialization. An expensive host fixture stays out of ordinary
-   test dependencies; the land gate reaches its dedicated target when its inputs change. A test tears down the fixtures
-   it physically owns on every exit path. _Enforced by: `cowshed exec`; the root `lint` policies `TEST-CLOCK-ORACLE`
-   (deadlines and elapsed-time asserts) and `TEST-ONE-WALK` (duplicate walks), on changed tests only
-   (`packages/nx-plugin/README.md`)._
+   fixture, not a mounted image, when it proves the same contract. A crate or package tests only its own contract:
+   behavior a dependency owns (another crate, package or repository: arrow-builder beneath LMAO, bitmosaic beneath
+   columine, Cargo, Nx, git, Bun, the OS) is tested once, in that dependency's own suite. A dependency re-test is never
+   written and is deleted on discovery, with its helpers, in the unit that finds it, never kept as "integration
+   coverage"; a test the dependency's suite lacks is added by its owner. A consumer that re-implements what a dependency
+   owns is a defect: the re-implementation goes, and its tests with it. A consumer keeps its own wire and protocol, its
+   own record recovery, one test per mapping of dependency results and refusals into its own terms (the dependency faked
+   only at its published interface), and exactly one smoke check that the real dependency is wired in. Otherwise never
+   fake our own code: use its real in-memory implementation. Exercise our real OS, process or network integration where
+   that behavior matters. A decision (event handling, ordering, timeouts, retries as policy, recovery) lives in a pure
+   core and gets a table-driven test with injected events and an injected clock: no real I/O, no sleeps. The I/O shell
+   holds no decisions: it maps OS events into core inputs and executes core outputs; it gets one simple mock integration
+   check plus actual runs, and no test drives core logic through real watchers, timers or a load generator. Every test
+   advances on readiness, completion and progress, never on a sleep or a per-test deadline. A missing test, an
+   infrastructure error or a timeout is never the intended red. A race gets a real interleaving, never serialization. An
+   expensive host fixture stays out of ordinary test dependencies; the land gate reaches its dedicated target when its
+   inputs change. A test tears down the fixtures it physically owns on every exit path. _Enforced by: `cowshed exec`;
+   the root `lint` policies `TEST-CLOCK-ORACLE` (deadlines and elapsed-time asserts) and `TEST-ONE-WALK` (duplicate
+   walks), on changed tests only (`packages/nx-plugin/README.md`); review for the test boundary._
 6. **Workarounds.** When a step fails, or you are about to make a failing, slow or blocked step pass without fixing its
    cause (a sleep used as a wait; a retry or rerun around the failure; a bound raised, or a check skipped or waived, to
    get a pass; a fallback; an env var, a lock or marker file, a wrapper protocol or hook; test serialization; SIGSTOP or
@@ -92,13 +98,14 @@ is the host-installed CLI of `packages/cowshed`.
    compatibility shim; a waiver list; a test-only code path) → stop and fix the cause at its owner: a tolerated failure
    is a defect with a receipt (`specs/cowshed/05_gateway.md`, "Deadlines": "the failure is the diagnosis"). What a
    contract designs is not a workaround: a transient error retried by its declared policy
-   (`specs/lmao/01r_transient_errors_and_retry.md`), a reconnect a spec defines, a bound that is the product's contract, an additive protocol reader that follows
-   its evolution contract. Before settling for a workaround, measure the right change: files, lines and contract
-   surfaces (wire, codec, spec, another shed), counted with `codegraph_explore`, LSP or `rg`. A small one is done in the
-   unit, coordinated with the path's owner; a large one goes to its owner with the count. "It would be bigger" without a
-   count, or an effort guess, is not a reason. If a seam, export or generator is missing, add it once at the owner.
-   Coordination that is allowed, and never cover for a failing concurrent test: one writer, one producer per checkout,
-   the jobserver, the land turn. Anything else needs a maintainer's approval. _Enforced by: review._
+   (`specs/lmao/01r_transient_errors_and_retry.md`), a reconnect a spec defines, a bound that is the product's contract,
+   an additive protocol reader that follows its evolution contract. Before settling for a workaround, measure the right
+   change: files, lines and contract surfaces (wire, codec, spec, another shed), counted with `codegraph_explore`, LSP
+   or `rg`. A small one is done in the unit, coordinated with the path's owner; a large one goes to its owner with the
+   count. "It would be bigger" without a count, or an effort guess, is not a reason. If a seam, export or generator is
+   missing, add it once at the owner. Coordination that is allowed, and never cover for a failing concurrent test: one
+   writer, one producer per checkout, the jobserver, the land turn. Anything else needs a maintainer's approval.
+   _Enforced by: review._
 7. **Done.** When you implement something or call it done → search existing code and specs first, and keep one owner per
    contract (no second copy). A field list, key set, constant or count that mirrors another type, schema or manifest is
    generated or derived from its owner, never retyped; a count or ratio is computed from what it counts when it is read,
@@ -109,25 +116,27 @@ is the host-installed CLI of `packages/cowshed`.
    otherwise wire it or delete it. _Enforced by: `tooling/wiring.ts`, which refuses each added item no production code
    reaches (`@smoothbricks/codebase:wiring`, run by `tooling/land-host.sh` before the gate) and every unreached item of
    a project tagged `wiring:enforced` (`wiring-lint`, in the root `lint`); review for the rest._
-8. **Byproducts.** When you choose a data structure, a storage or wire format, a log or trace shape, or a pass over
-   data, or when you are about to add a cache, an index, a copy or a second pass → among designs with the same
-   performance, pick the one whose necessary work has the most other uses, then thread it through everywhere. That
+8. **Byproducts.** When you choose a data structure, a storage or wire format, a log or trace shape, a crate boundary,
+   or a pass over data, or when you are about to add a cache, an index, a copy or a second pass → among designs with the
+   same performance, pick the one whose necessary work has the most other uses, then thread it through everywhere. That
    removes whole classes of code (extra indexes, sorts, caches, re-encodings, separate profilers) and the later
    optimizations they would need. Examples: a sorted structure serves ordered scans and range queries that a hash table
    plus a sort would pay for twice. LMAO traces write structured columns into preallocated buffers, so monitoring data
    is already columnar for offline analytics, span start and end times are already a profile, and the span result
-   already holds the `Ok`/`Err` with its status and error code, so nothing is allocated or computed twice. Before adding
-   a cache, name what your structure or pass already proves (order, an index, a checksum, a timing, a result) and use
-   it, and remove redundant passes, checks repeated below a boundary that already checked, re-parsing and duplicate
-   representations; then measure the uncached and the cached path. One fact has one authority: derived state (an index,
-   an envelope, a checkpoint, a queue, a cache) is a byproduct, never a second store. Before you write a record, ledger,
-   sidecar or cache, name the authority that already answers it (a directory listing, the filesystem, git, the kernel's
-   mount or process table, the event log) and read that instead (`specs/cowshed/01_storage.md`, "Runtime state: derived,
-   never stored" and "Tradeoffs"). Refuse these second stores by name: a write ledger beside the event log, a duplicate
-   inventory beside the authoritative index, a record of what a directory listing already holds, a retraction index kept
-   apart from the facts, a derivable-byte cache kept as an authoritative store, a parallel registry of what a manifest
-   lists, a checkpoint store duplicating live state, a summary table recomputable from its rows, a canonical copy beside
-   the live source, a shadow config beside the declared one, a second copy of a cache (move it instead;
+   already holds the `Ok`/`Err` with its status and error code, so nothing is allocated or computed twice. A crate split
+   moves its tests with the code and makes that crate the test boundary: consumers delete their tests of the moved
+   behavior, and a split that leaves them in the consumer is incomplete (Proof). Before adding a cache, name what your
+   structure or pass already proves (order, an index, a checksum, a timing, a result) and use it, and remove redundant
+   passes, checks repeated below a boundary that already checked, re-parsing and duplicate representations; then measure
+   the uncached and the cached path. One fact has one authority: derived state (an index, an envelope, a checkpoint, a
+   queue, a cache) is a byproduct, never a second store. Before you write a record, ledger, sidecar or cache, name the
+   authority that already answers it (a directory listing, the filesystem, git, the kernel's mount or process table, the
+   event log) and read that instead (`specs/cowshed/01_storage.md`, "Runtime state: derived, never stored" and
+   "Tradeoffs"). Refuse these second stores by name: a write ledger beside the event log, a duplicate inventory beside
+   the authoritative index, a record of what a directory listing already holds, a retraction index kept apart from the
+   facts, a derivable-byte cache kept as an authoritative store, a parallel registry of what a manifest lists, a
+   checkpoint store duplicating live state, a summary table recomputable from its rows, a canonical copy beside the live
+   source, a shadow config beside the declared one, a second copy of a cache (move it instead;
    `specs/cowshed/03_caches.md`, "Tradeoffs"). A cache stays basis-keyed, recomputable and disposable: a miss recomputes
    or says why it cannot, never serves a stale copy. If removing the work needs an upstream fork or patch, prefer a
    boundary cache and record the upstream alternative and its maintenance cost in the design record. _Enforced by:

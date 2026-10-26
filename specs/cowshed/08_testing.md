@@ -14,6 +14,18 @@ mapped input; the mock stands in for the OS, never for our code — and is prove
 drives core logic through real FSEvents, real timers or a load generator; the real tiers below prove substrate and
 enforcement contracts, not decisions a core takes.
 
+A suite tests only the contract of the crate or package it belongs to, in every tier: a test belongs to it only if a bug
+in that suite's own code can make it fail and its assertion is about what that code promises. Behavior a dependency owns
+(another crate or package, Cargo, Nx, git, Bun, the OS) is tested once, in that dependency's own suite: how Cargo reads
+a jobserver is Cargo's own to test (the jobserver proof below), and what the OS's disk tools do with an image is theirs.
+A dependency re-test is never written and is deleted on discovery, with its fixtures and helpers, in the unit that finds
+it, never kept as "integration coverage"; a test the dependency's suite lacks is added by its owner. A consumer that
+re-implements what a dependency owns is a defect: the re-implementation goes, and its tests with it. What a suite keeps
+is its own contract: its wire and protocol, its recovery of its own records, one test per mapping of a dependency's
+results and refusals into its own terms (the dependency faked only at its published interface, as the mock above stands
+in for the OS), and exactly one smoke check that the real dependency is wired in. The real tiers below assert what
+cowshed does with its real substrate, never what the substrate does.
+
 No mounts, no root, no network — pure functions with table-driven cases:
 
 - **Sandbox rule generation** (Seatbelt profile text and Landlock ruleset spec, from the same grant snapshot): closed
@@ -189,6 +201,10 @@ measured zero before exec. One lifecycle keeps the live, exited-unreaped and rea
 supplies readiness.
 
 ## Fixtures
+
+A fixture serves a test of its suite's own contract. The fixtures and helpers that only a deleted dependency re-test
+used are deleted with it, and a fixture stands in for a dependency only at that dependency's published interface: it
+returns the results and refusals the interface can return and reproduces nothing behind it.
 
 Every test fixture stays inside the effective grants of the ordinary exec it runs in. A Rust fixture whose paths are
 used as spelled, such as a Unix-socket fixture, takes the one shared scratch parent (`scratch_parent` in
