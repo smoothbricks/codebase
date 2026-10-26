@@ -6229,6 +6229,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             &volumes.layout.compacting(),
         )?;
         let pid = child.id();
+        // WHY unbounded: a detached reaper thread: nothing waits on it; it collects the compaction
+        // process whenever that exits, and says when it cannot.
+        #[allow(clippy::disallowed_methods)]
         std::thread::Builder::new()
             .name("seed-compaction-reaper".to_owned())
             .spawn(move || {

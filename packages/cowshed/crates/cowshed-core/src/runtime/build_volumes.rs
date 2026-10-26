@@ -6589,8 +6589,6 @@ fn main() {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_adoption_copies_nothing_from_the_target() {
-        use cowshed_os::fork_lock::Run as _;
-
         let scratch = Scratch::directory("adopt-copies-nothing");
         let (main_checkout, _, target) = scratch.linked_checkout("main", 1);
         let (topic_checkout, topic, landing) = scratch.linked_checkout("topic", 1);
@@ -6605,7 +6603,7 @@ fn main() {
             let output = std::process::Command::new("/usr/bin/sqlite3")
                 .arg(mount.join("nx/workspace-data/task-v3.db"))
                 .arg(statement)
-                .output_locked()
+                .output_bounded()
                 .unwrap();
             assert!(output.status.success(), "{output:?}");
             output.stdout
@@ -8367,7 +8365,6 @@ fn main() {
     #[tokio::test]
     async fn real_apfs_seed_compaction_publishes_a_fragmented_seed_and_catches_a_replaced_one_up() {
         use crate::storage::apfs::native::{SeedCatchUp, SeedCompaction};
-        use cowshed_os::fork_lock::Run as _;
         const MIB: u64 = 1024 * 1024;
         let scratch = Scratch::new("seed-compaction");
         let target = owner("main", '0');
@@ -8664,7 +8661,7 @@ fn main() {
                     .arg("-c")
                     .arg(scratch.layout.image(&replacement))
                     .arg(image)
-                    .status_locked()
+                    .status_bounded()
                     .expect("cp -c")
                     .success()
             );

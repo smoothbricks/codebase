@@ -517,6 +517,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_os::test_backstop::ChildBackstop as _;
 
     const HOUR: Duration = Duration::from_secs(60 * 60);
 
@@ -632,9 +633,9 @@ mod tests {
         let (ready, go) = (fifo("ready"), fifo("go"));
         let ticket = directory.join("ticket");
         let held = File::create(&ticket).expect("ticket");
-        // SAFETY: plain descriptor operations on a descriptor this test owns.
+        held.try_lock().expect("lock the fresh ticket");
+        // SAFETY: a plain descriptor operation on a descriptor this test owns.
         unsafe {
-            assert_eq!(libc::flock(held.as_raw_fd(), libc::LOCK_EX), 0, "lock");
             assert_eq!(
                 libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0),
                 0,
@@ -653,18 +654,16 @@ mod tests {
         assert_eq!(said, "started");
         drop(held);
         let again = File::open(&ticket).expect("ticket again");
-        // SAFETY: a non-blocking lock attempt on a descriptor this test owns.
-        let locked = unsafe { libc::flock(again.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        let error = std::io::Error::last_os_error();
+        let locked = again.try_lock();
         OpenOptions::new()
             .write(true)
             .open(&go)
             .and_then(|mut go| go.write_all(b"\n"))
             .expect("let the process end");
-        let status = process.wait().expect("reap the process");
-        assert_eq!(
-            locked, 0,
-            "the running compaction process keeps the land's lock: {error}"
+        let status = process.wait_bounded().expect("reap the process");
+        assert!(
+            locked.is_ok(),
+            "the running compaction process keeps the land's lock: {locked:?}"
         );
         assert!(status.success(), "the stand-in process ended {status}");
         fs::remove_dir_all(&directory).expect("cleanup");

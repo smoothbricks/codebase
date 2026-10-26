@@ -1002,7 +1002,7 @@ pub(crate) mod tests {
                     .arg("-c")
                     .arg(&base)
                     .arg(&path)
-                    .status_locked()
+                    .status_bounded()
                     .expect("cp -c")
                     .success()
             );
