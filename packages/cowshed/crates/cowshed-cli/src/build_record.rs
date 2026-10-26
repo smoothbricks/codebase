@@ -50,7 +50,9 @@ impl BuildRecord {
         format!(
             "commit {}, committed {}",
             self.short_commit(),
-            rfc3339_utc(self.commit_time)
+            cowshed_types::clock::rfc3339_utc(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(self.commit_time)
+            )
         )
     }
 }
@@ -141,32 +143,6 @@ pub fn unproven_refusal(
             installed.describe(),
         ),
         rebase_hint(installed),
-    )
-}
-
-/// `seconds` since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
-fn rfc3339_utc(seconds: u64) -> String {
-    // Howard Hinnant's `civil_from_days`: days since 1970-01-01 to a proleptic Gregorian date.
-    let days = (seconds / 86_400) as i64 + 719_468;
-    let era = days.div_euclid(146_097);
-    let day_of_era = days.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    let second_of_day = seconds % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        second_of_day / 3_600,
-        second_of_day % 3_600 / 60,
-        second_of_day % 60
     )
 }
 
@@ -276,12 +252,5 @@ mod tests {
             refusal.message
         );
         assert!(refusal.hint.contains("--downgrade"), "{}", refusal.hint);
-    }
-
-    #[test]
-    fn epoch_seconds_are_spelled_as_utc_dates() {
-        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
-        assert_eq!(rfc3339_utc(1_791_302_531), "2026-10-06T16:02:11Z");
     }
 }
