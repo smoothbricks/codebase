@@ -71,6 +71,7 @@
     "src/pr/index.test.ts": 39,
     "src/wrangler/prepare-env.test.ts": 35,
     "src/monorepo/publish-manifest.test.ts": 33,
+    "src/monorepo/compiler-variables.test.ts": 29,
     "src/monorepo/consumed-scope.test.ts": 27,
     "src/wrangler/stage-sweep.test.ts": 25,
     "src/release/__tests__/build-inputs.test.ts": 24,
