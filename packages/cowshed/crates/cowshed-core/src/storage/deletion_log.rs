@@ -185,7 +185,8 @@ pub enum KeptBy {
     Bundle { path: PathBuf },
     /// The removal gate proved `branch` (at `head`) holds the tip's changes, or, for the head the
     /// target does not hold, that `branch` is the ref `cowshed push` wrote
-    /// (`refs/cowshed/<ws>/heads/<branch>`, at `head`), which is then the only copy of those commits
+    /// (`refs/cowshed/<ws>/heads/<branch>`, at `head`), which is then the only copy of those commits.
+    /// Any other tip is named by the containment branch, whichever proof passed it
     /// (02_workspaces.md, `rm` step 1).
     Target {
         branch: String,

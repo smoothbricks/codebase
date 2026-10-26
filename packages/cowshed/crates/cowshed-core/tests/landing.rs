@@ -1316,6 +1316,28 @@ async fn a_head_only_the_push_ref_keeps_is_retirable_and_not_a_fold() {
     );
 }
 
+/// A ref can outlive its commit: a push ref that names a commit main's repository cannot see keeps
+/// nothing, so `rm` never retires the workspace that holds the only copy on the strength of the
+/// name alone (02_workspaces.md, `rm` step 1).
+#[tokio::test]
+async fn a_push_ref_naming_a_commit_main_cannot_see_keeps_nothing() {
+    let fixture = Fixture::new("head-dangling-ref");
+    let mount = fixture.clone_workspace("topic");
+    workspace_commit(&mount, "topic.txt", "topic\n", "topic work");
+    let head = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    // `git update-ref` refuses a commit it does not hold, so the ref is written as a lost object
+    // leaves it: a file naming the head.
+    let heads = fixture.parent().join(".git/refs/cowshed/topic/heads");
+    fs::create_dir_all(&heads).expect("the ref's directory");
+    fs::write(heads.join("topic"), format!("{head}\n")).expect("a ref naming the head");
+
+    let landing = measured(&fixture, &mount).await;
+
+    assert_eq!(counts(&landing), (1, 0, 0), "{landing:?}");
+    assert_eq!(landing.commits.preserved_by(), None, "{landing:?}");
+    assert!(!landing.fully_landed());
+}
+
 /// One row of a project listing: the fixture's workspace `name`, attached at `mount`.
 fn listing_row(name: &str, role: WorkspaceRole, mount: PathBuf) -> WorkspaceInfo {
     WorkspaceInfo {

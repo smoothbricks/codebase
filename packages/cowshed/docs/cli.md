@@ -617,17 +617,18 @@ cwd or `--project` selects the project as for any verb. Run from outside every p
 the way `detach <name>` does — from the store, by its session name — and refuses with the projects named when more than
 one holds it. The address is all that changes; the gate below is the same.
 
-Removing a workspace destroys its image, and the image is where its commits live — so `rm` refuses (exit 4) unless
-`main` already holds the workspace's work. A `HEAD` main contains is landed; otherwise every commit main lacks must be
-held by content or by patch identity. Content: every file the workspace changed since its merge base with main already
-carries that change in main, beside whatever main changed since. Patch identity: main holds a patch-equivalent commit
-(`git cherry`), even where main has since edited the same lines. Work main took by squash, cherry-pick, a rewrite or a
-conflict-resolved pick is landed. A `HEAD` main lacks also passes when the ref `cowshed push` wrote for its checked-out
-branch, `refs/cowshed/<name>/heads/<branch>`, is that commit or a descendant of it: main's repository holds the commits
-then, so a workspace pushed for review retires with no flag. A `HEAD` committed past its ref, or detached, is not kept,
-and a dirty tree still refuses first. The refusal names main's tip, each file whose change main lacks with why
-(`missing`, `conflict`, `added`, `deleted`, `changed`, `mode`, `unmergeable`; ten, then a count), the commits held by
-neither proof with their subjects (ten, then a count), and points at `cowshed land <ws>`.
+Removing a workspace destroys its image, and the image is where its commits live — so `rm` refuses (exit 4) unless every
+commit is safe elsewhere: `main` already holds the workspace's work, or the ref `cowshed push` wrote for a branch keeps
+it. A `HEAD` main contains is landed; otherwise every commit main lacks must be held by content or by patch identity.
+Content: every file the workspace changed since its merge base with main already carries that change in main, beside
+whatever main changed since. Patch identity: main holds a patch-equivalent commit (`git cherry`), even where main has
+since edited the same lines. Work main took by squash, cherry-pick, a rewrite or a conflict-resolved pick is landed. A
+`HEAD` main lacks also passes when the ref `cowshed push` wrote for its checked-out branch,
+`refs/cowshed/<name>/heads/<branch>`, is that commit or a descendant of it: main's repository holds the commits then, so
+a workspace pushed for review retires with no flag. A `HEAD` committed past its ref, or detached, is not kept, and a
+dirty tree still refuses first. The refusal names main's tip, each file whose change main lacks with why (`missing`,
+`conflict`, `added`, `deleted`, `changed`, `mode`, `unmergeable`; ten, then a count), the commits held by neither proof
+with their subjects (ten, then a count), and points at `cowshed land <ws>`.
 
 The project-open `cowshed: info: leaving … unfinished lifecycle operations …` line concerns other workspaces outside
 this command's recovery scope. It explicitly says those operations do not block this command; `cowshed doctor` lists
@@ -639,7 +640,7 @@ The two overrides authorize different losses and neither substitutes for the oth
 | Flag        | Overrides                                                                                                                       | Does **not** override                                                     |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `--force`   | transient state: a dirty tree, an in-progress merge, the workspace's own running jobs; and a workspace younger than ten minutes | the landed-content gate; a process cowshed does not run holding the mount |
-| `--abandon` | the landed-content gate — changes `main` does not hold                                                                          | transient state                                                           |
+| `--abandon` | the landed-content gate — changes neither `main` nor a `push` ref holds                                                         | transient state                                                           |
 
 `--force` stops that workspace's running jobs (TERM, then KILL after the grace period) before detaching; without it,
 removal lets the supervisor finish its active jobs. A leftover `.git/AUTO_MERGE` alone is not an in-progress operation

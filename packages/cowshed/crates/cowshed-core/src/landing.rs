@@ -321,7 +321,7 @@ async fn judged_branches(
         if standing(&target_repository, target_branches.get(&name), &tip)
             .await?
             .keeps()
-            || standing(&pushed, push_refs.get(&push_ref), &tip)
+            || pushed_standing(&pushed, push_refs.get(&push_ref), &tip)
                 .await?
                 .keeps()
         {
@@ -333,7 +333,7 @@ async fn judged_branches(
         let commits = counted(store_root, target, workspace_mount, tip.as_str())
             .await
             .unwrap_or_else(|reason| LandingCommits::Indeterminate { reason });
-        if !commits.fully_landed() {
+        if !commits.held_by_target() {
             unlanded.push(BranchLanding {
                 branch: String::from_utf8_lossy(short).into_owned(),
                 tip,
@@ -358,6 +358,9 @@ enum Standing {
     /// The commit is not an ancestor of the ref: it carries work the ref lacks, being ahead of it
     /// or diverged from it.
     Ahead,
+    /// The ref names this very commit, but the repository it lives in cannot see the commit, so it
+    /// keeps nothing: a ref can outlive its object, and only a commit that repository holds is kept.
+    Dangling,
 }
 
 impl Standing {
@@ -396,6 +399,27 @@ async fn standing(
     })
 }
 
+/// [`standing`] for a ref `cowshed push` wrote, which keeps its commit only while `pushed`, the
+/// repository the ref lives in, still holds it: a tip equal to the ref's is taken without proof
+/// otherwise, and a ref can name an object its repository lost. One process more, only for a ref
+/// that equals the tip.
+async fn pushed_standing(
+    pushed: &GitRepository,
+    preserving: Option<&Vec<u8>>,
+    tip: &[u8],
+) -> std::result::Result<Standing, String> {
+    let standing = standing(pushed, preserving, tip).await?;
+    if standing == Standing::Equal
+        && !pushed
+            .has_commit(&String::from_utf8_lossy(tip))
+            .await
+            .map_err(|error| error.message)?
+    {
+        return Ok(Standing::Dangling);
+    }
+    Ok(standing)
+}
+
 /// The ref `cowshed push` wrote in `push_repository` for the workspace's checked-out branch, when
 /// it keeps `head` ([`Standing::keeps`]). A detached head is on no branch, so no ref is its to
 /// read, and a branch `push` never wrote has none: both are no answer to keep, not a failure.
@@ -430,7 +454,7 @@ async fn pushed_head(
         .commit_oid(head)
         .await
         .map_err(|error| error.message)?;
-    if !standing(&pushed, Some(preserving), head.as_str().as_bytes())
+    if !pushed_standing(&pushed, Some(preserving), head.as_str().as_bytes())
         .await?
         .keeps()
     {
@@ -847,7 +871,8 @@ mod tests {
 
     /// The judgement every preservation proof shares, as a table: a ref keeps a commit exactly when
     /// it is that commit or a descendant of it. A head the workspace pushed and has not moved is
-    /// kept, and so is one it moved back from; one it committed past, or never pushed, is not.
+    /// kept, and so is one it moved back from; one it committed past, one never pushed, and one whose
+    /// ref lost its commit are not.
     #[test]
     fn a_ref_keeps_a_commit_only_when_it_is_that_commit_or_a_descendant_of_it() {
         for (standing, keeps) in [
@@ -855,6 +880,7 @@ mod tests {
             (Standing::Equal, true),
             (Standing::Ancestor, true),
             (Standing::Ahead, false),
+            (Standing::Dangling, false),
         ] {
             assert_eq!(standing.keeps(), keeps, "{standing:?}");
         }

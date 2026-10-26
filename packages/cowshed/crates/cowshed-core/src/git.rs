@@ -1355,7 +1355,9 @@ impl GitRepository {
         }
     }
 
-    async fn has_commit(&self, commit: &str) -> Result<bool> {
+    /// Whether this repository can see a commit named `commit`: a ref or oid it holds no commit for is
+    /// `false`, not an error.
+    pub async fn has_commit(&self, commit: &str) -> Result<bool> {
         Ok(self.resolve_commit(commit).await?.is_some())
     }
 

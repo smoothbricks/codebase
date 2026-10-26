@@ -8113,8 +8113,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// with what keeps it once the image is gone, for the deletion log (`retire-workspace`). A tip
     /// an abandonment kept is held by its bundle (the checked-out branch is kept as `HEAD`); a tip
     /// at the head the target does not hold, which `head_kept_by` names, is kept by that ref
-    /// `cowshed push` wrote, now the only copy; every other tip passed the removal gate, so the
-    /// containment branch holds its changes (`tip_keeper`).
+    /// `cowshed push` wrote, now the only copy; every other tip passed the removal gate and is named
+    /// by the containment branch, whichever proof passed it: the log does not say that a branch was
+    /// kept by a branch of its name or by its own push ref instead (`tip_keeper`).
     ///
     /// Read before the image retires, because nothing can read it after. A failure is said and
     /// costs the log its Git facts; it never fails a removal the gate already authorized.
