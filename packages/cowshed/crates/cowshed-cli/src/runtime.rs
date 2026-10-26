@@ -200,6 +200,13 @@ pub trait CliService: Send {
     async fn reconcile_gateway(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Where this project's store keeps its land-turn queues ([`CanonicalRoots::land_turn_root`]):
+    /// a declared land's turns and its `lands.log` (02_workspaces.md "A declared land").
+    fn land_turn_root(&self) -> Result<PathBuf>;
+    /// The cowshed a declared land's after-land child runs as: the store's installed one,
+    /// `<support>/bin/cowshed` (05_gateway.md "The installed cowshed"), the gateway's own program.
+    /// `None` when this store's home has none installed.
+    fn background_program(&self) -> Result<Option<PathBuf>>;
     async fn shutdown(self) -> Result<()>
     where
         Self: Sized;
@@ -254,6 +261,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
         | Command::Lock(_)
@@ -327,6 +335,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
         | Command::Lock(_)
@@ -444,6 +453,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
         | Command::Lock(_)
@@ -639,6 +649,15 @@ impl ActorBridge {
         self.coordinator.as_ref().ok_or_else(|| {
             CowshedError::internal("the CLI controller bridge has already been shut down")
         })
+    }
+
+    fn storage(&self) -> Result<&ValidatedHostStorage> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| &runtime.descriptor().storage)
+            .ok_or_else(|| {
+                CowshedError::internal("the CLI project runtime has already been shut down")
+            })
     }
 
     fn repo_id(&self) -> Result<&RepoId> {
@@ -891,6 +910,16 @@ impl CliService for ActorBridge {
 
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<RemoveReport> {
         self.coordinator()?.destroy(workspace, options).await
+    }
+
+    fn land_turn_root(&self) -> Result<PathBuf> {
+        Ok(self.storage()?.land_turn_root())
+    }
+
+    fn background_program(&self) -> Result<Option<PathBuf>> {
+        let program = cowshed_core::host_dirs::installed_binary_directory(self.storage()?.home())
+            .join("cowshed");
+        Ok(program.is_file().then_some(program))
     }
 
     async fn remove_project(
@@ -2141,6 +2170,45 @@ where
             Ok(success())
         }
         Command::Land(args) => {
+            // A land into main of a repository whose main declares `[land]` is that route
+            // (02_workspaces.md "A declared land"); a preflight is the primitive's for any land.
+            let declared = if matches!(args.into.as_deref(), None | Some("main")) {
+                let main = service.path("main", true).await?.mount;
+                let config = cowshed_core::storage::bootstrap::main_cowshed_config(&main)?;
+                config
+                    .land()
+                    .cloned()
+                    .map(|declaration| (main, declaration))
+            } else {
+                None
+            };
+            if let Some((main, declaration)) = declared.as_ref().filter(|_| !args.preflight) {
+                crate::declared_land::refuse_primitive_options(&args)?;
+                let report = crate::declared_land::land(
+                    service,
+                    main,
+                    declaration,
+                    crate::declared_land::DeclaredLand {
+                        workspace: &args.workspace,
+                        retire: args.retire,
+                        push: args.push,
+                    },
+                    output,
+                )
+                .await?;
+                if json {
+                    output.success(report).map_err(output_error)?;
+                } else {
+                    emit_land(output, &report)?;
+                }
+                return Ok(success());
+            }
+            if !args.push && declared.is_none() {
+                return Err(CowshedError::usage(
+                    "--no-push needs a declared land: only the route [land] declares in main's .cowshed.toml pushes",
+                    format!("cowshed land {}", args.workspace),
+                ));
+            }
             // A preflight retires nothing, so it leaves the gateway as it is.
             let reconcile_gateway = args.retire && !args.preflight;
             let options = LandOptions {
@@ -2219,6 +2287,9 @@ where
         )),
         Command::LandTurn(_) => Err(CowshedError::internal(
             "land-turn names no project and is dispatched before the runtime bridge",
+        )),
+        Command::DocCommit(_) => Err(CowshedError::internal(
+            "doc-commit opens no project and is dispatched before the runtime bridge",
         )),
         Command::SubtreeRoot(_) | Command::RetireDescendants(_) => Err(CowshedError::internal(
             "subtree commands use the native supervisor socket before the runtime bridge",

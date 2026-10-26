@@ -320,6 +320,13 @@ pub const PARITY: &[Row] = &[
     
     row("land", "ungated", field(&[("coordinator.land", "options.mode")], &[argument("Coordinator.land", 1, "mode")])),
     row("land", "preflight", field(&[("coordinator.land", "options.preflight")], &[argument("Coordinator.land", 1, "preflight")])),
+    row("land", "no-push", Counterpart::Composed { recipe: "a declared land (02_workspaces.md \"A declared land\"): land({preflight}), rebase, the repository's gate, land({refTurn, retire: false}) and remove, whose detached after-land child pushes; --no-push leaves the push out", facade: &[member("Coordinator.land"), member("Coordinator.rebase"), member("Coordinator.remove")] }),
+
+    row("doc-commit", "", input(member("spawnDocCommit"))),
+    row("doc-commit", "message", input(argument("spawnDocCommit", 0, "message"))),
+    row("doc-commit", "file", input(argument("spawnDocCommit", 0, "messageFile"))),
+    row("doc-commit", "patch", input(argument("spawnDocCommit", 0, "patch"))),
+    row("doc-commit", "icm", input(argument("spawnDocCommit", 0, "icm"))),
 
     row("doctor", "", field(&[("coordinator.doctor", "")], &[member("Coordinator.doctor")])),
     row("doctor", "repair", Counterpart::Composed { recipe: "doctor() then gc({}): the one sweep the CLI's repair runs (06_cli.md, \"Onboarding and repair\")", facade: &[member("Coordinator.doctor"), member("Coordinator.gc")] }),

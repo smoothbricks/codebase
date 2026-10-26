@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::fd::RawFd;
 use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
@@ -76,71 +77,15 @@ where
         .collect::<Vec<_>>()
         .join(" ");
 
-    let started = Instant::now();
-    let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let workspace = args.workspace.clone();
-    let outside = args.outside_lock.clone();
-    let mut taking = tokio::task::spawn_blocking(move || {
-        queue::take(
-            &directory,
-            &workspace,
-            &description,
-            outside.as_deref(),
-            LAND_TURN_REPORT_EVERY,
-            |wait| {
-                // The receiver is read until this call returns, so no report is lost; a send
-                // fails only once the receiver is gone, and then no caller is left to hear it.
-                let _ = reports.send(wait.clone());
-            },
-        )
-    });
-
-    let mut waited = false;
-    // A report that cannot be written is kept, not returned: returning while the take still waits
-    // would make the runtime's shutdown wait for the queue with nothing left to report to.
-    let mut written: Result<(), CowshedError> = Ok(());
-    let joined = loop {
-        tokio::select! {
-            Some(wait) = received.recv() => {
-                waited = true;
-                written = written.and(report(output, args.repo.as_str(), &wait));
-            }
-            joined = &mut taking => break joined,
-        }
-    };
-    while let Ok(wait) = received.try_recv() {
-        waited = true;
-        written = written.and(report(output, args.repo.as_str(), &wait));
-    }
-    let turn = joined
-        .map_err(|error| {
-            CowshedError::internal(format!(
-                "the land turn thread for {} failed: {error}",
-                args.repo
-            ))
-        })?
-        .map_err(|error| {
-            CowshedError::internal(format!(
-                "cannot take the land turn for {}: {error}",
-                args.repo
-            ))
-        })?;
-    let reported = written.and_then(|()| {
-        if waited {
-            output
-                .guidance(&format!(
-                    "land turn {}: taken after {} s",
-                    args.repo,
-                    started.elapsed().as_secs()
-                ))
-                .map_err(write_failed)?;
-        }
-        Ok(())
-    });
-    if let Err(error) = reported {
-        turn.end(format!("did not start: {}", error.message));
-        return Err(error);
-    }
+    let turn = take_turn(
+        directory,
+        args.repo.as_str(),
+        &args.workspace,
+        description,
+        args.outside_lock.clone(),
+        output,
+    )
+    .await?;
     // Armed once the turn is held and before the child starts, so a signal that arrives from here
     // on reaches the child, and the turn is held until the child ends.
     let mut interrupts = policy.arm_forwarding();
@@ -175,6 +120,81 @@ where
     };
     relay?;
     exit_code(status)
+}
+
+/// Take the turn of the queue in `directory` for a land of `workspace`, saying on `output` who
+/// holds it and how many are ahead while it waits, and how long it waited once it is taken. `label`
+/// names the queue in those lines. A report that cannot be written ends the turn unstarted.
+pub(crate) async fn take_turn<W, E>(
+    directory: PathBuf,
+    label: &str,
+    workspace: &str,
+    description: String,
+    outside: Option<PathBuf>,
+    output: &mut Output<W, E>,
+) -> Result<queue::Turn, CowshedError>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    let started = Instant::now();
+    let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let workspace = workspace.to_owned();
+    let mut taking = tokio::task::spawn_blocking(move || {
+        queue::take(
+            &directory,
+            &workspace,
+            &description,
+            outside.as_deref(),
+            LAND_TURN_REPORT_EVERY,
+            |wait| {
+                // The receiver is read until this call returns, so no report is lost; a send
+                // fails only once the receiver is gone, and then no caller is left to hear it.
+                let _ = reports.send(wait.clone());
+            },
+        )
+    });
+
+    let mut waited = false;
+    // A report that cannot be written is kept, not returned: returning while the take still waits
+    // would make the runtime's shutdown wait for the queue with nothing left to report to.
+    let mut written: Result<(), CowshedError> = Ok(());
+    let joined = loop {
+        tokio::select! {
+            Some(wait) = received.recv() => {
+                waited = true;
+                written = written.and(report(output, label, &wait));
+            }
+            joined = &mut taking => break joined,
+        }
+    };
+    while let Ok(wait) = received.try_recv() {
+        waited = true;
+        written = written.and(report(output, label, &wait));
+    }
+    let turn = joined
+        .map_err(|error| {
+            CowshedError::internal(format!("the land turn thread for {label} failed: {error}"))
+        })?
+        .map_err(|error| {
+            CowshedError::internal(format!("cannot take the land turn for {label}: {error}"))
+        })?;
+    let reported = written.and_then(|()| {
+        if waited {
+            output
+                .guidance(&format!(
+                    "land turn {label}: taken after {} s",
+                    started.elapsed().as_secs()
+                ))
+                .map_err(write_failed)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = reported {
+        turn.end(format!("did not start: {}", error.message));
+        return Err(error);
+    }
+    Ok(turn)
 }
 
 /// A held command whose environment is already valid, prepared before asking for any lock.

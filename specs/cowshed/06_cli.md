@@ -742,7 +742,21 @@ extra_workspace_dirs = ["build-out"]
 output_limit = "1GiB"         # combined stdout+stderr per job; explicit output-limit terminal state
 [nx]
 daemon_idle = "5m"             # a shed unused this long has its kept Nx daemon stopped (04_sandbox.md); main's copy only
+[land]                         # main's copy only: the declared land route (02_workspaces.md "A declared land")
+turn = "acme"                  # the land-turn queue; the ref turn is "acme.ref"
+gate = ["sh", "tooling/land-host.sh", "--gate", "{workspace}"]  # the gate; {workspace} is the landing workspace
+push = "origin"                # the remote a landed main is pushed to; omitted, nothing is pushed
+after = [["sh", "tooling/land-install.sh", "{before}", "{head}"]]  # run in order after the push, detached
+[doc]                          # main's copy only: `cowshed doc-commit` (02_workspaces.md)
+paths = ["*.md"]               # documentation: `*` matches any run of characters, `/` included; `?` one
+check = ["prettier", "--write"]  # optional; run with the admitted paths appended
 ```
+
+`[land]` and `[doc]` are read from main's checkout alone, as `[sandbox]` is: a workspace's copy is the agent's to edit.
+`turn` is a land-turn queue name (1 to 60 of `A-Z a-z 0-9 . _ -`, not starting with `.` or ending in `.ref`, so
+`<turn>.ref` is one too). `gate` and each `after` command are argv lists whose program is literal: a word spelled `{…}`
+must be one of that command's slots (`{workspace}` for the gate; `{before}` and `{head}` for an after command), and any
+other word is passed as it is. `[doc]` needs `[land]`, whose turn names the ref turn it holds.
 
 macOS port allocation is not a configuration setting. Fixture stores allocate from a reserved fixture partition of the
 validation range; the host never assigns there. The partition bounds are defined once in code. Allocation, growth, and

@@ -522,3 +522,34 @@ export async function spawnLandTurn(options: SpawnLandTurnOptions): Promise<Land
   );
   return { exit: ended(child, [], () => []) };
 }
+
+/** The message of `doc-commit`: given (`-m`), or read from a file (`-F`, `-` for stdin). */
+export type DocCommitMessage =
+  | { readonly message: string; readonly messageFile?: never }
+  | { readonly messageFile: string; readonly message?: never };
+
+/** The edit of `doc-commit`: a `git apply` patch or an ICM program file (`-` for stdin). */
+export type DocCommitEdit =
+  | { readonly patch: string; readonly icm?: never }
+  | { readonly icm: string; readonly patch?: never };
+
+/** `doc-commit (-m | -F) (--patch | --icm)`, in main's checkout `project`. */
+export type SpawnDocCommitOptions = { readonly project?: string } & DocCommitMessage & DocCommitEdit;
+
+/** A running `cowshed doc-commit`: the ref turn is held until it ends; its stdout is the commit. */
+export interface DocCommitRun {
+  readonly exit: Promise<LauncherExit>;
+}
+
+export async function spawnDocCommit(options: SpawnDocCommitOptions): Promise<DocCommitRun> {
+  const child = await launch(
+    [
+      ...(options.project === undefined ? [] : ['--project', options.project]),
+      'doc-commit',
+      ...(options.message === undefined ? ['-F', options.messageFile] : ['-m', options.message]),
+      ...(options.patch === undefined ? ['--icm', options.icm] : ['--patch', options.patch]),
+    ],
+    'inherit',
+  );
+  return { exit: ended(child, [], () => []) };
+}

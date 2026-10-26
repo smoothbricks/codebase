@@ -1318,6 +1318,58 @@ attributed Nx task graphs may be hashed and restored from the adopted local cach
 reported without executing a task. Non-Nx checks are not replayed. Declared outputs are restored onto main's source
 volume; adopting incremental state alone does not provide them (16_build_volumes.md, Land step 7).
 
+### `cowshed land <name> [--no-push] [--no-retire]` in a repository that declares `[land]`
+
+When main's `.cowshed.toml` declares `[land]` (see [Configuration](../../../specs/cowshed/06_cli.md#configuration)),
+`cowshed land <name>` into main is the repository's whole land route, and no host script runs around it. It checks the
+fences `--preflight` checks; takes the repository's land turn (`[land] turn`), saying who holds it and how many are
+ahead while it waits; rebases `<name>` onto main; runs `[land] gate` on the host in main's pure environment, its
+`{workspace}` replaced by `<name>` and its output on stderr; and fast-forwards main to exactly the gated commit under
+the ref turn `<turn>.ref`, retiring the workspace as `cowshed land` does (`--no-retire` keeps it). A main that moved
+while the gate ran, a doc commit say, sends it back to the rebase and the gate, which replays from the Nx cache every
+task those commits do not reach. A failing gate exits 4 and keeps the workspace. Once the turn has ended it starts a
+detached child that pushes main to `[land] push` (`--no-push` skips it) and then runs each `[land] after` command with
+`{before}` and `{head}` replaced; a refused retire still starts it, since main has moved. The land never waits for that
+child; every outcome is one JSON line of `lands.log` beside the turn's tickets in
+`~/Library/Application Support/dev.cowshed/land-turn/<turn>/`, and each command's output is kept in `lands/` beside it.
+The primitive's own fences and checks (`--check`, `--target`, `--expected-*`, `--ref-lock`, `--ref-turn`, `--push-only`,
+`--ungated`) are refused there (exit 2), since the route pins its own.
+
+The declared commands run with nothing of your shell: `HOME`, `USER`, `LOGNAME`, `TERM`, `LANG` and `SSH_AUTH_SOCK`
+pass, `PATH` is the host bootstrap path, and each runs in main's checkout as `direnv exec <main> …` when main has an
+`.envrc`, so a gate sees main's devenv and nothing of the caller's.
+
+```
+$ cowshed land topic
+cowshed: land: gating 6de24c8c0b61a08a7a098b2e83be8d3d513c57c3 (rebased onto e31f5266138612eca2f7fee4bf5d34d3607fba6e) with sh
+cowshed: land: main moved from e31f5266138612eca2f7fee4bf5d34d3607fba6e to c75731595db93e6bf08493a894602fb653359cd4 while the gate ran; rebasing onto it and gating again (re-gate 1)
+cowshed: land: gating bc2b19e15615159cb9430de3412db8cb722b9c5f (rebased onto c75731595db93e6bf08493a894602fb653359cd4) with sh
+cowshed: land: landed bc2b19e15615159cb9430de3412db8cb722b9c5f on main; the land turn smoothbricks is free
+cowshed: land: the push and after-land commands run detached, never awaited; their outcomes go to ~/Library/Application Support/dev.cowshed/land-turn/smoothbricks/lands.log and their output to ~/Library/Application Support/dev.cowshed/land-turn/smoothbricks/lands/bc2b19e15615159cb9430de3412db8cb722b9c5f.log
+main	bc2b19e15615159cb9430de3412db8cb722b9c5f	true
+```
+
+### `cowshed doc-commit (-m <msg> | -F <file>) (--patch <file> | --icm <program>)`
+
+Commits one documentation edit to main with no workspace and no gate, and without waiting for any land's gate. The edit
+is the input: a patch `git apply` takes, or an ICM program, which runs as `icm run <program> --root <main>` with the
+`icm` on your `PATH`. Either may be `-` for stdin, as may `-F`, but only one of them. In one hold of the ref turn
+`<[land] turn>.ref` it applies the edit, refuses any path `[doc] paths` does not admit or that main held uncommitted,
+runs `[doc] check` with the paths, and commits exactly those paths with the repository's hooks; anything that stops it
+first puts main's tree back as it was (exit 4). Run it in main's checkout or name it with `--project`; a workspace is
+refused. It asks no daemon and no gateway. Stdout is the commit; `--json` returns `{commit, paths}`.
+
+```
+$ cowshed doc-commit -m 'docs: name the ref turn' --patch fix.diff
+cowshed: doc-commit waits for the ref turn demo.ref: 1 ahead; raven holds it (pid 365, asked 1s ago)
+cowshed: doc-commit took the ref turn demo.ref after 2s
+e60724873ab7ff3cec3fadc6cc993d8e175de379
+
+$ cowshed doc-commit -m 'docs: code' --patch code.diff
+cowshed: the edit writes paths that are not documentation by /private/tmp/doc-demo.e1Kp/main/.cowshed.toml's [doc] paths: a.rs
+next: commit code in a shed and land it with cowshed land <ws>
+```
+
 ## Time travel
 
 ### `cowshed fork <src> <dst>`

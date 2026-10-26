@@ -1087,9 +1087,6 @@ implicit rebase would land a head nobody named whenever main had moved. A worksp
 the fast-forward with exit 4 and a hint naming `cowshed rebase <ws>`; rebasing and re-running the gates is the caller's
 step. An ungated land validates no head, so it rebases on its own (`--ungated`, below).
 
-The SmoothBricks host land gate refuses a source containing pre-rewrite main `e9e596563` before rebasing and names the
-ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that old range.
-
 1. **Refuse a dirty tree** (exit 4), read exactly as `rm` reads one (a tracked change, or an untracked file that is not
    hidden, not ignored by main's current rules, and not held by main's checkout with the same content). The check runs
    in the working tree but only the commit lands, so uncommitted work would be validated without landing, and would then
@@ -1269,6 +1266,108 @@ file records the holder (`land`, `remove`, or `make-room` while making room for 
 workspace's incarnation once, at its start, and never reads the workspace back after the fast-forward. A land whose own
 retire finds the workspace already gone (removed by a cowshed that predates the lease, or by hand) reports `landed` and
 says on stderr that there was nothing left to retire. Who removed it is the deletion log's `retiredBy`.
+
+### A declared land: `cowshed land <ws> [--no-push] [--no-retire]`
+
+A repository whose main checkout's `.cowshed.toml` declares `[land]` (06_cli.md "Configuration") lands into main by one
+verb: `cowshed land <ws>` is the whole route from a committed workspace to a pushed main, and no host script
+orchestrates it. The route is cowshed's and the gate is the repository's: `[land] gate` names the command, the
+repository's script stays the owner of what a gate checks, and cowshed owns when it runs and everything around it. Only
+main's copy of the declaration is read, as for `[sandbox]`: a workspace's copy is the agent's to edit, and a gate the
+landing workspace could name would gate nothing. A land into a lane base (`--into <lane>`) is the primitive above,
+unchanged.
+
+1. **Refuse early.** The land runs `land --preflight`'s fences first, so a land that would refuse after its gate (a
+   dirty tree, a retired binding) refuses before it asks for a turn.
+2. **The land turn.** It takes its repository's turn, the queue `[land] turn` (05_gateway.md "Land turns"), in this
+   process, and holds it through step 5 and its retire: its wait reports, ticket and `turns.log` lines are
+   `land-turn`'s, with `<ws>` as the ticket's workspace. The gate (step 4) inherits the ticket's descriptor, as a
+   `land-turn` command does, so the kernel keeps the turn until the gate has ended too, however this process ends: a
+   land killed alone leaves its gate holding the turn, never a second land beside it.
+3. **Rebase.** It rebases `<ws>` onto main's head as `cowshed rebase <ws> --expected-onto-head <head>` does, and again
+   onto the newer head when main moved before the rebase began (`OntoMoved`). A conflict stops the land with the
+   rebase's own refusal and the workspace as it was.
+4. **The declared gate.** It runs `[land] gate`, `{workspace}` replaced by `<ws>`, on the host in main's pure
+   environment (below), its stdout and stderr on the land's stderr. A nonzero exit stops the land (exit 4, naming the
+   gate and how it ended) and keeps the workspace. The gate checks the tree; it moves neither main nor the workspace,
+   and a workspace head that moved during the gate is step 5's `SourceMoved`.
+5. **Fast-forward under the ref turn.** It lands exactly the gated head onto exactly the head it rebased onto (the
+   primitive above with `--expected-source-head` and `--expected-target-head` pinned), and its ref fence is the
+   repository's **ref turn**, the queue `<turn>.ref` a doc commit holds ("`cowshed doc-commit`" below), taken only from
+   the head re-read through the fast-forward. The primitive's retire is the route's: the workspace is retired as
+   `cowshed land` retires the unit it landed, however young, with whatever that retire takes with it (`--no-retire`
+   keeps it, and the land collects build volumes instead). A main that moved since the rebase (`TargetMoved`: a doc
+   commit landed while the gate ran) sends the land back to step 3: it rebases onto the new head and runs the gate
+   again, whose Nx cache replays every task the commits main gained do not reach; stderr counts the re-gates. A refusal
+   no fence made, with main holding the gated head and that head not the one it rebased onto, came after the
+   fast-forward, from the retire: main has moved, so the land goes on to step 6 and answers that refusal last. Any other
+   refusal stops the land. Lock order is always the land turn, then the ref turn; nothing holds a ref turn and then asks
+   for a land turn, so the two never deadlock.
+6. **After the turn.** The turn ends once the fast-forward's retire has. Then, outside it: the landed head is recorded
+   in `lands.log` beside the turn's tickets (`{atUnixMs, event, head, before?, detail?}`, `event` one of `landed`,
+   `unpushed`, `pushed`, `push-failed`, `after-exited`; appended, never rewritten), and cowshed starts `__land-after`, a
+   child run as the store's installed cowshed (05_gateway.md "The installed cowshed", the gateway's own program) in a
+   session of its own, which pushes the landed branch to `[land] push` and then runs each `[land] after` command in
+   order, `{before}` and `{head}` replaced by main's head before and after the land. The push is keyed on main having
+   moved (a land of a workspace main already held pushes nothing), never on the retire: a land whose retire was refused
+   records `landed` and starts the child before it reports that refusal, so no landed main is left unpushed. A child
+   that cannot start is recorded as `push-failed` (`after-exited` when nothing was to be pushed) with why, and said.
+   Each outcome is one more `lands.log` line, and each command's output is kept in `lands/<head>.*.log` beside it, as it
+   comes. The push (`git push --progress`) and each after command have a silence bound of 180 s, not a total: one that
+   writes nothing for 180 s is sent `SIGTERM` and its outcome is `SILENT` (05_gateway.md "Deadlines"). The land never
+   waits for the child: a remote is never needed to land, and a slow push or install holds up neither this land nor the
+   next. `--no-push` records `unpushed` and pushes nothing; the after commands still run. The report is the primitive's
+   `landed` report.
+
+**The declared commands' environment.** Every command a declared land or a doc commit runs (gate, edit, check, commit,
+push, after) runs with nothing of the caller's shell. The environment is cleared; `HOME`, `USER`, `LOGNAME`, `TERM`,
+`LANG` and `SSH_AUTH_SOCK` are passed on when the caller has them; `PATH` is the host bootstrap path (the installed
+cowshed's directory, the host's Nix profile and program directories, the system directories); the command runs in main's
+checkout as `direnv exec <main> <argv…>` when main has an `.envrc`, so it sees exactly main's devenv and never the
+caller's, and as `<argv…>` when it has none. It gets the held-command policies ("Held locks": `NX_DAEMON_START=never`,
+git's automatic gc, maintenance and fsmonitor off). The caller's environment is only identity: a gate that passes in one
+agent's shell and fails in another's has not gated anything.
+
+With `[land]` declared, a land into main refuses the primitive's caller-side options with exit 2 naming the route:
+`--check` (the declared gate is the check), `--target`, `--expected-workspace-incarnation`, `--expected-source-head`,
+`--expected-target-head` (the route pins its own heads), `--ref-lock` and `--ref-turn` (the route takes the declared ref
+turn), `--push-only` and `--ungated`. `--preflight` runs the fences alone, as for any land. `--no-push` is refused where
+`[land]` is not declared, since only the route pushes.
+
+### `cowshed doc-commit (-m <msg> | -F <file>) (--patch <file> | --icm <program>)`
+
+Documentation reaches main without a workspace, without a gate of its own and without waiting for a land's gate, and
+main's tree is never dirty outside the ref turn. The edit is the input, never main's working tree: a patch (`git apply`
+input, paths relative to main) or an ICM program (what `icm run` takes). Either file may be `-`, stdin, as may the
+message file, and stdin serves one of them at most. Main is the checkout `--project` names, else the working
+directory's, when cowshed's in-checkout marker (`.cowshed/workspace.json`, 01_storage.md) gives it no other role: a doc
+edit in a workspace is refused, since it is committed there and landed. The verb asks no daemon and no gateway; it needs
+main's `.cowshed.toml` to declare `[doc]` (which paths are documentation) and `[land]` (whose `turn` names the ref turn
+`<turn>.ref`).
+
+Both inputs are read first. Then, in one hold of the ref turn (FIFO, its holder named, "Land turns"):
+
+1. Main's `git status --porcelain=v1 -z --untracked-files=all` is read: the paths main holds uncommitted.
+2. The edit's paths come from the edit's own account. A patch is judged before main's tree is touched: applied to a
+   scratch index of `HEAD`, its paths are the ones that then differ from `HEAD`, both sides of a rename, and a patch
+   that does not apply to `HEAD` is refused. An ICM program is run as `icm run <program> --root <main> --json` (the
+   `icm` on the caller's `PATH`, in main's pure environment), and its paths are the ones whose status it changed; every
+   path main held uncommitted is copied aside before it runs, so an edit that writes one is seen and that path put back
+   byte for byte.
+3. Admission: every path must match `[doc] paths` and must have matched `HEAD` before the edit. A path that is not
+   documentation is refused, naming the declaration and the land route for code; a path main held uncommitted is
+   refused, since committing it would commit someone else's edit and putting it back would destroy it.
+4. `[doc] check`, when declared, runs with the admitted paths appended; a nonzero exit refuses. It may rewrite those
+   paths (a formatter), and a path outside them that it writes is refused.
+5. Exactly those paths are committed: `git add -A -- <paths>` in main, then `git commit --only -F <msg> -- <paths>` in
+   main's pure environment with the repository's own hooks on.
+
+Whatever stops the hold short of the commit puts every path the edit or the check wrote back: a path `HEAD` has is
+restored in the index and the tree, a path it created goes, a held path gets its copied bytes back, and the refusal
+exits 4; bad usage is exit 2. A `HEAD` that moved means the commit landed before the stop, and nothing is put back. A
+doc commit that lands while a land's gate runs is a commit main gained, which that land's step 5 rebases onto and
+re-gates: a document some gate task hashes is gated by the next land, visibly, never here. The report is
+`{commit, paths}`, bare `commit` on stdout without `--json`.
 
 ### Lanes: `fork` and `--into`
 

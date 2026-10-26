@@ -323,7 +323,10 @@ fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
     mark_descriptor_range_close_on_exec_with(limit, mark_descriptor_close_on_exec)
 }
 
-pub(crate) fn prepare_child_descriptors(command: &mut Command) -> Result<(), SpawnFailure> {
+/// Mark every non-stdio descriptor of `command`'s child close-on-exec between fork and exec: the
+/// one boundary a detached child (a deletion child, a declared land's after-land child) passes, so
+/// it holds no lock or ticket of the verb that started it (05_gateway.md "Deleting released images").
+pub fn prepare_child_descriptors(command: &mut Command) -> Result<(), SpawnFailure> {
     prepare_child_descriptors_platform(command)
 }
 

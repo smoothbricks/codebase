@@ -352,12 +352,11 @@ jobs need from the path it started from. A failed prune is reported on stderr an
 **The install slot.** The installed cowshed is one slot, so one install fills it at a time. `setup` (repair and
 `--uninstall` alike), `gateway start` and `gateway stop --purge` each take an exclusive `flock(2)` on
 `dev.cowshed/install.lock` before they read what is installed, and hold it until the command exits; the kernel drops it
-when the process exits or dies, so no crash leaves the slot held. It is the lock `lockf(1)` takes, the shape of the
-operator's `<land-command>`: a second installer waits in line, says on stderr that it is waiting and for which file, and
-then judges its build against whatever the install it waited for left behind, because the judgement below runs after the
-lock is taken. A host move inside `setup` restarts the gateway under the slot `setup` already holds. This exists because
-two workers each built and installed a cowshed within an hour, neither aware of the other's commits, and nothing
-serialized who filled the slot.
+when the process exits or dies, so no crash leaves the slot held. It is the lock `lockf(1)` takes: a second installer
+waits in line, says on stderr that it is waiting and for which file, and then judges its build against whatever the
+install it waited for left behind, because the judgement below runs after the lock is taken. A host move inside `setup`
+restarts the gateway under the slot `setup` already holds. This exists because two workers each built and installed a
+cowshed within an hour, neither aware of the other's commits, and nothing serialized who filled the slot.
 
 **A pending install is visible.** `cowshed gateway status` says when an install holds the slot, without taking it from
 the install: it tries a shared `flock(2)` on `install.lock` without blocking, which fails exactly while an install holds
@@ -404,12 +403,14 @@ until the command, and every process it hands them to, has closed them: `land-tu
 land run beside its command, and the next land takes the turn when the last of them ends. A descendant that detaches
 holds the turn by design until it closes the descriptor or exits; it is never unlocked around. The launch boundaries and
 the git and Nx policies that keep cowshed's own daemons and git's automatic maintenance out of a held command are
-specified in 02_workspaces.md "Held locks". A land's turn covers rebase, gate, fast-forward and adoption; the push to a
-remote runs after the turn ends, since a remote is never needed to land (the owner's ruling, 2026-10-17). A turn is only
-as durable as the processes that hold it: a land that shares its caller's session ends with that session. Measured
-2026-10-21: one lander's lands died with its tool session three times, twice while queued and once mid-gate. So a caller
-that may go away first starts the land in a session of its own (`setsid`, output to a file, not its child) and waits on
-the land's pid; `land-turn` itself never detaches, since the caller that stays reads its output and its exit status.
+specified in 02_workspaces.md "Held locks". A land's turn covers rebase, gate, fast-forward and adoption, and a declared
+land (02_workspaces.md "A declared land") takes it in its own process for that span and the retire that ends it, its
+gate inheriting the ticket; the push to a remote runs after the turn ends, since a remote is never needed to land (the
+owner's ruling, 2026-10-17). A turn is only as durable as the processes that hold it: a land that shares its caller's
+session ends with that session. Measured 2026-10-21: one lander's lands died with its tool session three times, twice
+while queued and once mid-gate. So a caller that may go away first starts the land in a session of its own (`setsid`,
+output to a file, not its child) and waits on the land's pid; `land-turn` itself never detaches, since the caller that
+stays reads its output and its exit status.
 
 **A ref turn.** A repository whose main also moves outside its lands (an operator's Markdown commit straight into main)
 keeps a second queue beside its land turn, by convention `<repo>.ref`: every writer that moves main's ref outside
@@ -601,9 +602,9 @@ task result from that checkout's own Nx cache through the workspace's own route,
 `HttpRemoteCache` itself, which the read-only flag the job also carries does not wrap: local hits as well as executed
 tasks, since stock Nx stores only what it executed. A task Nx does not cache, or one that failed, is skipped; a key
 already stored is counted, never replaced. The cache never blocks a land: a failed publish is said on stderr with its
-cause, and the land goes on. A repository whose land gates outside `cowshed land` publishes its gate's run with the same
-script (SmoothBricks: `tooling/land-host.sh` through `tooling/land-publish.ts`, after its host gate and Linux cross
-check pass).
+cause, and the land goes on. A declared land's gate (02_workspaces.md "A declared land") publishes its run with the same
+script (SmoothBricks: `tooling/land-host.sh --gate` through `tooling/land-publish.ts`, after its host gate and Linux
+cross check pass).
 
 The existing artifact server is a controller-owned foreground child. The gateway passes `--exit-on-stdin-eof` and
 retains the write end of its stdin pipe; EOF drains the server and releases its store lock. A gateway SIGKILL closes
@@ -1430,11 +1431,12 @@ against 5m54s on the host route.
 
 ### Gates and lands
 
-- **A land is a gate job.** The land queue holder, `<checkouts>/.land-lock.sh`, runs main's `tooling/land-host.sh`, the
-  only path that gates a tree before `cowshed land` fast-forwards to it, and it runs that gate as
-  `cowshed exec <workspace> --class gate --host -- …`. The trusted route alone grants the class (class-not-permitted for
-  a worker). The jobs a land's own cowshed steps start are gate-class work too, since the land waits on each of them:
-  each `cowshed land --check` command (02_workspaces.md, "`cowshed land`" step 2).
+- **A land is a gate job.** The land turn's holder, a declared land (02_workspaces.md "A declared land"), runs its
+  repository's `[land] gate` (`tooling/land-host.sh --gate <ws>` in SmoothBricks), the only path that gates a tree
+  before main fast-forwards to it, and the gate runs as `cowshed exec <workspace> --class gate --host -- …`. The trusted
+  route alone grants the class (class-not-permitted for a worker). The jobs a land's own cowshed steps start are
+  gate-class work too, since the land waits on each of them: each `cowshed land --check` command (02_workspaces.md,
+  "`cowshed land`" step 2).
 - **One land per repository is the land turn's.** A repository's lands are serialized by its land turn ("Land turns"),
   which a land holds from before its gate to its fast-forward; the gateway keeps no gate order of its own. A
   `gate`-class job is a nice, not a lock: two gate jobs run side by side at the same nice, and only the land turn

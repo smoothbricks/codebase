@@ -11,7 +11,7 @@ use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::num::{NonZeroU16, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use crate::help::{self, CommandSpec, EXPECTED_SOURCE_HEAD, EXPECTED_WORKSPACE_INCARNATION, Opt};
@@ -47,6 +47,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &PUSH,
     &REBASE,
     &LAND,
+    &DOC_COMMIT,
     &DOCTOR,
     &DISK_COMMAND,
     &LAND_TURN,
@@ -113,6 +114,9 @@ pub enum Command {
     Push(PushArgs),
     Rebase(RebaseArgs),
     Land(LandArgs),
+    /// `doc-commit`: one documentation edit committed to main under its ref turn, with no
+    /// workspace and no gate: no project discovery, no daemon.
+    DocCommit(DocCommitArgs),
     Doctor(DoctorArgs),
     /// One `diskutil` or `hdiutil` invocation through cowshed's disk runner, for a caller that is
     /// not cowshed: no project, no daemon, the tool's own bytes and exit status.
@@ -198,6 +202,7 @@ impl Command {
             | Self::Gateway(_)
             | Self::DiskCommand(_)
             | Self::LandTurn(_)
+            | Self::DocCommit(_)
             | Self::SubtreeRoot(_)
             | Self::RetireDescendants(_)
             | Self::Lock(_)
@@ -681,6 +686,29 @@ pub struct LandArgs {
     pub ref_turn: Option<OsString>,
     pub mode: LandMode,
     pub preflight: bool,
+    /// `false` for `--no-push`: a declared land records `unpushed` instead of pushing.
+    pub push: bool,
+}
+
+/// `doc-commit (-m <msg> | -F <file>) (--patch <file> | --icm <program>)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocCommitArgs {
+    pub message: DocMessage,
+    pub edit: DocEdit,
+}
+
+/// The commit message: given, or read from a file (`-` is stdin).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DocMessage {
+    Text(String),
+    File(PathBuf),
+}
+
+/// The edit a doc commit applies: a `git apply` patch or an ICM program (`-` is stdin).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DocEdit {
+    Patch(PathBuf),
+    Icm(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1072,6 +1100,13 @@ pub fn cli_command() -> ClapCommand {
             value("ref-turn"),
             flag("ungated"),
             flag("preflight"),
+            flag("no-push"),
+        ]))
+        .subcommand(leaf("doc-commit").args([
+            value("message").short('m'),
+            value("file").short('F'),
+            value("patch"),
+            value("icm"),
         ]))
         .subcommand(leaf("doctor").args([flag("repair")]))
         .subcommand(
@@ -1291,6 +1326,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "push" => parse_push(leaf)?,
         "rebase" => parse_rebase(leaf)?,
         "land" => parse_land(leaf)?,
+        "doc-commit" => parse_doc_commit(leaf)?,
         "doctor" => parse_doctor(leaf)?,
         "disk-command" => parse_disk_command(leaf, &global)?,
         "land-turn" => parse_land_turn(leaf, &global)?,
@@ -3984,6 +4020,7 @@ const LAND: CommandSpec = CommandSpec {
         "An adopted build volume is renamed `[cowshed] <project> — build <target>` in the background. The target's previous volume is released before land returns, including with --no-retire, unless a running job's hold owns it. Release uses an unforced unmount with bounded grace, then force if needed, naming initial holders and every collection deferral. Seeds are never mounted or named: mounting one just to rename it would advance the image mtime used for seed freshness.",
         "With `--into <lane>`, the unit lands into the lane base <lane> instead of main: the lane base's checked-out branch is fast-forwarded, and the unit retires once the lane base holds its commits. The lane itself reaches main with `cowshed rebase <lane>` and `cowshed land <lane>`.",
         "With `--into <lane> --ungated`, the fold is Git alone and one command: land first rebases the unit onto the branch the lane base has checked out, as `cowshed rebase <ws> --into <lane>` does, and a unit already based on that branch lands as it is, with nothing fetched or replayed. A conflict stops the land before anything moves, leaves the unit as it was and names the conflicted paths. --expected-source-head names the head before that rebase; the landed head is reported. Then no check, seed freeze or build-volume adoption. The lane base keeps its build volume and seed, and the unit's volume is released with the unit. Only a land into main gates, so main refuses `--ungated`.",
+        "A repository whose main `.cowshed.toml` declares `[land]` lands into main by that route alone, and `cowshed land <ws>` runs all of it: the preflight fences, the repository's land turn, a rebase onto main, the declared gate on the host in main's pure environment, the fast-forward under the ref turn `<turn>.ref` (back to the rebase and gate while main moved under the gate) and the land's retire of the workspace and the workspaces it folded, then, after the turn, the push to the declared remote and the declared after-land commands, detached and never awaited, each outcome a line of the turn's lands.log; a refused retire still pushes. The primitive's caller-side options (--check, --target, --expected-*, --ref-lock, --ref-turn, --push-only, --ungated) are refused there; --no-push lands without pushing.",
         "With `--preflight`, land runs only the fences it runs before its check, with the same arguments, and stops: the plan, the workspace and its incarnation, the target, the source head, the dirty-tree refusal, the target branch and the target head. It exits 4 with land's own refusal when land would refuse, and 0 with what it read otherwise. It takes no land lease and no ref lock, attaches nothing, synchronizes no gateway, runs no check and finishes no interrupted work, so it runs beside a land of the same workspace; a detached lane base it cannot read without attaching is exit 5.",
     ],
     options: &[
@@ -4029,8 +4066,82 @@ const LAND: CommandSpec = CommandSpec {
             spelling: "--preflight",
             meaning: "run only land's fences before its check and stop, mutating nothing: exit 4 with land's own refusal, or 0 and the incarnation, source head and target head the land can pin",
         },
+        Opt {
+            spelling: "--no-push",
+            meaning: "a declared land records `unpushed` and pushes nothing; its after-land commands still run",
+        },
     ],
 };
+
+const DOC_COMMIT: CommandSpec = CommandSpec {
+    name: "doc-commit",
+    missing: "doc-commit needs a message (-m <msg> or -F <file>) and an edit (--patch <file> or --icm <program>)",
+    args: "(-m <msg> | -F <file>) (--patch <file> | --icm <program>)",
+    trailing: "",
+    summary: "commit a documentation edit to main",
+    about: &[
+        "Commits one documentation edit straight to main, with no workspace and no gate of its own, without waiting for a land's gate. The edit is the input, never main's working tree: a `git apply` patch, or an ICM program run as `icm run <program> --root <main>` with the icm on your PATH. In one hold of the repository's ref turn (`<[land] turn>.ref`, first come, first served, its holder named), it applies the edit, refuses any path `[doc] paths` in main's .cowshed.toml does not admit or that main held uncommitted, runs `[doc] check` on the paths, and commits exactly them with the repository's hooks on; whatever stops it first puts main's tree back as it was.",
+        "Main is the checkout --project names, else the working directory's; a workspace is refused. Either file may be `-`, stdin, but only one of them. It asks no daemon and no gateway. It prints the commit, or with --json `{commit, paths}`.",
+    ],
+    options: &[
+        Opt {
+            spelling: "-m, --message <msg>",
+            meaning: "the commit message",
+        },
+        Opt {
+            spelling: "-F, --file <file>",
+            meaning: "read the commit message from <file>, or stdin for `-`",
+        },
+        Opt {
+            spelling: "--patch <file>",
+            meaning: "the edit as a patch `git apply` takes, paths relative to main; `-` is stdin",
+        },
+        Opt {
+            spelling: "--icm <program>",
+            meaning: "the edit as an ICM program file; `-` is stdin",
+        },
+    ],
+};
+
+fn parse_doc_commit(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &DOC_COMMIT;
+    let message = match (os(matches, "message"), os(matches, "file")) {
+        (Some(text), None) => DocMessage::Text(
+            text.into_string()
+                .map_err(|_| UsageError::new("-m must be a UTF-8 commit message", USAGE))?,
+        ),
+        (None, Some(file)) => DocMessage::File(PathBuf::from(file)),
+        (Some(_), Some(_)) => {
+            return Err(UsageError::new(
+                "give the message once: -m <msg> or -F <file>",
+                USAGE,
+            ));
+        }
+        (None, None) => return Err(UsageError::new(USAGE.missing, USAGE)),
+    };
+    let edit = match (os(matches, "patch"), os(matches, "icm")) {
+        (Some(patch), None) => DocEdit::Patch(PathBuf::from(patch)),
+        (None, Some(program)) => DocEdit::Icm(PathBuf::from(program)),
+        (Some(_), Some(_)) => {
+            return Err(UsageError::new(
+                "one edit per commit: --patch <file> or --icm <program>",
+                USAGE,
+            ));
+        }
+        (None, None) => return Err(UsageError::new(USAGE.missing, USAGE)),
+    };
+    let stdin = |path: &Path| path == Path::new("-");
+    let edit_on_stdin = match &edit {
+        DocEdit::Patch(path) | DocEdit::Icm(path) => stdin(path),
+    };
+    if edit_on_stdin && matches!(&message, DocMessage::File(path) if stdin(path)) {
+        return Err(UsageError::new(
+            "the edit and the message cannot both be stdin",
+            USAGE,
+        ));
+    }
+    Ok(Command::DocCommit(DocCommitArgs { message, edit }))
+}
 
 fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &LAND;
@@ -4052,6 +4163,7 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
         ref_turn: os(matches, "ref-turn"),
         mode: land_mode(matches),
         preflight: flagged(matches, "preflight"),
+        push: !flagged(matches, "no-push"),
     }))
 }
 

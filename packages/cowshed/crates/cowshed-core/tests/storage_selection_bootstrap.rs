@@ -270,22 +270,15 @@ home = [ ".cache/ttsc",
     }
 }
 
-/// `land` runs nothing in its target, so `.cowshed.toml` has no `[land]` section: a file that
-/// still declares one is refused, never read as if its step ran.
+/// `land` runs nothing in its target, so `[land]` declares the land route alone: a file that
+/// still declares the old `warm` step is refused, never read as if that step ran.
 #[test]
-fn a_land_section_is_refused() {
+fn a_land_section_with_the_old_warm_step_is_refused() {
     let error = parse_cowshed_config("[land]\nwarm = [\"tooling/warm-main\"]\n").unwrap_err();
     assert!(
         matches!(
             &error,
-            ConfigError::Malformed { line: Some(1), message }
-                if message.contains("unknown field `land`")
-        ),
-        "{error}"
-    );
-    assert!(
-        error.to_string().starts_with(
-            "malformed configuration at line 1: unknown field `land`, expected one of"
+            ConfigError::Malformed { message, .. } if message.contains("unknown field `warm`")
         ),
         "{error}"
     );
@@ -1701,4 +1694,84 @@ async fn tokio_lane_moves_platform_work_off_the_async_worker() {
         .unwrap();
     assert_eq!(host.effects.load(Ordering::SeqCst), plan.operations().len());
     assert!(host.observed_off_caller.load(Ordering::SeqCst));
+}
+
+/// `[land]` declares the land route and `[doc]` the doc lane, from main's copy: a turn whose ref
+/// turn is a queue too, commands whose programs are literal and whose slots are their own, a git
+/// remote name, and documentation patterns; `[doc]` needs `[land]`.
+#[test]
+fn land_and_doc_declare_the_route_and_refuse_what_it_could_not_run() {
+    let config = parse_cowshed_config(
+        "[land]\nturn = \"acme\"\ngate = [\"sh\", \"tooling/land-host.sh\", \"--gate\", \"{workspace}\"]\npush = \"origin-https\"\nafter = [[\"sh\", \"install.sh\", \"{before}\", \"{head}\"]]\n[doc]\npaths = [\"*.md\"]\ncheck = [\"prettier\", \"--write\"]\n",
+    )
+    .unwrap();
+    let land = config.land().expect("the land is declared");
+    assert_eq!(land.turn().as_str(), "acme");
+    assert_eq!(land.ref_turn().as_str(), "acme.ref");
+    assert_eq!(
+        land.gate().argv("topic"),
+        ["sh", "tooling/land-host.sh", "--gate", "topic"].map(std::ffi::OsString::from)
+    );
+    assert_eq!(
+        land.push().map(|remote| remote.as_str()),
+        Some("origin-https")
+    );
+    assert_eq!(land.after().len(), 1);
+    let doc = config.doc().expect("the doc lane is declared");
+    assert!(doc.admits("specs/cowshed/02_workspaces.md"));
+    assert!(!doc.admits("src/lib.rs"));
+    assert_eq!(
+        doc.check.as_deref(),
+        Some(&["prettier".to_owned(), "--write".to_owned()][..])
+    );
+    assert!(parse_cowshed_config("").unwrap().land().is_none());
+
+    let invalid = [
+        ("[land]\nturn = \"acme\"\n", "missing field `gate`"),
+        (
+            "[land]\nturn = \"acme.ref\"\ngate = [\"true\"]\n",
+            "[land] turn at line 2",
+        ),
+        (
+            "[land]\nturn = \"../up\"\ngate = [\"true\"]\n",
+            "[land] turn at line 2",
+        ),
+        (
+            "[land]\nturn = \"acme\"\ngate = []\n",
+            "[land] gate at line 3",
+        ),
+        (
+            "[land]\nturn = \"acme\"\ngate = [\"{workspace}\"]\n",
+            "the program must be literal text",
+        ),
+        (
+            "[land]\nturn = \"acme\"\ngate = [\"sh\", \"{head}\"]\n",
+            "{head} is not a slot",
+        ),
+        (
+            "[land]\nturn = \"acme\"\ngate = [\"true\"]\npush = \"--force\"\n",
+            "[land] push at line 4",
+        ),
+        (
+            "[land]\nturn = \"acme\"\ngate = [\"true\"]\nafter = [[\"sh\", \"{workspace}\"]]\n",
+            "[land] after at line 4",
+        ),
+        ("[doc]\npaths = [\"*.md\"]\n", "[doc] needs [land]"),
+        (
+            "[land]\nturn = \"acme\"\ngate = [\"true\"]\n[doc]\npaths = []\n",
+            "the [doc] section sets nothing",
+        ),
+        (
+            "[land]\nturn = \"acme\"\ngate = [\"true\"]\n[doc]\npaths = [\"/abs.md\"]\n",
+            "[doc] paths at line 5",
+        ),
+        (
+            "[land]\nturn = \"acme\"\ngate = [\"true\"]\n[doc]\npaths = [\"*.md\"]\ncheck = []\n",
+            "[doc] check at line 6",
+        ),
+    ];
+    for (input, expected) in invalid {
+        let error = parse_cowshed_config(input).expect_err(input).to_string();
+        assert!(error.contains(expected), "{input:?}: {error}");
+    }
 }

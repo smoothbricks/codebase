@@ -683,6 +683,15 @@ export type DiskCommandRequest = {
  */
 export type DiskCommandTool = 'diskutil' | 'hdiutil';
 
+/**
+ * What `cowshed doc-commit` committed to main (02_workspaces.md "`cowshed doc-commit`"): the
+ * commit, and exactly the paths it holds, sorted.
+ */
+export type DocCommitReport = {
+  readonly commit: GitOid;
+  readonly paths: ReadonlyArray<string>;
+};
+
 export type DoctorReport = {
   readonly healthy: boolean;
   readonly findings: ReadonlyArray<Finding>;

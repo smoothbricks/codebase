@@ -62,6 +62,8 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 | Checkpoint or restore   | `cowshed checkpoint <ws> <label>` / `cowshed restore <ws> <label>`   | Save or roll back an image.                                                                                                                                                                                                                |
 | Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                                                                                                                                                                                                     |
 | Preflight a land        | `cowshed land <ws> --preflight`                                      | Land's fences before its check, mutating nothing: exit 4 with land's own refusal (a dirty tree included), else 0.                                                                                                                          |
+| Land a declared repo    | `cowshed land <ws> [--no-push]`                                      | Where main declares `[land]`: turn, rebase, the repository's gate, fast-forward and retire, push.                                                                                                                                          |
+| Commit docs to main     | `cowshed doc-commit -m '<msg>' (--patch <file> \| --icm <program>)`  | Where main declares `[doc]`: one Markdown edit under the ref turn, no shed, no gate.                                                                                                                                                       |
 | Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Check, fast-forward main, and retire on success.                                                                                                                                                                                           |
 | Rebase within a lane    | `cowshed rebase <ws> --into <lane>`                                  | Optional: take lane-mates' work before landing, by Git alone. An ungated land rebases by itself.                                                                                                                                           |
 | Fold into a lane base   | `cowshed land <ws> --into <lane> --ungated`                          | Rebase onto the lane base's branch, fast-forward it by Git alone, and retire; the lane base's own land into main gates. Main refuses it.                                                                                                   |
@@ -82,10 +84,12 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 ## Merge flow
 
 1. Work and commit in the shed. Never reuse sheds across tasks.
-2. `cowshed rebase <ws>` onto current main; resolve conflicts in the shed. Land will not do this for you.
-3. Gate, then land — **but check for a repo land path first.** Repositories with their own land command require that
-   route to rebase, gate on the _host_ (sandbox hashes differ and host-boundary tests cannot run sandboxed), and only
-   then fast-forward. A bare `cowshed land` is refused when the repository requires its own route. Elsewhere:
+2. A repository whose main `.cowshed.toml` declares `[land]` lands by one verb: `cowshed land <ws>` takes its land turn,
+   rebases onto main, runs the repository's declared gate on the host, fast-forwards (rebasing and gating again if main
+   moved), then retires, pushes and runs its after-land commands detached (`--no-push` skips the push). Resolve a rebase
+   conflict in the shed and land again. Its Markdown commits go `cowshed doc-commit -m '<msg>' --patch <file>` or
+   `--icm <program>`, in main: no shed, no gate, under the ref turn only.
+3. Elsewhere: `cowshed rebase <ws>` onto current main, resolve conflicts in the shed, then
    `cowshed land <ws> --check '<cmd>'` (repeatable; runs inside the sandbox after grant sync).
 4. A successful land retires by default. If retire was refused after the fast-forward, main already moved: run
    `cowshed rm <ws>`, never land again. With `--no-retire` or after `push`, `rm` once main contains HEAD and every other

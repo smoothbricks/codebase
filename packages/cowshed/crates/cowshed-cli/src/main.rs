@@ -16,6 +16,11 @@ fn main() {
     {
         cowshed_cli::gateway_host::run(&host.collect::<Vec<_>>());
     }
+    // A declared land's after-land child pushes main and runs the repository's after commands,
+    // detached from the land that started it (02_workspaces.md "A declared land" step 6).
+    if let Some(code) = cowshed_cli::land_after::dispatch() {
+        std::process::exit(code);
+    }
     // Before the runtime starts any thread: this binary is also every workspace's warm
     // exec host, and in that role it never returns from here.
     if let Err(error) = cowshed_shell::dispatch() {

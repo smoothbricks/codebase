@@ -3839,6 +3839,15 @@ pub struct PushReport {
     pub previous_destination_head: Option<GitOid>,
 }
 
+/// What `cowshed doc-commit` committed to main (02_workspaces.md "`cowshed doc-commit`"): the
+/// commit, and exactly the paths it holds, sorted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DocCommitReport {
+    pub commit: GitOid,
+    pub paths: Vec<String>,
+}
+
 /// Preservation-only delivery is distinct from a target that actually landed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
@@ -4919,6 +4928,7 @@ result_bodies!(
     ExecRecord,
     PushReport,
     LandReport,
+    DocCommitReport,
     RemoveReport,
     RemoveProjectReport,
     GrantSet,

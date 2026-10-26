@@ -368,6 +368,12 @@ export const assertDiskCommandToolList = typia.createAssertEquals<readonly Api.D
 export const parseDiskCommandToolList = (json: string): readonly Api.DiskCommandTool[] =>
   assertDiskCommandToolList(JSON.parse(json));
 
+export const assertDocCommitReport = typia.createAssertEquals<Api.DocCommitReport>();
+export const parseDocCommitReport = (json: string): Api.DocCommitReport => assertDocCommitReport(JSON.parse(json));
+export const assertDocCommitReportList = typia.createAssertEquals<readonly Api.DocCommitReport[]>();
+export const parseDocCommitReportList = (json: string): readonly Api.DocCommitReport[] =>
+  assertDocCommitReportList(JSON.parse(json));
+
 export const assertDoctorReport = typia.createAssertEquals<Api.DoctorReport>();
 export const parseDoctorReport = (json: string): Api.DoctorReport => assertDoctorReport(JSON.parse(json));
 export const assertDoctorReportList = typia.createAssertEquals<readonly Api.DoctorReport[]>();

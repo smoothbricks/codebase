@@ -315,6 +315,14 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     if let args::Command::LandTurn(land) = &parsed.command {
         return Ok(crate::land_turn::dispatch(land, &mut output, interrupts).await);
     }
+    // A doc commit edits main under its ref turn alone: no daemon, no gateway, no project open,
+    // so a hung gateway never holds it (02_workspaces.md "`cowshed doc-commit`").
+    if let args::Command::DocCommit(doc) = &parsed.command {
+        let outcome =
+            crate::doc_commit::dispatch(doc, parsed.global.project.as_deref(), json, &mut output)
+                .await;
+        return Ok(finish(outcome, &mut output, json, &waits));
+    }
     // These verbs address the already-running job supervisor directly. In particular, admission
     // authenticates this wrapper before exec replaces its image without changing its life.
     if let args::Command::SubtreeRoot(root) = &parsed.command {

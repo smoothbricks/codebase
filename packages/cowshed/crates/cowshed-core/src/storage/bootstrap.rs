@@ -324,6 +324,13 @@ pub struct CowshedConfig {
     /// `[nx] daemon_idle`: how long a shed goes unused before its supervisor stops the Nx daemon
     /// it keeps (04_sandbox.md, "The Nx daemon stays on").
     nx_daemon_idle: Option<crate::runtime::supervisor::NxDaemonIdle>,
+    /// `[land]`: the declared land route (02_workspaces.md "A declared land"). Trusted only from
+    /// main's checkout, like `[sandbox] deny`: a gate the landing workspace could name would gate
+    /// nothing.
+    land: Option<crate::declared_land::LandDeclaration>,
+    /// `[doc]`: what `cowshed doc-commit` may commit (02_workspaces.md "`cowshed doc-commit`");
+    /// declared only beside `[land]`, whose turn names its ref turn.
+    doc: Option<crate::declared_land::DocDeclaration>,
 }
 
 impl CowshedConfig {
@@ -367,6 +374,16 @@ impl CowshedConfig {
         self.nx_daemon_idle
             .unwrap_or(crate::runtime::supervisor::NxDaemonIdle::DEFAULT)
     }
+
+    /// The declared land route, `None` for a repository whose lands are the primitive.
+    pub fn land(&self) -> Option<&crate::declared_land::LandDeclaration> {
+        self.land.as_ref()
+    }
+
+    /// The declared doc lane, `None` for a repository that declares none.
+    pub fn doc(&self) -> Option<&crate::declared_land::DocDeclaration> {
+        self.doc.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,8 +409,27 @@ struct ConfigFile {
     build: Option<BuildSection>,
     caches: Option<CachesSection>,
     nx: Option<NxSection>,
+    land: Option<LandSection>,
+    doc: Option<DocSection>,
     #[serde(default)]
     capabilities: BTreeMap<CapabilityId, CapabilitySection>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LandSection {
+    turn: Spanned<String>,
+    gate: Spanned<Vec<String>>,
+    push: Option<Spanned<String>>,
+    #[serde(default)]
+    after: Vec<Spanned<Vec<String>>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocSection {
+    paths: Vec<Spanned<String>>,
+    check: Option<Spanned<Vec<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -528,6 +564,17 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
                 ))
             })
             .collect::<Result<_, ConfigError>>()?;
+    let land = file
+        .land
+        .map(|section| land_declaration(input, section))
+        .transpose()?;
+    let doc = file
+        .doc
+        .map(|section| doc_declaration(input, section))
+        .transpose()?;
+    if doc.is_some() && land.is_none() {
+        return Err(ConfigError::DocWithoutLand);
+    }
     Ok(CowshedConfig {
         substrate,
         sandbox_deny,
@@ -536,7 +583,94 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
         build_capacity,
         build_state,
         nx_daemon_idle,
+        land,
+        doc,
     })
+}
+
+/// `[land]`: a turn whose ref turn is a queue too, a gate and after commands whose programs are
+/// literal and whose slots are their own, and a remote that is a git remote name.
+fn land_declaration(
+    input: &str,
+    section: LandSection,
+) -> Result<crate::declared_land::LandDeclaration, ConfigError> {
+    use crate::declared_land::{AfterCommand, GateCommand, LandDeclaration, RemoteName};
+    let invalid =
+        |key: &'static str, line: usize, reason: String| ConfigError::InvalidDeclaration {
+            section: "land",
+            key,
+            line,
+            reason,
+        };
+    let gate = GateCommand::parse(section.gate.get_ref().clone())
+        .map_err(|error| invalid("gate", line_of(input, &section.gate), error.to_string()))?;
+    let push = section
+        .push
+        .map(|push| {
+            RemoteName::parse(push.get_ref().clone()).map_err(|name| {
+                invalid(
+                    "push",
+                    line_of(input, &push),
+                    format!("{name:?} is not a git remote name"),
+                )
+            })
+        })
+        .transpose()?;
+    let after = section
+        .after
+        .iter()
+        .map(|command| {
+            AfterCommand::parse(command.get_ref().clone())
+                .map_err(|error| invalid("after", line_of(input, command), error.to_string()))
+        })
+        .collect::<Result<_, _>>()?;
+    LandDeclaration::new(section.turn.get_ref(), gate, push, after)
+        .map_err(|error| invalid("turn", line_of(input, &section.turn), error.to_string()))
+}
+
+/// `[doc]`: at least one repository-relative pattern, and a check whose program is named.
+fn doc_declaration(
+    input: &str,
+    section: DocSection,
+) -> Result<crate::declared_land::DocDeclaration, ConfigError> {
+    use crate::declared_land::{DocDeclaration, DocPattern};
+    let invalid =
+        |key: &'static str, line: usize, reason: String| ConfigError::InvalidDeclaration {
+            section: "doc",
+            key,
+            line,
+            reason,
+        };
+    if section.paths.is_empty() {
+        return Err(ConfigError::EmptySection("doc"));
+    }
+    let paths = section
+        .paths
+        .iter()
+        .map(|pattern| {
+            DocPattern::parse(pattern.get_ref().clone()).map_err(|value| {
+                invalid(
+                    "paths",
+                    line_of(input, pattern),
+                    format!("{value:?} must be a non-empty repository-relative pattern"),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let check = section
+        .check
+        .map(|check| {
+            if check.get_ref().is_empty() {
+                return Err(invalid(
+                    "check",
+                    line_of(input, &check),
+                    "a check needs at least its program".to_owned(),
+                ));
+            }
+            Ok(check.into_inner())
+        })
+        .transpose()?;
+    Ok(DocDeclaration { paths, check })
 }
 
 /// `[nx] daemon_idle`: a whole number of seconds, minutes or hours above zero (`"90s"`, `"5m"`,
@@ -725,6 +859,15 @@ pub enum ConfigError {
     InvalidNxDaemonIdle { line: usize, value: String },
     #[error("the [{0}] section sets nothing")]
     EmptySection(&'static str),
+    #[error("[{section}] {key} at line {line}: {reason}")]
+    InvalidDeclaration {
+        section: &'static str,
+        key: &'static str,
+        line: usize,
+        reason: String,
+    },
+    #[error("[doc] needs [land]: a doc commit holds the ref turn of the land turn [land] names")]
+    DocWithoutLand,
     #[error("invalid ZFS pool: {0}")]
     InvalidPool(PoolNameError),
 }
@@ -1232,6 +1375,14 @@ impl ValidatedHostStorage {
 
     pub fn roots(&self) -> &CanonicalRoots {
         &self.roots
+    }
+
+    /// Where this home's land-turn queues live (05_gateway.md "Land turns"): `land-turn` in its
+    /// support directory, the queues every `cowshed land-turn` and doc commit run with this
+    /// `HOME` take. A fixture's home is its scratch root, so no test queues beside the host's
+    /// lands.
+    pub fn land_turn_root(&self) -> PathBuf {
+        crate::land_turn::land_turn_root(&crate::host_dirs::support_directory(&self.home))
     }
 
     pub fn home(&self) -> &Path {

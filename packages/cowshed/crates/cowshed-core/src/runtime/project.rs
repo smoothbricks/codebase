@@ -16021,7 +16021,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 timed_async(
                     "land",
                     "ref-turn-wait",
-                    super::ref_turn::RefTurn::acquire(queue, workspace.as_str()),
+                    super::ref_turn::RefTurn::acquire_in(
+                        &self.descriptor.storage.land_turn_root(),
+                        queue,
+                        super::ref_turn::RefWriter::Land {
+                            workspace: workspace.as_str(),
+                        },
+                    ),
                 )
                 .await?,
             ),

@@ -10,10 +10,39 @@ use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::dto::LandTurnName;
-use crate::gateway_sessions::canonical_home;
-use crate::host_dirs::support_directory;
 use crate::land_turn::{self, OutsideHolders, Turn, Wait};
 use crate::{CowshedError, Result};
+
+/// Who takes a ref turn: a land's ref fence, for its workspace, or a doc commit. It names the
+/// ticket's workspace and command and the verb its waits are said under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefWriter<'a> {
+    Land { workspace: &'a str },
+    DocCommit,
+}
+
+impl RefWriter<'_> {
+    fn workspace(self) -> String {
+        match self {
+            Self::Land { workspace } => workspace.to_owned(),
+            Self::DocCommit => "doc-commit".to_owned(),
+        }
+    }
+
+    fn command(self) -> String {
+        match self {
+            Self::Land { workspace } => format!("cowshed land {workspace} (ref fence)"),
+            Self::DocCommit => "cowshed doc-commit".to_owned(),
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Land { .. } => "land",
+            Self::DocCommit => "doc-commit",
+        }
+    }
+}
 
 /// A held ref turn. The git that moves the target's ref under it is handed its ticket's
 /// descriptor ([`Self::descriptor`]), so the kernel keeps the turn until that git ends. Ending it
@@ -24,27 +53,22 @@ pub struct RefTurn {
 }
 
 impl RefTurn {
-    /// Take the ref turn `queue` for a land of `workspace`, in the queue `cowshed land-turn
-    /// <queue>` takes: this user's support directory. Nothing bounds the wait: the holder is a
-    /// writer moving the same branch, which a land follows, never overtakes.
-    pub async fn acquire(queue: &LandTurnName, workspace: &str) -> Result<Self> {
-        let home = canonical_home()?;
-        Self::acquire_in(
-            &land_turn::land_turn_root(&support_directory(&home)),
-            queue,
-            workspace,
-        )
-        .await
-    }
-
-    /// [`Self::acquire`] in the land-turn root `root`. The queue is waited for on a blocking
-    /// thread, which reports every [`cowshed_os::flock::HOLDER_REPORT`] who holds the turn and how many are ahead. A
-    /// land dropped while it waits leaves that thread its place: it takes the turn when its turn
-    /// comes and drops it at once, so the queue behind it moves on.
-    pub async fn acquire_in(root: &Path, queue: &LandTurnName, workspace: &str) -> Result<Self> {
+    /// Take the ref turn `queue` for `writer` in the land-turn root `root`: the
+    /// store's (`ValidatedHostStorage::land_turn_root`), where `cowshed land-turn <queue>` and
+    /// `cowshed doc-commit` take it too. Nothing bounds the wait: the holder is a writer moving the
+    /// same branch, which a land follows, never overtakes. The queue is waited for on a blocking
+    /// thread, which reports every [`cowshed_os::flock::HOLDER_REPORT`] who holds the turn and how
+    /// many are ahead. A land dropped while it waits leaves that thread its place: it takes the
+    /// turn when its turn comes and drops it at once, so the queue behind it moves on.
+    pub async fn acquire_in(
+        root: &Path,
+        queue: &LandTurnName,
+        writer: RefWriter<'_>,
+    ) -> Result<Self> {
         let directory = root.join(queue.as_str());
-        let label = workspace.to_owned();
-        let command = format!("cowshed land {workspace} (ref fence)");
+        let label = writer.workspace();
+        let command = writer.command();
+        let verb = writer.verb();
         let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
         let mut taking = tokio::task::spawn_blocking(move || {
             land_turn::take(
@@ -66,14 +90,14 @@ impl RefTurn {
             tokio::select! {
                 Some(wait) = received.recv() => {
                     waited = true;
-                    report(queue, &wait);
+                    report(queue, verb, &wait);
                 }
                 joined = &mut taking => break joined,
             }
         };
         while let Ok(wait) = received.try_recv() {
             waited = true;
-            report(queue, &wait);
+            report(queue, verb, &wait);
         }
         let turn = joined
             .map_err(|error| {
@@ -87,7 +111,7 @@ impl RefTurn {
             })?;
         if waited {
             cowshed_os::eprintln!(
-                "cowshed: land took the ref turn {queue} after {}s",
+                "cowshed: {verb} took the ref turn {queue} after {}s",
                 started.elapsed().as_secs()
             );
         }
@@ -107,17 +131,17 @@ impl RefTurn {
 }
 
 /// One wait report on stderr, in the words `cowshed land-turn` uses.
-fn report(queue: &LandTurnName, wait: &Wait) {
+fn report(queue: &LandTurnName, verb: &str, wait: &Wait) {
     match wait {
         Wait::Queued { holder, ahead } => cowshed_os::eprintln!(
-            "cowshed: land waits for the ref turn {queue}: {ahead} ahead; {} holds it (pid {}, asked {}s ago)",
+            "cowshed: {verb} waits for the ref turn {queue}: {ahead} ahead; {} holds it (pid {}, asked {}s ago)",
             holder.workspace,
             holder.pid,
             seconds_since(holder.asked_unix_ms),
         ),
         // A ref turn names no outside lock, so the queue never reports one; said as it is if it did.
         Wait::Outside { lock, holders } => cowshed_os::eprintln!(
-            "cowshed: land waits for the ref turn {queue}: {} is held outside the queue{}",
+            "cowshed: {verb} waits for the ref turn {queue}: {} is held outside the queue{}",
             lock.display(),
             match holders {
                 OutsideHolders::Open(open) => format!(", open in {}", open.len()),
@@ -148,13 +172,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_land_takes_a_free_ref_turn_and_the_next_writer_takes_it_once_ended() {
         let root = crate::temp_root::TempRoot::new("ref-turn");
-        let held = RefTurn::acquire_in(&root, &queue(), "topic").await.unwrap();
+        let held = RefTurn::acquire_in(&root, &queue(), RefWriter::Land { workspace: "topic" })
+            .await
+            .unwrap();
         let tickets = land_turn::observe(&root.join("repo.ref")).unwrap();
         assert_eq!(tickets.len(), 1, "the land holds one ticket: {tickets:?}");
         assert_eq!(tickets[0].workspace, "topic");
         assert_eq!(tickets[0].pid, std::process::id());
         held.end("delivered".to_owned());
-        let next = RefTurn::acquire_in(&root, &queue(), "doc-commit").await;
+        let next = RefTurn::acquire_in(&root, &queue(), RefWriter::DocCommit).await;
         next.expect("an ended ref turn stayed held")
             .end("committed".to_owned());
     }
@@ -173,7 +199,9 @@ mod tests {
         .unwrap();
         let waiting = tokio::spawn({
             let root = root.to_path_buf();
-            async move { RefTurn::acquire_in(&root, &queue(), "topic").await }
+            async move {
+                RefTurn::acquire_in(&root, &queue(), RefWriter::Land { workspace: "topic" }).await
+            }
         });
         // The land queues behind the writer: two live tickets, the writer's first.
         let mut tickets = Vec::new();
