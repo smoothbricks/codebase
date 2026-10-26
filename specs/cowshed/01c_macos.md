@@ -59,7 +59,7 @@ Find the symptom in the left column and follow the link.
 | A cowshed volume is indexed by Spotlight; `mdutil -s` reports `unknown indexing state`                                                                                                                   | [Spotlight indexing opt-outs](#spotlight-indexing-opt-outs)                                                                                     |
 | `dev.cowshed.storage` exits 1 at `merge Spotlight Search Privacy exclusions`; `mkstemp failed on /System/Volumes/Data/.Spotlight-V100/…`                                                                 | [Spotlight indexing opt-outs](#spotlight-indexing-opt-outs)                                                                                     |
 | `fseventsd` load; a root-owned `.fseventsd` in a volume root                                                                                                                                             | [`fseventsd` keeps a persistent event log per volume](#fseventsd-keeps-a-persistent-event-log-per-volume)                                       |
-| A watcher probe never comes back (`watcher stream stopped`); `fseventsd` holds gigabytes and its router thread stays busy                                                                                | [`fseventsd` slows with uptime](#fseventsd-slows-with-uptime)                                                                                   |
+| A watcher probe is late or never comes back; `fseventsd` holds gigabytes and its router thread stays busy                                                                                                | [`fseventsd` slows with uptime](#fseventsd-slows-with-uptime)                                                                                   |
 | `root-held-event-debris`; a retired mountpoint cowshed cannot delete                                                                                                                                     | [A root-owned `.fseventsd` lands on a bare mountpoint](#a-root-owned-fseventsd-lands-on-a-bare-mountpoint)                                      |
 | Rewritten image blocks stay allocated; `tmutil` reports the store excluded                                                                                                                               | [Time Machine and local snapshots](#time-machine-and-local-snapshots)                                                                           |
 | After a reboot the store is absent; a DiskUnlock dialog at login; `environment-missing` naming the store                                                                                                 | [The store volume mounts before login](#the-store-volume-mounts-before-login)                                                                   |
@@ -588,8 +588,8 @@ Find the symptom in the left column and follow the link.
   thread busy in every sample and left a test stream's touch undelivered after 89 s, while a restarted instance held
   4.2–4.4 MB at 0–9 % router load and answered probes in 0.2–42 ms with the same clients, so no client causes it
   (_measured_ by thread sampling).
-- **Rule.** A watcher probe that does not come back within the validity interval stops the daemon and the command
-  continues without it, and cowshed never restarts `fseventsd`.
+- **Rule.** A daemon answers from the files as they are when its watcher probe comes back late or not at all, never from
+  a stream that has gone quiet, and cowshed never restarts `fseventsd`.
 - **Owners.** _No spec owner_ for the path table and the restart.
   [16_build_volumes.md §The Nx daemon stays on](./16_build_volumes.md#the-nx-daemon-stays-on), “A daemon answers from
   the files as they are” (the lost-probe rule). Code: [`packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts`].
