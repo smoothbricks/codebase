@@ -1775,6 +1775,12 @@ impl GitRepository {
         for setting in &overrides {
             command.arg("-c").arg(setting);
         }
+        // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
+        // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its
+        // lock files exclusively: a held index lock refuses at once, a held ref lock after the
+        // pinned timeout (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never
+        // waited out.
+        #[allow(clippy::disallowed_methods)]
         let output = command
             .env("GIT_OBJECT_DIRECTORY", &scratch.path)
             .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", read)
@@ -3741,7 +3747,7 @@ impl GitRepository {
     /// read whole answers short, which its caller refuses.
     // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
     // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
-    // files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+    // files exclusively: a held index lock refuses at once, a held ref lock after the pinned timeout
     // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
     #[allow(clippy::disallowed_methods)]
     async fn run_input<I, S>(&self, args: I, input: Vec<u8>) -> Result<Output>
@@ -3801,7 +3807,7 @@ where
 /// run merge/filter drivers, use configured remotes, or invoke hooks (disabled here).
 // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
 // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
-// files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+// files exclusively: a held index lock refuses at once, a held ref lock after the pinned timeout
 // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
 #[allow(clippy::disallowed_methods)]
 async fn run_git_bundle_at<I, S>(
@@ -3873,7 +3879,9 @@ async fn is_git_repository(
 /// Point git at a checkout without allowing repository metadata to run hooks or
 /// filesystem monitors in the controller's process. Other executable config
 /// (merge drivers, filters and transports) is confined by the controller's
-/// workspace Git sandbox when it runs a workspace operation.
+/// workspace Git sandbox when it runs a workspace operation. Git's own wait for a
+/// held ref lock is pinned to its defaults (100 ms per ref, 1 s for packed refs),
+/// so a repository config cannot make it wait out the holder.
 pub fn git_command_at(root: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command
@@ -3896,6 +3904,10 @@ pub fn git_command_at(root: &Path) -> std::process::Command {
             "sequence.editor=false",
             "-c",
             "diff.external=false",
+            "-c",
+            "core.filesRefLockTimeout=100",
+            "-c",
+            "core.packedRefsTimeout=1000",
         ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -4506,7 +4518,7 @@ fn sandboxed_git_command_with_paths(
         // select; each is switched off for the command the caller runs.
         // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
         // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
-        // files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+        // files exclusively: a held index lock refuses at once, a held ref lock after the pinned timeout
         // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
         #[allow(clippy::disallowed_methods)]
         let listing = build()?
@@ -4575,7 +4587,7 @@ fn git_command_with_objects(
 
 // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
 // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
-// files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+// files exclusively: a held index lock refuses at once, a held ref lock after the pinned timeout
 // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
 #[allow(clippy::disallowed_methods)]
 async fn run_git_at_with_objects<I, S>(
@@ -4821,7 +4833,7 @@ const CHECK_IGNORE_BATCH: &[&str] = &["check-ignore", "--stdin", "-z", "--no-ind
 /// returns. A write that fails because git exited early is not reported: git's status is.
 // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
 // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
-// files exclusively: a held index lock refuses at once, a held ref lock after git's own timeout
+// files exclusively: a held index lock refuses at once, a held ref lock after the pinned timeout
 // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
 #[allow(clippy::disallowed_methods)]
 fn git_batch_blocking(
@@ -5377,6 +5389,29 @@ mod tests {
         git_ended, git_message, held_by_repository_blocking, ignored_by_rules, is_git_repository,
         parse_lines, parse_range_listing, workspace_remote_name,
     };
+
+    /// A workspace git's ref-lock wait is the one the command sets, whatever the repository says:
+    /// with `core.filesRefLockTimeout` and `core.packedRefsTimeout` at -1 in its config (wait
+    /// forever) and the ref's lock held, an update through `git_command_at` refuses, naming the
+    /// held lock, instead of waiting out its holder (the WHYs on the workspace gits rest on it).
+    #[test]
+    fn a_held_ref_lock_refuses_whatever_the_repository_config_says() {
+        let fixture = repository();
+        let root: &Path = &fixture;
+        git(root, &["config", "core.filesRefLockTimeout", "-1"]);
+        git(root, &["config", "core.packedRefsTimeout", "-1"]);
+        let head = git_stdout(root, &["rev-parse", "HEAD"]);
+        let lock = root.join(".git/refs/heads/main.lock");
+        fs::write(&lock, b"").expect("hold the ref's lock");
+        let output = super::git_command_at(root)
+            .args(["update-ref", "refs/heads/main", head.trim(), head.trim()])
+            .output_bounded()
+            .expect("the update ends instead of waiting out the holder");
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("main.lock"), "{stderr}");
+        fs::remove_file(&lock).expect("let the ref's lock go");
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -6073,7 +6108,7 @@ mod tests {
                 .arg("-C")
                 .arg(&*root)
                 .args(["count-objects", "-v"])
-                .output_locked()
+                .output_bounded()
                 .expect("count objects");
             assert!(output.status.success());
             output.stdout

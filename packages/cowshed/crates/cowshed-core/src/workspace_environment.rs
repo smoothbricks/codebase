@@ -360,7 +360,8 @@ mod tests {
             if let Some(granted) = granted {
                 shell.env(NX_PARALLEL_RESTORE_ENV, granted);
             }
-            let output = cowshed_os::fork_lock::Run::output_locked(&mut shell).expect("run sh");
+            let output = cowshed_os::test_backstop::CommandBackstop::output_bounded(&mut shell)
+                .expect("run sh");
             String::from_utf8(output.stdout).expect("UTF-8")
         };
         assert_eq!(run(Some("2")), "2");

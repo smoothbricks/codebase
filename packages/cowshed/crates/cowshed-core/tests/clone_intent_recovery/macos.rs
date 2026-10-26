@@ -288,7 +288,7 @@ async fn a_land_retires_the_units_its_train_folded_and_keeps_live_dirty_and_unla
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
             .env("GIT_COMMITTER_NAME", "fixture")
             .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-            .output_locked()
+            .output_bounded()
             .expect("git cherry-pick");
         if !pick.status.success() {
             assert!(
@@ -315,7 +315,7 @@ async fn a_land_retires_the_units_its_train_folded_and_keeps_live_dirty_and_unla
         .await
         .expect("land the train into its lane base");
     holder.kill().expect("release the busy unit");
-    holder.wait().expect("reap the holder");
+    holder.wait_bounded().expect("reap the holder");
 
     let outcome = |name: &str| {
         landed["folded"]
