@@ -1,158 +1,157 @@
 # AGENTS.md
 
-## Rule card
+SmoothBricks is the monorepo behind the `@smoothbricks/*` packages: LMAO tracing, arrow-builder and columine (columnar
+data), StateBus, cowshed (warm copy-on-write workspaces), and the Nx plugin and `smoo` CLI that build and gate this
+repository. This file is the entry card for any agent working in this repository, read with no other context. Rules say
+**when** something applies, **what** to do, and **what enforces it** ("review" means the lead who briefed you, or a
+maintainer, checks it; no tool does). Mechanics live in the files this card points at. `CLAUDE.md` is a symlink to this
+file. `bun`, `nx` and `cargo` come from the repo's devenv: in a shed `cowshed exec` supplies them; on `main`, or under
+`cowshed exec --host`, wrap the command in `direnv exec .`. `cowshed` is the host-installed CLI of `packages/cowshed`.
 
-1. **Preserve others' work.** Coordinate shared files; never reset, checkout or stash a shared tree to clean it. Commit
-   each accepted coherent unit promptly with exact paths (`git commit --only -- <paths>`), never the shared index
-   wholesale. Commit WIP before disruptive host operations. Confirm main contains the accepted commit before claiming a
-   landing; preserve failed or partially landed work for its owner.
-2. **Use the cheapest sufficient proof: mount less; wait for the event.** Reuse valid proof until its relevant inputs
-   change. Use a directory or owned fixture instead of an image when it proves the same contract. Tests advance on
-   readiness, completion and progress, not sleeps or arbitrary total wall-clock ceilings; inject time for time behavior.
-   Keep expensive host fixtures out of ordinary test dependencies; the explicit land gate reaches their dedicated proof
-   when that boundary or its dependency, fixture, environment or toolchain inputs change. Keep caches warm and fix
-   unexplained misses where found. **`--skip-nx-cache` is forbidden, including for diagnosis.** Repair inputs, outputs
-   or dependencies; never raise a bound or bypass a cache to manufacture a pass. Clean up physically owned fixtures on
-   every exit path.
-3. **Inspect evidence before expensive work; stop obsolete work.** Read trace sinks, task history and prior verdicts
-   before rerunning. Cancel an owned run whose result is already obsolete or doomed, preserve its evidence, fix the
-   cause and run the relevant proof. Do not kill a peer's useful independent work or conceal a real failure.
-4. **One owner and one shed per code unit.** Helpers share the unit through explicitly owned files; no git worktrees as
-   a substitute. Use absolute workspace paths in filesystem/edit tools so session cwd cannot redirect an edit into main.
-   Standalone and unrelated Markdown follow the documentation custody card, not the code-workspace rule.
-5. **Land through the repo wrapper.** It owns the rebased-tree gate, cache custody and expected-tip fast-forward.
-   Prioritize fixes that remove fleet bottlenecks; combine related fixes into coherent trains. Nx acceptance follows its
-   declared DAG: lint-first is focused inner-loop fail-fast advice, not fleet serialization. Bare Cargo or Bun tests may
-   diagnose their runners but do not replace Nx acceptance. After success, confirm main's accepted commit and the
-   workspace's retirement; remove only a residual completed workspace, never failed or unlanded work.
-6. **Choose documentation custody by relationship.** Fix standalone or unrelated Markdown immediately on main through
-   its doc lane. Keep a code unit's own docs/specs with that code and land them atomically. A Markdown-only commit is
-   still an input to later acceptance: the next land re-gates the tasks it reaches.
-7. **Fix concurrency defects; do not serialize them into passing.** Prove the fix under intended concurrency. Shared
-   mutable state needs explicit ownership: single writers, one producer per checkout, the cowshed land turn and
-   jobserver admission are legitimate. They are not permission to hide a failing concurrent test.
-8. **Test at the defect's owner and the smallest real boundary.** Do not repeat dependency suites in consumers or
-   re-prove OS internals. Exercise our real OS/process/network integration where that behavior matters; use real
-   in-memory implementations for logic, never fake echoes. Decisions (event handling, ordering, timeouts, retries as
-   policy, recovery) live in a pure core fed injected events and an injected clock; test them as table-driven calls with
-   no real I/O or sleeps. The shell is decisionless I/O that maps OS events (watchers, sockets, signals, timers) into
-   core inputs and executes core outputs: one simple mock integration check plus actual runs prove it, and no test
-   drives core logic through real FSEvents, timers or a load generator. Choose an oracle that can fail. Missing tests,
-   infrastructure errors and timeouts are not intended red. Measure performance claims in comparable regimes and retain
-   the witness. Never assert a tautology: a test that the OS behaves like the OS, or Nx like Nx, proves nothing - test
-   our contract at the boundary that can actually fail.
-9. **Preserve inference.** Thread precise public types and generics from input through storage to returned values; fix
-   source APIs instead of adding cast bridges or test-only wrappers. No `as any`, `as unknown as`, or
-   `JSON.parse(...) as T` as validation. `as const` and `satisfies` preserve information. An `unknown` generic default
-   is valid when it preserves inference, not as a backward-compatibility exemption.
-10. **Validate external boundaries from their authoritative contracts.** Generate validation from the owning type or
-    schema, translate failures to typed `Err`, and do not revalidate proven internal data without a trust boundary.
-    Exact fixture/oracle readers reject unknown fields; additive protocol readers follow their evolution contract. Use
-    Typia `validate/createValidate` for TypeScript envelopes/JSON, or translate assert failures at the seam. Wire and
-    domain payloads use their owning generated codecs or schema validators; do not maintain a second validator.
-11. **Operational failures are observable typed values.** Return `Err`/`Result` with operation, code and cause; throw or
-    panic only for stated programmer bugs or impossible invariants. Require tracing context in normal wiring, root
-    traces at entry points and child spans below them. Test operational paths as `span-err`, not `span-exception`. Use
-    observable test tracers; no default NoOpTracer. API-comparison and benchmark exceptions remain explicit.
-12. **Keep private information out of public code and history.** No home paths, private project names or agent/session
-    identifiers in public source, comments, docs or commit messages. Use portable command placeholders there. Review
-    every surface; a partial guard does not establish complete coverage.
-13. **Reuse, simplify and keep one contract owner.** Search existing code/specs before implementing; use available
-    search tools and fall back to source when an index is unavailable. Fix touched defects; give unrelated code defects
-    evidence and an owner without replacing the goal. Fix unrelated docs immediately under rule 6. No compatibility
-    shims, dead APIs or hand-maintained copies of derivable contracts; required protocol evolution remains a contract.
-    Avoid needless allocation/copying, pay for computation once and retain what it proves. Specs state the target design
-    in present tense, not a diary: implement an agreed better design and update its spec with the same unit, never omit
-    the capability. Put implementation gaps and evidence in the owning brief, not status notes in the spec. A unit is
-    done when the production path calls it and a smoke run shows it: name the call site. A component no production code
-    reaches is wired in the same unit or deleted; never accepted as done.
-14. **Depend on published revisions, never host paths.** Patch a dependency by git source and locked revision
-    (`rev = "<sha>"`), never by filesystem path: Cargo serves it from the local git cache, so the same tree builds on
-    any host and in CI. A path patch bakes one machine's checkout into the build and fails everywhere else.
-15. **Fail early and fix the root cause.** A failure is information: stop the work that depends on it, name the cause
-    and fix it there. Never retry around it, tolerate it, widen a bound, skip the check or route around it - a tolerated
-    failure is a defect with a receipt. Every error you raise carries the context you already have at the throw site -
-    the operation, the subject (ids, paths, versions), the values involved and the cause - in the structured error
-    result, so the reader needs no second run to understand it.
-16. **No env-var, lock or ceremony fixes.** Never add environment variables, lock files, holder markers, wrapper
-    protocols or hooks to work around a tool or coordinate agents; fix the tool itself. Cowshed's jobserver and land
-    turn are the coordination. Anything else needs a maintainer's explicit approval first.
+## Words used below
 
-17. **Pay for computation once; keep what it proves.** Prefer work that leaves reusable structure: one structure, many
-    consumers; compute order once. Derived state (indexes, envelopes, checkpoints, caches) is a byproduct, never a
-    second store; units name their authoritative source and why no duplicate store exists. Assess every unit through
-    this byproduct lens. Flag these **second-ledger / second-store** shapes by name:
+- **Maintainers**: the humans who set direction and approve exceptions. **Lead**: the agent that briefed you; report and
+  hand off to it (or to a maintainer if you have no lead).
+- **Owner**: whoever was assigned a path or unit in a brief; a path nobody owns belongs to the lead who is working on
+  it. Ask the lead when you're unsure.
+- **cowshed**: the workspace tool, built in this repository (`packages/cowshed`). A **shed** is one cowshed workspace: a
+  warm copy-on-write clone of `main` with its own branch and build volume. `cowshed fork <ws> --project <checkout>`
+  creates one, `cowshed path <ws>` prints its directory, `cowshed rm <ws>` retires it; `<ws>` is the shed's name (its
+  `.cowshed/workspace.json` `workspace` field, whose `role` says shed or main). **main** is the shared checkout
+  (`cowshed path main`); never edit code there. These commands run from the trusted host shell: a sandboxed worker's
+  cowshed CLI is refused at its first write, so it hands fork, land and `rm` to its lead.
+- **cowshed exec**: `cowshed exec <ws> -- <cmd>` runs a build, test or bench under cowshed's jobserver, which admits
+  work by CPU tokens so host load stays schedulable. Work started outside it holds no token and starves everyone. Host
+  targets that a sandbox can't run (`host-e2e`) use `cowshed exec <ws> --host -- direnv exec . <cmd>`.
+- **Land**: the land command (see Commands). Under the repository's **land turn** (a FIFO queue per repo, holder named),
+  it rebases the shed onto `main`, runs the repo's gate (`tooling/land-host.sh`: `nx run-many -t gate`, the root
+  aggregate of every project's lint, test and build plus `host-e2e`; then `bun run check:linux`), fast-forwards `main`
+  on green and retires the shed.
+- **Nx**: the build and test runner. `@smoothbricks/nx-plugin` infers most targets.
+- **LMAO spans**: the traces `@smoothbricks/lmao` records. Tests flush them to each package's SQLite sink
+  (`<package>/.cache/lmao/trace-results.db`); `TraceQuery` or the `sqlite3` CLI reads them
+  (`targets/lmao-docs/src/content/docs/reference/trace-testing.mdx`).
+- **Brief**: `agent-todo/<unit>.md` holds a unit's gaps and evidence. **Specs** (`specs/`) state the target design in
+  present tense.
 
-    - **Write ledger:** a second ledger beside the event log.
-    - **Duplicate inventory:** a copy beside the authoritative index.
-    - **Retraction index:** a separately kept store instead of a byproduct of the facts.
-    - **Derivable-byte cache:** derivable bytes kept as a second durable or authoritative store.
-    - **Parallel registry:** another registry of what a manifest already lists.
-    - **Checkpoint store:** live state duplicated into a separate store.
-    - **Summary table:** a second store recomputable from its rows.
-    - **Canonical copy:** another canonical copy beside the live source.
-    - **Shadow config:** a copy beside the declared config.
+## Rules
 
-18. **Remove our work first; cache last. Cache over fork.** Measure and optimize our code before memoizing. If removing
-    the remaining work requires an upstream fork/patch, prefer a boundary cache; name the upstream alternative and its
-    maintenance cost in the design record, and explain why the fork is not worth carrying. Caches stay basis-keyed,
-    recomputable and disposable, never second stores.
+1. **Shared trees.** When you are about to reset, checkout, stash or commit in a tree another agent uses → coordinate
+   with its owner first, and never reset, checkout or stash to "clean" it. Commit one defect or one contract change with
+   `git commit --only -- <paths>`, never the whole index. _Enforced by: review._
+2. **Landing.** When you land, retire a shed or claim something is landed → use the land command. "Landed" means the
+   commit is an ancestor of `main` (`git merge-base --is-ancestor`). Retire a shed only after its work is landed. A
+   failure that blocks more than one shed comes before local polish. _Enforced by: the land turn and
+   `tooling/land-host.sh`._
+3. **Edits.** When you are about to edit → work in your own shed (one owner per unit, no git worktrees, never a peer's
+   path until released). Markdown that belongs to no code unit goes straight to `main` with the doc commit (see
+   Commands). _Enforced by: review._
+4. **Diagnosis.** When you are about to rerun something, or to name a cause → read the evidence first: the run's LMAO
+   spans, the Nx task history and prior verdicts (`.nx/workspace-data/bounded-exec/<task>/verdict.json`). Never decode
+   traces by hand, never add a retry, never pass `--skip-nx-cache`. A pass on rerun is not a verdict. _Enforced by:
+   review._
+5. **Proof.** When you are about to run host work → run it through `cowshed exec` (`--host` for host targets). When you
+   choose a test → pick the cheapest check that goes red when this contract is wrong, in the module that owns the
+   contract. A decision (ordering, timeouts, retry policy, recovery) gets a table-driven test of a pure function with
+   injected events and an injected clock: no real I/O, no sleeps. The I/O shell gets one integration check. A race gets
+   a real interleaving, never serialization. A test tears down what it created on every exit path. _Enforced by: cowshed
+   tokens; the root `lint` policies `TEST-CLOCK-ORACLE` (deadlines and elapsed-time asserts) and `TEST-ONE-WALK`
+   (duplicate walks), on changed tests only (`packages/nx-plugin/README.md`)._
+6. **Workarounds.** When a step fails, or you are about to add a sleep used as a wait, a retry, a raised bound, a
+   fallback, an env var, a lock or marker file, test serialization, SIGSTOP or manual `nice`, a local copy of another
+   owner's table or codec, a compatibility shim, a waiver list or a test-only code path → stop and fix the cause at its
+   owner. If a seam, export or generator is missing, add it once at the owner. If you are not the owner, hand off with
+   the measured blast radius: files, lines and contract surfaces (wire, codec, spec, another shed), counted with
+   `codegraph_explore`, LSP or `rg`. "It would be bigger" without a count is not a reason. Coordination that is allowed:
+   one writer, one producer per checkout, the jobserver, the land turn. Anything else needs a maintainer's approval.
+   _Enforced by: review._
+7. **Done.** When you implement something or call it done → search existing code and specs first, and keep one owner per
+   contract (no second copy). Update the spec in the same unit. Done means a production (non-test) call site plus a
+   smoke run that exercises it; otherwise wire it or delete it. _Enforced by: review._
+8. **Byproducts.** When you choose a data structure, a storage or wire format, a log or trace shape, or a pass over
+   data, or when you are about to add a cache, an index, a copy or a second pass → among designs with the same
+   performance, pick the one whose necessary work has the most other uses, then thread it through everywhere. That
+   removes whole classes of code (extra indexes, sorts, caches, re-encodings, separate profilers) and the later
+   optimizations they would need. Examples: a sorted structure serves ordered scans and range queries that a hash table
+   plus a sort would pay for twice. LMAO traces write structured columns into preallocated buffers, so monitoring data
+   is already columnar for offline analytics, span start and end times are already a profile, and the span result
+   already holds the `Ok`/`Err` with its status and error code, so nothing is allocated or computed twice. Before adding
+   a cache, name what your structure or pass already proves (order, an index, a checksum, a timing, a result) and use
+   it; then measure. Derived state (an index, an envelope, a checkpoint, a cache) is a byproduct, never a second store:
+   name its authoritative source and why no duplicate store exists. Refuse these second stores by name: a write ledger
+   beside the event log, a duplicate inventory beside the authoritative index, a retraction index kept apart from the
+   facts, a derivable-byte cache kept as an authoritative store, a parallel registry of what a manifest lists, a
+   checkpoint store duplicating live state, a summary table recomputable from its rows, a canonical copy beside the live
+   source, a shadow config beside the declared one. A cache stays basis-keyed, recomputable and disposable; if removing
+   the work needs an upstream fork or patch, prefer a boundary cache and record the upstream alternative and its
+   maintenance cost in the design record. _Enforced by: review._
+9. **Types.** When you are about to write `as`, an `unknown` default or a sentinel value → thread the precise type
+   instead. No `as any`, `as unknown as`, or `JSON.parse(...) as T`; `as const` and `satisfies` are fine. _Enforced by:
+   ESLint `@typescript-eslint/no-unsafe-type-assertion` on `packages/*/src` (the inferred `lint` target)._
+10. **Boundaries.** When you parse bytes, JSON, a fixture or a payload from another process, language or file → validate
+    with code generated from the owning schema (Typia `validate`/`createValidate` for TypeScript envelopes and JSON, the
+    owning generated codec or schema validator for wire and domain payloads) and return a typed error. Fixture and
+    oracle readers reject unknown fields. _Enforced by: review._
+11. **Errors.** When a correct caller can cause a failure → return `Err` carrying the operation, an error code, the
+    subject (ids, paths, versions), the values involved and the cause. Only programmer bugs throw or panic. Test the
+    span as `span-err`. _Enforced by: review._
+12. **Portability.** When you write a path, a name, a dependency or a spawn → no home paths, private project names or
+    agent/session ids in committed text; an external dependency is pinned by git revision (`rev = "<sha>"`), never by a
+    host path (in-repo workspace crates use `path =` as usual); spawn tools by PATH name. _Enforced by:
+    `smoo monorepo check-public-denylist` (`tooling/git-hooks`): commit-msg and pre-commit judge the home directory,
+    sibling project names and the clone's configured patterns, pre-push the configured patterns; agent and session ids
+    need a diff read._
 
 ### Conduct
 
-- **C1:** Finish authorized work; soft budgets never justify stopping, idling or handing off unfinished work.
-- **C2:** Prepare useful authorized work against a blocking dependency's newest candidate; do not invent another owner.
-- **C3:** Answer the actual question first; questions alone authorize no changes. Continue already authorized work.
-- **C4:** Read governing instructions before editing; reuse their terms and update the owner, not a parallel section.
+- Finish authorized work; a soft budget is never a reason to stop or to leave work uncommitted.
+- A question authorizes no changes: answer it, then continue authorized work.
+- While blocked on a dependency, prepare against its current tip; never wait on CI or a push.
+- Read the governing spec and this card before editing either; update the owner, not a parallel copy. Add a rule here
+  only for a recurring high-loss decision with an actionable scope and a named owner, and never paste vendor-generated
+  instruction blocks into this file.
+- Before answering a host or tool question, search the session record and the spec for prior findings, and cite them.
+- Ask a maintainer once, with the cost per hour of waiting, and staff the root cause in the same step.
+- A lead reports land results, installs and blockers to the maintainers unasked.
+- With an empty queue and no named dependency, yield after 30 minutes.
 
-## Repo card
+## Commands
 
-Follow the active human task and higher-level instructions. This sheet gives entry decisions; linked owners define
-mechanics and design. A specific scoped rule wins over a generic slogan. Name and repair conflicts at the owner rather
-than inventing workarounds. `CLAUDE.md` is a symlink to this file; there is no separate short authority or generated
-sheet.
-
-- **Tools:** Bun only; no npm, npx or bunx. Use `bun nx` or the shell's `nx` and other installed tools directly.
-- **Acceptance:** `NO_COLOR=1 bun nx run-many -t lint test build -p <projects> --outputStyle=static-failures-only`.
-  Focused proof does not replace the land wrapper's acceptance of the rebased candidate. Read its exit status and
-  evidence. For platform-conditional Rust, run `bun run check:linux` before the relevant final land/push; it proves
-  Linux compilation, not Linux test execution.
+- **Tools:** Bun only (no npm, npx or bunx). Run Nx as `bun nx` or `nx`.
+- **Acceptance (focused):**
+  `cowshed exec <ws> -- env NO_COLOR=1 bun nx run-many -t lint test build -p <projects> --outputStyle=static-failures-only`.
+  It does not replace the land gate; add `-p @smoothbricks/codebase` to run the root `lint` policies. For
+  platform-conditional Rust, run `bun run check:linux` before the final land or push; it proves Linux compilation, not
+  Linux test execution.
 - **Land:** `<land-command> land <ws>`, where `<land-command>` is the operator-configured host entry that takes the
-  repository's cowshed land turn. It invokes `tooling/land-host.sh`; that script owns acceptance of the rebased tree. Do
-  not invoke its internals directly or reconstruct its retry/waiver taxonomy in this sheet.
-- **Markdown commit:** `<land-command> git -C <main> commit --only -m 'docs: summary' -- <paths>`. Stage new files
-  through `<land-command> git -C <main> add -- <paths>`. Use conventional commits, no trailers. The entry takes the
-  repository's cowshed land turn briefly and runs no gate of its own.
-- **Build state:** shell/cowshed owns paired absolute Nx state paths and daemon lifecycle, preserving explicit absolute
-  CI/cowshed overrides. Tasks and agents must not redirect them ad hoc. Declare all restorable deliverables as Nx
-  outputs, never mutable tool state; keep one producer per checkout. Infer targets and inspect their resolved graph,
-  rather than adding lint/clean stubs. Detailed keying belongs in the linked owners, not another command recipe.
-- **Architecture:** arrow-builder owns generic buffers and Arrow conversion; LMAO owns spans, tracing, contexts and
-  span-tree conversion. Hot paths use allocation-sensitive column writes with each schema kind's storage, including raw
-  strings for dynamic category/text fields. Physical structural columns are eager; sparse system attributes can be lazy.
-  The architecture and schema specs own these distinctions, not a handwritten API or enum inventory.
-- **Admission:** add entry guidance only for a recurring high-loss decision with an actionable scope and named owner. Do
-  not restate what a tool, template or check already enforces. Preserve useful rationale at the existing owner; delete
-  stale recipes and API inventories. Do not regenerate vendor instruction blocks into this file.
-- **Enforcement:** these rules do not claim universal tool coverage. Source checks are scoped; Markdown instructions and
-  fixed-bound runner/waiver behavior are not proved correct by a source lint. Change owner tools/specs coherently.
+  repository's land turn; your lead gives you its path, it is not in this repository. It invokes `tooling/land-host.sh`,
+  which owns acceptance of the rebased tree; do not invoke its internals directly.
+- **Doc commit (Markdown only):** `<land-command> git -C <main> commit --only -m 'docs: summary' -- <paths>` (new files
+  first: `<land-command> git -C <main> add -- <paths>`). It takes the land turn briefly and runs no gate of its own; the
+  next land re-gates what the Markdown reaches. Conventional commits, no trailers.
+- **Build state:** cowshed owns Nx state paths and the Nx daemon. Declare restorable outputs as Nx outputs, one producer
+  per checkout; never redirect state paths ad hoc. Infer targets and read their resolved graph rather than adding lint
+  or clean stubs.
 
-## Read First
+## Read first
+
+Ownership: arrow-builder owns generic buffers and Arrow conversion; LMAO owns spans, tracing, contexts and span-tree
+conversion. The specs below own the rest, not a handwritten API or enum inventory here.
 
 - `specs/lmao/00_package_architecture.md`: package ownership, dependency direction and allocation strategy.
 - `specs/lmao/01a_trace_schema_system.md`: storage by schema kind, raw-string lanes and cold-path encoding.
 - `specs/lmao/01l_op_context_pattern.md`: inference-preserving contexts and Op authoring.
-- `packages/lmao/README.md`: tracer wiring, trace-testing and the TraceQuery/SQLite inspection entry; inspect before
-  reruns.
+- `packages/lmao/README.md`: tracer wiring, trace-testing and the TraceQuery/SQLite inspection entry.
 - `packages/nx-plugin/README.md`: inferred targets, Cargo closures, runtime inputs and build-state output safety.
 - `specs/cowshed/16_build_volumes.md`: workspace-owned build state, warm forks, cache carry and adoption.
-- `packages/cowshed/docs/agents.md`: workspace ownership and agent-facing CLI workflow.
+- `packages/cowshed/skills/cowshed/SKILL.md`: the shed workflow: fork, exec, land, and what to do when `rm` refuses.
+- `packages/cowshed/docs/agents.md`: workspace ownership and the agent-facing CLI workflow.
 - `tooling/land-host.sh` and `tooling/land-host.test.ts`: current landing mechanics and refusal evidence.
 
-## Documentation custody card
+## Documentation custody
 
-| Unit                                                  | Workspace                                    | Commit and acceptance                                                                    |
-| ----------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Only Markdown, unrelated to an active code unit       | Main, no shed                                | Exact-path commit through the configured entry; takes the land turn briefly, no gate.    |
-| Code plus docs/specs describing that code             | Unit's shed                                  | One coherent unit through the land wrapper.                                              |
-| Unrelated Markdown found while working in a code shed | Main for the doc fix; code stays in its shed | Fix immediately through the doc lane; the next rebase must reuse unaffected task caches. |
+| Unit                                          | Workspace              | Commit                                     |
+| --------------------------------------------- | ---------------------- | ------------------------------------------ |
+| Markdown unrelated to an active code unit     | `main`, no shed        | Doc commit (above)                         |
+| Code plus the docs/specs describing it        | the unit's shed        | One unit through the land command          |
+| Unrelated Markdown found while in a code shed | `main` for the doc fix | Doc commit now; the code stays in its shed |

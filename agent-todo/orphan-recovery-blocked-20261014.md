@@ -80,5 +80,5 @@ Local reports are evidence, not acceptance.
 Do not mutate, detach or retire original donors, ignored evidence, unfinished images/intents, queued land units,
 `landing-queue-sheds.txt` entries or live-owner exclusions. Contained commits, checkpoints and reports never authorize
 dirty-state loss. Follow `specs/cowshed/02_workspaces.md` §§The safe-to-clone-main invariant and `cowshed rm`,
-`packages/cowshed/docs/cli.md` §`cowshed fork`, and `AGENTS.md` §§Rule 12 and Repo card Acceptance. Keep private paths
-and session identities in local evidence, not public code, documentation or history.
+`packages/cowshed/docs/cli.md` §`cowshed fork`, and `AGENTS.md` Portability rule and the Acceptance line of Commands.
+Keep private paths and session identities in local evidence, not public code, documentation or history.
