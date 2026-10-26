@@ -384,6 +384,7 @@ async function runZigArchive(invocation: ArchiveInvocation): Promise<boolean> {
 }
 async function exited(command: string, child: ReturnType<typeof spawn>): Promise<boolean> {
   try {
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a scriptc build or a zig compile lasts as long as its work; the operator's interrupt or the enclosing runner's bound ends a hung one
     await once(child, 'exit');
     return child.exitCode === 0 && child.signalCode === null;
   } catch (error) {

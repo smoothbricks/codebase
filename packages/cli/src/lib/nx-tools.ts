@@ -34,6 +34,7 @@ export function runNxTool(tool: string, args: readonly string[]): number {
     process.stderr.write(`smoo: no tool ${tool}; the tools are ${[...tools.keys()].sort().join(', ')}\n`);
     return 64;
   }
+  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: smoo nx-<tool> is the tool, run for as long as its work (an archive extraction, a summary of any log); the operator's interrupt or the enclosing runner's bound ends a hung one
   const run = spawnSync(process.execPath, [script, ...args], { stdio: 'inherit' });
   if (run.error !== undefined) {
     process.stderr.write(`smoo: could not run ${script}: ${run.error.message}\n`);
