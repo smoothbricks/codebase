@@ -84,8 +84,17 @@ Notes for harness integration:
   _transient_ state (dirty tree, in-progress merge, the workspace's own running jobs; never a process cowshed does not
   run holding the mount) and deliberately cannot get past this gate; `--abandon` is the sole authorization for
   destroying unlanded commits, and it bundles them into `sessions/.trash` first.
-- **Never turn a removal conflict into a retry with a flag.** The gate is the whole point: a coordinator script that
-  answers exit 4 by adding `--force` is the failure mode this design exists to prevent.
+- **Never turn a removal conflict into a blind retry with a flag.** The gate is the whole point: a coordinator script
+  that answers exit 4 by adding `--force` is the failure mode this design exists to prevent. `--abandon` is not a retry
+  but a decision about the work, made once for a workspace whose work was deliberately dropped (superseded or obsolete,
+  the reason clear from history) and followed by `cowshed gc --abandoned`, which deletes the recovery bundle. Work still
+  wanted is landed.
+- **Land a round of units as one batch.** Fork one batch shed from main per round and each unit from the batch. Fold a
+  finished unit with `cowshed land <unit> --into <batch> --ungated`: Git alone, no check, and it retires the unit's
+  shed, so only main, the batch and the units being coded stay mounted. Gate once with `cowshed land <batch>` (or the
+  repository's land route); a red is fixed in the batch, or its unit goes back to its owner. Markdown-only changes never
+  go into a batch: they belong in place on main, committed whenever they are ready. The commands and their refusals are
+  in [usage.md](usage.md#lanes-one-change-built-by-several-workspaces).
 - If a task needs a _snapshot to retry from_, `cowshed checkpoint <ws> <label>` before the risky step and
   `cowshed restore <ws> <label>` on failure — both are milliseconds, and far cheaper than re-creating the workspace.
   Checkpoint publication first crosses a supervisor barrier: complete Arrow batches and spill files are sealed, and a

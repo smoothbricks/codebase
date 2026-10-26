@@ -223,9 +223,10 @@ When the task is complete, land it:
 cowshed land "$WS" --project "$PROJECT"
 ```
 
-If `rm` reports a conflict, **do not reach for a flag**. The conflict is the data-loss fence: the workspace holds
-commits that exist nowhere else, and the remedy it names — `cowshed land <ws>` — is the one that keeps them. `--force`
-will not get past it, by design; `--abandon` will, and destroys them (recoverably, via the bundle it writes) on purpose.
+If `rm` reports a conflict, **do not reach for a flag by reflex**. The conflict is the data-loss fence: the workspace
+holds commits that exist nowhere else, and the remedy it names — `cowshed land <ws>` — is the one that keeps them.
+`--force` will not get past it, by design. `--abandon` will, and destroys them (recoverably, via the bundle it writes,
+which `cowshed gc --abandoned` deletes): use it, on purpose, only for a workspace whose work was deliberately dropped.
 
 ### Lanes: one change built by several workspaces
 
