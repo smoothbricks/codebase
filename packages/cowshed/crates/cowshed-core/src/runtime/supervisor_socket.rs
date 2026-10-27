@@ -1047,6 +1047,7 @@ impl BoundSocket {
     }
 
     /// Another owner of this socket's fenced file lease: the same flock, not a new lock.
+    #[cfg(target_os = "macos")]
     #[must_use = "hold it until the group-ledger writer drops it after its final snapshot"]
     pub(crate) fn publication_lease(&self) -> PublicationLease {
         PublicationLease {

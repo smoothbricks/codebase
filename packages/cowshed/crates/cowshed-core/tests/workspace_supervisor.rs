@@ -2084,6 +2084,7 @@ fn owned_group() -> std::process::Child {
 }
 
 /// `(job id, leader start)` for every group the ledger at `path` names.
+#[cfg(target_os = "macos")]
 fn ledger_leaders(path: &std::path::Path) -> Vec<(u64, Option<u64>)> {
     let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     ledger_group_leaders(&ledger)
@@ -6784,7 +6785,7 @@ async fn a_stalled_group_ledger_write_leaves_the_supervisor_actor_responsive() {
     use std::future::Future as _;
     use std::io::Read as _;
 
-    let root = workspace_root("group-ledger-write");
+    let root = workspace_root(&temp_parent::scratch_parent(), "group-ledger-write");
     let ledger = root.join("supervisor.groups");
     let temporary = ledger.with_extension(format!("groups.{}", std::process::id()));
     let name = std::ffi::CString::new(temporary.as_os_str().as_bytes()).unwrap();

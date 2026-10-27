@@ -62,6 +62,7 @@ mod refusing_gateway;
 #[path = "support/temp_parent.rs"]
 mod temp_parent;
 
+#[cfg(target_os = "macos")]
 #[path = "support/publication.rs"]
 mod publication;
 #[path = "support/temp_root.rs"]
