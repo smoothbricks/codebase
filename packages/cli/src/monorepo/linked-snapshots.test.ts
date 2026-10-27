@@ -122,8 +122,11 @@ function write(file: string, content: string): void {
   writeFileSync(file, content);
 }
 
+// Ephemeral fixtures own no detached Git work: maintenance can remove its lock while the template is copied.
 function git(root: string, ...args: string[]): string {
-  const run = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  const run = spawnSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-C', root, ...args], {
+    encoding: 'utf8',
+  });
   if (run.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${run.stderr}`);
   return run.stdout.trim();
 }
