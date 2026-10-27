@@ -713,9 +713,11 @@ async function aLeaseLostUnderItsTask(): Promise<void> {
     expect(measured).toMatchObject({ kind: 'measured', lease: lease.directory, mountpoint: paths.mountpoint });
     expect(measured.kind === 'measured' && measured.capacityBytes <= capacity).toBe(true);
 
-    // Another owner detaches the volume, and a write through TMPDIR makes the lease directory again below the bare
-    // mountpoint, on the Data volume.
-    await detachOwned(owned, paths.uid, gatewaySocket);
+    // Another owner takes the volume away by force under the held lease, and a write through TMPDIR makes the lease
+    // directory again below the bare mountpoint, on the Data volume. Forced, since what the test owns is the lease and
+    // not every other process on the host: an unforced detach of the fresh volume was refused busy in a land gate.
+    const unmounted = await createHostCommands(gatewaySocket).run('/sbin/umount', ['-f', paths.mountpoint]);
+    expect(unmounted.status, unmounted.stderr).toBe(0);
     mkdirSync(join(lease.directory, 'node-compile-cache'), { recursive: true });
     const detail = `no marked volume is mounted at ${paths.mountpoint} any more: it was detached while the task held its lease`;
     expect(await volume.space(lease)).toEqual({
