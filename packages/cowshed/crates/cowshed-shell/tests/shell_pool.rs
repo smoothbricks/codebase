@@ -2405,3 +2405,33 @@ async fn host_controller_a_dropped_project_tool_future_ends_its_canonical_job() 
     );
     drop(server);
 }
+
+/// Pool identity includes the selected envrc; a root export is not a nested shell.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_each_selected_envrc_has_its_own_activation() {
+    let workspace = Workspace::new("shell-selected-envrc", 41_664);
+    workspace.envrc("export FROM_ENVRC=root\n");
+    std::fs::create_dir(workspace.mount().join("nested")).expect("nested shell directory");
+    std::fs::write(
+        workspace.mount().join("nested/.envrc"),
+        format!("{COUNT}export FROM_ENVRC=nested\n"),
+    )
+    .expect("nested envrc");
+    let handle = workspace.supervisor(false);
+    assert_eq!(
+        run(&handle, sh("printf %s \"$FROM_ENVRC\""))
+            .await
+            .ok()
+            .stdout,
+        "root"
+    );
+    let mut nested = sh("printf %s \"$FROM_ENVRC\"");
+    nested.cwd = Some(cowshed_core::api::dto::WorkspacePath::new("nested").expect("nested cwd"));
+    assert_eq!(run(&handle, nested).await.ok().stdout, "nested");
+    assert_eq!(
+        workspace.activations(),
+        2,
+        "different selected shells each evaluate once"
+    );
+}

@@ -58,7 +58,9 @@ the first two: nothing moves):
   (`GIT_CONFIG_GLOBAL`) left out; and under the name `<grants>`, the workspace's grants, since what the evaluation could
   read or reach is part of what it was computed against. A baseline that differs names the first variable that does
   (`cowshed: evaluating the workspace shell: … PATH differs`). A new pool after a grant revision with the same grants
-  adopts its own checkout's export; other grants evaluate.
+  adopts its own checkout's export; other grants evaluate. Under the reserved name `<shell>`, the baseline also keys the
+  selected .envrc directory with the same checkout-place normalization, so different selected shells never adopt each
+  other's export while cloned paths still compare equal.
 - **Nothing names the origin after the move.** Every value has each of the origin's per-workspace places — its root, its
   runtime link (`XDG_RUNTIME_DIR`), its `TMPDIR` and its `HOME`, root first — replaced by the adopting checkout's
   wherever a path starts there and ends a component (`/x/repo` moves `/x/repo/tooling`, `-I/x/repo/include` and

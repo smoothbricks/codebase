@@ -1216,13 +1216,17 @@ pub(super) struct HostActivator {
 }
 
 impl HostActivator {
-    /// The baseline an inherited record is keyed against: the host's environment and, under a
-    /// name no variable can have, the grants.
+    /// The inherited baseline: the host environment, grants and selected shell directory.
+    /// Reserved names cannot collide with environment variables.
     fn keyed_baseline(&self) -> BTreeMap<OsString, OsString> {
         let mut keyed = self.environment.clone();
         keyed.insert(
             shell_inherit::GRANTS_KEY.into(),
             shell_inherit::keyed_grants(&self.grants),
+        );
+        keyed.insert(
+            shell_inherit::SHELL_KEY.into(),
+            self.home().as_os_str().to_owned(),
         );
         keyed
     }

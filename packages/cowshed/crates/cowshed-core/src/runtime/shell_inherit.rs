@@ -49,6 +49,9 @@ const RECORD_LOCK_FILE: &str = "activation.lock";
 /// it reports the grants by this name.
 pub const GRANTS_KEY: &str = "<grants>";
 
+/// The selected shell directory, normalized by the baseline's existing checkout-place move.
+pub const SHELL_KEY: &str = "<shell>";
+
 const RECORD_VERSION: u32 = 1;
 
 /// A record is one export plus its watch list; a larger file is not one this code wrote.
