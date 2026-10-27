@@ -960,12 +960,13 @@ the handshake bound.
       it. A child that ends its streams is reaped within the reap bound and its status answers. Its callers: a
       repository mirror's transfers (`clone --mirror` and the `fetch --prune` that updates it), with `--progress`, their
       output in the mirror's transfer log; workspace git that runs repository-selected merge drivers, filters and hooks
-      (both Darwin's); a project's tool the controller runs outside any job (discovery's Cargo -- which waits behind no
-      holder, since neither query it asks waits on Cargo's package-cache lock, measured -- and the land's
-      `nx daemon --stop`), in a controller run's leaf on Linux; and a declared land's push and after commands, inside
-      their after-land job (02_workspaces.md "A declared land" step 6). Each has the heartbeat silence (15 s,
-      `HEARTBEAT_SILENCE`), except `nx daemon --stop`, which has the 10 s a stopped daemon gets to exit after the
-      SIGTERM it sends (`DAEMON_EXIT_GRACE`), and the push and after commands, which have 180 s.
+      (both Darwin's); a project's tool the controller runs outside any job (the land's nx daemon --stop), in a
+      controller run's leaf on Linux; and a declared land's push and after commands, inside their after-land job
+      (02_workspaces.md "A declared land" step 6). Discovery's Cargo instead runs in its canonical workspace job and
+      applies the same heartbeat silence (15 s, HEARTBEAT_SILENCE) only after its command starts; waiting on shared
+      shell activation does not spend it (11_shell.md, "One spare and a SIEVE cache"). Neither query waits on Cargo's
+      package-cache lock, measured, so no holder extends its command silence. nx daemon --stop has the 10 s a stopped
+      daemon gets after SIGTERM (DAEMON_EXIT_GRACE); push and after commands have 180 s.
   - **The gateway's drain reaps its Nx backends within one reap bound.** Once nothing is in flight, the drain sends
     `SIGTERM` to every Nx cache backend it started and waits for all of them within one reap bound
     (`cowshed-os::deadline::reap_async`). The actor is therefore parked at most that long, and the drain ends inside

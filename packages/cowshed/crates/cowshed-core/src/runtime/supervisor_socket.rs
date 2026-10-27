@@ -2624,8 +2624,23 @@ async fn serve_hold(
 
 /// Kill `job_id` because its holder went away while it ran. The job may have been advanced onto
 /// a newer grant revision meanwhile, so it is reached under the authority served now.
-async fn kill_unheld(supervisor: &WorkspaceSupervisorHandle, job_id: JobId) -> Result<()> {
-    let current = supervisor.with_authority(supervisor.current_authority().await?);
+pub(super) async fn kill_unheld(
+    supervisor: &WorkspaceSupervisorHandle,
+    job_id: JobId,
+) -> Result<()> {
+    let served = supervisor.current_authority().await?;
+    let expected = &supervisor.snapshot().workspace_incarnation;
+    if served.workspace_incarnation != *expected {
+        return Err(CowshedError::conflict(
+            format!(
+                "job {} belongs to workspace incarnation {expected}, but the supervisor now serves {}; refusing cancellation",
+                job_id.get(),
+                served.workspace_incarnation
+            ),
+            "inspect the original workspace supervisor",
+        ));
+    }
+    let current = supervisor.with_authority(served);
     if current.info(job_id).await?.state.is_terminal() {
         return Ok(());
     }

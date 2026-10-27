@@ -196,6 +196,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 environment: BTreeMap::new(),
                 grants: Default::default(),
                 envrc_directory: None,
+                activation: Arc::new(tokio::sync::Mutex::new(())),
             }),
             ShellPoolConfig {
                 prewarm: false,

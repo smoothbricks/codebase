@@ -1695,7 +1695,7 @@ pub struct JobRunState {
 /// One snapshot of a [`JobRunState`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObservedRun {
-    /// No process yet: the sandbox environment is still being prepared host-side.
+    /// The command has not started: preparation or shared shell activation may still be running.
     Preparing,
     /// The run's leader process exists, in kernel state `state`; `command` is its argv
     /// where the platform lets it be read.
@@ -2307,6 +2307,247 @@ pub async fn run_as_job(
         }
     };
     output
+}
+
+/// Describe a background project-tool command in the workspace's own shell.
+pub fn project_tool_request(mount: &Path, cwd: &Path, argv: Vec<OsString>) -> Result<ExecRequest> {
+    let relative = cwd.strip_prefix(mount).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "project tool directory {} is outside {}: {error}",
+                cwd.display(),
+                mount.display()
+            ),
+            "run the tool in its workspace",
+        )
+    })?;
+    let cwd = if relative.as_os_str().is_empty() {
+        None
+    } else {
+        Some(WorkspacePath::new(relative).map_err(|error| {
+            CowshedError::integrity(error.to_string(), "run the tool in its workspace")
+        })?)
+    };
+    Ok(ExecRequest {
+        command: ExecCommand::Argv(argv.into_iter().map(CommandArg::new).collect()),
+        cwd,
+        mode: crate::api::dto::RunSandboxMode::ReadWrite,
+        env: std::collections::HashMap::new(),
+        trace: None,
+        stdin: StdinSource::Empty,
+        stdout_copy: None,
+        stderr_copy: None,
+        admission_key: None,
+        class: ExecClass::Background,
+        want: Some(std::num::NonZeroUsize::MIN),
+        scope: ExecScope::Workspace,
+    })
+}
+
+/// Admission completes even if its waiter is dropped, so the existing socket hold is
+/// acquired and then closed rather than leaving an admitted job without its requester.
+async fn admit_held_tool(
+    handle: &WorkspaceSupervisorHandle,
+    socket: &Path,
+    build_volume: Option<PathBuf>,
+    request: ExecRequest,
+) -> Result<(JobId, super::supervisor_socket::JobHold)> {
+    let handle = handle.clone();
+    let incarnation = handle.snapshot().workspace_incarnation.clone();
+    let socket = socket.to_owned();
+    let (reply, receive) = oneshot::channel();
+    tokio::spawn(async move {
+        let admitted = async {
+            let job = handle
+                .exec(None, build_volume, request, AdmissionSource::Coordinator)
+                .await?;
+            match super::supervisor_socket::hold(&socket, &incarnation, job).await {
+                Ok(hold) => Ok((job, hold)),
+                Err(error) => {
+                    let ended = end_supervised_tool(&handle, job).await;
+                    Err(error.reworded(|message| {
+                        format!("{message}; ending unheld project tool job {job:?}: {ended:?}")
+                    }))
+                }
+            }
+        }
+        .await;
+        // An unsent successful result drops JobHold, whose socket EOF ends the job.
+        if let Err(Err(error)) = reply.send(admitted) {
+            cowshed_os::eprintln!(
+                "cowshed: project tool admission failed after its requester left: {error}"
+            );
+        }
+    });
+    receive.await.map_err(|error| {
+        CowshedError::environment_missing(
+            format!("project tool admission did not answer: {error}"),
+            "inspect the workspace supervisor",
+        )
+    })?
+}
+
+async fn end_supervised_tool(handle: &WorkspaceSupervisorHandle, job: JobId) -> Result<()> {
+    match tokio::time::timeout(
+        cowshed_os::deadline::REAP.within,
+        super::supervisor_socket::kill_unheld(handle, job),
+    )
+    .await
+    {
+        Ok(ended) => ended,
+        Err(error) => Err(CowshedError::environment_missing(
+            format!(
+                "TIMEOUT ending project tool job {job:?} within the reap bound: {error}; the supervisor retains the job"
+            ),
+            "inspect the job's retained processes and retirement error",
+        )),
+    }
+}
+
+/// Run a project tool in the workspace's canonical supervisor and activated shell.
+/// The existing socket hold binds the admitted job to this future and process lifetime.
+/// The tool's silence budget starts when its command has a pid, not during shared activation.
+pub async fn run_in_supervisor(
+    handle: &WorkspaceSupervisorHandle,
+    socket: &Path,
+    build_volume: Option<PathBuf>,
+    request: ExecRequest,
+    control: RunControl<'_>,
+) -> Result<std::process::Output> {
+    let RunControl {
+        silence,
+        mut queued,
+        mut cancelled,
+        observed,
+    } = control;
+    let (job, hold) = admit_held_tool(handle, socket, build_volume, request).await?;
+    let tick = (silence / 10).clamp(Duration::from_millis(1), Duration::from_millis(250));
+    let completed = async {
+        let waited = handle.wait(job);
+        tokio::pin!(waited);
+        let mut last_progress = tokio::time::Instant::now();
+        let mut last_pid = None;
+        let mut last_bytes = 0;
+        let mut last_cpu = None;
+        let mut cpu_read = false;
+        loop {
+            tokio::select! {
+                biased;
+                info = &mut waited => return info,
+                _ = &mut cancelled => return Err(CowshedError::conflict(
+                    format!("project tool job {job:?} was cancelled: its caller is gone"),
+                    "retry the command",
+                )),
+                _ = tokio::time::sleep(tick) => {
+                    let info = handle.info(job).await?;
+                    let Some(pid) = info.pid else { continue };
+                    let pid = i32::try_from(pid).map_err(|error| CowshedError::integrity(
+                        format!("project tool job {job:?} has an invalid pid: {error}"), "inspect the job",
+                    ))?;
+                    observed.spawned(pid);
+                    let bytes = info.stdout.bytes + info.stderr.bytes;
+                    if last_pid != Some(pid) || bytes > last_bytes {
+                        last_pid = Some(pid);
+                        last_bytes = bytes;
+                        last_cpu = None;
+                        cpu_read = false;
+                        last_progress = tokio::time::Instant::now();
+                        continue;
+                    }
+                    let within_silence = last_progress.elapsed() < silence;
+                    if within_silence && cpu_read { continue }
+                    let cpu = match handle.resources(job).await {
+                        Ok(sample) => {
+                            let cpu = sample.accounting.cpu();
+                            Some(cpu.user_us.get() + cpu.sys_us.get())
+                        }
+                        Err(error) => {
+                            cowshed_os::eprintln!("cowshed: project tool job {job:?}: CPU accounting unavailable: {error}");
+                            None
+                        }
+                    };
+                    cpu_read = true;
+                    if within_silence {
+                        last_cpu = cpu;
+                        continue;
+                    }
+                    match cowshed_os::deadline::at_silence(last_cpu, cpu, queued()) {
+                        cowshed_os::deadline::AtSilence::Worked => {}
+                        cowshed_os::deadline::AtSilence::Queued(holder) => cowshed_os::eprintln!(
+                            "cowshed: project tool job {job:?} pid {pid} waits in line behind {holder}"
+                        ),
+                        cowshed_os::deadline::AtSilence::Silent => return Err(CowshedError::environment_missing(
+                            format!("project tool job {job:?}: SILENT: pid {pid} wrote {bytes} bytes and then no output, CPU or live holder for {silence:?}; inspect the job's retained processes and stderr"),
+                            "the named command stopped making progress: inspect the job before retrying",
+                        )),
+                    }
+                    last_cpu = cpu.or(last_cpu);
+                    last_progress = tokio::time::Instant::now();
+                }
+            }
+        }
+    }.await;
+    let info = match completed {
+        Ok(info) => info,
+        Err(error) => {
+            let ended = end_supervised_tool(handle, job).await;
+            return Err(match ended {
+                Ok(()) => error,
+                Err(ending) => error.reworded(|message| {
+                    format!("{message}; ending project tool job {job:?}: {ending}")
+                }),
+            });
+        }
+    };
+    let stdout = read_job_stream(handle, job, StreamKind::Stdout).await?;
+    let stderr = read_job_stream(handle, job, StreamKind::Stderr).await?;
+    let raw = match info.exit {
+        Some(ExitStatus::Exited { code }) => code << 8,
+        Some(ExitStatus::Signaled {
+            signal,
+            core_dumped,
+        }) => signal | if core_dumped { 0x80 } else { 0 },
+        None => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "project tool job {job:?} ended without an exit ({:?}): {}",
+                    info.failure,
+                    String::from_utf8_lossy(&stderr)
+                ),
+                "inspect the job's retained failure",
+            ));
+        }
+    };
+    drop(hold);
+    Ok(std::process::Output {
+        status: std::process::ExitStatus::from_raw(raw),
+        stdout,
+        stderr,
+    })
+}
+
+pub(super) async fn read_job_stream(
+    handle: &WorkspaceSupervisorHandle,
+    job: JobId,
+    stream: StreamKind,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut offset = 0;
+    loop {
+        let chunk = handle
+            .log_read(job, stream, offset, false)
+            .await
+            .map_err(|error| {
+                error.reworded(|message| {
+                    format!("job {job:?} {stream:?} at byte {offset}: {message}")
+                })
+            })?;
+        output.extend_from_slice(&chunk.bytes);
+        offset = chunk.next_offset;
+        if chunk.eof {
+            return Ok(output);
+        }
+    }
 }
 
 /// Prepare the workspace's private environment host-side and describe the child environment.

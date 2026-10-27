@@ -329,6 +329,14 @@ supervisor that lives only as long as a short-lived controller process keeps no 
 spare's activation asks for nothing and runs at the supervisor's own nice, as every warm host does; a failed activation
 is like any other: there is no spare, and the next command activates for itself.
 
+Cold activation is single-flight per workspace, across demand hosts, spares and controller tools. A host waiting on
+another host's evaluation reports that wait and can be cancelled without ending the producer. Once the producer
+publishes the activation record, waiters verify and adopt it. Only cold activation is serialized; executing commands and
+the pool actor's state are not locked. Build-state discovery submits its Cargo through this canonical supervisor, never
+through an independent direnv activation. Its existing 15 s command-silence bound begins when Cargo starts, not while
+its host waits for shared activation. The caller owns the tool job through the existing socket hold; cancellation or a
+dropped caller ends that job, not another job's evaluation.
+
 **Activation belongs to the job that waited on it.** A command that activates a host receives the activation's output on
 its own stdout and stderr, and until its command starts that host's process group is the job's: a kill reaches the
 activation, and a failed activation fails the job with the activation's status and discards the host. A warm command's
@@ -1363,6 +1371,6 @@ read. JobAdmission.env is the public plaintext projection only for every scope; 
 including after restart. Records retain typed cpuAdmission/priority/memory failures. Earlier histories are retained
 untouched and set aside. Per 07_api.md Keyed admission, existing incarnations must be renewed before new keyed exec:
 unverifiable historical keys are refused as unprovable, never migrated into an attestation they did not record. Unkeyed
-operator CLI exec remains available. Controller-only discovery runs locate-project/metadata --no-deps --offline under
-its ordinary child sandbox outside job admission, retaining the explicit noncompiling exemption rather than claiming a
-jobserver or recorded nice.
+operator CLI exec remains available. Controller-only discovery runs locate-project/metadata --no-deps --offline as
+background jobs in the canonical workspace supervisor, sharing its activated shell and ordinary job placement; it never
+starts a second one-shot shell outside job admission.

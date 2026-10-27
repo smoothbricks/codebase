@@ -6735,6 +6735,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // A volume under an exclusive claim refuses here, before discovery's shell
             // activation is paid for an answer the refusal would discard.
             volumes.probe_admissible(&name, mount)?;
+            let supervisor = self.ensure_supervisor(&name).await?;
+            let socket = super::supervisor_socket::socket_path(
+                self.descriptor.storage.store(),
+                &self.descriptor.repo_id,
+                &name,
+            );
+            let build_volume = volumes.layout.grant(&name, mount)?;
             let main_mount = self.workspace_mount_path(&main_name())?;
             let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
             let sandbox = supervisor_sandbox(
@@ -6751,12 +6758,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             let (cancel_discovery, discovery_cancelled) = tokio::sync::oneshot::channel::<()>();
             let discovery = {
                 let mount = mount.to_owned();
-                let incarnation = current.derived.workspace.incarnation().clone();
                 let runtime = tokio::runtime::Handle::current();
                 crate::storage::lifecycle::dispatch_blocking(move || {
                     let mut cargo = crate::capabilities::JobCargo::new(
                         &sandbox,
-                        &incarnation,
+                        &supervisor,
+                        &socket,
+                        build_volume,
                         runtime,
                         discovery_cancelled,
                     );
@@ -21398,20 +21406,13 @@ async fn read_job_stdout(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     job: JobId,
 ) -> std::result::Result<Vec<u8>, String> {
-    use crate::storage::job_artifact::StreamKind;
-    let mut stdout = Vec::new();
-    let mut offset = 0_u64;
-    loop {
-        let chunk = handle
-            .log_read(job, StreamKind::Stdout, offset, false)
-            .await
-            .map_err(|error| format!("at byte {offset}: {error}"))?;
-        stdout.extend_from_slice(&chunk.bytes);
-        offset = chunk.next_offset;
-        if chunk.eof {
-            return Ok(stdout);
-        }
-    }
+    super::supervisor::read_job_stream(
+        handle,
+        job,
+        crate::storage::job_artifact::StreamKind::Stdout,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// The one `node -` job that runs `script` in the Nx root `root` of the workspace mounted at

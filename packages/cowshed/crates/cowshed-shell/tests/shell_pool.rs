@@ -2105,3 +2105,303 @@ async fn host_controller_worker_custom_environment_runs_but_is_absent_from_admis
             .any(|part| part == b"authored-custom-value")
     );
 }
+
+async fn activation_queued(handle: &WorkspaceSupervisorHandle, job: JobId) -> bool {
+    let marker = b"cowshed: waiting for this workspace's shell evaluation";
+    let mut stderr = Vec::new();
+    let mut offset = 0;
+    loop {
+        let chunk = handle
+            .log_read(job, StreamKind::Stderr, offset, true)
+            .await
+            .expect("activation diagnostics");
+        stderr.extend_from_slice(&chunk.bytes);
+        offset = chunk.next_offset;
+        if stderr.windows(marker.len()).any(|part| part == marker) {
+            return true;
+        }
+        if chunk.eof {
+            return false;
+        }
+    }
+}
+
+/// Discovery and an ordinary command enter one canonical shell, with one real evaluation.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_cargo_discovery_shares_the_canonical_activation() {
+    use cowshed_core::capabilities::{BuildStatePath, JobCargo, discover_build_state};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let workspace = Workspace::new("shell-discovery-shared", 41_616);
+    let mount = workspace.mount();
+    let tmp = &workspace.sandbox.exec_temp_dir;
+    for name in ["evaluation-ready", "evaluation-release"] {
+        fifo(&tmp.join(name));
+    }
+    std::fs::write(
+        mount.join(".cowshed/bin/cargo"),
+        "#!/bin/sh\necho 'bootstrap cargo is not the project toolchain' >&2\nexit 101\n",
+    )
+    .expect("bootstrap cargo");
+    std::fs::set_permissions(
+        mount.join(".cowshed/bin/cargo"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("executable bootstrap cargo");
+    let real_cargo =
+        std::fs::canonicalize(std::env::var_os("CARGO").expect("Cargo publishes its driver"))
+            .expect("real Cargo driver");
+    std::fs::create_dir(mount.join("toolchain")).expect("toolchain directory");
+    std::os::unix::fs::symlink(real_cargo, mount.join("toolchain/cargo")).expect("project cargo");
+    workspace.envrc(
+        r#"if [ ! -e "$TMPDIR/evaluation-entered" ]; then
+  : > "$TMPDIR/evaluation-entered"
+  printf '%s\n' $$ > "$TMPDIR/evaluation-ready"
+  read _ < "$TMPDIR/evaluation-release"
+fi
+PATH_add "$PWD/toolchain"
+"#,
+    );
+    std::fs::write(
+        mount.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::create_dir(mount.join("src")).expect("source directory");
+    std::fs::write(mount.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").expect("library");
+    for args in [&["init", "--quiet"][..], &["add", "Cargo.toml"]] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(mount)
+            .output_bounded()
+            .expect("fixture git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let handle = workspace.supervisor(true);
+    let (server, socket) = FixtureServer::start(handle.clone()).await;
+    let sandbox = workspace.sandbox.clone();
+    let canonical = handle.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let (_cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let mut discovery = tokio::task::spawn_blocking(move || {
+        let mut cargo = JobCargo::new(&sandbox, &canonical, &socket, None, runtime, cancelled);
+        sandbox.with_detection_context(&sandbox.workspace_mount, |context| {
+            discover_build_state(context, &mut cargo)
+        })
+    });
+    let ready = tmp.join("evaluation-ready");
+    tokio::select! {
+        _ = read_pid(&ready) => {},
+        ended = &mut discovery => panic!("discovery ended before activation readiness: {ended:?}"),
+    }
+    let normal = handle
+        .exec(
+            None,
+            None,
+            sh("printf canonical"),
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("ordinary command");
+    let queued = activation_queued(&handle, normal).await;
+    release(&tmp.join("evaluation-release")).await;
+    let discovered = discovery.await.expect("discovery task").expect("discovery");
+    let normal = handle.wait(normal).await.expect("ordinary command ends");
+    drop(server);
+    assert_eq!(
+        normal.exit,
+        Some(ExitStatus::Exited { code: 0 }),
+        "{normal:?}"
+    );
+    assert!(
+        queued,
+        "the second cold host evaluated instead of waiting for canonical publication"
+    );
+    assert!(discovered.findings.is_empty(), "{:?}", discovered.findings);
+    assert_eq!(
+        discovered.paths,
+        [BuildStatePath::new("target", "target").expect("target path")]
+    );
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "discovery, ordinary work and the spare share one evaluation"
+    );
+}
+
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_cancelling_a_waiting_activation_keeps_its_producer_alive() {
+    let workspace = Workspace::new("shell-activation-wait-cancel", 41_632);
+    let tmp = &workspace.sandbox.exec_temp_dir;
+    for name in ["producer-ready", "producer-release"] {
+        fifo(&tmp.join(name));
+    }
+    workspace.envrc(
+        r#"if [ ! -e "$TMPDIR/producer-entered" ]; then
+  : > "$TMPDIR/producer-entered"
+  printf '%s\n' $$ > "$TMPDIR/producer-ready"
+  read _ < "$TMPDIR/producer-release"
+fi
+export FROM_ENVRC=shared
+"#,
+    );
+    let handle = workspace.supervisor(false);
+    let producer = handle
+        .exec(
+            None,
+            None,
+            sh("printf producer"),
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("producer job");
+    read_pid(&tmp.join("producer-ready")).await;
+    let waiter = handle
+        .exec(
+            None,
+            None,
+            sh("printf waiter"),
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("waiting job");
+    let queued = activation_queued(&handle, waiter).await;
+    let killed = handle.kill(waiter).await;
+    let cancelled = handle
+        .wait(waiter)
+        .await
+        .expect("waiter retires while producer is held");
+    release(&tmp.join("producer-release")).await;
+    let produced = handle.wait(producer).await.expect("producer ends");
+    killed.expect("cancel waiter");
+    assert!(
+        queued,
+        "the waiter must observe the shared evaluation before cancellation"
+    );
+    assert_eq!(cancelled.state, JobState::Killed, "{cancelled:?}");
+    assert_eq!(
+        produced.exit,
+        Some(ExitStatus::Exited { code: 0 }),
+        "{produced:?}"
+    );
+    assert_eq!(
+        run(&handle, sh("printf %s \"$FROM_ENVRC\""))
+            .await
+            .ok()
+            .stdout,
+        "shared"
+    );
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "cancelling a waiter neither cancels nor repeats its producer"
+    );
+}
+
+struct FixtureServer {
+    task: tokio::task::JoinHandle<Result<()>>,
+    _root: LedgerRoot,
+}
+
+impl FixtureServer {
+    async fn start(handle: WorkspaceSupervisorHandle) -> (Self, PathBuf) {
+        // bind publishes through a 32-hex staging name, so keep its parent short too.
+        let parent = std::fs::canonicalize("/tmp").expect("canonical socket parent");
+        let root = LedgerRoot(parent.join(format!("cs-{}", uuid::Uuid::new_v4().simple())));
+        std::fs::create_dir(&root.0).expect("private socket directory");
+        let socket = root.0.join("s");
+        let listener = cowshed_core::runtime::supervisor_socket::bind(&socket)
+            .await
+            .expect("canonical socket");
+        let task = tokio::spawn(cowshed_core::runtime::supervisor_socket::serve(
+            listener, handle, None, None,
+        ));
+        (Self { task, _root: root }, socket)
+    }
+}
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A dropped capture owns a real socket hold, so the canonical job ends with its requester.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_dropped_project_tool_future_ends_its_canonical_job() {
+    use cowshed_core::runtime::supervisor::{
+        JobRunState, RunControl, project_tool_request, run_in_supervisor,
+    };
+    let workspace = Workspace::new("shell-tool-drop", 41_648);
+    let tmp = &workspace.sandbox.exec_temp_dir;
+    for name in ["tool-ready", "tool-hold"] {
+        fifo(&tmp.join(name));
+    }
+    workspace.envrc("");
+    let handle = workspace.supervisor(false);
+    let (server, socket) = FixtureServer::start(handle.clone()).await;
+    let request = project_tool_request(
+        workspace.mount(),
+        workspace.mount(),
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s\\n' $$ > \"$TMPDIR/tool-ready\"; read _ < \"$TMPDIR/tool-hold\"".into(),
+        ],
+    )
+    .expect("tool request");
+    let canonical = handle.clone();
+    let owned = tokio::spawn(async move {
+        let observed = JobRunState::default();
+        let (keep_alive, cancelled) = tokio::sync::oneshot::channel();
+        let output = run_in_supervisor(
+            &canonical,
+            &socket,
+            None,
+            request,
+            RunControl {
+                silence: cowshed_os::deadline::HEARTBEAT_SILENCE,
+                queued: Box::new(|| None),
+                cancelled,
+                observed: &observed,
+            },
+        )
+        .await;
+        drop(keep_alive);
+        output
+    });
+    let pid = read_pid(&tmp.join("tool-ready")).await;
+    let exited = ExitWatch::of(u32::try_from(pid).expect("tool pid"))
+        .expect("observe tool exit")
+        .expect("tool is held alive");
+    let job = handle
+        .list()
+        .await
+        .expect("canonical job list")
+        .into_iter()
+        .next()
+        .expect("admitted tool")
+        .job_id;
+    owned.abort();
+    assert!(
+        owned
+            .await
+            .expect_err("capture task was dropped")
+            .is_cancelled()
+    );
+    let ended = handle.wait(job).await.expect("socket EOF retires the tool");
+    assert_eq!(ended.state, JobState::Killed, "{ended:?}");
+    assert!(
+        exited
+            .within(Duration::ZERO)
+            .expect("read the retained exit")
+    );
+    drop(server);
+}

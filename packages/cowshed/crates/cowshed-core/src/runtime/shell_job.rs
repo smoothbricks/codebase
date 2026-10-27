@@ -96,6 +96,8 @@ fn pool_key(
 pub(super) struct WorkspaceShells {
     program: ShellHostProgram,
     config: ShellPoolConfig,
+    /// Cold hosts share publication, not command execution or mutable shell state.
+    activation: Arc<tokio::sync::Mutex<()>>,
     /// Keyed by (read-only, `.envrc` directory or none); a changed identity replaces the pool,
     /// whose idle hosts end with it and whose executing hosts are not returned.
     pools: BTreeMap<(bool, Option<PathBuf>), (Sha256Digest, ShellPool<HostActivator>)>,
@@ -137,6 +139,7 @@ impl WorkspaceShells {
         Self {
             program,
             config,
+            activation: Arc::new(tokio::sync::Mutex::new(())),
             pools: BTreeMap::new(),
         }
     }
@@ -167,6 +170,7 @@ impl WorkspaceShells {
                         environment: base,
                         grants: spawn.grants.clone(),
                         envrc_directory: spawn.envrc_directory.clone(),
+                        activation: Arc::clone(&self.activation),
                     }),
                     self.config,
                 );
@@ -1208,6 +1212,7 @@ pub(super) struct HostActivator {
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
     envrc_directory: Option<PathBuf>,
+    activation: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HostActivator {
@@ -1315,6 +1320,29 @@ impl HostActivator {
                 after: Snapshot::default(),
                 contents: Some(Default::default()),
             }));
+        };
+        // The first cold host publishes the existing activation record. Other hosts then
+        // verify and adopt that record instead of evaluating the same inputs concurrently.
+        let _activation = match self.activation.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                report_on(
+                    &stderr,
+                    "cowshed: waiting for this workspace's shell evaluation",
+                );
+                tokio::select! {
+                    guard = self.activation.lock() => guard,
+                    ended = host.fence.exited() => {
+                        return HostActivation::Broken(match ended {
+                            Ok(_) => CowshedError::conflict(
+                                "the exec host ended while waiting for the workspace shell evaluation",
+                                "retry the command",
+                            ),
+                            Err(error) => error,
+                        });
+                    }
+                }
+            }
         };
         // A clone carries its origin's verified export (11_shell.md, "Shell activation and
         // process reuse"). Proving it for this checkout reads every recorded input once; a miss

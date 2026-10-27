@@ -278,20 +278,19 @@ pub trait CargoRunner {
     fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<Vec<CargoAnswer>>;
 }
 
-/// Discovery's Cargo, run the way the workspace's jobs run it
-/// ([`crate::runtime::supervisor::run_as_job`]): inside the sandbox, after the workspace shell's
-/// activation, so a checkout whose toolchain comes from its dev environment is asked with that
-/// toolchain and not whatever the bootstrap PATH holds. One job per workspace shell that a
-/// batch's directories select answers the whole batch, so a batch pays one activation per
-/// shell rather than one per manifest.
+/// Discovery's Cargo runs in the workspace's canonical supervisor and activated shell.
+/// It shares cold activation and the published export with ordinary jobs and the spare,
+/// using the workspace's toolchain rather than the bootstrap PATH. One job per selected
+/// workspace shell answers the whole batch.
 ///
-/// Runs off the async runtime (the blocking pool): each job is awaited on `runtime`.
-/// `cancelled` resolves when the caller that asked for discovery is gone -- its sender
-/// dropped with the interrupted command -- and ends the batch's job the same way
-/// [`run_as_job`] ends it, so no activation tree outlives that caller.
+/// Runs off the async runtime (the blocking pool): each job is awaited on runtime.
+/// Cancellation ends its held canonical job; the tool's silence bound starts only once
+/// the command starts, never while it waits for shared shell activation.
 pub struct JobCargo<'a> {
     sandbox: &'a crate::sandbox::SandboxConfig,
-    incarnation: &'a crate::metadata::WorkspaceIncarnation,
+    supervisor: &'a crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    socket: &'a Path,
+    build_volume: Option<PathBuf>,
     runtime: tokio::runtime::Handle,
     cancelled: tokio::sync::oneshot::Receiver<()>,
 }
@@ -299,13 +298,17 @@ pub struct JobCargo<'a> {
 impl<'a> JobCargo<'a> {
     pub fn new(
         sandbox: &'a crate::sandbox::SandboxConfig,
-        incarnation: &'a crate::metadata::WorkspaceIncarnation,
+        supervisor: &'a crate::runtime::supervisor::WorkspaceSupervisorHandle,
+        socket: &'a Path,
+        build_volume: Option<PathBuf>,
         runtime: tokio::runtime::Handle,
         cancelled: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
         Self {
             sandbox,
-            incarnation,
+            supervisor,
+            socket,
+            build_volume,
             runtime,
             cancelled,
         }
@@ -346,11 +349,16 @@ impl CargoRunner for JobCargo<'_> {
             let (job_cancel, job_cancelled) = tokio::sync::oneshot::channel::<()>();
             let mut job_cancel = Some(job_cancel);
             let observed = crate::runtime::supervisor::JobRunState::default();
-            let job = crate::runtime::supervisor::run_as_job(
-                self.sandbox,
-                self.incarnation,
+            let request = crate::runtime::supervisor::project_tool_request(
+                &self.sandbox.workspace_mount,
                 directory,
                 driver_argv(args, &batch),
+            )?;
+            let job = crate::runtime::supervisor::run_in_supervisor(
+                self.supervisor,
+                self.socket,
+                self.build_volume.clone(),
+                request,
                 crate::runtime::supervisor::RunControl {
                     silence: cowshed_os::deadline::HEARTBEAT_SILENCE,
                     // Discovery's Cargo waits behind no holder: measured, neither
@@ -416,8 +424,8 @@ impl CargoRunner for JobCargo<'_> {
 const WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What a discovery job that has not answered says about its wait: how long, which Cargo
-/// question, and the phase the job itself was observed in -- still preparing its sandbox
-/// environment, or running as a named process in a named kernel state. Nothing else: a
+/// question, and the phase the command itself was observed in -- not started yet,
+/// or running as a named process in a named kernel state. Nothing else: a
 /// cause inferred from other processes (who happened to hold some file at the first
 /// report) is a guess, and a printed guess is read as fact.
 fn wait_report(
@@ -429,7 +437,7 @@ fn wait_report(
 ) -> String {
     let phase = match observed {
         ObservedRun::Preparing => {
-            "the job is still preparing its sandbox environment; no process has started".to_owned()
+            "the command has not started; preparing its sandbox environment or waiting for its workspace shell".to_owned()
         }
         ObservedRun::Running {
             pid,
@@ -1274,7 +1282,7 @@ mod tests {
             ObservedRun::Preparing,
         );
         assert!(
-            preparing.contains("still preparing its sandbox environment"),
+            preparing.contains("the command has not started"),
             "{preparing}"
         );
         let running = wait_report(
