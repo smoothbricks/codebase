@@ -15,8 +15,7 @@ type that runs at parity with the host's own processes (PRI 31). The type is the
 descendant, and a descendant cannot leave it; the daemon's supervisor manager starts every workspace supervisor, which
 starts every shell host and job. Background runs them at priority 4 and Standard at priority 20 (the utility band), and
 both throttle their I/O behind the host's. Under either clamp a loaded host delays a fresh workspace's supervisor, its
-first `direnv export json` and cold index reads many times over their unclamped cost. The sccache LaunchAgent is
-Interactive for the same reason (launchd.rs `PROCESS_TYPE`).
+first `direnv export json` and cold index reads many times over their unclamped cost.
 
 The gateway's generated plist sets `SoftResourceLimits.NumberOfFiles` to the finite kernel-sized value `245760` and
 `HardResourceLimits.NumberOfFiles` to Darwin's `RLIM_INFINITY`. A finite soft limit keeps `sysconf(_SC_OPEN_MAX)` useful
@@ -127,11 +126,10 @@ reaches it after a reboot whatever volume the build came from (a workspace image
 | `cowshed-gateway-host`   | The program launchd runs for the gateway: a copy of the build, signed ("The gateway host").    |
 
 `cowshed-source`, one level up beside `bin`, records the path the current install came from and its package version.
-`install.lock`, beside it, is the install slot's lock (below); it is never removed. Nothing in `bin` answers to `cargo`
-("Cargo reads its holder's jobserver"). Earlier installs planted a `cargo` link there, saying the stable name or a
-stored copy; every install removes it before it changes anything else, so `cargo` on a `PATH` that leads with `bin` is
-the toolchain's own. A `cargo` there that no install planted — a file, a foreign owner's, a link saying anything else —
-is refused by name and left untouched.
+`install.lock`, beside it, is the install slot's lock (below); it is never removed. Nothing in cowshed's installed `bin`
+answers to `cargo`: the project shell owns Cargo routing (11_shell.md, "Canonical mbx environment"). An install removes
+only a `cargo` link owned by cowshed, one naming the stable cowshed or a stored cowshed copy. A foreign file or link
+there is refused by name and left untouched.
 
 **The Nx cache server is JavaScript run by the shell's `bun`** (the owner's rulings, 2026-10-17 and 2026-10-18). Neither
 `@smoothbricks/cowshed` nor `@smoothbricks/nx-cache-server` ships a compiled server or an interpreter. An install copies
@@ -266,15 +264,14 @@ would restart a gateway that answers `status` — refuses with `Conflict`, namin
 repository's turn (the first ticket of its queue as that gateway lists it, "Land turns": its workspace, ticket and pid).
 It never waits for them. The refused install copies, moves and restarts nothing, so the installed cowshed and the
 running gateway stay as they were; `setup`'s storage repair, which runs before its install (setup_service order:
-volumes, owner markers, mains, git identity, sccache client, then the service refresh), stays done. The hint is to rerun
-once the land has ended, and `cowshed gateway status` lists the turns. A land queued behind the turn's holder runs
-nothing yet and is not a blocker: its first command waits for the slot. The land turns are that gateway's own state,
-gone with it: one that does not answer `land-turns`, a build from before them, names no land turn, and the install says
-so. A gate job that is no land's — a train's proof, an operator's run — is no blocker: it lives in its workspace
-supervisor, which a gateway restart leaves running. An install that restarts nothing (no daemon answers, or the refresh
-finds the agent current) checks nothing. This replaces a wait with no deadline for the gates in flight: measured
-2026-10-21, it held an install behind a gate of 2 h 26 min until the gate was killed, and operators took to granting
-installs a window by hand.
+volumes, owner markers, mains, git identity, then the service refresh), stays done. The hint is to rerun once the land
+has ended, and `cowshed gateway status` lists the turns. A land queued behind the turn's holder runs nothing yet and is
+not a blocker: its first command waits for the slot. The land turns are that gateway's own state, gone with it: one that
+does not answer `land-turns`, a build from before them, names no land turn, and the install says so. A gate job that is
+no land's — a train's proof, an operator's run — is no blocker: it lives in its workspace supervisor, which a gateway
+restart leaves running. An install that restarts nothing (no daemon answers, or the refresh finds the agent current)
+checks nothing. This replaces a wait with no deadline for the gates in flight: measured 2026-10-21, it held an install
+behind a gate of 2 h 26 min until the gate was killed, and operators took to granting installs a window by hand.
 
 **A land step waits for an install in progress.** A land is several cowshed commands with none running between them:
 measured 2026-10-20, an install found no gate running as a land's first gate ended and restarted the gateway as its host
@@ -911,12 +908,13 @@ the handshake bound.
   actor stopped answering, writes no heartbeat and fails `SILENT`, naming its socket and pid. A heartbeat about a job
   that is running or draining with no process of its group left is not progress. If that state persists for the silence
   bound, the wait fails `SILENT`, naming the job as stuck between its last process and its end. A queued job is
-  progress, because a background start waits out memory pressure with no deadline (Host scheduling, "Memory pressure").
-- **CPU-pool admission has its own policy.** Connecting and writing the complete request share the 5 s control bound.
-  After the write completes, the client keeps its connection open and reads the queue acknowledgement and grant under
-  the 15 s heartbeat-silence bound, never a total queue-age bound. A valid queued answer arriving after 2 s is still
-  accepted: the disk lease's 2 s half-close probes a gateway predating that protocol and has no place in CPU admission.
-  While requests wait for tokens, the pool actor writes `{"ok":true,"progress":n}` every 5 s. Only an advancing positive
+  progress: resource admission has no total queue-age deadline ("Host scheduling").
+- **Cowshed CPU-pool admission has its own policy when that pool is used.** This is the existing non-mbx protocol, not a
+  protocol imposed on mbx. Connecting and writing the complete request share the 5 s control bound. After the write
+  completes, the client keeps its connection open and reads the queue acknowledgement and grant under the 15 s
+  heartbeat-silence bound, never a total queue-age bound. A valid queued answer arriving after 2 s is still accepted:
+  the disk lease's 2 s half-close probes a gateway predating that protocol and has no place in CPU admission. While
+  requests wait for tokens, the pool actor writes `{"ok":true,"progress":n}` every 5 s. Only an advancing positive
   sequence renews silence, as does the queued acknowledgement. The heartbeat runs on the same event loop that admits and
   grants, not an independent liveness thread. A queue that keeps heartbeating waits until a token returns; a silent
   actor fails admission as `SILENT`, naming the socket, bound, elapsed wait and last progress. Expiry ends only this
@@ -1288,29 +1286,47 @@ detaches it.
 
 ## Host scheduling
 
-The kernel schedules CPU time, memory reclaim and I/O among every runnable thread on the host, and cowshed never decides
-whether runnable work runs. An admitted job spawns at once under its class ("Classes"), which the supervisor turns into
-the kernel's own scheduling parameters, and from then on the kernel arbitrates. Cowshed bounds only what a kernel cannot
-take back or cannot see as one unit: the parallelism one build tree hands the kernel ("Parallelism inside a job"), a
-background start while the host's memory is under pressure ("Memory pressure"), image release one cut at a time
-("Deleting released images"), and one land per repository at a time ("Land turns"). There is no host CPU token, grant,
-floor, top-up, probation or quiet window, and the gateway counts none.
+The kernel schedules runnable threads and their I/O. Resource admission has one authority: with mbx present on the host,
+mbx's machine-wide pool is the CPU and measured-memory ledger; without it, cowshed's existing mechanism is unchanged:
+per-job jobservers and the Nx/bounded-exec cpu-pool, not a host token ledger. Class placement still tells the kernel
+whose runnable threads take precedence ("Classes"). The owner's ruling, 2026-10-27, selects this boundary.
 
-**Why the kernel and not a ledger.** Until 2026-10-26 the gateway held one budget of N CPU tokens for the host, and a
-runner held its grant from its start to its exit. That is a slot reservation doing a proportional-share scheduler's
-work, and it failed as reservations fail: a token held by a thread blocked in `read(2)` or waiting on a child is a core
-nobody can use, and only the kernel knows which threads are runnable.
+### Pool selection and revision
 
-- 2026-10-19 (f5cff758e8): a background `cargo nextest run` granted 17 of 18 tokens sat at 0% CPU for 50 minutes while a
-  land's gate ran on its one token for over 35 minutes against a usual 10 to 20.
-- 2026-10-22 (fa47c27313): with no gate running and background capped at 9 of 18 tokens, one job held all 9, three other
-  sheds waited, and the other 9 tokens idled.
-- 2026-10-26 (9752d00c7d): one gate job held 1 token and asked nothing more while 17 background asks queued and 9 of 18
-  tokens sat free, a bug in the ledger's own floor rule.
-- 2026-10-26: a nextest run held 9 tokens at 0% CPU for 12 minutes while its tests' children waited at the host's queue.
+**Present on the host** means the mbx installed with the running cowshed build is available at that build's pinned git
+revision (14_nix.md, "mbx"). An arbitrary `mbx` on the operator's PATH does not select the host scheduler. An installed
+mbx that cannot be executed or whose revision cannot be proven is an admission failure, not absence. With no installed
+host mbx, the non-mbx behavior below applies unchanged.
 
-A kernel's priority is work-conserving: a sleeping thread costs nothing, and a runnable one takes an idle core at once.
-Every failure above is one the ledger made and the kernel cannot.
+A Cargo project whose canonical environment resolves mbx while the host installation is absent refuses job admission as
+`mbx-host-missing`, naming that resolved executable and the remedy `cowshed setup`. Doctor reports the same finding.
+Running that Cargo pool beside the non-mbx mechanism would violate the single-ledger boundary.
+
+The one pool is the pool of the shared store (03_caches.md, "mbx"). All Cargo sessions and external reservations use the
+same cache directory and the same host CPU/memory settings, not per-project or per-job copies. mbx owns that pool's
+lifecycle; cowshed starts no pool daemon and keeps no second resource ledger. One pool preserves single-flight:
+identical compilations in different sheds wait for one producer and restore its result, rather than compile twice. mbx
+documents both the pool and in-flight registry as cache-directory scoped
+([Machine-wide scheduling](https://mr-boxington.jdx.dev/how-it-works#machine-wide-scheduling)).
+
+The installed mbx's host-global settings retain memory scheduling. `scheduler.memory = "none"` is the typed host finding
+`mbx-memory-unscheduled`: doctor reports it and mbx-mode admission refuses with the remedy to set a memory budget. It
+never selects a CPU-only pool or cowshed fallback, because that would discard the measured-memory ledger.
+
+A Cargo project's mbx capability resolves its executable in the canonical job environment (15_capabilities.md, "mbx
+detection"). The proof of the pin is executable identity: its realpath must equal the realpath of the mbx shipped with
+the installed cowshed build. Both are derived at detection, never stored; on Nix the resolved store path identifies the
+pinned build. Equal `mbx --version` release strings alone prove nothing. A mismatch refuses admission, naming the host's
+expected revision, both executable paths, both `mbx --version` outputs and the remedy: align the project's devenv pin.
+Any actual revision established by the project's lock is reported too, never inferred from a release version. A pin
+whose revision cannot be established from that identity is the same skew finding as a mismatch, and refuses admission
+the same way: detection never fails open, so an unprovable pin yields no capability answer that external reservations
+could admit either. Admission never selects another pool or falls back to cowshed's cpu-pool for that project. A project
+without the capability does not acquire it merely because the host has mbx; its work uses external reservations under
+"Parallelism inside a job".
+
+**Enforced by:** the host-selection, revision-skew and one-pool tests under "Required scheduling evidence"; those tests
+must exist for Phase 2.
 
 ### Classes
 
@@ -1319,16 +1335,18 @@ A requester names its job's class in the exec request: `ExecClass`, one of `inte
 value (07_api.md, "CLI and API exec parity"), so an embedding executor declares a class exactly as the CLI does. Only
 the trusted coordinator/operator route may ask `gate`; a worker that asks it is refused with typed class-not-permitted
 before any job or spawn effect. Ordinary commands default to `background`. A class is fixed at the job's birth; no live
-transition moves a running job between classes. This table is the one statement of what each class gets; every other
-section names it.
+transition moves a running job between classes. The table owns kernel placement and the non-mbx pressure policy. With
+mbx selected, all classes use its admission and pressure policy ("Memory pressure"); the land gate has
+`MBX_SCHEDULER_PRIORITY=normal`, and every other class has `low`, including interactive and resident work. The same
+mapping supplies `mbx reserve --priority`. Kernel nice and cgroup placement do not create another pool.
 
-| Class                  | What runs in it                                                                                                       | Nice | Linux cgroup                                                                 | Waits on memory pressure | Ended at macOS Critical |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------- | ------------------------ | ----------------------- |
-| `interactive`          | work a person or model waits on, declared by the requester that awaits its result                                     | 0    | `interactive`                                                                | never                    | never                   |
-| `gate`                 | a land's gate job, a train's proof and the jobs a land's own steps start ("A land is a gate job"); trusted route only | +5   | `gate`: `memory.low` max                                                     | never                    | never                   |
-| `background`           | every other exec, the default                                                                                         | +10  | `background`: `memory.high` ½ host, `memory.max` ¾ host, `memory.swap.max` 0 | yes                      | youngest first          |
-| `resident`             | a process idle between the requests it serves: a shed's Nx daemon, a worker that runs each request it is sent         | +10  | `background`                                                                 | never                    | youngest first          |
-| `interactive-resident` | a resident whose requests a person or model waits on, such as an embedder's feedback Nx worker                        | 0    | `interactive`                                                                | never                    | never                   |
+| Class                  | What runs in it                                                                                                       | Nice | Linux cgroup                                                                 | Without mbx: waits on memory pressure | Without mbx: ended at macOS Critical |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------ |
+| `interactive`          | work a person or model waits on, declared by the requester that awaits its result                                     | 0    | `interactive`                                                                | never                                 | never                                |
+| `gate`                 | a land's gate job, a train's proof and the jobs a land's own steps start ("A land is a gate job"); trusted route only | +5   | `gate`: `memory.low` max                                                     | never                                 | never                                |
+| `background`           | every other exec, the default                                                                                         | +10  | `background`: `memory.high` ½ host, `memory.max` ¾ host, `memory.swap.max` 0 | yes                                   | youngest first                       |
+| `resident`             | a process idle between the requests it serves: a shed's Nx daemon, a worker that runs each request it is sent         | +10  | `background`                                                                 | never                                 | youngest first                       |
+| `interactive-resident` | a resident whose requests a person or model waits on, such as an embedder's feedback Nx worker                        | 0    | `interactive`                                                                | never                                 | never                                |
 
 Nice decides whose runnable threads win a core when more are runnable than there are cores: an interactive thread before
 a gate thread, and a gate thread before a background one. On an idle host every class runs at full speed. Nice is never
@@ -1336,7 +1354,8 @@ negative. On macOS, where it is each process's priority, raising one above the s
 supervisor holds, so the order is made by lowering it: interactive at the supervisor's own nice, gate five below it,
 background ten below it. On Linux the table's value itself is the class cgroup's `cpu.weight.nice`, a weight: one step
 is about 55:45, so five steps are about 3:1, and interactive, gate and background share contended cores about 9:3:1. A
-resident costs nothing while it is idle, since a sleeping thread holds no core, and it starts at once like any job.
+resident costs no runnable CPU while idle; with mbx selected, its external reservation still lasts for its admitted
+work.
 
 **Linux.** Every job runs in its own cgroup v2, `<class>/job-<incarnation>-<id>` under the supervisor's delegated root
 (07_api.md, "Process-tree observations"); the incarnation is in the name because job ids repeat across workspaces. There
@@ -1388,8 +1407,15 @@ process's disk I/O along with its CPU, and a throttled thread sleeps while it ho
 
 ### Memory pressure
 
-Memory is the one resource the kernel cannot take back from a running job without killing it, so it is the one cowshed
-admits by. **A background start waits while the host reports memory pressure**: on Linux while `/proc/pressure/memory`
+**With mbx, mbx owns memory admission.** Compilers charge CPU and predicted memory independently, using mbx's measured
+peak history; those are scheduling estimates, not OS memory limits. Live pressure control holds further admissions, not
+running processes. Cowshed adds no pressure queue or Critical-pressure kill loop in this mode. Existing kernel placement
+and memory backstops remain as specified under "Classes". External-work charges are specified under "Parallelism inside
+a job". The signals and prediction policy belong to
+[mbx's scheduling contract](https://mr-boxington.jdx.dev/scheduling#machine-wide-compile-scheduling), not a second
+cowshed implementation.
+
+**Without mbx, a background start waits while the host reports memory pressure**: on Linux while `/proc/pressure/memory`
 reads `some avg10` above 10.00%, on macOS while `kern.memorystatus_vm_pressure_level` reads Warning or Critical. The
 supervisor reads the pressure when it would spawn a background job and, while the reading says wait, keeps the job
 `queued` and reads again every 2 s. The wait has no deadline and is never a refusal: it ends when the reading drops or
@@ -1400,8 +1426,8 @@ failure `cpuAdmission`, naming the file or sysctl and its error): a host whose p
 have room. Gate, interactive and either resident never wait; a resident's start is small and its requests are what a
 person or the land waits on.
 
-**At Critical, macOS ends background work.** macOS charges no job tree to a group the kernel could reclaim or kill as
-one, so the supervisor does it. At each job-sampling tick (one second, 07_api.md "Job monitoring") while
+**Without mbx, at Critical, macOS ends background work.** macOS charges no job tree to a group the kernel could reclaim
+or kill as one, so the supervisor does it. At each job-sampling tick (one second, 07_api.md "Job monitoring") while
 `kern.memorystatus_vm_pressure_level` reads Critical, each workspace supervisor ends the youngest of its own running
 `memory`, its stderr naming the pressure level and the job's resident sum from that tick's sample. A supervisor ends one
 job at a time: while a job it ended for memory has not concluded, its grace still running, it ends no other, and once
@@ -1410,36 +1436,58 @@ last ending freed. Gate, interactive and interactive-resident jobs are never end
 throttles the background class at `memory.high`, kills inside it at `memory.max`, and `memory.swap.max` 0 keeps it from
 swapping the host.
 
-Measured 2026-10-26 (3607bc754e): six acceptance runs of one repository started together reached load 23 on 18 cores and
-put 5.9 of 7 GB in swap, and the CPU ledger never saw it, since it counted cores and not memory. Under the pressure wait
-the later runs wait at their start instead, and on macOS a run that still drives the host to Critical is ended and told
-why in numbers. An ended run is not retried: a killed nextest cannot resume, so its owner reruns it knowing the cause.
+Measured 2026-10-26: six acceptance runs of one repository started together reached load 23 on 18 cores and put 5.9 of 7
+GB in swap; a CPU-only budget did not account for that memory. The non-mbx pressure policy above remains the fallback,
+while mbx supplies measured-memory admission when present. An ended run is not retried automatically.
 
 ### Parallelism inside a job
 
-Every job receives a GNU make jobserver fifo of its own, served by its own supervisor with a constant count:
-`g = min(want, cores)`, `cores` being `std::thread::available_parallelism`, `want` its `--want` and `cores` when it
-names none, so a larger want is `cores`. Every class gets the same: the fifo bounds how many compiler and test threads
-one build tree starts, so one `cargo`, `nx` or `nextest` does not hand the kernel ten times the core count, and nothing
-else. Two jobs on one host hold `cores` tokens each, and the kernel weighs their threads by class. A short command that
-knows it is brief may ask fewer. Measured 2026-10-21 under a default of one token: an `nx run-many` under `cowshed exec`
-handed that one token to its runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 21m19s
-against 5m54s on the host route.
+`g = min(want, cores)`, with `cores` from `std::thread::available_parallelism`, remains cowshed's sizing rule. `want` is
+the job's `--want`, or `cores` when absent; every class uses the same rule and a brief command may request fewer.
 
-- **Cargo reads its holder's jobserver.** A job's count reaches the processes its command starts as the configuration
-  Cargo and its test runners already read; no `cargo` on `PATH` intercepts anything ("The installed cowshed"). The
-  command receives `CARGO_MAKEFLAGS` and `MAKEFLAGS` set to `-j --jobserver-auth=fifo:<path>`,
-  `BOUNDED_EXEC_CPU_TOKENS=g`, and `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to `g` where it named neither:
-  libtest and nextest test threads take no jobserver token, so without them a `cargo test` still runs one test thread
-  per core. A `--test-threads` count the command names outranks them, as a flag outranks the environment. The supervisor
-  sets these over a caller's own `CARGO_MAKEFLAGS`, `MAKEFLAGS`, `MFLAGS` and `BOUNDED_EXEC_CPU_*`, which it never
-  passes. It also exports `NX_PARALLEL` as `g` (a caller's lower count kept, a percentage replaced) and
-  `COWSHED_NX_PARALLEL`, which `.cowshed/env` restores after a devenv shell sets its own, so Nx's task fan-out is the
-  job's too; an explicit `--parallel=N` stays the caller's. Measured 2026-10-26: `cowshed exec <ws> -- nx run-many` on 2
-  tokens ran 11 task processes at once (16 GB RSS, host load 39), since the devenv shell's `NX_PARALLEL=100%` let Nx
-  start a task per core. Cargo, every build script and every nested `cargo` a test starts inherit these and run rustc
-  only on tokens read from that fifo; `cargo metadata` and every query read none, so nothing needs to tell a build from
-  a query.
+**With mbx, Cargo and non-Cargo leaves enter the same pool once.** A Cargo leaf runs through mbx under its job's
+priority, with `CARGO_BUILD_JOBS=g` as that build's CPU ceiling, not an enclosing resource reservation. It takes no
+cowshed host grant; mbx admits the actual compiler and supported test work. A non-Cargo leaf runs under the host's
+installed `mbx reserve --cpus g --priority <job-priority> -- <command>`. The grant is the job's admission: its command
+stays queued until mbx grants it, then its existing jobserver, runner flags and thread variables are bounded by that
+grant. The memory request is the same task identity's last recorded resource peak from existing LMAO job/process spans
+(13_telemetry.md, "Job resource peaks"), passed as `--memory <bytes>`; no cowshed peak ledger or prediction table
+exists. [INFERENCE] The task-identity key needed to select that span is not verified for Nx leaves; until the span
+carries it, or when no prior peak exists, `--memory` is omitted. mbx defines an omitted memory request as a zero-byte
+charge, not a measurement or a memory guarantee. This open keying question does not authorize a second store (AGENTS.md,
+rule 8).
+
+The boundary is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing orchestration
+command. An Nx run mixing Cargo and non-Cargo leaves holds no reservation of its own: Cargo leaves use mbx, non-Cargo
+leaves reserve, and local fan-out consumes only the admitted leaf's grant. `mbx reserve` does not discover Cargo
+children. Reserving around an orchestrator and then letting its Cargo children acquire again would double-charge and can
+deadlock, so that path is not used. Nested non-Cargo work shares its enclosing grant instead of reserving twice. The
+seven unscheduled Cargo test-runner cases are an explicit exception with job-local bounds, not another hidden pool
+(11_shell.md, "Cargo test-runner boundaries" and "Open questions"). The external-work interface belongs to
+[mbx reserve](https://mr-boxington.jdx.dev/scheduling#reserve-capacity-for-external-work).
+
+**Without mbx, every job receives its own GNU make jobserver fifo**, served by its supervisor at the constant count `g`.
+The fifo bounds the compiler and test threads one build tree starts, not host-wide capacity. Two jobs may each hold
+`cores` tokens, and the kernel weighs their runnable threads by class. This non-mbx mechanism remains unchanged. The
+remaining bullets specify that mechanism and the local sizing inside an external reservation; they do not add another
+host grant around mbx Cargo work.
+
+Measured 2026-10-21 under a default of one token: an `nx run-many` under `cowshed exec` handed that one token to its
+runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 21m19s against 5m54s on the host route.
+
+- **Without mbx, Cargo reads its holder's jobserver.** A job's count reaches its children as configuration Cargo and its
+  test runners already read; cowshed installs no Cargo interceptor ("The installed cowshed"). The command receives
+  `CARGO_MAKEFLAGS` and `MAKEFLAGS` set to `-j --jobserver-auth=fifo:<path>`, `BOUNDED_EXEC_CPU_TOKENS=g`, and
+  `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to `g` where it named neither: libtest and nextest test threads
+  take no jobserver token, so without them a `cargo test` still runs one test thread per core. A `--test-threads` count
+  the command names outranks them, as a flag outranks the environment. The supervisor sets these over a caller's own
+  `CARGO_MAKEFLAGS`, `MAKEFLAGS`, `MFLAGS` and `BOUNDED_EXEC_CPU_*`, which it never passes. It also exports
+  `NX_PARALLEL` as `g` (a caller's lower count kept, a percentage replaced) and `COWSHED_NX_PARALLEL`, which
+  `.cowshed/env` restores after a devenv shell sets its own, so Nx's task fan-out is the job's too; an explicit
+  `--parallel=N` stays the caller's. Measured 2026-10-26: `cowshed exec <ws> -- nx run-many` on 2 tokens ran 11 task
+  processes at once (16 GB RSS, host load 39), since the devenv shell's `NX_PARALLEL=100%` let Nx start a task per core.
+  Cargo, every build script and every nested `cargo` a test starts inherit these and run rustc only on tokens read from
+  that fifo; `cargo metadata` and every query read none, so nothing needs to tell a build from a query.
 - **The fifo is the job's free count.** The supervisor creates it as
   `<store>/run/cpu/<base64url-incarnation>/job-<id>.fifo`, mode `0600`, in the workspace's pool directory, which the
   sandbox opens for reading and writing fifos and nothing else (04_sandbox.md). It opens it `O_RDWR`, keeps that
@@ -1453,9 +1501,9 @@ against 5m54s on the host route.
   lies in the new job's own workspace pool directory reuses that fifo and its `BOUNDED_EXEC_CPU_TOKENS` count, so a
   test's child build reads the test run's tokens and waits only for a sibling's thread, which is the jobserver's
   intended behaviour inside one tree. An exec into another workspace, or with no inherited fifo, gets its own.
-- **No holder, no configuration.** A Cargo no job started — an agent's in a shed, a host shell's, rust-analyzer's —
-  receives none of these and runs as Cargo does unconfigured, at the host's full width. A parent make's own jobserver
-  still applies, by Cargo's own rule.
+- **No holder, no cowshed jobserver.** A Cargo no job started — a host shell's or rust-analyzer's — receives no job
+  count. With the mbx capability it still uses the canonical mbx environment and one shared pool (11_shell.md,
+  "Canonical mbx environment"); without it, Cargo's own or a parent make's jobserver behavior applies.
 - **A fifo the command cannot open is reported, never silent.** A command that cannot open its fifo — a sandbox profile
   that does not admit it, a fifo gone — runs, and every Cargo it starts runs without the jobserver. Cargo says so itself
   on stderr, `failed to connect to jobserver from environment variable CARGO_MAKEFLAGS=… (os error N)`, naming the fifo
@@ -1464,23 +1512,23 @@ against 5m54s on the host route.
   `cowshed: the job's CPU jobserver fifo <path> cannot be opened in the sandbox (<error>); Cargo will run without it` on
   the job's stderr; the command still runs. A one-shot child runs no cowshed code inside the sandbox before its command,
   so Cargo's own line is its report.
-- **Every Nx run budgets itself.** The `@smoothbricks/nx-plugin`'s `preTasksExecution` serves every Nx run that inherits
-  no `BOUNDED_EXEC_CPU_POOL` a CPU pool of its own, `min(inherited BOUNDED_EXEC_CPU_TOKENS, cores)` tokens, `cores` when
-  it inherits no count: a socket published as `BOUNDED_EXEC_CPU_POOL` beside `BOUNDED_EXEC_CPU_TOKENS`, and a make
-  jobserver fifo published as `CARGO_MAKEFLAGS`/`MAKEFLAGS`, in the environment every task inherits. Nx still starts the
-  run's targets side by side; their runners queue for the run's tokens instead of each taking the host. Measured in
-  nightly 477, `nx run-many -t mutation` under `NX_PARALLEL=100%` with nothing budgeting the run: Stryker started 31
-  workers per package and cargo-mutants a jobserver of one task per core, side by side, and Stryker for three packages
-  and a fourth target were SIGKILLed within 20 seconds. The pool serves its own FIFO queue, granting the head
-  `min(want, free)` once one token is free, every grant whole: no request holds part of a grant while it waits for more,
-  so no two deadlock on each other's tokens. Its fifo holds the free count: a socket child takes the fifo's bytes first
-  and the implicit token last, and its close writes them back, so a Cargo reading the fifo and a nested runner holding a
-  grant never count one token twice. A granted `bounded-exec` serves its grant the same way, as a pool its own nested
-  runners take from; no runner asks the gateway. A pool's end ends accounting, never work: a command whose lending
-  parent exits runs on to its own exit and is judged by that exit alone. The run's `postTasksExecution` closes the pool;
-  a run that dies first takes it with its process. The plugin's `run-cpu-pool.test.ts` holds that shape over a real
-  socket: two sweeps each asking 31 of a 4-token run pool, the first granted 4 and the second queued until the first
-  returned them.
+- **Without mbx, every Nx run budgets itself.** The `@smoothbricks/nx-plugin`'s `preTasksExecution` serves every Nx run
+  that inherits no `BOUNDED_EXEC_CPU_POOL` a CPU pool of its own, `min(inherited BOUNDED_EXEC_CPU_TOKENS, cores)`
+  tokens, `cores` when it inherits no count: a socket published as `BOUNDED_EXEC_CPU_POOL` beside
+  `BOUNDED_EXEC_CPU_TOKENS`, and a make jobserver fifo published as `CARGO_MAKEFLAGS`/`MAKEFLAGS`, in the environment
+  every task inherits. Nx still starts the run's targets side by side; their runners queue for the run's tokens instead
+  of each taking the host. Measured in nightly 477, `nx run-many -t mutation` under `NX_PARALLEL=100%` with nothing
+  budgeting the run: Stryker started 31 workers per package and cargo-mutants a jobserver of one task per core, side by
+  side, and Stryker for three packages and a fourth target were SIGKILLed within 20 seconds. The pool serves its own
+  FIFO queue, granting the head `min(want, free)` once one token is free, every grant whole: no request holds part of a
+  grant while it waits for more, so no two deadlock on each other's tokens. Its fifo holds the free count: a socket
+  child takes the fifo's bytes first and the implicit token last, and its close writes them back, so a Cargo reading the
+  fifo and a nested runner holding a grant never count one token twice. A granted `bounded-exec` serves its grant the
+  same way, as a pool its own nested runners take from; no runner asks the gateway. A pool's end ends accounting, never
+  work: a command whose lending parent exits runs on to its own exit and is judged by that exit alone. The run's
+  `postTasksExecution` closes the pool; a run that dies first takes it with its process. The plugin's
+  `run-cpu-pool.test.ts` holds that shape over a real socket: two sweeps each asking 31 of a 4-token run pool, the first
+  granted 4 and the second queued until the first returned them.
 - **Runners are sized to the count.** The `bounded-exec` executor reads each runner's requested parallelism from the
   runner's own flag rather than assuming the core count, since a runner's flag and its actual concurrency can disagree:
   a `nextest run` names `--test-threads` or defaults to one per core, and one with `--no-capture` (`--nocapture` past
@@ -1521,13 +1569,17 @@ against 5m54s on the host route.
   "`cowshed land`" step 2).
 - **One land per repository is the land turn's.** A repository's lands are serialized by its land turn ("Land turns"),
   which a land holds from before its gate to its fast-forward; the gateway keeps no gate order of its own. A
-  `gate`-class job is a nice, not a lock: two gate jobs run side by side at the same nice, and only the land turn
-  decides which of them moves main.
+  `gate`-class job is not a lock: kernel placement and mbx priority follow "Classes", and only the land turn decides
+  which land moves main. Resource admission does not serialize lands of different repositories.
 - **A train's proof is gate-class work.** A train is the repository's next land: its owner proves the train's tree
   before asking for the land turn, so the land's own gate replays that proof from the Nx cache. That proof is the land's
   gate run early, and it runs as one: `cowshed exec <train> --class gate [--host] -- <gate command>`, from the trusted
   route that alone grants the class. It takes no land turn, since nothing of it moves main. Ordinary unit work of a shed
   that is no train stays background.
+- **Nothing else yields to gates.** No fork, attach, rebase, removal, release cleanup or other job waits for a gate to
+  finish. With mbx, low-priority work continues through the same pool while normal-priority gate work waits or runs; the
+  admission policy belongs to mbx and never preempts an admitted reservation. Without mbx, the existing class placement
+  applies. A gate has no quiet window and creates no additional hold.
 - **A job lives with its requester.** A foreground job's only consumer is the process that asked for it, so when that
   process is gone the job stops. A gate job's verdict moves main only through the `cowshed land` its lander runs next,
   so a gate whose lander is gone authorizes nothing and only loads the host. Measured 2026-10-18: a land of another
@@ -1542,26 +1594,63 @@ against 5m54s on the host route.
 
 ### Status
 
-`cowshed gateway status` reports what the kernel and the store say, and nothing the gateway counts. The CLI reads it on
-the host: the 1-, 5- and 15-minute load averages (`getloadavg`), the memory pressure (macOS
-`kern.memorystatus_vm_pressure_level` as normal, warning or critical; Linux `/proc/pressure/memory` `some avg10`), the
-swap in use against its total (macOS `vm.swapusage`; Linux `/proc/meminfo`), the jobs per class and state from each live
-workspace supervisor's own job list, the image-cleanup entries a listing of the store's `.deleting` directories finds
-("Deleting released images"), and the land turns ("Land turns"). A reading that fails is stated with its error, never
-shown as zero, and a supervisor that does not answer is named, its jobs in no count. `--json` carries them as
-`scheduling` beside `landTurns` (07_api.md, `GatewayStatus`).
+`cowshed gateway status` identifies the active mechanism and reads its authority, never reconstructing a second ledger.
+With mbx, it reports the host's expected pinned revision, the shared cache directory, and the pool's live leases,
+waiters and CPU/memory charges through mbx's published inspection interface (`mbx stats --scheduler --json`). Unknown or
+unavailable observations stay unknown and name the error; the gateway neither converts them to zero nor admits work
+through a fallback pool. Scheduler estimates and activity remain mbx-owned
+([Machine-wide compile scheduling](https://mr-boxington.jdx.dev/scheduling#machine-wide-compile-scheduling)).
 
-**What this gives up.** A gate's precedence is a nice, not an admission order: on macOS it is the Clutch scheduler's
-priority order with background's lateness bounded, a ratio cowshed does not set, and a gate that starts beside a host
-full of background work shares the cores by priority from its first instruction instead of waiting for them. A
-background start waits for memory pressure with no deadline, so on a host that stays under pressure background work does
-not start until it eases. On macOS a background job can be ended for memory; it is told why, in numbers, and a killed
-nextest does not resume, where under the ledger it would have run on and swapped the host (3607bc754e).
+In either mode the host reports the 1-, 5- and 15-minute load averages (`getloadavg`), memory pressure (macOS
+`kern.memorystatus_vm_pressure_level`; Linux `/proc/pressure/memory` `some avg10`), swap in use against its total (macOS
+`vm.swapusage`; Linux `/proc/meminfo`), and jobs by class and state from each live supervisor. It also reports cleanup
+entries from their authoritative `.deleting` directories ("Deleting released images"; 16_build_volumes.md, "Garbage
+collection") and land turns ("Land turns"). A failed reading names its error, and a supervisor that does not answer is
+named with its jobs excluded from counts. `--json` carries the projection as `scheduling` beside `landTurns` (07_api.md,
+`GatewayStatus`).
 
-Tests: the pure decisions alone, at the edges where a bug is plausible: a background start waits above the PSI limit and
-starts at it, waits at Warning and Critical and starts at Normal, and no other class waits; the Critical choice ends the
-youngest background or resident job and never a gate, interactive or interactive-resident one. What the kernel does with
-a nice, a cgroup file or a pressure reading is the kernel's to test.
+**Tradeoff.** A non-Cargo reservation holds its stated capacity until the owned command concludes, even while it sleeps.
+Its last observed peak is not a prediction or an OS limit, and a first or unidentified run has the zero-byte charge
+specified above. Cargo's fine-grained measured admissions and single-flight are why cowshed delegates that work instead
+of reserving one job-sized envelope around a build. Without mbx, the existing kernel-priority and pressure policy
+provides no host-wide CPU reservation.
+
+### Required scheduling evidence
+
+For Phase 2, the following cowshed-owned tests must exist:
+
+- **`host_mbx_selection_uses_the_installed_pin`** distinguishes no host installation, the matching installed build, a
+  broken installation and an unrelated ambient PATH program; absence keeps non-mbx projects unchanged but refuses a
+  project with canonical mbx as `mbx-host-missing`, with its executable and `cowshed setup` remedy.
+- **`mbx_mode_requires_a_memory_budget`** maps host-global `scheduler.memory = "none"` to `mbx-memory-unscheduled`, the
+  set-memory-budget remedy and no spawned work, CPU-only pool or fallback admission.
+- **`mbx_revision_skew_refuses_admission`** checks realpath identity even when release versions match, both executable
+  paths and version outputs, the expected pin and align-devenv remedy, with no second pool, fallback or spawned command.
+- **`mbx_priority_follows_the_job_class`** table-checks the Cargo environment and reserve priority against "Classes".
+- **`external_work_reserves_its_existing_want`** checks `--want` capping, exactly one `--cpus g` reservation, the last
+  matching span's peak as `--memory` or its explicit absence, the bounded jobserver and runner count, and release only
+  after the owned command tree concludes. The peak selection reads existing spans and writes no second store.
+- **`mixed_nx_leaves_take_one_pool_grant_each`** drives one Cargo leaf and one non-Cargo leaf through the real cowshed
+  admission/runner boundary against mbx's published interface; the orchestrator reserves nothing, Cargo uses the
+  compiler pool, and the external leaf reserves once. Nested work never reacquires an enclosing external grant.
+- **`mbx_status_reads_the_pool_authority`** maps published mbx observations and inspection errors into status without
+  gateway-maintained capacity, queue or lease counters.
+- **`no_mbx_keeps_existing_jobserver_and_pressure_behavior`** preserves `g`, FIFO inheritance, runner sizing, and the
+  existing pure pressure decisions: threshold crossings and youngest eligible Critical-pressure victim.
+- **`gate_priority_never_holds_other_lifecycle_work`** interleaves a gate with fork, attach and release cleanup and sees
+  no gate-induced admission hold.
+
+Exactly one real mbx wiring smoke, **`canonical_cargo_route_reaches_the_pinned_mbx`**, uses two shed roots, the upstream
+Cargo shim and the one shared cache directory: it records both sessions' pool identity, priority and published evidence
+of shared in-flight work. It proves the common pool wiring, not mbx's deduplication, prediction or OS permit recovery.
+Kernel nice/cgroup behavior and mbx's internal scheduling policy remain their owners' tests.
+
+### Open questions
+
+- **External-work peak identity.** The inference under "Parallelism inside a job" is whether existing job/process spans
+  identify the same Nx task across runs. Inspect that correlation before enabling the span-derived memory request;
+  absent or unprovable identity uses the specified zero-byte charge, never a shadow table.
+- The known unscheduled Cargo test-runner gap and its closing measurement belong to 11_shell.md, "Open questions".
 
 ## The task server schedules work units
 
@@ -1588,21 +1677,21 @@ ready unit acquires a lease. Strong models propose task boundaries and interface
   publication only: gate coordinator groups run concurrently in one class. Lands queue for the fence in one order — the
   first claimant in admission order, behind older aged waiters — so an urgent land waits its turn and never overtakes an
   older claimant. These classes bound the windows the operator keeps by hand today; the disk-lifecycle lease above still
-  spaces every disk command, and the kernel schedules every runner ("Host scheduling"). A lease-blocked unit holds up
-  nothing beside it.
+  spaces every disk command; leaf resource admission follows "Host scheduling". A lease-blocked unit holds up nothing
+  beside it.
 - **Caps and bands.** A unit may declare its own parallelism ceiling — the caps its run kind applies to itself
   (`nx parallel`, `CARGO_BUILD_JOBS`, `--test-threads`) — and the grant reports that ceiling as declared; leaf controls
   derive from it, never from a static profile. The grant also names the run's band, its class's nice in "Classes":
   interactive work foreground (0), gate-class work normal (+5) — the land turn's holder included — and background work
   background (+10). Placement is server-owned: the band follows the class alone, and no other caller field raises a band
   or widens a ceiling.
-- **Memory pressure holds back background units, nothing else does.** A background unit is not selected while the host's
-  memory pressure holds a background start ("Memory pressure"), and the scheduler reads the pressure again on the same 2
-  s interval; a unit of any other class is selected regardless. A reading that cannot be taken holds a background unit
-  too and names why, but does not fail it, since the unit is not a job yet. The scheduler holds no CPU counter and mints
-  no CPU grant: a selected unit's runners are scheduled by the kernel under their class and bounded by their own job's
-  jobserver ("Parallelism inside a job"). `TaskClass` is the work-unit ordering and placement axis; a task band never
-  creates an exclusive gate root per group.
+- **Memory admission has the same owner as jobs.** With mbx selected, the task server adds no pressure gate before
+  selecting a ready unit; its leaves admit through mbx. Without mbx, a background unit is not selected while the host's
+  memory pressure holds a background start ("Memory pressure"), and the scheduler reads pressure again on the same 2 s
+  interval; every other class is selected regardless. A failed reading holds a background unit and names why rather than
+  failing a unit that is not a job yet. The scheduler holds no CPU counter and mints no CPU grant: selected units' leaf
+  runners use "Host scheduling" and "Parallelism inside a job", not another task-server resource ledger. `TaskClass` is
+  the work-unit ordering and placement axis; a task band never creates an exclusive gate root per group.
 - **Wire.** `task-admit` is held like a disk lease —
   `{"op":"task-admit","unit":…,"owner":…,"incarnation": …,"deps":[…],"leases":[…],"priority":<u32>,"urgent":true,"class":"background","deadline": <epoch-ms>,"command":…}`
   — answered `queued` at once and a granted `taskGrant` (`unit`, `band`, `caps`) when the scheduler selects it.

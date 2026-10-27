@@ -2036,14 +2036,16 @@ Every workspace image carries its environment in the in-image private namespace 
 `.cowshed/env` exports, on macOS, `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` from detached metadata's exact
 `portBlock`; Linux has no port block and omits both lines. In an Nx checkout it also exports the project cache route's
 endpoint and read-only flag, `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`
-(03_caches.md); the route takes no credential. It never exports the bare token: a file every shell of the workspace
-sources hands its exports to every child, and `.cowshed/workspace.json`, not an environment variable, marks a workspace.
-One function derives the file from the workspace's recorded platform and block, and it is the file's only writer:
-create, fork and restore publish it as they mint, and every supervisor start publishes it again, so values are always
-current — a workspace minted before a variable existed gains it on its next start. The supervisor start alone also
-exports the sandbox's `TMPDIR` and `COWSHED_RUNTIME_LINK`, the workspace's short runtime link (04_sandbox.md): a mint
-may run at a staging mount, and the link is named after the mount the workspace is served at. Nothing is derived from
-cwd, guessed from a slot, or trusted from a marker alone.
+(03_caches.md); the route takes no credential. On a host with a provisioned build-cache volume it exports that volume's
+root as `COWSHED_BUILD_CACHE` (01a_apfs.md, "Dedicated build-cache volume"), the one spelling every consumer reads; a
+host without one omits the line. It never exports the bare token: a file every shell of the workspace sources hands its
+exports to every child, and `.cowshed/workspace.json`, not an environment variable, marks a workspace. One function
+derives the file from the workspace's recorded platform and block, and it is the file's only writer: create, fork and
+restore publish it as they mint, and every supervisor start publishes it again, so values are always current — a
+workspace minted before a variable existed gains it on its next start. The supervisor start alone also exports the
+sandbox's `TMPDIR` and `COWSHED_RUNTIME_LINK`, the workspace's short runtime link (04_sandbox.md): a mint may run at a
+staging mount, and the link is named after the mount the workspace is served at. Nothing is derived from cwd, guessed
+from a slot, or trusted from a marker alone.
 
 Shell hooks are optional repository input. Cowshed never creates or rewrites `.envrc` or `.envrc-local`, and adoption,
 fork and restore do not require either file or any ignore rule for it. A repository with no shell configuration uses the

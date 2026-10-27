@@ -83,8 +83,10 @@ The diagram shows the macOS/APFS substrate: every image is a case-sensitive APFS
 attached in the kernel with `hdiutil attach -kernel` (01a_apfs.md), re-adoption's retained inputs read-only; an image in
 any other format is refused by name. On Linux the same logical shape holds with ZFS datasets in place of image files and
 the store mounted directly at `/private/cowshed/store` (09_substrates.md). The store volume is dedicated: the Data
-volume carries no image or store byte (01a_apfs.md). Shared caches are not on the store: each tool's cache stays at the
-tool's own default in the host HOME, and the gateway's mirrors in cowshed's user cache directory (03_caches.md).
+volume carries no image or store byte (01a_apfs.md). The host's build-cache volume (01a_apfs.md, "Dedicated build-cache
+volume") is a plain volume, not an image, holding the mbx store and its managed targets. Other shared caches are on
+neither volume: each other tool's cache stays at the tool's own default in the host HOME, and the gateway's mirrors in
+cowshed's user cache directory (03_caches.md).
 
 Gateway reachability is deliberately platform-specific. macOS package clients use the workspace's `portBlock.base`.
 Linux allocates no `portBlock`: each attached workspace has a private loopback/netns and a controller-launched trusted
@@ -115,9 +117,10 @@ build wrote it. A command that reports such a record says once, as a warning, wh
 The persistent processes are the cowshed daemon (one per host, the `dev.cowshed.gateway` LaunchAgent), which serves the
 gateway and the supervisor manager at `/private/cowshed/store/run/manager.sock`; the per-workspace supervisors, which
 that manager starts and owns so they outlive both the command that asked for one and the daemon's own restarts
-(11_shell.md); and the host sccache daemon (03_caches.md). Linux additionally has one ephemeral minimal connector per
-attached workspace; it is attachment plumbing and stores no authority. Runtime processes hold no sole authority: kill
-them and the next command rederives lifecycle from the host inventory — the images and mounts under
+(11_shell.md). No compiler-cache daemon joins them: mbx keeps its store on the host's build-cache volume and runs its
+cache agent only for the build that started it (03_caches.md, 05_gateway.md). Linux additionally has one ephemeral
+minimal connector per attached workspace; it is attachment plumbing and stores no authority. Runtime processes hold no
+sole authority: kill them and the next command rederives lifecycle from the host inventory — the images and mounts under
 `/private/cowshed/store/`, the marker each image carries (incarnation and lineage), the per-workspace grants files, the
 intent journal, and the controller lock — together with the protected in-volume job evidence. The trusted supervisor is
 nevertheless the sole live writer of that in-volume evidence; the controller emits each of its acts as a compact audit

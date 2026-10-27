@@ -339,6 +339,25 @@ One generated column declaration owns these names, types, enum values, and event
 hand-copies the schema. The tree is span parentage, never JSON; no process name, metric name, or sample number creates a
 new column. Program/path categories share dictionaries across repeated observations.
 
+### Job resource peaks
+
+One recorded peak answers "how much memory did this task last take", and it is read from the spans above, never from a
+ledger kept beside them. The native-field selection is exact:
+
+| Host accounting source               | Peak field                                         | What it means                                                                                                                                                          |
+| ------------------------------------ | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS rusage (`macOsRusageChildren`) | the terminal sample's `rss_peak_bytes`             | the maximum simultaneously sampled resident sum of the job's process group (07_api.md, `JobResourceSample`)                                                            |
+| Linux cgroup v2 (`linuxCgroupV2`)    | the job span end row's `charged_memory_peak_bytes` | the cgroup's `memory.peak`: charged memory, cache and kernel charges included — what the host actually charged the job, never an RSS value in an RSS column's clothing |
+
+The per-process `rss_peak_bytes` on `process.run` rows is that one process's own observed peak. Process peaks are never
+summed into a job peak: processes reach theirs at different instants, so the sum is a number no instant ever held. A
+consumer that must charge a task's next run by its last one (05_gateway.md's external reservation) takes the last
+recorded terminal peak for the task identity it names (05_gateway.md owns that identity) from these job spans, in the
+field its host's accounting source selects above. A job whose terminal sample could not be taken records no peak: the
+field is null, never zero, and a reader with no recorded peak has no number to charge — it does not estimate one. These
+spans and the protected job records that carry the same terminal sample are the only record of peaks; no writer keeps a
+second, peak-only store for a reader to consult.
+
 ## Attribution tiers
 
 Under interception (05_gateway.md), most granted traffic is request-visible, so attribution sharpens by tier:
@@ -377,7 +396,9 @@ Report the following independently, with unavailable measurements explicitly abs
   `PUT` and builds no archive);
 - a land's publication: the `published`, `existing` and `skipped` counts of `build_volume::nx::Published`, and each
   failed entry's cause on stderr;
-- client archive construction, land publication transfer, target download/extraction, and Cargo build-volume warmth;
+- client archive construction, land publication transfer, target download/extraction, and — in a project without the mbx
+  capability — Cargo build-volume warmth; a project with mbx reports no such measurement here, its Cargo warmth being
+  the shared store's (03_caches.md), absent rather than zero;
 - server complete-entry bytes, staging bytes, configured capacity, eviction count/bytes, interrupted-upload recovery,
   and actual allocated bytes where the filesystem reports them;
 - the target's exact landed head and the same successful cacheable task/hash set before and after adoption, every

@@ -64,7 +64,6 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; (measured: the kernel canonicalizes the connect target before matching — a
 ;; /tmp-spelled rule silently denies what a /private/tmp rule allows).
 (allow network-outbound (remote unix-socket (path-literal "<nix daemon socket>")))
-(allow network-outbound (remote unix-socket (path-literal "/private/cowshed/store/sccache.sock")))  ;; host sccache daemon
 (allow network-outbound (remote unix-socket (path-literal "<own supervisor socket>")))
 ;; The workspace's own tree: its processes rendezvous over Unix sockets there
 ;; (devenv and nx in the runtime dir, a test in its temp dir, a tool under the
@@ -148,8 +147,10 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; and emission order both matter; scoped carve-backs follow this deny:
 (deny file-read* file-read-data file-write* (subpath "/private/cowshed/store"))
 ;; No cache lives under the cowshed tree, so nothing here is carved back for one.
-;; sccache's store is daemon-write-only (03_caches.md) — clients speak to the host
-;; daemon over the socket above and never touch the store directly.
+;; The shared caches sit outside it: layer 3 in the host HOME, and the mbx store
+;; on the build-cache volume (<bc>, 01a_apfs.md), carved back below by its exact
+;; subtree (03_caches.md). A checkout's build volume is an image of its own,
+;; carved back as that job's mount ("Build-volume write authority" below).
 ;; The installed cowshed is the one host-install exception: derive its absolute
 ;; identity from the trusted controller HOME, resolve the stable cowshed name,
 ;; and allow read/exec of ONLY that installed binary. Stable-name and ancestor
@@ -176,7 +177,7 @@ writes — but cannot add a permission absent from the enclosing execution profi
   (require-all (subpath "<cpu pool dir>") (vnode-type FIFO)))
 ;; All other HOME carve-backs come only from detected capabilities' contributions
 ;; (15_capabilities.md), which the capability merge collects in one place. A
-;; shared cache is strictly beneath HOME and never intersects a protected path or
+;; shared cache beneath HOME is strictly beneath it and never intersects a protected path or
 ;; cowshed's controller state (~/Library/Application Support/dev.cowshed,
 ;; ~/Library/Caches/dev.cowshed). Ancestors beneath HOME get `file-read-metadata`
 ;; literals only, so they resolve but are never listable. With every detector
@@ -193,6 +194,15 @@ writes — but cannot add a permission absent from the enclosing execution profi
   (subpath "~/.cache/nix") (subpath "~/.local/state/nix")
   (subpath "~/go/pkg/mod") (subpath "~/Library/Caches/go-build")
   … one subtree per [caches] home entry …)
+;;   - on the build-cache volume, outside HOME, for a Cargo project with the
+;;     mbx capability only: the one mbx cache directory — the action store
+;;     and its managed targets together, shared writable by every shed
+;;     (03_caches.md, "mbx"). A project without the capability gets no rule
+;;     naming it, and nothing else on that volume is ever named. Its
+;;     ancestors resolve metadata-only:
+(allow file-read* file-read-data file-write*
+  (subpath "<bc>/mbx"))  ;; mbx subtree only with the mbx capability
+(allow file-read-metadata (literal "<bc>")) ;; … and the mountpoint's ancestors
 ;;   - a split tool home's root as a literal read (the directory, not its
 ;;     contents), and cargo's root state files as read-write literals:
 (allow file-read* file-read-data (literal "~/.cargo") (literal "~/.gradle"))
@@ -203,7 +213,7 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;;     each bootstrap candidate as its literal program path
 ;;     (~/.nix-profile/bin/<tool>, ~/.local/state/nix/profile/bin/<tool>,
 ;;     ~/.bun/bin/bun, ~/.local/bin/uv), rustup's
-;;     settings file, and the sccache GC root that names RUSTC_WRAPPER.
+;;     settings file.
 (allow file-read* file-read-data (literal "~/.nix-profile/bin/direnv"))  ;; … one per grant
 (allow file-read-metadata (literal "~/.nix-profile/bin") (literal "~/.nix-profile") (literal "~"))  ;; its ancestors beneath HOME
 ;; Core bootstrap: exact installed cowshed link/target reads only, metadata-only ancestors.
@@ -1102,6 +1112,13 @@ workspace-relative deny beneath a fixed build-state link also denies the resolve
 ancestors, including a leaf not created yet. Selecting a new volume does not grant a sibling volume to an already
 running job: its compiled profile keeps its old physical authority.
 
+The mbx grant is a separate authority on a different volume: for a Cargo project with the mbx capability, the profile
+names `<bc>/mbx` read-write — the one mbx store and its managed targets on the build-cache volume, shared writable by
+every shed (03_caches.md, "mbx"). It is a capability contribution (15_capabilities.md), never part of
+`build_volume_mount` and never a repository grant, and it is absent entirely from a project without the capability. It
+is the only subtree of the build-cache volume any profile names; the volume's root resolves by metadata only and is
+never listable from a sandbox.
+
 Sharing the record works only when every boundary can reach the daemon's socket. A read-write job's socket directory is
 the `nx` leaf of `<mount>/.cowshed/run`, inside the checkout's tree, which jobs of every mode name as
 `/tmp/cs-<digest>/nx`, below the workspace's read-write runtime link. A host shell of a cowshed checkout names the same
@@ -1331,27 +1348,21 @@ the pinned 23.2.1; line numbers are those of commit `d2dc2aaef9`.
 `16_build_volumes.md:1291-1292` and the policy above (`04_sandbox.md:1039-1054`) say the opposite of what a
 client-started daemon needs, so a spec change would come first.
 
-## The sccache daemon as trusted mediator
+## The mbx store: a direct grant, no mediator
 
-The host-owned sccache server (03_caches.md) follows the nix-daemon doctrine: a scoped canonical-path `unix-socket`
-allow in the baseline (`/private/cowshed/store/sccache.sock`), a daemon running _outside_ every sandbox, and no protocol
-translation by cowshed — sccache speaks its own client-server protocol, and cowshed adds lifecycle (the
-`dev.cowshed.sccache` LaunchAgent, managed by `cowshed sccache start|stop|status`) plus scoped access, nothing else.
-Unlike the nix socket, the path is admitted without resolving to a live socket: it is a cowshed-owned constant under
-`/private/cowshed/store`, where the store-wide deny leaves sandboxes unable to create, unlink, or bind anything, so
-naming the path grants nothing a sandbox could conjure and profiles stay correct across daemon restarts and late
-installs. The same deny doubles as the client fail-fast: sccache 0.16 has no client flag that suppresses spawning a
-fallback server on connect failure (source-verified — `SCCACHE_NO_DAEMON` only keeps a spawned server in the
-foreground), but the fallback must bind the socket path and cannot, so a down daemon costs a prompt compile error, never
-a wrong-boundary server serving siblings from inside a sandbox.
+No process mediates the Cargo compiler cache. mbx's cache agent runs inside the build that uses it (03_caches.md,
+"mbx"), so there is no compiler-cache daemon outside the sandboxes, no socket for the baseline to allow, and no
+unsandboxed process that reads sources or executes a client-named compiler at a sandboxed client's request: the compiler
+a job runs is the job's own, under the job's own profile. Jobs of an mbx-capable project instead hold a plain filesystem
+grant — read-write on `<bc>/mbx`, the store and the managed targets together — and jobs of any other project hold no
+grant naming it.
 
-**The confused-deputy surface is named, not implied.** The daemon reads sources and executes a _client-named_ compiler
-binary with client-supplied arguments and environment, unsandboxed, at the client's request — socket access equals
-arbitrary user-uid execution outside the sandbox. Accepted: the confinement threat model (semi-trusted agents running
-the user's own code) already concedes that class to a deliberate adversary through layer-3 cache poisoning — a poisoned
-sccache entry feeds main's next build (03_caches.md) — so the daemon adds immediacy, not new reach. In exchange the
-store itself narrows: no sandbox holds any grant on sccache's store, `~/Library/Caches/Mozilla.sccache`, which the HOME
-read deny covers, and every cache write flows through the daemon.
+The accepted risk is the direct one, stated where it is owned (03_caches.md, "Known limitations"): a shed can write
+store entries that main's next build restores, the same trust class as the layer-3 write scope it already holds,
+accepted under the confinement threat model because those agents can land code (the owner's ruling, 2026-10-27). Routing
+the store through a compiling daemon would not remove that trust — a daemon that executes a client-named compiler
+unsandboxed is arbitrary user-uid execution at any client's request, a strictly wider hole than bytes in a
+content-addressed store — so no mediator exists.
 
 ## Linux enforcement (ZFS substrate)
 

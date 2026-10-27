@@ -23,8 +23,7 @@ make that possible and they are absolute:
 
 ## Launcher
 
-The npm package's `cowshed` bin is `bin/cowshed`, a POSIX shell script that execs the native binary for the host:
-`sccache` (the one daemon-control verb) runs the installed cowshed launchd runs when it exists; everything else runs the
+The npm package's `cowshed` bin is `bin/cowshed`, a POSIX shell script that execs the native binary for the host: the
 package's own build, which its source authority picks (packages/nx-plugin/README.md, "Cargo profiles"). A checkout holds
 the tracked entry of the CLI's own crate, `crates/cowshed-cli/src/main.rs`, which a published package never ships, and
 runs its development build, `.cache/bin/<platform>/cowshed`; a published package runs `dist/bin/<platform>/cowshed`,
@@ -33,9 +32,9 @@ checkout without its development build exits 5 naming the path and `nx run cowsh
 binary exits 5 naming its path, and a host the package ships no binary for exits 5 naming the host. `setup` and
 `gateway` run that binary too, since they install the invoking build. It is a shell script rather than Node because it
 runs before every command, and Node's own start (~30 ms) costs more than the fastest verbs take in total; `exec` hands
-the binary the command's signals, exit status and standard streams unchanged. The library's `runCli`, `openHost`,
-`openSccacheHost` and the typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`, `spawnLandTurn`; 07_api.md,
-"Launchers") run the CLI through the same script, so one rule picks the binary.
+the binary the command's signals, exit status and standard streams unchanged. The library's `runCli`, `openHost` and the
+typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`, `spawnLandTurn`; 07_api.md, "Launchers") run the CLI
+through the same script, so one rule picks the binary.
 
 The launcher is how a build that is not installed yet is run, and not the `cowshed` on `PATH`. After `setup`, the
 `cowshed` on `PATH` is the installed copy (05_gateway.md "The installed cowshed"): setup repoints the first `cowshed` on
@@ -89,24 +88,23 @@ Two verbs own the host story, both runnable from any directory:
   host every ordinary probe answered in under a second while the ones a slow doctor's time went to — the gateway's
   answer, the store's metadata walk — took 2 s and more, so below that a `done` line would only say, hundreds of times
   per project, that a probe was fast. A probe that waits for another party names it on the line after its `start`:
-  `cowshed: doctor <probe> waits-on=<party>` (launchd, securityd, the gateway or the sccache server at its socket, the
-  commitment publisher). The host probes are `host-storage`, `caches-volume`, `gateway-status`, `vnode-table`,
-  `disk-image-helpers`, `attach-budget`, `sccache-status`, `sccache-agent`, `inventory` and `retired-mount-layout`, then
-  `first-launch` while the gateway serves; the project's are `project-root`, `artifact-repair` (`--repair` only),
-  `project-open`, `git-identity`, `project` and `project-shutdown`, and `project` runs one step per project check, per
-  workspace as `<workspace>/<check>` (`main/marker`), ending in one summary line,
+  `cowshed: doctor <probe> waits-on=<party>` (launchd, securityd, the gateway at its socket, the commitment publisher).
+  The host probes are `host-storage`, `caches-volume`, `gateway-status`, `vnode-table`, `disk-image-helpers`,
+  `attach-budget`, `inventory` and `retired-mount-layout`, then `first-launch` while the gateway serves; the project's
+  are `project-root`, `artifact-repair` (`--repair` only), `project-open`, `git-identity`, `project` and
+  `project-shutdown`, and `project` runs one step per project check, per workspace as `<workspace>/<check>`
+  (`main/marker`), ending in one summary line,
   `cowshed: doctor workspace-checks done elapsed=<d> workspaces=<n> slowest=<workspace> <d>`. A doctor that does not
   finish therefore names, in its last `start` line, the probe it waits in, and in that probe's `waits-on=` whose answer
   is missing. `status=err` means the probe's own query failed; the failure is also its finding. A party that is absent
-  or refuses is a typed finding (`gateway-down`, `gateway-status`, `sccache-status`, `project-checks-skipped`, …). A
-  daemon that took doctor's request and stays silent is reported as `gateway-unanswered` (error) or `sccache-unanswered`
-  (warning): `<peer> accepted doctor's request at <socket> and gave no answer in <bound>`. The gateway heartbeats every
-  answer that is not ready yet (05_gateway.md, "Deadlines"), so a live, saturated gateway that answers `status` late
-  (4.6–4.9 s measured on a loaded host) is never reported; one that says nothing, not even a heartbeat, for the 15 s
-  silence bound is. The sccache server cannot heartbeat, so its statistics get 60 s (`DOCTOR_PEER_ANSWER`), still well
-  inside the 180 s a caller once gave a silent doctor before killing it. The `gateway-unanswered` hint looks before it
-  restarts, since a restart cuts off every gate the gateway serves. No probe reports an answer it did not get. A caller
-  that asked for its steps (07_api.md) hears every step start and end, however short; `--json` changes stdout only.
+  or refuses is a typed finding (`gateway-down`, `gateway-status`, `project-checks-skipped`, …). A daemon that took
+  doctor's request and stays silent is reported as `gateway-unanswered` (error):
+  `<peer> accepted doctor's request at <socket> and gave no answer in <bound>`. The gateway heartbeats every answer that
+  is not ready yet (05_gateway.md, "Deadlines"), so a live, saturated gateway that answers `status` late (4.6–4.9 s
+  measured on a loaded host) is never reported; one that says nothing, not even a heartbeat, for the 15 s silence bound
+  is. The `gateway-unanswered` hint looks before it restarts, since a restart cuts off every gate the gateway serves. No
+  probe reports an answer it did not get. A caller that asked for its steps (07_api.md) hears every step start and end,
+  however short; `--json` changes stdout only.
 
   `first-launch` reads whether workspace jobs pay macOS's first-launch scan (05_gateway.md "The gateway host"). The TCC
   database is unreadable to the user, so it reads behavior: doctor mints a fresh copy of its own executable, signed ad
@@ -128,34 +126,48 @@ Two verbs own the host story, both runnable from any directory:
   `cowshed setup` for a gateway of a build without the op, and running doctor from a terminal for the latter. A scan is
   a cost, not a broken host, so no `first-launch-*` finding makes doctor unhealthy.
 
+  Doctor also judges the host's mbx, for every project whose canonical job environment resolves one (15_capabilities.md;
+  05_gateway.md, "Pool selection and revision" owns the rules, doctor only reports them). A canonical-environment `mbx`
+  whose realpath is not the host-installed mbx's realpath is a finding naming both paths, both `mbx --version` outputs
+  and the expected pinned revision, with the remedy: align the project's devenv pin; a matching version string alone
+  never clears it, and admission never selects another pool or falls back. A project that resolves a canonical `mbx`
+  while no host-installed mbx exists is `mbx-host-missing`, naming the project's resolved executable and the remedy
+  `cowshed setup`; job admission refuses with the same finding, and cowshed's own ledger runs only when no host mbx is
+  installed (05_gateway.md, "Pool selection and revision"). An installed mbx whose host-global `scheduler.memory` is
+  `"none"` is `mbx-memory-unscheduled`: doctor reports it and mbx-mode job admission refuses with the remedy to set a
+  memory budget; there is no CPU-only fallback. Each is derived at every detection from the two realpaths and versions,
+  never stored.
+
 - **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones,
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin
   `/etc/fstab`, and install the `dev.cowshed.storage` system LaunchDaemon that unlocks and mounts before login
-  (`01a_apfs.md`, Dedicated store volume). Privileged commands report their actual child exit status. A newly persisted
-  canonical passphrase must read back identically before encryption; the UUID-keyed APFS discovery credential is
-  prepared and verified in the same authorization session, including repair for retained encrypted volumes. The boot
-  script checks credential retrieval before unlocking, and its root daemon retains the refusing step/source line in
-  `/var/log/cowshed-storage.log`. It announces an authorization prompt before raising one, then performs everything that
-  can require elevation inside that single session. Once storage repair succeeds, it installs the invoking build as the
-  installed cowshed — the gateway's binary and the `cowshed` on `PATH` alike, with the gateway host signed by the user's
-  cowshed code-signing identity, made in cowshed's own keychain on first need without authorization or a dialog —
-  restarting a gateway that runs other bytes, and points the first `cowshed` on `PATH` at it when that entry is a
-  symbolic link (05_gateway.md "The installed cowshed"). Run from the installed copy it installs nothing and says so;
-  another build is installed by running that build's own `setup`. It holds the install slot for its whole run
-  (05_gateway.md "The install slot") and refuses to replace the installed build with one that does not contain it — one
-  whose commit is on no adopted `main`, or which lacks an installed commit by both ancestry and patch identity — or one
-  that records no commit, naming the binary, both builds and each lost commit; it repairs everything else and exits
-  non-zero; `setup --downgrade` installs it anyway. It then refreshes every adopted main's build state through the same
-  runtime path jobs use (16_build_volumes.md). Migration is rebuild-only: it announces the discard of contributed
-  incremental directories before acting, protects tracked source files, and links an empty build volume for the next
-  build to repopulate. No build state is copied. A project refusal is reported on stderr without hiding later projects;
-  the command exits with the first typed failure and the number of failed projects, never a success JSON envelope first.
-  Uninstall and a failed storage repair never run migration. A fully migrated healthy host changes nothing and says so.
-  The non-destructive storage promise applies to the host store volume, layer-3 caches and source data, not to
-  rebuildable incremental state. On a host that still has the retired caches volume, setup moves what the volume holds
-  to the host HOME without authorization, and `setup --retire-caches-volume` deletes the emptied volume, its
-  `/etc/fstab` pin and its mount-service entry inside that same single session, refusing while anything but the marker
-  is left (03_caches.md "Retiring the caches volume").
+  (`01a_apfs.md`, Dedicated store volume). The build-cache volume is provisioned by this same transaction — created or
+  adopted by UUID at its mountpoint, encrypted, pinned and boot-mounted by the same daemon, script and keychain scheme,
+  and never deleted (`01a_apfs.md`, Dedicated build-cache volume). Privileged commands report their actual child exit
+  status. A newly persisted canonical passphrase must read back identically before encryption; the UUID-keyed APFS
+  discovery credential is prepared and verified in the same authorization session, including repair for retained
+  encrypted volumes. The boot script checks credential retrieval before unlocking, and its root daemon retains the
+  refusing step/source line in `/var/log/cowshed-storage.log`. It announces an authorization prompt before raising one,
+  then performs everything that can require elevation inside that single session. Once storage repair succeeds, it
+  installs the invoking build as the installed cowshed — the gateway's binary and the `cowshed` on `PATH` alike, with
+  the gateway host signed by the user's cowshed code-signing identity, made in cowshed's own keychain on first need
+  without authorization or a dialog — restarting a gateway that runs other bytes, and points the first `cowshed` on
+  `PATH` at it when that entry is a symbolic link (05_gateway.md "The installed cowshed"). Run from the installed copy
+  it installs nothing and says so; another build is installed by running that build's own `setup`. It holds the install
+  slot for its whole run (05_gateway.md "The install slot") and refuses to replace the installed build with one that
+  does not contain it — one whose commit is on no adopted `main`, or which lacks an installed commit by both ancestry
+  and patch identity — or one that records no commit, naming the binary, both builds and each lost commit; it repairs
+  everything else and exits non-zero; `setup --downgrade` installs it anyway. It then refreshes every adopted main's
+  build state through the same runtime path jobs use (16_build_volumes.md). Migration is rebuild-only: it announces the
+  discard of contributed incremental directories before acting, protects tracked source files, and links an empty build
+  volume for the next build to repopulate. No build state is copied. A project refusal is reported on stderr without
+  hiding later projects; the command exits with the first typed failure and the number of failed projects, never a
+  success JSON envelope first. Uninstall and a failed storage repair never run migration. A fully migrated healthy host
+  changes nothing and says so. The non-destructive storage promise applies to the host store volume, layer-3 caches and
+  source data, not to rebuildable incremental state. On a host that still has the retired caches volume, setup moves
+  what the volume holds to the host HOME without authorization, and `setup --retire-caches-volume` deletes the emptied
+  volume, its `/etc/fstab` pin and its mount-service entry inside that same single session, refusing while anything but
+  the marker is left (03_caches.md, "Wiring").
 
 The verbs that change workspace or lifecycle state or run a job through a workspace supervisor — `adopt`, `fork`, `mv`,
 `checkpoint`, `restore`, `path`, `exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`,
@@ -164,8 +176,8 @@ this CLI's build (`sameBuild`, 11_shell.md), before the project is opened, so no
 daemon of another build is refused up front with "the cowshed daemon is build X; this cowshed is build Y" and the hint
 "run `cowshed setup` from the cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on
 PATH"; no daemon answering is not a disagreement. `ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`,
-`controller`, `credential`, `identity`, `sccache`, `skill`, `--version` and `--help` are not asked: `doctor` diagnoses
-the disagreement, and `setup` and `gateway` end it. `gateway status` and `doctor` (`gateway-stale-binary`) name
+`controller`, `credential`, `identity`, `skill`, `--version` and `--help` are not asked: `doctor` diagnoses the
+disagreement, and `setup` and `gateway` end it. `gateway status` and `doctor` (`gateway-stale-binary`) name
 `cowshed setup` as the remedy for a daemon running other bytes than the CLI.
 
 For exec in host scope, project discovery first establishes the caller's store authority through the controller Git
@@ -348,7 +360,6 @@ never errors).
 | `cowshed mcp serve`                                 | — (stdio/socket server)                               | Coordinator authority arrives only on an inherited FD/socketpair; it is never printed or placed in argv/environment (12).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `cowshed controller`                                | — (serves stdin)                                      | One coordinator controller connection for an embedding process, on standard input, which must be a Unix socket (else exit 2 before the project is resolved); exits 0 when the peer closes its end. A program that links cowshed is another build, and the daemon starts supervisors only for its own (11), so it runs its controller as this verb. Reconciles the project's gateway sessions before each exec, shell and checked land, as `exec` and `land --check` do (05).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `cowshed host`                                      | — (serves stdin)                                      | One host connection on standard input for an embedding process: the host's own verbs as typed operations (07_api.md, Host operations). N-API's `openHost` starts it through the launcher on a socketpair. Never writes stdout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `cowshed sccache host`                              | — (serves stdin)                                      | One sccache host connection on standard input for an embedding process: `start`, `stop` and `status` as typed operations (07_api.md, Host operations), and nothing else. N-API's `openSccacheHost` starts it through the launcher, which runs the installed build for it as for every `sccache` verb. Never writes stdout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `cowshed gateway run`                               | — (foreground daemon)                                 | launchd runs this as the gateway host's child (05_gateway.md "The gateway host").                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `cowshed gateway status`                            | `--json` status                                       | Health and versions; an install holding the install slot (05, "A pending install is visible"); then the host's scheduling, read on the host (05, "Host scheduling", Status): load averages, memory pressure, swap in use, jobs per class and state from each workspace supervisor, the image-cleanup entries waiting, and the land turns. A reading that fails is stated with its error, never as zero. `--json`: `GatewayStatus` with `pendingInstall?`, `scheduling?` and `landTurns`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | { unanswered }`. |
 | `cowshed resize <ws\|main> <size>`                  | new capacity                                          | Grow the image (01a, "Detached growth"); with `--build <size>` instead, grow the workspace's build volume and its seed (16, "Substrate"). The supervisor stops for the resize and restarts after; a held volume refuses before anything changes. `--json`: `ResizeResult { workspace, volume: "workspace"\|"build", previousCapacity, capacity }`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -726,11 +737,11 @@ supervisor of another build drains its jobs (11_shell.md, "Draining a supervisor
 does, whose attach of a mounted workspace attaches nothing (02_workspaces.md, "`cowshed attach` / `cowshed detach`").
 `exec` also asks which authority the supervisor's socket reports, and whether the gateway has the workspace's session
 installed at that revision — exactly the case in which the controller's pre-exec reconcile would install nothing for it.
-And `exec` admits a job only onto build state the controller's refresh (16_build_volumes.md, "Refresh") would leave as
-it is: every fixed link the checkout's build volume records is in place and reaches its volume directory (a declared
-path nothing occupies needs none), and the tracked build inputs still have the fingerprint that volume records, computed
-as the refresh computes it (one `git ls-files`, one more per declared pattern, and a hash of the tracked manifests). The
-job then runs through the supervisor's socket, relayed as the controller path relays it.
+And `exec` admits a job only onto build state the controller's refresh (16_build_volumes.md, "One link per checkout")
+would leave as it is: every fixed link the checkout's build volume records is in place and reaches its volume directory
+(a declared path nothing occupies needs none), and the tracked build inputs still have the fingerprint that volume
+records, computed as the refresh computes it (one `git ls-files`, one more per declared pattern, and a hash of the
+tracked manifests). The job then runs through the supervisor's socket, relayed as the controller path relays it.
 
 Any disagreement opens the controller exactly as before, which is what does the work: a workspace that is detached; for
 `exec`, one unserved, served under an older grant or another incarnation, a gateway session not yet at the served

@@ -892,7 +892,11 @@ is the contract. `GrantSet.port_block` is the platform union: macOS always `Port
 its JSON/N-API projection omits `portBlock`. `GrantSet.retained_port_blocks` (`retainedPortBlocks`, omitted when empty)
 is controller-written, macOS-only, and non-empty only after a relocation; no `GrantDelta` field sets it. Adapters and
 consumers must use that optional shape directly; casts, `null`, zero-sized blocks, and sentinel base values are
-forbidden. Adding a field is a coordinated change across core + goldens, not a per-adapter patch.
+forbidden. Adding a field is a coordinated change across core + goldens, not a per-adapter patch. Removing or retyping
+one is the same coordinated change — the core declaration, every generated projection and the goldens move together in
+one unit — because under Reader projection (below) a dropped field is only ever one the reader never declared: a missing
+required field, a retyped value and an unknown enum variant still refuse by name, so no adapter can absorb a removal on
+its own and no compatibility shim stands in for the declaration moving.
 
 JSON and N-API use the same camel-case projection. `StreamInfo` is exactly `{storage,bytes,sha256,summary}`. `storage`
 is `{kind:"captured",artifact}` or `{kind:"redirect",source,artifact}`; an artifact is `{kind:"inline",data}` or
@@ -1747,9 +1751,12 @@ supervisor that ran the job retires.
   (05_gateway.md "Startup contract"); `recovering = { supervisors }` counts the workspace supervisors from before the
   daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery"). `scheduling?: HostScheduling`
   is what the CLI reads on the host for `gateway status` and `doctor` (05_gateway.md "Status"), absent from an install's
-  health wait: `HostScheduling = { readings, jobs, imageCleanup }`.
-  `readings: HostReadings = { load, memoryPressure, swap }`, each `{ kind: "read", … } | { kind: "unread", error }`, a
-  failed kernel read stated and never zero: `load` reads `{ one, five, fifteen }` (`getloadavg`), `memoryPressure` reads
+  health wait: `HostScheduling = { readings, jobs, imageCleanup }`. `GatewayStatus.scheduling` identifies the active
+  scheduling mechanism; with mbx present it reports the expected pinned mbx revision, the canonical shared cache
+  directory and pool activity read through mbx's published inspection interface (05_gateway.md, "Status"), never
+  gateway-maintained pool counters. `readings: HostReadings = { load, memoryPressure, swap }`, each
+  `{ kind: "read", … } | { kind: "unread", error }`, a failed kernel read stated and never zero: `load` reads
+  `{ one, five, fifteen }` (`getloadavg`), `memoryPressure` reads
   `{ kind: "darwin", level: "normal" | "warning" | "critical" }` (`kern.memorystatus_vm_pressure_level`) or
   `{ kind: "psi", someAvg10 }` in hundredths of a percent (`/proc/pressure/memory`), and `swap` reads
   `{ usedBytes, totalBytes }` (`vm.swapusage`, `/proc/meminfo`). `jobs: HostJobs = { counts?, unanswered? }`, read from
@@ -2357,15 +2364,6 @@ when the variable is unset or empty) reads `cowshed host`'s environment, which i
 the variable from every child of the project; `command` (`--secret-command`) runs the helper with no stdin; `upload`
 (`--secret-stdin`) is the call's upload frame, trimmed UTF-8 as the verb's pipe is. A frame beside any other source is
 refused as usage before a project is opened. The answer is the project's routes.
-
-The `sccache` verbs are rows of their own scope, `sccache`: `sccache.start` (`capacity` as `--capacity` spells it),
-`sccache.stop` and `sccache.status`. They are served only by a `cowshed sccache host` connection, which the package
-launcher routes to the installed build as it routes every `sccache` verb (06_cli.md, "Launcher"), so a typed caller
-controls the same daemon `cowshed sccache start` does. TypeScript reaches it through
-`openSccacheHost(): Promise<SccacheHost>`, a handle of its own with `Host`'s start, handshake, close and
-concurrent-close contract; `Host` never opens it. A host connection's handshake answer names its role (`{host: "host"}`
-or `{host: "sccache"}`), a client refuses an answer of another role, and the connection serves exactly its role's scope:
-every other method, the other role's and every project method, is refused before it is decoded.
 
 ### Launchers
 

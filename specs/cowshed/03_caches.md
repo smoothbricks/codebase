@@ -11,17 +11,18 @@ Nearly every cache in scope is content-addressed with immutable entries — bun'
 object as cargo's registry. Concurrency safety therefore discriminates nothing; what matters is the cache's role at use
 time:
 
-- **Read-at-build caches** — cargo registry, Go module + build caches, uv, sccache, zig global cache, gradle. The tool
-  reads sources or artifacts from the cache and writes its output somewhere else. The cache is only ever read at build
-  time, so sharing it costs nothing. These stay where the tool keeps them in the host user's HOME.
+- **Read-at-build caches** — cargo registry, Go module + build caches, uv, zig global cache, gradle. The tool reads
+  sources or artifacts from the cache and writes its output somewhere else. The cache is only ever read at build time,
+  so sharing it costs nothing. These stay where the tool keeps them in the host user's HOME.
 - **Link-target caches** — bun with its isolated linker (`[install] linker = "isolated"`). `bun install` extracts each
   package once into `<cache>/links/<name>@<version>-<hash>` and writes `node_modules/.bun/<name>@<version>` as an
   absolute symlink to it, so the cache's path is part of every checkout's `node_modules`. These stay in the host HOME
   too, and every checkout reaches them through **one literal path**: the tool's own default (Wiring, tool homes).
-- **Clone-materializing caches** — a tool that materializes the workspace by _cloning out of its cache_: the cache is
-  the reflink source. APFS clonefile is strictly same-volume, so cache placement decides whether install runs at
-  clonefile speed or copyfile speed. Such a cache must live **reflink-reachable from the workspace** — on APFS, inside
-  the workspace image.
+- **Clone-materializing caches** — a tool that materializes its outputs by _cloning out of its cache_: the cache is the
+  reflink source. APFS clonefile is strictly same-volume, so cache placement decides whether a restore runs at clonefile
+  speed or copyfile speed. Such a cache must live **reflink-reachable from the place its outputs land**. mbx is the one
+  cache of this class in scope: a hit reflinks the stored object into the checkout's managed target directory, so the
+  store and the managed targets live on one filesystem together (mbx, below).
 
 Why placement decides it for a clone-materializing cache (measured with bun's clonefile backend, so it is not
 re-litigated — bun 1.3.14, warm caches, lockfile pinned, 83 packages / 1,579 files / 59 MB `node_modules`,
@@ -40,11 +41,11 @@ no reflink, so the cache's volume never enters an install's cost.
 
 ## The three layers
 
-| Layer                                   | Contents                                                                                                                                                                | Location                                                                                                                     | Sharing                                   |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| 1. Gateway mirrors                      | npm metadata and tarballs, bare repository mirrors                                                                                                                      | cowshed's own user cache directory: `~/Library/Caches/dev.cowshed/{mirror,repo-mirrors}` (Linux `$XDG_CACHE_HOME/cowshed/…`) | Global, written only by cowshed-gateway   |
-| 2. Clone-materializing caches           | caches a tool reflinks out of into the workspace — **none in scope**: bun's isolated linker links into its cache instead                                                | Inside each workspace image                                                                                                  | Inherited from main via CoW at clone time |
-| 3. Read-at-build and link-target caches | Cargo registry/git extraction caches, bun/npm/pnpm install caches, uv cache, Go module + build caches, sccache, zig global cache, gradle, Nix fetcher and profile state | Each tool's own default location in the host user's HOME, shared into the sandboxes of projects that use the tool            | Shared writable by detecting workspaces   |
+| Layer                                   | Contents                                                                                                                                                       | Location                                                                                                                     | Sharing                                                                                                     |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| 1. Gateway mirrors                      | npm metadata and tarballs, bare repository mirrors                                                                                                             | cowshed's own user cache directory: `~/Library/Caches/dev.cowshed/{mirror,repo-mirrors}` (Linux `$XDG_CACHE_HOME/cowshed/…`) | Global, written only by cowshed-gateway                                                                     |
+| 2. Clone-materializing caches           | the mbx store: cached compiler actions and learned incremental state, restored into mbx's managed target directories by reflink (mbx, below)                   | `<bc>/mbx` on the build-cache volume (01a_apfs.md), managed targets at mbx's default `<bc>/mbx/targets/v1/<checkout digest>` | One store per host, shared writable by every shed whose project has the mbx capability (15_capabilities.md) |
+| 3. Read-at-build and link-target caches | Cargo registry/git extraction caches, bun/npm/pnpm install caches, uv cache, Go module + build caches, zig global cache, gradle, Nix fetcher and profile state | Each tool's own default location in the host user's HOME, shared into the sandboxes of projects that use the tool            | Shared writable by detecting workspaces                                                                     |
 
 Layer 1 removes duplicate _downloads_ (and stores compressed bytes once, ever). Bare repository mirrors live only at
 `<cowshed cache dir>/repo-mirrors/<host>/<path>.git`; they are written by the gateway's `repo mirror` control-plane verb
@@ -52,8 +53,9 @@ and, like the rest of cowshed's cache directory, are controller state no sandbox
 is **not** that mirror tree: it is cargo's own shared writable extraction/index cache. The two have distinct ownership,
 permissions, and paths, so a Cargo process can never mutate gateway repository mirrors. Layer 2 is one special case, not
 a category: it exists exactly where a tool reflinks out of its cache and the substrate cannot reflink across volume
-boundaries, and no cache in scope does that. Layer 3 caches are read at build time or linked to, and write nowhere near
-the workspace, so sharing them is free.
+boundaries. mbx is that case, and its placement rule is internal to its own directory: the store and the managed targets
+it reflinks into share one filesystem, so a restore is a clone, never a copy (The reflink-reachability rule, below).
+Layer 3 caches are read at build time or linked to, and write nowhere near the workspace, so sharing them is free.
 
 **ZFS may widen layer 2**: OpenZFS 2.2 block cloning (BRT) works across datasets within a pool — something APFS
 clonefile cannot do across volumes. A clone-materializing cache whose copy path goes through `copy_file_range` (which
@@ -61,11 +63,13 @@ BRT intercepts) would get reflink speed from a pool-shared location, so on ZFS l
 and no speed penalty. Bun's Linux _default_ backend is hardlink, which cannot cross datasets; its isolated linker needs
 neither.
 
-**Workspace-keyed state** — `target/`, materialized `node_modules`, `DerivedData`, `.nx`, `.zig-cache`, Metro/Expo
-caches — is not shareable concurrently under any mechanism. A build tool's per-tree incremental state that capability
-detection names (Cargo target directories, Nx's cache and task database) lives on the workspace's build volume, cloned
-from main's seed at fork and adopted by main at land (16_build_volumes.md). The rest stays in the workspace image, warm
-because the image was cloned from main.
+**Workspace-keyed state** — materialized `node_modules`, `DerivedData`, `.zig-cache`, Metro/Expo caches — is not
+shareable concurrently under any mechanism and stays in the workspace image, warm because the image was cloned from
+main. A build tool's per-tree incremental state that capability detection names (Nx's cache and task database among
+them) lives on the workspace's build volume, cloned from main's seed at fork and adopted by main at land
+(16_build_volumes.md), with one exception: a Cargo project with the mbx capability has no `target` build state, because
+its `target` is mbx's managed-target link into the layer-2 store (mbx, below; 16_build_volumes.md states the link
+rules). Without mbx, a Cargo `target` is ordinary build-volume state like any other.
 
 For a managed Bun checkout, the successful installer records each present `bun.lock`/`bun.lockb` SHA-256 in its existing
 `node_modules/.smoo-install` receipt, beside the installer-input digest. The receipt is written only after success and
@@ -125,10 +129,15 @@ lock-preservation proof; ordinary shell entry does not acquire this cost.
 
 ## The reflink-reachability rule
 
-A clone-materializing cache must live where the substrate can reflink from it into the workspace — on APFS, the same
-volume; on ZFS, the same pool (pending the BRT verification). Any placement that breaks reachability silently downgrades
-materialization from clonefile to copyfile. This replaces the earlier, broader "no cache dependency outside the volume"
-rule: read-at-build and link-target caches may live off-image freely, because nothing reflinks or hardlinks out of them.
+A clone-materializing cache must live where the substrate can reflink from it into the place its outputs land — on APFS,
+the same volume; on ZFS, the same pool (pending the BRT verification). Any placement that breaks reachability silently
+downgrades materialization from clonefile to copyfile. For mbx that place is its managed target root: cowshed sets mbx's
+cache directory and no `target.root`, so managed targets stay at mbx's default inside the cache directory on the
+build-cache volume and every restore can reflink (mbx, below). mbx itself refuses nothing here — a target root on
+another filesystem silently copies — so the rule is enforced by cowshed's wiring never setting one, and by a test that
+must exist: with the build-cache volume provisioned, `mbx doctor` reports reflink as the restore method for a managed
+target, and a restored output shares its blocks with the store object. Read-at-build and link-target caches may live
+off-image freely, because nothing reflinks or hardlinks out of them.
 
 ## Wiring
 
@@ -214,19 +223,18 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   path into the sandbox of every project whose detector names the tool (15_capabilities.md). There is no cache volume,
   no relocation and no link: the bytes a sandbox writes are the bytes the host's own `cargo`, `bun` or `go` reads next.
 
-  | Detector | Shared host paths (macOS; Linux in parentheses)                                            |
-  | -------- | ------------------------------------------------------------------------------------------ |
-  | cargo    | `~/.cargo/registry`, `~/.cargo/git`                                                        |
-  | Bun      | `~/.bun/install/cache`                                                                     |
-  | npm      | `~/.npm`                                                                                   |
-  | pnpm     | `~/Library/pnpm/store` (`~/.local/share/pnpm/store`)                                       |
-  | uv       | `~/.cache/uv`                                                                              |
-  | Zig      | `~/.cache/zig`                                                                             |
-  | Gradle   | `~/.gradle/caches`                                                                         |
-  | Nix      | `~/.cache/nix`, `~/.local/state/nix`                                                       |
-  | Go       | `~/go/pkg/mod`, `~/Library/Caches/go-build` (`~/.cache/go-build`)                          |
-  | sccache  | none: `~/Library/Caches/Mozilla.sccache` (`~/.cache/sccache`) is daemon-write-only (below) |
-  | direnv   | `~/.cache/direnv/cas`, read-only: `source_url`'s store, which host shells execute          |
+  | Detector | Shared host paths (macOS; Linux in parentheses)                                   |
+  | -------- | --------------------------------------------------------------------------------- |
+  | cargo    | `~/.cargo/registry`, `~/.cargo/git`                                               |
+  | Bun      | `~/.bun/install/cache`                                                            |
+  | npm      | `~/.npm`                                                                          |
+  | pnpm     | `~/Library/pnpm/store` (`~/.local/share/pnpm/store`)                              |
+  | uv       | `~/.cache/uv`                                                                     |
+  | Zig      | `~/.cache/zig`                                                                    |
+  | Gradle   | `~/.gradle/caches`                                                                |
+  | Nix      | `~/.cache/nix`, `~/.local/state/nix`                                              |
+  | Go       | `~/go/pkg/mod`, `~/Library/Caches/go-build` (`~/.cache/go-build`)                 |
+  | direnv   | `~/.cache/direnv/cas`, read-only: `source_url`'s store, which host shells execute |
 
   The HOME read deny (04_sandbox.md) stays the default; each detector's contribution carves back exactly its tool's
   paths after it: the cache directories read-write, the tool's root and that root's ancestors as literal reads with
@@ -236,7 +244,13 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   child granted writes inside one cannot create its parent. Each child is pointed at the host path itself —
   `CARGO_HOME=<host home>/.cargo`, `BUN_INSTALL_CACHE_DIR=<host home>/.bun/install/cache`,
   `UV_CACHE_DIR=<host home>/.cache/uv`, `GOMODCACHE`, `GOCACHE` and the rest — and a caller's own value for these
-  variables never reaches it.
+  variables never reaches it. **The shared cache on the build-cache volume.** One shared cache lives on the build-cache
+  volume (01a_apfs.md), not in HOME, and is not a tool home: mbx's cache directory, `<bc>/mbx`, for a Cargo project with
+  the mbx capability (mbx, below). It is granted read-write as its own subtree (04_sandbox.md), never as part of a HOME
+  carve-back and never as a blanket grant on the volume: a job with the capability reaches `<bc>/mbx` and nothing else
+  on that volume, and its build volume is an image of its own elsewhere (16_build_volumes.md), granted separately. The
+  canonical environment names mbx's cache directory there (11_shell.md, "Canonical mbx environment"); a caller's value
+  for it never reaches a child, exactly as for the tool homes above.
 
   Restoration classifies a developer's package links against these same roots, and grants nothing for them: the
   controller derives each root from the host home (`BUN_HOME` and `PNPM_HOME` through `host_path`), and a job's wrapper
@@ -260,25 +274,25 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   escalates for the retirement; the volume is deleted only inside an attended run,
   `cowshed setup --retire-caches-volume`, which runs step 4:
 
-  1. With the gateway and the sccache daemon stopped, each host link into the volume is replaced by the tool's own
-     directory: the linked bytes move back to the host path — a copy that keeps symlinks, modes, times and hard links
-     (`ditto` on macOS, `cp -a` on Linux) into a staging directory beside the host path, published with one rename, then
-     removed from the volume. Cargo's two move under cargo's own package-cache locks; a cargo process holding them
-     refuses the run. bun and uv offer no host-wide lock, so their caches move only while no install runs.
+  1. With the gateway stopped, each host link into the volume is replaced by the tool's own directory: the linked bytes
+     move back to the host path — a copy that keeps symlinks, modes, times and hard links (`ditto` on macOS, `cp -a` on
+     Linux) into a staging directory beside the host path, published with one rename, then removed from the volume.
+     Cargo's two move under cargo's own package-cache locks; a cargo process holding them refuses the run. bun and uv
+     offer no host-wide lock, so their caches move only while no install runs.
   2. A cache that exists in both places is merged, never kept twice: for a content-addressed cache (cargo, bun, npm,
-     pnpm, uv, Zig, Gradle, Go, sccache) every entry the host lacks moves in and every entry it already holds is dropped
-     from the volume, because the same key names the same bytes. Nix's fetcher and state caches are not
-     content-addressed; the host's copy wins for the old canonical client cache. The historically nested `nix/nix` tree
-     can hold unique mutable SQLite state and Git packs: it is never host-wins-dropped or merged into the active client
-     cache. Its entire tree is retained under `~/.cache/nix/cowshed-retired/nix-nix`, with its moved bytes and retained
-     destination reported. An existing retained copy is reconciled only by byte equality; different bytes refuse without
-     overwriting or dropping either copy.
-  3. Directories the volume held for no detector — the gateway's `mirror/` and `repo-mirrors/`, sccache's store,
-     repository-placed caches such as `ttsc/` — move to their HOME location the same way: the gateway's to cowshed's own
-     cache directory, sccache's to its default directory, a repository's to the `[caches] home` path that repository
-     declares. Earlier Nix XDG-root wiring also placed Bun's install cache at `nix/.bun/install/cache` and Bun's runtime
-     transpiler cache at `nix/bun`: those move to `~/.bun/install/cache` and `~/.cache/bun`, respectively, not into the
-     Nix client cache.
+     pnpm, uv, Zig, Gradle, Go) every entry the host lacks moves in and every entry it already holds is dropped from the
+     volume, because the same key names the same bytes. Nix's fetcher and state caches are not content-addressed; the
+     host's copy wins for the old canonical client cache. The historically nested `nix/nix` tree can hold unique mutable
+     SQLite state and Git packs: it is never host-wins-dropped or merged into the active client cache. Its entire tree
+     is retained under `~/.cache/nix/cowshed-retired/nix-nix`, with its moved bytes and retained destination reported.
+     An existing retained copy is reconciled only by byte equality; different bytes refuse without overwriting or
+     dropping either copy.
+  3. Directories the volume held for no detector — the gateway's `mirror/` and `repo-mirrors/`, repository-placed caches
+     such as `ttsc/` — move to their HOME location the same way: the gateway's to cowshed's own cache directory, a
+     repository's to the `[caches] home` path that repository declares. Earlier Nix XDG-root wiring also placed Bun's
+     install cache at `nix/.bun/install/cache` and Bun's runtime transpiler cache at `nix/bun`: those move to
+     `~/.bun/install/cache` and `~/.cache/bun`, respectively, not into the transpiler cache at `nix/bun`: those move to
+     `~/.bun/install/cache` and `~/.cache/bun`, respectively, not into the Nix client cache.
 
      A legacy toolchain cache whose current owner instead declares checkout build state is placed with that existing
      build volume, never made into a new shared HOME cache merely to retire this volume. For `ttsc/`, the managed shell
@@ -327,21 +341,19 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   incrementally is part of that key. A `test` profile that differs from `dev` makes `cargo test` and `cargo build` two
   builds of every dependency, and a main warmed by one hands its clones nothing for the other; so `test` inherits `dev`,
   and `smoo monorepo check` asks nothing of it. Dependencies are never incremental and, through the one `$CARGO_HOME`,
-  are path-identical in every checkout, so the compile cache shares them as they are; workspace crates stay incremental.
-  For the same reason no cowshed-launched child — `land --check` included — sets `CARGO_INCREMENTAL`. Cargo itself turns
-  incremental off for workspace crates whenever `CI` is set: its precedence is `CARGO_INCREMENTAL`, then
-  `build.incremental`, then `CI`, and only then the profile's `incremental`, so no profile key outranks `CI`. A host
-  shell exporting `CI` therefore builds different units for those crates than a sandbox child, which never inherits it,
-  and main is warmed through `cowshed exec main --`.
+  are path-identical in every checkout, so the compile cache shares them as they are. With the mbx capability that
+  compile cache is the one store and a clone needs no copied target at all: units of either profile restore from
+  `<bc>/mbx`, and a crate being edited keeps mbx's private learned incremental state rather than Cargo's (mbx, below).
+  Without mbx, workspace crates stay incremental in the cloned build volume. Which incremental environment every Cargo
+  invocation sees on either path — `CARGO_INCREMENTAL`, the `CI` interaction, all of it — is 16_build_volumes.md's "One
+  Cargo environment on every path"; this file owns only where the resulting units are cached.
 
   **The parent config directories stay denied.** `~/.cargo/config.toml`, `~/.cargo/config`, `~/.cargo/credentials.toml`,
   `~/.cargo/credentials` and `~/.gradle/gradle.properties` sit beside the shared caches and are on the secret deny list
   (04_sandbox.md); a sandbox building against the host `$CARGO_HOME` cannot read or write any of them. `~/.cargo/bin`
   holds rustup's proxies and no credentials: a cargo project reads it, never writes it (above). A Gradle project's
-  `GRADLE_USER_HOME` is private (below), never the host's `~/.gradle`; `SCCACHE_DIR` reaches host shells and jobs
-  through the same capability contribution, naming the daemon's own cache directory, which the sandbox can neither read
-  nor write (below). Profile generation canonicalizes symlinked paths when emitting write grants (the `/var` →
-  `/private/var` handling generalizes).
+  `GRADLE_USER_HOME` is private (below), never the host's `~/.gradle`. Profile generation canonicalizes symlinked paths
+  when emitting write grants (the `/var` → `/private/var` handling generalizes).
 
 - **Environment variables.** Two sets, and neither is wiring a file could carry instead:
   - The in-image `.cowshed/env`, sourced by the workspace's `.envrc`, exports what processes cowshed never spawned need
@@ -349,18 +361,19 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     `COWSHED_PORT_BLOCK_SIZE` (04_sandbox.md, cooperative-sandboxing caveat), and in an Nx checkout the local Nx cache
     route's server and its read-only flag (`NX_SELF_HOSTED_REMOTE_CACHE_SERVER`,
     `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`; the route takes no credential, 05_gateway.md "`/nx/v1/cache/{hash}`").
-    It never exports the bare token as `COWSHED_WORKSPACE_TOKEN`. A served mount also publishes the sccache capability's
-    client environment below, and Nx's `NX_MAX_CACHE_SIZE` default; explicit caller cache-size overrides are preserved.
-    A served mount of a Cargo project also exports the Cargo capability's `CARGO_UNSTABLE_MTIME_ON_USE=true`, so a host
-    shell's cargo records each unit use as a job's does (16_build_volumes.md, "One Cargo environment on every path").
-    Linux exports no port values: services use private loopback and package/proxy wiring uses `http://127.0.0.1:7644`.
-    No workspace-identity variable is exported; anything that needs identity derives it from cwd via
-    `.cowshed/workspace.json` or asks the CLI. A served mount binds `NODE_COMPILE_CACHE` to
-    `<workspace>/.cowshed/cache/node-compile-cache`, replacing any caller or parent value rather than borrowing the
-    host's `XDG_CACHE_HOME`. When sourced by a read-only job whose `XDG_CACHE_HOME` is exactly this workspace's
-    `<exec-temp>/cache`, it instead binds the cache below that directory; activation never redirects that job's writes
-    into source. A minted environment unsets the variable until its supervisor publishes the served paths, so a staging
-    clone never inherits another workspace's cache.
+    It never exports the bare token as `COWSHED_WORKSPACE_TOKEN`. A served mount of a Cargo project with the mbx
+    capability also publishes the canonical mbx environment (11_shell.md, "Canonical mbx environment"), which names the
+    one store at `<bc>/mbx`, and an Nx mount publishes Nx's `NX_MAX_CACHE_SIZE` default; explicit caller cache-size
+    overrides are preserved. A served mount of a Cargo project also exports the Cargo capability's
+    `CARGO_UNSTABLE_MTIME_ON_USE=true`, so a host shell's cargo records each unit use as a job's does
+    (16_build_volumes.md, "One Cargo environment on every path"). Linux exports no port values: services use private
+    loopback and package/proxy wiring uses `http://127.0.0.1:7644`. No workspace-identity variable is exported; anything
+    that needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI. A served mount binds
+    `NODE_COMPILE_CACHE` to `<workspace>/.cowshed/cache/node-compile-cache`, replacing any caller or parent value rather
+    than borrowing the host's `XDG_CACHE_HOME`. When sourced by a read-only job whose `XDG_CACHE_HOME` is exactly this
+    workspace's `<exec-temp>/cache`, it instead binds the cache below that directory; activation never redirects that
+    job's writes into source. A minted environment unsets the variable until its supervisor publishes the served paths,
+    so a staging clone never inherits another workspace's cache.
   - The supervisor sets, for every job it spawns (`runtime/supervisor.rs` `sandbox_environment`):
     - the private environment: `HOME`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `DIRENV_CONFIG`, `TMPDIR` (the workspace's
       temp dir in the project store, 04_sandbox.md) and `XDG_RUNTIME_DIR`; - Node and compatible runtimes' module
@@ -382,15 +395,14 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
       path; and for a Gradle project a private `GRADLE_USER_HOME` under the private cache whose `caches` links to the
       host's `~/.gradle/caches`, so the daemon, wrapper distributions, native libraries and JDKs stay private and no
       other part of the host `~/.gradle` is granted;
-    - the `.cowshed/env` set again (the port pair, and for an Nx project the cache route pair), `SCCACHE_SERVER_UDS` and
-      `SCCACHE_DIR` (the host sccache daemon, below), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases, carrying
-      the token as proxy userinfo. A caller's `COWSHED_WORKSPACE_TOKEN` is withheld, not forwarded;
-    - the build wiring, also emitted into `.cowshed/env` from the same sccache capability: `SCCACHE_BASEDIR_CWD=1`,
-      `SCCACHE_BASEDIR=<workspace root>`, and `RUSTC_WRAPPER` naming `bin/sccache` inside the store path the host's
-      sccache GC root pins, the program the daemon itself runs (below). It is read through the root before every spawn
-      and names the program rather than a `PATH` entry: shell activation owns `PATH`, and a repository shell that ships
-      no sccache left a bare `sccache` unresolvable, failing every cargo at its version probe. A host that pinned none —
-      sccache is opt-in — or whose pinned store path was collected gets no wrapper at all; no value is the caller's;
+    - the `.cowshed/env` set again (the port pair, `COWSHED_BUILD_CACHE` on a host with a provisioned build-cache
+      volume, for an Nx project the cache route pair, and for a Cargo project with the mbx capability the canonical mbx
+      environment, 11_shell.md "Canonical mbx environment"), and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases,
+      carrying the token as proxy userinfo. A caller's `COWSHED_WORKSPACE_TOKEN` is withheld, not forwarded;
+    - no compiler-cache wrapper of cowshed's: a job gets no `RUSTC_WRAPPER` from cowshed and no compiler-cache endpoint
+      variable, and a caller's values for them never reach it. A build through mbx installs mbx's own compiler shims for
+      the length of that build (mbx, below); how `cargo` invokes mbx is the mbx capability's wiring
+      (15_capabilities.md), never an export from here;
     - for a Cargo project, the Cargo capability's `CARGO_UNSTABLE_MTIME_ON_USE=true`, which `.cowshed/env` sources too
       and no caller's value replaces: a build stamps the fingerprint hash file of every unit it uses, `Fresh` ones
       included, so Cargo output retention can tell a unit still in use from one only built long ago. It changes no unit
@@ -412,51 +424,114 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     No registry client receives the workspace token from a file: it travels only as proxy userinfo. No job environment
     and no `.cowshed/env` carries it bare, and no file under the private `home`, `config` or `cache` carries it. Within
     one workspace a child inherits its parent's proxy variables, token included, by design; a fork's inherited shell
-    export leaves the proxy variables and every token-bearing name out, and the fork's own supervisor sets its own. The
-    cargo `[env]` guidance above mirrors `SCCACHE_SERVER_UDS` for cargo builds cowshed never spawned.
+    export leaves the proxy variables and every token-bearing name out, and the fork's own supervisor sets its own.
 
-    **Paths under the checkout but outside the cwd.** sccache hashes every `CARGO_*` value and every env-dep value into
-    a Rust key, and `SCCACHE_BASEDIR_CWD=1` normalizes only the request's cwd prefix. cargo runs a registry crate's
-    rustc from its package directory, so the OUT_DIR its build script fills (`<checkout>/target/.../out`) is outside
-    that cwd, and a crate that includes from it — serde and serde_core do — keyed and recorded the checkout, as did
-    every crate built on it. A nested Cargo workspace (a vendored upstream checkout) has the same problem with
-    `CARGO_HTTP_CAINFO` (`<checkout>/.cowshed/ca-bundle.pem`) and the devenv's `CARGO_INSTALL_ROOT`
-    (`<checkout>/tooling/direnv/.devenv/state/cargo-install`): 0/192 cross-workspace hits measured. Neither path can
-    take a stable spelling: the bundle's content is per workspace (the platform roots plus the workspace's own CA,
-    04_sandbox.md), and a path spelled the same in every workspace but holding each workspace's content would need a
-    per-process filesystem namespace, which macOS does not have. So every job also gets
-    `SCCACHE_BASEDIR=<workspace root>`, the bundled sccache's per-request base (both hashers): it strips and remaps the
-    workspace root as the cwd is, and at a workspace member's cwd it keys exactly as `SCCACHE_BASEDIR_CWD=1` alone. A
-    C/C++ request under it runs with direct mode off. A build whose outputs are relative to a deeper root (cmake and
-    ninja below a checkout) sets its own.
+    **Paths under the checkout but outside the cwd.** A compiler cache keyed on absolute paths keys every checkout
+    apart: cargo runs a registry crate's rustc from its package directory, so the OUT_DIR its build script fills
+    (`<checkout>/target/.../out`) is a path value a crate that includes from it — serde and serde_core do — keys on, as
+    does every crate built on it, and a per-workspace path value such as `CARGO_HTTP_CAINFO`
+    (`<checkout>/.cowshed/ca-bundle.pem`) or the devenv's `CARGO_INSTALL_ROOT` has the same effect. mbx answers this by
+    construction, so cowshed emits nothing for it: mbx maps the workspace, target, Cargo registry, toolchain and sysroot
+    paths it knows to stable placeholders before they enter an action key, and gives rustc a shared, content-addressed
+    `OUT_DIR` inside its cache directory for build-script output a compilation reads, so an identical output tree is the
+    same path in every checkout (mbx, below). What mbx cannot model exactly it bypasses — the compiler runs and no entry
+    is stored — so a path value in a job's environment can cost a bypass, which `mbx explain` names, and can never
+    silently partition the one store per checkout. Enforced by tests that must exist: the same crate built through mbx
+    in two checkouts of one tree records a store hit in the second checkout, including a crate that includes generated
+    code from its build script's `OUT_DIR`; and the job environment of an mbx-capable project carries no `RUSTC_WRAPPER`
+    and no `SCCACHE_*` name, whatever the caller exported.
 
-### The sccache daemon
+### mbx
 
-sccache is served by a **host-owned daemon**: the `dev.cowshed.sccache` LaunchAgent runs the sccache binary itself as a
-foreground unix-socket server outside every sandbox — `SCCACHE_START_SERVER=1` selects server mode,
-`SCCACHE_NO_DAEMON=1` keeps it in the foreground under launchd supervision, `SCCACHE_IDLE_TIMEOUT=0` disables idle exit,
-and its environment pins `SCCACHE_SERVER_UDS=/private/cowshed/store/sccache.sock` and `SCCACHE_DIR` to sccache's own
-default cache directory — `~/Library/Caches/Mozilla.sccache` on macOS, `~/.cache/sccache` on Linux — (all
-source-verified against sccache 0.16, which reads `SCCACHE_SERVER_UDS` in both client and server ahead of
-`SCCACHE_SERVER_PORT`; the TCP port is the fallback wiring only on a platform without unix sockets, and then the
-Seatbelt loopback-allow class in 04_sandbox.md applies). `cowshed sccache start|stop|status` install, remove, and probe
-the agent; start is healthy when the socket answers. Every disk-cache read and write happens inside the daemon
-(source-verified: sccache instantiates its disk cache only in the server process), so no sandbox is granted the store at
-all — it is **daemon-only**, and the HOME read deny covers it. `cowshed setup` writes sccache's own client config with
-the same directory and the daemon's size cap, so a store-less client that starts a server of its own neither forks a
-second cache nor evicts the shared one down to sccache's 10 GiB default.
+mbx is the Cargo compiler cache. There is **one mbx cache directory per host, `<bc>/mbx`** on the build-cache volume
+(01a_apfs.md), named to every job of a Cargo project with the mbx capability by the canonical mbx environment
+(11_shell.md, "Canonical mbx environment"; the capability itself is 15_capabilities.md's). It holds mbx's
+content-addressed action store, its private per-checkout learned incremental state, and its managed target directories
+at mbx's default `<bc>/mbx/targets/v1/<checkout digest>`; a checkout's `target` is mbx's managed-target link to its
+directory there (16_build_volumes.md states the link rules). Cowshed sets no `target.root`: store and targets stay on
+the one filesystem, so a restore reflinks a store object into the managed target instead of copying it (The
+reflink-reachability rule, above).
 
-Host ownership is the boundary: a server a workspace spawned would inherit that workspace's Seatbelt profile and apply
-it to every other client, while launchd starts this one outside every sandbox, so it enforces no workspace's boundary
-and can serve them all. No client-side mode avoids a server: `SCCACHE_NO_DAEMON=1` only stops an auto-spawned server
-from detaching, and a client still spawns one on connect failure (source-verified, sccache 0.16). Because no sccache
-0.16 client flag suppresses that auto-spawn fallback, the sandbox provides the fail-fast: binding
-`/private/cowshed/store/sccache.sock` needs write-create under `/private/cowshed/store`, which no workspace holds, so a
-client whose daemon is down fails its compile promptly with a bind error instead of wedging — and can never stand up a
-wrong-boundary server for siblings. The daemon is a trusted mediator in the nix-daemon sense, with its confused-deputy
-surface named explicitly in 04_sandbox.md: the unsandboxed daemon reads sources and executes a client-named compiler at
-a sandboxed client's request, accepted under the same threat model that already concedes layer-3 poisoning (below)
-because it adds immediacy, not new reach, while the store's write surface strictly narrows.
+**Every shed reads and writes the one store** (the owner's ruling, 2026-10-27). A job reaches it through its sandbox
+grant on exactly that subtree (04_sandbox.md), and a host build in a checkout uses the same directory, so an action any
+shed or main compiles is a hit for every other — in flight as well as after the fact, because mbx single-flights an
+identical compilation another build against the same cache directory is already running. Direct write access is the
+trust model, not an oversight: poisoning is not a boundary here, because the agents in those sheds can land code (Known
+limitations, below). There is no compiler-cache daemon and no socket: mbx's cache agent lives inside each build's
+process tree and exits with the build, so no cowshed verb starts, stops or probes a cache server, and no unsandboxed
+process compiles at a sandboxed client's request.
+
+**Keys are portable across checkouts.** mbx maps the workspace, target, Cargo registry, toolchain and sysroot paths it
+knows to stable placeholders before they enter an action key, and the key also covers the compilation's inputs and
+relevant environment. Build-script output a compilation reads through `OUT_DIR` is shared as a content-addressed copy
+inside the cache directory, so an identical output tree is one path in every checkout. Anything mbx cannot model exactly
+— an unknown flag, an unmodeled search path, a linker it cannot describe — bypasses: the real compiler runs, nothing is
+stored, and `mbx explain` names the reason. A crate under active editing keeps private incremental state under
+`<bc>/mbx/incremental`, seeded copy-on-write from the most recent checkout that built it; that state never enters the
+shared store. What Cargo environment every invocation sees is 16_build_volumes.md's "One Cargo environment on every
+path"; when mbx's scheduler is the host's CPU and memory ledger is 05_gateway.md's "Host scheduling".
+
+**Collection is mbx's own; cowshed collects nothing under `mbx/`.** mbx owns `mbx/` on the volume (01a_apfs.md), and
+build volumes are not on it — they stay images on the store (16_build_volumes.md) — so cowshed's build-volume garbage
+collection never enters `<bc>/mbx`, and no cowshed cap, sweep or `gc` names a store object or a managed target. mbx
+bounds its three parts against the disk that holds them: the action store under `gc.max_size` (default 5% of that disk,
+between 5 GiB and 500 GiB), managed targets under `target.max_size` (default 10%, between 10 GiB and 100 GiB), and
+learned incremental state under `gc.incremental_max_size` (default 5%, between 10 GiB and 100 GiB). How mbx sizes a
+role-less APFS volume inside a shared container is [INFERENCE] until measured on a provisioned host. Budgets are
+host-global mbx settings: a repository's `.mbx.toml` cannot carry collection or placement settings, and cowshed writes
+none per project.
+
+Within those budgets, mbx removes a managed target whose checkout is gone, regardless of the limits; a target unused for
+`target.max_age`; and least-recently-used targets while over `target.max_size`. Removing a target never removes store
+objects, and when the store itself must shrink, compilations no live checkout uses go first. Cowshed bends that order
+exactly twice, through mbx's host-global settings: `target.keep` names each project's main checkout, whose managed
+target is never collected for age or size, and `target.evict_first` names the shed mount tree, whose targets go before
+any other when the targets are over budget. A kept target is still removed when its checkout is gone. `cowshed setup`
+writes both settings and `adopt` adds a project's main to `target.keep` [INFERENCE: the writing step's exact mechanics
+are the implementation's; the settings live in mbx's host-global configuration, never in a repository file]. Enforced by
+tests that must exist: after `setup` and `adopt`, mbx's effective settings show the shed tree in `target.evict_first`
+and each adopted main in `target.keep`; a removed shed's managed target is collected while main's survives an
+over-budget sweep; and a cowshed garbage-collection run leaves every byte under `<bc>/mbx` untouched.
+
+The volume mounts `noatime` (01a_apfs.md). What that costs mbx, and whether the volume keeps `noatime` under that cost,
+is 16_build_volumes.md, "Open questions", not a choice made here.
+
+**Remote cache is a designed-for non-goal.** No remote is configured: cowshed writes no `[remote]` settings, gives no
+job an `MBX_REMOTE_*` value, and holds no cache-server or bucket credential. The design keeps one addable without
+re-keying anything: action keys are already path-portable (above), so an action compiled on one host names the same key
+on another host with the same toolchain identity; `<bc>` is platform-specific, and cross-host `OUT_DIR` reuse needs the
+same platform path on both hosts; and an mbx remote downloads into this same local store, so the local wiring would not
+move. A remote, when one is configured, is configured once and host-globally — a cache server or an S3-compatible
+bucket, a namespace per project — and follows mbx's environment write policy, under which only a trusted
+protected-branch build keeps a configured `read-write` and every other context narrows to read-only: CI publishes from
+main, sheds read. Learned incremental state and managed targets never leave the host under a remote. Nothing in the
+local design depends on a remote existing, and no environment reserves a placeholder for one.
+
+### Nx cache
+
+Each checkout of an Nx project has **its own local Nx cache, paired with its own task database**: `.nx/cache` and
+`.nx/workspace-data` are both build-volume state, reached through the checkout's fixed links (16_build_volumes.md states
+the link table), cloned from the seed at fork and adopted by the target at land. No two checkouts ever name the same
+`.nx/cache` directory. The database is the cache's only index — its rows name exactly the entries that one checkout's
+directory holds — so the pair is cloned, adopted, evicted and cleared as one unit: Nx's own eviction, bounded by
+`NX_MAX_CACHE_SIZE` (Wiring, above), deletes only entries its own database indexes, and a row without a payload cannot
+arise from eviction, because no second database and no external collector names this directory. Clearing takes the pair
+together (16_build_volumes.md, "Clearing a checkout's Nx state"). Jobs reach both through the checkout's own
+build-volume grant (04_sandbox.md), read-only jobs included: a read-only job's source tree is read-only, its build
+volume is not.
+
+**A shared local content directory is refused**, for two facts read in the pinned Nx 23.2.1's native cache
+(`packages/nx/src/native/cache/cache.rs`). First, it buys nothing: a local lookup is a query against the checkout's own
+database — an update-and-return on its `cache_outputs` row for the hash — so an entry another checkout wrote into a
+shared directory, with no row in this database, is a miss; sharing the directory produces no cross-checkout hits at all.
+Second, it loses what exists: storing an entry first removes the task's directory and then rewrites it, so one checkout
+storing a hash destroys the payload a sibling is restoring from the same directory, and two checkouts storing the same
+hash destroy each other's. Concurrent writers to one local directory are destructive inside the dependency itself, where
+no lock, collector or repair pass of cowshed's can intervene. The sharing route Nx does model is its remote-cache path,
+where a fetched result is applied into the local database with its record (`apply_remote_cache_results`) — and that is
+the gateway's accepted-task artifact service (below). Cross-checkout warmth therefore travels only the two routes that
+carry a record with the payload: the build volume itself, cloned at fork and adopted at land, and the accepted store a
+land publishes.
 
 ### Nx accepted-task artifact service
 
@@ -467,11 +542,11 @@ loopback, with no credential: a hash names a task's inputs, so a result stored u
 cache (05_gateway.md, "No credential: one user, localhost"). Sheds only read it; a land is its only writer, by
 configuration (05_gateway.md, "Sheds read; a land writes").
 
-Nx's live database and local cache remain private to each checkout/build volume. Accepted task archives are a separate
-host-owned store, not a shared `.nx` directory, blob CAS, or Cargo warm volume. Cowshed reuses the public
-`@smoothbricks/nx-cache-server` Bun server and its stock `GET`/`PUT /v1/cache/{hash}` protocol. Each project has one
-backend listener and one flat entries directory under cowshed's host cache directory; the gateway maps project identity
-to that backend. A hash in one project cannot name another project's archive.
+Nx's live database and local cache remain private to each checkout/build volume (Nx cache, above). Accepted task
+archives are a separate host-owned store, not a shared `.nx` directory, blob CAS, or Cargo warm volume. Cowshed reuses
+the public `@smoothbricks/nx-cache-server` Bun server and its stock `GET`/`PUT /v1/cache/{hash}` protocol. Each project
+has one backend listener and one flat entries directory under cowshed's host cache directory; the gateway maps project
+identity to that backend. A hash in one project cannot name another project's archive.
 
 The gateway service owns the backend lifecycle, outside every workspace sandbox, using an installed copy of the
 package's server bundle rather than a workspace's source files. The package ships that bundle as one
@@ -481,8 +556,8 @@ its invoker's `PATH` finds `bun`, named as a devenv or nix profile and never as 
 `bun` is the one the gateway runs. One process exclusively owns each entries directory, and binds loopback only; its
 configuration is host-owned, and no repository, workspace child environment, or sandbox receives a filesystem grant to
 the store. Every checkout reads its project's results. Only a land publishes: after its gate passes it stores every task
-result its gate attributed, local hits included, without rebuilding (05_gateway.md, "Publication"). There is no scratch
-store, and a shed's read-only Nx client builds no archive and sends no `PUT`.
+result its gate attributed, local hits included, without rebuilding (05_gateway.md, "/nx/v1/cache/{hash}"). There is no
+scratch store, and a shed's read-only Nx client builds no archive and sends no `PUT`.
 
 The installed gateway starts the backend as `bun <installed bundle> --exit-on-stdin-eof`, `bun` resolved on that
 recorded `PATH` at each start (none found is a start failure said as one), and retains the write end of its stdin pipe
@@ -549,7 +624,8 @@ superseded source in the same change.
 ## What a land re-runs
 
 A cached task's key is every input it declares: its files, its dependencies' files, its environment, runtime and
-toolchain inputs. With a warm cache holding a valid entry for each key, a land gate runs only the tasks whose key the
+toolchain inputs. With warm caches holding a valid entry for each key — the checkout's own Nx cache and the accepted
+store behind it for tasks, the one mbx store for Cargo units (mbx, above), a land gate runs only the tasks whose key the
 landed commits (or a changed runtime or toolchain input) changed, plus the targets that state `"cache": false`, each for
 a reason its configuration names; a re-gate of an unchanged tree runs those uncached targets alone. A cold, evicted or
 unreachable entry runs its task again, as a cache degrade does (Nx accepted-task artifact service, above). Six rules
@@ -595,25 +671,28 @@ twenty minutes of gate for a one-line change).
   config loads re-keyed 44 lint targets of a downstream workspace, 464 task-seconds, in land icm-land-10.
 
 Cargo's own reuse is not where the time goes: a TypeScript-only land compiled no Rust unit, and a cowshed-core change
-compiled exactly the seven cowshed crates downstream of it. The targets that state `"cache": false` are `cargo-fetch`
-(the registry lives outside Nx outputs; nx-plugin README, "Cargo cache boundaries"), `shard-timings`,
-`tooling:lint-disk-commands`, the ttsc and capability-probe warmups (their caches live outside Nx outputs) and the
-packaging checks; they are what a re-gate re-runs.
+compiled exactly the seven cowshed crates downstream of it. For an mbx-capable project that reuse does not travel in the
+adopted build volume at all: the gate's Cargo hits come from the one mbx store, which the landing shed — and every
+sibling — already wrote to, so a land compiles only the units its own commits invalidated. Without mbx, Cargo warmth
+rides the adopted build volume. The targets that state `"cache": false` are `cargo-fetch` (the registry lives outside Nx
+outputs; nx-plugin README, "Cargo cache boundaries"), `shard-timings`, `tooling:lint-disk-commands`, the ttsc and
+capability-probe warmups (their caches live outside Nx outputs) and the packaging checks; they are what a re-gate
+re-runs.
 
 ## Convention table
 
 Cache classification is a built-in table keyed by well-known names — never configuration:
 
-| Name (at any depth, gitignored)                       | Class                         |
-| ----------------------------------------------------- | ----------------------------- |
-| `node_modules`                                        | workspace-keyed, in-image     |
-| `target` (with `Cargo.toml` sibling)                  | workspace-keyed, build volume |
-| `.nx`                                                 | workspace-keyed, build volume |
-| `.turbo`, `.next`, `.expo`, `.gradle` (project-local) | workspace-keyed, in-image     |
-| `.zig-cache`, `zig-cache`, `zig-out`                  | workspace-keyed, in-image     |
-| `DerivedData` (project-local)                         | workspace-keyed, in-image     |
-| `Pods`                                                | workspace-keyed, in-image     |
-| `vendor` (with `go.mod` sibling)                      | workspace-keyed, in-image     |
+| Name (at any depth, gitignored)                       | Class                                                                                                               |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `node_modules`                                        | workspace-keyed, in-image                                                                                           |
+| `target` (with `Cargo.toml` sibling)                  | workspace-keyed, build volume; with the mbx capability, mbx's managed-target link into `<bc>/mbx` — not build state |
+| `.nx`                                                 | workspace-keyed, build volume                                                                                       |
+| `.turbo`, `.next`, `.expo`, `.gradle` (project-local) | workspace-keyed, in-image                                                                                           |
+| `.zig-cache`, `zig-cache`, `zig-out`                  | workspace-keyed, in-image                                                                                           |
+| `DerivedData` (project-local)                         | workspace-keyed, in-image                                                                                           |
+| `Pods`                                                | workspace-keyed, in-image                                                                                           |
+| `vendor` (with `go.mod` sibling)                      | workspace-keyed, in-image                                                                                           |
 
 The table exists so `cowshed doctor` can report cache health and so the Seatbelt baseline can include project-local
 build dirs as writable without per-project config. Unknown build dirs are simply in-image files — nothing breaks; the
@@ -640,24 +719,28 @@ table is advisory metadata, not a gate.
 - **Path-keyed warm state.** Cargo keys a workspace crate on its package-relative path, so a session at a per-name mount
   finds main's units fresh; what stays path-keyed is whatever a build records absolutely — a dependency's `$CARGO_HOME`
   path (one literal path, above) and a build script's watched path outside its package — and Xcode DerivedData. Slot
-  mounts (`fork --slot`) recycle stable paths for those. A compiled-in `env!("CARGO_MANIFEST_DIR")` is worse than
+  mounts (`fork --slot`) recycle stable paths for those. Under mbx the same fact appears as a key rather than a
+  freshness accident: a crate that reads a checkout path — `env!("CARGO_MANIFEST_DIR")`, an `OUT_DIR` value it embeds —
+  keys to its checkout and compiles there, and its dependents share again only when its bytes agree across checkouts;
+  mapping the workspace root to a placeholder is mbx's `share_workspace_root`, which cowshed does not set, because it
+  rewrites the source paths debug info records. Without mbx, a compiled-in `env!("CARGO_MANIFEST_DIR")` is worse than
   path-keyed: cargo does not fingerprint the checkout path, so the inherited unit stays fresh and reads its origin's
   files; the path is read at run time instead, where cargo and nextest set it. cowshed does not force compiler flags.
 - **Poisoning model.** Lockfile integrity hashes protect _downloads_ (layer 1 is verified by the package managers
-  themselves), not cache _reuse_: layers 2–3 are trusted once written. State this plainly: the layer-3 write scope a
-  sandbox holds includes cargo's `registry/src`, bun's global cache (whose `links/` main's `node_modules` resolves
-  into), uv's cache and the Go caches — caches that _main itself compiles from_, so a poisoned entry can influence
-  main's next build. That is an accepted risk under the confinement threat model (semi-trusted agents running the user's
-  own code), bounded by write scope — a sandboxed workspace can write only the designated layer-3 subtrees, never the
-  gateway mirror or `repo-mirrors` (layer 1, gateway-only) and never the Cargo/Gradle _config_ beside the shared caches
-  (deny-listed, above). Keeping the caches in the host HOME widens nothing: the host's tools read the same directories
-  the volume's links led them to before. The sccache store left that direct write scope entirely (Wiring): it is
-  daemon-write-only, so poisoning it means going through the daemon's compile path rather than writing entries — the
-  same trust class with one fewer direct write surface, traded against the daemon's named confused-deputy surface
-  (04_sandbox.md). Go's posture within that scope is notably stronger than cargo's: module downloads verify against
-  `go.sum` plus the checksum database, extraction is ziphash-verified, and `GOMODCACHE` entries land read-only (0444) —
-  tampering requires an explicit chmod, which the escape suite exercises (04_sandbox.md); `GOCACHE` is the
-  sccache-analog and shares its trust level.
+  themselves), not cache _reuse_: layers 2–3 are trusted once written. State this plainly: the write scope a sandbox
+  holds on those layers includes cargo's `registry/src`, bun's global cache (whose `links/` main's `node_modules`
+  resolves into), uv's cache and the Go caches — caches that _main itself compiles from_, so a poisoned entry can
+  influence main's next build. That is an accepted risk under the confinement threat model (semi-trusted agents running
+  the user's own code), bounded by write scope — a sandboxed workspace can write only the designated layer-3 subtrees,
+  never the gateway mirror or `repo-mirrors` (layer 1, gateway-only) and never the Cargo/Gradle _config_ beside the
+  shared caches (deny-listed, above). Keeping the caches in the host HOME widens nothing: the host's tools read the same
+  directories the volume's links led them to before. The mbx store is inside that direct write scope by design (the
+  owner's ruling, 2026-10-27): every shed writes store objects directly, with no mediating daemon, so a poisoned mbx
+  entry is the same trust class as a poisoned registry source — accepted because an agent who could write one can also
+  land code. Go's posture within that scope is notably stronger than cargo's: module downloads verify against `go.sum`
+  plus the checksum database, extraction is ziphash-verified, and `GOMODCACHE` entries land read-only (0444) — tampering
+  requires an explicit chmod, which the escape suite exercises (04_sandbox.md); `GOCACHE` is a compiler cache in the mbx
+  store's trust class and shares its trust level.
 - **Proxy-unaware tools.** Tools that hardcode registries need per-tool shims in the wiring step; the shim list grows by
   experience and lives in cowshed-core, not user config.
 - **Simulator and Xcode state.** CoreSimulator device sets (`~/Library/Developer/CoreSimulator`) are **dev-uid host
@@ -686,16 +769,28 @@ full copy of the cache (measured: a 5.5 GB copy inherited by every clone of one 
 paths survive everything. So identity is the marker file, the gateway URL lives in the config files that consume it, and
 shared package cache locations are the tools' own default directories — none of them an export. What is exported is what
 no file can carry (the list above): Go's env file path, the token and port pair a dev server or proxy client needs, the
-sccache endpoint for compile paths with no config file, `NODE_COMPILE_CACHE` for workspace-owned module compilation, and
-the per-job private environment and trust anchors only the supervisor can set.
+the mbx capability's canonical environment for builds no file can configure, `NODE_COMPILE_CACHE` for workspace-owned
+module compilation, and the per-job private environment and trust anchors only the supervisor can set.
 
-**Gateway-proxied sccache rejected.** Routing sccache through cowshed-gateway would mean translating sccache's own
-client-server protocol for zero policy gain — the gateway mediates _egress_, and the sccache daemon never leaves the
-host. cowshed adds lifecycle and scoped socket access, not protocol translation.
+**A shared local Nx content directory rejected.** It reads as free shed-to-shed sharing and is neither shareable nor
+free under the pinned Nx 23.2.1: a local hit is gated on the checkout's own task-database row, so shared bytes yield no
+hits, and a store removes then rewrites the entry, so siblings destroy each other's payloads (Nx cache, above). Sharing
+travels the route that carries a record with its payload — the accepted-task artifact service.
+
+**A per-checkout compiler cache behind a wrapper daemon — the sccache shape — rejected.** It caches one rustc invocation
+at a time through a client-server daemon cowshed would host, patch and grant a socket to; its keys name absolute paths
+unless every caller normalizes them identically; and it still leaves every shed compiling identical units its siblings
+already built, relinking identical test binaries and rerunning identical build scripts. The mbx store removes the
+daemon, the patches and the per-shed duplication together: one content-addressed store every shed writes directly, keys
+path-portable by construction, identical in-flight work single-flighted, and links and build-script executions as
+cacheable actions (mbx, above). The price is one more pinned third-party binary, owned where every pinned tool is owned
+(14_nix.md, "mbx").
 
 **Cross-session cache harvest rejected.** Actively copying new cache entries between live sessions adds a mutable side
 channel between sandboxes and machinery (staging, folding, scheduling) whose entire benefit is bytes that
-land-then-clone convergence already delivers a few hours later.
+land-then-clone convergence already delivers a few hours later. Where live sharing is sound it needs no harvester: those
+caches are shared in place — layer 3 at the tools' HOME defaults, the mbx store on the build-cache volume — and a cache
+that cannot be shared in place, an Nx local cache, cannot be harvested into soundness either (Nx cache, above).
 
 **A dedicated caches volume rejected.** Earlier releases put layer 3 on its own volume and linked the host's tool paths
 into it, so that a sandbox's write scope was one subtree outside HOME. It bought nothing the HOME read deny and exact

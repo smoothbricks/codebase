@@ -31,6 +31,7 @@ counterpart is [01a_apfs.md](./01a_apfs.md).
 └── cowshed                          com.apple.devdisk=off  com.apple.browse=off  com.apple.mimic=off
     │                                com.apple.ignoreowner=off                    (all local)
     ├── store                        mountpoint=/private/cowshed/store  com.apple.ignoreowner=on (local)
+    ├── build-cache                  Linux only; hierarchy and mountpoint in 09_substrates.md
     └── projects                     mountpoint=none
         └── <owner>/<repo>           (inherit mountpoint=none: never mounted)
             ├── main                 mountpoint=<checkout path>
@@ -43,34 +44,36 @@ counterpart is [01a_apfs.md](./01a_apfs.md).
                 └── .trash           canmount=off  mountpoint=none
 ```
 
-The two children of `<pool>/cowshed` and their roles are 09_substrates.md's fixed hierarchy. A project's build volumes
-are datasets under its own container, `…/projects/<owner>/<repo>/build/<id>`, so creation, helper containment,
-discovery, send/receive and collection see one tree per project. `canmount=off` makes `ws` and `build` property
-containers: they pass their `mountpoint` down by inheritance and are never mounted themselves, so every workspace and
-build dataset mounts at its own path and never inside another dataset's mount. `canmount` is not inherited, so the
-datasets below them mount normally. Retirement does not rely on that inheritance: it unmounts a dataset, sets
-`canmount=off` on it locally and only then renames it under a `.trash` container (`mountpoint=none`). `canmount=off`
-holds whatever `mountpoint` the dataset carries, so main, whose `mountpoint` is set locally to its checkout path and
-survives a rename, cannot remount there; `rm main --restore` retires main this way, into `ws/.trash`, before it swaps
-the retained tree back (02_workspaces.md, "Checkout layouts"). Collection sets `canmount=off` on any dataset it finds
-under a `.trash` without it before it decides anything else about that dataset.
+The children of `<pool>/cowshed` and their roles are 09_substrates.md's fixed hierarchy; `build-cache` among them is
+Linux-only ("The mbx store on a ZFS host", below). A project's build volumes are datasets under its own container,
+`…/projects/<owner>/<repo>/build/<id>`, so creation, helper containment, discovery, send/receive and collection see one
+tree per project. `canmount=off` makes `ws` and `build` property containers: they pass their `mountpoint` down by
+inheritance and are never mounted themselves, so every workspace and build dataset mounts at its own path and never
+inside another dataset's mount. `canmount` is not inherited, so the datasets below them mount normally. Retirement does
+not rely on that inheritance: it unmounts a dataset, sets `canmount=off` on it locally and only then renames it under a
+`.trash` container (`mountpoint=none`). `canmount=off` holds whatever `mountpoint` the dataset carries, so main, whose
+`mountpoint` is set locally to its checkout path and survives a rename, cannot remount there; `rm main --restore`
+retires main this way, into `ws/.trash`, before it swaps the retained tree back (02_workspaces.md, "Checkout layouts").
+Collection sets `canmount=off` on any dataset it finds under a `.trash` without it before it decides anything else about
+that dataset.
 
 ## The datasets of a workspace
 
 A workspace is a **worktree dataset** (the source volume of 16_build_volumes.md: the git tree, `.git`, installed
-dependencies, declared task outputs) and, when its tree has build state, a **build dataset** (its build volume: Cargo
-target directories, the Nx cache and task database, declared build state). A checkout whose tree can name no build state
-(no tracked Cargo or package manifest, no declared `[build] state`, no enabled Nx detector match) has no build dataset
-until its first touch needs one (16_build_volumes.md, "Refresh"). A fork clones both from snapshots, so a new workspace
-starts with its source's files and its target's warm build state.
+dependencies, declared task outputs) and, when its tree has build state, a **build dataset** (its build volume: the Nx
+cache and task database, declared build state, and Cargo target directories in a project without the mbx capability;
+16_build_volumes.md owns the full list). A checkout whose tree can name no build state (no tracked Cargo or package
+manifest, no declared `[build] state`, no enabled Nx detector match) has no build dataset until its first touch needs
+one (16_build_volumes.md, "One link per checkout"). A fork clones both from snapshots, so a new workspace starts with
+its source's files and its target's warm build state.
 
 - **Worktree.** `cowshed fork [<src>] <ws>` takes `<src>@cowshed:fork-<ws>` and clones it to `ws/<ws>`; the source
   defaults to main. Each workspace has one origin snapshot, destroyed with it (09_substrates.md, "The clone-origin
   dependency"). A ZFS snapshot is transactionally atomic, so there is no flush, descriptor clone or `fsck` before the
   clone mounts.
 - **Build.** The fork clones its target's latest seed, `zfs clone <target-build>@seed-<n> build/<id>`. A block-level
-  clone carries every file's bytes and modification time, so every Cargo unit the seed held is Fresh in the fork and
-  every Nx task the seed recorded is a cache hit.
+  clone carries every file's bytes and modification time, so every Cargo unit the seed held is Fresh in the fork (a
+  project with the mbx capability holds none in its seed) and every Nx task the seed recorded is a cache hit.
 - **Seed.** A seed is a snapshot, `build/<id>@seed-<n>`, of the build dataset it freezes (the target's live dataset at a
   reseed, the landing workspace's at Land step 5.4), taken under the writer exclusion of
   [16_build_volumes.md §Targets and seeds](./16_build_volumes.md#targets-and-seeds): the build hold, the Nx task
@@ -253,6 +256,26 @@ takes effect when a dataset mounts, so the mount table is attested too: every mo
 (`f_mntfromname`) is its dataset name. A `/dev/disk…` source is a dataset mounted with a proxy disk, reported by name
 with the remount that drops it. The macOS real-ZFS test lane counts the host's registered `IOMedia` before and after
 adopt, fork, land and `rm`, and requires the counts equal.
+
+## The mbx store on a ZFS host
+
+The one shared mbx store is not a per-workspace dataset and never sits inside a build dataset: in a project with the mbx
+capability the checkout's `target` is mbx's managed-target link out of the build dataset altogether
+(16_build_volumes.md; 15_capabilities.md), and every shed writes the same store (03_caches.md, "mbx"). On a Linux ZFS
+host the store lives in its own dedicated dataset, **`<pool>/cowshed/build-cache`**; its place in the hierarchy and its
+mountpoint are 09_substrates.md's ("Linux host paths", "Fixed dataset hierarchy") and are cited here, not restated. That
+dataset is Linux-only: a macOS host, on ZFS or not, always uses the APFS build-cache volume mounted at
+`/private/var/folders/cowshed/shared/build-cache` (01a_apfs.md, "Dedicated build-cache volume"). The dataset's
+mountpoint is the `<bc>` of 03_caches.md: the mbx cache directory is `<bc>/mbx`, with managed targets at mbx's default
+inside it and no `target.root` set, so store and targets share one filesystem — this one dataset — as 03_caches.md's
+reflink-reachability rule requires. [INFERENCE] Restores between them are then clones where the pool's block cloning
+serves them (09_substrates.md, "ZFS substrate"); where it does not, mbx hard-links or copies the restored output
+instead, in that order (mbx documentation, "How it works", output restoration), and a restore that had to copy is
+slower, never wrong. The dataset cannot sit under the store dataset: that tree is controller-owned and denied to
+sandboxes, and every shed's Cargo work writes the store. `cowshed setup` creates the dataset with its mountpoint set
+locally and attests both on every run, as it does the root's properties; the canonical environment that names `<bc>/mbx`
+to mbx is 11_shell.md's ("Canonical mbx environment"). mbx owns everything in the dataset, and no cowshed collection
+lists, sweeps or reclaims it.
 
 ## Mount root and Spotlight
 

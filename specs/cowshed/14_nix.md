@@ -12,8 +12,6 @@ deployment postures (which uid runs all of this). The NixOS sibling for CI runne
 programs.cowshed = {
   enable = true;               # puts the cowshed binary in home.packages
   gateway.launchd = true;      # dev.cowshed.gateway LaunchAgent (HM manages ~/Library/LaunchAgents on darwin)
-  sccache.launchd = true;      # dev.cowshed.sccache LaunchAgent: host-owned foreground sccache UDS server
-                               #   (03_caches.md "The sccache daemon"); imperative counterpart: cowshed sccache start
   loginAttach = true;          # dev.cowshed.attach LaunchAgent: mount volumes + personal workspaces at login
   linuxConnector = true;       # Linux only: trusted per-attached-workspace netns connector runtime/identity
 };
@@ -22,8 +20,8 @@ programs.cowshed = {
 With the module enabled, cowshed's launchd plists become a home-manager generation — declared, rollbackable, never
 drifting. Combined with the store volume mounted at `/private/cowshed/store` (01_storage.md), the Data-volume home
 footprint is: one empty mountpoint directory, HM-managed artifacts, cowshed's own support and cache directories
-(`~/Library/Application Support/dev.cowshed`, `~/Library/Caches/dev.cowshed`: installed service binaries, the sccache GC
-root, the gateway's mirrors), and the layer-3 caches the tools already keep at their own defaults (03_caches.md).
+(`~/Library/Application Support/dev.cowshed`, `~/Library/Caches/dev.cowshed`: installed service binaries and the
+gateway's mirrors), and the layer-3 caches the tools already keep at their own defaults (03_caches.md).
 
 On Linux, `programs.cowshed.linuxConnector` (and `services.cowshed-runner` in CI) installs the controller-side launcher
 and declares the dedicated connector uid/process restrictions and cgroup subtree. The launcher may enter the already
@@ -63,13 +61,41 @@ declarative remediation hint, never an imperative fallback derived from a checko
 adjacent) and every per-project/per-workspace artifact (images, grants, tokens, CA keys). Native volume creation is
 capability-fenced further: only an explicit, foreground `cowshed setup` or `cowshed adopt` (which runs the same host
 setup first) uses provisioning mode and may cause the one-time macOS administrator authorization prompt that creates
-`cowshed.store`. All other commands and every launchd/background service use existing-only mode. They may validate
-filesystem, `diskutil`, mount, and marker evidence, reclaim a launchd StandardErrorPath stub, and remount an
-already-created cowshed volume at its canonical `-nobrowse` path. A plan that would create a volume, write a marker, or
-otherwise require authorization is rejected before executor dispatch with `environment-missing` and
-`next: cowshed setup`. Per-project/per-workspace artifacts live inside cowshed's volumes, not `$HOME`; there is nothing
-for a dotfile generation to own. Trusted repository bindings and policy are the exception: despite living under the
-cowshed volume, they remain host-bootstrap-owned and outside workspace authority.
+`cowshed.store` and the build-cache volume, `cowshed.build-cache`, both inside that one authorization session; which of
+them a given host's run creates and which it adopts is 01a_apfs.md's ("Dedicated store volume"; "Dedicated build-cache
+volume" — the build-cache volume's provisioning uses the same machinery, and its adoption by UUID is stated there). All
+other commands and every launchd/background service use existing-only mode. They may validate filesystem, `diskutil`,
+mount, and marker evidence, reclaim a launchd StandardErrorPath stub, and remount already-created cowshed volumes at
+their canonical `-nobrowse` paths. A plan that would create a volume, write a marker, or otherwise require authorization
+is rejected before executor dispatch with `environment-missing` and `next: cowshed setup`. Per-project/per-workspace
+artifacts live inside cowshed's volumes, not `$HOME`; there is nothing for a dotfile generation to own. Trusted
+repository bindings and policy are the exception: despite living under the cowshed volume, they remain
+host-bootstrap-owned and outside workspace authority.
+
+## mbx
+
+Cowshed's package pins mbx by git revision as a flake input; `cowshed setup` installs that revision beside the installed
+cowshed binary, and the gateway invokes it by the PATH name `mbx` for external-work reservations (05_gateway.md, "Host
+scheduling"). The pin is mbx v1.28.0, rev `44f50c329a83dedd012e1e49cf9f265f79226a83`, and each project pins the same
+revision in its devenv through mbx's flake, so a job's canonical environment also resolves `mbx` by that PATH name (the
+capability is 15_capabilities.md's). Neither copy is ever spelled as a Nix store path or a host path where a command is
+spawned; the store path appears only as the identity the pin proves.
+
+The host's `mbx` entry is a **symlink to the shipped pinned executable, never a copied inode**, so when the two pins
+agree, the `mbx` a job resolves and the one setup installed have the same realpath — and the Nix store path names the
+build, so that equality is what revision agreement means. On a home-manager host the same holds declaratively: the
+module puts cowshed's package, with its pinned mbx beside the cowshed binary, into the generation, and `setup` validates
+the symlink's realpath instead of writing it (Ownership detection, above). Comparing the two realpaths is derived at
+each detection and never stored, and what a mismatch refuses — with both paths and both `mbx --version` outputs named,
+semver equality alone being no proof, and no second pool or fallback behind it — is 05_gateway.md's "Pool selection and
+revision".
+
+There is nothing else to declare for mbx. It runs no daemon and owns no socket (03_caches.md, "mbx"), so
+`programs.cowshed` has no mbx option and neither mode installs an agent for it: home-manager owns the generation that
+puts the pin in place, and the cache it serves lives on the build-cache volume under mbx's own collection
+(03_caches.md). Enforced by tests that must exist: after an imperative `cowshed setup` and after a home-manager switch,
+`mbx` resolves by PATH to a symlink whose realpath is the pinned revision's executable beside the installed cowshed
+binary; and no install in either mode writes an mbx plist, socket or second copy anywhere.
 
 ## Deployment postures
 
@@ -248,8 +274,8 @@ shell or explicit uid switch is fine and expected.
 **Imperative-only host setup rejected.** cowshed writing its own LaunchAgent plists on a home-manager host is exactly
 the out-of-band drift HM users adopted HM to eliminate; the next `home-manager switch` may fight it. Dual-mode costs one
 detection check and keeps both audiences: nix hosts get generation-owned state, everyone else gets the same agents from
-`cowshed gateway start` and `cowshed sccache start`. Layer-3 caches need neither mode: they stay at the tools' own
-defaults, where no module and no command has to place them (03_caches.md).
+`cowshed gateway start`. Layer-3 caches need neither mode: they stay at the tools' own defaults, where no module and no
+command has to place them (03_caches.md).
 
 **Fixed shared path rejected** (see Deployment postures): a group-writable shared state root breaks the 0600
 controller-owned policy and grant model and Keychain scoping for no gain — the uid boundary is the point of posture B,

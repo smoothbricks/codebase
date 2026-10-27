@@ -1,9 +1,9 @@
 # APFS Storage
 
-cowshed stores all durable artifacts on one dedicated APFS volume and derives all runtime state from the filesystem and
-the kernel. Nothing cowshed creates is visible in Finder, the Desktop, or the user's home directory listing — and no
-image or store churn lands on the Data volume, so the user's unique data keeps its metadata, fsck time, and snapshots to
-itself.
+cowshed stores its durable artifacts on two dedicated APFS volumes in one container — the store volume and the
+build-cache volume — and derives all runtime state from the filesystem and the kernel. Nothing cowshed creates is
+visible in Finder, the Desktop, or the user's home directory listing — and no image, store or Cargo-output churn lands
+on the Data volume, so the user's unique data keeps its metadata, fsck time, and snapshots to itself.
 
 Repository identity, logical layout, shared metadata and retention policy belong to [01_storage.md](./01_storage.md).
 This companion owns the macOS/APFS implementation. The other macOS host constraints — Spotlight policy, launchd,
@@ -677,7 +677,7 @@ hidden behind `nobrowse`.
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Read-write / `rdonly`         | Read-write by default; recovery-marker mounts request `rdonly`.                                                                                               | Neither is mounted.                                                                                   | Read-write by default.                                                                   | `rw` in fstab.                                                                                                                     | Builds must write and execute their outputs; recovery reads a marker without modifying the image. Image backend `mount`; `storage/apfs/native.rs::detached_image_incarnation`; `storage/fstab.rs::build_fstab`.                                                                                                                                                                                                           |
 | `nobrowse`                    | Default; workspace `--browse` omits it. Live build volumes stay hidden.                                                                                       | Neither is mounted; template attachment uses `--nobrowse --noMount`.                                  | Requested at `diskutil mount`.                                                           | Requested at bootstrap/boot mount and in fstab.                                                                                    | Keep temporary/work volumes out of Finder, Desktop and sidebar. Image backend `mount`/attachment; build host `create_build_volume`/`mount_build_volume`; RAM `RamTempVolume.provision`; `storage/bootstrap/native/macos.rs::desired_mount_service` and `storage/fstab.rs::build_fstab`.                                                                                                                                   |
-| `noatime`                     | Requested on every normal read-write/read-only image mount, including `--browse`.                                                                             | Neither is mounted.                                                                                   | Not requested.                                                                           | Requested in fstab.                                                                                                                | Suppress access-time updates in read-heavy builds; workflow decisions do not depend on those updates. Image backend `mount`; `storage/fstab.rs::build_fstab`.                                                                                                                                                                                                                                                             |
+| `noatime`                     | Requested on every normal read-write/read-only image mount, including `--browse`.                                                                             | Neither is mounted.                                                                                   | Not requested.                                                                           | Requested in fstab.                                                                                                                | Suppress access-time updates in read-heavy builds; on the store volume workflow decisions do not depend on those updates, and the build-cache volume's cost is 16_build_volumes.md's ("Open questions"). Image backend `mount`; `storage/fstab.rs::build_fstab`.                                                                                                                                                          |
 | `owners`                      | Requested on normal mounts, including read-only mounts.                                                                                                       | No mount flags; filesystem ownership is inherited/formatted.                                          | Not requested; unprivileged Disk Arbitration mounting yields `noowners`.                 | Not requested; fstab specifies `noowners`.                                                                                         | Workspace permissions must be honored. RAM mounting with ownership would require authorization; launchd plists therefore live outside the RAM-backed `TMPDIR`. Image backend `mount`; RAM module's mount/authorization contract.                                                                                                                                                                                          |
 | `noowners`                    | Only the temporary root-owned event-store repair mount; normal requested options are restored afterward.                                                      | Not mounted.                                                                                          | Kernel/Disk Arbitration property of the unprivileged mount, not an explicit RAM option.  | Explicit in fstab.                                                                                                                 | Permit marker repair in an inherited root-owned `.fseventsd` without root authorization; it is not the workspace's final permission policy. Image backend `retire_inherited_event_log`; RAM `provision`; `storage/fstab.rs::build_fstab`.                                                                                                                                                                                 |
 | `nodev`                       | Kernel flag on unprivileged image mounts; not in cowshed's option string.                                                                                     | Not mounted.                                                                                          | Kernel flag on the unprivileged mount; not requested explicitly.                         | Not requested by privileged bootstrap.                                                                                             | Device-special files must not become usable device nodes through an unprivileged mounted image. Applies at the image backend/RAM mount calls; cowshed has no separate `nodev` setter.                                                                                                                                                                                                                                     |
@@ -688,7 +688,7 @@ hidden behind `nobrowse`.
 | Root-owned event-store repair | One-time `nobrowse,noowners` staging mount (does not request `noatime`), then the caller's original `owners`/`noatime`/visibility options.                    | Neither is mounted; seed preserves its source's on-disk state.                                        | No repair path.                                                                          | This repairs an image's `.fseventsd`, **not** the dedicated store volume.                                                          | Add the marker without purging historical records; make root's directory traversable (`0711`, no listing) so later ownership-honoring mounts can find it without repeating repair. Image backend `retire_inherited_event_log`/`retire_event_log`; the final policy honors ownership again.                                                                                                                                |
 | Spotlight indexing            | No indexing command or marker.                                                                                                                                | No indexing command or marker.                                                                        | No explicit indexing command/marker; mounted `nobrowse`.                                 | No explicit indexing command/marker; mounted `nobrowse`.                                                                           | Cowshed writes no Spotlight policy ([Stable workspace mount root](#stable-workspace-mount-root)). Volumes adopted while adopt planted `.metadata_never_index` (until 2026-10-25) still carry it at their root and clones inherit it, so `.git/info/exclude` carries `/.metadata_never_index`, and copies, cache retirement and workspace retirement pass over it like the volume's own bookkeeping (`SPOTLIGHT_OPT_OUT`). |
 | Time Machine exclusion        | No per-image/path exclusion setter.                                                                                                                           | No exclusion setter.                                                                                  | No exclusion setter; volume is temporary.                                                | No `tmutil` setter; OS policy excludes the dedicated store.                                                                        | Images live on a separate volume rather than the Data volume, avoiding Data-volume snapshot retention of build churn. Durability is git, not a cowshed-applied backup rule; user backup policy remains separate. Host provisioning creates/mounts the dedicated APFS volume; no code calls `tmutil`.                                                                                                                      |
-| Case sensitivity              | One case-sensitive APFS volume, inherited from the template.                                                                                                  | Seed inherits the filesystem; template uses `newfs_apfs -e`.                                          | Plain `APFS` in `addVolume`; no case-sensitive variant requested.                        | New volumes use plain `APFS`; no case-sensitive variant requested.                                                                 | Preserve distinct case-sensitive source/output names in image-backed trees. Image backend `attach_and_format_unlocked`; RAM `provision`; `storage/bootstrap/native/macos.rs::provision_apfs_volumes_in_session`.                                                                                                                                                                                                          |
+| Case sensitivity              | One case-sensitive APFS volume, inherited from the template.                                                                                                  | Seed inherits the filesystem; template uses `newfs_apfs -e`.                                          | Plain `APFS` in `addVolume`; no case-sensitive variant requested.                        | The store uses plain `APFS`; the build-cache volume is case-sensitive (`APFSX`).                                                   | Preserve distinct case-sensitive source/output names in image-backed trees and in the Cargo targets on the build-cache volume. Image backend `attach_and_format_unlocked`; RAM `provision`; `storage/bootstrap/native/macos.rs::provision_apfs_volumes_in_session`.                                                                                                                                                       |
 | Root UID/GID                  | Invoking user's UID/GID at formatting, inherited by clones.                                                                                                   | Seed inherits ownership; template uses `newfs_apfs -U <uid> -G <gid>`.                                | No explicit formatter UID/GID; mount ignores ownership.                                  | Provisioning chowns the root to the invoking UID/GID; fstab ignores ownership.                                                     | Make image roots writable by their owner without an elevated format. `blank_template.rs::owner`/`mint` supplies UID/GID to the image backend; `provision_apfs_volumes_in_session` issues/attests the host-root chown.                                                                                                                                                                                                     |
 | FileVault/encryption          | No extra image-volume encryption switch; durable image bytes reside on the encrypted store.                                                                   | Backing-store protection only; no per-image `newfs_apfs -E`.                                          | No encryption setter.                                                                    | FileVault enabled; label-keyed boot and UUID-keyed discovery passwords read back identically in System.keychain before encryption. | Protect durable bytes without a second per-image crypto/password layer. `storage/bootstrap/native/macos.rs::encrypt_volume_with` (`diskutil apfs encryptVolume -user disk -stdinpassphrase`) and `desired_mount_service` (`unlockVolume ... -nomount`).                                                                                                                                                                   |
 | `noauto`                      | No image fstab entry.                                                                                                                                         | No fstab entry.                                                                                       | No fstab entry.                                                                          | Explicit in fstab.                                                                                                                 | Skip generic `mount -a`; cowshed's boot service explicitly unlocks/mounts the known UUID at the canonical path. `storage/fstab.rs::build_fstab`; `desired_mount_service`.                                                                                                                                                                                                                                                 |
@@ -1278,20 +1278,25 @@ within one project, but that key is computed from metadata on both sides and nev
 
 ## Dedicated store volume
 
-All of cowshed's durable bytes live on one dedicated APFS volume, so the Data volume carries no image or store churn:
+All of cowshed's durable bytes live on dedicated APFS volumes in one container, so the Data volume carries no image or
+store churn:
 
 - **`cowshed.store`**, mounted at `/private/cowshed/store` — images, grant sidecars, waivers, quarantine, gateway config
   and audit, telemetry. Mostly rebuildable, with a small unique window: uncommitted work between autosaves
   (02_workspaces.md); durability is still git. Same-volume clonefile is preserved by construction — main → sessions →
   checkpoints and trash renames all stay within `cowshed.store`.
+- **`cowshed.build-cache`**, mounted at `/private/var/folders/cowshed/shared/build-cache` — the one shared mbx store and
+  its managed targets, beside other host tools' own trees
+  ([Dedicated build-cache volume](#dedicated-build-cache-volume)). Nothing cowshed keeps on it is the only copy of
+  anything: every byte is rebuildable compiler output (03_caches.md).
 
-Rebuildable caches do not live on it. Each tool's cache stays at the tool's own default in the host HOME; the gateway's
-npm mirror and bare repository mirrors live in cowshed's user cache directory, `~/Library/Caches/dev.cowshed/mirror` and
-`~/Library/Caches/dev.cowshed/repo-mirrors`, written only by the gateway and readable by no sandbox; sccache's store is
-sccache's own default directory, written only by its daemon. 03_caches.md gives the placement rule and how sandboxes
-reach each cache. A host that still has the `cowshed.caches` volume of an earlier release keeps it mounted, encrypted,
-and pinned by the same machinery below — never creating one — until `cowshed setup --retire-caches-volume` deletes it
-(03_caches.md, "Retiring the caches volume").
+Rebuildable caches do not live on the store. Each tool's cache stays at the tool's own default in the host HOME, except
+the mbx store, which lives on the build-cache volume above (03_caches.md, "mbx"); the gateway's npm mirror and bare
+repository mirrors live in cowshed's user cache directory, `~/Library/Caches/dev.cowshed/mirror` and
+`~/Library/Caches/dev.cowshed/repo-mirrors`, written only by the gateway and readable by no sandbox. 03_caches.md gives
+the placement rule and how sandboxes reach each cache. A host that still has the `cowshed.caches` volume of an earlier
+release keeps it mounted, encrypted, and pinned by the same machinery below — never creating one — until
+`cowshed setup --retire-caches-volume` deletes it (03_caches.md, "Wiring").
 
 The store is created once by explicit foreground `cowshed setup`
 (`diskutil apfs addVolume <container> APFS cowshed.store -nomount`) and shares the container's free-space pool — no
@@ -1331,13 +1336,14 @@ measured on a FileVault-off host against `diskutil info -plist`'s `FileVault`:
 | `cowshed.store`, `cowshed.caches` | 0           | Yes         | Yes                       |
 
 All 138 volumes registered a `RoleValue`, and none registered `Encrypted = No`, so an absent `Encrypted` is an
-unencrypted volume. For the selected reserved `cowshed.store` / `cowshed.caches` records, a role-less volume's FileVault
-is its `Encrypted`; a reserved volume with any role, or none registered, is refused (`ReservedVolumeRole`), because for
-it `Encrypted` can be keyless encryption. The rule protects the `MissingVolumeKeychain` refusal: a FileVault volume
-without a usable System.keychain passphrase can never be remounted at boot, and reading keyless encryption as FileVault,
-or FileVault as unencrypted, would let that refusal be skipped or misapplied. Setup shares the same evidence, so its
-encrypt-in-place decision reads the same derivation. The execution-time pre-create recheck inside the authorization
-session reads a fresh kernel snapshot the same way, and an unreadable or empty snapshot refuses the create.
+unencrypted volume. For the selected reserved `cowshed.store` / `cowshed.build-cache` / `cowshed.caches` records, a
+role-less volume's FileVault is its `Encrypted`; a reserved volume with any role, or none registered, is refused
+(`ReservedVolumeRole`), because for it `Encrypted` can be keyless encryption. The rule protects the
+`MissingVolumeKeychain` refusal: a FileVault volume without a usable System.keychain passphrase can never be remounted
+at boot, and reading keyless encryption as FileVault, or FileVault as unencrypted, would let that refusal be skipped or
+misapplied. Setup shares the same evidence, so its encrypt-in-place decision reads the same derivation. The
+execution-time pre-create recheck inside the authorization session reads a fresh kernel snapshot the same way, and an
+unreadable or empty snapshot refuses the create.
 
 **Boot mounting is owned by a root system LaunchDaemon, and the store is FileVault-encrypted.** At provision, the same
 authorization session:
@@ -1419,16 +1425,16 @@ deletes a volume.
 `.cowshed-volume.json` marker distinguishes the mounted cowshed volume from that bare directory. The system storage
 LaunchDaemon writes stderr to `/var/log/cowshed-storage.log`; user launchd agents write pre-tracer stderr under
 `~/Library/Logs/cowshed/`. Neither log lives under the mountpoint, so a reboot cannot recreate a masking stub. What does
-land on a bare mountpoint before its volume is mounted — the sccache agent's socket and compile cache, the gateway
-heal's directory-only `mnt/` scaffolding, Finder's `.DS_Store`, empty directories — is reclaimed before remount; any
-other entry keeps the mountpoint masked.
+land on a bare mountpoint before its volume is mounted — the gateway heal's directory-only `mnt/` scaffolding, Finder's
+`.DS_Store`, empty directories — is reclaimed before remount; any other entry keeps the mountpoint masked.
 
 Why a volume and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
 block of a multi-GB churning image — ghosts that path-level `tmutil addexclusion` does **not** prevent (exclusion stops
 backup, not snapshotting). A dedicated volume gets no local snapshots, collapses backup policy to one per-volume
 decision, and isolates the fsck domain and corruption blast radius (store loss = WIP since last autosave; Data untouched
 either way). Rebuildable caches are not images: they stay at the tools' own defaults in HOME, where the host's own
-builds already keep them (03_caches.md).
+builds already keep them (03_caches.md). The build-cache volume is a second dedicated volume for the same reason, not a
+directory on this one ([Dedicated build-cache volume](#dedicated-build-cache-volume)).
 
 ### One herd, multiple users
 
@@ -1440,6 +1446,97 @@ derives from `$HOME`. Workspace images remain on the store volume while their li
 so per-image `clonefile` semantics, locks, and lifecycle are unchanged by sharing; concurrent multi-user mutation of one
 workspace stays serialized by the same `<image>.lock` flocks, and cross-user `gc` policy is deliberately blunt: any user
 may retire any shed, because `noowners` already made the trust model explicit.
+
+## Dedicated build-cache volume
+
+The host's one shared mbx store lives on one dedicated plain APFS volume, **`cowshed.build-cache`**: role-less, in the
+same container as `cowshed.store`, mounted at `/private/var/folders/cowshed/shared/build-cache` with
+`nobrowse,noowners,noatime`. It is a volume, not an image: nothing attaches, seals or detaches it, it mounts once at
+boot and stays mounted, and no checkout mounts anything to reach it — in a project with the mbx capability, the
+checkout's `target` is mbx's managed-target link into it (16_build_volumes.md; 15_capabilities.md). Build volumes do not
+move: they stay images on the store volume ("Images", above; 16_build_volumes.md). Cowshed manages exactly one top-level
+entry on the build-cache volume, **`<bc>/mbx/`**: the one mbx cache directory every user of the volume shares — its
+action store, learned incremental state and managed targets at mbx's default `<bc>/mbx/targets/v1/<checkout digest>`
+(03_caches.md owns what mbx keeps there and how sandboxes reach it). Its layout is
+[01_storage.md §Directory layout](./01_storage.md#directory-layout).
+
+The volume has more than one owner. Other host tools keep their own top-level trees on it — today a Bun build recipe's
+shared ThinLTO cache at `<bc>/thinlto/<target system>` and its archive caches at `<bc>/bun/<build system>/<uid>`. Those
+entries are foreign: cowshed never lists, sweeps or collects any top-level entry but `mbx/`, setup's masked-mountpoint
+and stub reclamation never reclaims one, and `doctor` reports such an entry by name only when it blocks a mount.
+
+**Cowshed publishes the volume's root; consumers never spell it.** The canonical mountpoint is cowshed's to derive, so
+every consumer reads it from cowshed: each workspace's environment exports it as `COWSHED_BUILD_CACHE`
+(02_workspaces.md, "Workspace environment"), and the mbx cache directory is derived from it (11_shell.md, "Canonical mbx
+environment"). A devenv or Nix recipe that keeps its own tree on the volume (the ThinLTO and archive caches above) takes
+its root from `COWSHED_BUILD_CACHE`, never from a hardcoded path, and outside cowshed (the variable unset) uses its own
+default, not this volume.
+
+Why its own volume, and why there:
+
+- **Churn and inode isolation.** A Cargo store and its managed targets are a high-churn tree of compiler outputs, and
+  every file is an inode in the volume that holds it. On its own volume that inode tree, its fsck domain and its
+  corruption blast radius touch neither the store's images nor Data's unique data, and losing it loses only rebuildable
+  output. A directory on the store volume would put that churn inside the store's inode tree and fsck domain, and mbx's
+  restores are clones only when its store and managed targets share one filesystem: this volume is that filesystem for
+  both, at no cost to the store.
+- **No snapshots.** [INFERENCE] Like the store, a dedicated volume takes no local snapshots, so no snapshot pins
+  rewritten compiler output ("Why a volume and not paths on Data", above) — measured for the store only; 01c_macos.md,
+  "Time Machine and local snapshots", states the measurement that settles it for this volume. On Data, hourly snapshots
+  would retain exactly that churn.
+- **Spotlight exclusion.** Its mountpoint contains `/var/folders/`, which mds's volume factory rejects before it
+  constructs a record ([Spotlight media references](#spotlight-media-references)): the volume is never admitted, never
+  indexed and leaks no media port, with no Spotlight policy written for it. The store's mountpoint reaches no such
+  exclusion, which is one more reason the store volume cannot host this tree.
+- **A user-owned mountpoint parent.** A mountpoint needs a user-owned parent: a root mount, or an `rmdir` directly under
+  the root-owned `/private/var/folders/cowshed`, is refused. The parent `/private/var/folders/cowshed/shared` is
+  therefore owned by the provisioning user, group `nixbld`, mode **0750** (the owner's ruling, 2026-10-27), and the
+  mountpoint below it is that user's to create, attest and remove.
+
+`noowners` carries the store's trust model ("`noowners` is deliberate", above): every local account sees the same bytes
+as its own, and every shed reads and writes the one shared mbx store (03_caches.md). What `noatime` costs mbx on this
+volume, and whether that stands, is 16_build_volumes.md's "Open questions"; the mechanism is stated there, not here.
+
+**`cowshed setup` owns its transaction**, in the same single provisioning authorization session as the store's
+([Dedicated store volume](#dedicated-store-volume)), and with the same machinery throughout: it creates the volume when
+absent (`diskutil apfs addVolume <the store's container> APFSX cowshed.build-cache -nomount` — case-sensitive, because
+Cargo targets live on it — sharing the container's free-space pool, no sizing), creates and attests the `shared` parent
+and the mountpoint (refusing a symlink, non-directory or foreign owner rather than writing through it), encrypts the
+volume in place when it is not already FileVaulted with the same label-keyed and UUID-keyed System.keychain passphrases
+read back identically before encryption, writes its `.cowshed-volume.json` marker at the volume root, and appends its
+idempotent, comment-tagged fstab pin:
+
+<!-- prettier-ignore -->
+```
+UUID=<build-cache-uuid>  /private/var/folders/cowshed/shared/build-cache   apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.build-cache
+```
+
+The existing root LaunchDaemon script (`dev.cowshed.storage`, `mount-volumes.sh`) unlocks and mounts it at boot by that
+UUID, as one more entry of the same per-UUID loop that mounts the store; no second daemon, script or keychain scheme
+exists for it. A volume that already exists at the canonical mountpoint under another label (an existing prototype
+volume is one) is **adopted by its UUID**: setup takes the UUID the kernel snapshot reports for the volume mounted
+there, encrypts it in place if it is unencrypted, pins and boot-mounts it by that UUID, and never deletes it; labels are
+mutable and identity is the UUID, here as for the store. An existing volume is never deleted by setup, and `--uninstall`
+removes its pin and keychain items with the store's, never the volume.
+
+Its mountpoint is a plain directory on Data until the volume mounts, so the store's masking guard applies unchanged,
+with one addition: the marker at the volume root distinguishes the mounted volume from the bare directory, the same
+enumerated reclaimable stubs are reclaimed before remount, any other entry keeps the mountpoint **masked**, and a
+foreign top-level entry of another owner (above) is never a reclaimable stub, on the bare mountpoint or off it.
+`cowshed doctor` reports the volume with the store's findings, each naming the observed and canonical paths and
+prescribing `cowshed setup`: **missing** (no volume by its pinned UUID or label, and none mounted at the canonical
+mountpoint), **mis-mounted** (mounted anywhere but the canonical mountpoint, `/Volumes/<name>` included),
+**unencrypted** (no FileVault by the registry derivation above), **masked mountpoint** (the marker absent, or a non-stub
+entry on the bare mountpoint), and the missing-keychain-item finding the store carries. A command that needs the mbx
+store fails before mutation with `environment-missing`, naming which of these it found, exactly as a store fault refuses
+(above); a command that does not touch Cargo through mbx does not consult the volume. Diagnosis reads the same one
+kernel snapshot the store's planning reads, so the two volumes' verdicts cannot observe different listings.
+
+**Enforced by**: tests that must exist — setup provisioning and adoption cells over kernel-snapshot fixtures (absent,
+present-by-label, prototype adopted by UUID without deletion, mis-mounted, unencrypted-encrypted-in-place, masked
+mountpoint, foreign `shared` parent refused, foreign top-level entries never reclaimed or listed), doctor finding
+goldens for each state above, and a real-APFS boot-mount cell proving the installed script mounts a throwaway second
+volume by UUID at its canonical path under a user-owned parent (08_testing.md).
 
 ## Restore publication custody
 
@@ -1509,4 +1606,6 @@ reflink boundary that matters is the image's _inner_ filesystem — clonefile ca
 the cache or the image file sits on (the wall 03_caches.md's reflink-reachability rule names). The only same-volume
 relationship images need is with each other. Layer-3 caches therefore stay at the tools' own defaults in HOME, where the
 host's own builds already use them; 03_caches.md ("A dedicated caches volume rejected") explains why they get no volume
-of their own either.
+of their own either. The build-cache volume is not that rejected volume: it holds no layer-3 cache, only mbx's store and
+managed targets, whose sharing is `clonefile` between two plain directory trees that must share one filesystem outside
+Spotlight admission ([Dedicated build-cache volume](#dedicated-build-cache-volume)).

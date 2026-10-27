@@ -1,28 +1,33 @@
 # Build Volumes: Millisecond Forks and Lands
 
 A workspace is two volumes: the **source volume** (the workspace image of 01a_apfs.md: the git tree, installed
-dependencies, every build tool's declared outputs) and a **build volume** (the build tools' own incremental state: Cargo
-target directories and Nx's task cache with its database). A fork clones both and is warm for every task main built. A
-land moves main to the build volume the landing workspace already built, by renaming one link: main builds nothing that
-the workspace built, and nothing is copied. This spec states that model, every rule that keeps it warm, why each rule
-exists, and how each is enforced. It is the one place these rules live; other specs cite it.
+dependencies, every build tool's declared outputs) and a **build volume** (the build tools' own incremental state: Nx's
+task cache with its database, package caches, the code index, declared build state, and the Cargo target directories of
+a project without mbx). A Cargo project with the mbx capability keeps its compiler work out of both: mr boxington (mbx)
+holds it in one content-addressed store per host and one managed target directory per checkout, on the host's
+build-cache volume (01a_apfs.md, "Dedicated build-cache volume"). A fork clones both volumes and is warm for every task
+main built, and restores every Cargo unit any checkout stored. A land moves main to the build volume the landing
+workspace already built, by renaming one link: main builds nothing that the workspace built, and nothing is copied. This
+spec states that model, every rule that keeps it warm, why each rule exists, and how each is enforced. It is the one
+place these rules live; other specs cite it.
 
 ## Goal
 
 - **Fork in milliseconds, warm.** `cowshed fork` clones images (milliseconds; 01a_apfs.md "Images") and attaches them (a
   fraction of a second each, independent of how many images the host has attached). Every Nx task main ran is a cache
-  hit in the fork and every Cargo unit is `Fresh`: the fork reseeds main first when main's volume holds work its seed
-  does not (Targets and seeds). Only the fork's own edits invalidate anything, and exactly what the same edit would
-  invalidate on main.
+  hit in the fork: the fork reseeds main first when main's volume holds work its seed does not (Targets and seeds).
+  Every Cargo unit is restored from the mbx store instead of compiled, or, in a project without mbx, is `Fresh` in the
+  cloned volume. Only the fork's own edits invalidate anything, and exactly what the same edit would invalidate on main.
 - **Land in milliseconds.** A land runs no build on main. The landing workspace has already built and checked the exact
   tree main moves to; main takes that workspace's build volume by one `rename(2)`.
 - **Nothing copied, nothing patched, nothing extra in the environment.** No cache entries are copied between checkouts:
   a land adopts the landing volume as it is, and what other lands ran reaches a fork through the project's Nx cache
-  (05_gateway.md, "Publication"). Nx, Cargo and sccache run unmodified. A process learns nothing about cowshed: it reads
-  the same paths it always reads.
+  (05_gateway.md, "/nx/v1/cache/{hash}") and the mbx store. Nx and Cargo run unmodified, Cargo through mbx exactly as
+  mbx documents. A process learns nothing about cowshed: it reads the same paths it always reads.
 - **Generic.** Build volumes come from capability detection (15_capabilities.md), not from a project's configuration. A
   project that uses Nx, Cargo, Go, ttsc, zig or none of them gets exactly the build state its tools have.
-- **Bounded.** Every build volume and every cache inside one has an owner that deletes it. Nothing grows without bound.
+- **Bounded.** Every build volume and every cache inside one has an owner that deletes it. mbx owns its store and its
+  managed targets and bounds both with its own collection (03_caches.md). Nothing grows without bound.
 
 ## Why two volumes
 
@@ -38,7 +43,9 @@ each of them.
    repair for imports, not a routine operation. Build volumes are not replaced by anything that sheds extents: a fork
    clones its target's seed, a land adopts the landing volume and a seed is captured from it, so every build volume
    inherits its parent's extent map and adds its own churn. SmoothBricks' main seed went from 434,000 to 881,000 extents
-   in four days. Seed compaction (Targets and seeds) bounds that lineage.
+   in four days, and reached 1.2 million extents and 397.7 GB allocated by 2026-10-27, when its `mount_apfs` outran the
+   120 s deadline. Nearly all of that churn was Cargo's `target/`, which an mbx project keeps on the build-cache volume
+   instead (item 4). Seed compaction (Targets and seeds) bounds what lineage remains.
 2. **Without build volumes, a land rebuilds main from scratch, or main is never warm.** A workspace builds and checks
    its work, lands, and then main has to build the same tree again before the next fork can start warm. A warm step for
    main would be a background job that can fail, queue, or be skipped; while it lags, every fork starts cold, and
@@ -46,21 +53,31 @@ each of them.
    main adopts what the workspace built.
 3. **The inode problem stays solved.** Build state is the largest inode count a checkout has (a Rust `target/` holds
    hundreds of thousands of files). It lives inside a volume, never on the Data volume or the store volume's directory
-   tree, so it stays out of the host's inode namespace (00_overview.md "Problem").
+   tree, so it stays out of the host's inode namespace (00_overview.md "Problem"). mbx's managed targets live on the
+   build-cache volume for the same reason.
+4. **Cargo's state is shared, not per tree.** A target directory per build volume means two sheds compile the same
+   change twice, main adopts only one lander's units, and a build volume carries the churn of every Cargo build. The mbx
+   store holds each compiled action once per host, addressed by content with checkout paths replaced by placeholders.
+   Every checkout restores what any other compiled, including work in flight, through one scheduler (05_gateway.md,
+   "Host scheduling"), and build-script runs and host links are cached with it. A plain volume, not an image, holds it:
+   the store is shared by every checkout, so no fork clones it and no land adopts it, and a volume has no extent
+   lineage, attach or compaction.
 
 ## Model
 
 ### What lives where
 
-| State                                                                                                                                                       | Volume                                       | Shared how                                                                             |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                              | Source volume                                | Cloned with the workspace image                                                        |
-| Cargo target directories; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                                 | Cloned at fork; adopted by main at land                                                |
-| Codegraph's per-tree `.codegraph/` index                                                                                                                    | Build volume                                 | Cloned at fork; adopted by main at land                                                |
-| Node/Bun module compile cache (`NODE_COMPILE_CACHE`)                                                                                                        | Workspace's private XDG cache (03_caches.md) | Read-write/host cache cloned with source; read-only cache retired with owned exec-temp |
-| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                      | Build volume                                 | Cloned at fork; adopted by main at land                                                |
-| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                 | Per checkout, never travels                  | Deleted from a build volume before main adopts it (below)                              |
-| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv, sccache)                                                        | Shared cache paths (03_caches.md)            | Written once, read by every checkout; never in any image                               |
+| State                                                                                                                                                                                               | Volume                                                                                  | Shared how                                                                             |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Git tree and `.git`, installed dependencies (`node_modules`), every Nx task's declared outputs                                                                                                      | Source volume                                                                           | Cloned with the workspace image                                                        |
+| Cargo target directories of a project without the mbx capability; Nx `.nx/cache` and `.nx/workspace-data` (task database, project graph); each installed JavaScript package's `node_modules/.cache` | Build volume                                                                            | Cloned at fork; adopted by main at land                                                |
+| Cargo target directory of a project with the mbx capability                                                                                                                                         | mbx's managed target for the checkout, `<build-cache>/mbx/targets/v1/<checkout digest>` | Per checkout, never travels; restored from the mbx store by content                    |
+| Cargo compiled actions, build-script runs, host links, learned incremental state                                                                                                                    | The mbx store, `<build-cache>/mbx`                                                      | One per host, written and read by every checkout (03_caches.md)                        |
+| Codegraph's per-tree `.codegraph/` index                                                                                                                                                            | Build volume                                                                            | Cloned at fork; adopted by main at land                                                |
+| Node/Bun module compile cache (`NODE_COMPILE_CACHE`)                                                                                                                                                | Workspace's private XDG cache (03_caches.md)                                            | Read-write/host cache cloned with source; read-only cache retired with owned exec-temp |
+| Declared build state (`.cowshed.toml` `[build] state`), under the volume's `declared/`                                                                                                              | Build volume                                                                            | Cloned at fork; adopted by main at land                                                |
+| Nx daemon record and sockets (`.nx/workspace-data/d`, the socket directory)                                                                                                                         | Per checkout, never travels                                                             | Deleted from a build volume before main adopts it (below)                              |
+| Content-addressed tool caches (Cargo registry/git, Go `GOMODCACHE`/`GOCACHE`, zig, bun, uv)                                                                                                         | Shared cache paths (03_caches.md)                                                       | Written once, read by every checkout; never in any image                               |
 
 The build volume holds exactly the state a build tool keeps **for one tree and keys by its own fingerprints**: state
 that is correct to reuse for any tree the tool checks against, but costly to rebuild and useless to share between two
@@ -130,11 +147,19 @@ volume's mountpoint. `.cowshed/` is already excluded from git in every checkout 
 are fixed relative symlinks through it, created by cowshed when it mints the checkout and never changed afterwards:
 
 ```
-<checkout>/target            -> .cowshed/build/target               # one per Cargo target dir capability detection finds
+<checkout>/target            -> .cowshed/build/target               # one per Cargo target dir capability detection finds, without mbx
 <checkout>/.nx/cache         -> ../.cowshed/build/nx/cache
 <checkout>/.nx/workspace-data -> ../.cowshed/build/nx/workspace-data
 <checkout>/.codegraph        -> .cowshed/build/codegraph
 ```
+
+In a project with the mbx capability, `target` is not a build-volume link. mbx creates and owns it at the checkout's
+first Cargo build, `target -> <build-cache>/mbx/targets/v1/<checkout digest>`, and adds its exact path to the
+repository's `info/exclude` itself (mbx docs, "Managed target directories"). Cowshed never creates, discards or relinks
+it, and a refresh that finds it leaves it. The source image carries the link to every fork, where it names the source
+checkout's managed target, so a fork deletes it (Fork step 4) and the fork's first build places its own. The managed
+target never travels: a land leaves the target's managed target where it is, and its next build restores from the store
+what the landing workspace compiled.
 
 A land changes exactly one name, `.cowshed/build`, with one `rename(2)` of a new symlink over it. That is atomic: every
 path a tool opens afterwards resolves into the new volume. The fixed links mean no tool, no environment variable and no
@@ -173,19 +198,23 @@ fingerprints the tracked build inputs (Cargo manifests, `.cowshed.toml`, the bui
 while the fingerprint matches the one the volume's state records, only restores a fixed link a tool displaced (a real
 directory where the link belongs is discarded and relinked, never copied, and reported). When it moved, capability
 detection runs again in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the like never name a
-checkout's build state): new paths join the volume, held ones never move. A checkout with build state and no volume gets
-its first one (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target
-from then on. Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity the adopted
-checkout's `.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS host
-degrades"), unless nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared
-`[build] state`, no enabled Nx detector match), whose first touch makes no volume. Main's first touch links it once main
-is mounted at the checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's
-`.cowshed.toml` may change while main is copied; the first touch then mints its own at the capacity asked now). A mint
-that failed fails only a first touch that needs a volume, with the mint's own error, and is not retried. An adoption
-releases the volume before it completes whenever its first touch does not link it (nothing to hold, a refusal, a
-failure, a volume already linked, another capacity), and an adoption dropped before that (a cancelled request) releases
-it as it is dropped, the mint itself when it was still running. A build-state path that holds tracked source refuses
-before anything is deleted.
+checkout's build state): new paths join the volume, held ones never move. A refresh never treats mbx's managed-target
+link as a displaced fixed link. For a Cargo project that gains the mbx capability, the refresh removes cowshed's own
+fixed `target` link (which names `.cowshed/build/target`), so that mbx's first build places the managed target: mbx
+leaves a `target` that is already a symlink alone (mbx docs, "Eligibility and recovery"). The volume's old `target`
+directory leaves the volume's state and is deleted in the background like a discarded directory (below), so no fork or
+seed carries it again. A checkout with build state and no volume gets its first one (its first touch) at the project's
+`[build] capacity`, and the checkout's seed with it, so it is a target from then on. Main's first volume is minted while
+`cowshed adopt` stages main's image, at the capacity the adopted checkout's `.cowshed.toml` asks, so the two attaches
+wait on `storagekitd` once (01a_apfs.md, "How the APFS host degrades"), unless nothing in the checkout can name build
+state (no tracked Cargo or package manifest, no declared `[build] state`, no enabled Nx detector match), whose first
+touch makes no volume. Main's first touch links it once main is mounted at the checkout, when main links no volume yet
+and asks the capacity it was minted at (the checkout's `.cowshed.toml` may change while main is copied; the first touch
+then mints its own at the capacity asked now). A mint that failed fails only a first touch that needs a volume, with the
+mint's own error, and is not retried. An adoption releases the volume before it completes whenever its first touch does
+not link it (nothing to hold, a refusal, a failure, a volume already linked, another capacity), and an adoption dropped
+before that (a cancelled request) releases it as it is dropped, the mint itself when it was still running. A build-state
+path that holds tracked source refuses before anything is deleted.
 
 **Owned index links.** `.codegraph/` is build-volume state and follows the same fixed-link contract as other contributed
 paths. At the checkout root, `.codegraph -> .cowshed/build/codegraph`; a nested project's contribution preserves its
@@ -197,8 +226,9 @@ The seed-capture writer exclusion is a named list of build-state holders whose o
 of files being written:
 
 - **Nx state** (`.nx/cache`, `.nx/workspace-data`): a task updates database, metadata and output files separately.
-- **Cargo build output** (`target/`, including discovered custom target directories): a build writes its units and
-  fingerprints separately.
+- **Cargo build output** (`target/`, including discovered custom target directories), in a project without the mbx
+  capability: a build writes its units and fingerprints separately. Under mbx no Cargo state is in the build volume, and
+  capture takes no Cargo lock.
 
 Every other contributed path is exempt by default: it is a rebuildable cache with a consistent read, such as a
 code-intelligence SQLite index or a lint/type cache, or state a capture cannot tear. Adding a contributed path does not
@@ -234,12 +264,14 @@ and failures retain manifest order; a failed manifest does not hide independent 
 fingerprint caches the complete discovered path set, so unchanged refreshes run no Cargo query. This bound changes only
 discovery scheduling, not journal identity or failure fences.
 
-Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
-contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
-`.nx/workspace-data`, and a JavaScript package manager contributes the `node_modules/.cache` of every package it
-installed. The Codegraph capability contributes each detected project's `.codegraph/` index, held at that project's
-`codegraph` path on the build volume. A project with no build-state capability and no declared build state gets no build
-volume and pays nothing.
+Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Nx capability
+contributes `.nx/cache` and `.nx/workspace-data`, and a JavaScript package manager contributes the `node_modules/.cache`
+of every package it installed. The Codegraph capability contributes each detected project's `.codegraph/` index, held at
+that project's `codegraph` path on the build volume. The Cargo capability contributes each `cargo metadata`
+`target_directory` inside the checkout only in a project without the mbx capability. With it, the target directory is
+mbx's, and the Cargo capability contributes nothing (15_capabilities.md, "mbx detection", which also refuses a tracked
+target-directory override mbx would not manage). A project with no build-state capability and no declared build state
+gets no build volume and pays nothing.
 
 A tool's own per-checkout state that no capability names belongs inside one that is named, never in the source tree
 beside an output. Content-keyed or per-run tool state is not an output, and written into the source tree it churns the
@@ -255,7 +287,8 @@ state, because build tools declare their outputs there.
 motivating case is a patch-development checkout of an upstream project plus its build tree, kept gitignored inside the
 repository: many GiB of incremental build output that no convention file names, so no detector can recognize it. Left in
 the source image, it is the largest thing a fork clones and the main source of main's fragmentation (Why two volumes);
-on the build volume it travels exactly as a Cargo target directory does.
+on the build volume it is cloned at fork and adopted at land, as a Cargo target directory is only in a project without
+the mbx capability.
 
 An entry may be a pattern, `packages/*/.cache/lmao`: its leading components hold `*`, `?` or `[...]`, each matching one
 directory level as Git's glob pathspec reads them (`**` is refused), and its last components are a literal name. At
@@ -381,9 +414,10 @@ which every fork of the target holds while it clones the seed, so a reseed never
 2. the target's Nx task database may have no holder but the target's daemon, which is stopped as at an adoption (Land
    step 5); any other holder, or a daemon that outlives its stop, skips the reseed. The Nx database open locks remain
    held through capture so another client cannot open a known task database between the holder check and the clone;
-3. every existing Cargo profile's `.cargo-lock` is taken exclusively without waiting; Cargo holds that lock shared for
-   its whole build, so a held one skips the reseed with its lock path and processes. The admitted profile locks remain
-   held through capture;
+3. in a project without the mbx capability, every existing Cargo profile's `.cargo-lock` is taken exclusively without
+   waiting; Cargo holds that lock shared for its whole build, so a held one skips the reseed with its lock path and
+   processes. The admitted profile locks remain held through capture. Under mbx this step is empty: no Cargo state is in
+   the build volume;
 4. the live volume and its backing image are flushed, then the existing mounted-source descriptor-clone captures the
    image atomically. Capture does not require unmount or detach; open files on exempt contributed paths do not refuse
    it. The Nx and Cargo guards remain held until the cloned bytes and immutable freshness mark are fixed;
@@ -410,15 +444,16 @@ operations do not depend on that platform-only capability. Re-adoption's retaine
 compile with macOS, while its durable record data, Git evidence schema and pure command-contract and Git-preservation
 tests remain portable.
 
-The guarantee is no capture mid-write by a holder of a known Cargo profile or by an admitted Nx state holder. It is not
-a kernel-wide filesystem-writer barrier: an open index reader, editor or other exempt cache holder does not refuse
-capture. Neither those holders nor the named writers are force-unmounted or killed.
+The guarantee is no capture mid-write by an admitted Nx state holder or, in a project without mbx, by a holder of a
+known Cargo profile. It is not a kernel-wide filesystem-writer barrier: an open index reader, editor or other exempt
+cache holder does not refuse capture. Neither those holders nor the named writers are force-unmounted or killed.
 
-**Known gap: a host process can create a new Cargo profile after enumeration.** The current profile locks do not fence
-that new directory, and mounted capture no longer has the detached-volume barrier that previously covered it. Such a
+**Known gap, without mbx only: a host process can create a new Cargo profile after enumeration.** The current profile
+locks do not fence that new directory, and mounted capture does not fence a profile created after enumeration. Such a
 host build can leave intermediate build-output bytes in a seed. A producer-side capture lease, acquired by every Cargo
-invocation before it creates or writes a profile and held for the build, is required to close that gap. This is queued
-in `agent-todo/cowshed-small-spec-gaps.md`; no protection for that case is claimed by the current capture contract.
+invocation before it creates or writes a profile and held for the build, is required to close that gap; no protection
+for that case is claimed by the current capture contract. Under mbx the gap does not exist: the managed target is never
+in a build volume.
 
 **Which volume a seed holds.** Every build volume's sidecar records the tree it was built at (01_storage.md "Layout"): a
 seed the tree it was frozen at, a land's adopted volume the landed tree, a fork's live volume its seed's. A linked
@@ -629,11 +664,12 @@ declared task output is copied, reset or deleted. Only the excluded `.cowshed/bu
 
 Whether to reseed is decided by rebuild time: for the tree about to build, the Nx miss-work seconds plus the Cargo
 dirty-unit seconds each image leaves. The Nx term is the same for every image wherever the project's localhost Nx cache
-serves the tree's hashes (05_gateway.md, "Publication"): every land publishes its gate's results there, so a seed's gate
-entries are already shared, and only Cargo freshness, with the non-cacheable tasks that compile through it, differs
-between images. Space decides only when no Cargo unit is priced (Cargo-only projects without a timed unit, and projects
-without Cargo, included); the default is then the project's main seed, because unpriced workspace-only build state
-retains private blocks. A land makes this choice before its gate ("Picking a land's build volume", below).
+serves the tree's hashes (05_gateway.md, "/nx/v1/cache/{hash}"): every land publishes its gate's results there, so a
+seed's gate entries are already shared, and only Cargo freshness, with the non-cacheable tasks that compile through it,
+differs between images. Space decides only when no Cargo unit is priced (Cargo-only projects without a timed unit,
+projects without Cargo, and projects with the mbx capability, whose images hold no Cargo unit, included); the default is
+then the project's main seed, because unpriced workspace-only build state retains private blocks. A land makes this
+choice before its gate ("Picking a land's build volume", below).
 
 The seed is cloned as it stands, even when it is behind the target's live build volume or built at another tree.
 Workspace-specific output is lost: the next build pays a cold rebuild for incremental units or cache entries the seed
@@ -713,9 +749,9 @@ An image's price is the compile seconds of the workspace's Cargo units it would 
   stamp is not timed). Of a unit's generations, the one whose hash file was used last counts (`-Zmtime-on-use`, "One
   Cargo environment on every path"). A unit costs the same whichever image holds it, so the workspace's own fingerprints
   price both images. A dirty member with no timed unit is reported `unpriced`, never priced free. Registry units are not
-  priced: sccache serves them. Every price is serial unit-seconds, not gate wall time. A member with no build directory
-  has no timed unit; a target directory that exists but cannot be read, or a tree file Git cannot read, is a pricing
-  failure, never a member without timings.
+  priced: a lock change dirties them through the rules above, and otherwise both images hold them. Every price is serial
+  unit-seconds, not gate wall time. A member with no build directory has no timed unit; a target directory that exists
+  but cannot be read, or a tree file Git cannot read, is a pricing failure, never a member without timings.
 - **Equal Cargo environments and one freshness mode are assumed.** A unit whose environment input differs between the
   build that filled an image and the gate (a `CC_<target>` one set and the other did not) rebuilds whatever its tree,
   and so does every unit of an image built under the other fingerprint mode (`"fingerprint":"mtime"` units where the
@@ -788,7 +824,8 @@ workspace. All sources use one mint path, carrying edits and untracked files war
    forkable, publish and attach it, and point the workspace's `.cowshed/build` at it. Clones preserve every file's bytes
    and mtime; Cargo freshness depends on that (rule "Clones preserve mtimes").
 4. Delete `nx/workspace-data/d` in the new build volume: a daemon record names another checkout's process and socket
-   (rule "One Nx state per checkout").
+   (rule "One Nx state per checkout"). Delete the checkout's inherited `target` link when it names an mbx managed
+   target: it names the source checkout's managed target, and the fork's first build places its own.
 
 The lock covers what reads the target: the clone of its image, its seed refresh and the capture of its seed, all one
 hold, so the clone's checkout and its build volume come from one state of the target that no land or reseed changes
@@ -823,7 +860,8 @@ unit's export.
 
 1. **Refuse a dirty tree**.
 2. **Validate in the workspace**: the caller's check (`--check`, for an Nx project `nx run-many -t lint test build` over
-   what the workspace changed) runs in the sandbox against the workspace's own build volume. Only the delta builds.
+   what the workspace changed) runs in the sandbox against the workspace's own build volume. Only the delta builds. In a
+   project with the mbx capability the check runs at normal mbx priority (05_gateway.md, "Classes").
 3. **Update the target** under its repository lock (02_workspaces.md "`cowshed land`" step 3), which the land holds for
    this step alone: every step after it runs with the lock released. When the target's checkout has the target branch
    checked out, the branch fast-forwards through that checkout and the land continues at step 4. When nothing has the
@@ -848,10 +886,10 @@ unit's export.
    ledger instead skips as `LandingDaemonUnverifiable`, carrying the record path and reason, before quiesce or any
    signal. Nothing is signalled through a record alone. The landing build volume's Nx task database must then have no
    open file descriptors, read without signalling. If it still does, adoption is **skipped** and reported, as for the
-   target below. This settles supervised jobs and Nx; the later seed capture retains Nx open locks and existing
-   Cargo-profile guards through capture and publication. Other contributed paths remain exempt under the named-list rule
-   (Owned index links). Mounted capture replaces the former detach-and-seal barrier; the new-host-profile gap remains as
-   documented in Targets and seeds.
+   target below. This settles supervised jobs and Nx; the later seed capture retains Nx open locks and, in a project
+   without the mbx capability, existing Cargo-profile guards through capture and publication. Other contributed paths
+   remain exempt under the named-list rule (Owned index links). Mounted capture replaces the former detach-and-seal
+   barrier; the new-host-profile gap remains as documented in Targets and seeds.
 5. **Close the target and freeze the seed.** Outside the repository lock, which fenced only the head: what keeps these
    steps correct is the target's Nx open locks and image lock below (rule "The adoption needs the target's Nx database
    closed"):
@@ -861,14 +899,15 @@ unit's export.
       verified it live, and wait for its exit on a process-exit event (it restarts on the next client). A test with a
       real stock daemon pins the equivalence: after this stop, `nx daemon` starts cleanly;
    3. query again; any holder at all, including a daemon a host client started in between, means skip;
-   4. take the target's image lock and admit the landing volume's Nx state and existing Cargo profile locks immediately
-      before capture. A live task-database holder is `landingHeld`, a process opening that database is `landingOpening`,
-      a daemon that outlives its stop is `landingDaemonStayed`, and a held Cargo profile is `landingBuilding`, with the
-      resource and holder named. Retain the Nx open locks and admitted Cargo locks through the mounted-source capture.
-      Every other contributed path is exempt under the named-list rule above. Capture does not unmount the live volume
-      or kill an index reader. On success, publish the target's new seed and claim its previous seeds, released once the
-      land lets go of the target's image lock (Garbage collection). Writes after the snapshot reach the seed through a
-      reseed (Targets and seeds); the documented new-host-profile gap is not claimed closed.
+   4. take the target's image lock and admit the landing volume's Nx state and, in a project without the mbx capability,
+      existing Cargo profile locks immediately before capture. A live task-database holder is `landingHeld`, a process
+      opening that database is `landingOpening`, a daemon that outlives its stop is `landingDaemonStayed`, and a held
+      Cargo profile is `landingBuilding`, with the resource and holder named. Retain the Nx open locks and any admitted
+      Cargo locks through the mounted-source capture. Every other contributed path is exempt under the named-list rule
+      above. Capture does not unmount the live volume or kill an index reader. On success, publish the target's new seed
+      and claim its previous seeds, released once the land lets go of the target's image lock (Garbage collection).
+      Writes after the snapshot reach the seed through a reseed (Targets and seeds); the documented new-host-profile gap
+      is not claimed closed.
 
    Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
    recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a
@@ -929,6 +968,10 @@ unit's export.
    Every seeded/unseeded and adopted/skipped result is also a durable `LandOutcome` commitment, including every
    `AdoptionSkip` and its holders (13_telemetry.md §"Controller audit record schema"), not just cache misses.
 
+   Cargo state takes no part in adoption. In a project with the mbx capability the target keeps its own managed target,
+   and its next build restores from the mbx store what the landing workspace compiled [INFERENCE: until the A/B
+   gate-after-land cell measures it].
+
 7. **Restore the checked outputs (2b).** Checks run **once**, in the landing workspace before delivery. Capture each
    check's attributed stock Nx run summary immediately, in memory for this land only. After adoption, a cowshed-owned
    cache-only helper reconstructs that run's declared task graph through stock Nx's argument parsers and graph builder.
@@ -956,9 +999,9 @@ capturing it immediately avoids treating a later check's summary as the earlier 
 byproducts of the completed checks, not another validation ledger.
 
 The same attributed runs are what the land publishes to the project's Nx cache once every check has passed
-(05_gateway.md, "Publication"): each run's task hashes, local hits included, from the landing checkout's own cache, as a
-gate-class job of the landing workspace. An unattributed check publishes nothing, and a failed publication is said
-without failing the land.
+(05_gateway.md, "/nx/v1/cache/{hash}"): each run's task hashes, local hits included, from the landing checkout's own
+cache, as a gate-class job of the landing workspace. An unattributed check publishes nothing, and a failed publication
+is said without failing the land.
 
 8. **Retire the workspace**. An adopted build volume is now the target's and does not retire with it. After a
    compare-and-swap at step 3 nothing adopted it, so it is still the workspace's.
@@ -971,9 +1014,16 @@ compactor (Seed compaction); the child, not the land, decides whether its refres
 The target adopts the landing volume exactly as the land quiesced it. Nothing of the target's previous volume is copied
 into it: what the target and other lands ran since the landing workspace forked stays in the previous volume, which is
 released (step 6.5). Those results reach later forks and sheds through the project's Nx cache instead: every gated land
-publishes its checks' attributed runs to it, and every shed reads it (05_gateway.md, "Publication"). A rebase is Git
-alone (02_workspaces.md, "`cowshed rebase`"): it computes no task hash, stops no Nx daemon and copies no cache entry,
-and the workspace's next gate reads what its target ran from the same cache.
+publishes its checks' attributed runs to it, and every shed reads it (05_gateway.md, "/nx/v1/cache/{hash}"). A rebase is
+Git alone (02_workspaces.md, "`cowshed rebase`"): it computes no task hash, stops no Nx daemon and copies no cache
+entry, and the workspace's next gate reads what its target ran from the same cache.
+
+**Why the local Nx cache is not shared between checkouts.** Pinned Nx 23.2.1 finds a cached task only through a row in
+the checkout's own task database (`NxCache::get` is `UPDATE cache_outputs … WHERE hash = ?1 RETURNING`), so an entry
+another checkout wrote into a shared directory, with no row here, is a miss. Its `put` removes the task's directory
+before writing it again, so two checkouts writing one hash, or one writing while another restores it, destroy each
+other's payload (`packages/nx/src/native/cache/cache.rs`). The cache and its database are therefore one pair per
+checkout, and sharing between checkouts is the remote-cache path, the gateway's accepted-task service.
 
 - **Enforced by**: a directory-host test in which the target's volume indexes an Nx entry the landing volume lacks, and
   after quiesce, seed freeze, close and adoption the adopted volume indexes only its own entry and holds none of the
@@ -1199,10 +1249,18 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   reports the same ownership reasons.
 - Inside a build volume, Nx's own cache eviction runs unchanged (age and size bounds, configured in `nx.json` as Nx
   documents). Its database and its cache directory are always the same pair, so its eviction never deletes what another
-  database indexes. Gc never opens a volume's contents. Cargo does not bound its target directory: it keeps every unit
-  generation a later build superseded, and rustc keeps every split-debuginfo object set it writes
-  (rust-lang/rust#161824). The Nx plugin's Cargo retention reclaims superseded generations after each run that built
-  (`packages/nx-plugin/README.md`, "Cargo Workspace Layouts"); cowshed does not prune target directories.
+  database indexes. Gc never opens a volume's contents. Under mbx, mbx bounds each managed target and the store by its
+  own collection (checkout gone, `target.max_age`, `target.max_size`, store budget; 03_caches.md, "mbx"). A detached
+  shed whose mount path is absent may look gone to mbx, so its managed target can be collected while the shed exists;
+  its next build restores from the store [INFERENCE: mbx's "checkout is gone" test is path existence; Open questions].
+  The Nx plugin's Cargo retention and its post-run purge (`packages/nx-plugin/README.md`, "Cargo Workspace Layouts") do
+  not run in a project with the mbx capability: mbx collects unused units and whole managed targets itself (unused units
+  only where the volume records access times; Open questions, "`noatime`"), and a second collector over the same
+  directory would only add work (measured: a post-run purge of 73 superseded generations outran a host gate's 10-minute
+  bound). Without mbx, Cargo does not bound its target directory: it keeps every unit generation a later build
+  superseded, and rustc keeps every split-debuginfo object set it writes (rust-lang/rust#161824), so a Rust project
+  without mbx keeps the Nx plugin's Cargo retention, which reclaims superseded generations after each run that built;
+  cowshed does not prune target directories.
 - A workspace's build volume retires with the workspace (`cowshed rm`, which collects before it answers, an unfinished
   clone's removal included), unless main adopted it.
 
@@ -1224,12 +1282,11 @@ needs no new lifecycle operation or candidate write grant.
 
 On macOS, the advisor starts one confined child with kernel denial of persistent writes except its private scratch
 directory. The nonpersistent `/dev/null` device is explicitly writable because Git opens it O_RDWR. All process signals
-and network access are denied except outbound IPC to the configured `SCCACHE_SERVER_UDS` Unix socket. Graph plugins and
-runtime-input descendants inherit that denial. The probe does talk to sccache for metadata/toolchain queries
-(`cargo metadata` asks its compiler for `-vV`); this is a read-only consultation of a toolchain service, not a build or
-target invocation. A missing/unavailable wrapper or service fails loudly, never unsets `RUSTC_WRAPPER` or silently
-probes a different toolchain. Unsupported platforms refuse rather than run unconfined. Node 22.13 or newer supplies
-SQLite.
+and network access are denied. Graph plugins and runtime-input descendants inherit that denial. `cargo metadata` asks
+its compiler for `-vV`; under mbx that query runs through mbx's wrapper, a read-only consultation of the toolchain, not
+a build [INFERENCE: whether mbx's wrapper answers `-vV` without its scheduler socket is unverified; the advisor's test
+must pin it]. A wrapper that refuses fails loudly, never unsets `RUSTC_WRAPPER` or silently probes a different
+toolchain. Unsupported platforms refuse rather than run unconfined. Node 22.13 or newer supplies SQLite.
 
 SQLite never opens a live candidate database, even read-only: a read-only WAL connection can still require SHM writes.
 Instead each database and its present `-wal`/`-journal` files are copied once into scratch, without its `-shm`. The
@@ -1403,8 +1460,22 @@ map, and the probe's bookkeeping must not reach either candidate image.
 ### One Cargo environment on every path
 
 Every Cargo invocation of a checkout (host shell, sandboxed job, Nx task, land check, a long-running dev process) sees
-the same unit-identity environment. Concretely:
+the same unit-identity environment, and in a project with the mbx capability the same mbx route. 11_shell.md, "Canonical
+mbx environment", owns the exact mbx variables every path carries. This rule owns what must hold around them.
+Concretely:
 
+- **Cargo runs through mbx, unwrapped by anything else.** mbx defers to a preset `RUSTC_WRAPPER`, warns and caches
+  nothing, and treats a preset `RUSTC_WORKSPACE_WRAPPER` other than Clippy's `clippy-driver` the same way for workspace
+  crates (mbx FAQ, "Can I use mbx together with sccache"). In an mbx project the canonical job environment therefore
+  carries neither. A wrapper a devenv activation sets is a typed finding that refuses job admission, naming the variable
+  and its source, with the remedy to remove it or disable the mbx capability; a caller's value never reaches an owned
+  job. A tracked `build.target-dir` or `build.build-dir`, or a `CARGO_TARGET_DIR` in the canonical environment, is
+  refused the same way, because mbx leaves such a target unmanaged (15_capabilities.md, "mbx detection").
+- **Incremental compilation is mbx's.** mbx sets `CARGO_INCREMENTAL=0` and gives a workspace crate private incremental
+  state on its first source edit, seeded from the most recently used checkout's state for the same crate and flags on
+  rustc 1.98 or later (mbx docs, "Incremental"). A caller's `CARGO_INCREMENTAL=0` already wins and changes nothing; no
+  path sets `CARGO_INCREMENTAL=1` or `MBX_INCREMENTAL`, which would hand workspace crates to Cargo's checkout-specific
+  incremental state, outside the shared store.
 - **No `CI` in a dev environment.** Cargo turns incremental compilation off for workspace crates whenever `CI` is set,
   which changes their `-C metadata` and writes a second set of units into the same target directory: a target built
   without `CI` is not wholly `Fresh` under `CI=true`. Agent harnesses export `CI=true` on every command. The workspace
@@ -1432,15 +1503,22 @@ the same unit-identity environment. Concretely:
   `-Zremap-cwd-prefix` (relative), or no remap.
 - **No checkout-resolved linker paths.** `target.<triple>.linker` and `host.linker` are a bare PATH program or an
   immutable store path, never a checkout-relative path: Cargo hashes the resolved linker into every unit. On macOS the
-  repository's store-installed linker uses exported `SDKROOT` without discovery and executes `/usr/bin/clang` with
-  `-fuse-ld=/usr/bin/ld`, selecting Apple's linker independently of PATH; only an absent SDK invokes `xcrun`. The Darwin
-  dev shell disables devenv's C tools, uses a compiler-free stdenv, and removes only the Rust toolchain's propagated Nix
-  compiler while retaining the pinned components and their runtime dependencies. Linux retains its existing C tools,
-  stdenv and toolchain propagation. Its Rust linker, devenv's clang driver, links with a patched LLD 21 that sizes ELF
-  relocation shards from the actual LLVM executor, whose worker indices address them. The driver's earlier CPU-affinity
-  snapshot cannot size those shards: an Incus cpuset can grow before the pool starts. The serial path keeps one shard
-  without creating a pool. Only that linker is patched, as local derivations in `tooling/direnv/devenv.nix` rather than
-  an overlay on `llvmPackages`, which would rebuild every package that links with the LLVM stdenv (Chromium, which no
+  repository's store-installed linker wrapper uses exported `SDKROOT` without discovery and executes `/usr/bin/clang`
+  with `-fuse-ld=/usr/bin/ld`, selecting Apple's linker independently of PATH; only an absent SDK invokes `xcrun`.
+  **Under mbx the wrapper links but is never cached.** mbx identifies a `-C linker` only when its file name is `clang`
+  or `clang++`, and any other bypasses the link cache while the link still runs (mbx limits, "Linker overrides and link
+  arguments"); it models `-C link-arg=-fuse-ld=<absolute path>` and keys that linker's path and version. The form mbx
+  caches is `linker = "/usr/bin/clang"` for the macOS target in `.cargo/config.toml`, `MBX_LINKER=path:/usr/bin/ld`
+  exported by the dev shell, and the dev shell's `SDKROOT` selecting the SDK. Measured 2026-10-27: the wrapper bypasses
+  as `unportable-native-link`, and in the cached form a native test link restores from the store with no compiler run.
+  An mbx project switches to the cached form only on the link measurement in Migration. The Darwin dev shell disables
+  devenv's C tools, uses a compiler-free stdenv, and removes only the Rust toolchain's propagated Nix compiler while
+  retaining the pinned components and their runtime dependencies. Linux retains its existing C tools, stdenv and
+  toolchain propagation. Its Rust linker, devenv's clang driver, links with a patched LLD 21 that sizes ELF relocation
+  shards from the actual LLVM executor, whose worker indices address them. The driver's earlier CPU-affinity snapshot
+  cannot size those shards: an Incus cpuset can grow before the pool starts. The serial path keeps one shard without
+  creating a pool. Only that linker is patched, as local derivations in `tooling/direnv/devenv.nix` rather than an
+  overlay on `llvmPackages`, which would rebuild every package that links with the LLVM stdenv (Chromium, which no
   binary cache holds): `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER` names devenv's driver over the patched wrapper.
   LLVM 23 removes implicit thread-index shards in
   [905f654bb721](https://github.com/llvm/llvm-project/commit/905f654bb721f1df119bd2cfaa23736e30838e90); the local patch
@@ -1450,10 +1528,9 @@ the same unit-identity environment. Concretely:
 - **Two profiles.** `dev`, which includes unit tests, and `release`, for a released binary. `test` inherits `dev`. The
   owner's ruling, 2026-09-30: "BUILD EVERYTHING ONCE. CARGO ALREADY TRACKS CHANGES AND REBUILDS WHAT HAS CHANGED"; "You
   have realistically 2 profiles: dev (which includes unit testing) and release". 03_caches.md states the profile rule.
-- **sccache is for dependencies and CI, never dev targets.** Incremental workspace units are not cacheable by sccache;
-  the wrapper does not change fingerprints either way. The owner's ruling, 2026-09-30: "sccache is for CI and stable
-  crates, not for dev targets". Host shells receive the detector's exact pinned client, endpoints and request bases
-  through `.cowshed/env`, matching supervisor children; absent pinned clients unset stale wrapper settings.
+- **One compiler cache.** mbx is the only compiler cache in a project with the mbx capability: registry crates and
+  workspace crates alike are restored from the mbx store by content. A project without mbx compiles every crate in its
+  own target directory.
 - **Every use of a unit is recorded.** `CARGO_UNSTABLE_MTIME_ON_USE=true` (`-Zmtime-on-use`) makes a build stamp the
   fingerprint hash file of every unit it uses, `Fresh` ones included. Cargo output retention
   (`packages/nx-plugin/README.md`, "Cargo Workspace Layouts") reads that stamp as the unit's last use; without it a
@@ -1463,15 +1540,17 @@ the same unit-identity environment. Concretely:
   and every fingerprint byte are those of a build without it, a build with it and one without are each `Fresh` over the
   other's units, and a no-op `cargo build -p a` stamps `a`'s hash file and not an unrelated unit's. Stable Cargo (1.95.0
   and 1.97.0) ignores the variable without a warning, so it is exported unconditionally.
-- **Enforced by**: a test that builds a fixture workspace in one checkout, clones its build volume to a second checkout
-  at another path, runs the same build from a host shell with `CI=true` exported and from a sandboxed job, and requires
-  every unit `Fresh`. The repository's own Cargo configuration also receives a real-repository two-checkout build
-  requiring every inherited unit `Fresh`, not just a fixture.
+- **Enforced by**: a test that builds a fixture workspace in one checkout and the same tree in a second checkout at
+  another path, from a host shell with `CI=true` exported and from a sandboxed job, and requires every compilation of
+  the second build to be an mbx store hit, and without mbx, requires every unit `Fresh` in a cloned build volume. The
+  repository's own Cargo configuration also receives a real-repository two-checkout build requiring the same, not just a
+  fixture. A detection test refuses an activation-set `RUSTC_WRAPPER`, a non-Clippy `RUSTC_WORKSPACE_WRAPPER` and a
+  tracked `build.target-dir` in an mbx project by name, and a link test requires mbx to report host links of the
+  repository's test binaries as cached, not bypassed.
 - **Enforced by**: `directory_a_noop_cargo_build_stamps_the_units_it_uses_and_no_others_substrate_lifecycle`
   (`crates/cowshed-cli/tests/command_dispatch/macos.rs`): a no-op `cargo build -p` from a sandboxed job and from a host
   shell that sources `.cowshed/env` stamps the used unit's hash file and no other's, and the same host build without the
-  file stamps nothing. `cargo_wraps_rustc_with_the_pinned_sccache_or_with_nothing` holds the job and the sourced file to
-  one value whatever the caller names, `a_detected_project_gets_its_tools_wiring_and_a_trust_bundle` and
+  file stamps nothing. `a_detected_project_gets_its_tools_wiring_and_a_trust_bundle` and
   `a_plain_repository_gets_port_loaders_but_no_tool_wiring` hold the job's variable to Cargo projects, and
   `a_cargo_projects_published_environment_records_each_unit_use` holds a served file to the same split.
 
@@ -1596,17 +1675,19 @@ taken holds the database at the look, and one that begins later waits and opens 
 ### Content-addressed tool caches are shared and writable
 
 Read-at-build and link-target caches (03_caches.md layer 3: Cargo registry and git, Go module and build caches, zig,
-bun, uv, sccache through its daemon) are one shared copy per host, written by whichever checkout fetches or compiles
-first. Every sandbox that uses the tool must be able to write them; a cache a sandbox can only read fails the tool (Go's
-build cache, unwritable from the sandbox, fails every sandboxed Go build with `operation not permitted`).
+bun, uv) are one shared copy per host, written by whichever checkout fetches or compiles first. The mbx store is shared
+and writable the same way (03_caches.md, "mbx"). Every sandbox that uses the tool must be able to write them; a cache a
+sandbox can only read fails the tool (Go's build cache, unwritable from the sandbox, fails every sandboxed Go build with
+`operation not permitted`).
 
 - **Enforced by**: a sandboxed `go build`, `cargo fetch` and `bun install` in the capability test suite.
 
 ## Process lifetime across a swap
 
 Nothing pins a path. A process resolves paths through the links when it opens them, inside the sandbox grant of the job
-it belongs to. Each job's sandbox grants exactly the build volume the controller resolved when the job was admitted
-(04_sandbox.md); the supervisor is never relaunched for a swap:
+it belongs to. Each job's sandbox grants exactly the build volume the controller resolved when the job was admitted,
+and, in a project with the mbx capability, `<build-cache>/mbx` (04_sandbox.md); the supervisor is never relaunched for a
+swap:
 
 - A job admitted after a swap, and the Nx daemon the supervisor restarts after it, use the new build volume entirely.
   The keeper resolves the current pointer through the same controller-owned layout as admission on every restart, even
@@ -1637,9 +1718,50 @@ close-out writes main. With build volumes, each level adopts its units' build vo
 queues" above), and main's source image is written once per stack close-out. Stacks remain a coordinator choice; build
 volumes do not require them.
 
+## Migration
+
+A host moves to this model in one release, in this order:
+
+1. **The release installs mbx first.** The cowshed release that carries this model installs its pinned mbx beside the
+   cowshed binary, and `cowshed setup` provisions the build-cache volume (01a_apfs.md, "Dedicated build-cache volume"),
+   adopting an existing volume at its mountpoint by UUID. Only then does a project's devenv pin the same mbx. A project
+   that pins mbx on a host without it is refused admission as `mbx-host-missing` (05_gateway.md, "Pool selection and
+   revision").
+2. **Each checkout moves at its first refresh.** For a Cargo project that gains the mbx capability, the checkout's first
+   refresh removes cowshed's fixed `target` link and drops the old target directory from the build image (Refresh), so
+   mbx's first build places its managed target. Build images, seeds and adoption are otherwise unchanged, and nothing is
+   copied out of the old target directory: build state is rebuild-only.
+3. **The store fills on first builds.** The mbx store starts empty and fills with the first build of each crate, after
+   which every checkout restores it. A checkout's first Cargo build under mbx is cold, once.
+4. **What is deleted with it.** sccache, with its four patches, its daemon and its wiring, and the smoo sccache-patches
+   check. For projects with the mbx capability, the Nx plugin's Cargo retention, its purge, and the `postTasksExecution`
+   hook step that runs it after each Nx run (Garbage collection; `packages/nx-plugin/README.md`, "Cargo Workspace
+   Layouts"); Rust projects without mbx keep all three.
+5. **The linker wrapper goes only if linking through mbx is faster.** After a project's mbx cutover, on one host, it
+   links the same fixtures (two test binaries of the project's largest dependency graphs) both ways: through the
+   repository's wrapper, and through `/usr/bin/clang` with `MBX_LINKER` ("One Cargo environment on every path"). Each
+   way is timed on a link-cache miss and on a hit, the hit being an edit of one leaf crate and the relink. Both sides
+   are measured in the same session, never against a recorded baseline, because the expected gain is under tenfold. The
+   wrapper is removed only when the mbx form is faster on the miss, or faster on the hit at no greater cost on the miss.
+   The measured link times are recorded here, with the decision they gave.
+
+**Overlap with the cowshed-core crate split.** The split moves the code this model changes (00_overview.md, "Crate
+map"). The model's code lands in the existing module at each item's planned crate, so the split later moves it
+unchanged: Cargo/mbx detection in `capabilities/` (cowshed-environment), the build-volume record, layout and link model
+in `build_volume/` (cowshed-storage), fork, land, reseed and clear coordination in `runtime/build_volumes`
+(cowshed-workspaces), mbx reservation in `runtime/job_cpu.rs` (cowshed-runtime) and build-cache provisioning in
+`storage/bootstrap/native` (cowshed-host).
+
 ## Open questions
 
-- **rust-analyzer and editors with `target` as a symlink.** Not yet verified.
+- **rust-analyzer and editors with `target` as a symlink.** Not yet verified for mbx's managed-target link.
 - **Daemon keeper probing.** 04_sandbox.md's workspace supervisor probes the sandboxed daemon every 5 s; an event-driven
   alternative (the daemon's exit) is preferred if Nx exposes one.
-- **Fragmentation measurement** (Why two volumes, item 1).
+- **`noatime` on the build-cache volume.** mbx reads access times to collect unused build units inside a managed target
+  and to seed a new checkout with only the units the other checkout last read; under `noatime` it skips the first and
+  copies every unit for the second (mbx docs, "Managed target directories"). Whether the volume keeps `noatime` is the
+  owner's decision, informed by the A/B's `mbx doctor` reading.
+- **A detached shed's managed target.** Whether mbx's "checkout is gone" test treats an unmounted shed's path as gone,
+  so its target is collected while the shed exists. Its next build then restores from the store.
+- **Seed growth without Cargo churn.** With Cargo's `target/` out of the build image, whether a seed's extents still
+  grow to the compaction trigger, and how fast: the A/B reports a day's extents (Why two volumes, item 1).

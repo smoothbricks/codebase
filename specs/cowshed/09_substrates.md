@@ -237,27 +237,32 @@ budgets").
 Whole RAW backing images can share host APFS blocks through `clonefile`; files inside two separately mounted RAW images
 cannot. Each image contains its own APFS volume, and `clonefile` does not cross those volume boundaries; a fork clones
 the backing image whole, from a live capture that never seals, unmounts or detaches its source (01a_apfs.md, "Images").
-A same-host store is not evidence that its guest files can be reflinked across mounts.
+A same-host store is not evidence that its guest files can be reflinked across mounts. The mbx store is the one
+plain-directory tree in the APFS design: it and mbx's managed targets are directories on the build-cache volume
+(01a_apfs.md, "Dedicated build-cache volume"), so `clonefile` between them works exactly as it does between any two
+files on one volume, and no image is involved. A checkout with the mbx capability reaches them through the `target` link
+mbx creates (16_build_volumes.md); its build volume stays an image here like every other.
 
 ## ZFS substrate
 
 ### Mapping
 
-| cowshed concept                   | ZFS object                                                                                                                                                                                                   |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| project                           | `<pool>/cowshed/projects/<owner>/<repo>` (primary `repo_id`; component-safe container dataset)                                                                                                               |
-| main workspace                    | `<pool>/cowshed/projects/<owner>/<repo>/main`, `mountpoint=` original checkout path                                                                                                                          |
-| session workspace                 | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`                                                                                                                                                           |
-| workspace mounts                  | `mountpoint` inheritance on `…/ws` → `<mount-root>/<owner>/<repo>/<name>`                                                                                                                                    |
-| crash-consistent snapshot of main | `zfs snapshot main@cowshed:<name>` (transactionally atomic)                                                                                                                                                  |
-| `cowshed checkpoint <ws> <label>` | `zfs snapshot ws@<label>` — instant, zero-copy                                                                                                                                                               |
-| `cowshed restore`                 | clone-swap (default; later checkpoints survive) or `--discard-newer` → `zfs rollback`                                                                                                                        |
-| `cowshed fork [<src>] <ws>`       | `zfs snapshot src@cowshed:fork-<ws>` + clone; source defaults to main                                                                                                                                        |
-| `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves) |
-| capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                            |
-| shared caches (layers 1 and 3)    | none — layer 1 is cowshed's user cache directory and layer 3 each tool's own default in the host HOME (03_caches.md)                                                                                         |
-| Linux gateway attachment          | no persistent port block; per-incarnation Unix socket + private netns + trusted `127.0.0.1:7644` connector, created and destroyed with attachment                                                            |
-| compaction                        | not needed — freed blocks return to the pool                                                                                                                                                                 |
+| cowshed concept                   | ZFS object                                                                                                                                                                                                                                                                             |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| project                           | `<pool>/cowshed/projects/<owner>/<repo>` (primary `repo_id`; component-safe container dataset)                                                                                                                                                                                         |
+| main workspace                    | `<pool>/cowshed/projects/<owner>/<repo>/main`, `mountpoint=` original checkout path                                                                                                                                                                                                    |
+| session workspace                 | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`                                                                                                                                                                                                                                     |
+| workspace mounts                  | `mountpoint` inheritance on `…/ws` → `<mount-root>/<owner>/<repo>/<name>`                                                                                                                                                                                                              |
+| crash-consistent snapshot of main | `zfs snapshot main@cowshed:<name>` (transactionally atomic)                                                                                                                                                                                                                            |
+| `cowshed checkpoint <ws> <label>` | `zfs snapshot ws@<label>` — instant, zero-copy                                                                                                                                                                                                                                         |
+| `cowshed restore`                 | clone-swap (default; later checkpoints survive) or `--discard-newer` → `zfs rollback`                                                                                                                                                                                                  |
+| `cowshed fork [<src>] <ws>`       | `zfs snapshot src@cowshed:fork-<ws>` + clone; source defaults to main                                                                                                                                                                                                                  |
+| `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves)                                                                           |
+| capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                                                                                                      |
+| shared caches (layers 1 and 3)    | none — layer 1 is cowshed's user cache directory and layer 3 each tool's own default in the host HOME (03_caches.md)                                                                                                                                                                   |
+| mbx store and managed targets     | `<pool>/cowshed/build-cache` dataset at `/private/cowshed/build-cache`, holding only the mbx cache dir `mbx/`; store and targets together on one filesystem, so restores are clones where the pool's block cloning serves them [INFERENCE] (01b_zfs.md, "The mbx store on a ZFS host") |
+| Linux gateway attachment          | no persistent port block; per-incarnation Unix socket + private netns + trusted `127.0.0.1:7644` connector, created and destroyed with attachment                                                                                                                                      |
+| compaction                        | not needed — freed blocks return to the pool                                                                                                                                                                                                                                           |
 
 Adopt on ZFS: create `…/projects/<owner>/<repo>/main`, copy the tree once (rsync-fidelity, preserving metadata), set
 `mountpoint=` the original path. The original tree moves aside as `<root>.pre-cowshed` exactly as on macOS. The
@@ -314,31 +319,38 @@ Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI — runs unpr
 
 ### Linux host paths
 
-State paths are identical across platforms — the store volume/dataset at `/private/cowshed/store` — only the volume
-technology behind the mountpoint differs. Shared caches are not datasets: they live in the host HOME on both platforms
-(03_caches.md). ZFS additionally keeps workspace data in the sibling `projects` dataset tree:
+The store is at `/private/cowshed/store` on both platforms; `<bc>`, the build-cache root that holds the mbx store, is
+platform-specific, as the table below states — only the volume technology behind each mountpoint also differs. Shared
+layer-1 and layer-3 caches are not datasets: they live in the host HOME on both platforms (03_caches.md); the mbx store
+is the one shared cache that is a dataset on ZFS and a dedicated volume on APFS, because its restores must clone
+(03_caches.md, "The reflink-reachability rule"). ZFS additionally keeps workspace data in the sibling `projects` dataset
+tree:
 
-| macOS                                                                                                          | Linux                                                                 |
-| -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `cowshed.store` APFS volume at `/private/cowshed/store` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `/private/cowshed/store`            |
-| project images are files on `cowshed.store`                                                                    | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers |
+| macOS                                                                                                          | Linux                                                                  |
+| -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `cowshed.store` APFS volume at `/private/cowshed/store` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `/private/cowshed/store`             |
+| `cowshed.build-cache` APFS volume at `/private/var/folders/cowshed/shared/build-cache` (the mbx store, `mbx/`) | `<pool>/cowshed/build-cache` dataset at `/private/cowshed/build-cache` |
+| project images are files on `cowshed.store`                                                                    | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers  |
 
 ### Fixed dataset hierarchy
 
-The ZFS root has exactly two sibling children; project datasets never sit beside or beneath the store dataset:
+The ZFS root has exactly three sibling children; project datasets never sit beside or beneath the store dataset, and
+nothing but the mbx cache dir sits in the build-cache dataset:
 
 ```
 <pool>/cowshed
 ├── store       mountpoint=/private/cowshed/store
+├── build-cache mountpoint=/private/cowshed/build-cache
 └── projects    mountpoint=none
     └── <owner>/<repo>/{main,ws/...}
 ```
 
 `store` contains repository bindings, trusted `policy.json`, grants, quarantine, gateway state, and telemetry.
-`projects` contains only workspace datasets and their snapshots. Creation, helper containment checks, discovery,
-send/receive, and GC all use these exact roots; the two siblings are not configurable independently. A host that still
-has the `<pool>/cowshed/caches` dataset of an earlier release keeps it mounted, never creating one, until its retirement
-destroys it (03_caches.md, "Retiring the caches volume").
+`build-cache` contains only `mbx/`, the one mbx cache directory (01b_zfs.md, "The mbx store on a ZFS host"); mbx owns
+its contents and no cowshed collection enters it. `projects` contains only workspace datasets and their snapshots.
+Creation, helper containment checks, discovery, send/receive, and GC all use these exact roots; the siblings are not
+configurable independently. A host that still has the `<pool>/cowshed/caches` dataset of an earlier release keeps it
+mounted, never creating one, until its retirement destroys it (03_caches.md, "Wiring").
 
 ### Restore transaction
 

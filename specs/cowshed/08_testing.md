@@ -79,10 +79,12 @@ No mounts, no root, no network — pure functions with table-driven cases:
   is not that readiness condition.
 - **Env wiring**: exec env allowlist filtering (no `*_TOKEN`/`*_SECRET`/`AWS_*` pass-through), cache exports match
   03_caches.md exactly.
-- **Repository Cargo warmth**: warm the real repository's own config in a managed shell, fork its source/build images to
-  a different mount path and repeat the identical Cargo build. Require every `compiler-artifact` to be `fresh: true`; a
-  fixture alone cannot catch a checkout-relative linker. The Darwin linker probe requires zero `xcrun`/`xcode-select`
-  with exported `SDKROOT`, exactly one fallback `xcrun` without it, and runnable binaries from both paths.
+- **Repository Cargo warmth**: in a project without the mbx capability, warm the real repository's own config in a
+  managed shell, fork its source/build images to a different mount path and repeat the identical Cargo build. Require
+  every `compiler-artifact` to be `fresh: true`; a fixture alone cannot catch a checkout-relative linker. The Darwin
+  linker probe requires zero `xcrun`/`xcode-select` with exported `SDKROOT`, exactly one fallback `xcrun` without it,
+  and runnable binaries from both paths. With mbx present, Cargo warmth after a fork is the shared store's, not the
+  build image's, and its evidence is the host scheduling evidence below, not this oracle.
 - **Port-block rule generation**: the generated SBPL emits the block as **one literal single-port `network-outbound`
   allow per port of its recorded size** — 16 for a live pre-64 block, 64 for a new one (measured: SBPL rejects port
   ranges — `invalid port in network address` — and hosts other than `localhost`/`*`), leaves
@@ -256,9 +258,7 @@ Process fixtures resolve real portable tools through the selected shell's PATH, 
 version-probe fixture prepends its selected executable directory without discarding that toolchain PATH. Host API proofs
 compare both successful answers and typed refusals with their CLI verbs; JSON failure diagnostics live on stdout. The
 native disk-output proof in CLI `host.rs` belongs to its macOS-only `real_apfs_host` module and the existing
-`cargo-test-group-real-apfs-host` lane. Portable runs still prove the disk runner's rename refusal and sccache role
-isolation. Sccache's LaunchAgent status is macOS-only: Linux proves the same explicit launchctl-unavailable error
-through the CLI and host API, never a fabricated running status.
+`cargo-test-group-real-apfs-host` lane. Portable runs still prove the disk runner's rename refusal.
 
 An oracle on allocated bytes is judged against the same filesystem, never one filesystem's block count: a sparse-file
 proof compares the file with a fresh sparse control of the same length created and synced beside it and reads zeroes at
@@ -628,6 +628,15 @@ exact commands to run. It never looks at `t` or a test namespace's directory: th
 `cowshed exec` sandbox, where the shards run too, denies it. On a host setup has been through it checks and changes
 nothing.
 
+Build-cache volume provisioning is proved the same way, at its own boundaries: setup's and doctor's cells (absent,
+present-by-label, prototype adopted by UUID, mis-mounted, unencrypted, masked mountpoint, foreign parent, foreign
+top-level entries) run over kernel-snapshot fixtures with no volume created, and the one real boot-mount cell mounts a
+throwaway volume by UUID at a canonical-shaped path under its test namespace's directory
+(`/private/var/folders/cowshed/<uid>/<ns>`), under a user-owned parent the fixture makes — the test-namespace mount
+rules above, unchanged. No test provisions, mounts over or writes into the host's production build-cache volume, and no
+fixture's mbx cache dir is the host's `<bc>/mbx`: a fixture that runs mbx points it at a cache dir inside its own
+scratch root.
+
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (the mounted RAW image, then the retained RAW input) and the worker record; neither a sibling's
 output nor a host inventory count substitutes for either record. The child runs libtest with `--nocapture --quiet`:
@@ -715,6 +724,15 @@ a job's command receives — `CARGO_MAKEFLAGS`/`MAKEFLAGS` naming the job's own 
 passed — and a fifo of `g − 1` bytes. How Cargo reads a jobserver is Cargo's own to test; an end-to-end proof with real
 Cargo belongs in a nightly, not the gate. The `bounded-exec` executor suite clears every inherited sizing variable for
 its own run, so the count of the job that runs the suite is no ceiling on the runners its cases size.
+
+**Required scheduling evidence.** The jobserver proof above is the evidence for cowshed's own ledger, which serves only
+when no mbx is present. The host-tier proofs that mbx, when present, is the one CPU/memory ledger — mbx-present
+admission, pinned-revision skew and `mbx-host-missing` refusals, `mbx reserve` for non-Cargo work, in-flight dedupe of
+identical compiles, and an Nx run mixing Cargo and non-Cargo tasks taking exactly one pool grant per leaf task — are
+named in 05_gateway.md, "Required scheduling evidence", and must exist in the host lanes there; this file does not
+restate them. Where a proof there needs a recorded memory peak, it reads the last recorded peak for the same task
+identity from the existing job/process spans (13_telemetry.md, "Job resource peaks"); no test maintains a second peak
+ledger to read from.
 
 Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
 or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its
@@ -833,7 +851,7 @@ or on an input that is no workspace file. Naming is reporting only: a step that 
 stays the verdict. A red land's next attempt gates whole again. Nx's cache already replays every task whose inputs did
 not move, and a task Nx does not cache has a verdict its hash does not decide, so no record of earlier passes stands in
 for running it. After a passing gate, task hashes that cannot be read from the run summary are said and the land goes on
-without publishing them: the cache never blocks a land (05_gateway.md, "Publication").
+without publishing them: the cache never blocks a land (05_gateway.md, "/nx/v1/cache/{hash}").
 
 Every test target, the groups included, is bounded by progress alone: the run ends when the time since the last finished
 test reaches its configured `idleTimeoutMs` (`BOUNDED_TEST_IDLE_TIMEOUT_MS` in the plugin's test-target policy), and
@@ -1182,11 +1200,18 @@ Covered flows:
   no-mount attach, pinned `fsck_apfs -q` and `mount_apfs` path and verify the resulting held mount identity. A failed
   operation refuses publication and cleans up only the destination, never the live source (02_workspaces.md, fork step
   4). A build seed (16_build_volumes.md, "Targets and seeds") uses the same block-atomic mounted descriptor clone with
-  supervised admission closed and the Nx and existing Cargo-profile guards held through capture and publication. Tests
-  require an exempt index/cache reader to survive with source identity and mounts unchanged; an Nx state holder or a
-  held known Cargo profile refuses seed replacement. The new-host-profile gap remains explicit in that contract; no
-  fencing of that case is claimed. RAW has no outer allocation map for a live capture to split (02_workspaces.md, fork
-  step 2).
+  supervised admission closed and the Nx guard — and, in a project without the mbx capability, the existing
+  Cargo-profile guards — held through capture and publication. Tests require an exempt index/cache reader to survive
+  with source identity and mounts unchanged; an Nx state holder or a held known Cargo profile refuses seed replacement.
+  The new-host-profile gap remains explicit in that contract for a project that keeps its Cargo target in the build
+  volume; a project with mbx holds no Cargo profile there for it to gap over, and its capture takes no Cargo lock. No
+  fencing of the gap case is claimed. RAW has no outer allocation map for a live capture to split (02_workspaces.md,
+  fork step 2).
+- **mbx target link at fork**: fork a project with the mbx capability whose source checkout has a `target` link naming
+  the source's managed target on the build-cache volume; the fork starts with that inherited link deleted, its build
+  image otherwise cloned as any other, and cowshed's refresh neither recreates nor retargets the link — the first build
+  through mbx creates the fork's own (16_build_volumes.md). A project without mbx forks with its build-volume `target`
+  exactly as today.
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount

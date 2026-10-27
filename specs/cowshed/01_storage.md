@@ -92,7 +92,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     checkpoints/
       <workspace>/<label>.dmg        # clonefile snapshot
     build/
-      <id>.dmg                       # one build volume: Cargo target dirs + Nx cache and task DB (16_build_volumes.md)
+      <id>.dmg                       # one build volume (16_build_volumes.md owns what it holds)
       <id>.dmg.json                  # its sidecar: built-at tree, linking checkout, checked-out tree when placed, seed flag, created
       <id>.dmg.hold                  # flock each job on the volume holds shared; a release claims it exclusive, then deletes it
       .deleting/<id>.dmg             # a committed release, waiting for the gateway's cleanup
@@ -101,7 +101,6 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
                                      #   read-only directories its tools sealed made owner-writable first (`go clean -modcache`)
     quarantine/                      # secrets relocated by `cowshed adopt --quarantine`, and keyless sidecars awaiting `rekey`
   gateway.sock                       # gateway unix socket (control plane; root-level keeps sun_path short)
-  sccache.sock                       # the host sccache daemon's socket (03_caches.md)
   run/
     manager.sock                     # the daemon's supervisor manager (11_shell.md)
     <digest>.sock                    # one workspace supervisor's socket
@@ -120,6 +119,26 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
 
 Each process makes a project deletion-log name power-loss durable by one successful parent sync per held parent
 directory identity, whether created or opened; later appends sync only the file and a replacement parent starts again.
+
+The build-cache volume (`<bc>`) is the second dedicated volume; its provisioning, mountpoint and findings are
+[01a_apfs.md §Dedicated build-cache volume](./01a_apfs.md#dedicated-build-cache-volume). Cowshed owns exactly one
+top-level entry on it:
+
+```
+/private/var/folders/cowshed/shared/build-cache/   # ← the cowshed.build-cache volume, fstab-pinned here (01a_apfs.md)
+  .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted", as the store's (01a_apfs.md)
+  mbx/                               # the one shared mbx cache dir: action store, learned incremental state, and
+                                     #   managed targets at targets/v1/<checkout digest>; mbx owns everything below
+                                     #   it, cowshed only provisions the volume and points mbx at this directory
+                                     #   (03_caches.md)
+  (every other top-level entry belongs to another host tool: foreign, never listed, swept or collected by cowshed,
+   01a_apfs.md, "Dedicated build-cache volume")
+```
+
+There is no per-project or per-checkout tree on `<bc>`: a checkout's build volume stays an image in the store tree
+above, and a checkout with the mbx capability reaches `<bc>/mbx` only through the `target` link mbx creates in the
+checkout (16_build_volumes.md; 15_capabilities.md). Nothing beneath `<bc>` is discovered as a project, workspace or
+build volume, and no walker of the store root ever descends into it.
 
 **Owners are marked, never inferred.** Every walker of the store root reads only the directories that hold
 `.cowshed-owner` and are not reserved names (dotted names and the controller's own namespaces above): one `lstat` passes
@@ -162,10 +181,12 @@ metadata is optional and platform-specific: it is present only for macOS workspa
 not synthesize a base port in persistent metadata.
 
 The Data-volume footprint is limited to the empty `/private/cowshed/store` mountpoint directory, the per-user workspace
-mount root (on macOS, the fixed `/private/var/folders/cowshed/<uid>/mnt`), and cowshed's user cache directory
-`~/Library/Caches/dev.cowshed`, which holds the gateway's registry and repository mirrors. Durable evidence lives on the
-dedicated store volume, outside Data's snapshots, backups, and fsck domain. Layer-3 caches belong to the tools and stay
-where the tools keep them in HOME (03_caches.md).
+mount root (on macOS, the fixed `/private/var/folders/cowshed/<uid>/mnt`), the build-cache volume's empty mountpoint
+directory under its user-owned `shared` parent (01a_apfs.md, "Dedicated build-cache volume"), and cowshed's user cache
+directory `~/Library/Caches/dev.cowshed`, which holds the gateway's registry and repository mirrors. Durable evidence
+lives on the dedicated store volume, outside Data's snapshots, backups, and fsck domain; the mbx store lives on the
+build-cache volume, outside them for the same reason. Layer-3 caches belong to the tools and stay where the tools keep
+them in HOME (03_caches.md).
 
 ### Two `.cowshed` namespaces
 
@@ -173,9 +194,10 @@ The name appears in two namespaces that must not be confused. **Host-absolute `/
 the herd's store volume holds images, grants, and telemetry. **In-image relative `.cowshed/`** exists once _per
 workspace_, at each workspace volume root — the marker, token, CA certificate, in-image cache roots, and job spools —
 and travels with every clone. The wiring rule follows the split: shared state resolves to a host-absolute path — under
-`/private/cowshed/store/...`, or a shared cache's own directory in the host HOME (03_caches.md) — that is the same
-string in every context, while workspace-keyed state resolves to in-image relative `.cowshed/...` paths (correct in
-every clone automatically). Main and sessions use identical wiring; only the sandbox's permission mask differs.
+`/private/cowshed/store/...`, under the build-cache volume for the one shared mbx store, or a shared cache's own
+directory in the host HOME (03_caches.md) — that is the same string in every context, while workspace-keyed state
+resolves to in-image relative `.cowshed/...` paths (correct in every clone automatically). Main and sessions use
+identical wiring; only the sandbox's permission mask differs.
 
 ### Host namespace
 
@@ -231,13 +253,14 @@ binds a socket for a fixture below `TMPDIR` binds it through a short runtime ali
 
 ## Runtime state: derived, never stored
 
-| Question                | Source of truth                                                                                                                              |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| Which workspaces exist? | For the selected primary `repo_id`, `readdir` its `sessions/` images plus that project's exactly one `main`                                  |
-| What is attached where? | Kernel mount table (`getfsstat` into an owned buffer), matched by mount point, identity confirmed by the in-image marker                     |
-| Workspace identity      | In-image marker `.cowshed/workspace.json`                                                                                                    |
-| Grants                  | Sibling file `<image>.grants.json`                                                                                                           |
-| Concurrency             | `flock` on `<image>.lock` per lifecycle operation; `<workspace>.intent.lock` held by the process executing that workspace's lifecycle intent |
+| Question                           | Source of truth                                                                                                                                                     |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Which workspaces exist?            | For the selected primary `repo_id`, `readdir` its `sessions/` images plus that project's exactly one `main`                                                         |
+| What is attached where?            | Kernel mount table (`getfsstat` into an owned buffer), matched by mount point, identity confirmed by the in-image marker                                            |
+| Is the build-cache volume mounted? | Kernel mount table, matched at its canonical mountpoint, identity confirmed by its root `.cowshed-volume.json` marker (01a_apfs.md, "Dedicated build-cache volume") |
+| Workspace identity                 | In-image marker `.cowshed/workspace.json`                                                                                                                           |
+| Grants                             | Sibling file `<image>.grants.json`                                                                                                                                  |
+| Concurrency                        | `flock` on `<image>.lock` per lifecycle operation; `<workspace>.intent.lock` held by the process executing that workspace's lifecycle intent                        |
 
 The detached metadata required for discovery and attach lives in `<image>.grants.json`; at minimum it contains the
 workspace identity, in addition to the grant schema in 04_sandbox.md, so `cowshed ls` and attach never mount an image to
@@ -340,15 +363,16 @@ gateway, which deletes it in the background (05_gateway.md, "Deleting released i
 only explicitly released images (build volumes, the sources of clean removals, the orphan, expired and staged images
 that `gc` and failed verbs release) and provably dead scratch, never idle workspaces:
 
-| Object                                       | Default retention                                                                      | Exempt / override                                                                                                                                                            |
-| -------------------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Checkpoints                                  | all younger than 14 days **plus the newest five per workspace, whichever keeps more**  | explicit pin from a label or `cowshed checkpoint --keep`; pins never expire until unpinned                                                                                   |
-| CI failure checkpoints                       | same checkpoint rule as above                                                          | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                                                                                                    |
-| Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**          | landing/removal is always explicit                                                                                                                                           |
-| Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`   | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are released to `.deleting`, not here    |
-| Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background | each is nudged to the gateway, whose `image-cleanup` thread lists every `.deleting` each pass (05_gateway.md); no verb frees it: `rm`, `land` and `gc` only commit and nudge |
-| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; the bundle is the only copy of the commits it holds        | explicit `cowshed gc --abandoned`                                                                                                                                            |
-| Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`   | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                                                                                     |
+| Object                                       | Default retention                                                                                                                                             | Exempt / override                                                                                                                                                            |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Checkpoints                                  | all younger than 14 days **plus the newest five per workspace, whichever keeps more**                                                                         | explicit pin from a label or `cowshed checkpoint --keep`; pins never expire until unpinned                                                                                   |
+| CI failure checkpoints                       | same checkpoint rule as above                                                                                                                                 | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                                                                                                    |
+| Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**                                                                                 | landing/removal is always explicit                                                                                                                                           |
+| Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`                                                                          | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are released to `.deleting`, not here    |
+| Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background                                                                        | each is nudged to the gateway, whose `image-cleanup` thread lists every `.deleting` each pass (05_gateway.md); no verb frees it: `rm`, `land` and `gc` only commit and nudge |
+| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; the bundle is the only copy of the commits it holds                                                                               | explicit `cowshed gc --abandoned`                                                                                                                                            |
+| Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`                                                                          | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                                                                                     |
+| mbx store and managed targets (`<bc>/mbx`)   | mbx's own collection budgets (03_caches.md); `cowshed gc` never lists or collects them, nor any other top-level entry of the build-cache volume (01a_apfs.md) | none                                                                                                                                                                         |
 
 - `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
   14 days old **and** is not among the newest five for that workspace. A user-supplied label creates an explicit pin;
@@ -453,9 +477,9 @@ keeps the archive and its record, reports both the archive and the error, and gi
 it still take their turn; the next full listing walks it again from its root.
 
 The roots are canonical `/tmp` and the daemon/CLI's non-RAM temp root, deduplicated. Foreign `node_*`, `bash_*`,
-`cargo_*`, `bun_*`, `devenv-*`, and `sccache_*` entries are excluded, even if they contain a marker. Bounded-exec
-remains the sole owner of RAM lease reclamation: `ram-temp.ts::settle` runs under its kernel lock, claim ledger and
-identity recheck during acquire/release. This sweep never enters a namespace's `ram<revision>` mount, production's below
+`cargo_*`, `bun_*` and `devenv-*` entries are excluded, even if they contain a marker. Bounded-exec remains the sole
+owner of RAM lease reclamation: `ram-temp.ts::settle` runs under its kernel lock, claim ledger and identity recheck
+during acquire/release. This sweep never enters a namespace's `ram<revision>` mount, production's below
 `/private/var/folders/cowshed/<uid>` or a test namespace's below its directory, their leases, staging, `.archive`,
 `.archive/.deleting`, locks or ledgers, and reports that delegation. Reclamation and retention decisions are printed by
 path and reason; the summary states the examined count and bound.

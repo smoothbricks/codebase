@@ -154,8 +154,12 @@ Find the symptom in the left column and follow the link.
 - **Rule.** `cowshed setup` provisions a subtree of its own, `/private/var/folders/cowshed` (root:wheel 0755), holding
   the invoking user's `<uid>` directory and its `mnt` mount root (0700) under names the sweeps do not address, and each
   provisioner of it — `cowshed setup`, the `cowshed:apfs-test-root` target and the fixtures' scratch parent — refuses a
-  symlink, a non-directory or a foreign owner rather than write through it.
+  symlink, a non-directory or a foreign owner rather than write through it. A mountpoint under it needs a user-owned
+  parent — a root mount, or an `rmdir` directly under the root-owned `cowshed` directory, is refused — so the
+  build-cache volume mounts at `shared/build-cache` under a `shared` parent the provisioning user owns (group `nixbld`,
+  0750; the owner's ruling, 2026-10-27).
 - **Owners.** [01a_apfs.md §Stable workspace mount root](./01a_apfs.md#stable-workspace-mount-root);
+  [01a_apfs.md §Dedicated build-cache volume](./01a_apfs.md#dedicated-build-cache-volume) (the user-owned parent);
   [01_storage.md §Directory layout](./01_storage.md#directory-layout);
   [08_testing.md §Integration tests (real substrate)](./08_testing.md#integration-tests-real-substrate) (the scratch
   parent `t`). Code: [`cowshed-core/src/storage/bootstrap/native/macos.rs`] `mount_root_operations`;
@@ -524,8 +528,9 @@ Find the symptom in the left column and follow the link.
   (or one of four other substrings) and applies no `nobrowse`, read-only, marker or Search Privacy gate to any other
   mount (_measured_: disassembly and `lsmp` controls).
 - **Rule.** Every session, build, fixture and RAM mount sits under `/private/var/folders/cowshed/<uid>/…` — sessions and
-  build volumes under `mnt`, fixtures under `t`, the RAM volume under `ram<revision>` — and cowshed never impersonates a
-  firmware path or waits for `mds` to release a right; a main mounts at its checkout path, which `mds` admits.
+  build volumes under `mnt`, fixtures under `t`, the RAM volume under `ram<revision>` — and the build-cache volume at
+  `/private/var/folders/cowshed/shared/build-cache`, and cowshed never impersonates a firmware path or waits for `mds`
+  to release a right; a main mounts at its checkout path, which `mds` admits.
 - **Owners.** [01a_apfs.md §Spotlight media references](./01a_apfs.md#spotlight-media-references);
   [01a_apfs.md §Stable workspace mount root](./01a_apfs.md#stable-workspace-mount-root);
   [08_testing.md §Integration tests (real substrate)](./08_testing.md#integration-tests-real-substrate);
@@ -612,8 +617,12 @@ Find the symptom in the left column and follow the link.
   it (_owner text_); a path-level `tmutil addexclusion` stops that path's backup, not its volume's snapshots (_owner
   text_), and Time Machine leaves the store volume out (`tmutil isexcluded /private/cowshed/store` reports `[Excluded]`;
   _measured_).
-- **Rule.** All durable bytes live on one dedicated store volume, which takes no local snapshots while Time Machine
-  leaves it out and makes backup one per-volume decision, and cowshed runs no `tmutil` and applies no exclusion.
+- **Rule.** All durable bytes live on dedicated volumes (the store, and the build-cache volume for the mbx store). The
+  store takes no local snapshots while Time Machine leaves it out — measured above, for `/private/cowshed/store` only —
+  and backup is one per-volume decision; cowshed runs no `tmutil` and applies no exclusion. [INFERENCE] The build-cache
+  volume's snapshot and Time Machine behaviour is unmeasured; measuring it as the store was measured —
+  `tmutil isexcluded` on its mountpoint and a local-snapshot listing for the volume, on a host with Time Machine
+  configured — is what settles whether it takes no local snapshots either.
 - **Owners.** [01a_apfs.md §Images](./01a_apfs.md#images), “Time Machine”;
   [01a_apfs.md §Dedicated store volume](./01a_apfs.md#dedicated-store-volume);
   [01a_apfs.md §Rejected APFS alternatives](./01a_apfs.md#rejected-apfs-alternatives);
@@ -630,7 +639,10 @@ Find the symptom in the left column and follow the link.
 - **Rule.** `cowshed setup` encrypts an unencrypted store in place, stores its passphrase in
   `/Library/Keychains/System.keychain` under the label and the UUID, pins the volume `noauto,nobrowse,noowners` by UUID
   in `/etc/fstab` and installs the root LaunchDaemon `dev.cowshed.storage`, which unlocks and mounts it at
-  `/private/cowshed/store` before any login without running the cowshed binary.
+  `/private/cowshed/store` before any login without running the cowshed binary. The build-cache volume gets the same
+  treatment by the same daemon, script and keychain scheme, at its own canonical path and with the fstab flags its own
+  pin states, `noatime` among them
+  ([01a_apfs.md §Dedicated build-cache volume](./01a_apfs.md#dedicated-build-cache-volume)).
 - **Owners.** [01a_apfs.md §Dedicated store volume](./01a_apfs.md#dedicated-store-volume);
   [06_cli.md §Onboarding and repair](./06_cli.md#onboarding-and-repair);
   [01a_apfs.md §Mount and per-volume policy](./01a_apfs.md#mount-and-per-volume-policy) (the `noauto`, `nobrowse` and
@@ -658,10 +670,12 @@ Find the symptom in the left column and follow the link.
   mounts — a LaunchAgent's socket, a stderr file, Finder's `.DS_Store` — stays in it, and an entry that is not a
   disposable stub keeps it masked (_owner text_).
 - **Rule.** Logs live outside the mountpoint (`/var/log/cowshed-storage.log`, `~/Library/Logs/cowshed/`), `setup` and
-  the existing-only runtime reclaim only enumerated disposable stubs (an idle daemon socket, the sccache cache,
-  directory-only `mnt/` scaffolding, empty directories, `.DS_Store`) before they remount, the root boot script refuses
-  any nonempty mountpoint, and any other entry keeps the mountpoint masked, which existing-only commands refuse with
-  `environment-missing` naming the mountpoint.
+  the existing-only runtime reclaim only enumerated disposable stubs (an idle daemon socket, directory-only `mnt/`
+  scaffolding, empty directories, `.DS_Store`) before they remount, the root boot script refuses any nonempty
+  mountpoint, and any other entry keeps the mountpoint masked, which existing-only commands refuse with
+  `environment-missing` naming the mountpoint. The build-cache volume's mountpoint follows the same rule, and a foreign
+  top-level entry of another owner on that volume is never a reclaimable stub
+  ([01a_apfs.md §Dedicated build-cache volume](./01a_apfs.md#dedicated-build-cache-volume)).
 - **Owners.** [01a_apfs.md §Dedicated store volume](./01a_apfs.md#dedicated-store-volume), “Mount ordering and the
   unmounted-masking guard”;
   [14_nix.md §Ownership detection: validate, never mutate](./14_nix.md#ownership-detection-validate-never-mutate). Code:
@@ -706,10 +720,9 @@ Find the symptom in the left column and follow the link.
 
 - **Fact.** User LaunchAgents load into the `gui/<uid>` domain, the user-login domain created when the user logs in at
   the GUI (`launchctl(1)`), and never fire for a uid with no graphical login (_owner text_).
-- **Rule.** The gateway and sccache run as LaunchAgents bootstrapped into `gui/<uid>` with fixed `/bin/launchctl`
-  arguments, an install whose bootout goes overdue leaves the agent unloaded and prints the exact `launchctl bootstrap`
-  line to run once launchd lets go, and a headless dedicated account is specified to run the gateway as a LaunchDaemon
-  instead.
+- **Rule.** The gateway runs as a LaunchAgent bootstrapped into `gui/<uid>` with fixed `/bin/launchctl` arguments, an
+  install whose bootout goes overdue leaves the agent unloaded and prints the exact `launchctl bootstrap` line to run
+  once launchd lets go, and a headless dedicated account is specified to run the gateway as a LaunchDaemon instead.
 - **Owners.** [05_gateway.md §Placement and identity](./05_gateway.md#placement-and-identity);
   [14_nix.md §Posture B — dedicated `dev` uid (recommended hardening)](./14_nix.md#posture-b--dedicated-dev-uid-recommended-hardening);
   [docs/gateway.md §Start at login (launchd)](../../packages/cowshed/docs/gateway.md#start-at-login-launchd);
