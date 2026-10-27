@@ -316,6 +316,10 @@ test that executes the CLI or loads the ordinary platform addon names those prod
 addon still name `napi-debug`. The land host runs `cowshed:cli-native:production` then the uncached, dependency-free
 `cowshed:release-check`; the guard inspects the produced shipping bytes, not a development output or a cache replay.
 
+After the fast-forward, main's output restoration explicitly requests `build`, `cli-native`, and `napi-native`. The
+normal build remains JS/dependency-only; this post-land seam restores the source-selected host CLI/addon and their input
+receipts for linked consumers. Each concrete producer remains cacheable and recompiles only changed inputs.
+
 Artifact loaders select the profile from package source authority, never from which artifact happens to exist. A
 checkout contains a tracked source entry that the package never publishes and loads the development artifact, even when
 its JavaScript runs from `dist/ts`. A published package or sealed snapshot omits that authority entry and loads the

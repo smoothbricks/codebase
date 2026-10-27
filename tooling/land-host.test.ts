@@ -43,8 +43,8 @@ const TASK = 'cowshed:cargo-test-cowshed-core-shard1';
 const CORES = String(spawnSync('sysctl', ['-n', 'hw.ncpu'], { encoding: 'utf8' }).stdout).trim();
 const GATE = ['run-many', '-t', 'gate', `--parallel=${CORES}`, '--nx-bail=false', '--outputStyle=static-failures-only'];
 const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
-/** The build a successful land runs in main, so main's built outputs match the sources it lands. */
-const MAIN_BUILD = ['run-many', '-t', 'build', '--outputStyle=static-failures-only'];
+/** Main restores the ordinary outputs plus its source-selected host CLI and addon after a successful land. */
+const MAIN_BUILD = ['run-many', '-t', 'build', 'cli-native', 'napi-native', '--outputStyle=static-failures-only'];
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
 const SHIPPING_PRODUCER = ['run', 'cowshed:cli-native:production', '--outputStyle=static-failures-only'];
 const SHIPPING_CHECK = ['run', 'cowshed:release-check', '--outputStyle=static-failures-only'];

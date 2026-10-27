@@ -34,10 +34,10 @@
 #    hashes that cannot be read from the gate's run summary, or a publish that fails, are said and the land goes on.
 # 5. `cowshed land` fast-forwards main to exactly the gated commit and retires the workspace. If main moved
 #    meanwhile, rebase and gate the new tree; this is a source fence, never a retry of a red gate.
-# 6. Build main's outputs at the landed commit (`nx run-many -t build` in main). Main's built products (the plugin's,
-#    cowshed's and the CLI's dist) are what developer links in other checkouts run; until they are rebuilt they lag the
-#    sources the land just moved main to, and those links refuse. Nx restores the outputs the gate cached for the same
-#    tree, so this replays rather than compiles. A failed build is said with its status; the land stands.
+# 6. Build main's outputs at the landed commit (nx run-many -t build cli-native napi-native in main). The ordinary
+#    compiler outputs and the host's development CLI/addon are what developer links run; until restored they lag the
+#    sources the land just moved main to, and those links refuse. Each producer restores its artifacts and input receipts
+#    from the cache when its inputs match, compiling only changed inputs. A failed build is said; the land stands.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -284,7 +284,7 @@ gate_workspace() {
 build_main() {
   say "building main's outputs at $head"
   build_status=0
-  (cd "$main" && direnv exec "$main" bun nx run-many -t build --outputStyle=static-failures-only </dev/null) >&2 || build_status=$?
+  (cd "$main" && direnv exec "$main" bun nx run-many -t build cli-native napi-native --outputStyle=static-failures-only </dev/null) >&2 || build_status=$?
   if [ "$build_status" -ne 0 ]; then
     say "main's build exited $build_status; the land stands, but main's built outputs lag its sources until it passes"
   fi
