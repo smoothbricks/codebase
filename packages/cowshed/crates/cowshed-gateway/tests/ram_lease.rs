@@ -11,6 +11,8 @@
 mod fixture_dir;
 #[path = "support/ram_fixture.rs"]
 mod ram_fixture;
+#[path = "../../cowshed-core/tests/support/vnode.rs"]
+mod vnode;
 
 use std::time::{Duration, Instant};
 
@@ -111,11 +113,34 @@ async fn the_next_gateway_detaches_a_disk_a_stopped_gateway_attached_but_never_r
         owned.is_registered(),
         "a stopped gateway detaches nothing: {owned:?}"
     );
+    let watched = records.clone();
+    let watched_disk = owned.clone();
+    let (cancel, cancel_on_drop) = std::io::pipe().expect("the owned wait cancellation pipe");
+    let (armed, arming) = tokio::sync::oneshot::channel();
+    let mut settled = tokio::task::spawn_blocking(move || {
+        let mut armed = Some(armed);
+        vnode::await_vnode(&watched, Some(cancel), || {
+            if let Some(armed) = armed.take() {
+                armed.send(()).expect("the fixture awaits its armed watch");
+            }
+            !watched_disk.is_registered() && !watched.join("1-0.intent").exists()
+        })
+    });
+    arming
+        .await
+        .expect("the watch is armed before successor startup");
     let (next, _) = gateway_on(&root, DiskLeaseLimits::default()).await;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while owned.is_registered() && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let observed = tokio::time::timeout(Duration::from_secs(60), &mut settled).await;
+    drop(cancel_on_drop);
+    let observed = match observed {
+        Ok(observed) => observed,
+        Err(_) => settled.await,
     }
+    .expect("join the owned filesystem wait");
+    assert!(
+        observed,
+        "the same sixty-second bound covers detach and intent retirement"
+    );
     assert!(
         !owned.is_registered(),
         "the next gateway's startup scan detached the unrecorded attach's disk: {owned:?}"

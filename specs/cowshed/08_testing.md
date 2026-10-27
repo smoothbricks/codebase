@@ -234,6 +234,11 @@ root, start the prebuilt helper, wait for its socket readiness, detach only iden
 close the helper. `disk-command --gateway-socket` routes native tools to the same fixture admission, with registry-bound
 detach revalidation inside it. Size and UID distinguish fixture inventories but never authorize teardown.
 
+The stopped-mid-attach RAM recovery fixture waits for both its disk's registry absence and removal of its own intent:
+registry disappearance alone precedes record retirement. It arms the shared cancellable vnode waiter on its records
+directory before starting the successor, retains the case's existing sixty-second observation bound, and closes the
+cancellation pipe and joins the waiter before a timed-out wait settles. Production recovery is unchanged.
+
 A fixture's child directory is a real, non-symlink directory owned by the test process UID with mode 0700. Drop cleans
 every path the fixture created. No fixture adds a grant, a host cache path, a script wrapper, or a sandbox disable. FIFO
 readiness reads are nonblocking asynchronous reads: dropping a failed or cancelled wait closes its descriptor, never
