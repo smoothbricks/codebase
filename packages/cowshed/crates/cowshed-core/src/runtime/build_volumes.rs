@@ -2984,12 +2984,14 @@ fn reseed(
     })
 }
 
+type CaptureAttempt = std::result::Result<(u64, Option<Duration>, SupersededSeeds), CaptureSkip>;
+
 /// Freeze `source`, recorded at `tree`, as `target`'s seed after Nx and existing Cargo profiles
 /// admit capture, then claim every older seed of `target` ([`claim_superseded`]) for its
 /// retirement once the target's image lock is let go: the fork this refresh serves never waits
 /// on releasing them under it, and no step of it reads them again. Measured on build 48a8ffff,
 /// an inline free of one 300 GiB superseded seed held a provision about 12 minutes in
-/// `ftruncate`. The elapsed milliseconds and the claimed seeds. Their
+/// `ftruncate`. Capture returns elapsed milliseconds, optional live work, and the claimed seeds. Their
 /// guards and the exclusive build hold stay alive through mounted capture and publication.
 /// Exempt cache/index handles may stay open. A skip leaves every seed as it was.
 fn capture(
@@ -2998,7 +3000,7 @@ fn capture(
     target: &Owner,
     source: &BuildVolumeId,
     tree: Option<GitOid>,
-) -> Result<std::result::Result<(u64, Option<Duration>, SupersededSeeds), CaptureSkip>> {
+) -> Result<CaptureAttempt> {
     let started = Instant::now();
     let (mount, mount_elapsed) = host.mount_build_volume(layout, source).map_err(storage)?;
     let state = BuildVolumeState::read(&mount)?;

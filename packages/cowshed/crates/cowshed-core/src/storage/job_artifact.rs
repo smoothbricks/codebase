@@ -1538,8 +1538,11 @@ enum ArtifactRead {
 }
 
 #[cfg(test)]
+type ArtifactReadObserver = Box<dyn FnMut(ArtifactRead)>;
+
+#[cfg(test)]
 thread_local! {
-    static ARTIFACT_READ_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(ArtifactRead)>>> = const { std::cell::RefCell::new(None) };
+    static ARTIFACT_READ_OBSERVER: std::cell::RefCell<Option<ArtifactReadObserver>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -7041,13 +7044,6 @@ mod tests {
             counts.get(),
             (bytes.len(), bytes.len() + window),
             "latest raw tail reads only its window"
-        );
-        eprintln!(
-            "sealed-range counts: B={} seal_hash={} paging={} tail={}",
-            bytes.len(),
-            bytes.len(),
-            bytes.len(),
-            window
         );
         drop(store);
         counts.set((0, 0));
