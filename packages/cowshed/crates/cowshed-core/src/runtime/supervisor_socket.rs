@@ -11,7 +11,7 @@
 //! `0700` directory by the process that serves it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,7 @@ use crate::api::server::codec::Demand;
 use crate::error::{CowshedError, Result};
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::deadline::{self, Occupant, PeerStream, Progress, Silent, WaitError, occupant};
+use cowshed_os::flock::{self, LeaseMode, NamedLeaseError};
 use cowshed_os::fork_lock::Fenced;
 
 /// The identity of a cowshed build: the Mach-O `LC_UUID` the linker derives from the image's
@@ -1024,7 +1025,7 @@ pub struct PublicationLease {
 }
 
 /// Exclusive ownership of a workspace's supervisor socket, held while serving it or changing
-/// its substrate. The persistent file lease serializes binders; an older build is drained before
+/// its substrate. The persistent file lease, the inode its name names, serializes binders; an older build is drained before
 /// a new build binds, and the occupant probe still refuses any live inherited listener. The
 /// listener and the lease are fenced: once either is closed, no child still being spawned holds
 /// it, so the next binder finds the socket stopped and the lease free (`fork_lock`), unless a
@@ -1039,6 +1040,9 @@ pub struct BoundSocket {
     /// before.
     path: PathBuf,
     instance: Instance,
+    /// The drain report this socket's supervisor publishes beside it, once it serves
+    /// ([`Self::drain_report`]): written only while this socket is held.
+    drain: Option<DrainReport>,
 }
 
 impl BoundSocket {
@@ -1054,11 +1058,24 @@ impl BoundSocket {
             _lease: Arc::clone(&self._lease),
         }
     }
+
+    /// The drain report beside this socket. Only the lease's holder writes it, so the socket's
+    /// release closes it to every writer of this process before it withdraws it.
+    fn drain_report(&mut self) -> DrainReport {
+        self.drain
+            .get_or_insert_with(|| DrainReport::beside(&self.path))
+            .clone()
+    }
 }
 
 impl Drop for BoundSocket {
     fn drop(&mut self) {
-        // The listener and lease remain held here. Remove only this socket's own file.
+        // The listener and lease remain held here. From now on no task of this process
+        // publishes a drain report: the lease that made it the report's writer is going.
+        if let Some(report) = &self.drain {
+            report.close();
+        }
+        // Remove only this socket's own file, then the report it published.
         match Instance::at(&self.path) {
             Ok(Some(instance)) if instance == self.instance => {
                 if let Err(error) = std::fs::remove_file(&self.path) {
@@ -1073,6 +1090,9 @@ impl Drop for BoundSocket {
                 "cowshed: cannot inspect retired supervisor socket {}: {error}",
                 self.path.display()
             ),
+        }
+        if let Some(report) = &self.drain {
+            report.withdraw();
         }
     }
 }
@@ -1139,11 +1159,19 @@ fn socket_error(path: &Path, what: &str, error: io::Error) -> CowshedError {
     )
 }
 
-/// The lease beside the socket at `path`, `<digest>.sock.lock`, opened (created `0600` in a
-/// `0700` directory when missing) and not yet locked. Whoever holds it is the one binder of that
-/// workspace's supervisor socket, or a lifecycle operation that keeps every binder out.
-fn open_lease(path: &Path) -> Result<Fenced<std::fs::File>> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+/// The lease beside the socket at `path`, `<digest>.sock.lock` (created `0600` in a `0700`
+/// directory when missing), taken exclusive without waiting; `None` while another holder has it.
+/// Whoever holds it is the one binder of that workspace's supervisor socket, or a lifecycle
+/// operation that keeps every binder out. It is the inode its name names, taken through the named
+/// lease protocol ([`flock::lock_named`], 11_shell.md "Protocol"): after the attempt, taken or
+/// refused, the name must still name the inode it was made on, or it is reopened. `open` is
+/// [`flock::open_lock`] outside tests.
+fn take_lease(
+    path: &Path,
+    open: impl FnMut(&std::fs::File, &std::ffi::CStr) -> io::Result<Fenced<std::fs::File>>,
+) -> Result<Option<Fenced<std::fs::File>>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
     let io = |what: &str, error: io::Error| socket_error(path, what, error);
     let directory = path.parent().ok_or_else(|| {
         CowshedError::internal(format!(
@@ -1154,17 +1182,36 @@ fn open_lease(path: &Path) -> Result<Fenced<std::fs::File>> {
     std::fs::create_dir_all(directory).map_err(|error| io("create the directory of", error))?;
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| io("restrict the directory of", error))?;
-    Ok(Fenced::new(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path.with_extension("sock.lock"))
-            .map_err(|error| io("open the socket lease of", error))?,
-    ))
+    let lease = path.with_extension("sock.lock");
+    let name = lease
+        .file_name()
+        .and_then(|name| CString::new(name.as_bytes()).ok())
+        .ok_or_else(|| {
+            CowshedError::internal(format!(
+                "socket lease {} has no file name a system call can take",
+                lease.display()
+            ))
+        })?;
+    match flock::lock_named(
+        || cowshed_os::fsio::open_directory_nofollow(directory),
+        &name,
+        LeaseMode::Exclusive,
+        open,
+    ) {
+        Ok(taken) => Ok(taken.map(|(_, lease)| lease)),
+        Err(NamedLeaseError::Directory(error)) => Err(io("open the directory of", error)),
+        Err(NamedLeaseError::Open(error)) => Err(io("open the socket lease of", error)),
+        Err(NamedLeaseError::Lock(error)) => Err(io("lock the socket lease of", error)),
+        Err(NamedLeaseError::Inspect(error)) => Err(io("inspect the socket lease of", error)),
+        Err(NamedLeaseError::Replaced) => Err(CowshedError::conflict(
+            format!(
+                "the socket lease {} was replaced under each of {} opens in a row",
+                lease.display(),
+                flock::NAMED_LEASE_REOPENS
+            ),
+            "check the cowshed runtime directory: only a holder of that lease may replace it",
+        )),
+    }
 }
 
 /// The lease of the supervisor socket at `path`, taken without waiting while no supervisor
@@ -1172,14 +1219,9 @@ fn open_lease(path: &Path) -> Result<Fenced<std::fs::File>> {
 /// or another lifecycle operation holds the lease. Making room for an attach detaches a workspace
 /// only under it (media_room.rs).
 pub(crate) fn lease_unserved(path: &Path) -> Result<Option<Fenced<std::fs::File>>> {
-    let lease = open_lease(path)?;
-    match lease.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => {
-            return Err(socket_error(path, "lock the socket lease of", error));
-        }
-    }
+    let Some(lease) = take_lease(path, flock::open_lock)? else {
+        return Ok(None);
+    };
     match occupant(path)
         .map_err(|error| socket_error(path, "inspect the current server of", error))?
     {
@@ -1200,22 +1242,15 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
         ))
     })?;
     let io = |what: &str, error: io::Error| socket_error(path, what, error);
-    let lease = open_lease(path)?;
-    match lease.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(CowshedError::conflict(
-                format!(
-                    "a supervisor or lifecycle operation owns {}",
-                    path.display()
-                ),
-                "wait for that operation to finish; do not unlink its socket or lock file",
-            ));
-        }
-        Err(std::fs::TryLockError::Error(error)) => {
-            return Err(io("lock the socket lease of", error));
-        }
-    }
+    let Some(lease) = take_lease(path, flock::open_lock)? else {
+        return Err(CowshedError::conflict(
+            format!(
+                "a supervisor or lifecycle operation owns {}",
+                path.display()
+            ),
+            "wait for that operation to finish; do not unlink its socket or lock file",
+        ));
+    };
     match occupant(path).map_err(|error| io("inspect the current server of", error))? {
         Occupant::Absent => {}
         Occupant::Stopped => {
@@ -1267,6 +1302,7 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
         _lease: Arc::new(lease),
         path: fresh,
         instance,
+        drain: None,
     };
     std::fs::set_permissions(&socket.path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| io("restrict", error))?;
@@ -1294,7 +1330,7 @@ fn publish(mut socket: BoundSocket, path: &Path) -> Result<BoundSocket> {
 /// Serve `supervisor` on `socket`, one call per connection, until a `retire` call has
 /// retired it and been answered. Releasing the bound socket removes only its own socket inode.
 pub async fn serve(
-    socket: BoundSocket,
+    mut socket: BoundSocket,
     supervisor: WorkspaceSupervisorHandle,
     advances: Option<Advances>,
     feed: Option<super::commitment_feed::CommitmentFeed>,
@@ -1303,6 +1339,7 @@ pub async fn serve(
     let streams: Streams = Arc::default();
     let retired = Arc::new(tokio::sync::Notify::new());
     let owed = Arc::new(DrainReads::default());
+    let drain_report = socket.drain_report();
     let (release, mut released) = mpsc::channel::<(UnixStream, serde_json::Value, Bytes)>(1);
     loop {
         let (stream, is_membership) = tokio::select! {
@@ -1342,6 +1379,7 @@ pub async fn serve(
         let feed = feed.clone();
         let release = release.clone();
         let socket_path = socket.path.clone();
+        let report = drain_report.clone();
         tokio::spawn(async move {
             match serve_endpoint_call(
                 stream,
@@ -1366,7 +1404,6 @@ pub async fn serve(
                     }
                 }
                 Ok(Retirement::Draining) => {
-                    let report = DrainReport::beside(&socket_path);
                     // Under the authority it holds now, which an advance may have moved.
                     let current = match supervisor.current_authority().await {
                         Ok(authority) => supervisor.with_authority(authority),
@@ -1404,10 +1441,9 @@ pub async fn serve(
                         BuildId::current().map_or("(unnamed)", BuildId::as_str),
                     );
                     match current.retire(NxDaemonRetirement::Recorded).await {
-                        Ok(()) => {
-                            report.withdraw();
-                            retired.notify_one();
-                        }
+                        // Releasing the socket withdraws the report, after it has closed
+                        // publication to every task of this supervisor.
+                        Ok(()) => retired.notify_one(),
                         Err(error) => report.stuck("retire", &error),
                     }
                 }
@@ -1421,9 +1457,13 @@ pub async fn serve(
 /// a command of another build it refuses can say why it still serves (11_shell.md "Draining a
 /// supervisor of another build"). Read across builds: a reader decodes what it knows, and says
 /// so when it cannot.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DrainReport {
     path: PathBuf,
+    /// Whether the socket it is beside was released: from then on this process is not its
+    /// writer, and publishes nothing. A publication holds it across its write, so the release
+    /// waits for the one in flight.
+    released: Arc<Mutex<bool>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1507,10 +1547,18 @@ impl DrainReport {
     fn beside(socket: &Path) -> Self {
         Self {
             path: socket.with_extension("drain"),
+            released: Arc::default(),
         }
     }
 
     fn publish(&self, waits: DrainWait) {
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *released {
+            return;
+        }
         let wire = DrainReportWire {
             pid: std::process::id(),
             waits,
@@ -1557,6 +1605,14 @@ impl DrainReport {
         });
     }
 
+    /// Its socket is released: wait out a publication in flight and refuse every later one.
+    fn close(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+
     fn withdraw(&self) {
         match std::fs::remove_file(&self.path) {
             Ok(()) => {}
@@ -1589,6 +1645,77 @@ impl DrainReport {
                 "its drain report {} does not decode: {error}",
                 path.display()
             )),
+        }
+    }
+}
+
+/// The supervisor socket whose drain report, or one of whose report's writers' temps, the entry
+/// `name` of the store's `run` directory is: `<digest>.drain`, or `.<digest>.drain.tmp.<uuid>`
+/// as [`cowshed_os::fsio::temp_name`] names a publication's temp, its uuid 32 lowercase hex
+/// digits. Anything else, a malformed temp included, is no drain residue.
+pub(crate) fn drain_residue(run: &Path, name: &OsStr) -> Option<PathBuf> {
+    let name = name.to_str()?;
+    let report = match name.strip_prefix('.') {
+        Some(temp) => {
+            let (report, uuid) = temp.rsplit_once(".tmp.")?;
+            let simple = uuid.len() == 32
+                && uuid
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+            simple.then_some(report)?
+        }
+        None => name,
+    };
+    let socket = format!("{}.sock", report.strip_suffix(".drain")?);
+    is_socket_name(OsStr::new(&socket)).then(|| run.join(socket))
+}
+
+/// Remove `residue`, the drain report beside `socket` and its writers' temps
+/// ([`drain_residue`]), that a supervisor left when it was killed holding the socket: only the
+/// holder of the socket's lease writes them, so they are removed only under that lease, taken
+/// free with no socket attached ([`lease_unserved`]), when no writer of them remains. Each goes
+/// only as a regular file of this user; anything else there is kept and named. Said on stderr, the
+/// daemon's log: what this leaves, the next start finds again.
+pub(crate) fn clear_dead_drain(socket: &Path, residue: &[PathBuf]) {
+    use std::os::unix::fs::MetadataExt as _;
+    let _lease = match lease_unserved(socket) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return,
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: cannot take the lease of supervisor socket {} to clear the drain report \
+                 a killed supervisor left: {}",
+                socket.display(),
+                error.message
+            );
+            return;
+        }
+    };
+    // SAFETY: geteuid takes nothing and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    for path in residue {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.uid() == uid => {
+                if let Err(error) = std::fs::remove_file(path)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    cowshed_os::eprintln!(
+                        "cowshed: cannot remove the drain report {} a killed supervisor left: \
+                         {error}",
+                        path.display()
+                    );
+                }
+            }
+            Ok(_) => cowshed_os::eprintln!(
+                "cowshed: kept {}: it is named as a drain report but is not a regular file of \
+                 this user",
+                path.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => cowshed_os::eprintln!(
+                "cowshed: cannot inspect the drain report {} a killed supervisor left: {error}",
+                path.display()
+            ),
         }
     }
 }
@@ -4371,6 +4498,183 @@ mod socket_ownership_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
         assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A taker that reached a socket lease inode its holder then removed takes the lease at the
+    /// name, never the removed inode: whether the remover still holds that inode when the taker
+    /// tries it (refused) or has let go (locked), the taker finds the name no longer names it and
+    /// reopens. Where another taker made the lease anew and holds it, this one is refused there,
+    /// so no two hold "the" lease; where none did, it makes the lease at the name and holds that.
+    #[test]
+    fn a_taker_that_reached_a_removed_socket_lease_takes_the_one_at_its_name() {
+        use std::os::unix::fs::MetadataExt as _;
+        for (still_held, recreated) in [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let case = format!("still held {still_held}, recreated {recreated}");
+            let path = path();
+            let lease_at = path.with_extension("sock.lock");
+            let mut removing = Some(
+                take_lease(&path, flock::open_lock)
+                    .unwrap()
+                    .expect("the first taker holds the lease"),
+            );
+            let directory =
+                cowshed_os::fsio::open_directory_nofollow(path.parent().unwrap()).unwrap();
+            let name = CString::new("s.sock.lock").unwrap();
+            let mut reached = Some(flock::open_lock(&directory, &name).unwrap());
+            let removed = reached.as_ref().unwrap().metadata().unwrap().ino();
+            std::fs::remove_file(&lease_at).unwrap();
+            let replacement = recreated.then(|| {
+                take_lease(&path, flock::open_lock)
+                    .unwrap()
+                    .expect("a taker after the removal holds the lease made anew")
+            });
+            if !still_held {
+                removing = None;
+            }
+
+            let mut opens = 0;
+            let taken = take_lease(&path, |directory, name| {
+                opens += 1;
+                reached
+                    .take()
+                    .map_or_else(|| flock::open_lock(directory, name), Ok)
+            })
+            .unwrap();
+            assert_eq!(opens, 2, "{case}: the removed inode was not reopened");
+            match (replacement.is_some(), taken) {
+                (true, None) => {}
+                (false, Some(lease)) => {
+                    let locked = lease.metadata().unwrap().ino();
+                    assert_eq!(locked, inode(&lease_at), "{case}");
+                    assert_ne!(locked, removed, "{case}");
+                }
+                (_, taken) => panic!(
+                    "{case}: took the lease {}, beside a holder at the name",
+                    taken.is_some()
+                ),
+            }
+            drop((removing, replacement));
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    /// A supervisor's drain report is written only while its socket is held: releasing the
+    /// socket withdraws the report, and a task of the supervisor that publishes after the release,
+    /// as a requester's exit watch can, writes nothing. The lease itself stays.
+    #[tokio::test]
+    async fn a_released_socket_withdraws_its_drain_report_and_lets_no_later_one_be_written() {
+        let path = path();
+        let mut socket = bind(&path).await.unwrap();
+        let report = socket.drain_report();
+        report.publish(DrainWait::Jobs {
+            running: Vec::new(),
+            ended: Vec::new(),
+        });
+        assert_eq!(entries(&path), ["s.drain", "s.sock", "s.sock.lock"]);
+
+        drop(socket);
+        assert_eq!(entries(&path), ["s.sock.lock"]);
+        report.stuck(
+            "retire",
+            &CowshedError::internal("published after the release"),
+        );
+        assert_eq!(
+            entries(&path),
+            ["s.sock.lock"],
+            "a publication after the release writes nothing"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Drain residue is the report beside a supervisor socket and its writers' temps, in the one
+    /// temp grammar, and nothing else.
+    #[test]
+    fn only_a_drain_report_and_its_writers_temps_are_drain_residue() {
+        let run = Path::new("/run");
+        let digest = "0123456789abcdef0123456789abcdef";
+        let socket = run.join(format!("{digest}.sock"));
+        let uuid = "fedcba9876543210fedcba9876543210";
+        let written = cowshed_os::fsio::temp_name(OsStr::new(&format!("{digest}.drain")), uuid)
+            .into_string()
+            .unwrap();
+        for (name, residue) in [
+            (format!("{digest}.drain"), true),
+            (written, true),
+            (format!(".{digest}.drain.tmp.{}", &uuid[..31]), false),
+            (
+                format!(".{digest}.drain.tmp.{}", uuid.to_uppercase()),
+                false,
+            ),
+            (format!(".{digest}.drain"), false),
+            (format!("{digest}.members.drain"), false),
+            (format!(".{digest}.groups.tmp.{uuid}"), false),
+            (format!("{digest}.sock.lock"), false),
+            (format!("{digest}.sock"), false),
+            ("manager.drain".to_owned(), false),
+        ] {
+            assert_eq!(
+                drain_residue(run, OsStr::new(&name)),
+                residue.then(|| socket.clone()),
+                "{name}"
+            );
+        }
+    }
+
+    /// A killed supervisor's drain report and temps go only under its socket's lease, taken free,
+    /// with no socket attached: a holder of the lease and a live listener each keep them. A file
+    /// named like a temp that is no regular file is kept, and so is the lease.
+    #[tokio::test]
+    async fn a_dead_drain_report_is_cleared_only_under_its_free_lease_with_nothing_serving() {
+        let root = path().parent().unwrap().to_owned();
+        std::fs::create_dir_all(&root).unwrap();
+        let digest = "0123456789abcdef0123456789abcdef";
+        let socket = root.join(format!("{digest}.sock"));
+        let temp = |uuid: uuid::Uuid| root.join(format!(".{digest}.drain.tmp.{}", uuid.simple()));
+        let report = socket.with_extension("drain");
+        let (torn, linked) = (temp(uuid::Uuid::new_v4()), temp(uuid::Uuid::new_v4()));
+        std::fs::write(&report, br#"{"pid":1}"#).unwrap();
+        std::fs::write(&torn, br#"{"pid""#).unwrap();
+        std::os::unix::fs::symlink(&report, &linked).unwrap();
+        let residue = [report, torn, linked];
+        let present = || {
+            residue
+                .iter()
+                .map(|path| std::fs::symlink_metadata(path).is_ok())
+                .collect::<Vec<_>>()
+        };
+
+        let holder = take_lease(&socket, flock::open_lock)
+            .unwrap()
+            .expect("the test holds the lease");
+        clear_dead_drain(&socket, &residue);
+        assert_eq!(
+            present(),
+            [true, true, true],
+            "the lease's holder writes them"
+        );
+        drop(holder);
+
+        let live = Fenced::create(|| UnixListener::bind(&socket)).unwrap();
+        clear_dead_drain(&socket, &residue);
+        assert_eq!(
+            present(),
+            [true, true, true],
+            "a supervisor serves the socket"
+        );
+        drop(live);
+
+        clear_dead_drain(&socket, &residue);
+        assert_eq!(
+            present(),
+            [false, false, true],
+            "the report and its temp go; a link named like a temp is kept"
+        );
+        assert!(
+            socket.with_extension("sock.lock").exists(),
+            "the lease stays"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

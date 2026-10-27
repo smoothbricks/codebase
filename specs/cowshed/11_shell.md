@@ -448,15 +448,23 @@ the SHA-256 of `repo_id`, a NUL, and the workspace name. Owner, repository and w
 103 usable bytes of a macOS socket path (`sun_path` is 104 bytes including the terminating NUL); the digest keeps every
 path at 64 and no two workspaces share one. The serving process creates `<store>/run` mode `0700`, so no other user
 reaches a socket in it, binds the socket there and sets it `0600`, and verifies each connecting peer's uid before
-reading a byte. A persistent no-follow file lease at `<digest>.sock.lock` serializes binders and stale-socket
-replacement. The bound listener and lease are one owned value, held throughout serving or a workspace mutation. A
-supervisor of another build must finish the other-build drain before a new build binds; ensure refuses the old build
-while it still serves, and the lifecycle stop waits for its exit. Stream refusal is not absence: a live Darwin listener
-can refuse when its backlog is full. Recovery probes the exact filesystem socket with a datagram connection; wrong-type
-or connected means a socket remains attached to that vnode, including one inherited after its creator exited. Only a
-proven unattached socket is removed under the lease. New listeners bind privately in mode `0600` and publish with one
-exclusive rename. Cleanup removes only the bound listener's own inode while holding the lease. Retirement releases the
-listener and lease **before** acknowledging success.
+reading a byte. A no-follow file lease at `<digest>.sock.lock` serializes binders and stale-socket replacement. The
+lease is the inode its name names, taken as the project lease is (02_workspaces.md, `fenced`) through the one
+named-lease owner (`cowshed_os::flock::lock_named`): every taker checks after locking, and after a refused attempt, that
+the name still names the inode it locked, by device and inode without following a link, and reopens it when not. No
+holder unlinks it yet: a taker of a build from before that check would lock an inode no name names while another taker
+made a new one, and nothing lists which builds' processes still run. Removal is enabled by the build that follows the
+retirement of the first build that checks; until then the lease file stays when its holder lets it go. The lease's
+holder owns the drain report beside the socket (`<socket>.drain`, "Supervisor recovery") and that report's publication
+temps: a supervisor publishes only while it holds its socket, and releasing the socket closes publication, waiting out
+one in flight, before it withdraws the report and lets the lease go. The bound listener and lease are one owned value,
+held throughout serving or a workspace mutation. A supervisor of another build must finish the other-build drain before
+a new build binds; ensure refuses the old build while it still serves, and the lifecycle stop waits for its exit. Stream
+refusal is not absence: a live Darwin listener can refuse when its backlog is full. Recovery probes the exact filesystem
+socket with a datagram connection; wrong-type or connected means a socket remains attached to that vnode, including one
+inherited after its creator exited. Only a proven unattached socket is removed under the lease. New listeners bind
+privately in mode `0600` and publish with one exclusive rename. Cleanup removes only the bound listener's own inode
+while holding the lease. Retirement releases the listener and lease **before** acknowledging success.
 
 The same serving actor also binds `<digest>.members.sock` under its own listener lease, with the same framing and uid
 check but a separate closed request grammar: exactly `subtreeHandle` and `retireDescendants`. Unknown operations are
@@ -1188,14 +1196,18 @@ supervisor) before the daemon's control socket binds, and recovers them once it 
 drains each of another build, watches each of its own build, and ends the jobs a positively absent one left (the group
 ledger, above). Each recovery reaches only its own socket and ledger, so they all run at once, each in a task of its
 own, with nothing bounding them but the sockets there are; one wedged supervisor holds back its own workspace, never the
-host's others. Each drain is a lifecycle span, `supervisor-recovery drain <socket>`, that reports the answering `pid=`
-(or `error=`) and ends `status=ok|err`; the whole pass is `supervisor-recovery startup`, reporting `supervisors=` up
-front. The manager takes ensures from the daemon's first moment. Until the daemon's startup pass has mounted every
-project and restored its sessions, every ensure is refused as a `Conflict` carrying `healing` (05_gateway.md "Startup
-contract"), because the supervisor would run in a workspace that pass may not have mounted yet. After it, an ensure of a
-workspace whose supervisor is still being recovered is refused as a `Conflict` carrying `recovering: { supervisors }`
-(the count left), because a supervisor started then would race the recovery for the socket and the ledger; every other
-ensure is served. Gateway status reports both until they are over.
+host's others. The same listing names the drain reports (`<digest>.drain`) and their writers' temps
+(`.<digest>.drain.tmp.<uuid>`) that supervisors killed while serving left. Beside no listed socket, each is cleared
+then, under its socket's lease taken free with no socket attached; beside a listed socket, by that socket's recovery
+once it finds nothing serving there. Only a regular file of this user goes; anything else at such a name is kept and
+named in the daemon's log. Each drain is a lifecycle span, `supervisor-recovery drain <socket>`, that reports the
+answering `pid=` (or `error=`) and ends `status=ok|err`; the whole pass is `supervisor-recovery startup`, reporting
+`supervisors=` up front. The manager takes ensures from the daemon's first moment. Until the daemon's startup pass has
+mounted every project and restored its sessions, every ensure is refused as a `Conflict` carrying `healing`
+(05_gateway.md "Startup contract"), because the supervisor would run in a workspace that pass may not have mounted yet.
+After it, an ensure of a workspace whose supervisor is still being recovered is refused as a `Conflict` carrying
+`recovering: { supervisors }` (the count left), because a supervisor started then would race the recovery for the socket
+and the ledger; every other ensure is served. Gateway status reports both until they are over.
 
 ## Teardown ordering
 

@@ -45,6 +45,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 
+use cowshed_os::flock::{self, LeaseMode, NamedLeaseError, names_file, open_lock, unlink_at};
 use cowshed_os::fork_lock::Fenced;
 use cowshed_os::fsio::{self, Durability, TemporaryAt};
 use serde::{Deserialize, Serialize};
@@ -65,13 +66,8 @@ const RECORD_SUFFIX: &str = ".json";
 const SERIALIZATION_SUFFIX: &str = ".lock";
 const LEASE_SUFFIX: &str = ".lease";
 const RUN_SUFFIX: &str = ".run";
-/// How many times one taking of the project lease reopens it after finding it removed under
-/// the open. Each reopen means an unbinding removed the inode this open reached, which happens
-/// at most once per unbinding, so a run of them is the store being tampered with, not a race.
-const LEASE_REOPENS: usize = 16;
 /// Records and registrations are a few hundred bytes; a file this large is neither.
 const MAX_CONTROLLER_FILE: u64 = 1 << 20;
-const LOCK_FILE_MODE: libc::c_uint = 0o600;
 const STORAGE_HINT: &str = "check controller storage permissions and retry";
 const RECORD_HINT: &str =
     "inspect the record; only `cowshed forget <owner/repo> --abandon` writes one";
@@ -1118,50 +1114,32 @@ impl<'a> Store<'a> {
 
     /// Lock `names`' project lease in `mode` without waiting; `None` while another holder
     /// excludes it. The lease is the inode its path names, and an unbinding may remove it after
-    /// this opened it ([`ProjectReadLease::remove_unbound`]): after the attempt, locked or
-    /// refused, the path must still name the inode it was made on, compared by device and inode
-    /// without following a link, or the lease is reopened from `owner` (which reopens an owner
-    /// directory the unbinding removed). `open` is [`open_lock`] outside tests.
+    /// this opened it ([`ProjectReadLease::remove_unbound`]), so it is taken through the named
+    /// lease protocol ([`flock::lock_named`]): reopened from `owner`, which reopens an owner
+    /// directory the unbinding removed, until the path names the inode it was taken on. `open` is
+    /// [`open_lock`] outside tests.
     fn lock_lease(
         &self,
         names: &Names,
         mode: LeaseMode,
-        mut owner: impl FnMut() -> Result<File>,
-        mut open: impl FnMut(&File, &CStr) -> io::Result<Fenced<File>>,
+        owner: impl FnMut() -> Result<File>,
+        open: impl FnMut(&File, &CStr) -> io::Result<Fenced<File>>,
     ) -> Result<Option<(File, Fenced<File>)>> {
         let path = self.retirement_path(names, &names.lease);
-        for _ in 0..LEASE_REOPENS {
-            let directory = owner()?;
-            let lease = match open(&directory, &names.lease) {
-                Ok(lease) => lease,
-                // An unbinding removed the owner directory after `owner` opened it.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(io_failure("open project lease", &path, error)),
-            };
-            let locked = match mode {
-                LeaseMode::Shared => lease.try_lock_shared(),
-                LeaseMode::Exclusive => lease.try_lock(),
-            };
-            let busy = match locked {
-                Ok(()) => false,
-                Err(TryLockError::WouldBlock) => true,
-                Err(TryLockError::Error(error)) => {
-                    return Err(io_failure("take project lease", &path, error));
-                }
-            };
-            if names_file(&directory, &names.lease, &lease)
-                .map_err(|error| io_failure("inspect project lease", &path, error))?
-            {
-                return Ok(if busy { None } else { Some((directory, lease)) });
-            }
-        }
-        Err(CowshedError::conflict(
-            format!(
-                "project lease {} was removed under this open {LEASE_REOPENS} times in a row",
-                path.display()
+        flock::lock_named(owner, &names.lease, mode, open).map_err(|error| match error {
+            NamedLeaseError::Directory(error) => error,
+            NamedLeaseError::Open(error) => io_failure("open project lease", &path, error),
+            NamedLeaseError::Lock(error) => io_failure("take project lease", &path, error),
+            NamedLeaseError::Inspect(error) => io_failure("inspect project lease", &path, error),
+            NamedLeaseError::Replaced => CowshedError::conflict(
+                format!(
+                    "project lease {} was removed under this open {} times in a row",
+                    path.display(),
+                    flock::NAMED_LEASE_REOPENS
+                ),
+                "retry once the project's unbindings have finished",
             ),
-            "retry once the project's unbindings have finished",
-        ))
+        })
     }
 
     fn load_at(
@@ -1307,96 +1285,6 @@ fn publish_at(directory: &File, name: &CStr, bytes: &[u8]) -> io::Result<()> {
     }
     cleanup.disarm();
     Durability::PowerLoss.sync_new_entry_at(directory)
-}
-
-/// How a project lease is taken.
-#[derive(Clone, Copy, Debug)]
-enum LeaseMode {
-    Shared,
-    Exclusive,
-}
-
-/// Whether `name` beneath `directory` is `file` itself: the same device and inode, the leaf
-/// not followed. An absent `name` is not.
-fn names_file(directory: &File, name: &CStr, file: &File) -> io::Result<bool> {
-    let mut at = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: the held directory fd and NUL-terminated leaf outlive the call, which fills `at`
-    // on success. NOFOLLOW stats a link at the leaf itself.
-    if unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            at.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        let error = io::Error::last_os_error();
-        return if error.kind() == io::ErrorKind::NotFound {
-            Ok(false)
-        } else {
-            Err(error)
-        };
-    }
-    let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: the held fd outlives the call, which fills `held` on success.
-    if unsafe { libc::fstat(file.as_raw_fd(), held.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: both calls succeeded, so both buffers are initialized.
-    let (at, held) = unsafe { (at.assume_init(), held.assume_init()) };
-    Ok(at.st_dev == held.st_dev && at.st_ino == held.st_ino)
-}
-
-/// Remove the leaf `name` beneath `directory` (`AT_REMOVEDIR` for an empty directory), never
-/// following it.
-fn unlink_at(directory: &File, name: &CStr, flags: libc::c_int) -> io::Result<()> {
-    // SAFETY: the held directory fd and NUL-terminated leaf outlive the call.
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Open the lock file `name` beneath `directory`, creating it 0600 when absent, fenced from the
-/// open on (`fork_lock`). Never one `O_CREAT` open: racing creators on macOS get `ENOENT` from it
-/// (`store_lock::open_or_create_lock_at`).
-fn open_lock(directory: &File, name: &CStr) -> io::Result<Fenced<File>> {
-    let open = |flags: libc::c_int| {
-        // SAFETY: the held directory fd and NUL-terminated leaf outlive the call. NOFOLLOW
-        // refuses a link at the leaf; the mode applies only to O_CREAT.
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | flags,
-                LOCK_FILE_MODE,
-            )
-        };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: a successful openat returned a new owned file descriptor.
-            Ok(Fenced::new(unsafe { File::from_raw_fd(fd) }))
-        }
-    };
-    let lock = open(0)
-        .or_else(|error| match error.kind() {
-            io::ErrorKind::NotFound => open(libc::O_CREAT | libc::O_EXCL),
-            _ => Err(error),
-        })
-        .or_else(|error| match error.kind() {
-            io::ErrorKind::AlreadyExists => open(0),
-            _ => Err(error),
-        })?;
-    if !lock.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "lock is not a regular file",
-        ));
-    }
-    Ok(lock)
 }
 
 /// Rename `from_name` beneath `from` to `to_name` beneath `to`, refusing an existing destination

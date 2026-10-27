@@ -745,9 +745,11 @@ fn validate_directory_leaf(name: &CStr) -> io::Result<()> {
 /// restoration) or an inherited link's directory (`inherited_links::apply`). A crash between
 /// creating its temp symlink and renaming it leaves an inert, dot-hidden symlink in that
 /// directory, so workspace content can hold residue as well as controller metadata. Creating the
-/// symlink runs nothing. No sweeper or watcher exists, so this residue is never swept on its own:
-/// it is reclaimed only when the tree holding it is removed whole, by `remove_owned_tree` or the
-/// removal that owns that tree.
+/// symlink runs nothing. Apart from the drain reports beside supervisor sockets, whose temps the
+/// daemon's startup pass clears under each socket's lease (cowshed-core
+/// `supervisor_socket::clear_dead_drain`), no sweeper or watcher exists, so this residue is never
+/// swept on its own: it is reclaimed only when the tree holding it is removed whole, by
+/// `remove_owned_tree` or the removal that owns that tree.
 pub fn temp_name(final_name: &OsStr, discriminator: impl fmt::Display) -> OsString {
     let mut name = OsString::from(".");
     name.push(final_name);
@@ -757,7 +759,7 @@ pub fn temp_name(final_name: &OsStr, discriminator: impl fmt::Display) -> OsStri
 
 /// True for any file name produced by [`temp_name`]. The exact inverse of that grammar, so
 /// residue sweeping stays possible without knowing which writer crashed. No production sweeper
-/// exists yet — residue is currently reclaimed only by whole-tree removal — so until one lands
+/// uses it yet -- the one sweeper, of drain report temps, matches its writer's exact names -- so
 /// this predicate is pinned by tests alone.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_temp_artifact(file_name: &OsStr) -> bool {

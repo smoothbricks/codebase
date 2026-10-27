@@ -107,6 +107,8 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     <digest>.sock                    # one workspace supervisor's socket
     <digest>.members.sock            # that supervisor's membership endpoint, the only one its jobs reach (11_shell.md)
     <digest>.sock.lock               # the lease whose holder alone binds that supervisor's socket
+    <digest>.members.sock.lock       # the membership endpoint's lease, the same way
+    <digest>.drain                   # a draining supervisor's report; the lease's holder owns it and its temps (11_shell.md)
     <digest>.groups                  # that supervisor's process-group ledger
     gateway/                         # Linux only, 0700: per-incarnation data-plane Unix sockets, each mode 0600
       <workspaceIncarnation>.sock    # bind-mounted into exactly one attached workspace; absent after detach/restore fence

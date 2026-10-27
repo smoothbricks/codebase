@@ -356,14 +356,30 @@ impl SupervisorManager {
     /// workspace until it is recovered. Nothing reaches them until [`Recovery::start`], so a
     /// daemon lists them before it answers anyone and starts recovering them only once it has
     /// claimed the host.
+    ///
+    /// The same listing names the drain reports, and their temps, that supervisors killed while
+    /// they held their sockets left (11_shell.md "Recovering at daemon start"). Those beside no
+    /// listed socket have no recovery to wait for and are cleared here, each under its socket's
+    /// lease taken free; the rest are cleared by their socket's recovery once it found nothing
+    /// serving there.
     pub fn recovery(self: &Arc<Self>) -> Recovery {
-        let sockets: BTreeSet<PathBuf> = std::fs::read_dir(self.store_root.join("run"))
+        let run = self.store_root.join("run");
+        let mut sockets = BTreeSet::new();
+        let mut drains = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+        for entry in std::fs::read_dir(&run).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            if supervisor_socket::is_socket_name(&name) {
+                sockets.insert(entry.path());
+            } else if let Some(socket) = supervisor_socket::drain_residue(&run, &name) {
+                drains.entry(socket).or_default().push(entry.path());
+            }
+        }
+        let (drains, unserved): (BTreeMap<_, _>, BTreeMap<_, _>) = drains
             .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|entry| supervisor_socket::is_socket_name(&entry.file_name()))
-            .map(|entry| entry.path())
-            .collect();
+            .partition(|(socket, _)| sockets.contains(socket));
+        for (socket, residue) in unserved {
+            supervisor_socket::clear_dead_drain(&socket, &residue);
+        }
         self.recovering
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -371,6 +387,7 @@ impl SupervisorManager {
         Recovery {
             manager: Arc::clone(self),
             sockets,
+            drains,
         }
     }
 
@@ -395,9 +412,15 @@ impl SupervisorManager {
         NonZeroUsize::new(recovering.len()).map(|supervisors| SupervisorRecovery { supervisors })
     }
 
-    /// Recover the supervisor that served `socket` before this manager started. Its workspace
-    /// is refused until this ends, however it ends.
-    async fn recover_one(self: Arc<Self>, peers: Arc<dyn SupervisorPeers>, socket: PathBuf) {
+    /// Recover the supervisor that served `socket` before this manager started, and clear the
+    /// drain residue (`drains`) a killed one left beside it once nothing serves there. Its
+    /// workspace is refused until this ends, however it ends.
+    async fn recover_one(
+        self: Arc<Self>,
+        peers: Arc<dyn SupervisorPeers>,
+        socket: PathBuf,
+        drains: Vec<PathBuf>,
+    ) {
         let _recovered = Recovered {
             manager: &self,
             socket: &socket,
@@ -411,7 +434,12 @@ impl SupervisorManager {
             }
             // Only a positively absent listener authorizes lost-supervisor recovery. A wedged
             // live peer or an unknown protocol outcome retains its jobs and ledger.
-            Ok(None) => end_lost_jobs(socket.clone(), super::job_groups::Writer::Any).await,
+            Ok(None) => {
+                end_lost_jobs(socket.clone(), super::job_groups::Writer::Any).await;
+                if !drains.is_empty() {
+                    supervisor_socket::clear_dead_drain(&socket, &drains);
+                }
+            }
             Err(error) => cowshed_os::eprintln!(
                 "cowshed: cannot determine whether workspace supervisor {} stopped; its jobs and \
              ledger are retained: {}",
@@ -554,6 +582,8 @@ impl SupervisorManager {
 pub struct Recovery {
     manager: Arc<SupervisorManager>,
     sockets: BTreeSet<PathBuf>,
+    /// The drain residue beside listed sockets, by socket.
+    drains: BTreeMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl Recovery {
@@ -562,7 +592,11 @@ impl Recovery {
     /// and its own ledger, so they all run at once: a wedged supervisor holds back its own
     /// workspace, never the host's others.
     pub fn start(self, peers: Arc<dyn SupervisorPeers>) -> JoinHandle<()> {
-        let Self { manager, sockets } = self;
+        let Self {
+            manager,
+            sockets,
+            mut drains,
+        } = self;
         tokio::spawn(async move {
             let supervisors = sockets.len();
             let Ok(()) = timing::timed_async(RECOVERY_SCOPE, "startup", async move {
@@ -574,7 +608,12 @@ impl Recovery {
                 );
                 let mut recoveries = JoinSet::new();
                 for socket in sockets {
-                    recoveries.spawn(Arc::clone(&manager).recover_one(Arc::clone(&peers), socket));
+                    let residue = drains.remove(&socket).unwrap_or_default();
+                    recoveries.spawn(Arc::clone(&manager).recover_one(
+                        Arc::clone(&peers),
+                        socket,
+                        residue,
+                    ));
                 }
                 while let Some(recovered) = recoveries.join_next().await {
                     if let Err(error) = recovered {
@@ -1574,6 +1613,48 @@ mod tests {
             self.gate.acquire().await.expect("the gate opens").forget();
             Ok(drained())
         }
+    }
+
+    /// The startup pass's one listing of `run` names the drain reports, and their temps, that
+    /// supervisors killed while serving left. Beside no listed socket each is cleared then, under
+    /// its socket's lease taken free. Beside a lease another process holds, or a listed socket
+    /// whose recovery has not found it unserved, it is kept; every lease file stays.
+    #[test]
+    fn the_startup_listing_clears_only_the_drain_residue_no_holder_owns() {
+        let store = recovery_store("cowshed-drain-residue", &["raven"]);
+        let residue = |workspace: &str| {
+            let socket = supervisor_socket_of(&store, workspace);
+            let report = socket.with_extension("drain");
+            let temp = socket.with_file_name(format!(
+                ".{}.tmp.{}",
+                report.file_name().unwrap().to_str().unwrap(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::write(&report, br#"{"pid":1}"#).expect("a dead report");
+            std::fs::write(&temp, br#"{"pid""#).expect("a torn temp");
+            (socket, [report, temp])
+        };
+        let (gone_socket, gone) = residue("gone");
+        let (held_socket, held) = residue("held");
+        let (_, recovering) = residue("raven");
+        let holder = supervisor_socket::lease_unserved(&held_socket)
+            .expect("take the lease")
+            .expect("the test holds the lease");
+        let manager = SupervisorManager::new(&*store, Box::new(NoSpawner), healed());
+
+        let recovery = manager.recovery();
+
+        for path in &gone {
+            assert!(!path.exists(), "{} was cleared", path.display());
+        }
+        for path in held.iter().chain(&recovering) {
+            assert!(path.exists(), "{} was kept", path.display());
+        }
+        assert!(
+            gone_socket.with_extension("sock.lock").exists(),
+            "the lease stays"
+        );
+        drop((recovery, holder));
     }
 
     /// While a supervisor from before the manager started still drains, the manager refuses an
