@@ -1373,3 +1373,48 @@ fn host_controller_recovery_refuses_a_mounted_temp_root_and_keeps_the_image() {
         "the recovered workspace's temp dir outlived its export"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn directory_fixture_retirement_moves_the_inode_once_for_every_payload_size() {
+    use crate::scratch_directory::{retire_directory_tree, retirement_rename_attempts};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let scratch =
+        crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "directory-retirement-rename");
+    for entries in [0_usize, 1, 32, 128] {
+        let source = scratch.join(format!("source-{entries}"));
+        let destination = scratch.join(format!("retired-{entries}"));
+        fs::create_dir(&source).unwrap();
+        for index in 0..entries {
+            fs::write(source.join(format!("entry-{index}")), index.to_le_bytes()).unwrap();
+        }
+        let inode = fs::metadata(&source).unwrap().ino();
+        let before = retirement_rename_attempts();
+        retire_directory_tree(&source, &destination).unwrap();
+        assert_eq!(retirement_rename_attempts() - before, 1);
+        assert!(!source.exists());
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+        for index in 0..entries {
+            assert_eq!(
+                fs::read(destination.join(format!("entry-{index}"))).unwrap(),
+                index.to_le_bytes(),
+            );
+        }
+        eprintln!(
+            "directory-retirement counts: entries={entries} rename_attempts=1 inode_preserved=true"
+        );
+    }
+    let source = scratch.join("source-stays");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("kept"), b"kept").unwrap();
+    let missing_destination = scratch.join("missing-parent/retired");
+    assert_eq!(
+        retire_directory_tree(&source, &missing_destination)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound,
+    );
+    assert_eq!(fs::read(source.join("kept")).unwrap(), b"kept");
+    retire_directory_tree(&scratch.join("already-gone"), &missing_destination).unwrap();
+}

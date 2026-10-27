@@ -258,6 +258,14 @@ alias-owned fixtures keep their selected runtime alias unchanged. The constructo
 shared-temp sweep reclaims a killed run's root by the pid its name records (01_storage.md, "Shared temporary scratch"),
 which it can read only from a claimable name.
 
+Large directory-backed lifecycle fixtures keep their literal short source path. Drop ends the root's workers, then
+retires its intact tree by one rename beneath an already-owned TestNamespace root, using the existing create_root and
+owner record. Synchronous recursive unlink of large cloned trees on a busy APFS host can exhaust the 180-second
+no-finish guard; it is not the test's subject. The unchanged dead-run sweep reclaims the retired namespace after its
+owner is gone, under its existing lock and run record. No new t/trash selection, cleanup worker or grant is introduced.
+Ordinary TempRoot guards still remove their roots on return and panic; APFS image release and its refusal fences stay
+unchanged.
+
 A pure regression fixture runs inside an ordinary exec and covers both the HTTP and Unix-socket authentication cases. It
 is not a real APFS mount or cache cutover proof.
 

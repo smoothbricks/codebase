@@ -101,13 +101,7 @@ impl ScratchRoot {
     /// A child fixture whose parent owns recovery if the child is killed. It cleans its own
     /// root on drop, but never starts or waits for a sweep of unrelated host runs.
     pub(crate) fn new_owned(label: &str) -> std::io::Result<Self> {
-        let namespace = TestNamespace::mint().map_err(|error| {
-            std::io::Error::other(format!(
-                "mint the test namespace of scratch root {label}: {error}"
-            ))
-        })?;
-        let path = create_root(namespace)?;
-        cowshed_os::eprintln!("scratch root {}: {label}", path.display());
+        let (namespace, path) = create_owned_root(label)?;
         Ok(Self {
             path,
             namespace,
@@ -148,6 +142,18 @@ impl ScratchRoot {
     pub fn namespace(&self) -> TestNamespace {
         self.namespace
     }
+}
+
+/// Mint and publish one owned namespace root for either a live image fixture or directory retirement.
+pub(crate) fn create_owned_root(label: &str) -> std::io::Result<(TestNamespace, PathBuf)> {
+    let namespace = TestNamespace::mint().map_err(|error| {
+        std::io::Error::other(format!(
+            "mint the test namespace of scratch root {label}: {error}"
+        ))
+    })?;
+    let path = create_root(namespace)?;
+    cowshed_os::eprintln!("scratch root {}: {label}", path.display());
+    Ok((namespace, path))
 }
 
 /// Make `namespace`'s directory in the per-user root, 0700 and the user's alone, record this

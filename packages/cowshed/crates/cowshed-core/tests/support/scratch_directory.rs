@@ -1,7 +1,7 @@
 //! Real filesystem roots for lifecycle tests that own no disk images.
 //!
-//! Cleanup ends the processes working beneath the root before removing it. It never inventories,
-//! attaches or releases disk images; the prefix is separate from the real-APFS fixture's sweep.
+//! Cleanup ends the root's workers, then moves its intact tree under an existing owned test
+//! namespace. The unchanged dead-run sweep owns eventual unlink; the live source stays short.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,8 @@ pub(crate) const LABEL_FILE: &str = "label";
 
 pub struct ScratchRoot {
     path: PathBuf,
+
+    retired_path: PathBuf,
 }
 
 impl ScratchRoot {
@@ -34,6 +36,9 @@ impl ScratchRoot {
             *swept = true;
         }
         drop(swept);
+
+        let (_, mut retired_path) = super::scratch_apfs::create_owned_root(label)?;
+        retired_path.push("directory");
         let path = PathBuf::from(format!(
             "/private/tmp/{ROOT_PREFIX}{}-{}",
             std::process::id(),
@@ -49,7 +54,7 @@ impl ScratchRoot {
             }
             Err(error) => return Err(error),
         }
-        let root = Self { path };
+        let root = Self { path, retired_path };
         fs::write(root.path.join(LABEL_FILE), label)?;
         Ok(root)
     }
@@ -57,6 +62,47 @@ impl ScratchRoot {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RETIREMENT_RENAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn retirement_rename_attempts() -> usize {
+    RETIREMENT_RENAMES.with(std::cell::Cell::get)
+}
+
+/// Missing source is already retired; a missing destination must not hide a surviving source.
+fn retirement_result(
+    renamed: std::io::Result<()>,
+    source_exists: impl FnOnce() -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    match renamed {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match source_exists() {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(error),
+            Err(probe) => Err(std::io::Error::new(
+                error.kind(),
+                format!("rename fixture: {error}; inspect its source: {probe}"),
+            )),
+        },
+        result => result,
+    }
+}
+
+pub(crate) fn retire_directory_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    RETIREMENT_RENAMES.with(|count| count.set(count.get() + 1));
+    retirement_result(
+        fs::rename(source, destination),
+        || match fs::symlink_metadata(source) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        },
+    )
 }
 
 fn reclaim(path: &Path) -> std::io::Result<()> {
@@ -94,11 +140,74 @@ fn sweep_dead_roots() -> std::io::Result<()> {
 
 impl Drop for ScratchRoot {
     fn drop(&mut self) {
-        if let Err(error) = reclaim(&self.path) {
-            cowshed_os::eprintln!(
-                "directory fixture {}: {error}; keeping the root for the next run",
-                self.path.display()
+        let started = std::time::Instant::now();
+        cowshed_os::eprintln!("directory fixture {}: teardown start", self.path.display());
+        let result = processes::end_processes_in(|cwd| cwd.starts_with(&self.path))
+            .and_then(|()| retire_directory_tree(&self.path, &self.retired_path));
+        match result {
+            Ok(()) => cowshed_os::eprintln!(
+                "directory fixture {}: retired under {} elapsed={:?}",
+                self.path.display(),
+                self.retired_path.display(),
+                started.elapsed()
+            ),
+            Err(error) => cowshed_os::eprintln!(
+                "directory fixture {}: {error}; remaining state stays for the existing sweeps \
+                 (namespace {}) elapsed={:?}",
+                self.path.display(),
+                self.retired_path.display(),
+                started.elapsed()
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod retirement_result_tests {
+    use super::retirement_result;
+    use std::cell::Cell;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn rename_completion_preserves_source_absence_and_real_failures() {
+        for (rename_error, source, expected, reads) in [
+            (None, Err(ErrorKind::Other), None, 0),
+            (
+                Some(ErrorKind::PermissionDenied),
+                Err(ErrorKind::Other),
+                Some(ErrorKind::PermissionDenied),
+                0,
+            ),
+            (Some(ErrorKind::NotFound), Ok(false), None, 1),
+            (
+                Some(ErrorKind::NotFound),
+                Ok(true),
+                Some(ErrorKind::NotFound),
+                1,
+            ),
+            (
+                Some(ErrorKind::NotFound),
+                Err(ErrorKind::PermissionDenied),
+                Some(ErrorKind::NotFound),
+                1,
+            ),
+        ] {
+            let probes = Cell::new(0);
+            let result = retirement_result(
+                rename_error.map_or(Ok(()), |kind| Err(Error::from(kind))),
+                || {
+                    probes.set(probes.get() + 1);
+                    source.map_err(Error::from)
+                },
             );
+            assert_eq!(result.as_ref().err().map(Error::kind), expected);
+            assert_eq!(probes.get(), reads);
+            if source.is_err() && reads == 1 {
+                let message = result.unwrap_err().to_string();
+                assert!(
+                    message.contains("rename fixture") && message.contains("inspect its source")
+                );
+            }
         }
     }
 }
@@ -118,8 +227,32 @@ mod tests {
         let root = ScratchRoot::new("links").unwrap();
         let path = root.path().to_path_buf();
         std::os::unix::fs::symlink(outside.path(), path.join("linked")).unwrap();
+
+        let retired = root.retired_path.clone();
+        let renames = retirement_rename_attempts();
         drop(root);
         assert!(!path.exists());
+
+        assert_eq!(retirement_rename_attempts() - renames, 1);
+        assert!(
+            fs::symlink_metadata(retired.join("linked"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let namespace_root = retired.parent().unwrap();
+        let namespace = cowshed_os::namespace::TestNamespace::parse(
+            namespace_root.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(namespace.owner_pid(), std::process::id());
+        assert!(
+            fs::symlink_metadata(namespace_root.join(".owner"))
+                .unwrap()
+                .is_file()
+        );
+        assert!(super::super::scratch_apfs::reclaim_dead_root(namespace_root).is_err());
+        assert!(retired.exists());
         assert_eq!(
             fs::read_to_string(outside.path().join("kept")).unwrap(),
             "outside"
