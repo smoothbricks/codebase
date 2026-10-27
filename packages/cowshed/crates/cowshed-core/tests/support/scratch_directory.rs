@@ -1,16 +1,17 @@
 //! Real filesystem roots for lifecycle tests that own no disk images.
 //!
 //! Cleanup ends the root's workers, then moves its intact tree under an existing owned test
-//! namespace. The unchanged dead-run sweep owns eventual unlink; the live source stays short.
+//! namespace. The lane setup's dead-run sweep owns eventual unlink; the live source stays short.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::scratch_namespace::processes;
 
-pub(crate) const ROOT_PREFIX: &str = "cowshed-dtest-";
+#[path = "../../../cowshed-apfs/tests/support/scratch_directory_cleanup.rs"]
+pub(crate) mod cleanup;
+use cleanup::{ROOT_PREFIX, reclaim};
 
 /// The file in each root that names the test which made it. The name stays out of the path: the
 /// store's Unix sockets (`run/<32 hex>.sock`, the CPU pools' `run/cpu/<22>/<22>`) must fit
@@ -25,17 +26,7 @@ pub struct ScratchRoot {
 
 impl ScratchRoot {
     pub fn new(label: &str) -> std::io::Result<Self> {
-        static SWEPT: Mutex<bool> = Mutex::new(false);
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let mut swept = SWEPT.lock().map_err(|error| {
-            std::io::Error::other(format!("directory fixture sweep lock: {error}"))
-        })?;
-        if !*swept {
-            sweep_dead_roots()?;
-            *swept = true;
-        }
-        drop(swept);
-
         let (_, mut retired_path) = super::scratch_namespace::create_owned_root(label)?;
         retired_path.push("directory");
         let path = PathBuf::from(format!(
@@ -102,39 +93,6 @@ pub(crate) fn retire_directory_tree(source: &Path, destination: &Path) -> std::i
             Err(error) => Err(error),
         },
     )
-}
-
-fn reclaim(path: &Path) -> std::io::Result<()> {
-    processes::end_processes_in(|cwd| cwd.starts_with(path))?;
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn sweep_dead_roots() -> std::io::Result<()> {
-    for entry in fs::read_dir("/private/tmp")? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(ROOT_PREFIX))
-            .and_then(|suffix| suffix.split('-').next())
-            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
-            .filter(|pid| *pid > 0)
-        else {
-            continue;
-        };
-        // SAFETY: signal zero checks one positive pid without delivering a signal.
-        if unsafe { libc::kill(pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            && entry.file_type()?.is_dir()
-        {
-            reclaim(&entry.path())?;
-        }
-    }
-    Ok(())
 }
 
 impl Drop for ScratchRoot {

@@ -88,7 +88,7 @@ function projectName(manifest: unknown): string | undefined {
  * where no tool package carries an executable to run.
  */
 export function nativeToolCommand(
-  tools: NativeTools | null,
+  tools: Pick<NativeTools, 'platform'> | null,
   cwd: string,
   tool: NativeToolPackage,
   bin: string,

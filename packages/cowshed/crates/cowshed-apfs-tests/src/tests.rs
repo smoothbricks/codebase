@@ -147,7 +147,7 @@ fn finish_real_image_test(result: Result<(), ApfsError>, cleanup: RealImageClean
 fn fixture_cleanup_proves_backing_file_unlock_before_unlink() {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let root = ScratchRoot::new_owned("cleanup-lock").expect("owned scratch root");
+    let root = ScratchRoot::new("cleanup-lock").expect("owned scratch root");
     let image = root.path().join("unreturned.dmg");
     fs::write(&image, b"fixture backing file").expect("create fixture backing file");
     let helper = fs::OpenOptions::new()
@@ -184,7 +184,7 @@ fn fixture_cleanup_proves_backing_file_unlock_before_unlink() {
 fn a_scratch_root_is_its_test_namespaces_private_directory_beside_t() {
     use std::os::unix::fs::MetadataExt as _;
 
-    let root = ScratchRoot::new_owned("namespace-directory").expect("owned scratch root");
+    let root = ScratchRoot::new("namespace-directory").expect("owned scratch root");
     // SAFETY: `geteuid` reads this process's credentials; it takes no pointers and cannot fail.
     let euid = unsafe { libc::geteuid() };
     let namespace = root.namespace();
@@ -208,13 +208,47 @@ fn a_scratch_root_is_its_test_namespaces_private_directory_beside_t() {
     assert!(
         !root
             .path()
-            .starts_with(crate::scratch_apfs::SCRATCH_PARENT.as_path()),
+            .starts_with(cowshed_os::scratch::macos_scratch_root().expect("shared scratch parent")),
         "no root is made in the directory every test run shares"
     );
     let metadata = fs::symlink_metadata(root.path()).expect("the root's metadata");
     assert!(metadata.is_dir());
     assert_eq!(metadata.uid(), euid);
     assert_eq!(metadata.mode() & 0o777, 0o700);
+}
+
+/// No fixture may borrow the actual lane owner's sweep lock, including its first fixture.
+#[cfg(target_os = "macos")]
+#[test]
+fn real_apfs_fixture_construction_and_drop_do_not_wait_for_the_lane_sweep_lock() {
+    use cowshed_os::test_backstop::lock_exclusive;
+    use std::sync::mpsc;
+
+    let path =
+        cowshed_os::scratch::macos_scratch_sweep_lock().expect("canonical lane sweep lock path");
+    let lock = lock_exclusive(&path).expect("hold the real lane sweep lock");
+    let (completed, completion) = mpsc::channel();
+    let fixtures = std::thread::spawn(move || {
+        let roots = [
+            ScratchRoot::new("first-fixture"),
+            ScratchRoot::new("later-fixture"),
+        ]
+        .map(|root| root.expect("owned fixture root"));
+        let paths = roots.each_ref().map(|root| root.path().to_owned());
+        drop(roots);
+        completed
+            .send(paths)
+            .expect("report both fixture teardowns");
+    });
+    // A constructor or Drop that waits for the real sweep cannot send this while we own its lock.
+    let paths = completion.recv();
+    drop(lock);
+    fixtures.join().expect("fixture construction and teardown");
+    let paths = paths.expect("both fixtures finish while the real sweep lock is held");
+    assert!(
+        paths.iter().all(|path| !path.exists()),
+        "each fixture removes its own root"
+    );
 }
 
 /// The system runner, except that naming a volume first force-unmounts it, as another process
@@ -859,7 +893,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    let root = ScratchRoot::new_owned("fixture-kill").expect("owned scratch root");
+    let root = ScratchRoot::new("fixture-kill").expect("owned scratch root");
     let system = runner(root.namespace());
     let backend = MacOsApfsBackend::new(system);
     let image = root.path().join("attach.dmg");
@@ -1045,7 +1079,7 @@ fn real_apfs_fixture_run_ended_by_its_parent() {
     let Some(ending) = std::env::var_os(FIXTURE_ENDING) else {
         return;
     };
-    let root = ScratchRoot::new_owned("fixture-run").expect("owned scratch root");
+    let root = ScratchRoot::new("fixture-run").expect("owned scratch root");
     let backend = MacOsApfsBackend::new(runner(root.namespace()));
     for name in ["first", "retained/second"] {
         let image = root.path().join(name).with_extension(IMAGE_EXTENSION);

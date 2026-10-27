@@ -59,6 +59,18 @@ pub fn macos_scratch_root() -> io::Result<PathBuf> {
     Ok(root)
 }
 
+/// Held while a sweep runs. Unserialized, concurrent sweeps raced each other for the same
+/// abandoned images: every sweeper waited on the image lease another held for its detach (11.5 s
+/// measured), then found the volume already unmounted under it and failed. It lies in `t`, which
+/// is no test namespace, and its name spells no pid, so no sweep ever reclaims it. Other
+/// checkouts' sweeps share it and write their own records into it, so it records nothing of
+/// this one's.
+#[cfg(target_os = "macos")]
+pub fn macos_scratch_sweep_lock() -> io::Result<PathBuf> {
+    let mut path = macos_scratch_root()?;
+    path.push("sweep.lock");
+    Ok(path)
+}
 /// Create a private scratch root and publish its creating pid before it holds any output.
 pub fn create(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;

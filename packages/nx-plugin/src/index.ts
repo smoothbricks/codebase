@@ -2101,11 +2101,13 @@ async function createProjectTargets(
 
   // `<tool>-native` is the host's own build of one tool, so a test that runs it names one edge: `cli-native` is the
   // declared `cli-<arch>-<family>` build for this machine, `napi-native` the addon (this host's platform target, or
-  // `cargo-napi` where no configured triple is this machine's). Each is picked from `hostPlatformBinaries` by the same
+  // cargo-napi where no configured triple is this machine's), and scriptc-native its host executable producer.
+  // Each is picked from hostPlatformBinaries by the same
   // suffix rule, its family name `-native` joins it to `build`, and it states no outputs. It runs nothing, so it
   // states `cache: false`; a cached aggregate would need inputs of its own. A host with no such producer gets no
   // aggregate, and inference makes no test depend on one.
   const hostBuilds: Record<string, string[]> = {
+    'scriptc-native': hostPlatformBinaries.filter((name) => name.startsWith('scriptc-')),
     'cli-native': hostPlatformBinaries.filter((name) => name.startsWith('cli-')),
     'napi-native': targets['cargo-napi']
       ? ['cargo-napi']

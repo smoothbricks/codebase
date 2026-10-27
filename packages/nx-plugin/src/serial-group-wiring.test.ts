@@ -29,6 +29,8 @@ const CHECKOUT_COWSHED_BUILD = { projects: ['cowshed'], target: 'cli-native' };
 /** The target that provisions the per-user mount root the real-image fixtures keep their scratch trees below. */
 const APFS_TEST_ROOT = { projects: ['cowshed'], target: 'apfs-test-root' };
 const APFS_TEST_ROOT_TASK = 'cowshed:apfs-test-root';
+const APFS_TEST_SWEEP = { projects: ['cowshed'], target: 'apfs-test-sweep' };
+const APFS_TEST_SWEEP_TASK = 'cowshed:apfs-test-sweep';
 
 describe('the real-APFS serial groups of this repository', () => {
   it('are exactly the device group and the host group, each scoped to the packages it holds', () => {
@@ -92,7 +94,7 @@ describe('the real-APFS serial groups of this repository', () => {
     const nx = await readRecord('nx.json', JSON.parse);
     const host = child(child(nx, 'targetDefaults'), HOST_GROUP);
     // `...` keeps the inferred archive and fetch edges ahead of the explicit ones.
-    expect(host.dependsOn).toEqual(['...', CHECKOUT_COWSHED_BUILD, APFS_TEST_ROOT, DEVICE_GROUP]);
+    expect(host.dependsOn).toEqual(['...', CHECKOUT_COWSHED_BUILD, APFS_TEST_ROOT, APFS_TEST_SWEEP, DEVICE_GROUP]);
   });
 
   it("run this checkout's cowshed, built first, for every disk command the code under test makes", async () => {
@@ -241,6 +243,44 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
     expect(setup?.cache).toBe(false);
   });
 
+  it('owns predecessor cleanup once before the lanes, not as a test or a cached result', async () => {
+    const graph = await projectGraph();
+    const setup = graph.nodes.cowshed?.data.targets?.[APFS_TEST_SWEEP.target];
+    expect(setup?.executor).toBe('nx:run-commands');
+    expect(setup?.cache).toBe(false);
+    expect(setup?.options?.command).toBe('bun packages/cowshed/scripts/apfs-test-sweep.ts');
+    expect(setup?.dependsOn).toContain('apfs-test-root');
+    expect(setup?.dependsOn).toContain('cli-native');
+    expect(setup?.dependsOn).toContainEqual({ projects: [ROOT_PROJECT], target: 'cargo-test-archive' });
+    expect(setup?.dependsOn).toContainEqual({ projects: ['nextest-extract'], target: 'scriptc-native' });
+    const tasks = createTaskGraph(
+      graph,
+      {},
+      [ROOT_PROJECT, 'cowshed'],
+      [DEVICE_GROUP, HOST_GROUP, 'host-controller-test', 'integration-apfs'],
+      undefined,
+      {},
+    );
+    const extractor = 'nextest-extract:scriptc-native';
+    const producer = `scriptc-${process.arch}-${process.platform === 'darwin' ? 'macos' : 'linux'}`;
+    expect(tasks.dependencies[APFS_TEST_SWEEP_TASK]).toContain(extractor);
+    expect(tasks.dependencies[extractor]).toEqual([`nextest-extract:${producer}`]);
+    expect(graph.nodes['nextest-extract']?.data.targets?.[producer]?.options?.outputDirectory).toBe(
+      `dist/bin/${process.platform}-${process.arch}`,
+    );
+    expect(Object.keys(tasks.tasks).filter((id) => id === APFS_TEST_SWEEP_TASK)).toHaveLength(1);
+    for (const group of [DEVICE_GROUP, HOST_GROUP]) {
+      expect(tasks.dependencies[`${ROOT_PROJECT}:${group}`]).toContain(APFS_TEST_SWEEP_TASK);
+      expect(graph.nodes[ROOT_PROJECT]?.data.targets?.[group]?.options?.idleTimeoutMs).toBe(180000);
+    }
+    for (const target of ['host-controller-test', 'integration-apfs']) {
+      const declared = graph.nodes.cowshed?.data.targets?.[target];
+      expect(declared?.dependsOn, target).toContain(APFS_TEST_SWEEP.target);
+      expect(tasks.dependencies[`cowshed:${target}`]).toContain(APFS_TEST_SWEEP_TASK);
+    }
+    const nx = await readRecord('nx.json', JSON.parse);
+    expect(child(child(nx, 'targetDefaults'), 'cargo-test-cowshed-*').dependsOn).toEqual(['...', APFS_TEST_ROOT]);
+  });
   it('is provisioned before every test that makes a scratch root there, in a shard, a group or a host proof', async () => {
     const graph = await projectGraph();
     // The crates whose Rust sources make scratch roots: by the function that does, or the support module that calls it.

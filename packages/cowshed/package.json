@@ -761,11 +761,41 @@
           "cwd": "{projectRoot}"
         }
       },
+      "apfs-test-sweep": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "dependsOn": [
+          "apfs-test-root",
+          "cli-native",
+          {
+            "projects": [
+              "nextest-extract"
+            ],
+            "target": "scriptc-native"
+          },
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "cargo-test-archive"
+          }
+        ],
+        "//": "One setup owner per Nx run, shared by every fixture runner. Executes the existing dead-namespace sweep from the built archive to completion before nextest starts; no fixture teardown inherits the backlog. Host state is never cached and no test completion is emitted for cleanup.",
+        "options": {
+          "command": "bun packages/cowshed/scripts/apfs-test-sweep.ts",
+          "cwd": ".",
+          "env": {
+            "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed"
+          }
+        }
+      },
       "apfs-test-root-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "inputs": [
           "{projectRoot}/scripts/apfs-test-root.ts",
+          "{projectRoot}/scripts/apfs-test-sweep.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/tool-bins.ts",
           "{projectRoot}/scripts/apfs-test-root.test.ts",
           "{projectRoot}/crates/cowshed-core/src/storage/host_config.rs",
           "{projectRoot}/crates/cowshed-core/src/storage/bootstrap/native/macos.rs",
@@ -792,6 +822,7 @@
           "napi-native",
           "tsc-js",
           "apfs-test-root",
+          "apfs-test-sweep",
           {
             "target": "cargo-test-archive",
             "projects": [
@@ -825,7 +856,8 @@
         "executor": "nx:run-commands",
         "cache": false,
         "dependsOn": [
-          "apfs-test-root"
+          "apfs-test-root",
+          "apfs-test-sweep"
         ],
         "options": {
           "cwd": "packages/cowshed",

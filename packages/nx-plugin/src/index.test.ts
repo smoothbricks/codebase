@@ -471,6 +471,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(mac['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts/']);
       // Only the host's own platform joins build; the publish legs build the rest by family.
       expect(mac.build?.dependsOn).toContain('scriptc-arm64-macos');
+      expect(mac['scriptc-native']).toMatchObject({
+        executor: 'nx:noop',
+        cache: false,
+        outputs: [],
+        dependsOn: ['scriptc-arm64-macos'],
+      });
       expect(mac.build?.dependsOn).not.toContain('scriptc-x64-macos');
       const linux = await inferProjectTargets(
         workspace,
@@ -480,6 +486,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Every host infers the same four targets: a target's output does not depend on who built it.
       for (const [name] of platforms) expect(linux[name]).toEqual(mac[name]);
       expect(linux.build?.dependsOn).toContain('scriptc-x64-linux');
+      expect(linux['scriptc-native']?.dependsOn).toEqual(['scriptc-x64-linux']);
       expect(linux.build?.dependsOn).not.toContain('scriptc-arm64-macos');
       await workspace.write(
         'packages/tool/package.json',

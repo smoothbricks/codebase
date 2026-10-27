@@ -307,6 +307,18 @@ impl AsyncUnixStreamBackstop for tokio::net::UnixStream {
     }
 }
 
+/// `path` opened (created if absent) and `flock`ed exclusively, waiting for any holder: the lock
+/// lives as long as the returned file, and dies with its process however that process ends.
+pub fn lock_exclusive(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.lock_bounded()?;
+    Ok(file)
+}
 /// `std::fs::File`'s blocking locks, each ended by [`BACKSTOP`]. The lock is taken through a
 /// duplicate of the descriptor, which shares the open file and so the lock.
 pub trait FileBackstop {

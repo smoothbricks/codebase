@@ -354,7 +354,7 @@ fn checkout_template_directory() -> PathBuf {
     let run = unsafe { libc::getppid() };
     let directory = PathBuf::from(format!(
         "/private/tmp/{}{run}-templates",
-        scratch_directory::ROOT_PREFIX
+        scratch_directory::cleanup::ROOT_PREFIX
     ));
     fs::create_dir_all(&directory)
         .unwrap_or_else(|error| panic!("template directory {}: {error}", directory.display()));
@@ -365,7 +365,7 @@ fn checkout_template_directory() -> PathBuf {
 fn materialized_template(directory: &Path, key: &str, write: impl FnOnce(&Path)) -> PathBuf {
     let template = directory.join(key);
     let lock = directory.join(format!("{key}.lock"));
-    let _writing = scratch_apfs::lock_exclusive(&lock)
+    let _writing = cowshed_os::test_backstop::lock_exclusive(&lock)
         .unwrap_or_else(|error| panic!("template lock {}: {error}", lock.display()));
     if !template.exists() {
         let aside = directory.join(format!("{key}.{}", std::process::id()));

@@ -29,18 +29,25 @@ use std::fs::{self, File};
 use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::CommandBackstop as _;
 
-use super::scratch_apfs::SCRATCH_PARENT;
 use super::scratch_namespace::release_image;
 use super::{
     ApfsBackend, CommandRunner, DiskImageSource, ImageCapacity, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner, blank_template,
 };
 
+/// The directory every test run of this user shares, `/private/var/folders/cowshed/<euid>/t`
+/// ([`cowshed_os::scratch::macos_scratch_root`]): shared state only, never a run's own tree. The
+/// sweep's lock and record, the user's blank template and the lane pools are in it, and none of
+/// them belongs to one test namespace.
+static SCRATCH_PARENT: LazyLock<PathBuf> = LazyLock::new(|| {
+    cowshed_os::scratch::macos_scratch_root()
+        .unwrap_or_else(|error| panic!("real-APFS scratch parent: {error}"))
+});
 /// The 1 GiB test cap (08_testing.md): the template's capacity, and so every clone's.
 pub const CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(1);
 
@@ -280,7 +287,7 @@ pub fn shared_image_at(namespace: TestNamespace, scenario: &str, image: &Path) -
     let pool = pool_directory();
     fs::create_dir_all(&pool)
         .unwrap_or_else(|error| panic!("pool directory {}: {error}", pool.display()));
-    let _lock = super::scratch_apfs::lock_exclusive(&pool.join("pool.lock"))
+    let _lock = cowshed_os::test_backstop::lock_exclusive(&pool.join("pool.lock"))
         .unwrap_or_else(|error| panic!("pool lock: {error}"));
     detach_previous_runs(namespace, &pool);
 

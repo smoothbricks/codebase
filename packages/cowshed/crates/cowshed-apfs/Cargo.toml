@@ -15,6 +15,12 @@ path = "src/bin/attach_budget.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "cowshed-test-sweep"
+path = "src/bin/test_sweep.rs"
+test = false
+bench = false
+
 [dependencies]
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 cowshed-os = { path = "../cowshed-os" }

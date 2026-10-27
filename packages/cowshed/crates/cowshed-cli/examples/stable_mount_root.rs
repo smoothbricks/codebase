@@ -130,7 +130,7 @@ mod native {
         let receipts = fs::canonicalize(receipts)?;
         let live_path = Path::new(cowshed_gateway_types::STORE_ROOT).join(HOST_CONFIG_FILE);
         let live_before = live_configuration(&live_path)?;
-        let scratch = crate::scratch_apfs::ScratchRoot::new_owned("root")?;
+        let scratch = crate::scratch_apfs::ScratchRoot::new("root")?;
         let scratch_path = scratch.path().to_path_buf();
         let root = HostConfig::load(scratch.path(), scratch.path())?
             .mount_root()

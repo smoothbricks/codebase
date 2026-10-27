@@ -16,6 +16,45 @@ import {
   requirements,
   systemHost,
 } from './apfs-test-root.js';
+import { extractorCommand, sweepExecutable } from './apfs-test-sweep.js';
+
+describe('the lane sweep executable in a relocated nextest archive', () => {
+  const entry = { name: 'cowshed-test-sweep', kind: 'bin-exe', path: 'debug/cowshed-test-sweep' };
+  const metadata = (entries: unknown[]) => ({
+    'rust-build-meta': { 'non-test-binaries': { 'archived-cowshed-apfs-package': entries } },
+  });
+  it('selects the native producer output, never an unbuilt JavaScript entrypoint', () => {
+    for (const platform of ['darwin', 'linux'] as const) {
+      for (const architecture of ['arm64', 'x64']) {
+        expect(extractorCommand(platform, architecture)).toBe(
+          'node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/bin/' +
+            platform +
+            '-' +
+            architecture +
+            '/smoo-nx-nextest-extract',
+        );
+      }
+    }
+    expect(() => extractorCommand('freebsd', 'x64')).toThrow();
+    expect(() => extractorCommand('darwin', 'riscv64')).toThrow();
+  });
+  it('uses exactly the archived executable under the current extraction', () => {
+    expect(sweepExecutable('/extracted', metadata([entry]))).toBe('/extracted/target/debug/cowshed-test-sweep');
+    expect(sweepExecutable('/relocated', metadata([{ ...entry, path: 'debug/build/sweep/out/helper' }]))).toBe(
+      '/relocated/target/debug/build/sweep/out/helper',
+    );
+  });
+  it('refuses missing or ambiguous cleanup executables instead of starting fixtures', () => {
+    for (const value of [null, {}, metadata([]), metadata([entry, entry]), metadata([{ ...entry, kind: 'dylib' }])]) {
+      expect(() => sweepExecutable('/extracted', value)).toThrow();
+    }
+  });
+  it('cannot execute a path outside the extracted target', () => {
+    for (const path of ['/foreign/helper', '../foreign/helper', 'debug/../../foreign/helper', '.']) {
+      expect(() => sweepExecutable('/extracted', metadata([{ ...entry, path }]))).toThrow();
+    }
+  });
+});
 
 const SUDO = '/usr/bin/sudo';
 const INSTALL = '/usr/bin/install';

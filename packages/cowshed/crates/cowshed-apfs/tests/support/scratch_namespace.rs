@@ -1,6 +1,6 @@
 //! Shared test-namespace ownership and scoped reclamation.
 //!
-//! Global dead-run scanning stays with the APFS guard; these are its existing root and image rules.
+//! The lane setup owns global dead-run scanning; these are its shared root and image rules.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
