@@ -1132,13 +1132,16 @@ drain is owed until one of the processes it is owed to has read its end (a `wait
 and read to EOF every stream it was reading through `logRead`, or until every one of them has exited: a reader that is
 gone reads nothing, and a drain never waits on it. The supervisor retires once every owed job is read or owed to nobody,
 or once 30 minutes pass with no read of an owed job (the idle retirement's bound), so a live reader that never reads, or
-a job no process was seen asking about, cannot keep it serving. Only a read of an owed job starts that bound over: a
-`hello`, a `drain`, a refused command of another build or membership traffic reads nothing. Measured 2026-10-22: a
-drained supervisor whose job had ended with its client gone answered the `hello` of every command of the new build it
-refused, each of which started its bound over, and it served until it was killed. Its retirement says on stderr which
-jobs' ends were read, which were owed to processes that all exited, and which went unread. This holds only when the
-supervisor being replaced already contains it: a supervisor of a build from before it still retires the moment its last
-job ends, so the first install of a build with this rule is not covered by it, and its clients are refused as before.
+a reader whose exit cannot be seen, cannot keep it serving. A job no process asked about, such as the daemon the Nx
+keeper starts for the supervisor itself, is owed to nobody: once it has ended it holds the drain for nothing (measured
+2026-10-27: each shed whose keeper ran a daemon refused the new build's commands for the full bound after an install,
+its report waiting on that daemon's end). Only a read of an owed job starts that bound over: a `hello`, a `drain`, a
+refused command of another build or membership traffic reads nothing. Measured 2026-10-22: a drained supervisor whose
+job had ended with its client gone answered the `hello` of every command of the new build it refused, each of which
+started its bound over, and it served until it was killed. Its retirement says on stderr which jobs' ends were read,
+which were owed to processes that all exited, and which went unread. This holds only when the supervisor being replaced
+already contains it: a supervisor of a build from before it still retires the moment its last job ends, so the first
+install of a build with this rule is not covered by it, and its clients are refused as before.
 
 A draining supervisor says what it waits for. At each step it publishes a report beside its socket (`<socket>.drain`,
 naming its pid): the jobs still running, then the ends no client has read, with each resident it ended for its

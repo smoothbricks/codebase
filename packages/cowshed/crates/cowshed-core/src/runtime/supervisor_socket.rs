@@ -1857,7 +1857,6 @@ impl Drain {
     /// Owe `job` to `peer` too, unless it is already owed to it: the exit to watch, if any.
     fn reader(&mut self, job: JobId, peer: io::Result<Process>) -> Option<Watch> {
         let owed = self.owed.get_mut(&job)?;
-        owed.asked = true;
         match peer {
             Ok(peer) => {
                 if owed.readers.values().any(|known| same_life(known, &peer)) {
@@ -1888,7 +1887,6 @@ impl Drain {
             self.running.push(job);
         }
         let owed = self.owed.entry(job).or_default();
-        owed.asked = true;
         match requester {
             Ok(requester) => Some(self.owe(job, Arc::new(requester), resident(class))),
             Err(error) => {
@@ -1936,8 +1934,6 @@ struct Owed {
     eof: [bool; 2],
     /// The processes it is owed to that have not been seen exiting, by exit-watch number.
     readers: BTreeMap<u64, Arc<Process>>,
-    /// Some process asked for or about the job.
-    asked: bool,
     /// One of them can never be seen exiting: its identity could not be read, or its exit
     /// cannot be watched.
     unseen: bool,
@@ -1948,9 +1944,11 @@ impl Owed {
         self.end && (0..2).all(|stream| !self.reading[stream] || self.eof[stream])
     }
 
-    /// Every process the job was owed to has exited, so nothing will read it.
+    /// Nothing will read it: every process it was owed to has exited, or none ever asked about it
+    /// (a job the supervisor started for itself, such as the Nx keeper's daemon, which no client
+    /// requested or waits on).
     fn abandoned(&self) -> bool {
-        self.asked && !self.unseen && self.readers.is_empty()
+        !self.unseen && self.readers.is_empty()
     }
 
     fn settled(&self) -> bool {
@@ -2167,7 +2165,6 @@ impl DrainReads {
                 begun.running.push(job);
             }
             let owed = begun.owed.entry(job).or_default();
-            owed.asked = true;
             owed.unseen = unidentified;
             if let Some(requester) = requester {
                 watches.push(begun.owe(job, requester, resident(class)));
@@ -4793,6 +4790,18 @@ mod drain_read_tests {
 
     const BOUND: Duration = Duration::from_secs(30 * 60);
 
+    /// Owe job `id` to a process whose identity could not be read, so it is never seen exiting.
+    fn unseen(owed: &DrainReads, id: u64) {
+        owed.asked().insert(
+            job(id),
+            Asked {
+                class: ExecClass::Background,
+                requester: None,
+                readers: Vec::new(),
+                unidentified: true,
+            },
+        );
+    }
     /// What would end a resident: a supervisor handle these tests never call, and a report path.
     fn ends() -> ResidentEnd {
         ResidentEnd {
@@ -4890,6 +4899,8 @@ mod drain_read_tests {
     #[tokio::test]
     async fn a_job_is_read_once_its_end_and_every_stream_being_read_reached_a_client() {
         let owed = DrainReads::default();
+        unseen(&owed, 1);
+        unseen(&owed, 2);
         assert!(owed.begin(&background(&[1, 2]), ends()).is_some());
         assert!(
             owed.begin(&background(&[3]), ends()).is_none(),
@@ -4912,11 +4923,25 @@ mod drain_read_tests {
         assert_eq!(settled.to_string(), "read by a client: [1, 2]");
     }
 
-    /// A job nobody was seen asking about cannot keep a drained supervisor serving: past the
-    /// bound with no read it retires, and says which ends went unread.
+    /// A job no process asked about is owed to nobody: the Nx keeper's daemon, which the
+    /// supervisor started for itself, holds no drained supervisor once it has ended. Measured
+    /// 2026-10-27: after an install, each shed whose keeper ran a daemon refused every command of
+    /// the new build for the idle bound, its drain report waiting on the daemon's end.
     #[tokio::test(start_paused = true)]
-    async fn an_end_nobody_reads_is_given_up_after_the_idle_bound_and_named() {
+    async fn a_job_no_process_asked_about_is_owed_to_nobody() {
         let owed = DrainReads::default();
+        owed.begin(&background(&[7]), ends());
+        let settled = owed.settle(BOUND).await;
+        assert_eq!(settled.abandoned, [job(7)]);
+        assert!(settled.unread.is_empty());
+    }
+
+    /// A job owed to a process the drain can never see exiting cannot keep a drained supervisor
+    /// serving either: past the bound with no read it retires, and says which ends went unread.
+    #[tokio::test(start_paused = true)]
+    async fn an_end_no_process_can_be_seen_reading_is_given_up_after_the_idle_bound_and_named() {
+        let owed = DrainReads::default();
+        unseen(&owed, 7);
         owed.begin(&background(&[7]), ends());
         let settled = owed.settle(BOUND).await;
         assert!(settled.read.is_empty());
@@ -4990,6 +5015,7 @@ mod drain_read_tests {
     #[tokio::test]
     async fn the_idle_bound_gives_up_on_unread_ends_never_on_an_exec_in_flight() {
         let owed = DrainReads::default();
+        unseen(&owed, 7);
         owed.begin(&background(&[7]), ends())
             .expect("the first drain");
         let admitting = owed.admitting();
@@ -5128,6 +5154,8 @@ mod drain_read_tests {
         );
 
         let owed = DrainReads::default();
+        unseen(&owed, 7024);
+        unseen(&owed, 7025);
         owed.begin(&background(&[7024, 7025]), ends());
         owed.record(job(7025), |owed| owed.end = true);
         owed.reading(&report);
