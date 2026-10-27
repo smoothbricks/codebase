@@ -35,6 +35,7 @@ use crate::path_entry::PathEntryOutcome;
 use crate::probe::{GitIdentityGap, probe_project};
 use async_trait::async_trait;
 use cowshed_core::AdoptedProject;
+use cowshed_core::api::{SkillInstallReport, SkillInstallStatus};
 use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::caches_retirement::{
     self, LeftoverReason, Merge, Owner, RetirementError, RetirementLayout, RetirementReport,
@@ -315,6 +316,14 @@ pub trait HostSetup: Send {
     async fn install_cli(&mut self) -> Result<Option<CliInstall>> {
         Ok(None)
     }
+    /// Write the invoking build's agent skill into every harness present under the host's home
+    /// (`cowshed skill install`), after this run installed that build.
+    ///
+    /// `None` for a test host, which must never write into a real home; the native host answers
+    /// always.
+    async fn install_skill(&mut self) -> Result<Option<SkillInstallReport>> {
+        Ok(None)
+    }
 }
 
 /// The real host, rooted at the canonical home every other host verb resolves and at the
@@ -374,6 +383,20 @@ impl HostSetup for NativeHostSetup {
         crate::gateway_service::install_cli(&self.home, self.downgrade, &path)
             .await
             .map(Some)
+    }
+
+    async fn install_skill(&mut self) -> Result<Option<SkillInstallReport>> {
+        let planned = crate::skill::plan(&self.home, crate::skill::Scope::Global, &[], &|path| {
+            path.exists()
+        });
+        crate::skill::install(&self.home, &planned)
+            .map(Some)
+            .map_err(|error| {
+                CowshedError::internal(format!(
+                    "could not install the cowshed skill into {}: {error}",
+                    self.home.display()
+                ))
+            })
     }
 
     /// Count what the store holds, or say why it could not be counted.
@@ -981,6 +1004,14 @@ where
         emit_retirement(retirement.as_ref(), retire_requested, retire, output)?;
     if let Some(identity) = &identity {
         emit_git_identity(identity, output)?;
+    }
+    // The guidance agents read is part of the installed cowshed: an install writes its skill into
+    // every harness present, so no harness keeps describing a cowshed that is no longer installed.
+    if failure.is_none()
+        && matches!(cli, Some(CliInstall::Installed { .. }))
+        && let Some(skill) = setup.install_skill().await?
+    {
+        emit_skill_install(&skill, output)?;
     }
     if let Some(failure) = failure {
         return Err(partial_setup_failure(failure));
@@ -1640,6 +1671,30 @@ fn emit_cli_install<W: Write, E: Write>(
         output.guidance(&line).map_err(output_error)?;
     }
     Ok(())
+}
+
+/// Name each harness copy of the skill this install rewrote; copies that already held it say
+/// nothing.
+fn emit_skill_install<W: Write, E: Write>(
+    report: &SkillInstallReport,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    let written: Vec<String> = report
+        .installs
+        .iter()
+        .filter(|install| install.status == SkillInstallStatus::Written)
+        .map(|install| install.path.display().to_string())
+        .collect();
+    if written.is_empty() {
+        return Ok(());
+    }
+    output
+        .guidance(&format!(
+            "wrote this cowshed's agent skill for {} harness(es): {}",
+            written.len(),
+            written.join(", ")
+        ))
+        .map_err(output_error)
 }
 
 /// The commands that finish what setup could not do for the `PATH` entry, and the remedy of a

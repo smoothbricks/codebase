@@ -92,7 +92,8 @@ not workspace corruption; install the intended build with its own setup before r
 
 `cowshed skill install` writes the bundled skill into every agent harness detected on the host, and
 `cowshed skill install --project <path>` installs it into one repository. It is idempotent, needs no network, and works
-before `adopt` has run.
+before `adopt` has run. `cowshed setup` writes the same skill into every harness present whenever it installs a cowshed,
+so the guidance agents read is always the installed cowshed's own; a copy that already holds it is left alone.
 
 Its harness table is a generated snapshot of [vercel-labs/skills](https://github.com/vercel-labs/skills), refreshed with
 `nx run cowshed:refresh-harnesses`. The generated file records the upstream revision it came from and lists the entries

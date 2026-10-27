@@ -22,6 +22,7 @@ use cowshed_cli::setup_service::{
     SccacheInstall, WorkspaceCensus, dispatch as setup_dispatch,
 };
 use cowshed_core::AdoptedProject;
+use cowshed_core::api::{SkillInstall, SkillInstallReport, SkillInstallStatus};
 use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::caches_retirement::{
     CacheOutcome, Leftover, LeftoverReason, Merge, Owner, Placement, RetirementReport,
@@ -70,6 +71,8 @@ struct FakeHost {
     retirement: Option<RetirementReport>,
     /// The caches-volume mode setup planned and executed with.
     caches_volume: Option<CachesVolume>,
+    /// What the skill install answers; `None` models a host that installs no skill.
+    skill: Option<SkillInstallReport>,
 }
 
 /// A setup plan whose `non_destructive` is derived exactly the way core derives it — no
@@ -153,6 +156,7 @@ impl Default for FakeHost {
             owners: Vec::new(),
             retirement: None,
             caches_volume: None,
+            skill: None,
         }
     }
 }
@@ -214,6 +218,11 @@ impl HostSetup for FakeHost {
 
     async fn install_cli(&mut self) -> Result<Option<CliInstall>> {
         Ok(self.cli.clone())
+    }
+
+    async fn install_skill(&mut self) -> Result<Option<SkillInstallReport>> {
+        self.events.push(String::from("install-skill"));
+        Ok(self.skill.clone())
     }
 
     async fn mark_project_owners(&mut self) -> Result<Vec<PathBuf>> {
@@ -1070,6 +1079,64 @@ async fn a_path_entry_setup_cannot_repoint_is_reported_with_the_command_that_wou
         ),
         "{}",
         streams.stderr
+    );
+}
+
+/// The guidance agents read is the installed cowshed's own: a setup that installs this cowshed
+/// writes its skill into every harness present and names each copy it rewrote, and a setup that
+/// kept the installed cowshed leaves every copy as it was.
+#[tokio::test]
+async fn an_install_writes_its_skill_and_a_kept_install_leaves_the_skill() {
+    let mut host = FakeHost {
+        cli: Some(CliInstall::Installed {
+            stable: PathBuf::from("/Users/dev/Library/Application Support/dev.cowshed/bin/cowshed"),
+            replaced: true,
+            from_installed_copy: false,
+            path_entry: PathEntryOutcome::AlreadyInstalled {
+                entry: PathBuf::from("/Users/dev/.bun/bin/cowshed"),
+            },
+        }),
+        skill: Some(SkillInstallReport {
+            skill: String::from("cowshed"),
+            installs: vec![
+                SkillInstall {
+                    harness: String::from("omp"),
+                    path: PathBuf::from("/Users/dev/.omp/agent/skills/cowshed/SKILL.md"),
+                    status: SkillInstallStatus::Written,
+                },
+                SkillInstall {
+                    harness: String::from("zed"),
+                    path: PathBuf::from("/Users/dev/.agents/skills/cowshed/SKILL.md"),
+                    status: SkillInstallStatus::Unchanged,
+                },
+            ],
+        }),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0);
+    assert!(
+        streams.stderr.contains(
+            "cowshed: wrote this cowshed's agent skill for 1 harness(es): /Users/dev/.omp/agent/skills/cowshed/SKILL.md\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+
+    let reason = String::from("the invoking build is older than the installed cowshed");
+    let mut host = FakeHost {
+        cli: Some(CliInstall::Refused {
+            reason: reason.clone(),
+            remedy: String::from("run `cowshed setup` from a build of a newer commit"),
+        }),
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0, "{}", streams.stderr);
+    assert!(
+        !host.events.iter().any(|event| event == "install-skill"),
+        "a kept install wrote the skill: {:?}",
+        host.events
     );
 }
 
