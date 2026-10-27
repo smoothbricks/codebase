@@ -778,7 +778,7 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
             "panic" => assert_eq!(status.code(), Some(101), "the run failed"),
             _ => {
                 assert_eq!(status.signal(), Some(libc::SIGKILL), "the run was killed");
-                crate::scratch_apfs::reclaim_dead_root(&root)
+                crate::scratch_namespace::reclaim_dead_root(&root)
                     .expect("reclaim exactly the killed fixture's root");
             }
         }
@@ -793,7 +793,7 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
             );
             assert!(!image.exists(), "{ending}: {} remains", image.display());
         }
-        let left = crate::scratch_apfs::processes::processes_in(|cwd| cwd.starts_with(&root))
+        let left = crate::scratch_namespace::processes::processes_in(|cwd| cwd.starts_with(&root))
             .expect("list the processes working under the run's root");
         assert_eq!(left, [], "{ending}: worker {worker} outlived its run");
         assert!(!root.exists(), "{ending}: {} remains", root.display());
@@ -905,8 +905,8 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             .expect("wait for the caller's stop");
         assert_eq!(stopped, caller);
         assert!(libc::WIFSTOPPED(status), "the caller ended before its stop");
-        let tree =
-            crate::scratch_apfs::processes::processes_in(in_root).expect("list the caller's tree");
+        let tree = crate::scratch_namespace::processes::processes_in(in_root)
+            .expect("list the caller's tree");
         if tree.iter().any(|&(pid, _)| pid == announced) {
             break announced;
         }
@@ -916,7 +916,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     // The tree-killer's two strokes: SIGTERM to every process working in the root
     // (the disk-image child among them, which holds it blocked), SIGKILL to the caller.
     for (pid, _) in
-        crate::scratch_apfs::processes::processes_in(in_root).expect("list the caller's tree")
+        crate::scratch_namespace::processes::processes_in(in_root).expect("list the caller's tree")
     {
         // SAFETY: kill only names a process; a pid gone since the listing reports ESRCH.
         unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -927,7 +927,8 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     // The detached attach, and anything else still working in the root, ends on its own:
     // wait for each one's exit event, then reconcile as the next invocation does.
     loop {
-        let left = crate::scratch_apfs::processes::processes_in(in_root).expect("list the root");
+        let left =
+            crate::scratch_namespace::processes::processes_in(in_root).expect("list the root");
         if left.is_empty() {
             break;
         }
@@ -969,7 +970,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         .delete_image(&image)
         .expect("delete the released image");
     assert_eq!(
-        crate::scratch_apfs::processes::processes_in(in_root).expect("list the root"),
+        crate::scratch_namespace::processes::processes_in(in_root).expect("list the root"),
         [],
         "a process outlived the released image in its root"
     );
@@ -1000,7 +1001,7 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
         let mut announced = std::collections::BTreeSet::new();
         loop {
             let found =
-                crate::scratch_apfs::processes::processes_in(|cwd| cwd.starts_with(&watched))
+                crate::scratch_namespace::processes::processes_in(|cwd| cwd.starts_with(&watched))
                     .unwrap_or_default();
             for (pid, _) in found {
                 let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];

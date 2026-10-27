@@ -2761,7 +2761,7 @@ mod tests {
         let daemon = daemon
             .get()
             .expect("the daemon was live when the test failed");
-        let left = crate::scratch_directory::processes::processes_in(|cwd| cwd.starts_with(&path))
+        let left = crate::scratch_namespace::processes::processes_in(|cwd| cwd.starts_with(&path))
             .expect("list the processes working under the root");
         assert_eq!(
             left,

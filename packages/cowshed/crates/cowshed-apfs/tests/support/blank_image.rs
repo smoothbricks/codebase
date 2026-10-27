@@ -34,7 +34,8 @@ use std::sync::OnceLock;
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::test_backstop::CommandBackstop as _;
 
-use super::scratch_apfs::{SCRATCH_PARENT, release_image};
+use super::scratch_apfs::SCRATCH_PARENT;
+use super::scratch_namespace::release_image;
 use super::{
     ApfsBackend, CommandRunner, DiskImageSource, ImageCapacity, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner, blank_template,

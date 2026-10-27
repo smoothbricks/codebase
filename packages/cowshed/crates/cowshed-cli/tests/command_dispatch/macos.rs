@@ -1,5 +1,4 @@
 use cowshed_apfs::image::ImageCapacity;
-use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{blank_template, blank_template_path};
 use cowshed_apfs::{
     ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
@@ -52,13 +51,10 @@ mod blank_image;
 mod nx_dependencies;
 #[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
-#[expect(
-    clippy::duplicate_mod,
-    reason = "scratch_directory and scratch_apfs each include the stateless scratch_processes \
-              helpers, so either support file also stands alone in a test binary"
-)]
 #[path = "../../../cowshed-core/tests/support/scratch_directory.rs"]
 mod scratch_directory;
+#[path = "../../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 use nx_dependencies::nx_read_paths;
 
 use scratch_apfs::ScratchRoot;
@@ -2898,7 +2894,7 @@ fn directory_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycl
     let (root, daemon) = started
         .into_inner()
         .expect("the daemon started before the test failed");
-    let left = scratch_directory::processes::processes_in(|cwd| cwd.starts_with(&root))
+    let left = scratch_namespace::processes::processes_in(|cwd| cwd.starts_with(&root))
         .expect("list the processes working under the root");
     assert_eq!(
         left,

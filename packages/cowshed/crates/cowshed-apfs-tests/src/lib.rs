@@ -1,7 +1,6 @@
 #![cfg(all(test, target_os = "macos"))]
 
 use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
-use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::blank_template;
 use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRequest, CommandRunner, CreateImageRequest,
@@ -14,5 +13,7 @@ use cowshed_apfs::{
 mod blank_image;
 #[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[path = "../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 
 mod tests;

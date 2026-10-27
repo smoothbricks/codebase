@@ -27,14 +27,11 @@ use cowshed_os::process::RunState;
 use cowshed_os::test_backstop::CommandBackstop as _;
 
 #[cfg(target_os = "macos")]
-use cowshed_apfs::{
-    CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
-    store_lock::verify_no_symlinks,
-};
-
-#[cfg(target_os = "macos")]
 #[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[cfg(target_os = "macos")]
+#[path = "../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 
 const HOME: &str = "/Users/cowshed-test";
 /// The only path shape a cowshed LaunchAgent can name: on the volume that carries the plist.

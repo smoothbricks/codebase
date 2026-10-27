@@ -9,11 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use cowshed_apfs::image::ImageCapacity;
-use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
 use cowshed_apfs::{
-    ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
-    ImageCapture, MacOsApfsBackend, SystemCommandRunner, volume_name,
+    ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DiskImageSource, ImageCapture,
+    MacOsApfsBackend, SystemCommandRunner, volume_name,
 };
 use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
@@ -39,6 +38,8 @@ use cowshed_os::namespace::{HostNamespace, TestNamespace};
 mod blank_image;
 #[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[path = "../../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 
 use blank_image::CAPACITY;
 use scratch_apfs::ScratchRoot;

@@ -1401,7 +1401,7 @@ fn directory_fixture_retirement_moves_the_inode_once_for_every_payload_size() {
                 index.to_le_bytes(),
             );
         }
-        eprintln!(
+        cowshed_os::eprintln!(
             "directory-retirement counts: entries={entries} rename_attempts=1 inode_preserved=true"
         );
     }

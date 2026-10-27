@@ -12,7 +12,6 @@ use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::store_lock::LockMode;
-use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
 use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedDiskImage, AttachedImage, CommandOutput, CommandRequest,
@@ -50,6 +49,8 @@ mod blank_image;
 mod fsevents;
 #[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[path = "../../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 
 use scratch_apfs::ScratchRoot;
 

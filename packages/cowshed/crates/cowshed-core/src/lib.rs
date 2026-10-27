@@ -51,12 +51,12 @@ pub mod workspace_git_fetch;
 #[cfg(all(test, target_os = "macos"))]
 use cowshed_apfs::image::ImageCapacity;
 #[cfg(all(test, target_os = "macos"))]
+use cowshed_apfs::template::blank_template;
+#[cfg(all(test, target_os = "macos"))]
 use cowshed_apfs::{
-    ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
+    ApfsBackend, CommandRunner, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
-#[cfg(all(test, target_os = "macos"))]
-use cowshed_apfs::{store_lock::verify_no_symlinks, template::blank_template};
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
@@ -64,13 +64,11 @@ mod blank_image;
 #[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 #[cfg(all(test, target_os = "macos"))]
-#[expect(
-    clippy::duplicate_mod,
-    reason = "scratch_directory and scratch_apfs each include the stateless scratch_processes \
-              helpers, so either support file also stands alone in a test binary"
-)]
 #[path = "../tests/support/scratch_directory.rs"]
 mod scratch_directory;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 #[cfg(test)]
 #[path = "../tests/support/temp_parent.rs"]
 mod temp_parent;

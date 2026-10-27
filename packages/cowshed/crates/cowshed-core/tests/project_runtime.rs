@@ -12,11 +12,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(target_os = "macos")]
-use cowshed_apfs::{
-    CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
-    store_lock::verify_no_symlinks,
-};
 use cowshed_core::api::dto::{
     AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo,
     CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg, DefragmentResult,
@@ -74,6 +69,9 @@ use temp_root::TempRoot;
 #[cfg(target_os = "macos")]
 #[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
+#[cfg(target_os = "macos")]
+#[path = "../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {

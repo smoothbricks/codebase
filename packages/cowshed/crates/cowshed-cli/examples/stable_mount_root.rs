@@ -4,14 +4,11 @@
 //! root, accessed through a preferred-path symlink. Live host configuration is never changed.
 
 #[cfg(target_os = "macos")]
-use cowshed_apfs::store_lock::verify_no_symlinks;
-#[cfg(target_os = "macos")]
-use cowshed_apfs::{
-    CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
-};
-#[cfg(target_os = "macos")]
 #[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 pub mod scratch_apfs;
+#[cfg(target_os = "macos")]
+#[path = "../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+pub mod scratch_namespace;
 
 #[cfg(target_os = "macos")]
 #[tokio::main]

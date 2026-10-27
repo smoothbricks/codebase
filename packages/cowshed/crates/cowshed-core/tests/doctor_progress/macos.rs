@@ -3,10 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_apfs::store_lock::verify_no_symlinks;
-use cowshed_apfs::{
-    CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
-};
 use cowshed_core::api::dto::AdoptOptions;
 use cowshed_core::api::operations::OperationRequest;
 use cowshed_core::api::server::ConnectionAuthority;
@@ -22,13 +18,9 @@ use tokio::sync::mpsc;
 #[path = "../support/refusing_gateway.rs"]
 mod refusing_gateway;
 
-#[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
-mod scratch_apfs;
+#[path = "../../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 
-#[expect(
-    clippy::duplicate_mod,
-    reason = "both scratch guards share the stateless process cleanup helpers"
-)]
 #[path = "../support/scratch_directory.rs"]
 mod scratch_directory;
 

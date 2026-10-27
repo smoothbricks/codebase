@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[path = "../../../cowshed-os/tests/support/scratch_processes.rs"]
-pub(crate) mod processes;
+use super::scratch_namespace::processes;
 
 pub(crate) const ROOT_PREFIX: &str = "cowshed-dtest-";
 
@@ -37,7 +36,7 @@ impl ScratchRoot {
         }
         drop(swept);
 
-        let (_, mut retired_path) = super::scratch_apfs::create_owned_root(label)?;
+        let (_, mut retired_path) = super::scratch_namespace::create_owned_root(label)?;
         retired_path.push("directory");
         let path = PathBuf::from(format!(
             "/private/tmp/{ROOT_PREFIX}{}-{}",
@@ -251,7 +250,7 @@ mod tests {
                 .unwrap()
                 .is_file()
         );
-        assert!(super::super::scratch_apfs::reclaim_dead_root(namespace_root).is_err());
+        assert!(super::super::scratch_namespace::reclaim_dead_root(namespace_root).is_err());
         assert!(retired.exists());
         assert_eq!(
             fs::read_to_string(outside.path().join("kept")).unwrap(),

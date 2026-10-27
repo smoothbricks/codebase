@@ -8,10 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use arrow_ipc::reader::StreamReader;
-use cowshed_apfs::store_lock::verify_no_symlinks;
-use cowshed_apfs::{
-    CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
-};
 use cowshed_core::api::ControllerCommitment;
 use cowshed_core::api::dto::{
     AdoptOptions, ForkOptions, LandMode, LandOptions, RemoveOptions, RevisionTarget,
@@ -40,13 +36,9 @@ use serde_json::{Value, json};
 #[path = "../support/refusing_gateway.rs"]
 mod refusing_gateway;
 
-#[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
-mod scratch_apfs;
+#[path = "../../../cowshed-apfs/tests/support/scratch_namespace.rs"]
+mod scratch_namespace;
 
-#[expect(
-    clippy::duplicate_mod,
-    reason = "both scratch guards share the stateless process cleanup helpers"
-)]
 #[path = "../support/scratch_directory.rs"]
 mod scratch_directory;
 
