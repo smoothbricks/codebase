@@ -558,10 +558,12 @@ nothing when nothing changed:
   any task, only to capture the environment (it sets `DEVENV_SKIP_TASKS` for that pass), so a repository's own
   `enterShell` hook that needs what the tasks install, such as the `ttsc` in `node_modules`, must skip the pass: on a
   fresh checkout or a runner that restored another lockfile's `node_modules` the hook would abort the capture before the
-  install could run. This repository's `tooling/direnv/enter-shell.ts` does. The managed `.envrc` watches
-  `package.json`, the lockfiles and the scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull
-  or a script change. Local nvfetcher overlays also watch `nixpkgs-overlay/flake.nix` and `_sources/generated.nix`.
-  Import the existing local flake outputs directly in `devenv.nix`
+  install could run. This repository's `tooling/direnv/enter-shell.ts` does. Managed toolchain cache maintenance
+  (`toolchain-stamp.ts`) skips that capture pass too: it exports no variables, and compiler probes and invalidation
+  belong after tasks and project hooks have settled the toolchain, not once before them and again afterward. The managed
+  `.envrc` watches `package.json`, the lockfiles and the scripts shell entry runs, so a shell direnv keeps loaded
+  re-enters after a pull or a script change. Local nvfetcher overlays also watch `nixpkgs-overlay/flake.nix` and
+  `_sources/generated.nix`. Import the existing local flake outputs directly in `devenv.nix`
   (`((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default`), rather than declaring the overlay as a `path:`
   flake input: the live import makes generated pins part of devenv's evaluation dependencies as well as direnv's
   watches. Ordinary activation then selects changed pins while an unchanged shell stays cached; no forced refresh or
