@@ -2683,6 +2683,57 @@ fn assert_kept_by_bundle(entry: &Value, head: &str, bundle: &Path) {
 }
 
 /// A clean workspace at main reads as landed, so an `rm` sweep can take one its owner forked a
+/// The directory a verb was invoked from is no hold of the workspace it retires (02_workspaces.md,
+/// "Holders cowshed does not run"): `rm` run from inside a workspace first moves its own working
+/// directory to main's checkout, and removes it. A file the same process holds open in another
+/// workspace still refuses that one's `rm`, naming the process.
+#[tokio::test]
+async fn rm_run_from_inside_a_workspace_leaves_it_first_and_an_open_file_still_refuses() {
+    let fixture = Fixture::new("r-cwd");
+    let runtime = fixture.adopt().await;
+    let mount_of = |view: &Value| PathBuf::from(view["info"]["mount"].as_str().expect("mount"));
+    let a = mount_of(
+        &fixture
+            .mint(&runtime, "a", ForkOptions::default())
+            .await
+            .expect("mint a"),
+    );
+    let b = mount_of(
+        &fixture
+            .mint(&runtime, "b", ForkOptions::default())
+            .await
+            .expect("mint b"),
+    );
+    std::env::set_current_dir(&a).expect("stand in a");
+    fixture
+        .remove(&runtime, "a")
+        .await
+        .expect("rm of a run from inside a removes it");
+    assert_eq!(
+        std::env::current_dir().expect("the working directory after rm"),
+        fixture.checkout,
+        "rm moved its working directory to main's checkout"
+    );
+    let open = fs::File::open(b.join("tracked")).expect("open a file of b's");
+    let refused = fixture
+        .remove(&runtime, "b")
+        .await
+        .expect_err("a file this process holds open in b refuses b's rm");
+    assert!(
+        refused
+            .message
+            .contains(&format!("pid {}", std::process::id())),
+        "the refusal names this process: {}",
+        refused.message
+    );
+    drop(open);
+    fixture
+        .remove(&runtime, "b")
+        .await
+        .expect("rm of b once nothing holds it");
+    runtime.shutdown().await.expect("stop the runtime");
+}
+
 /// minute ago and has not written in yet. An explicit `rm` refuses a workspace that young, naming
 /// its age and the floor, and refuses a dirty one first; `--force` removes it, and the deletion
 /// log says which process forced it and past which guards (02_workspaces.md, `rm` step 1).

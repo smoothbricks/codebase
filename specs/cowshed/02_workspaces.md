@@ -1832,11 +1832,15 @@ has now: a record that names no process, or whose pid another process has since 
 evidence the holder wrote under its own lock, not a guess from the process tree. Such a process can sit in one kernel
 call for minutes holding one of its descriptors' vnodes (a fork's first mount of its clone, "`cowshed fork`" step 3),
 and it is no foreign holder: the operation's own leases and image locks already refuse the operations a census guards.
-The census's own process is always asked, whatever its leases say. Every census on macOS starts from this one list of
-pids, the volume census included, which walks the processes itself rather than through libproc's `proc_listpidspath`.
-The leases read are the host store's (`/private/cowshed/store/<owner>/<repo>/sessions`) only: a lifecycle operation in a
-test fixture's store elsewhere records its lease there, which no census reads, so it is asked like any other process and
-can still stall a concurrent census. Linux records no unique id and its census asks every process.
+The census's own process is always asked, whatever its leases say. A verb that retires, detaches or moves a workspace
+first moves its own working directory off that workspace's mount, to main's checkout, so the directory it was invoked
+from never refuses its own retirement; anything else of its own there, an open file, still holds the mount and is named
+like any other holder, and so is the working directory of the shell that invoked it, a process cowshed does not run.
+Every census on macOS starts from this one list of pids, the volume census included, which walks the processes itself
+rather than through libproc's `proc_listpidspath`. The leases read are the host store's
+(`/private/cowshed/store/<owner>/<repo>/sessions`) only: a lifecycle operation in a test fixture's store elsewhere
+records its lease there, which no census reads, so it is asked like any other process and can still stall a concurrent
+census. Linux records no unique id and its census asks every process.
 
 A record's unique id is its exact decimal string (`DecimalU64` in `api::held_lock`, the form every kernel identifier on
 the wire takes), the one form any reader parses; the switch from a JSON number was a clean cutover, with no reader of

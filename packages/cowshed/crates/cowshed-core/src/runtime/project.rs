@@ -10427,11 +10427,37 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// exits while the census reads the process table is not shown cowshed's, and one the keeper
     /// admits after the census is a process no census looked at. A refusal leaves the keeper
     /// stopped until the shed's next job or session.
+    /// Move this process's working directory off `workspace`'s `mount` when it stands there, to
+    /// main's checkout: the directory a verb was invoked from is no hold of the workspace the verb
+    /// retires, detaches or moves (02_workspaces.md, "Holders cowshed does not run"). Anything
+    /// else of this process's there, an open file, still holds the mount, and the census names it.
+    fn leave_mount(&self, workspace: &WorkspaceName, mount: &Path) -> Result<()> {
+        // A working directory the kernel cannot name (removed under it, or unreadable) is left as
+        // it is: the census asks this process like any other and names whatever it holds.
+        let Ok(here) = std::env::current_dir() else {
+            return Ok(());
+        };
+        if !here.starts_with(mount) {
+            return Ok(());
+        }
+        let main = self.workspace_mount_path(&main_name())?;
+        std::env::set_current_dir(&main).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot move this process's working directory {} off {workspace}'s mount to main's checkout {}: {error}",
+                    here.display(),
+                    main.display()
+                ),
+                format!("run the command from outside {}", mount.display()),
+            )
+        })
+    }
     async fn require_mount_unheld_before_stop(
         &self,
         workspace: &WorkspaceName,
         mount: &Path,
     ) -> Result<()> {
+        self.leave_mount(workspace, mount)?;
         self.stop_nx_keeper(workspace).await?;
         let supervisor = self.serving_supervisor(workspace).await?;
         self.require_mount_unheld(workspace, mount, supervisor)
