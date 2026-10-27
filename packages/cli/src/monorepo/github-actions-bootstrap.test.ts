@@ -124,7 +124,17 @@ describe('github-actions-bootstrap build-shell environment persistence', () => {
 // directory does not. Copy the script into a temp tree instead, stub away
 // `nix profile add`, and delegate `nix eval` to the real nix so the lock-reading
 // expression itself is under test rather than mocked.
-const REAL_NIX = spawnSync('sh', ['-c', 'command -v nix'], { encoding: 'utf8' }).stdout.trim();
+// Resolved as the fixture resolves its other tools (Bun.which, no child process), and refused by
+// name when absent: in one land gate a forked `command -v nix` answered nothing, and the stub then
+// ran `exec ""` (cause not reproduced outside that gate).
+function realNix(): string {
+  const nix = Bun.which('nix');
+  if (nix === null) {
+    throw new Error('nix must be on PATH: the install-devenv cases delegate `nix eval` to it');
+  }
+  return nix;
+}
+const REAL_NIX = realNix();
 
 const NIX_STUB = `#!/usr/bin/env bash
 printf '%s\\n' "nix $*" >> "$NIX_CALLS"
