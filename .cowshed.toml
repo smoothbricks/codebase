@@ -12,8 +12,8 @@
 #
 # Not declared: `.cache/nextest` and `.cache/lmao-thread-ffi` are Nx task outputs, which never
 # live on the build volume (16_build_volumes.md "Nx outputs never live in the build volume"); the
-# Nx cache restores them. `.cache/statebus-packages` is an uncached verification run's report,
-# read back by nothing, and its consumer lockfiles name the checkout.
+# Nx cache restores them. `.cache/statebus-packages` is the packed-consumer verification's declared
+# Nx output on the same footing; its consumer lockfiles name tarballs workspace-relatively.
 state = [".cache/ttsc"]
 
 [land]

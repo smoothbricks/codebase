@@ -53,6 +53,50 @@
     "test": "nx run statebus-core:test --outputStyle=stream"
   },
   "nx": {
+    "namedInputs": {
+      "verifyPackages": [
+        "default",
+        "bunToolchain",
+        "{workspaceRoot}/bun.lock",
+        "{projectRoot}/**/*.md",
+        "{workspaceRoot}/bunfig.toml",
+        {
+          "json": "{workspaceRoot}/package.json",
+          "excludeFields": [
+            "version",
+            "scripts",
+            "smoo",
+            "nx"
+          ]
+        },
+        "{workspaceRoot}/packages/cli/src/monorepo/published-exports.ts",
+        "{workspaceRoot}/packages/statebus-core/scripts/consumer/**/*",
+        "{workspaceRoot}/packages/statebus-react/**/*",
+        "{workspaceRoot}/packages/statebus-data-loader/**/*",
+        "{workspaceRoot}/packages/statebus-tanstack-query/**/*",
+        "{workspaceRoot}/packages/statebus-navigation-core/**/*",
+        "{workspaceRoot}/packages/statebus-navigation-browser/**/*",
+        "{workspaceRoot}/packages/lmao/**/*",
+        "{workspaceRoot}/packages/arrow-builder/**/*",
+        "{workspaceRoot}/packages/validation/**/*",
+        {
+          "dependentTasksOutputFiles": "**/*",
+          "transitive": true
+        },
+        {
+          "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+        },
+        {
+          "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -sm"
+        },
+        {
+          "env": "GITHUB_SHA"
+        },
+        {
+          "env": "STATEBUS_BENCH_COMMIT"
+        }
+      ]
+    },
     "targets": {
       "lint": {},
       "test": {
@@ -101,7 +145,7 @@
       },
       "verify-packages": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
         "dependsOn": [
           {
             "target": "build",
@@ -123,10 +167,40 @@
           "cwd": "{projectRoot}"
         },
         "inputs": [
-          "default",
-          "^dependencyDefault",
-          "{workspaceRoot}/packages/cli/src/monorepo/published-exports.ts",
-          "{workspaceRoot}/packages/statebus-core/scripts/consumer/**/*"
+          "verifyPackages",
+          "^dependencyDefault"
+        ],
+        "outputs": [
+          "{workspaceRoot}/.cache/statebus-packages/"
+        ]
+      },
+      "verify-packages-fresh": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "parallelism": false,
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "statebus-core",
+              "statebus-react",
+              "statebus-data-loader",
+              "statebus-tanstack-query",
+              "statebus-navigation-core",
+              "statebus-navigation-browser",
+              "lmao",
+              "arrow-builder",
+              "validation"
+            ]
+          }
+        ],
+        "options": {
+          "command": "bun scripts/verify-packages.mjs --fresh",
+          "cwd": "{projectRoot}"
+        },
+        "inputs": [
+          "verifyPackages",
+          "^dependencyDefault"
         ]
       }
     },
