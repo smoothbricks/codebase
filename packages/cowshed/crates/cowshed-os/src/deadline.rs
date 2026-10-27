@@ -1561,6 +1561,10 @@ impl<S> PeerStream<S> {
     fn poll_bound<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
         loop {
             ready!(self.timer.as_mut().poll(cx));
+            // This waiter's own stall is not the holder's silence ([`Idle::look`]).
+            if let Bounding::Held(idle) = &mut self.wait.bounding {
+                idle.look(HEARTBEAT, clock());
+            }
             if self.wait.bounding.remaining() < TIMER_TICK {
                 return Poll::Ready(Err(self.wait.timed_out()));
             }

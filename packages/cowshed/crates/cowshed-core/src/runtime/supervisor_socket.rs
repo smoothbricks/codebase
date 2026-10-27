@@ -944,6 +944,7 @@ async fn answer_of(
     let mut stalled = deadline::idle(stream.op(), deadline::HEARTBEAT_SILENCE);
     loop {
         let frame = receive_frame(stream, MAX_JSON_FRAME).await?;
+        stalled.look(deadline::HEARTBEAT, deadline::clock());
         let response = serde_json::from_slice::<Response>(&frame)
             .map_err(|error| protocol_error(format!("malformed frame: {error}")))?;
         let pulse = match response {

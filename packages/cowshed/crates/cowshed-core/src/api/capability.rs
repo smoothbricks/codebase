@@ -1847,6 +1847,10 @@ async fn run_controller_actor(
         mpsc::unbounded_channel::<crate::runtime::wait_spans::WaitReceipt>();
     let mut last_receipt = None;
     let failure = loop {
+        // This actor's own stall is not the controller's silence: a turn later than the silence
+        // allows plus a heartbeat gives the controller one heartbeat more (05_gateway.md
+        // "Deadlines").
+        stalled.idle.look(deadline::HEARTBEAT, deadline::clock());
         let owed = owes(&pending, &streams, &abandoned);
         let silence = stalled
             .idle
@@ -2018,6 +2022,7 @@ async fn run_controller_actor(
             // The timer only wakes the actor; the silence decides (cowshed-os::deadline's rule).
             // Tokio's timer can fire a tick early, and then it is re-armed for the rest.
             () = tokio::time::sleep(silence), if owed => {
+                stalled.idle.look(deadline::HEARTBEAT, deadline::clock());
                 if stalled
                     .idle
                     .remaining(deadline::clock())
@@ -3536,6 +3541,33 @@ mod tests {
         drop(server);
     }
 
+    /// 05_gateway.md "Deadlines": a waiter whose own process does not run past the silence bound
+    /// (its timer, due at 15 s, fires 12 s late) did not see what the controller sent meanwhile,
+    /// so it gives the controller one heartbeat more instead of failing the call SILENT, and an
+    /// answer in that heartbeat is the call's.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_whose_own_process_stalled_past_the_bound_is_not_silent_for_that_stall() {
+        let (runtime, mut server) = actor_in_memory();
+        let call = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let (_, request) = read_rpc_request(&mut server).await;
+        let id = request["id"].as_u64().expect("the call's id");
+        // Nothing in this process runs while 27 s pass, then the waiter's overdue timer fires.
+        tokio::time::advance(std::time::Duration::from_secs(27)).await;
+        tokio::task::yield_now().await;
+        let answer = codec::encode_rpc_success(id, &json!({"state": "running"}), None).unwrap();
+        write_raw_frame(&mut server, &answer).await;
+        assert_eq!(
+            call.await
+                .expect("the call task joins")
+                .expect("an answer in the heartbeat after the waiter's stall is the call's"),
+            json!({"state": "running"})
+        );
+    }
+
     /// A controller connection over a real socketpair whose controller is `pid`, recording its
     /// silences with `recording`.
     #[cfg(unix)]
@@ -3627,7 +3659,8 @@ mod tests {
         let (_, request) = read_rpc_request(&mut server).await;
         let id = request["id"].as_u64().expect("the next call's id");
         assert!(id > late, "the next call is a new call");
-        write_rpc_success(&mut server, id, json!({"state": "running"}), None).await;
+        let answer = codec::encode_rpc_success(id, &json!({"state": "running"}), None).unwrap();
+        write_raw_frame(&mut server, &answer).await;
         let answered = next
             .await
             .expect("the next call joins")
@@ -3717,7 +3750,8 @@ mod tests {
         });
         let (_, request) = read_rpc_request(&mut server).await;
         let id = request["id"].as_u64().expect("the next call's id");
-        write_rpc_success(&mut server, id, json!({"state": "running"}), None).await;
+        let answer = codec::encode_rpc_success(id, &json!({"state": "running"}), None).unwrap();
+        write_raw_frame(&mut server, &answer).await;
         assert_eq!(
             next.await
                 .expect("the next call joins")

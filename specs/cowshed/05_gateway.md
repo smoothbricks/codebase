@@ -903,9 +903,14 @@ the handshake bound.
   supervisor's actor under the authority the supervisor serves now: it reads that authority, and the job for a call
   about one. A grant advance during the wait therefore changes nothing. A supervisor that is alive but silent, or whose
   actor stopped answering, writes no heartbeat and fails `SILENT`, naming its socket and pid. A heartbeat about a job
-  that is running or draining with no process of its group left is not progress. If that state persists for the silence
-  bound, the wait fails `SILENT`, naming the job as stuck between its last process and its end. A queued job is
-  progress: resource admission has no total queue-age deadline ("Host scheduling").
+  that is running or draining with no process of its group left is not progress. Only a silence the waiter was there to
+  see is judged: a waiter whose own turn comes later than the silence bound plus one heartbeat after its last one (its
+  thread was blocked, its process stopped, as an in-process controller and its client stall together) did not run to
+  read what the holder sent meanwhile, so it gives the holder one heartbeat more from then before it judges. That is a
+  liveness rule, not a wider bound: a waiter that runs in time judges the holder at the bound, and a SILENT still names
+  the holder's whole silence since its last progress. If that state persists for the silence bound, the wait fails
+  `SILENT`, naming the job as stuck between its last process and its end. A queued job is progress: resource admission
+  has no total queue-age deadline ("Host scheduling").
 - **Cowshed CPU-pool admission has its own policy when that pool is used.** This is the existing non-mbx protocol, not a
   protocol imposed on mbx. Connecting and writing the complete request share the 5 s control bound. After the write
   completes, the client keeps its connection open and reads the queue acknowledgement and grant under the 15 s
