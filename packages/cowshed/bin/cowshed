@@ -18,9 +18,14 @@
 #   Neither falls back to the other, nor to a cargo target/release: a missing build is an error.
 #   Only its presence is judged: whether a development build still matches its sources is the
 #   shell-entry guard's question, asked once, never on each exec.
+# - a checkout's launcher reached through a link from outside that checkout (another repository's
+#   node_modules/.bin/cowshed, which a developer link points here) is a consumer's `cowshed`, and
+#   the checkout's development build cannot talk to the daemon the install runs: every verb but
+#   `setup` and `gateway` runs the host-stable install when it exists, as `sccache` does.
 set -eu
 
 # Package managers link `bin` entries, sometimes through a chain of links.
+invoked=$0
 launcher=$0
 while [ -h "$launcher" ]; do
   target=$(readlink "$launcher")
@@ -48,16 +53,18 @@ consider() {
 
 # The verb is the first argument that is not a flag: `--json sccache start` routes like
 # `sccache start`.
+stable=${HOME:-}/Library/Application\ Support/dev.cowshed/bin/cowshed
+verb=
 for argument in "$@"; do
   case $argument in
   -*) continue ;;
   sccache)
-    stable=${HOME:-}/Library/Application\ Support/dev.cowshed/bin/cowshed
     if consider "$stable"; then
       exec "$stable" "$@"
     fi
     ;;
   esac
+  verb=$argument
   break
 done
 
@@ -67,6 +74,25 @@ if [ -z "$platform" ]; then
 fi
 
 if [ -f "$package/crates/cowshed-cli/src/main.rs" ]; then
+  case $verb in
+  setup | gateway) ;;
+  *)
+    # Where the link chain started: a directory outside this checkout is another repository's.
+    checkout=$(cd "$package/../.." && pwd -P)
+    case $invoked in
+    */*) from=$(cd "${invoked%/*}" 2>/dev/null && pwd -P) || from=$checkout ;;
+    *) from=$checkout ;;
+    esac
+    case $from/ in
+    "$checkout"/*) ;;
+    *)
+      if consider "$stable"; then
+        exec "$stable" "$@"
+      fi
+      ;;
+    esac
+    ;;
+  esac
   # Written by this checkout's own build, so unlike a published binary it keeps its execute bit.
   development=$package/.cache/bin/$platform/cowshed
   if consider "$development"; then

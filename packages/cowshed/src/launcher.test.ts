@@ -216,6 +216,34 @@ describe('cowshed launcher', () => {
     }
   });
 
+  hostOnly(
+    "runs a consumer's every verb but setup and gateway from the installed copy, through a link from outside the checkout",
+    async () => {
+      // Another repository links this checkout's package (a developer link), so its `cowshed` is this
+      // launcher reached through its own node_modules/.bin. The checkout's development build cannot
+      // talk to the daemon the install runs, so the consumer gets the installed copy.
+      const f = await fixture();
+      await f.checkout();
+      await named(f.development(host), 'development');
+      const consumerRoot = `${f.root}-consumer`;
+      fixtureRoots.push(consumerRoot);
+      const consumer = join(consumerRoot, 'node_modules', '.bin', 'cowshed');
+      await mkdir(dirname(consumer), { recursive: true });
+      await symlink(f.launcher, consumer);
+
+      expect(launch(consumer, ['fork', 'raven'], f).stdout).toBe('development [fork] [raven]');
+
+      await named(f.stable, 'stable');
+
+      expect(launch(consumer, ['--json', 'fork', 'raven'], f).stdout).toBe('stable [--json] [fork] [raven]');
+      for (const argv of [['setup'], ['gateway', 'status']]) {
+        expect(launch(consumer, argv, f).stdout).toStartWith('development ');
+      }
+      // The checkout's own launcher still runs its development build.
+      expect(launch(f.launcher, ['fork', 'raven'], f).stdout).toBe('development [fork] [raven]');
+    },
+  );
+
   hostOnly('the library runs the CLI through the launcher and resolves with its exit status', async () => {
     const f = await fixture();
     await binary(f.packaged(host), 'exit 23');

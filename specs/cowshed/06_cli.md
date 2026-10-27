@@ -29,12 +29,16 @@ the tracked entry of the CLI's own crate, `crates/cowshed-cli/src/main.rs`, whic
 runs its development build, `.cache/bin/<platform>/cowshed`; a published package runs `dist/bin/<platform>/cowshed`,
 restoring an execute bit a publish dropped. Neither falls back to the other or to a cargo `target/release/cowshed`: a
 checkout without its development build exits 5 naming the path and `nx run cowshed:cli-native`, a package without its
-binary exits 5 naming its path, and a host the package ships no binary for exits 5 naming the host. `setup` and
-`gateway` run that binary too, since they install the invoking build. It is a shell script rather than Node because it
-runs before every command, and Node's own start (~30 ms) costs more than the fastest verbs take in total; `exec` hands
-the binary the command's signals, exit status and standard streams unchanged. The library's `runCli`, `openHost` and the
-typed launchers (`spawnLock`, `spawnHold`, `spawnSubtreeRoot`, `spawnLandTurn`; 07_api.md, "Launchers") run the CLI
-through the same script, so one rule picks the binary.
+binary exits 5 naming its path, and a host the package ships no binary for exits 5 naming the host. A checkout's
+launcher reached through a link from outside that checkout (another repository's `node_modules/.bin/cowshed`, which a
+developer link points at the checkout's package) is a consumer's `cowshed`: the checkout's development build cannot talk
+to the daemon the install runs, so every verb but `setup` and `gateway` runs the installed copy (05_gateway.md "The
+installed cowshed") when there is one, as `sccache` always does. `setup` and `gateway` run that binary too, since they
+install the invoking build. It is a shell script rather than Node because it runs before every command, and Node's own
+start (~30 ms) costs more than the fastest verbs take in total; `exec` hands the binary the command's signals, exit
+status and standard streams unchanged. The library's `runCli`, `openHost` and the typed launchers (`spawnLock`,
+`spawnHold`, `spawnSubtreeRoot`, `spawnLandTurn`; 07_api.md, "Launchers") run the CLI through the same script, so one
+rule picks the binary.
 
 The launcher is how a build that is not installed yet is run, and not the `cowshed` on `PATH`. After `setup`, the
 `cowshed` on `PATH` is the installed copy (05_gateway.md "The installed cowshed"): setup repoints the first `cowshed` on
