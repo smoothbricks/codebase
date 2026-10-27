@@ -45,7 +45,7 @@ const FINISHED = [
   /^\((?:pass|fail|skip|todo)\) (.+)$/,
   /^\s*[✓×]\s+(\S.*?)\s+\d+ms\b/,
   /^\s*❯\s+(\S.*?)\s+\(\d+ tests?(?: \| \d+ (?:failed|skipped|todo))*\)\s+\d+ms\b/,
-  /^\s*↓\s+(\S.*?)\s+\(\d+ tests?(?: \| \d+ (?:skipped|todo))+\)$/,
+  /^\s*↓\s+(\S.*?)\s+\(\d+ tests?(?: \| \d+ (?:skipped|todo))+\)(?:\s+\d+ms\b|$)/,
 ];
 /** Lines naming a test still running; group 1 is its name. */
 const RUNNING = [

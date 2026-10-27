@@ -88,6 +88,8 @@ describe('run progress', () => {
       [' ✓ src/runner/do-runner-signal-identity.test.ts (1 test) 694ms', true],
       ['       ✓ keeps a future same-label timer scheduled during successful alarm execution  575ms', true],
       [' ↓ src/runner/do-runner-ingress-cell.test.ts (1 test | 1 skipped)', true],
+      // The same terminal form with the optional duration from Vitest's getDurationPrefix.
+      [' ↓ src/runner/do-runner-ingress-cell.test.ts (1 test | 1 skipped) 1ms', true],
       [' ❯ reporter.test.js (3 tests | 1 failed | 1 skipped) 4ms', true],
       ['   ✓ reports a passing test 1ms', true],
       ['   × reports a failed test 3ms', true],
