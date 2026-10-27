@@ -251,12 +251,12 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   a legacy layout's records alone) refuses the whole pass, as does a lock it cannot attempt at all, with the reason
   named: under Node, macOS takes its `flock(2)`s in-process (`open(2)` with `O_EXLOCK | O_NONBLOCK`) and starts no
   helper, and other platforms hold them in a perl child, so a sandbox that refuses to exec perl, like a lock file that
-  cannot be opened, refuses the pass instead of failing the run; the compiled CLI calls `flock(2)` itself through a
-  small C wrapper (`native/flock.c`) that classifies the failure while `errno` is still valid, so it answers as the Node
-  providers do: only contention skips the pass as `busy`, and any other failure refuses it with its cause. The hook only
-  reports outcomes and never fails the run it follows: whatever escapes a pass is logged as a warning, and the next
-  workspace is still tried. It moves each reclaimed generation into the profile's `.smoo-retention-trash/` under that
-  hold, recording its inode first, and unlinks it after letting go. Each proven generation gets a synchronous,
+  cannot be opened, refuses the pass instead of failing the run. The compiled CLI opens and locks through a small C
+  wrapper (`native/flock.c`) that captures `errno` immediately. Each provider's canonical refusal retains the operation,
+  exact lock path, actual host errno and OS cause: only contention is `busy`; any other failure refuses the pass. The
+  hook only reports outcomes and never fails the run it follows: whatever escapes a pass is logged as a warning, and the
+  next workspace is still tried. It moves each reclaimed generation into the profile's `.smoo-retention-trash/` under
+  that hold, recording its inode first, and unlinks it after letting go. Each proven generation gets a synchronous,
   non-symlink-following inode census and one native recursive removal, not an awaited lstat/unlink for every artifact.
   The census counts internal hardlinks once; the pass ledger drops an inode only when its last link is removed, so bytes
   freed and bytes still linked outside the removed generations remain distinct. The manifest's root identity is
