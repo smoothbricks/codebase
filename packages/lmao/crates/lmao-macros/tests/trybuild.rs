@@ -27,18 +27,24 @@ const SPAN_HELP: &str =
 
 const PROVENANCE_CASE: &str = "tests/compile_fail/provenance_required.rs";
 
+/// One test owns trybuild's project directory (`target/tests/trybuild/lmao-macros`), which every
+/// trybuild run regenerates. nextest runs each test in its own process, so two trybuild tests in this
+/// binary raced on it: one built the other's generated project, and the provenance probe "compiled".
+/// The cases run first, when `t` drops, then the probe, one writer at a time.
 #[test]
 fn compile_fail_cases() {
-    let t = trybuild::TestCases::new();
-    // Not `*.rs`: that glob also matches provenance_required.rs, whose
-    // cross-crate help path is checked separately so both path renderings pass.
-    t.compile_fail("tests/compile_fail/empty_enum.rs");
-    t.compile_fail("tests/compile_fail/empty_schema.rs");
-    t.compile_fail("tests/compile_fail/unknown_kind.rs");
-    t.pass("tests/pass/*.rs");
+    {
+        let t = trybuild::TestCases::new();
+        // Not `*.rs`: that glob also matches provenance_required.rs, whose
+        // cross-crate help path is checked separately so both path renderings pass.
+        t.compile_fail("tests/compile_fail/empty_enum.rs");
+        t.compile_fail("tests/compile_fail/empty_schema.rs");
+        t.compile_fail("tests/compile_fail/unknown_kind.rs");
+        t.pass("tests/pass/*.rs");
+    }
+    compile_fail_provenance_required();
 }
 
-#[test]
 fn compile_fail_provenance_required() {
     let (preferred, probe_name) = preferred_compile_fail(PROVENANCE_CASE);
     let bound = bind_probe_callsite(&preferred, &probe_name)
