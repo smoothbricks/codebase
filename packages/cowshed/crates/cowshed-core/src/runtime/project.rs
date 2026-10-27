@@ -5373,6 +5373,20 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         )
         .await?;
         touched?;
+        timed_async(
+            "adopt",
+            "shell",
+            self.refresh_source_shell(workspace.name(), &mount),
+        )
+        .await
+        .map_err(|error| {
+            error.reworded(|message| {
+                format!(
+                    "adopted {}, but its shell was not refreshed: {message}",
+                    workspace.name()
+                )
+            })
+        })?;
         timed_async("adopt", "snapshot", self.snapshot_named(workspace.name())).await
     }
 
@@ -5394,6 +5408,77 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         )
         .await?;
         Ok(())
+    }
+
+    /// Publish a current shell at its source, through the ordinary canonical supervisor.
+    async fn refresh_source_shell(
+        &mut self,
+        workspace: &WorkspaceName,
+        mount: &Path,
+    ) -> Result<()> {
+        let envrc = mount.join(".envrc");
+        let configured = crate::storage::lifecycle::dispatch_blocking(move || {
+            envrc.try_exists().map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("cannot inspect shell input {}: {error}", envrc.display()),
+                    "inspect the workspace shell inputs",
+                )
+            })
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("shell inspection task failed: {error}"))
+        })??;
+        if !configured {
+            return Ok(());
+        }
+        let (handle, build_volume) = self.admit_build_state(workspace).await?;
+        let socket = super::supervisor_socket::socket_path(
+            self.descriptor.storage.store(),
+            &self.descriptor.repo_id,
+            workspace,
+        );
+        let (keep_alive, cancelled) = tokio::sync::oneshot::channel();
+        let observed = super::supervisor::JobRunState::default();
+        let activated = super::supervisor::run_in_supervisor(
+            &handle,
+            &socket,
+            build_volume,
+            land_check_request("true"),
+            super::supervisor::RunControl {
+                silence: cowshed_os::deadline::HEARTBEAT_SILENCE,
+                queued: Box::new(|| None),
+                cancelled,
+                observed: &observed,
+            },
+        )
+        .await;
+        drop(keep_alive);
+        let output = activated?;
+        if !output.status.success() {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "workspace {workspace} shell activation ended {}: {}",
+                    output.status,
+                    super::supervisor::diagnostic_stderr_tail(&output.stderr)
+                ),
+                "repair the named shell activation failure before forking this source",
+            ));
+        }
+        require_current_shell(workspace, mount)
+            .await
+            .map_err(|error| {
+                if output.stderr.is_empty() {
+                    error
+                } else {
+                    error.reworded(|message| {
+                        format!(
+                            "{message}; activation stderr: {}",
+                            super::supervisor::diagnostic_stderr_tail(&output.stderr)
+                        )
+                    })
+                }
+            })
     }
 
     fn workspace_mount_path(&self, workspace: &WorkspaceName) -> Result<PathBuf> {
@@ -13434,6 +13519,24 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if let Some(expected) = self.completed_workspace_intent(&intent).cloned() {
             let current = self.current(&main_name()).await?;
             Self::require_exact_incarnation(&current, &expected)?;
+            // The intent completed before a failed shell refresh could leave its record:
+            // a replayed adopt refreshes again, so it never reports an adopted main whose
+            // current activation record no fork can rely on.
+            let mount = self.workspace_mount_path(&main_name())?;
+            timed_async(
+                "adopt",
+                "shell",
+                self.refresh_source_shell(&main_name(), &mount),
+            )
+            .await
+            .map_err(|error| {
+                error.reworded(|message| {
+                    format!(
+                        "adopted {}, but its shell was not refreshed: {message}",
+                        main_name()
+                    )
+                })
+            })?;
             return self.snapshot(&current);
         }
 
@@ -16336,6 +16439,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .await?;
             }
         }
+        timed_async("land", "target-shell", self.refresh_source_shell(&into.name, &into.root))
+            .await.map_err(|error| error.reworded(|message| format!("landed {source_head} on {target_branch}, but {} shell was not refreshed: {message}", into.name)))?;
         let mut folded = Vec::new();
         if retire {
             // The target has already moved, so a refused retire must not read as a refused land:
@@ -21226,6 +21331,24 @@ impl CheckedLandChecks {
     }
 }
 
+/// Require a source or landed target's current activation before another fork consumes it.
+#[cfg(target_os = "macos")]
+async fn require_current_shell(workspace: &WorkspaceName, mount: &Path) -> Result<()> {
+    let workspace = workspace.clone();
+    let mount = mount.to_owned();
+    crate::storage::lifecycle::dispatch_blocking(move || {
+        let envrc = mount.join(".envrc");
+        if !envrc.try_exists().map_err(|error| CowshedError::environment_missing(
+            format!("cannot inspect workspace {workspace} shell {}: {error}", envrc.display()),
+            "inspect the workspace shell inputs",
+        ))? { return Ok(()) }
+        super::shell_inherit::current_inputs(&mount).map_err(|error| CowshedError::environment_missing(
+            format!("workspace {workspace} has no current shell activation record ({error}); its source-refresh step must complete before a fork"),
+            format!("activate the source with cowshed exec {workspace} -- true and inspect the adopt shell or post-land target-shell step"),
+        ))
+    }).await.map_err(|error| CowshedError::internal(format!("shell freshness task failed: {error}")))?
+}
+
 /// The job one `land --check` command runs as: a read-write child of the workspace, at gate class
 /// like the land's other own jobs (05_gateway.md, "A land is a gate job").
 ///
@@ -21531,20 +21654,16 @@ async fn read_job_stderr_tail(
         .await
     {
         collected.extend_from_slice(&chunk.bytes);
+        if collected.len() > super::supervisor::DIAGNOSTIC_STDERR_LIMIT {
+            collected.drain(..collected.len() - super::supervisor::DIAGNOSTIC_STDERR_LIMIT);
+        }
         offset = chunk.next_offset;
-        if chunk.eof || collected.len() >= DIAGNOSTIC_STDERR_LIMIT {
+        if chunk.eof {
             break;
         }
     }
-    if collected.len() > DIAGNOSTIC_STDERR_LIMIT {
-        collected.drain(..collected.len() - DIAGNOSTIC_STDERR_LIMIT);
-    }
-    String::from_utf8_lossy(&collected).trim().to_owned()
+    super::supervisor::diagnostic_stderr_tail(&collected)
 }
-
-#[cfg(target_os = "macos")]
-/// The bound on child stderr kept in a land-check/exec diagnostic.
-const DIAGNOSTIC_STDERR_LIMIT: usize = 2048;
 
 #[cfg(target_os = "macos")]
 /// Recognize a Seatbelt-class denial in a child's own stderr, quoted verbatim in the

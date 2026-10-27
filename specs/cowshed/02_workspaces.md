@@ -114,6 +114,10 @@ not a best-effort script:
    guards recheck exact image/device ownership after the host lease wait, and the held mount root/source is verified
    before handing the checkout back (01a_apfs.md §Mounts). The normal path has no detach, image rename, second attach,
    or second fsck: an attached image is never renamed, because its identity is the backing path it was attached from.
+6. Finish main's first build-state touch, then activate its root shell once through its canonical supervisor when an
+   .envrc is present, including projects without Cargo. Require a current activation record (11_shell.md, Inherited
+   shells) before adoption completes. Publication has already happened: a failure reports adopted main and the shell
+   failure, leaving main in place for repair rather than charging its first fork a cold activation.
 
 ### Re-adoption: space reclamation
 
@@ -1166,12 +1170,17 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    head a conflicted replay was rolled back to — so a coordinator types the outcome without reading either repository
    again.
 
-4. **Freeze the seed, adopt the build volume and restore checked outputs**: every land refreshes the target's seed by
-   sealing and cloning the landing workspace's warm build volume before the target adopts it by renaming its
+4. **Freeze the seed, adopt the build volume and restore checked outputs**: every gated land refreshes the target's seed
+   by sealing and cloning the landing workspace's warm build volume before the target adopts it by renaming its
    `.cowshed/build` link. It restores only the attributed Nx task graphs of the checks already completed in the landing
    workspace, from the adopted local cache. A miss or uncacheable task is reported without executing it; check commands
    never run again in the target. 16_build_volumes.md, Land step 7, owns restoration, writer-quiescence skips and
    collection; every seeded/unseeded and adopted/skipped outcome is durable (13_telemetry.md).
+
+   Every land that advances its target then refreshes that target's shell once through its own canonical supervisor,
+   gated or ungated, and requires its current activation record before retirement (11_shell.md, Inherited shells). This
+   runs no check and copies no export from the landing workspace. A refresh failure names the head and target already
+   landed, preserves the unit and reports the activation error; it never claims the fast-forward was refused.
 
 5. **Retire**: only after the target branch and, when checked out, its visible working state resolve to the validated
    source head, destroy the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*`
@@ -1234,18 +1243,19 @@ decides from its lease on is outside the preflight: a lease another land or `rm`
 branch (read after the check), the check itself, an ungated land's rebase, and the target head re-read under the ref
 lock.
 
-`--ungated`, with `--into <lane>` only, folds a unit into its lane base by Git alone (see "Lanes"): steps 1, 3 and 5
-run, and steps 2 and 4 do not. Before step 3 it rebases the unit onto the lane base's target branch, so a fold is one
-command. A unit whose head already holds that branch's tip is based on it and lands as it is: nothing is fetched and
-nothing is replayed. Otherwise the land fetches the branch into the unit and replays the unit onto it as
-`rebase --into <lane>` does, outside the ref lock; a conflict rolls the replay back and refuses with exit 4 as the
-rebase does, naming the conflicted paths, with the unit as it was and the lane base unmoved. `--expected-source-head`
-names the unit's head before that rebase, and the report's `landedHead` is the head after it; a rebase that replayed
-says so on stderr. A lane base that moves between the rebase and the fast-forward fails the fast-forward as any land's
-does, and its hint is to run the ungated land again, which rebases again. It runs no check, and after the fast-forward
-it freezes no seed and adopts no build volume. The lane base keeps its build volume and seed. The unit's volume is still
-the unit's, so the retire releases it with the unit, closing its Nx state as `cowshed rm` does. The report is `landed`
-with `buildVolume: {seed: {kind: "unchanged"}, adoption: {kind: "skipped", reason: {kind: "ungated"}}}`, and its durable
+`--ungated`, with `--into <lane>` only, folds a unit without a check or build-volume adoption (see Lanes): steps 1, 3
+and 5 run, along with step 4's target-shell refresh alone. Before step 3 it rebases the unit onto the lane base's target
+branch, so a fold is one command. A unit whose head already holds that branch's tip is based on it and lands as it is:
+nothing is fetched and nothing is replayed. Otherwise the land fetches the branch into the unit and replays the unit
+onto it as `rebase --into <lane>` does, outside the ref lock; a conflict rolls the replay back and refuses with exit 4
+as the rebase does, naming the conflicted paths, with the unit as it was and the lane base unmoved.
+`--expected-source-head` names the unit's head before that rebase, and the report's `landedHead` is the head after it; a
+rebase that replayed says so on stderr. A lane base that moves between the rebase and the fast-forward fails the
+fast-forward as any land's does, and its hint is to run the ungated land again, which rebases again. It runs no check,
+and after the fast-forward it freezes no seed and adopts no build volume; it still refreshes the target shell once
+before retirement. The lane base keeps its build volume and seed. The unit's volume is still the unit's, so the retire
+releases it with the unit, closing its Nx state as `cowshed rm` does. The report is `landed` with
+`buildVolume: {seed: {kind: "unchanged"}, adoption: {kind: "skipped", reason: {kind: "ungated"}}}`, and its durable
 `LandOutcome` records that skip (13_telemetry.md). A land into main (no `--into`, or `--into main`) refuses `--ungated`
 with exit 2 naming main, since only a land into main gates; `--check` and `--push-only` are refused with it (exit 2).
 With `--no-retire` an ungated land keeps the unit and collects nothing, since it released no volume.
@@ -1396,15 +1406,15 @@ removed. The lane completes with the ordinary close-out of its base: `cowshed re
 fast-forward main and remove the lane base.
 
 A unit's fold into its lane base is ungated: `cowshed land <unit> --into <lane> --ungated` rebases the unit onto the
-lane base's branch and fast-forwards it, by Git alone and in one command, and `cowshed rebase <unit> --into <lane>` is
-that rebase alone, for a unit that takes its lane-mates' work before it lands. The fold does not run a check, freeze a
-seed or adopt a build volume. The lane base's build volume, link and seed stay as they were, and each unit's build
-volume is released when the unit retires. The lane is built once, at its base's own gated close-out into main, whose
-check is the lane's batch gate; the lane base builds the lane's whole delta there, incrementally on its own volume, and
-main adopts that volume (16_build_volumes.md, "Ungated folds"). Measured 2026-10-22 on SmoothBricks folds into a lane
-base before folds were ungated: the land spent 68 s in `freeze-seed` and 22 s in `adopt`, while the Git work took
-seconds. Without `--ungated`, a land into a lane base is the full gated close-out above, for a stack whose units each
-gate (16_build_volumes.md, "Stacks and merge queues").
+lane base's branch and fast-forwards it, without a check and in one command, and `cowshed rebase <unit> --into <lane>`
+is that rebase alone, for a unit that takes its lane-mates' work before it lands. The fold does not run a check, freeze
+a seed or adopt a build volume; it refreshes the target shell once before retiring the unit. The lane base's build
+volume, link and seed stay as they were, and each unit's build volume is released when the unit retires. The lane is
+built once, at its base's own gated close-out into main, whose check is the lane's batch gate; the lane base builds the
+lane's whole delta there, incrementally on its own volume, and main adopts that volume (16_build_volumes.md, "Ungated
+folds"). Measured 2026-10-22 on SmoothBricks folds into a lane base before folds were ungated: the land spent 68 s in
+`freeze-seed` and 22 s in `adopt`, while the Git work took seconds. Without `--ungated`, a land into a lane base is the
+full gated close-out above, for a stack whose units each gate (16_build_volumes.md, "Stacks and merge queues").
 
 The caller (an external coordinator) tracks the tree; cowshed stores nothing about lanes. `--into` names a workspace,
 and every lane rule is read off that workspace at the moment of the call: its checked-out branch is the target, its

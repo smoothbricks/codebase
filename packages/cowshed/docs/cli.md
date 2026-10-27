@@ -372,6 +372,10 @@ image-backed **main workspace** at the same path. A host may have any number of 
 number of repository-scoped mains. Only adoption, and explicit re-adoption below, copies the source tree into a new
 image.
 
+After publication, adoption activates main's shell once through its canonical supervisor when .envrc is present,
+including a project without Cargo. It requires the source's current activation record; a failure says main is already
+adopted and names the shell failure, keeping it available for repair.
+
 On macOS, `cowshed adopt` and `cowshed setup` are the only commands allowed to create native storage. The first adopt on
 a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts the
 space-sharing `cowshed.store` APFS volume. Once it is present and correctly mounted, later adopts only validate it and
@@ -1273,6 +1277,10 @@ when retirement is left at its default. Its text output is the preservation ref 
 `kind: delivered` with the existing push-report fields. An ordinary land returns `kind: landed` with its target,
 build-volume and retirement report.
 
+Every target-changing land refreshes the target's shell once through its own supervisor before retiring the unit,
+requiring a current activation record. It runs no check again and never copies the unit's export. A failed refresh names
+the head and target already landed, reports the shell failure and keeps the unit.
+
 A land that retires its workspace then retires every workspace it folded: a train that cherry-picked units, resolving
 conflicts and fixing review findings on the way, lands work none of whose commits are a unit's own, so no unit could
 retire by its own land. A workspace is folded when its own changes touch a path the landed range changes and the target
@@ -1282,17 +1290,18 @@ its checkout keeps it. A dirty folded workspace is kept too. The report's `folde
 (`retired`, or `kept` with why), and stderr says the same; a kept fold never fails the land, and a later `rm` retires
 it. Work the target does not hold is never folded. `--no-retire` folds nothing.
 
-`--ungated`, with `--into <lane>`, folds a unit into its lane base by Git alone: no check, seed freeze or build-volume
+`--ungated`, with `--into <lane>`, folds a unit into its lane base without a gate: no check, seed freeze or build-volume
 adoption. First it rebases the unit onto the lane base's checked-out branch, as `rebase --into <lane>` does; a unit
 whose head already holds that branch's tip is based on it and lands as it is, with no fetch and no replay.
 `--expected-source-head` names the unit's head before that rebase, and the report's `landedHead` is the head after it. A
 conflict rolls the replay back and refuses with exit 4, naming the conflicted paths, with the unit as it was and the
-lane base unmoved. Then it fast-forwards the lane base and retires the unit, whose volume and seed are released with it;
-the lane base keeps its volume and seed. A lane base that moves between the rebase and the fast-forward refuses the
-fast-forward, and its hint is to run the ungated land again. The report is `kind: landed` with seed `{kind:"unchanged"}`
-and adoption `{kind:"skipped", reason:{kind:"ungated"}}`, recorded as the land's outcome. Only a land into main gates,
-so main refuses `--ungated` (exit 2, naming main); `--check` and `--push-only` are refused with it (exit 2). With
-`--no-retire` it keeps the unit and collects nothing, since it released no volume.
+lane base unmoved. Then it fast-forwards the lane base and refreshes its shell once before retiring the unit, whose
+volume and seed are released with it; the lane base keeps its volume and seed. A lane base that moves between the rebase
+and the fast-forward refuses the fast-forward, and its hint is to run the ungated land again. The report is
+`kind: landed` with seed `{kind:"unchanged"}` and adoption `{kind:"skipped", reason:{kind:"ungated"}}`, recorded as the
+land's outcome. Only a land into main gates, so main refuses `--ungated` (exit 2, naming main); `--check` and
+`--push-only` are refused with it (exit 2). With `--no-retire` it keeps the unit and collects nothing, since it released
+no volume.
 
 `--preflight` runs only the fences land runs before its check, with the same arguments, and stops: the plan, the
 workspace and its incarnation, the target, the source head, the dirty tree, the target branch and the target head. When

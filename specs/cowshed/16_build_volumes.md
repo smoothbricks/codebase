@@ -814,10 +814,12 @@ freeze, or `--ref` names a tree no volume was built at), the fork builds the dif
 
 Land's contract is 02_workspaces.md "`cowshed land`": a gated land lands the head the caller validated into its target
 (main by default, an integration workspace with `--into <target>`), fencing the target's head under its repository lock,
-and never rebases on its own. It builds nothing on the target: it adopts the workspace's build volume. Every step reads
-the same for main and for an integration workspace; "the target" is whichever one it is. An ungated fold into a lane
-base rebases the unit onto the lane base's branch by Git alone and runs none of steps 2 and 4 to 7 ("Ungated folds",
-below).
+and never rebases on its own. Its check and output restoration build nothing on the target: it adopts the workspace's
+build volume. Every step reads the same for main and for an integration workspace; "the target" is whichever one it is.
+An ungated fold into a lane base rebases the unit onto the lane base's branch by Git alone and runs none of steps 2 and
+4 to 7 ("Ungated folds", below). Every delivered target also runs its ordinary canonical shell refresh before retirement
+(02_workspaces.md, land); that entry may run its normal shell tasks, but never reruns a check or adopts the landing
+unit's export.
 
 1. **Refuse a dirty tree**.
 2. **Validate in the workspace**: the caller's check (`--check`, for an Nx project `nx run-many -t lint test build` over
@@ -995,31 +997,32 @@ again at any level above it. A lane whose units fold ungated pays one build in a
 
 ### Ungated folds
 
-A lane unit's ungated fold into its lane base (`land --into <lane> --ungated`, 02_workspaces.md "Lanes") moves Git state
-only. Its rebase, alone or the one its land runs before the fast-forward, is the ordinary rebase, Git alone. Its land
-runs no check and skips Land steps 4 to 7: it quiesces no landing volume, closes no target Nx state, freezes no seed,
-adopts nothing and restores no output. The lane base keeps its build link, its build volume and its latest seed exactly
-as they were. The unit's volume is still the unit's, as after a compare-and-swap at Land step 3, so step 8 retires it
-with the unit and collection releases it like any retired checkout's volume (Garbage collection): nothing is adopted and
-nothing is left behind. The land report's seed is `unchanged` and its adoption is `skipped` with
-`reason:{kind:"ungated"}`, which its `LandOutcome` records (13_telemetry.md).
+A lane unit's ungated fold into its lane base (`land --into <lane> --ungated`, 02_workspaces.md Lanes) moves Git state
+without a check or unit-volume adoption. Its rebase is the ordinary rebase, Git alone. Its land skips Land steps 4 to 7:
+it quiesces no landing volume, closes no target Nx state, freezes no seed, adopts nothing and restores no output. It
+then refreshes the target's shell through its canonical supervisor; ordinary entry tasks are not a gate or output
+restoration. No landing unit's volume replaces the lane base's own volume or seed. The unit's volume is still the
+unit's, as after a compare-and-swap at Land step 3, so step 8 retires it with the unit and collection releases it like
+any retired checkout's volume (Garbage collection): nothing is adopted and nothing is left behind. The land report's
+seed is `unchanged` and its adoption is `skipped` with `reason:{kind:"ungated"}`, which its `LandOutcome` records
+(13_telemetry.md).
 
 Main refuses `--ungated` by name: a land into main is where a tree is gated and its built volume adopted, so main and
 every fork of it stay warm. A lane base whose units fold ungated builds the lane's whole delta once, incrementally on
-its own volume, at its own gated close-out into main, and main adopts that volume. Folds write nothing to the lane
-base's build volume, so a fork of the lane base meanwhile takes the seed the lane base already had and builds the folded
-delta incrementally, as an edit would.
+its own volume, at its own gated close-out into main, and main adopts that volume. A fold does not build or restore its
+delta on the lane base; the target's ordinary shell-entry tasks may write their normal state. A fork meanwhile takes the
+seed the lane base already had and builds the folded delta incrementally, as an edit would.
 
-- **Enforced by**: unit tests of the land plan, in which an ungated land into a lane base is Git alone and retires as
-  `rm` does, a gated plan is unchanged into main and into a lane base, and main, `--check` and `--push-only` refuse an
-  ungated land; unit tests of an ungated land's rebase, in which a unit behind its lane base is replayed onto the lane
-  base's tip and fast-forwards it, a unit already based lands its own head with no fetch and no replay, a conflicting
-  replay is rolled back, names its conflicted paths and moves nothing, and a fast-forward refused after that rebase
-  names the ungated land's retry while a gated land's names `cowshed rebase`; and a directory-host test in which main
-  refuses `--ungated` by name, a rebase of the unit into its lane base replays by Git alone, an ungated land of a unit a
-  lane-mate's commit left behind rebases it and fast-forwards the lane base in one call, only the lane base's branch
-  moves, the land reports the `ungated` skip, every build volume record but the unit's is unchanged, and the unit's
-  volume is released with the unit.
+- **Enforced by**: unit tests of the land plan, in which an ungated land into a lane base runs no check or volume
+  adoption and retires as `rm` does, a gated plan is unchanged into main and into a lane base, and main, `--check` and
+  `--push-only` refuse an ungated land; unit tests of an ungated land's rebase, in which a unit behind its lane base is
+  replayed onto the lane base's tip and fast-forwards it, a unit already based lands its own head with no fetch and no
+  replay, a conflicting replay is rolled back, names its conflicted paths and moves nothing, and a fast-forward refused
+  after that rebase names the ungated land's retry while a gated land's names `cowshed rebase`; and a directory-host
+  test in which main refuses `--ungated` by name, a rebase of the unit into its lane base replays by Git alone, an
+  ungated land of a unit a lane-mate's commit left behind rebases it and fast-forwards the lane base in one call, only
+  the lane base's branch moves, the land reports the `ungated` skip, every build volume record but the unit's is
+  unchanged, and the unit's volume is released with the unit.
 
 ## Garbage collection
 

@@ -174,7 +174,17 @@ struct RecordedWatch {
     exists: bool,
 }
 
-/// The file as written. Read only through [`verify`].
+impl RecordedWatch {
+    fn absolute(&self, root: &Path) -> PathBuf {
+        if self.inside {
+            root.join(&self.path)
+        } else {
+            self.path.clone()
+        }
+    }
+}
+
+/// The file as written, decoded and filtered through read_record.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ActivationRecord {
     v: u32,
@@ -209,6 +219,20 @@ impl ActivationRecord {
             temp_dir.as_deref(),
             home.as_deref(),
         ]
+    }
+
+    fn inputs(&self, root: &Path) -> Result<(Snapshot, Contents), AdoptionMiss> {
+        let paths: Vec<_> = self
+            .watches
+            .iter()
+            .map(|watch| watch.absolute(root))
+            .collect();
+        // Identities, bytes, identities: the snapshot must describe the bytes that were keyed.
+        let (snapshot, contents) = certify(paths.iter().map(PathBuf::as_path))?;
+        if key(root, &self.watches, &contents) != self.key {
+            return Err(AdoptionMiss::KeyMoved);
+        }
+        Ok((snapshot, contents))
     }
 }
 
@@ -900,7 +924,20 @@ fn read_record(mount: &Path) -> Result<(ActivationRecord, [u8; 32]), AdoptionMis
     if record.v != RECORD_VERSION {
         return Err(AdoptionMiss::Version(record.v));
     }
+    if let Some((name, _)) = record
+        .environment
+        .iter()
+        .find(|(name, value)| withheld(name, value.as_deref()).is_some())
+    {
+        return Err(AdoptionMiss::Withheld { name: name.clone() });
+    }
     Ok((record, Sha256::digest(&bytes).into()))
+}
+
+/// Check the activation's watched input bytes without evaluating or mutating any checkout.
+pub fn current_inputs(root: &Path) -> Result<(), AdoptionMiss> {
+    let (record, _) = read_record(root)?;
+    record.inputs(root).map(|_| ())
 }
 
 /// Prove this checkout's inherited record, or say why it cannot serve.
@@ -909,28 +946,7 @@ pub fn verify(
     baseline_environment: &BTreeMap<OsString, OsString>,
 ) -> Result<VerifiedActivation, AdoptionMiss> {
     let (record, digest) = read_record(placement.root)?;
-    if let Some((name, _)) = record
-        .environment
-        .iter()
-        .find(|(name, value)| withheld(name, value.as_deref()).is_some())
-    {
-        return Err(AdoptionMiss::Withheld { name: name.clone() });
-    }
-    let absolute = |watch: &RecordedWatch| {
-        if watch.inside {
-            placement.root.join(&watch.path)
-        } else {
-            watch.path.clone()
-        }
-    };
-    // Identities, bytes, identities: a write between the readings would let the identities the
-    // pool keeps certify bytes nobody hashed ([`certify`]).
-    let paths: Vec<PathBuf> = record.watches.iter().map(absolute).collect();
-    let (snapshot, contents) = certify(paths.iter().map(PathBuf::as_path))?;
-    let key = key(placement.root, &record.watches, &contents);
-    if key != record.key {
-        return Err(AdoptionMiss::KeyMoved);
-    }
+    let (snapshot, contents) = record.inputs(placement.root)?;
     if let Some(name) = baseline(placement, baseline_environment).differs_from(&record.baseline) {
         return Err(AdoptionMiss::BaselineMoved { name });
     }
@@ -1018,7 +1034,7 @@ pub fn verify(
         .watches
         .iter()
         .map(|watch| {
-            let path = absolute(watch);
+            let path = watch.absolute(placement.root);
             let exists = snapshot.exists(&path);
             WatchEntry { path, exists }
         })
@@ -1364,6 +1380,38 @@ mod tests {
             inherited,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn source_freshness_checks_current_bytes_and_rejects_withheld_exports() {
+        let sites = sites("source-current");
+        assert!(matches!(
+            current_inputs(&sites.origin.root),
+            Err(AdoptionMiss::Absent)
+        ));
+        evaluate(&sites.origin, NOTHING, None);
+        assert!(current_inputs(&sites.origin.root).is_ok());
+        let input = sites.origin.root.join("bun.lock");
+        std::fs::write(&input, "lock\n").unwrap();
+        assert!(
+            current_inputs(&sites.origin.root).is_ok(),
+            "new identity, same input bytes"
+        );
+        std::fs::write(&input, "changed\n").unwrap();
+        assert!(matches!(
+            current_inputs(&sites.origin.root),
+            Err(AdoptionMiss::KeyMoved)
+        ));
+        std::fs::write(&input, "lock\n").unwrap();
+        let path = record_path(&sites.origin.root);
+        let mut recorded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        recorded["environment"]["HF_TOKEN"] = serde_json::Value::String("fixture-value".into());
+        std::fs::write(path, serde_json::to_vec(&recorded).unwrap()).unwrap();
+        assert!(matches!(
+            current_inputs(&sites.origin.root),
+            Err(AdoptionMiss::Withheld { .. })
+        ));
     }
 
     fn verify_at(site: &Site) -> Result<VerifiedActivation, AdoptionMiss> {

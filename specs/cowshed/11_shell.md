@@ -103,6 +103,12 @@ the first two: nothing moves):
   not a proof for every third root: a value that varies only along a dimension no two measured roots differ in, other
   than their parent, would still pass.
 
+Main's record stays current at its source: initial adoption activates main once through its own supervisor, including
+projects without Cargo, and every target-changing land refreshes the chosen target once after delivery
+(02_workspaces.md, adopt and land). An ungated fold runs no check, but still refreshes its target shell. Each step
+requires a current activation record before completing. Ordinary host-side direnv entry writes no cowshed activation
+record, and a land never copies its unit's export into the target.
+
 The record never carries direnv's own `DIRENV_WATCHES` and `DIRENV_DIFF` (the host rebuilds both for its checkout),
 `DEVENV_TASK_FILE` (the parent's task file runs scripts built with the parent's root; tasks and processes are not tools)
 or a `shellHook`, nor any variable the secret convention names — cowshed's workspace and cache tokens, proxy URLs,

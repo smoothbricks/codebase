@@ -2404,6 +2404,17 @@ async fn end_supervised_tool(handle: &WorkspaceSupervisorHandle, job: JobId) -> 
     }
 }
 
+/// The bound on child stderr kept in a diagnostic error.
+pub(super) const DIAGNOSTIC_STDERR_LIMIT: usize = 2048;
+
+/// The last [DIAGNOSTIC_STDERR_LIMIT] bytes of a captured stderr, as a diagnostic keeps
+/// it: what a failed command names is at its end, and a chatty one cannot balloon the error
+/// that quotes it.
+pub(super) fn diagnostic_stderr_tail(stderr: &[u8]) -> String {
+    let tail = &stderr[stderr.len().saturating_sub(DIAGNOSTIC_STDERR_LIMIT)..];
+    String::from_utf8_lossy(tail).trim().to_owned()
+}
+
 /// Run a project tool in the workspace's canonical supervisor and activated shell.
 /// The existing socket hold binds the admitted job to this future and process lifetime.
 /// The tool's silence budget starts when its command has a pid, not during shared activation.
@@ -2512,7 +2523,7 @@ pub async fn run_in_supervisor(
                 format!(
                     "project tool job {job:?} ended without an exit ({:?}): {}",
                     info.failure,
-                    String::from_utf8_lossy(&stderr)
+                    diagnostic_stderr_tail(&stderr)
                 ),
                 "inspect the job's retained failure",
             ));

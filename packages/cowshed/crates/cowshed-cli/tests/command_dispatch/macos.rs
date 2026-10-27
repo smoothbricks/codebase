@@ -1210,6 +1210,173 @@ async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without
     phase("done");
 }
 
+/// The source, not its next fork, owns activation after adoption and every target change.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_source_shell_records_follow_adopt_and_every_land() {
+    cowshed_core::runtime::shell_host::register(
+        cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
+            cowshed(),
+            vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
+        ),
+    );
+    let mut fixture = Fixture::directory();
+    fs::write(fixture.checkout.join(".envrc"),
+        "watch_file shell-input\nread -r LAND_SHELL_VALUE < shell-input\nexport LAND_SHELL_VALUE\nsource_env_if_exists .envrc-local\n")
+        .expect("source shell");
+    fs::write(fixture.checkout.join("shell-input"), "one\n").expect("initial shell input");
+    fs::write(fixture.checkout.join(".gitignore"), ".envrc-local\n").expect("local tail ignore");
+    git(
+        &fixture.checkout,
+        &["add", ".envrc", "shell-input", ".gitignore"],
+    );
+    git(&fixture.checkout, &["commit", "-q", "-m", "source shell"]);
+    install_in_fixture_profile(&fixture, "direnv", &path_program("direnv"));
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let record = |root: &Path| -> serde_json::Value {
+        serde_json::from_slice(
+            &fs::read(cowshed_core::runtime::shell_inherit::record_path(root))
+                .expect("the completed source step publishes its activation record"),
+        )
+        .expect("activation record")
+    };
+    assert_eq!(
+        record(&fixture.checkout)["environment"]["LAND_SHELL_VALUE"],
+        "one",
+        "initial adoption activates even a project without Cargo"
+    );
+    // An already-published adoption must not skip a changed, failing source shell.
+    fs::write(
+        fixture.checkout.join(".envrc-local"),
+        "echo adopt-refresh-failure >&2\nexit 23\n",
+    )
+    .expect("failing adopted shell");
+    let (adopt_replay, _, _) = run(
+        &mut service,
+        [
+            OsString::from("adopt"),
+            fixture.checkout.as_os_str().to_os_string(),
+            OsString::from("--repo-id"),
+            OsString::from("fixture/dispatch"),
+            OsString::from("--capacity"),
+            OsString::from("1g"),
+        ],
+    )
+    .await;
+    fs::remove_file(fixture.checkout.join(".envrc-local")).expect("repair adopted shell");
+    let replay_refused = adopt_replay.as_ref().is_err_and(|error| {
+        error.message.contains("adopted main") && error.message.contains("adopt-refresh-failure")
+    });
+    adopt(&fixture, &mut service).await;
+    // serve_project's explicit grant changed the baseline after adoption.
+    assert!(
+        sh(&mut service, "main", "test \"$LAND_SHELL_VALUE\" = one")
+            .await
+            .is_empty()
+    );
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("shell-input"), "two\n").expect("landed shell input");
+    git(
+        &topic,
+        &["commit", "-q", "-a", "-m", "second shell generation"],
+    );
+    land(
+        &mut service,
+        "topic",
+        false,
+        &["test \"$LAND_SHELL_VALUE\" = two"],
+    )
+    .await;
+    let refreshed = record(&fixture.checkout);
+    assert_eq!(refreshed["environment"]["LAND_SHELL_VALUE"], "two");
+    assert_eq!(
+        refreshed["root"],
+        serde_json::json!(fs::canonicalize(&fixture.checkout).unwrap()),
+        "main publishes its own activation, never the landing workspace's export"
+    );
+    assert_eq!(
+        refreshed["key"],
+        record(&topic)["key"],
+        "the landed input bytes match"
+    );
+
+    let lane = new_workspace(&mut service, "lane").await;
+    fs::write(topic.join("shell-input"), "three\n").expect("folded shell input");
+    git(
+        &topic,
+        &["commit", "-q", "-a", "-m", "third shell generation"],
+    );
+    succeed(
+        &mut service,
+        [
+            "land",
+            "topic",
+            "--into",
+            "lane",
+            "--ungated",
+            "--no-retire",
+        ],
+    )
+    .await;
+    assert_eq!(
+        record(&lane)["environment"]["LAND_SHELL_VALUE"],
+        "three",
+        "an ungated fold refreshes its target without running a check"
+    );
+    assert_eq!(
+        record(&fixture.checkout)["environment"]["LAND_SHELL_VALUE"],
+        "two",
+        "the lane's refresh does not activate an unrelated target"
+    );
+
+    // A target-only tail fails after delivery, while the source's gate still succeeds.
+    fs::write(
+        fixture.checkout.join(".envrc-local"),
+        "printf 'chatty-prefix-drop-me%4096s\n' '' >&2\necho target-only-shell-failure >&2\nexit 29\n",
+    )
+    .expect("target failure");
+    let source_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    let (outcome, _, _) = run(
+        &mut service,
+        [
+            "land",
+            "topic",
+            "--check",
+            "test \"$LAND_SHELL_VALUE\" = three",
+        ],
+    )
+    .await;
+    fs::remove_file(fixture.checkout.join(".envrc-local")).expect("remove target failure");
+    let error = outcome.expect_err("a failed target activation must fail the post-land step");
+    assert!(
+        error.message.contains("landed")
+            && error.message.contains(&source_head)
+            && error.message.contains("target-only-shell-failure"),
+        "{error}"
+    );
+    assert_eq!(
+        git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]),
+        source_head,
+        "the failure reports the target that already moved"
+    );
+    assert!(
+        topic.is_dir(),
+        "a failed source refresh must not retire the landing workspace"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop source-refresh runtime");
+    fixture.stop_gateway().await;
+    let bounded_tail = !error.message.contains("chatty-prefix-drop-me");
+    assert_eq!(
+        (replay_refused, bounded_tail),
+        (true, true),
+        "completed-adopt result: {adopt_replay:?}; diagnostic bytes: {}; prefix retained: {}",
+        error.message.len(),
+        !bounded_tail
+    );
+}
+
 /// A `--git-worktree` workspace's checkout holds a `.git` pointer file, not a repository: its
 /// excludes are main's, the common directory's. Its supervisor wrote cowshed's excludes into
 /// the checkout's own `.git/info/exclude` as for a standalone clone, refused the pointer file
