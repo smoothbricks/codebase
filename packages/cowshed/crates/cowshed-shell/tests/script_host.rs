@@ -335,11 +335,9 @@ impl Host {
                 .retire()
                 .map_err(std::io::Error::other)?;
         }
-        std::fs::remove_dir(
-            cgroup_authority()
-                .root()
-                .join(format!("ws-{}", self.cgroups.incarnation().as_str())),
-        )
+        // Each job's cgroup is the incarnation's only one: jobs sit in the shared class cgroups
+        // (`<root>/<class>/job-<incarnation>-<id>`), which outlive every incarnation.
+        Ok(())
     }
 
     /// Go away as a supervisor does: close the control socket, which the host reads as its end
