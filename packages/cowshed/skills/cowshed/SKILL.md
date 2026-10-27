@@ -182,8 +182,10 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
   `std::env::var_os("CARGO_MANIFEST_DIR")`, which cargo and nextest set for every test.
 - After a lockfile or toolchain bump, re-warm main's image with `cowshed exec main -- <canonical build>` so new clones
   inherit the dependency graph.
-- Cargo's linker must be a bare PATH program or immutable store path, never checkout-relative. Use the pinned nightly's
-  checksum/content freshness consistently; switching modes invalidates units once.
+- Cargo's linker must be a bare PATH program or immutable store path, never checkout-relative. Cargo keeps its default
+  mtime freshness: a checkout's sources and build state stay paired (a fork clones both from one tree; a land restamps
+  target sources the fast-forward left older than the landing checkout's), and a producer that restores changed input
+  bytes gives them a fresh mtime.
 - Nx inside a workspace sandbox keeps its normal daemon and the checkout's own `.nx`: host shells, read-write and
   read-only jobs share one task database, cache and daemon through the build volume. Read-only jobs keep source
   read-only, not a second Nx state. The supervisor keeps the daemon in the sandbox and host shells connect to it. The

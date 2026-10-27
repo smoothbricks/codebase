@@ -1651,8 +1651,8 @@ fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process
     );
     // The owned scratch root has no repository config ancestors. Forward the files a Cargo
     // started in cowshed-core's runtime directory reads, shallowest first: a later `--config`
-    // wins, as a deeper file does. This preserves checksum freshness, linker and `[env]` in
-    // the one Cargo environment (16_build_volumes.md, "One Cargo environment on every path").
+    // wins, as a deeper file does. This preserves the linker and `[env]` in the one Cargo
+    // environment (16_build_volumes.md, "One Cargo environment on every path").
     let mut workspace_configs: Vec<PathBuf> = manifest_dir
         .ancestors()
         .map(|directory| directory.join(".cargo").join("config.toml"))

@@ -1437,13 +1437,13 @@ every mtime. A file-by-file copy that restamps files in walk order (`cp -c -R`) 
 `cp -c -p -R` takes minutes. Build volumes are only ever image clones or dataset clones.
 
 - **Enforced by**: the fork test above runs on a cloned build volume and requires every unit `Fresh`.
-- The pinned nightly uses checksum freshness (`[unstable] checksum-freshness = true` and
-  `[build] fingerprint = "content"`) consistently in host shells, jobs and every checkout. Content identity survives
-  source checkout timestamp changes; mtimes are still preserved for other tools. Never mix modes in one build volume:
-  switching modes rebuilds every unit once. A Cargo run whose directory has none of the checkout's `.cargo/config.toml`
-  above it reads them through `--config`, shallowest first: the cowshed-core capability probe builds its workspace under
-  `CARGO_TARGET_TMPDIR`, which resolves into the build volume, and without them it built cowshed-core's tree in mtime
-  mode, without the workspace's linker or `[env]`.
+- Cargo keeps its default mtime freshness in host shells, jobs and every checkout. That is sound because every producer
+  of a Cargo-read input gives changed bytes a fresh mtime: an Nx cache restore stamps what it writes
+  (`packages/nx-plugin/README.md`, "A restored output is newer than the output it replaces"), and a checkout's sources
+  and build state come from one tree ("Source and build state arrive together"). A Cargo run whose directory has none of
+  the checkout's `.cargo/config.toml` above it reads them through `--config`, shallowest first: the cowshed-core
+  capability probe builds its workspace under `CARGO_TARGET_TMPDIR`, which resolves into the build volume, and without
+  them it built cowshed-core's tree without the workspace's linker or `[env]`.
 
 ### Nx outputs never live in the build volume
 

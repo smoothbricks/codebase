@@ -23,6 +23,7 @@ import { nodeLocks } from './locks-node.js';
 import {
   artifacts,
   backdate,
+  backdateSources,
   build,
   buildJson,
   type CargoRun,
@@ -1272,6 +1273,7 @@ async function reportsRecencyFromStampedUse(fx: Churn, stamping: boolean): Promi
   check(planned(await retain(fx.ws, { apply: false, now: Date.now() })).recency, 'no compile stamps').toEqual(unknown);
   for (const stamp of stamps) await put(stamp, '');
   await backdate([...used, ...unused]);
+  await backdateSources([fx.ws, fx.ext], fx.target);
   const aged = Date.now() - DAY3;
   // `ret-mid` and what it builds on: a no-op build of them, and nothing of `ret-app`.
   const run = await cargoOk(
@@ -1296,7 +1298,7 @@ describe('cargo retention against real Cargo target layouts', () => {
     await withEnv(
       {
         CARGO_UNSTABLE_MTIME_ON_USE: 'true',
-        CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'false',
+        CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true',
         RET_UNRELATED: 'kept',
         RUSTC_WRAPPER: 'sccache',
       },

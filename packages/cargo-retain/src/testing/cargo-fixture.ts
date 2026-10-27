@@ -282,6 +282,21 @@ export async function backdate(metas: string[]): Promise<void> {
   }
 }
 
+/**
+ * Ages every file under `trees` to before `backdate`'s stamps, so the units built from them stay fresh under Cargo's
+ * mtime freshness, as a checkout's sources and build state come from one tree. `target` keeps its own times.
+ */
+export async function backdateSources(trees: string[], target: string): Promise<void> {
+  const past = new Date(Date.now() - DAY3 - RECENT_USE_MS);
+  const age = async (path: string): Promise<void> => {
+    if (path === target) return;
+    const stats = await lstat(path);
+    if (stats.isDirectory()) for (const name of await readdir(path)) await age(join(path, name));
+    else if (stats.isFile()) await utimes(path, past, past);
+  };
+  for (const tree of trees) await age(tree);
+}
+
 /** The residue of a compile Cargo never finished: it empties the hash file before compiling a dirty unit. */
 export async function emptyHash(meta: string): Promise<void> {
   const fingerprints = join(meta, 'fingerprint');
@@ -347,9 +362,7 @@ export function future(): number {
 }
 
 export function fixtureConfig(mtimeOnUse: boolean): string {
-  return mtimeOnUse
-    ? lines('[build]', 'fingerprint = "content"', '', '[unstable]', 'checksum-freshness = true', 'mtime-on-use = true')
-    : lines('[build]', 'fingerprint = "content"', '', '[unstable]', 'checksum-freshness = true');
+  return mtimeOnUse ? lines('[unstable]', 'mtime-on-use = true') : '';
 }
 
 export function extManifest(version: string): string {
