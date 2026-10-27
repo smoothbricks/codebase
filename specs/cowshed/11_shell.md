@@ -419,12 +419,13 @@ values. Validation precedes RPC, job/artifact effects, process allocation, and s
 into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supervisor wire shape exists.
 
 - It retires itself after 30 minutes with no named session open and no job running, freeing its warm hosts; the next
-  command starts another. A shed's supervisor also waits for its Nx daemon to be gone, which its keeper stops five
-  minutes after the shed was last in use (04_sandbox.md). `cowshed detach`/`cowshed rm` retire it before the substrate
-  changes (teardown below). Every retirement, and a project runtime's shutdown, which retires each supervisor that
-  process serves, stops and waits for all of the supervisor's jobs, including the foreground keeper maintenance job,
-  through the ordinary job lifecycle (16_build_volumes.md, "The Nx daemon stays on"). No daemon or plugin worker
-  outlives the supervisor or the runtime.
+  command starts another. A shed's supervisor also waits for its Nx daemon to be gone, which its keeper stops after the
+  configured idle interval (five minutes by default) without developer activity (04_sandbox.md). An open named session
+  alone does not keep Nx resident: only its opening is use, and its commands use Nx as jobs; the session still keeps the
+  supervisor itself open. `cowshed detach`/`cowshed rm` retire it before the substrate changes (teardown below). Every
+  retirement, and a project runtime's shutdown, which retires each supervisor that process serves, stops and waits for
+  all of the supervisor's jobs, including the foreground keeper maintenance job, through the ordinary job lifecycle
+  (16_build_volumes.md, "The Nx daemon stays on"). No daemon or plugin worker outlives the supervisor or the runtime.
 - Admission closes only on the way to retirement, and nothing reopens it: a supervisor that refuses work is one that
   retires, whoever asked and whether or not they are still there. So a caller in another process asks one request,
   `retire`, saying when — now (running jobs stopped), after the running jobs end, or only if no job runs (a `Conflict`,

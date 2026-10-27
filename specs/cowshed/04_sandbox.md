@@ -1124,78 +1124,81 @@ present, its process alive, its socket accepting. When the probe fails while the
 most one at a time: the daemon is idle between the clients it answers, so as a resident (05_gateway.md, "Classes")
 keeping it costs the host nothing while it waits. The foreground process stays owned by that job's real birth and group
 and keeps its shared build-volume hold for its lifetime (16_build_volumes.md, "The Nx daemon stays on"). The process
-that starts a daemon owns its restart. The supervisor's own start is no use: a supervisor that runs no job and holds no
-session starts no daemon. A supervisor starts for reasons that run nothing on the mount, such as a failed `rm` that
-restores its workspace (02_workspaces.md). Measured 2026-10-21: such a supervisor launched a daemon at once, and the
-next `rm` was refused naming the daemon's launch processes, which no record named yet, so every retry started another. A
-job's admission and a named session's opening are use at that moment, and the keeper probes at once: a job that ends
-between two probes is still use, and the daemon starts alongside the first command rather than up to a probe interval
-after it. A daemon the keeper started stops, rather than restarts, when its installation changes (a root lockfile or a
-linked plugin, the patched Nx's validity checks); the keeper starts its successor. `--kept` is how the keeper says so: a
-successor the old daemon spawned itself would run outside the job, and a land skips adopting a volume whose daemon its
-ledger cannot prove (16_build_volumes.md, Land step 4), discarding the gate's whole cache for an ordinary plugin
-rebuild. A daemon a client started outside a keeper, such as main's host daemon, keeps restarting itself, since no
-keeper would. In a shed whose shell is activated, `node` is the one that shell declares (15_capabilities.md, "Bootstrap
-executables"); in one without, it is the `node` `execvp` would find on the job's own bootstrap PATH (the capability
-`tools/bin` links, the workspace's `.cowshed/bin`, the system directories), run by its absolute path. A start that
-cannot run — no executable `node` anywhere on that PATH (`ENOENT`, or `EACCES` when one exists but cannot execute) —
-admits no job and is named on the supervisor's stderr when its reason changes; each probe repeats the lookup (`stat`s
-only), and the first that finds a `node` starts it. A lookup that cannot tell (a directory it may not read) runs `node`,
-bounded below. A daemon that served and then stopped — idle, or a kept daemon that stopped for its successor — is
-followed by a successor at the next probe and is no failure. Any other failed start (its job ended, or was refused
-admission, with no daemon live and none seen live while it ran) is reported there too and tried again at the next probe,
-at most 3 in a row: an exit status cannot classify it, since `sandbox-exec` exits 71 both for an `execvp` it could not
-make and for a child that exited 71. After 3 the keeper starts none for 60 s, then one; each further failure doubles the
-pause, up to 15 min. So a failure that does not clear costs at most 3 starts and then one per pause, and never halts the
-keeper: a halted keeper would leave every host client to start its own daemon outside the sandbox. A daemon found live,
-whoever started it, ends the pause and resets it to 60 s. Each change of pause is said on the supervisor's stderr with
-its failures, its length and the cap, and the supervisor answers the refusal or the pause (failures, time left, length,
-cap) to whoever asks the keeper's state. A lifecycle verb about to take its census of the mount stops the keeper's
-starts first and ends the start it has in flight unless that start's daemon is live (02_workspaces.md, "Holders cowshed
-does not run"); the keeper then answers `Stopped`, says so once on stderr, and counts the ended start as no failure,
-until the shed's next job or named session resumes it. A stop of an idle shed's live daemon that fails is likewise tried
-at most 3 times in a row, and again only after a probe finds it gone. A host client finds the daemon through the shared
-record and connects to it instead of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the
-operator's checkout, and its daemon is the host's. A fork deletes the record from the build volume; a land deletes the
-landing workspace's and gives the adopted volume the target's record of a live unsandboxed daemon in its place
-(16_build_volumes.md). A repository shell that exports either directory unconditionally replaces the checkout's, like
-any export, and splits the state again; a repository shell that sets them keeps a value already present
-(`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
+that starts a daemon owns its restart. The supervisor's own start is no use: a supervisor that has admitted no job and
+opened no named session starts no daemon. A supervisor starts for reasons that run nothing on the mount, such as a
+failed `rm` that restores its workspace (02_workspaces.md). Measured 2026-10-21: such a supervisor launched a daemon at
+once, and the next `rm` was refused naming the daemon's launch processes, which no record named yet, so every retry
+started another. A job's admission and a named session's opening are use at that moment, and the keeper probes at once:
+a job that ends between two probes is still use, and the daemon starts alongside the first command rather than up to a
+probe interval after it. A daemon the keeper started stops, rather than restarts, when its installation changes (a root
+lockfile or a linked plugin, the patched Nx's validity checks); the keeper starts its successor. `--kept` is how the
+keeper says so: a successor the old daemon spawned itself would run outside the job, and a land skips adopting a volume
+whose daemon its ledger cannot prove (16_build_volumes.md, Land step 4), discarding the gate's whole cache for an
+ordinary plugin rebuild. A daemon a client started outside a keeper, such as main's host daemon, keeps restarting
+itself, since no keeper would. In a shed whose shell is activated, `node` is the one that shell declares
+(15_capabilities.md, "Bootstrap executables"); in one without, it is the `node` `execvp` would find on the job's own
+bootstrap PATH (the capability `tools/bin` links, the workspace's `.cowshed/bin`, the system directories), run by its
+absolute path. A start that cannot run — no executable `node` anywhere on that PATH (`ENOENT`, or `EACCES` when one
+exists but cannot execute) — admits no job and is named on the supervisor's stderr when its reason changes; each probe
+repeats the lookup (`stat`s only), and the first that finds a `node` starts it. A lookup that cannot tell (a directory
+it may not read) runs `node`, bounded below. A daemon that served and then stopped — idle, or a kept daemon that stopped
+for its successor — is followed by a successor at the next probe and is no failure. Any other failed start (its job
+ended, or was refused admission, with no daemon live and none seen live while it ran) is reported there too and tried
+again at the next probe, at most 3 in a row: an exit status cannot classify it, since `sandbox-exec` exits 71 both for
+an `execvp` it could not make and for a child that exited 71. After 3 the keeper starts none for 60 s, then one; each
+further failure doubles the pause, up to 15 min. So a failure that does not clear costs at most 3 starts and then one
+per pause, and never halts the keeper: a halted keeper would leave every host client to start its own daemon outside the
+sandbox. A daemon found live, whoever started it, ends the pause and resets it to 60 s. Each change of pause is said on
+the supervisor's stderr with its failures, its length and the cap, and the supervisor answers the refusal or the pause
+(failures, time left, length, cap) to whoever asks the keeper's state. A lifecycle verb about to take its census of the
+mount stops the keeper's starts first and ends the start it has in flight unless that start's daemon is live
+(02_workspaces.md, "Holders cowshed does not run"); the keeper then answers `Stopped`, says so once on stderr, and
+counts the ended start as no failure, until the shed's next job or named session opening resumes it. A stop of an idle
+shed's live daemon that fails is likewise tried at most 3 times in a row, and again only after a probe finds it gone. A
+host client finds the daemon through the shared record and connects to it instead of starting one outside the sandbox.
+Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon is the host's. A fork deletes the
+record from the build volume; a land deletes the landing workspace's and gives the adopted volume the target's record of
+a live unsandboxed daemon in its place (16_build_volumes.md). A repository shell that exports either directory
+unconditionally replaces the checkout's, like any export, and splits the state again; a repository shell that sets them
+keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
 
 A kept daemon costs its host a resident Node process (about 0.65 GB RSS in a 56-project consumer's shed, its plugins
 loaded in it rather than in workers) and a file watcher that recomputes the project graph on every change in the tree,
 per shed. Stock Nx stops a daemon after three hours without a request or a file event; the patched Nx 23.2.1 uses five
 minutes at the same `daemon/server/shutdown-utils.js` boundary. Every file event of the tree restarts that timer, so a
 tree that keeps changing never reaches it. The keeper therefore also ends the daemon. A shed is in use while its
-supervisor's ledger holds a job (a `--host` job and a land's gate job are the shed's jobs like any other) or a named
-session, and for the shed's idle bound after a job is admitted or ends, a session opens, or a daemon comes up. The bound
-is main's `.cowshed.toml` `[nx] daemon_idle` (06_cli.md, "Configuration"), a whole number of seconds, minutes or hours
-above zero such as `"10m"`, read where the sandbox's repository policy is read, at the supervisor's start; without it
-the bound is five minutes. A job's end restarts the interval itself, rather than the last probe that saw the job run, so
-the bound is measured from the moment the shed fell idle. The ledger is the only source of use: no probe walks the
-process table. The record read and native liveness probe run off the supervisor's actor, at most one in flight. Actor
-events never cancel or duplicate that read; its completion is judged against the current ledger and idle clock, and a
-result for a replaced Nx root is discarded. A lifecycle census uses that same probe before deciding whether to end a
-keeper start. While that census fence stands, the pure keeper decision holds both starts and idle stops until a job or
-session resumes it; a live daemon is left for the walk (02_workspaces.md, "Holders cowshed does not run"). A stalled
-probe record read cannot stop hello, exec or the actor round trips that prove heartbeat progress (05_gateway.md,
-"Deadlines"). Work that runs as no job of the supervisor's, such as a host shell's `direnv exec <ws> nx …` on the mount,
-is not use, and the keeper may stop the daemon under it; such work runs through `cowshed exec`, which the ledger
-records. Untracked work that shows up again is a defect in whatever let it run outside the ledger, never a reason to
-bring back a process walk. Measured 2026-10-21 at about 720 host processes and 10.25k vnode descriptors: the keeper's
-former look, one descriptor query of every process every 30 s per shed, made 12.2k `proc_info` calls and took 47-132 ms
-when nothing stalled it; one of those calls waited 51 s on the descriptor of a `cowshed fork` in uninterruptible sleep,
-and every supervisor that looked then stopped answering hello and exec (`did not answer within 10 seconds`; 2.6% of
-3,528 hellos over 10 s, clustered on 13 of 21 supervisors at once). Agents then ran their work around `cowshed exec`,
-which made exactly the work the look had been written to see. Once the shed has gone its idle bound with no job and no
-session in the ledger the keeper stops the daemon as `nx daemon --stop` does (a SIGTERM to the pid its record names,
-taken from the read that verified it live; its plugin workers go with it), says so on its stderr, and starts none until
-the shed is in use again: a job, a session, or a daemon someone else started, which the keeper then stops after another
-idle bound of disuse. A kept daemon is said on stderr with the job or session that keeps it, each time that changes. A
-supervisor retires only once its keeper holds no daemon (11_shell.md), so no daemon outlives the supervisor that watched
-it. The price is one Nx's own idle stop has: the first host client after a shed went idle finds no daemon and starts one
-of its own, outside the sandbox, until the keeper stops that one too. A daemon is stopped, never disabled: the next host
-Nx command, or the keeper once a job is admitted, starts one (16_build_volumes.md, "The Nx daemon stays on").
+supervisor's ledger holds a developer job (a `--host` job and a land's gate job are the shed's jobs like any other), and
+for the shed's idle bound after a job is admitted or ends, a named session opens, or a daemon comes up. A named session
+held open without a running job is not continuous use: opening an existing handle again, an exec whose admission key
+answers a job already admitted, state reads, probes, and the admission and end of the keeper's foreground maintenance
+job do not restart the interval. The bound is main's `.cowshed.toml` `[nx] daemon_idle` (06_cli.md, "Configuration"), a
+whole number of seconds, minutes or hours above zero such as `"10m"`, read where the sandbox's repository policy is
+read, at the supervisor's start; without it the bound is five minutes. A job's end restarts the interval itself, rather
+than the last probe that saw the job run, so the bound is measured from the moment the shed fell idle. The ledger is the
+only source of use: no probe walks the process table. The record read and native liveness probe run off the supervisor's
+actor, at most one in flight. Actor events never cancel or duplicate that read; its completion is judged against the
+current ledger and idle clock, and a result for a replaced Nx root is discarded. A lifecycle census uses that same probe
+before deciding whether to end a keeper start. While that census fence stands, the pure keeper decision holds both
+starts and idle stops until a job or a named session opening resumes it; a live daemon is left for the walk
+(02_workspaces.md, "Holders cowshed does not run"). A stalled probe record read cannot stop hello, exec or the actor
+round trips that prove heartbeat progress (05_gateway.md, "Deadlines"). Work that runs as no job of the supervisor's,
+such as a host shell's `direnv exec <ws> nx …` on the mount, is not use, and the keeper may stop the daemon under it;
+such work runs through `cowshed exec`, which the ledger records. Untracked work that shows up again is a defect in
+whatever let it run outside the ledger, never a reason to bring back a process walk. Measured 2026-10-21 at about 720
+host processes and 10.25k vnode descriptors: the keeper's former look, one descriptor query of every process every 30 s
+per shed, made 12.2k `proc_info` calls and took 47-132 ms when nothing stalled it; one of those calls waited 51 s on the
+descriptor of a `cowshed fork` in uninterruptible sleep, and every supervisor that looked then stopped answering hello
+and exec (`did not answer within 10 seconds`; 2.6% of 3,528 hellos over 10 s, clustered on 13 of 21 supervisors at
+once). Agents then ran their work around `cowshed exec`, which made exactly the work the look had been written to see.
+Once the shed has gone its idle bound with no developer activity the keeper stops the daemon as `nx daemon --stop` does
+(a SIGTERM to the pid its record names, taken from the read that verified it live; its plugin workers go with it), says
+so on its stderr, and starts none until the shed is in use again: a job, a new named session opening, or a daemon
+someone else started, which the keeper then stops after another idle bound of disuse. A kept daemon is said on stderr
+with the developer job that keeps it, each time that changes. A supervisor retires only once its keeper holds no daemon
+(11_shell.md), so no daemon outlives the supervisor that watched it. The price is one Nx's own idle stop has: the first
+host client after a shed went idle finds no daemon and starts one of its own, outside the sandbox, until the keeper
+stops that one too. A daemon is stopped, never disabled: the next host Nx command, or the keeper once a job is admitted,
+starts one (16_build_volumes.md, "The Nx daemon stays on").
 
 The reasons the keeper starts the daemon, and no job's client does, are in
 [Why cowshed keeps the daemon, not the first client](#why-cowshed-keeps-the-daemon-not-the-first-client).
@@ -1321,8 +1324,9 @@ the pinned 23.2.1; line numbers are those of commit `d2dc2aaef9`.
   (`04_sandbox.md:1112-1113`), and host shells start; with every job able to, the race is the normal case.
 - **The idle stop.** Stock Nx stops a daemon after three hours without a request or a file event, the patched Nx after
   five minutes (`daemon/server/shutdown-utils.js`), and every file event of the tree restarts that timer, so a tree that
-  keeps changing never reaches it (`04_sandbox.md:1156-1158`). The keeper ends the daemon from its ledger once the shed
-  has gone its idle bound with no job and no session (`04_sandbox.md:1174-1178`); without it only that timer remains.
+  keeps changing never reaches it (`04_sandbox.md:1167-1169`). The keeper ends the daemon from its ledger once the shed
+  has gone its idle bound with no developer activity: no job running, and none admitted or ended and no named session
+  opened within it; a named session held open is no use (`04_sandbox.md:1169-1174`). Without it only that timer remains.
 
 `16_build_volumes.md:1291-1292` and the policy above (`04_sandbox.md:1039-1054`) say the opposite of what a
 client-started daemon needs, so a spec change would come first.

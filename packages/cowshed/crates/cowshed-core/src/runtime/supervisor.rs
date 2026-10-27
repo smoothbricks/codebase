@@ -5080,6 +5080,20 @@ async fn next_group_ledger_finish(state: &mut GroupLedgerFinish) -> std::io::Res
         GroupLedgerFinish::Idle | GroupLedgerFinish::Done(_) => std::future::pending().await,
     }
 }
+/// A successful exec request either admitted work now or found its existing keyed job.
+enum ExecAdmission {
+    New(JobId),
+    Existing(JobId),
+}
+
+impl ExecAdmission {
+    fn job_id(self) -> JobId {
+        match self {
+            Self::New(job) | Self::Existing(job) => job,
+        }
+    }
+}
+
 struct SupervisorActor {
     authority: WorkspaceAuthoritySnapshot,
     group_ledger: Option<GroupLedgerWriter>,
@@ -5653,11 +5667,7 @@ impl SupervisorActor {
                 name,
                 reply,
             } => {
-                let named = name.is_some();
                 let result = self.open_session(&authority, name);
-                if named && result.is_ok() {
-                    self.nx_daemon_used();
-                }
                 let _ = reply.send(result);
             }
             Command::SessionSnapshot {
@@ -5695,10 +5705,13 @@ impl SupervisorActor {
                         source,
                         parent_jobserver,
                     )
-                    .await;
-                if admitted.is_ok() {
-                    self.nx_daemon_used();
-                }
+                    .await
+                    .map(|admission| {
+                        if matches!(admission, ExecAdmission::New(_)) {
+                            self.nx_daemon_used();
+                        }
+                        admission.job_id()
+                    });
                 let _ = reply.send(admitted);
             }
             Command::Detach {
@@ -6192,6 +6205,7 @@ impl SupervisorActor {
         self.sessions.insert(identity, state);
         if let Some(name) = &name {
             self.named_sessions.insert(name.clone(), identity);
+            self.nx_daemon_used();
         }
         Ok(SessionToken {
             authority: self.authority.clone(),
@@ -6459,7 +6473,7 @@ impl SupervisorActor {
         request: ExecRequest,
         source: AdmissionSource,
         parent_jobserver: Option<super::job_cpu::InheritedJobserver>,
-    ) -> Result<JobId> {
+    ) -> Result<ExecAdmission> {
         self.validate_authority(&authority)
             .and_then(|()| {
                 if self.lifecycle == ActorLifecycle::Running {
@@ -6531,7 +6545,7 @@ impl SupervisorActor {
                             AdmissionRefusal::StdinBound { job_id },
                         ))
                     } else {
-                        Ok(job_id)
+                        Ok(ExecAdmission::Existing(job_id))
                     };
                 }
                 AdmissionLookup::Unprovable { set_aside } => {
@@ -6837,7 +6851,7 @@ impl SupervisorActor {
             failure: None,
         };
         self.jobs.insert(job_id, job);
-        Ok(job_id)
+        Ok(ExecAdmission::New(job_id))
     }
 
     /// Leave `job_id` running with nobody attached: both captured prefixes become durable in
@@ -7140,6 +7154,7 @@ impl SupervisorActor {
     /// probe, up to [`super::nx_daemon::START_ATTEMPTS`] in a row, then after each pause
     /// ([`super::nx_daemon::FIRST_PAUSE`] doubling to [`super::nx_daemon::PAUSE_CAP`]).
     async fn keep_nx_daemon(&mut self, probed: Option<(PathBuf, Probe)>) -> bool {
+        let working = self.user_job();
         let Some(keeper) = &mut self.nx_daemon else {
             return false;
         };
@@ -7185,20 +7200,6 @@ impl SupervisorActor {
                 daemon,
             );
         }
-        // The keeper's foreground job is maintenance, not use by the developer. It still belongs
-        // to the ordinary job ledger and every lifecycle drain waits for its real conclusion.
-        let working = self
-            .jobs
-            .iter()
-            .find(|(id, job)| Some(**id) != keeper.starting && !job.terminal())
-            .map(|(id, _)| super::nx_daemon::Use::Job(*id))
-            .or_else(|| {
-                self.named_sessions
-                    .keys()
-                    .next()
-                    .cloned()
-                    .map(super::nx_daemon::Use::Session)
-            });
         if keeper.judge(&project_root, working, daemon).await != Verdict::Keep {
             return true;
         }
@@ -7233,8 +7234,8 @@ impl SupervisorActor {
         let authority = self.authority.clone();
         let started = match self.current_build_volume_grant() {
             // The keeper is the supervisor's own coordinator-side work.
-            Ok(grant) => {
-                self.admit_exec(
+            Ok(grant) => self
+                .admit_exec(
                     authority,
                     None,
                     grant,
@@ -7243,7 +7244,7 @@ impl SupervisorActor {
                     None,
                 )
                 .await
-            }
+                .map(ExecAdmission::job_id),
             Err(error) => Err(error),
         };
         let Some(keeper) = &mut self.nx_daemon else {
@@ -8522,11 +8523,17 @@ impl SupervisorActor {
         }
     }
 
-    fn has_user_jobs(&self) -> bool {
+    /// The canonical developer-activity projection: neither idle handles nor maintenance count.
+    fn user_job(&self) -> Option<JobId> {
         let keeper_job = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting);
         self.jobs
             .iter()
-            .any(|(id, job)| Some(*id) != keeper_job && !job.terminal())
+            .find(|(id, job)| Some(**id) != keeper_job && !job.terminal())
+            .map(|(id, _)| *id)
+    }
+
+    fn has_user_jobs(&self) -> bool {
+        self.user_job().is_some()
     }
 
     fn has_running_jobs(&self) -> bool {

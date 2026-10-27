@@ -16,12 +16,13 @@
 //! watcher that recomputes the project graph on every change in the tree. Nx stops a daemon only
 //! after its own inactivity interval without a request or a file event, which a tree that keeps
 //! changing never reaches, so the supervisor ends the daemon itself. A shed is used while its
-//! supervisor's ledger holds a job or a named session, when a job is admitted or ends, when a
-//! session opens, and when a daemon comes up; nothing else is asked. Once none of that has happened
-//! for the shed's [`NxDaemonIdle`] the keeper stops the daemon, as `nx daemon --stop` does, and
-//! starts none until the shed is used again. Its foreground daemon is one admitted maintenance
-//! job, excluded from developer activity. Quiescence and retirement stop and wait for that job;
-//! the supervisor also releases any daemon its keeper watched.
+//! supervisor's ledger holds a developer job, when a job is admitted or ends, when a named
+//! session opens, and when a daemon comes up; a named session held open without a job, an exec
+//! whose admission key answers a job already admitted, and a probe are no use. Once none of that
+//! has happened for the shed's [`NxDaemonIdle`] the keeper stops the daemon, as
+//! `nx daemon --stop` does, and starts none until the shed is used again. Its foreground daemon
+//! is one admitted maintenance job, excluded from developer activity. Quiescence and retirement
+//! stop and wait for that job; the supervisor also releases any daemon its keeper watched.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -553,7 +554,7 @@ pub(crate) struct NxDaemonKeeper {
     /// When the shed was last used, and whether the last probe found its daemon live.
     clock: IdleClock,
     /// What in the ledger kept the live daemon at the last probe, said each time it changes.
-    kept_by: Option<Use>,
+    kept_by: Option<JobId>,
     /// Whether the last probe found the shed unused for its idle bound and no daemon live:
     /// nothing is left for the supervisor to wait for.
     pub(super) settled: bool,
@@ -589,9 +590,10 @@ pub(crate) enum Verdict {
 impl NxDaemonKeeper {
     /// The keeper of a supervisor of a workspace in `role`: a shed's, never main's. Its first
     /// probe is due at once, but the supervisor's start is no use: a daemon is started only once
-    /// the ledger holds a job or a session, and one found live gets its interval. A supervisor
-    /// started for anything else (a failed `rm` restoring the workspace, an ensure that runs
-    /// nothing) would otherwise launch a daemon whose start processes then hold the mount.
+    /// a job is admitted or a named session opens, and one found live gets its interval. A
+    /// supervisor started for anything else (a failed `rm` restoring the workspace, an ensure
+    /// that runs nothing) would otherwise launch a daemon whose start processes then hold the
+    /// mount.
     pub(crate) fn for_role(role: WorkspaceRole, idle: NxDaemonIdle) -> Option<Self> {
         match role {
             WorkspaceRole::Main => None,
@@ -811,17 +813,16 @@ impl NxDaemonKeeper {
     }
 
     /// Judge one probe of the Nx project at `project_root`, whose daemon the probe found
-    /// `daemon`, `working` being what the supervisor's ledger holds that uses the shed: a job it
-    /// runs or a named session it holds. Stops the daemon once the shed has gone unused for its
-    /// idle bound ([`IdleClock::probe`]).
+    /// `daemon`, `working` being the supervisor's nonterminal developer job, if any. Stops the
+    /// daemon once the shed has gone unused for its idle bound ([`IdleClock::probe`]).
     ///
     /// The ledger is the only source of use: no process-table walk looks for work outside it.
     /// Record and liveness observations arrive from the owned off-actor probe. A kept daemon
-    /// is said on stderr with the job or session that keeps it, each time that changes.
+    /// is said on stderr with the job that keeps it, each time that changes.
     pub(crate) async fn judge(
         &mut self,
         project_root: &Path,
-        working: Option<Use>,
+        working: Option<JobId>,
         daemon: Probe,
     ) -> Verdict {
         let live = daemon == Probe::Live;
@@ -838,8 +839,9 @@ impl NxDaemonKeeper {
             .filter(|using| self.kept_by.as_ref() != Some(using))
         {
             cowshed_os::eprintln!(
-                "cowshed: keeps the Nx daemon of {}: {using}",
-                project_root.display()
+                "cowshed: keeps the Nx daemon of {}: its supervisor runs job {}",
+                project_root.display(),
+                using.get()
             );
         }
         self.kept_by = kept_by;
@@ -861,7 +863,7 @@ impl NxDaemonKeeper {
                 self.settled = false;
                 if self.may_stop() {
                     let why = format!(
-                        "its supervisor ran no job and held no named session for {}s",
+                        "its supervisor had no developer activity for {}s",
                         self.idle.get().as_secs()
                     );
                     if let Err(why) = stop(project_root, &why).await {
@@ -907,9 +909,9 @@ impl NxDaemonKeeper {
 /// that has been up.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct IdleClock {
-    /// The last use: a probe whose ledger held a job or a session, a job's admission or end, a
-    /// session's opening, or a daemon newly up; `None` until one happens. The supervisor's own
-    /// start is no use, so a supervisor nothing uses starts no daemon.
+    /// The last use: a probe whose ledger held a developer job, a job's admission or end, a
+    /// named session's opening, or a daemon newly up; `None` until one happens. Idle session
+    /// handles, probes alone and the supervisor's own start are no use.
     last_use: Option<Instant>,
     daemon_was_live: bool,
 }
@@ -955,25 +957,6 @@ impl IdleClock {
             Some(used) if now.duration_since(used) < idle.get() => Idleness::InUse,
             _ if live => Idleness::Stop,
             _ => Idleness::Settled,
-        }
-    }
-}
-
-/// What in the supervisor's ledger uses the shed ([`NxDaemonKeeper::judge`]): a job it runs, or
-/// a named session it holds.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Use {
-    Job(JobId),
-    Session(String),
-}
-
-impl std::fmt::Display for Use {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Job(job) => write!(formatter, "its supervisor runs job {}", job.get()),
-            Self::Session(name) => {
-                write!(formatter, "its supervisor holds the named session {name}")
-            }
         }
     }
 }
@@ -1168,7 +1151,7 @@ mod tests {
 
     proptest! {
         /// The idle clock stops a live daemon exactly once the shed has gone its whole bound
-        /// without use -- a job or session in the ledger at a probe, a job admitted or ended, a
+        /// without use -- a developer job in the ledger at a probe, a job admitted or ended, a
         /// session opened, or a daemon newly up -- and settles a shed whose daemon is gone. A probe
         /// whose ledger holds use never stops one, and a longer bound never stops one sooner.
         #[test]
@@ -1368,14 +1351,13 @@ mod tests {
     }
 
     async fn judge(keeper: &mut NxDaemonKeeper, working: bool, daemon: Probe) -> Verdict {
-        let working = working.then(|| Use::Job(JobId::new(1).expect("a job id")));
+        let working = working.then(|| JobId::new(1).expect("a job id"));
         keeper.judge(Path::new(NO_PROJECT), working, daemon).await
     }
 
     /// A shed keeps a daemon for [`IDLE`] from its last use and no longer. Its supervisor's start
-    /// is no use: a keeper nothing has used wants no daemon at its first probe. A job or session
-    /// is use at every probe, and a probe that finds the shed in use after it was released asks
-    /// for a daemon again.
+    /// is no use: a keeper nothing has used wants no daemon at its first probe. A developer job
+    /// is use at every probe, and new use after release asks for a daemon again.
     #[tokio::test(start_paused = true)]
     async fn a_keeper_releases_the_daemon_of_a_shed_unused_for_the_idle_interval() {
         let mut keeper = keeper();
@@ -1522,26 +1504,25 @@ mod tests {
         );
     }
 
-    /// A kept daemon names what in the ledger keeps it, a job or a named session, for as long as
-    /// it lasts; once the ledger holds neither, nothing keeps it.
+    /// A kept daemon names its running developer job; only an event or a running job is use.
     #[tokio::test(start_paused = true)]
     async fn a_kept_daemon_names_what_in_the_ledger_keeps_it() {
         let mut keeper = keeper();
         let root = Path::new(NO_PROJECT);
-        let job = Use::Job(JobId::new(7).expect("a job id"));
+        let job = JobId::new(7).expect("a job id");
         assert_eq!(
-            keeper.judge(root, Some(job.clone()), Probe::Live).await,
+            keeper.judge(root, Some(job), Probe::Live).await,
             Verdict::Keep
         );
         assert_eq!(keeper.kept_by, Some(job));
         tokio::time::advance(IDLE * 2).await;
-        let session = Use::Session("build".to_owned());
+        let next = JobId::new(8).expect("another job id");
         assert_eq!(
-            keeper.judge(root, Some(session.clone()), Probe::Live).await,
+            keeper.judge(root, Some(next), Probe::Live).await,
             Verdict::Keep,
-            "a job or session is use however long it lasts"
+            "a running developer job is use however long it lasts"
         );
-        assert_eq!(keeper.kept_by, Some(session));
+        assert_eq!(keeper.kept_by, Some(next));
         assert_eq!(keeper.judge(root, None, Probe::Live).await, Verdict::Keep);
         assert_eq!(keeper.kept_by, None);
     }

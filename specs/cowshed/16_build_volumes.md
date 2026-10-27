@@ -1354,10 +1354,12 @@ map, and the probe's bookkeeping must not reach either candidate image.
   birth/group is the only ledger ownership proof; a daemon record never enrolls a new process. That maintenance job is
   excluded from user-activity and idle checks, while quiescence and retirement stop and wait for it through the ordinary
   job lifecycle.
-- An idle shed's daemon is stopped, never disabled. Five minutes after a shed was last in use, its keeper stops its
-  daemon and starts none until the shed is in use again (04_sandbox.md), and the next Nx command starts one. What the
-  rule protects is the warm state of a shed in use; a daemon nothing uses is a resident process, its plugin workers and
-  a file watcher recomputing the project graph for every change in a tree nobody builds.
+- An idle shed's daemon is stopped, never disabled. After the configured idle interval (five minutes by default) without
+  developer activity, its keeper stops its daemon and starts none until the shed is in use again (04_sandbox.md), and
+  the next Nx command starts one. A named session's opening is one use; its idle handle is not a continuing hold on Nx.
+  Real job admission and conclusion restart the interval; probes and maintenance do not. What the rule protects is the
+  warm state of a shed in use; a daemon nothing uses is a resident process, its plugin workers and a file watcher
+  recomputing the project graph for every change in a tree nobody builds.
 - **A daemon answers from the files as they are.** A daemon whose file watcher stops delivering is blind to every later
   change and would hash tasks from the files it last saw: a shed's daemon received no event for 33 minutes (its FSEvents
   stream stopped with no error; Nx 23.2.1 drops FSEvents' rescan flags) and called a changed input's target "[existing

@@ -7023,6 +7023,71 @@ async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drain
     h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
+/// A named session held open without a job, and the foreground maintenance job, are not continuous
+/// developer use: reopening the same handle, a keyed repeat of an admitted exec and reading actor
+/// state do not revive an expired interval; only a new named session's opening does.
+#[tokio::test(start_paused = true)]
+async fn idle_named_handles_and_maintenance_do_not_keep_the_nx_daemon_resident() {
+    let (config, _root) = nx_project("idle-handles");
+    let mut h = real_store_harness(config);
+    let session = open_named(&h.handle, "build").await;
+    let maintenance = h
+        .spawned
+        .recv()
+        .await
+        .expect("session opening starts maintenance");
+    let job = h
+        .handle
+        .exec(
+            Some(&session),
+            None,
+            keyed("idle-handles-command", StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let command = h.spawned.recv().await.expect("a real session command");
+    assert_eq!(command.request.job_id, job);
+    complete(&command, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    tokio::time::sleep(NX_IDLE + NX_PROBES).await;
+    let _ = h.handle.list().await.unwrap();
+    let _ = h.handle.nx_daemon_keeper().await.unwrap();
+    let same = open_named(&h.handle, "build").await;
+    assert_eq!(session, same, "an existing session is not a new opening");
+    assert_eq!(
+        h.handle
+            .exec(
+                Some(&session),
+                None,
+                keyed("idle-handles-command", StdinSource::Empty),
+                AdmissionSource::Worker,
+            )
+            .await
+            .unwrap(),
+        job,
+        "a keyed replay is not a real admission"
+    );
+    complete(&maintenance, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(maintenance.request.job_id).await.unwrap();
+    assert!(
+        tokio::time::timeout(NX_PROBES, h.spawned.recv())
+            .await
+            .is_err(),
+        "idle handles, keyed replays, reads and maintenance admission/end admit no successor"
+    );
+    h.handle.close_session(session).await.unwrap();
+    let _new = open_named(&h.handle, "build").await;
+    let restart = h
+        .spawned
+        .recv()
+        .await
+        .expect("a new session opening is one use");
+    complete(&restart, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(restart.request.job_id).await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+}
+
 /// How long a shed must go unused before its keeper stops the daemon it keeps.
 const NX_IDLE: Duration = Duration::from_secs(5 * 60);
 
