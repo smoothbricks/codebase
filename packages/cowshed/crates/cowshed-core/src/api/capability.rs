@@ -1741,6 +1741,9 @@ async fn run_controller_actor(
     let mut streams = std::collections::HashMap::<u64, OpenStream>::new();
     let mut next_id = 1_u64;
     let mut closing = None;
+    // Calls that failed SILENT and are still open at the controller: an answer that arrives for
+    // one is read and dropped, and each holds its in-flight slot until it does.
+    let mut abandoned = std::collections::HashSet::<u64>::new();
     // The controller's silence while it owes an answer, and the op its last heartbeat named.
     let mut stalled = ControllerSilence::start();
     let failure = loop {
@@ -1754,7 +1757,7 @@ async fn run_controller_actor(
             // is judged: the silence arm is polled last.
             biased;
             () = std::future::ready(()),
-                if pending.len() < MAX_IN_FLIGHT_REQUESTS && !waiting.is_empty() => {
+                if pending.len() + abandoned.len() < MAX_IN_FLIGHT_REQUESTS && !waiting.is_empty() => {
                 waiting.pop_front().expect("the enabled admission branch has a queued call")
             }
             message = messages.recv() => {
@@ -1762,7 +1765,7 @@ async fn run_controller_actor(
                 let Some(message) = message else { return };
                 match message {
                     ActorMessage::Call(call) => {
-                        if pending.len() >= MAX_IN_FLIGHT_REQUESTS || !waiting.is_empty() {
+                        if pending.len() + abandoned.len() >= MAX_IN_FLIGHT_REQUESTS || !waiting.is_empty() {
                             waiting.push_back(call);
                             continue;
                         }
@@ -1837,6 +1840,9 @@ async fn run_controller_actor(
                     }
                     Some(Ok(Inbound::Step { id, report })) => {
                         let Some(listener) = listeners.get(&id) else {
+                            if abandoned.contains(&id) {
+                                continue;
+                            }
                             break CowshedError::internal(
                                 "controller RPC step did not match a pending call that asked for steps",
                             );
@@ -1894,6 +1900,9 @@ async fn run_controller_actor(
                 }
                 listeners.remove(&answer.id);
                 let Some(reply) = pending.remove(&answer.id) else {
+                    if abandoned.remove(&answer.id) {
+                        continue;
+                    }
                     break CowshedError::internal(
                         "controller RPC response id did not match a pending request",
                     );
@@ -1912,7 +1921,34 @@ async fn run_controller_actor(
                     continue;
                 }
                 let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.take() };
-                break silent_controller(&stalled.idle.silent(holder, deadline::clock()));
+                let silent = silent_controller(&stalled.idle.silent(holder, deadline::clock()));
+                // SILENT ends the waits, never the connection: a `cowshed controller` exits once
+                // its peer closes its end (06_cli.md), and every other op shares it.
+                for (id, reply) in pending.drain() {
+                    listeners.remove(&id);
+                    abandoned.insert(id);
+                    let _ = reply.send(Err(silent.clone()));
+                }
+                let silenced = streams
+                    .iter_mut()
+                    .filter_map(|(id, stream)| {
+                        let waiting = stream.waiting.take()?;
+                        let _ = waiting.send(Err(silent.clone()));
+                        stream.closing = true;
+                        Some(*id)
+                    })
+                    .collect::<Vec<_>>();
+                let mut closed = Ok(());
+                for id in silenced {
+                    closed = send_demand(&mut writer, id, codec::Demand::Close).await;
+                    if closed.is_err() {
+                        break;
+                    }
+                }
+                if let Err(error) = closed {
+                    break error;
+                }
+                continue;
             }
         };
         let ActorCall {
@@ -3400,6 +3436,52 @@ mod tests {
             failure.message
         );
         drop(server);
+    }
+
+    /// 05_gateway.md "Deadlines": SILENT ends the waits, never the controller. A `cowshed
+    /// controller` exits once its peer closes its end (06_cli.md), so the connection stays open:
+    /// an answer the controller sends late for a call that failed SILENT is read and dropped, and
+    /// the next call is served on the same connection.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_controller_keeps_its_connection_and_answers_the_next_call() {
+        let (runtime, mut server) = actor_in_memory();
+        let silent = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let (_, request) = read_rpc_request(&mut server).await;
+        let late = request["id"].as_u64().expect("the silent call's id");
+        let failure = silent
+            .await
+            .expect("the silent call joins")
+            .expect_err("a silent controller's call fails");
+        assert!(
+            failure.message.starts_with("SILENT: "),
+            "{}",
+            failure.message
+        );
+        let answer = codec::encode_rpc_success(late, &json!({"late": true}), None).unwrap();
+        write_rpc_frame(&mut server, &answer)
+            .await
+            .expect("the controller's end stays open after SILENT");
+        let next = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let (_, request) = read_rpc_frame(&mut server)
+            .await
+            .map(|bytes| ((), serde_json::from_slice::<Value>(&bytes).unwrap()))
+            .expect("the next call reaches the controller on the same connection");
+        let id = request["id"].as_u64().expect("the next call's id");
+        assert_ne!(id, late, "the next call is a new call");
+        let answer = codec::encode_rpc_success(id, &json!({"state": "running"}), None).unwrap();
+        write_rpc_frame(&mut server, &answer).await.unwrap();
+        let answered = next
+            .await
+            .expect("the next call joins")
+            .expect("the next call is answered, and the late answer before it was dropped");
+        assert_eq!(answered, json!({"state": "running"}));
     }
 
     /// 05_gateway.md "Deadlines": a controller that heartbeats keeps a slow call waiting however
