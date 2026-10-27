@@ -1429,18 +1429,22 @@ working tree, parent symlink replacement, and directory membership changes canno
 `EnsureBuiltReceipt`, not a cache hit re-probed under the consumer's environment. The producer opts into publication in
 its own Nx plugin options as
 `producerReceipts: { targets: ["lmao:rust-dist", "lmao:cargo-wasm:production", "lmao:cargo-thread-ffi"] }`, naming every
-target a consumer's snapshot declaration names. The pre-task hook captures the committed HEAD/tree and
-tracked-source/tool basis; the post-task hook uses Nx's actual successful `TaskResults`, hashes/hash details, argv and
-start/end times, including successful uncacheable prerequisites, and atomically publishes the receipt in that checkout's
-`.cache/producer-receipts`. That is its source tree, not Nx's workspace-data: under cowshed workspace-data is build
-state on the checkout's build volume, which a consumer's read grant of the provider checkout does not reach, so the
-consumer could not read the receipt it validates. The directory ignores itself with a `.gitignore` of `*`, so no
-checkout tracks a record and Nx never hashes one. A missing receipt refuses naming the path it was looked for at; a
-receipt the consumer cannot read refuses with the read error (EPERM under a sandbox). Disabled publication performs no
-source prepass, so an ordinary consumer CLI pays none of that producer work. No file permission, path, daemon state or
-cached row can invent a completion receipt. Nx takes one pre/post task-hook pair per plugin, so the plugin's pair runs
-the controller's `COWSHED_NX_TASK_RECEIPT_ID` task-results hint first and these producer hooks second, each with the
-same options and run context and neither reading the other's output.
+target a consumer's snapshot declaration names. The pre-task hook uses Nx's supplied project/task graphs and captures
+only configured roots scheduled in that invocation, including roots reached as dependencies. An invocation that runs
+none performs no source or tool census; a read-only wrapper probe likewise executes no producer tasks. Selected roots
+share one Git/tracked-source acquisition, with each root's precise public-output exclusions kept separate. The hook
+captures the committed HEAD/tree and tracked-source/tool basis; the post-task hook uses Nx's actual successful
+`TaskResults`, hashes/hash details, argv and start/end times, including successful uncacheable prerequisites, and
+atomically publishes the receipt in that checkout's `.cache/producer-receipts`. That is its source tree, not Nx's
+workspace-data: under cowshed workspace-data is build state on the checkout's build volume, which a consumer's read
+grant of the provider checkout does not reach, so the consumer could not read the receipt it validates. The directory
+ignores itself with a `.gitignore` of `*`, so no checkout tracks a record and Nx never hashes one. A missing receipt
+refuses naming the path it was looked for at; a receipt the consumer cannot read refuses with the read error (EPERM
+under a sandbox). Disabled publication performs no source prepass, so an ordinary consumer CLI pays none of that
+producer work. No file permission, path, daemon state or cached row can invent a completion receipt. Nx takes one
+pre/post task-hook pair per plugin, so the plugin's pair runs the controller's `COWSHED_NX_TASK_RECEIPT_ID` task-results
+hint first and these producer hooks second, each with the same options and run context and neither reading the other's
+output.
 
 The receipt binds the selected target, basis commit SHA and committed tree SHA, actual argv, declared producer
 environment identity and bound tool/module inputs, independent product output SHA-256, measured wall time, and an
@@ -1464,22 +1468,22 @@ external inputs (`AllExternalDependencies` and the npm nodes of its project's de
 identities: the task's hash details and the committed `bun.lock` bind them, and no installed closure is resolved for
 them, since under Bun's isolated linker most of them do not resolve from the task's project.
 
-The pre-task hook stats every node of that installed closure on every run, and that is what lets it skip reading bytes.
-The census is a function of the nodes' stamps (device, inode, mode, size, and mtime and ctime in nanoseconds), not of
-the moment it runs: the hook records the census it took in Nx's workspace-data (`producer-installation-census.json`, a
-hash source, never a proof), and the next run takes the hash of every file whose stamp has not moved and that the record
-did not read in the tick it changed in. An unchanged closure reads no file bytes; a developer-linked package whose
-`dist` a rebuild rewrites in place, with no lockfile or `node_modules` change, moves those files' ctimes and they are
-read again. No cheaper generation (a lockfile, a manifest, an install marker) keys it, since such a rebuild moves none
-of those. The tool's nodes take the hash the census read instead of reading each file a second time: a write landing
-between two reads could make them disagree. Nor does the census take a stat pass of its own to prove itself: the tool's
-nodes stat each of its nodes again, a file whose stamp moved since the census read it is read again, and the capture's
-stability check refuses a tool node that moves before publication. For a consumer that links this plugin from a checkout
-(about 28,000 closure nodes) the hook took 9-17 s of synchronous I/O on the plugin worker before, with every file read
-twice, and 6-9 s after, almost all of it stats; on a host whose disk-image layer is saturated the reads ran for minutes,
-while the worker's event loop could neither answer Nx nor reap its exited children. The hook's phases are performance
-measures (`producerReceipts:graph`, `producerReceipts:source`, `producerReceipts:tools`, `producerReceipts:census`),
-which Nx reports under `NX_PERF_LOGGING=true`.
+For an invocation with selected producers, the pre-task hook stats every node of that installed closure, and that is
+what lets it skip reading bytes. The census is a function of the nodes' stamps (device, inode, mode, size, and mtime and
+ctime in nanoseconds), not of the moment it runs: the hook records the census it took in Nx's workspace-data
+(`producer-installation-census.json`, a hash source, never a proof), and the next run takes the hash of every file whose
+stamp has not moved and that the record did not read in the tick it changed in. An unchanged closure reads no file
+bytes; a developer-linked package whose `dist` a rebuild rewrites in place, with no lockfile or `node_modules` change,
+moves those files' ctimes and they are read again. No cheaper generation (a lockfile, a manifest, an install marker)
+keys it, since such a rebuild moves none of those. The tool's nodes take the hash the census read instead of reading
+each file a second time: a write landing between two reads could make them disagree. Nor does the census take a stat
+pass of its own to prove itself: the tool's nodes stat each of its nodes again, a file whose stamp moved since the
+census read it is read again, and the capture's stability check refuses a tool node that moves before publication. For a
+consumer that links this plugin from a checkout (about 28,000 closure nodes) the hook took 9-17 s of synchronous I/O on
+the plugin worker before, with every file read twice, and 6-9 s after, almost all of it stats; on a host whose
+disk-image layer is saturated the reads ran for minutes, while the worker's event loop could neither answer Nx nor reap
+its exited children. The hook's phases are performance measures (`producerReceipts:source`, once per selected
+invocation, `producerReceipts:tools`, `producerReceipts:census`), which Nx reports under `NX_PERF_LOGGING=true`.
 
 Validity compares the committed tree, not the current HEAD spelling. An empty commit with an identical tree keeps the
 receipt valid and its original basis SHA unchanged; the consumer never rewrites that provenance. A genuinely changed

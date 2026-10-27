@@ -117,6 +117,20 @@ require `python3 tooling/nx_patch.py --check` to reproduce the current patch byt
 regenerate both patch copies with `python3 tooling/nx_patch.py`. Retire the prepared copy and install normally as
 specified there. Do not splice Bun-generated sections or hand-edit the generated patch.
 
+## Pre-task producer selection
+
+The pre-task context carries the project graph already loaded by Nx and a task graph expanded by Nx from the
+invocation's normalized projects, targets, configuration, overrides and dependency-selection option. Producer hooks
+select configured canonical roots from those task identities instead of parsing argv, asking for another project graph,
+or capturing every configured producer before an unrelated command. Configuration and dependency expansion for that
+membership test remain Nx's authority. Hooks still run before task hashing and sync processing; a later graph change
+cannot publish without matching actual POST results and the existing source/configuration checks. A wrapper probe that
+executes no tasks supplies an empty task graph.
+
+The producer source tests cover shared acquisition with independent output exclusions; the linked-snapshot smoke uses
+real Nx pre/post hooks and validates the published completion through the consumer operation. Retire this patch when
+upstream supplies the same pre-task selection context.
+
 ## Root-only raw-input inspection
 
 `getTaskRawInputs` returns only the requested canonical task's inputs. Upstream nevertheless asks the native inspector

@@ -13,6 +13,7 @@ import type { EnsureBuiltProducerReceipt } from './ensure-built.js';
 import {
   boundedReceiptRuntimes,
   captureProducerSource,
+  captureProducerSources,
   dirtyProviderPaths,
   type ProducerSourceWitness,
   type ProviderInputProof,
@@ -314,6 +315,62 @@ describe('a tracked public output', () => {
     expect(providerReceipt(root, produced.id, [produced], reads(), expandOutputs, edited, producer).disposition).toBe(
       'failed',
     );
+  });
+});
+
+describe('shared producer source capture', () => {
+  it("shares file identities but never another target's output exemption", async () => {
+    await writeFile(join(root, 'generated.txt'), 'generated');
+    git('add', 'generated.txt');
+    git('-c', 'user.name=Receipt fixture', '-c', 'user.email=receipt@example.invalid', 'commit', '-qm', 'generated');
+    const captured = captureProducerSources(
+      root,
+      new Map([
+        ['emitter', ['generated.txt']],
+        ['reader', []],
+      ]),
+    );
+    if (!captured.ok) throw new Error(captured.detail);
+    const emitter = captured.value.get('emitter');
+    const reader = captured.value.get('reader');
+    expect(emitter?.files).toBe(reader?.files);
+    expect(emitter?.files.map(({ path }) => path)).toContain('generated.txt');
+    expect(emitter?.nodes.some(({ path }) => path === join(root, 'generated.txt'))).toBe(false);
+    expect(reader?.nodes.some(({ path }) => path === join(root, 'generated.txt'))).toBe(true);
+    await writeFile(join(root, 'generated.txt'), 'other bytes');
+    expect(
+      captureProducerSources(
+        root,
+        new Map([
+          ['emitter', ['generated.txt']],
+          ['reader', []],
+        ]),
+      ).ok,
+    ).toBe(false);
+    const outputOnly = captureProducerSources(
+      root,
+      new Map([
+        ['first', ['generated.txt']],
+        ['second', ['generated.txt']],
+      ]),
+    );
+    if (!outputOnly.ok) throw new Error(outputOnly.detail);
+    expect(outputOnly.value.get('first')?.files.map(({ path }) => path)).not.toContain('generated.txt');
+  });
+  it('never exempts graph configuration, even when every producer declares it as output', async () => {
+    await writeFile(join(root, 'package.json'), '{}');
+    git('add', 'package.json');
+    git('-c', 'user.name=Receipt fixture', '-c', 'user.email=receipt@example.invalid', 'commit', '-qm', 'manifest');
+    await writeFile(join(root, 'package.json'), '{"changed":true}');
+    expect(
+      captureProducerSources(
+        root,
+        new Map([
+          ['first', ['package.json']],
+          ['second', ['package.json']],
+        ]),
+      ).ok,
+    ).toBe(false);
   });
 });
 

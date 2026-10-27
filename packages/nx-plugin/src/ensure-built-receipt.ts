@@ -307,6 +307,34 @@ export function captureProducerSource(
     throw error;
   }
 }
+/** Share Git and tracked-byte acquisition, never one target's output exemption with another. */
+export function captureProducerSources(
+  root: string,
+  targets: ReadonlyMap<string, readonly string[]>,
+): ReceiptEvidence<ReadonlyMap<string, ProducerSourceWitness>> {
+  if (targets.size === 0) return { ok: true, value: new Map() };
+  const plans = [...targets].map(([target, outputs]) => ({
+    target,
+    outputs,
+    excluded: new Set(outputs.filter((path) => !graphConfiguration(path))),
+  }));
+  const common = [...(plans[0]?.excluded ?? [])].filter((path) => plans.every(({ excluded }) => excluded.has(path)));
+  const source = captureProducerSource(root, common);
+  if (!source.ok) return source;
+  return {
+    ok: true,
+    value: new Map(
+      plans.map(({ target, outputs, excluded }) => [
+        target,
+        {
+          ...source.value,
+          outputs,
+          nodes: source.value.nodes.filter(({ path }) => !excluded.has(relative(root, path))),
+        },
+      ]),
+    ),
+  };
+}
 export function producerSourceUnchanged(root: string, before: ProducerSourceWitness): ReceiptEvidence<true> {
   const revision = receiptGit(root, ['rev-parse', '--verify', 'HEAD']);
   if (!revision.ok) return revision;

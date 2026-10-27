@@ -4353,6 +4353,27 @@ index 0000000000000000000000000000000000000000..a6b40a520844b6e0ac46cc09c230cf80
 +    });
 +    return () => pending.splice(0);
 +}
+diff --git a/dist/src/project-graph/plugins/public-api.d.ts b/dist/src/project-graph/plugins/public-api.d.ts
+index 9014799cfb98f624d9d2b04891c3c9d876c64916..e29dd0e015e0e63ccdd27c2036b0395f2f2b99fa 100644
+--- a/dist/src/project-graph/plugins/public-api.d.ts
++++ b/dist/src/project-graph/plugins/public-api.d.ts
+@@ -2,6 +2,7 @@ import type { FileMap, ProjectGraph, ProjectGraphExternalNode } from '../../conf
+ import type { ProjectConfiguration } from '../../config/workspace-json-project-json';
+ import type { NxJsonConfiguration } from '../../config/nx-json';
+ import type { TaskResults } from '../../tasks-runner/life-cycle';
++import type { TaskGraph } from '../../config/task-graph';
+ import type { RawProjectGraphDependency } from '../project-graph-builder';
+ export interface CreateNodesContext {
+     readonly nxJsonConfiguration: NxJsonConfiguration;
+@@ -118,6 +119,8 @@ export type PreTasksExecutionContext = {
+     readonly id: string;
+     readonly workspaceRoot: string;
+     readonly nxJsonConfiguration: NxJsonConfiguration;
++    readonly projectGraph: ProjectGraph;
++    readonly taskGraph: TaskGraph;
+     readonly argv: string[];
+ };
+ export type PostTasksExecutionContext = {
 diff --git a/dist/src/project-graph/plugins/tasks-execution-hooks.js b/dist/src/project-graph/plugins/tasks-execution-hooks.js
 index 83c97768834e3f56083d5e5c2ff52806f55e95a3..eb2a4b563448079be79b58540290f41c53d0025d 100644
 --- a/dist/src/project-graph/plugins/tasks-execution-hooks.js
@@ -5275,7 +5296,7 @@ index 0000000000000000000000000000000000000000..c8d00d0f94ed40dfc27b4ffaf0018311
 +    }
 +}
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
-index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd39fe9131 100644
+index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..b1a2a9654962067daeea7f1b2fff7a04c9ba57f1 100644
 --- a/dist/src/tasks-runner/run-command.js
 +++ b/dist/src/tasks-runner/run-command.js
 @@ -41,6 +41,7 @@ const task_profiling_life_cycle_1 = require("./life-cycles/task-profiling-life-c
@@ -5286,7 +5307,16 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd
  const task_telemetry_life_cycle_1 = require("./life-cycles/task-telemetry-life-cycle");
  const task_timings_life_cycle_1 = require("./life-cycles/task-timings-life-cycle");
  const tui_summary_life_cycle_1 = require("./life-cycles/tui-summary-life-cycle");
-@@ -373,8 +374,9 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+@@ -332,6 +333,8 @@ async function runCommand(projectsToRun, currentProjectGraph, { nxJson }, nxArgs
+             id,
+             workspaceRoot: workspace_root_1.workspaceRoot,
+             nxJsonConfiguration: nxJson,
++            projectGraph: currentProjectGraph,
++            taskGraph: (0, create_task_graph_1.createTaskGraph)(currentProjectGraph, extraTargetDependencies ?? {}, projectsToRun.map((project) => project.name), nxArgs.targets, nxArgs.configuration, overrides, extraOptions.excludeTaskDependencies),
+             argv: process.argv,
+         });
+         const startTime = Date.now();
+@@ -373,8 +376,9 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
      const initiatingTasks = tasks.filter((t) => projectNameSet.has(t.target.project) &&
          nxArgs.targets.includes(t.target.target));
      const { lifeCycle, renderIsDone, printSummary, restoreTerminal } = await getTerminalOutputLifeCycle(initiatingProject, initiatingTasks, projectNames, tasks, taskGraph, nxArgs, nxJson, overrides);
@@ -5297,7 +5327,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd
              tasks,
              projectGraph,
              taskGraph,
-@@ -384,7 +386,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+@@ -384,7 +388,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
              loadDotEnvFiles: extraOptions.loadDotEnvFiles,
              initiatingProject,
              initiatingTasks,
@@ -5306,7 +5336,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd
          await renderIsDone.finally(() => restoreTerminal?.());
          if (printSummary) {
              printSummary();
-@@ -395,7 +397,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
+@@ -395,7 +399,7 @@ async function runCommandForTasks(projectsToRun, currentProjectGraph, { nxJson }
              logger_1.logger.log((0, nx_key_1.createNxKeyLicenseeInformation)(nxKey));
          return {
              taskResults,
@@ -5315,7 +5345,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd
          };
      }
      catch (e) {
-@@ -424,18 +426,22 @@ async function printConfigureAiAgentsDisclaimer() {
+@@ -424,18 +428,22 @@ async function printConfigureAiAgentsDisclaimer() {
          // Silently ignore errors
      }
  }
@@ -5347,7 +5377,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd
  }
  async function ensureWorkspaceIsInSyncAndGetGraphs(projectGraph, nxJson, projectNames, nxArgs, overrides, extraTargetDependencies, extraOptions) {
      let taskGraph = createTaskGraphAndRunValidations(projectGraph, extraTargetDependencies ?? {}, projectNames, nxArgs, overrides, extraOptions);
-@@ -659,7 +665,16 @@ function setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles) {
+@@ -659,7 +667,16 @@ function setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles) {
          process.env.NX_LOAD_DOT_ENV_FILES = 'true';
      }
  }
@@ -5365,7 +5395,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd
      setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
      // this needs to be done before we start to run the tasks
      const taskDetails = (0, hash_task_1.getTaskDetails)();
-@@ -674,10 +689,11 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+@@ -674,10 +691,11 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
          ...constructLifeCycles(lifeCycle, taskGraph, nxJson, nxArgs.skipNxCache),
          taskResultsLifecycle,
      ]);
@@ -5379,7 +5409,7 @@ index 4e64afa4fb985191ac8bc0e31a1e380bcecf9427..14723620cb7d8094bff0eb70214442dd
          initiatingProject,
          initiatingTasks,
          projectGraph,
-@@ -735,12 +751,24 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
+@@ -735,12 +753,24 @@ async function invokeTasksRunner({ tasks, projectGraph, taskGraph, lifeCycle, nx
              },
          },
          daemon: client_1.daemonClient,

@@ -29,6 +29,7 @@ import {
 } from './ensure-built.js';
 import {
   captureProducerSource,
+  captureProducerSources,
   type ProducerSourceWitness,
   producerOutputPaths,
   providerReceipt,
@@ -83,7 +84,7 @@ interface RunBasis {
   readonly tools: readonly EnsureBuiltProducerTool[];
   readonly toolNodes: readonly NodeWitness[];
 }
-type RunFrame = ReceiptEvidence<RunBasis>;
+type RunFrame = ReceiptEvidence<RunBasis> & { readonly rootIds: ReadonlyMap<string, string> };
 interface PublishedReceipt {
   readonly version: 1;
   readonly disposition: 'published';
@@ -421,35 +422,51 @@ export async function preTasksExecution(
 ): Promise<void> {
   const targets = configured(options);
   if (targets.length === 0) return;
+  const rootIds = new Map<string, string>();
   try {
     const load = createWorkspaceNxRequire(context.workspaceRoot);
-    // A hook that can hold a run for minutes names its phases: Nx reports each measure under NX_PERF_LOGGING.
-    performance.mark('producerReceipts:graph:start');
-    const projectGraph = await load('nx/src/project-graph/project-graph').createProjectGraphAsync();
-    performance.measure('producerReceipts:graph', 'producerReceipts:graph:start');
-    const bases = new Map<string, TargetBasis>();
+    const projectGraph = context.projectGraph;
+    const graphs = new Map<string, TaskGraph>();
     for (const target of targets) {
-      performance.mark('producerReceipts:source:start');
+      const selected = parseTargetSelector(target);
+      if (selected === null) throw new Error(`Invalid declared producer target ${target}`);
       const graph = targetGraph(context.workspaceRoot, target, projectGraph);
-      const outputs = producerOutputPaths(
-        context.workspaceRoot,
-        Object.values(graph.tasks),
-        load('nx/src/native').expandOutputs,
+      const root = Object.values(graph.tasks).find(
+        (task) => task.target.project === selected.project && task.target.target === selected.target,
       );
-      const source = captureProducerSource(context.workspaceRoot, outputs);
-      performance.measure('producerReceipts:source', 'producerReceipts:source:start');
-      if (!source.ok) {
-        runs.set(context.id, source);
-        return;
-      }
-      bases.set(target, { graph, source: source.value });
+      if (root !== undefined) rootIds.set(target, root.id);
+      const actual = root === undefined ? undefined : context.taskGraph.tasks[root.id];
+      if (actual !== undefined && defaultOverrides(actual)) graphs.set(target, graph);
+    }
+    if (graphs.size === 0) {
+      runs.set(context.id, { ok: false, detail: 'No default producer roots scheduled', rootIds });
+      return;
+    }
+    const outputs = new Map(
+      [...graphs].map(([target, graph]) => [
+        target,
+        producerOutputPaths(context.workspaceRoot, Object.values(graph.tasks), load('nx/src/native').expandOutputs),
+      ]),
+    );
+    performance.mark('producerReceipts:source:start');
+    const sources = captureProducerSources(context.workspaceRoot, outputs);
+    performance.measure('producerReceipts:source', 'producerReceipts:source:start');
+    if (!sources.ok) {
+      runs.set(context.id, { ...sources, rootIds });
+      return;
+    }
+    const bases = new Map<string, TargetBasis>();
+    for (const [target, graph] of graphs) {
+      const source = sources.value.get(target);
+      if (source === undefined) throw new Error('Lost selected producer source basis');
+      bases.set(target, { graph, source });
     }
     performance.mark('producerReceipts:tools:start');
     const tools = toolsFor(context.workspaceRoot, context.nxJsonConfiguration, projectGraph, [...bases.values()]);
     performance.measure('producerReceipts:tools', 'producerReceipts:tools:start');
-    runs.set(
-      context.id,
-      tools.ok
+    runs.set(context.id, {
+      rootIds,
+      ...(tools.ok
         ? {
             ok: true,
             value: {
@@ -460,10 +477,10 @@ export async function preTasksExecution(
               toolNodes: tools.value.nodes,
             },
           }
-        : tools,
-    );
+        : tools),
+    });
   } catch (error) {
-    if (error instanceof Error) runs.set(context.id, { ok: false, detail: error.message });
+    if (error instanceof Error) runs.set(context.id, { ok: false, detail: error.message, rootIds });
     else throw error;
   }
 }
@@ -476,13 +493,7 @@ export async function postTasksExecution(
   for (const target of configured(options)) {
     const selected = parseTargetSelector(target);
     if (selected === null) continue;
-    const targetBasis = frame?.ok === true ? frame.value.targets.get(target) : undefined;
-    const plannedRoot =
-      targetBasis === undefined
-        ? undefined
-        : Object.values(targetBasis.graph.tasks).find(
-            (task) => task.target.project === selected.project && task.target.target === selected.target,
-          );
+    const plannedRoot = frame?.rootIds.get(target);
     const rootResult =
       plannedRoot === undefined
         ? Object.values(context.taskResults).find(
@@ -491,7 +502,7 @@ export async function postTasksExecution(
               task.target.target === selected.target &&
               (selected.configuration === undefined || task.target.configuration === selected.configuration),
           )
-        : context.taskResults[plannedRoot.id];
+        : context.taskResults[plannedRoot];
     if (rootResult === undefined) continue;
     const refuse = (detail: string) => {
       const saved = publish(context.workspaceRoot, target, { version: 1, disposition: 'refused', target, detail });

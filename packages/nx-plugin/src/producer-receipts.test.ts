@@ -123,9 +123,55 @@ describe('actual producer completion evidence', () => {
     ).not.toBe(identity);
   });
   it('disabled producer hooks perform no source, graph or publication work', async () => {
-    const context = { id: 'disabled-hook', workspaceRoot: '/not-a-workspace', nxJsonConfiguration: {}, argv: [] };
+    const context = {
+      id: 'disabled-hook',
+      workspaceRoot: '/not-a-workspace',
+      nxJsonConfiguration: {},
+      argv: [],
+      projectGraph: { nodes: {}, dependencies: {} },
+      taskGraph: graph,
+    };
     await preTasksExecution(undefined, context);
     await postTasksExecution(undefined, { ...context, taskResults: {}, startTime: 10, endTime: 20 });
+  });
+  it('does no capture or publication for absent roots and other configurations', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'producer-selection-')));
+    try {
+      await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
+      const other: Task = { ...task, id: 'app:build:other', target: { ...task.target, configuration: 'other' } };
+      const phases = () =>
+        performance.getEntriesByType('measure').filter(({ name }) => name.startsWith('producerReceipts:'));
+      const before = phases();
+      for (const results of [{}, { [other.id]: { task: other, status: 'success', code: 0 } }] satisfies TaskResults[]) {
+        const context = {
+          id: 'unselected-hook',
+          workspaceRoot: root,
+          nxJsonConfiguration: {},
+          argv: [],
+          projectGraph: {
+            nodes: {
+              app: { name: 'app', type: 'lib', data: { root: '.', targets: { build: { executor: 'nx:noop' } } } },
+            },
+            dependencies: {},
+          } satisfies import('nx/src/config/project-graph').ProjectGraph,
+          taskGraph: { ...graph, tasks: Object.fromEntries(Object.values(results).map(({ task }) => [task.id, task])) },
+        };
+        await preTasksExecution({ producerReceipts: { targets: [task.id] } }, context);
+        await postTasksExecution(
+          { producerReceipts: { targets: [task.id] } },
+          {
+            ...context,
+            taskResults: results,
+            startTime: 10,
+            endTime: 20,
+          },
+        );
+      }
+      expect(phases()).toEqual(before);
+      expect((await readdir(root)).sort()).toEqual(['node_modules']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
   it('publishes a refusal beside a published receipt, never over it, and names it in the miss', async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'producer-refusal-')));

@@ -819,6 +819,9 @@ async function withTaskHooks<Result>(
     id: runId,
     workspaceRoot,
     nxJsonConfiguration: prepared.nxJson,
+    projectGraph: prepared.projectGraph,
+    // This probe executes no tasks; a miss's runner owns its own hook pair.
+    taskGraph: { roots: [], tasks: {}, dependencies: {}, continuousDependencies: {} },
     argv: process.argv,
   });
   const result = await operation(workspaceRoot, selector, prepared);
