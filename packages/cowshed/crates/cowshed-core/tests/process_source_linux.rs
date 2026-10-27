@@ -1732,12 +1732,22 @@ fn reap(pid: libc::pid_t) -> c_int {
 }
 
 /// Reap `pid`, whose exit was already seen, without blocking: no helper thread joins the
-/// observed tree.
+/// observed tree. A process reports its exit before `wait` can take it (a Linux CI runner's
+/// `WNOHANG` found none right after the pidfd said so), so the collection looks again as cowshed's
+/// own does ([`cowshed_os::deadline::collect_exited`]).
 fn reap_exited(pid: libc::pid_t) -> c_int {
-    let (reaped, status) = cowshed_os::test_backstop::waitpid(pid, libc::__WALL | libc::WNOHANG)
-        .unwrap_or_else(|error| panic!("waitpid {pid}: {error}"));
-    assert_eq!(reaped, pid, "waitpid {pid}: the exit seen is there to reap");
-    status
+    cowshed_os::deadline::collect_exited(
+        "oracle grandchild",
+        u32::try_from(pid).expect("pid"),
+        &cowshed_os::deadline::start("test reap", cowshed_os::test_backstop::BACKSTOP),
+        cowshed_os::deadline::Progress::Nothing,
+        || {
+            let (reaped, status) =
+                cowshed_os::test_backstop::waitpid(pid, libc::__WALL | libc::WNOHANG)?;
+            Ok((reaped == pid).then_some(status))
+        },
+    )
+    .unwrap_or_else(|error| panic!("waitpid {pid}: {error}"))
 }
 
 // ---------------------------------------------------------------------------------------------

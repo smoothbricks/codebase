@@ -83,6 +83,16 @@ impl TestGateway {
             .create(&cache)
             .expect("create the gateway's mirror cache");
         let socket = root.join("gateway.sock");
+        // A Linux gateway serves each workspace's data socket under a root of the user's own, 0700.
+        #[cfg(target_os = "linux")]
+        let data = {
+            let data = root.join("data");
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&data)
+                .expect("create the gateway's data socket root");
+            data
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -93,6 +103,8 @@ impl TestGateway {
                 GatewayConfig {
                     control_socket: Some(socket.clone()),
                     mirror_cache: MirrorCacheConfig::new(cache),
+                    #[cfg(target_os = "linux")]
+                    data_socket_root: Some(data),
                     ..GatewayConfig::default()
                 },
                 Arc::new(NoCredentials),

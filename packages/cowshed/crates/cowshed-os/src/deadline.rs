@@ -2176,7 +2176,7 @@ mod tests {
     }
     #[test]
     fn a_raw_child_not_exited_at_the_bound_expires_naming_it_and_stays_unreaped() {
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("600")
             .spawn_locked()
             .expect("spawn sleep");

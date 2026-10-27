@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn a_child_still_running_at_the_bound_fails_naming_it() {
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("600")
             .spawn_locked()
             .expect("spawn sleep");
