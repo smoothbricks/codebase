@@ -5164,6 +5164,49 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     fixture.stop_gateway().await;
 }
 
+/// A land answers once main has moved, adopted and retired (16_build_volumes.md, Land 6.5): its
+/// target's previous volume is still recorded superseded under main when the land answers, and the
+/// collection that releases it runs as `cowshed __collect-build-volumes`, the store's installed
+/// cowshed, logging to `build/.collecting/log`. No release's unmount or detach holds the answer,
+/// however long it takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_land_answers_before_its_previous_volume_is_released() {
+    let rust = RustToolchain::of_this_test();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: None,
+        rust: Some(&rust),
+    })
+    .with_background_program();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let layout = build_volumes(&fixture);
+    let previous = linked_volume(&layout, &fixture.checkout);
+    let workspace = new_workspace(&mut service, "w").await;
+    fs::write(workspace.join("notes.txt"), b"notes\n").unwrap();
+    git(&workspace, &["add", "notes.txt"]);
+    git(&workspace, &["commit", "-q", "-m", "notes"]);
+    let landing = linked_volume(&layout, &workspace);
+    let report = land(&mut service, "w", true, &[CARGO_BUILD]).await;
+    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+    assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
+    assert!(
+        layout.image(&previous).exists(),
+        "the land answered without releasing main's previous volume"
+    );
+    assert!(
+        matches!(
+            layout.read_record(&previous).expect("previous record").role,
+            BuildVolumeRole::Superseded { owner, .. } if owner.is_main()
+        ),
+        "main's previous volume stays recorded as main's for the collection"
+    );
+    assert!(
+        layout.collecting().join("log").is_file(),
+        "the land started its background collection, logging to build/.collecting/log"
+    );
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
 /// Every mounted build volume has a live checkout link, and every supplied link is mounted.
 /// Query the kernel, not sidecars: an unlinked attachment is precisely the regression.
 fn assert_linked_build_mounts(layout: &BuildVolumeLayout, checkouts: &[&Path]) {

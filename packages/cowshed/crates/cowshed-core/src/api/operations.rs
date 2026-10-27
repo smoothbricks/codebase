@@ -354,6 +354,9 @@ operations! {
     internal json "coordinator.refreshBuildState" CoordinatorRefreshBuildState(WorkspaceRequest) -> BuildStateRefresh;
     /// Checks the refreshed immutable main seed and compacts it when it reaches the extent bound.
     internal json "coordinator.compactSeed" CoordinatorCompactSeed(RepoRequest) -> SeedCompactionReport;
+    /// Collects the build volumes nothing links: the `cowshed __collect-build-volumes` process a
+    /// land starts once it answers.
+    internal json "coordinator.collectBuildVolumes" CoordinatorCollectBuildVolumes(RepoRequest) -> GcReport;
     /// Admits one job; inline stdin travels as the upload frame.
     worker upload "worker.exec" WorkerExec(ExecParams) -> JobId;
     /// Writes one chunk of a streamed stdin at its byte offset.

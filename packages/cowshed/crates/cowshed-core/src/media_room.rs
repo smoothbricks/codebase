@@ -249,6 +249,7 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         | Op::CoordinatorDoctor(_)
         | Op::CoordinatorServeSupervisor(_)
         | Op::CoordinatorCompactSeed(_)
+        | Op::CoordinatorCollectBuildVolumes(_)
         | Op::WorkerStdinChunk(_)
         | Op::WorkerStdinClose(_)
         | Op::WorkerListJobs(_)

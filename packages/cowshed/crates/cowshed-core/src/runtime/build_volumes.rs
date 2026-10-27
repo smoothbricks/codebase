@@ -239,23 +239,12 @@ pub(crate) struct SupersededSeeds {
     claims: Vec<ReleaseClaim>,
 }
 
-/// What [`BuildVolumes::adopt`] did: how long the move took, and the target's previous volume.
+/// What [`BuildVolumes::adopt`] did: how long the move took. The target's previous volume is
+/// recorded [`BuildVolumeRole::Superseded`] under the target at its incarnation, for the land's
+/// background collection, or for the end of a job admitted on it before the move.
 #[derive(Debug)]
-#[must_use = "its previous volume is released by release_previous"]
 pub(crate) struct Adopted {
     pub elapsed_ms: u64,
-    pub previous: Superseded,
-}
-
-/// A target's previous build volume once an adoption moved its link off it and recorded it
-/// [`BuildVolumeRole::Superseded`] under the target at its incarnation:
-/// [`BuildVolumes::release_previous`] releases it unless a job admitted on it before the move
-/// still holds it, and then the release when that job's hold ends does.
-#[derive(Debug)]
-#[must_use = "release_previous releases the target's previous build volume"]
-pub(crate) struct Superseded {
-    id: BuildVolumeId,
-    owner: Owner,
 }
 
 /// How near a volume's recorded tree is to the tree a fork checks out (16_build_volumes.md,
@@ -1574,9 +1563,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// Land step 6, under the target's image lock: when nothing opened the closed target's task
     /// database since [`Self::close_target`], give the landing volume the target's daemon records
     /// in place of its own and rename the target's build link onto it. The target's previous
-    /// volume is recorded superseded under the target at its incarnation and answered, for
-    /// [`Self::release_previous`] beside what the land does in the target next. Answers how long
-    /// the move took.
+    /// volume is recorded superseded under the target at its incarnation, for the land's
+    /// background collection (16_build_volumes.md, Land 6.5). Answers how long the move took.
     ///
     /// The look and the rename happen under Nx's own open locks on the target's databases
     /// ([`nx::hold_opens`]). The look alone proves nothing past the moment it lists processes:
@@ -1653,10 +1641,6 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             )?;
             Ok(Ok(Adopted {
                 elapsed_ms: millis(elapsed),
-                previous: Superseded {
-                    id: previous,
-                    owner,
-                },
             }))
         })
         .await
@@ -1696,16 +1680,6 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// error. It needs no target lock: no fork or reseed of the target that took the lock after
     /// the move reads it, and none that held it before the land took it still runs. The
     /// release commits the image to `build/.deleting` and returns; the gateway frees its bytes.
-    pub async fn release_previous(&self, previous: Superseded) -> Result<()> {
-        self.blocking(move |host, layout| {
-            let Superseded { id, owner } = previous;
-            let release = host.release_build_volume(layout, &id).map_err(storage)?;
-            say_release(&id, &format!("{}'s previous", owner.name), &release);
-            Ok(())
-        })
-        .await
-    }
-
     /// The release a job's end owes the volume it was admitted on (16_build_volumes.md,
     /// "Garbage collection"): when that volume is recorded superseded, its owner's link having
     /// moved off it while the job ran, it is released now unless another job still holds it,
@@ -2000,6 +1974,38 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             Ok(registered)
         })
         .await
+    }
+
+    /// Start `program __collect-build-volumes <project_root>` in a session of its own, its stderr
+    /// appended to `build/.collecting/log` (16_build_volumes.md, Land 6.5), and a detached
+    /// reaper for it: the land that starts it answers without waiting. Answers the process's pid
+    /// and its log.
+    pub fn start_collection(&self, program: &Path, project_root: &Path) -> Result<(u32, PathBuf)> {
+        let (mut child, log) = compaction::start_background_verb(
+            program,
+            crate::runtime::project::BUILD_VOLUME_COLLECTION_VERB,
+            project_root,
+            &self.layout.collecting(),
+        )?;
+        let pid = child.id();
+        // WHY unbounded: a detached reaper, with no waiter, collects the child when it ends.
+        #[allow(clippy::disallowed_methods)]
+        let reaper = std::thread::Builder::new()
+            .name("build-volume-collection-reaper".to_owned())
+            .spawn(move || {
+                if let Err(error) = child.wait() {
+                    cowshed_os::eprintln!(
+                        "cowshed: the build-volume collection process {pid} could not be reaped: {error}"
+                    );
+                }
+            });
+        if let Err(error) = reaper {
+            cowshed_os::eprintln!(
+                "cowshed: build-volume collection process {pid} started, logging to {}, but its reaper could not be created: {error}",
+                log.display()
+            );
+        }
+        Ok((pid, log))
     }
 
     /// Next-open recovery of interrupted creations (16_build_volumes.md, "Garbage collection"):
@@ -6809,7 +6815,7 @@ fn main() {
             .await
             .unwrap()
             .expect("nothing holds the target's volume");
-        let adopted = scratch
+        scratch
             .volumes
             .adopt(&locked, &quiet, closed, main_checkout.clone(), tree)
             .await
@@ -6817,11 +6823,6 @@ fn main() {
             .expect("nothing opened the target's volume since");
         drop(quiet);
         drop(locked);
-        scratch
-            .volumes
-            .release_previous(adopted.previous)
-            .await
-            .unwrap();
         let linked = scratch.layout.linked(&main_checkout).unwrap();
         let indexed = sqlite(&landing, "SELECT hash FROM cache_outputs ORDER BY hash;");
         let copied = landing.join("nx/cache/1").exists();
@@ -7184,7 +7185,7 @@ fn main() {
             .await
             .unwrap()
             .expect("nothing holds the target's volume");
-        let adopted = scratch
+        scratch
             .volumes
             .adopt(&locked, &quiet, closed, main_checkout.clone(), tree)
             .await
@@ -7197,14 +7198,14 @@ fn main() {
             Some(topic.clone())
         );
         // The previous volume stays the target's, at its incarnation, recorded superseded by
-        // the move, and is released by its caller.
+        // the move, for the land's background collection to release.
         assert!(matches!(
             scratch.layout.read_record(&previous).unwrap().role,
             BuildVolumeRole::Superseded { owner, .. } if owner.is_main()
         ));
         scratch
             .volumes
-            .release_previous(adopted.previous)
+            .release_superseded(previous.clone())
             .await
             .unwrap();
         assert!(!scratch.layout.image(&previous).exists());
@@ -7685,19 +7686,13 @@ fn main() {
             .await
             .unwrap()
             .expect("nothing holds the target's volume");
-        let adopted = scratch
+        scratch
             .volumes
             .adopt(&locked, &quiet, closed, main_checkout.clone(), tree)
             .await
             .unwrap()
             .expect("nothing opened the target's volume since");
         drop(quiet);
-        scratch
-            .volumes
-            .release_previous(adopted.previous)
-            .await
-            .unwrap();
-
         let after = scratch
             .volumes
             .collect(rm_listed, rm_saw(), false)
@@ -7879,14 +7874,14 @@ fn main() {
                 let Freeze::Frozen { superseded, .. } = frozen else {
                     panic!("nothing holds the landing volume: {frozen:?}");
                 };
-                let adopted = volumes
+                volumes
                     .adopt(&locked, &quiet, closed, main_checkout, tree)
                     .await?
                     .expect("nothing opened the target's volume since");
                 drop(quiet);
                 drop(locked);
                 volumes.retire_superseded(superseded).await;
-                volumes.release_previous(adopted.previous).await
+                Ok::<(), CowshedError>(())
             })
         };
         // The new goes on only once the land runs: whatever the land does next, it does while
@@ -7971,7 +7966,12 @@ fn main() {
             .expect("the land froze main's seed");
         assert_ne!(main_seed, first_seed);
         assert!(!scratch.layout.image(&first_seed).exists());
-        assert!(!scratch.layout.image(&main_live).exists());
+        // Main's previous volume is left recorded superseded under main for the land's background
+        // collection.
+        assert!(matches!(
+            scratch.layout.read_record(&main_live).unwrap().role,
+            BuildVolumeRole::Superseded { owner, .. } if owner.is_main()
+        ));
         scratch.release_all();
     }
 
@@ -8160,10 +8160,7 @@ fn main() {
 
         scratch
             .volumes
-            .release_previous(Superseded {
-                id: previous.clone(),
-                owner: main.clone(),
-            })
+            .release_superseded(previous.clone())
             .await
             .expect("a held previous volume is not the land's failure");
         assert_eq!(scratch.layout.read_record(&previous).unwrap(), superseded);

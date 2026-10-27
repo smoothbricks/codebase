@@ -2,6 +2,7 @@ pub mod agent_cycle;
 pub mod args;
 pub mod build_record;
 pub mod build_state;
+pub mod build_volume_collection;
 pub mod capabilities;
 pub mod code_signing;
 pub mod controller_service;

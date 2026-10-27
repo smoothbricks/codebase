@@ -72,6 +72,11 @@ pub const DEFAULT_LANDING_BRANCH: &str = "main";
 /// compaction"). It is the CLI's on every platform: only a host with build volumes compacts.
 pub const SEED_COMPACTION_VERB: &str = "__compact-seed";
 
+/// The hidden verb a land starts once it answers, to collect the build volumes nothing links:
+/// its target's previous volume, the seeds its freeze replaced and whatever else no checkout
+/// links (`cowshed __collect-build-volumes <project-root>`; 16_build_volumes.md, Land 6.5).
+pub const BUILD_VOLUME_COLLECTION_VERB: &str = "__collect-build-volumes";
+
 /// The sandbox the land's declared-output helper runs in (16_build_volumes.md, step 5.3): the
 /// landing workspace's read-write one, whose shell pool adopts the activation record the
 /// workspace's other jobs left, so the helper finds its `node` without evaluating anything.
@@ -236,6 +241,13 @@ pub trait ProjectRuntimeHost: Send + 'static {
     async fn compact_seed(&mut self) -> Result<crate::api::dto::SeedCompactionReport> {
         Err(CowshedError::internal(
             "compacting a seed is unavailable for this runtime host",
+        ))
+    }
+    /// Collect the build volumes nothing links (16_build_volumes.md, "Garbage collection"): the
+    /// whole of the `cowshed __collect-build-volumes` process a land starts once it answers.
+    async fn background_collection(&mut self) -> Result<GcReport> {
+        Err(CowshedError::internal(
+            "collecting build volumes is unavailable for this runtime host",
         ))
     }
     /// Make room under IOKit's IOMedia match-notification ceiling for what a verb may attach
@@ -1212,6 +1224,18 @@ impl ProjectRuntime {
             )
             .await
     }
+    /// Collect the build volumes nothing links ([`ProjectRuntimeHost::background_collection`]):
+    /// the whole of the `cowshed __collect-build-volumes` process.
+    pub async fn collect_build_volumes(&self) -> Result<GcReport> {
+        self.router
+            .call::<operations::CoordinatorCollectBuildVolumes>(
+                self.coordinator(),
+                operations::RepoRequest {
+                    repo_id: self.descriptor.repo_id.clone(),
+                },
+            )
+            .await
+    }
     fn coordinator(&self) -> ConnectionAuthority {
         ConnectionAuthority::Coordinator {
             repo_id: self.descriptor.repo_id.clone(),
@@ -1519,6 +1543,12 @@ impl ProjectActor {
             Op::CoordinatorCompactSeed(params) => {
                 self.require_repo(&params.repo_id)?;
                 respond::<operations::CoordinatorCompactSeed>(&self.host.compact_seed().await?)
+            }
+            Op::CoordinatorCollectBuildVolumes(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorCollectBuildVolumes>(
+                    &self.host.background_collection().await?,
+                )
             }
             Op::CoordinatorRefreshBuildState(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -5531,6 +5561,37 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// now unless a job holds it, and every one left is said on stderr with the reason, the
     /// routine ones (a detached or still-forming workspace's own) counted on one line, so a
     /// volume that stays is never a silent skip.
+    /// The collection a land owes once it has moved, adopted and retired (16_build_volumes.md,
+    /// Land 6.5): the target's previous volume, the seeds its freeze replaced and whatever else no
+    /// checkout links. It runs as `cowshed __collect-build-volumes`, the store's installed cowshed,
+    /// in a session of its own logging to `build/.collecting/log`, so no release's unmount or
+    /// detach holds the land's answer. A store with no installed cowshed has no program for it,
+    /// and the land collects before it answers, saying so.
+    async fn collect_after_land(&self) -> Result<()> {
+        let program = crate::host_dirs::installed_binary_directory(&self.home).join("cowshed");
+        if !program.is_file() {
+            cowshed_os::eprintln!(
+                "cowshed: {} is not installed, so this land collects its build volumes before it answers",
+                program.display()
+            );
+            return self.collect_build_volumes().await;
+        }
+        match self
+            .build_volumes()?
+            .start_collection(&program, &self.descriptor.git_root)
+        {
+            Ok((pid, log)) => cowshed_os::eprintln!(
+                "cowshed: build-volume collection runs as process {pid}, logging to {}",
+                log.display()
+            ),
+            Err(failed) => cowshed_os::eprintln!(
+                "cowshed: build-volume collection was not started: {}; the next land, `rm` or `gc` collects what it would have",
+                failed.message
+            ),
+        }
+        Ok(())
+    }
+
     async fn collect_build_volumes(&self) -> Result<()> {
         let (images, links) = self.build_volume_links().await?;
         let collection = self.build_volumes()?.collect(images, links, false).await?;
@@ -6072,10 +6133,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 }
                 Adoption::Skipped { reason }
             }
-            Ok(super::build_volumes::Adopted {
-                elapsed_ms,
-                previous,
-            }) => {
+            Ok(super::build_volumes::Adopted { elapsed_ms }) => {
                 // A kept workspace's capture of the target's new seed is the last step under the
                 // target's image lock; its publication, mount and link run after it.
                 let refork = if retire {
@@ -6098,60 +6156,32 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     }
                 };
                 // Nothing links the previous volume and its record says superseded under the
-                // target, and no fork reads a superseded seed, so their releases (each a rename,
-                // sync and nudge to the gateway, and for the volume an unmount and detach
-                // waiting on storagekitd) run once the lock is let go, beside the target's next
-                // steps. A job admitted on the previous volume before the move keeps it,
-                // recorded as the target's, until that job's end releases it.
-                let release = async {
-                    if let Some(superseded) = superseded {
-                        volumes.retire_superseded(superseded).await;
-                    }
-                    timed_async(
-                        "land",
-                        "release-previous",
-                        volumes.release_previous(previous),
-                    )
-                    .await
-                };
-                let in_target = async {
-                    if let Some(refork) = refork {
-                        timed_async("land", "refork", volumes.ready_refork(refork)).await?;
-                    }
-                    let _landing_hold = quiet.release_admission();
-                    // Each moved link's volume carries the label of the checkout that built it:
-                    // the target's supervisor names the adopted one now, in the background, and a
-                    // kept workspace's supervisor, started on its fresh clone, names that one as
-                    // it starts.
-                    let target = self.ensure_supervisor(&into.name).await?;
-                    target
-                        .name_build_volume(volumes.layout.grant(&into.name, &into.mount)?)
-                        .await?;
-                    if !retire {
-                        self.ensure_supervisor(workspace).await?;
-                    }
-                    timed_async(
-                        "land",
-                        "adoption-check",
-                        self.check_adoption(&into.name, &into.mount, checks),
-                    )
-                    .await
-                };
-                let check = match tokio::join!(release, in_target) {
-                    (Ok(()), check) => check?,
-                    (Err(release), Ok(_)) => return Err(release),
-                    // The land fails for what failed in the target; the previous volume stays
-                    // recorded superseded under the target, for its owner's retirement or the
-                    // next collection.
-                    (Err(release), Err(error)) => {
-                        cowshed_os::eprintln!(
-                            "cowshed: {}'s previous build volume stays recorded as {}'s: {release}; the next `cowshed land`, `rm` or `gc` retries it",
-                            into.name,
-                            into.name
-                        );
-                        return Err(error);
-                    }
-                };
+                // target, as the seeds the freeze replaced are, and no fork reads a superseded
+                // seed: the land's background collection releases them once the land answers
+                // (`collect_after_land`), so their unmounts and detaches never hold the land. A
+                // job admitted on the previous volume before the move keeps it, recorded as the
+                // target's, until that job's end releases it.
+                if let Some(refork) = refork {
+                    timed_async("land", "refork", volumes.ready_refork(refork)).await?;
+                }
+                let _landing_hold = quiet.release_admission();
+                // Each moved link's volume carries the label of the checkout that built it:
+                // the target's supervisor names the adopted one now, in the background, and a
+                // kept workspace's supervisor, started on its fresh clone, names that one as
+                // it starts.
+                let target = self.ensure_supervisor(&into.name).await?;
+                target
+                    .name_build_volume(volumes.layout.grant(&into.name, &into.mount)?)
+                    .await?;
+                if !retire {
+                    self.ensure_supervisor(workspace).await?;
+                }
+                let check = timed_async(
+                    "land",
+                    "adoption-check",
+                    self.check_adoption(&into.name, &into.mount, checks),
+                )
+                .await?;
                 Adoption::Adopted { elapsed_ms, check }
             }
         };
@@ -16805,12 +16835,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     })?;
             }
         }
-        // One collection after the unit's retirement and its folds' release their volumes. A land
-        // that keeps the workspace collects too, so the target's previous volume and whatever else
-        // no checkout links goes with every land; an ungated land that kept its unit released no
-        // volume, so it has nothing to collect.
+        // One collection after the unit's retirement and its folds' release their volumes, in the
+        // background once the land answers. A land that keeps the workspace collects too, so the
+        // target's previous volume and whatever else no checkout links goes with every land; an
+        // ungated land that kept its unit released no volume, so it has nothing to collect.
         if retire || plan == LandPlan::Gated {
-            self.collect_build_volumes().await.map_err(|failed| {
+            self.collect_after_land().await.map_err(|failed| {
                 CowshedError::new(
                     failed.code,
                     format!(
@@ -16894,6 +16924,24 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
     async fn serve_supervisor(&mut self, workspace: WorkspaceName) -> Result<()> {
         self.serve_supervisor_until_retired(workspace).await
+    }
+
+    /// The whole of the `cowshed __collect-build-volumes` process a land starts once it answers
+    /// (16_build_volumes.md, Land 6.5): one collection of what no checkout links, reported as
+    /// `gc` reports its build volumes.
+    async fn background_collection(&mut self) -> Result<GcReport> {
+        self.validate_binding().await?;
+        let (images, links) = self.build_volume_links().await?;
+        let collection = self.build_volumes()?.collect(images, links, false).await?;
+        Ok(GcReport {
+            examined: collection.examined,
+            reclaimed: collection.reclaimed,
+            retained_active: 0,
+            released_bytes: collection.released_bytes,
+            dry_run: false,
+            candidates: collection.candidates,
+            deferred: collection.deferred.into_iter().map(Into::into).collect(),
+        })
     }
 
     /// A compaction that ends in an error records it, so no land of this build starts another

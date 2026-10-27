@@ -138,35 +138,37 @@ pub(crate) fn lands_hold(
     Ok((!held.is_empty()).then(|| format!("lands hold turns: {}", held.join(", "))))
 }
 
-/// Start `program __compact-seed <project_root>` in a session of its own, so the land's terminal
-/// and process group end nothing of it, with its stdout discarded and its stderr appended to the
-/// log in `compacting`, which is created first: the first compaction of a project finds none. It
-/// inherits no descriptor but its stdio: a held lock the land's command inherited (02_workspaces.md
-/// "Held locks") would otherwise stay held for the whole copy. Returns the process and its log.
-pub(crate) fn start_compaction(
+/// Start `program <verb> <project_root>`, a background cowshed verb of the project (the seed
+/// compaction, the collection a land starts), in a session of its own, so the land's terminal and
+/// process group end nothing of it, with its stdout discarded and its stderr appended to the log
+/// in `directory`, which is created first: the project's first run finds none. It inherits no
+/// descriptor but its stdio: a held lock the land's command inherited (02_workspaces.md "Held
+/// locks") would otherwise stay held for the whole run. Returns the process and its log.
+pub(crate) fn start_background_verb(
     program: &Path,
+    verb: &str,
     project_root: &Path,
-    compacting: &Path,
+    directory: &Path,
 ) -> Result<(Child, PathBuf)> {
     use std::os::unix::process::CommandExt;
-    fs::create_dir_all(compacting)
-        .map_err(|error| io("create the seed compaction directory", compacting, &error))?;
-    let log = compacting.join(LOG);
+    fs::create_dir_all(directory)
+        .map_err(|error| io(&format!("create the {verb} directory"), directory, &error))?;
+    let log = directory.join(LOG);
     let output = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log)
-        .map_err(|error| io("open the seed compaction log", &log, &error))?;
+        .map_err(|error| io(&format!("open the {verb} log"), &log, &error))?;
     let mut command = Command::new(program);
     command
-        .arg(SEED_COMPACTION_VERB)
+        .arg(verb)
         .arg(project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(output);
     crate::exec::prepare_child_descriptors(&mut command).map_err(|failure| {
         io(
-            "seal the seed compaction's descriptors",
+            &format!("seal the {verb} process's descriptors"),
             program,
             &failure.source,
         )
@@ -181,7 +183,7 @@ pub(crate) fn start_compaction(
         });
     }
     let process = cowshed_os::fork_lock::Spawn::spawn_locked(&mut command)
-        .map_err(|error| io("start the seed compaction", program, &error))?;
+        .map_err(|error| io(&format!("start {verb}"), program, &error))?;
     Ok((process, log))
 }
 /// Whether necessary work on main's seed advises a background compaction. The receipt
@@ -283,8 +285,12 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let executable = std::env::current_exe().map_err(|error| {
                 io("find this cowshed executable", Path::new("cowshed"), &error)
             })?;
-            let (mut child, log) =
-                start_compaction(&executable, project_root, &self.layout.compacting())?;
+            let (mut child, log) = start_background_verb(
+                &executable,
+                SEED_COMPACTION_VERB,
+                project_root,
+                &self.layout.compacting(),
+            )?;
             let pid = child.id();
             // WHY unbounded: a detached reaper, with no waiter, collects the child when it ends.
             #[allow(clippy::disallowed_methods)]
@@ -338,7 +344,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         // through. It is admission, never a wait: a second process answers `Running` and exits.
         // The descriptor is close-on-exec from its `open` and held in a `Fenced`, so no child of
         // this process holds the lease past `exec`, and the process itself starts with every
-        // inherited descriptor sealed ([`start_compaction`]).
+        // inherited descriptor sealed ([`start_background_verb`]).
         let path = directory.join(LOCK);
         let file = OpenOptions::new()
             .create(true)
@@ -623,7 +629,7 @@ mod tests {
         held.try_lock().expect("lock the fresh ticket");
         // SAFETY: `fcntl` on a descriptor this test owns; the result is checked before the
         // descriptor it may have made is wrapped. F_DUPFD clears FD_CLOEXEC, so the child
-        // inherits this number unless start_compaction seals it.
+        // inherits this number unless start_background_verb seals it.
         let duped = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_DUPFD, 64) };
         assert!(
             duped >= 64,
@@ -651,7 +657,8 @@ mod tests {
         let (ready, go) = (fifo("ready"), fifo("go"));
         let compacting = directory.join("build/.compacting");
         let (mut process, log) =
-            start_compaction(&program, &directory, &compacting).expect("started");
+            start_background_verb(&program, SEED_COMPACTION_VERB, &directory, &compacting)
+                .expect("started");
         assert_eq!(log, compacting.join(LOG));
         let mut said = String::new();
         File::open(&ready)

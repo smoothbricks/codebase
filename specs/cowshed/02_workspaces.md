@@ -1160,8 +1160,8 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    folded workspace is reported in `LandedReport.folded` with its head and its outcome, `retired`, or `kept` with why
    (`dirty` with its file count, or `refused` with the refusal's code and message), and said on stderr. A kept fold
    never fails the land, and nothing about it is stored: it is the next `rm`'s, or the next land's that touches it.
-   Retired folds release their build volumes in one collection after the last of them. A land with `--no-retire` folds
-   nothing.
+   Retired folds release their build volumes in one collection after the last of them, which runs in the background once
+   the land answers (16_build_volumes.md, Land 6.5). A land with `--no-retire` folds nothing.
 
 `--no-retire` keeps the workspace after a successful land (for a coordinator that wants to reuse it via
 `rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable
