@@ -44,6 +44,8 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceSupervisorHandle,
 };
 
+#[path = "support/publication.rs"]
+mod publication;
 #[path = "support/temp_parent.rs"]
 mod temp_parent;
 #[path = "support/temp_root.rs"]
@@ -529,6 +531,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         shell_host: None,
         shell_pool: Default::default(),
         group_ledger: None,
+        group_ledger_lease: None,
         membership_socket: None,
         telemetry_root: None,
         inherited_groups: Vec::new(),
@@ -2083,6 +2086,21 @@ fn owned_group() -> std::process::Child {
 /// `(job id, leader start)` for every group the ledger at `path` names.
 fn ledger_leaders(path: &std::path::Path) -> Vec<(u64, Option<u64>)> {
     let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    ledger_group_leaders(&ledger)
+}
+
+/// The writer, not the actor's next turn, determines when a cut reaches the filesystem.
+async fn published_ledger_leaders(path: &Path, count: usize) -> Vec<(u64, Option<u64>)> {
+    let ledger = publication::read_when(path.to_path_buf(), move |value| {
+        value["groups"]
+            .as_array()
+            .is_some_and(|groups| groups.len() == count)
+    })
+    .await;
+    ledger_group_leaders(&ledger)
+}
+
+fn ledger_group_leaders(ledger: &serde_json::Value) -> Vec<(u64, Option<u64>)> {
     ledger["groups"]
         .as_array()
         .unwrap()
@@ -2154,7 +2172,7 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
         .await
         .unwrap();
     let first = birth(births.recv().await.unwrap());
-    assert_eq!(ledger_leaders(&ledger), vec![(1, first)]);
+    assert_eq!(published_ledger_leaders(&ledger, 1).await, vec![(1, first)]);
     handle
         .exec(
             None,
@@ -2165,7 +2183,10 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
         .await
         .unwrap();
     let second = birth(births.recv().await.unwrap());
-    assert_eq!(ledger_leaders(&ledger), vec![(1, first), (2, second)]);
+    assert_eq!(
+        published_ledger_leaders(&ledger, 2).await,
+        vec![(1, first), (2, second)]
+    );
     for id in [JobId::new(1).unwrap(), JobId::new(2).unwrap()] {
         let spawned = spawns.recv().await.unwrap();
         complete(
@@ -2203,7 +2224,7 @@ async fn an_unidentified_leader_never_enters_the_ledger() {
         .await
         .unwrap();
     assert_eq!(h.handle.info(job).await.unwrap().pid, Some(10_001));
-    assert_eq!(ledger_leaders(&ledger), Vec::new());
+    assert_eq!(published_ledger_leaders(&ledger, 0).await, Vec::new());
     let spawned = h.spawned.recv().await.unwrap();
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
@@ -2276,6 +2297,12 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
         )
         .await
         .unwrap();
+    publication::read_when(ledger.clone(), |value| {
+        value["unresolved"]
+            .as_array()
+            .is_some_and(|groups| !groups.is_empty())
+    })
+    .await;
     assert_eq!(carried(&ledger), vec![9]);
     // SAFETY: signal 0 only checks that the group exists.
     assert_eq!(
@@ -2306,6 +2333,10 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
         )
         .await
         .unwrap();
+    publication::read_when(ledger.clone(), |value| {
+        value["unresolved"].as_array().is_none_or(Vec::is_empty)
+    })
+    .await;
     assert_eq!(carried(&ledger), Vec::<u64>::new());
     let spawned = h.spawned.recv().await.unwrap();
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
@@ -6747,6 +6778,71 @@ fn nx_daemon_start(project: &Path) -> Vec<OsString> {
     ]
 }
 
+/// A held ledger publication must not park the actor, but retirement must wait for that cut.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_group_ledger_write_leaves_the_supervisor_actor_responsive() {
+    use std::future::Future as _;
+    use std::io::Read as _;
+
+    let root = workspace_root("group-ledger-write");
+    let ledger = root.join("supervisor.groups");
+    let temporary = ledger.with_extension(format!("groups.{}", std::process::id()));
+    let name = std::ffi::CString::new(temporary.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the NUL-terminated path is private to this test and outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut supervisor_config = config(&root);
+    supervisor_config.group_ledger = Some(ledger.clone());
+    let expected_authority = supervisor_config.authority.clone();
+    let h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let retirement = h.handle.retire(NxDaemonRetirement::Recorded);
+    tokio::pin!(retirement);
+    assert!(
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(retirement.as_mut().poll(context).is_pending())
+        })
+        .await
+    );
+
+    // No reader exists, so the real recorder cannot open its temporary FIFO. Advance the
+    // injected clock through four heartbeat turns and beyond the unchanged 15 s bound.
+    for advance in [
+        Duration::ZERO,
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+        Duration::from_secs(5),
+    ] {
+        tokio::time::advance(advance).await;
+        assert_eq!(
+            h.handle.current_authority().await.unwrap(),
+            expected_authority
+        );
+        assert!(
+            std::future::poll_fn(|context| {
+                std::task::Poll::Ready(retirement.as_mut().poll(context).is_pending())
+            })
+            .await,
+            "retirement cannot acknowledge an unpublished final cut"
+        );
+    }
+
+    // Opening the reader releases exactly that filesystem fault, not an actor-side mock.
+    let reading = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        std::fs::File::open(temporary)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    });
+    retirement.await.unwrap();
+    let publication: serde_json::Value = serde_json::from_slice(&reading.await.unwrap()).unwrap();
+    assert!(publication["groups"].as_array().unwrap().is_empty());
+    assert!(
+        ledger.exists(),
+        "the final publication precedes retirement success"
+    );
+}
+
 /// A held record read must not park the actor that answers the heartbeat round trip.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_nx_record_read_leaves_the_supervisor_actor_responsive() {
@@ -7200,7 +7296,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 )
                 .await
                 .unwrap();
-            let leaders = ledger_leaders(&ledger);
+            let leaders = published_ledger_leaders(&ledger, 1).await;
             assert_eq!(leaders.len(), 1, "only the admitted job enters the ledger");
             assert_eq!(leaders[0].0, job.get());
             assert!(
@@ -8987,7 +9083,7 @@ os._exit(0)
         JobState::Running,
         "a blocked live job is not a leak"
     );
-    assert_eq!(ledger_leaders(&ledger).len(), 1);
+    assert_eq!(published_ledger_leaders(&ledger, 1).await.len(), 1);
     let finishing_handle = handle.clone();
     let finishing = tokio::spawn(async move {
         if cancel {
@@ -9016,7 +9112,7 @@ os._exit(0)
     assert_eq!(draining.state, JobState::Draining);
     assert_eq!(draining.exit, None);
     assert_eq!(
-        ledger_leaders(&ledger).len(),
+        published_ledger_leaders(&ledger, 1).await.len(),
         1,
         "draining retains its claim"
     );
@@ -9300,7 +9396,8 @@ async fn host_controller_a_declared_resident_survives_unrelated_terminal_and_ref
             life.unique_id
         );
         assert_eq!(
-            ledger_leaders(&ledger)
+            published_ledger_leaders(&ledger, 1)
+                .await
                 .into_iter()
                 .map(|(job, _)| job)
                 .collect::<Vec<_>>(),
@@ -9318,7 +9415,7 @@ async fn host_controller_a_declared_resident_survives_unrelated_terminal_and_ref
         .await
         .unwrap()
         .unwrap();
-    assert!(ledger_leaders(&ledger).is_empty());
+    assert!(published_ledger_leaders(&ledger, 0).await.is_empty());
     handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
@@ -10077,7 +10174,7 @@ if not sibling_reaped:
         ended.outlived.iter().any(|member| member.pid == child_pid)
             && ended.outlived.iter().any(|member| member.pid == child2_pid)
     );
-    assert!(ledger_leaders(&ledger).is_empty());
+    assert!(published_ledger_leaders(&ledger, 0).await.is_empty());
 
     drop(child_peer);
     drop(child2_peer);

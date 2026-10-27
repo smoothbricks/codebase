@@ -78,6 +78,8 @@ use crate::storage::job_artifact::{
     SealedCheckpointManifest, SealedJobReader, StreamKind,
 };
 
+mod group_ledger;
+use group_ledger::GroupLedgerWriter;
 #[cfg(test)]
 const DEFAULT_ACTOR_CAPACITY: usize = 64;
 #[cfg(test)]
@@ -174,6 +176,8 @@ pub struct WorkspaceSupervisorConfig {
     /// Where the supervisor keeps the process groups of its running jobs for whoever finds it
     /// gone ([`super::job_groups`]); `None` keeps no ledger.
     pub group_ledger: Option<PathBuf>,
+    /// The existing served socket lease, retained by the writer until its final publication.
+    pub group_ledger_lease: Option<super::supervisor_socket::PublicationLease>,
     /// The membership-only endpoint served beside the privileged coordinator socket.
     /// Only this endpoint is admitted into child sandboxes and exported to their environment.
     pub membership_socket: Option<PathBuf>,
@@ -372,6 +376,7 @@ impl Default for WorkspaceSupervisorConfig {
             shell_host: None,
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: None,
+            group_ledger_lease: None,
             membership_socket: None,
             telemetry_root: None,
             inherited_groups: Vec::new(),
@@ -3939,6 +3944,23 @@ impl WorkspaceSupervisor {
             WorkspaceRole::for_name(&config.authority.workspace),
             config.nx_daemon_idle,
         );
+        let mut inherited_groups = config.inherited_groups;
+        let group_ledger = config
+            .group_ledger
+            .map(|path| {
+                GroupLedgerWriter::start(
+                    super::job_groups::Recorder::new(path),
+                    std::mem::take(&mut inherited_groups),
+                    config.group_ledger_lease,
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("cannot start process-group ledger writer: {error}"),
+                    "inspect the supervisor's thread resources and retained group ledger",
+                )
+            })?;
         let mut actor = SupervisorActor {
             authority: config.authority,
             workspace_root: config.workspace_root,
@@ -3948,10 +3970,11 @@ impl WorkspaceSupervisor {
             volume_labels: config.volume_labels,
             workspace_volume: config.workspace_volume,
             credential_env_names: config.credential_env_names,
-            group_ledger: config.group_ledger.map(super::job_groups::Recorder::new),
+            group_ledger,
+            group_ledger_finish: GroupLedgerFinish::Idle,
             membership_socket: config.membership_socket,
             job_spans,
-            inherited_groups: config.inherited_groups,
+            inherited_groups,
             term_grace: config.term_grace,
             next_job_id,
             next_session_id: 1,
@@ -4800,9 +4823,26 @@ fn process_observation_unavailable(job_id: JobId) -> CowshedError {
     }
 }
 
+enum GroupLedgerFinish {
+    Idle,
+    Pending(oneshot::Receiver<std::io::Result<()>>),
+    Done(Result<()>),
+}
+
+async fn next_group_ledger_finish(state: &mut GroupLedgerFinish) -> std::io::Result<()> {
+    match state {
+        GroupLedgerFinish::Pending(receiver) => receiver.await.unwrap_or_else(|error| {
+            Err(std::io::Error::other(format!(
+                "group-ledger writer ended before its final reply: {error}"
+            )))
+        }),
+        GroupLedgerFinish::Idle | GroupLedgerFinish::Done(_) => std::future::pending().await,
+    }
+}
 struct SupervisorActor {
     authority: WorkspaceAuthoritySnapshot,
-    group_ledger: Option<super::job_groups::Recorder>,
+    group_ledger: Option<GroupLedgerWriter>,
+    group_ledger_finish: GroupLedgerFinish,
     membership_socket: Option<PathBuf>,
     /// See [`WorkspaceSupervisorConfig::telemetry_root`].
     job_spans: Option<JobSpanPublisher>,
@@ -4865,10 +4905,14 @@ struct SupervisorActor {
 /// retirement. A refusal stays in the existing ledger for recovery, never a terminal record.
 impl Drop for SupervisorActor {
     fn drop(&mut self) {
-        if self.jobs.values().all(JobStateRecord::terminal) {
+        if self.jobs.values().all(JobStateRecord::terminal)
+            && self
+                .group_ledger
+                .as_ref()
+                .is_none_or(GroupLedgerWriter::closed_ok)
+        {
             return;
         }
-        self.record_groups();
         let jobs = std::mem::take(&mut self.jobs);
         #[cfg(target_os = "macos")]
         let observed: Vec<_> = jobs
@@ -4899,24 +4943,47 @@ impl Drop for SupervisorActor {
                 );
             }
         };
-        let ledger = self.group_ledger.take();
         let inherited = std::mem::take(&mut self.inherited_groups);
         let grace = self.term_grace;
         let bound = grace
             .saturating_add(grace.max(Duration::from_secs(1)).saturating_mul(2))
             .saturating_add(Duration::from_secs(1));
-        let held = Arc::new(std::sync::Mutex::new(Some((jobs, ledger, inherited))));
+        if let Some(writer) = self.group_ledger.take() {
+            match writer.teardown(jobs, grace) {
+                Ok(joined) => match joined.recv_timeout(bound) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => cowshed_os::eprintln!(
+                        "cowshed: supervisor drop retained group claims after ledger retirement: {error}"
+                    ),
+                    Err(error) => {
+                        cowshed_os::eprintln!(
+                            "cowshed: supervisor drop could not join serialized membership retirement within {bound:?}: {error}; its writer retains custody"
+                        );
+                        report_retained();
+                    }
+                },
+                Err(jobs) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: group-ledger writer could not accept retirement; retaining native claims"
+                    );
+                    report_retained();
+                    std::mem::forget(jobs);
+                }
+            }
+            return;
+        }
+        let held = Arc::new(std::sync::Mutex::new(Some((jobs, inherited))));
         let worker = held.clone();
         let (done, joined) = std::sync::mpsc::sync_channel(1);
         match std::thread::Builder::new()
             .name("cowshed-retire-jobs".into())
             .spawn(move || {
-                let (jobs, ledger, inherited) = worker
+                let (jobs, inherited) = worker
                     .lock()
                     .expect("retirement handoff mutex poisoned")
                     .take()
                     .expect("one retirement worker");
-                let result = retire_dropped_jobs(jobs, ledger.as_ref(), inherited, grace);
+                let result = retire_dropped_jobs(jobs, None, inherited, grace);
                 let _ = done.send(result);
             }) {
             Ok(_worker) => match joined.recv_timeout(bound) {
@@ -4948,15 +5015,11 @@ impl Drop for SupervisorActor {
     }
 }
 
-/// Publish every job whose group may still run, with the lives its observation holds outside the
-/// group: borrowed from the jobs and their published observations, never collected first.
-fn record_job_groups(
-    recorder: &super::job_groups::Recorder,
+/// Freeze the actor's current ownership cut; member arrays stay shared with their observations.
+fn job_group_claims(
     jobs: &BTreeMap<JobId, JobStateRecord>,
-    inherited: &[super::job_groups::UnresolvedGroup],
-) -> std::io::Result<super::job_groups::Recorded> {
-    let groups = jobs
-        .iter()
+) -> impl Iterator<Item = super::job_groups::JobGroupClaim> + Clone + '_ {
+    jobs.iter()
         // A job sealed after a wait failure may have left its group running: nothing saw it
         // end, so the ledger keeps it for whoever finds this supervisor gone.
         .filter(|(_, job)| !job.sealed() || job.wait_failure.is_some())
@@ -4971,8 +5034,7 @@ fn record_job_groups(
                 leader,
                 members,
             })
-        });
-    recorder.record(groups, inherited)
+        })
 }
 
 /// The sole ledger writer after actor teardown. No process is released before either native
@@ -4989,7 +5051,9 @@ fn retire_dropped_jobs(
     for id in ids {
         let job = jobs.get(&id).expect("the retained job exists");
         if job.terminal() {
-            jobs.remove(&id);
+            if job.sealed() && job.wait_failure.is_none() {
+                jobs.remove(&id);
+            }
             continue;
         }
         #[cfg(target_os = "linux")]
@@ -5056,7 +5120,7 @@ fn retire_dropped_jobs(
         }
     }
     if let Some(recorder) = ledger {
-        match record_job_groups(recorder, &jobs, &inherited) {
+        match recorder.record(job_group_claims(&jobs), &inherited) {
             Ok(recorded) => {
                 for error in recorded.uninspected {
                     cowshed_os::eprintln!(
@@ -5103,7 +5167,10 @@ impl SupervisorActor {
         loop {
             if self.command_lane_closed && !self.has_running_jobs() {
                 self.release_kept_nx_daemon().await;
-                break;
+                self.begin_group_ledger_finish();
+                if matches!(self.group_ledger_finish, GroupLedgerFinish::Done(_)) {
+                    break;
+                }
             }
             tokio::select! {
                 command = self.commands.recv(), if !self.command_lane_closed => {
@@ -5116,6 +5183,19 @@ impl SupervisorActor {
                             }
                         },
                     }
+                }
+                finished = next_group_ledger_finish(&mut self.group_ledger_finish),
+                    if matches!(self.group_ledger_finish, GroupLedgerFinish::Pending(_)) =>
+                {
+                    let outcome = finished.map_err(|error| {
+                        let path = self.group_ledger.as_ref()
+                            .expect("a pending ledger finish owns its writer").path();
+                        CowshedError::environment_missing(
+                            format!("cannot finish process-group ledger {}: {error}", path.display()),
+                            "inspect the retained group ledger before replacing this supervisor",
+                        )
+                    });
+                    self.group_ledger_finish = GroupLedgerFinish::Done(outcome);
                 }
                 _ = self.membership_changed.notified() => {
                     self.record_groups();
@@ -5762,34 +5842,32 @@ impl SupervisorActor {
         }
     }
 
-    /// Replace the group ledger with the groups of the jobs whose terminal record is not durable,
-    /// or whose end was never observed, and the inherited unresolved groups processes still hold.
-    /// One found released is dropped for good: its id may later name a stranger's group, which
-    /// this ledger has no claim to.
+    /// Publish one latest immutable ownership cut; the serialized writer alone touches the file.
     fn record_groups(&mut self) {
-        let Some(path) = &self.group_ledger else {
+        if !matches!(self.group_ledger_finish, GroupLedgerFinish::Idle) {
             return;
-        };
-        match record_job_groups(path, &self.jobs, &self.inherited_groups) {
-            Ok(recorded) => {
-                for error in &recorded.uninspected {
-                    cowshed_os::eprintln!(
-                        "cowshed: an inherited unresolved process group in {} could not be \
-                     inspected and is carried as it was: {error}",
-                        path.path().display()
-                    );
-                }
-                self.inherited_groups = recorded.carried;
-            }
-            Err(error) => {
-                // The jobs run either way; what is lost is only the means to end them should
-                // this supervisor die, which is worth saying where the daemon log shows it.
-                cowshed_os::eprintln!(
-                    "cowshed: cannot record the job process groups at {}: {error}",
-                    path.path().display()
-                );
-            }
         }
+        if let Some(writer) = &self.group_ledger
+            && let Err(error) = writer.publish(job_group_claims(&self.jobs))
+        {
+            cowshed_os::eprintln!(
+                "cowshed: cannot queue process-group ledger {}: {error}",
+                writer.path().display()
+            );
+        }
+    }
+
+    /// Stop publication admission only once no job can add another owned life. Completion is
+    /// a selectable event, never an actor-side wait on filesystem IO or a worker join.
+    fn begin_group_ledger_finish(&mut self) {
+        if !matches!(self.group_ledger_finish, GroupLedgerFinish::Idle) {
+            return;
+        }
+        self.record_groups();
+        self.group_ledger_finish = match self.group_ledger.as_mut() {
+            Some(writer) => GroupLedgerFinish::Pending(writer.finish()),
+            None => GroupLedgerFinish::Done(Ok(())),
+        };
     }
 
     fn validate_authority(&self, authority: &WorkspaceAuthoritySnapshot) -> Result<()> {
@@ -8102,7 +8180,7 @@ impl SupervisorActor {
         if job.birth.is_some() {
             self.record_groups();
         }
-        // Likewise its process observation, once the ledger has recorded the job's end with
+        // Likewise its process observation, once the latest cut has captured its end with
         // nothing awaited between its waiters' answers and that record.
         #[cfg(target_os = "macos")]
         self.release_observation(job_id).await;
@@ -8182,6 +8260,17 @@ impl SupervisorActor {
             let _ = waiter.send(Ok(()));
         }
         if self.lifecycle == ActorLifecycle::Retiring {
+            self.begin_group_ledger_finish();
+            match &self.group_ledger_finish {
+                GroupLedgerFinish::Idle | GroupLedgerFinish::Pending(_) => return,
+                GroupLedgerFinish::Done(Err(error)) => {
+                    for waiter in self.retire_waiters.drain(..) {
+                        let _ = waiter.send(Err(error.clone()));
+                    }
+                    return;
+                }
+                GroupLedgerFinish::Done(Ok(())) => {}
+            }
             self.labelling.abort_all();
             self.lifecycle = ActorLifecycle::Retired;
         }
@@ -10765,6 +10854,7 @@ mod lifecycle_commitment_tests {
             shell_host: None,
             shell_pool: defaults.shell_pool,
             group_ledger: None,
+            group_ledger_lease: None,
             membership_socket: None,
             telemetry_root: None,
             inherited_groups: Vec::new(),

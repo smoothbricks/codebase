@@ -62,6 +62,8 @@ mod refusing_gateway;
 #[path = "support/temp_parent.rs"]
 mod temp_parent;
 
+#[path = "support/publication.rs"]
+mod publication;
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -2626,6 +2628,7 @@ fn supervisor_config_of(
         shell_host: None,
         shell_pool: Default::default(),
         group_ledger: None,
+        group_ledger_lease: None,
         membership_socket: None,
         telemetry_root: None,
         inherited_groups: Vec::new(),
@@ -2827,90 +2830,7 @@ impl DrainFixture {
     /// The report the draining supervisor publishes beside its socket, once `ready` holds of it.
     /// Directory writes wake the reader; the target's no-progress bound owns a missing report.
     async fn report(&self, ready: impl Fn(&Value) -> bool + Send + 'static) -> Value {
-        let path = self.path.with_extension("drain");
-        tokio::task::spawn_blocking(move || {
-            use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-            let directory = std::fs::File::open(path.parent().expect("the report's directory"))
-                .expect("open the report's directory");
-            // SAFETY: kqueue takes no arguments and returns a new descriptor, checked below.
-            let queue = unsafe { libc::kqueue() };
-            assert!(queue >= 0, "kqueue: {}", std::io::Error::last_os_error());
-            // SAFETY: this task alone owns the descriptor kqueue just returned.
-            let queue = unsafe { OwnedFd::from_raw_fd(queue) };
-            let watch = libc::kevent {
-                ident: usize::try_from(directory.as_raw_fd()).expect("a descriptor"),
-                filter: libc::EVFILT_VNODE,
-                flags: libc::EV_ADD | libc::EV_CLEAR,
-                fflags: libc::NOTE_WRITE,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            // SAFETY: one live change, no event output and no timeout. Subscribe before the
-            // first read so a publication between a read and its wait cannot be missed.
-            let registered = unsafe {
-                libc::kevent(
-                    queue.as_raw_fd(),
-                    &watch,
-                    1,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            assert_eq!(
-                registered,
-                0,
-                "watch {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            );
-            loop {
-                match std::fs::read(&path) {
-                    Ok(bytes) => {
-                        let report: Value = serde_json::from_slice(&bytes).expect("a drain report");
-                        if ready(&report) {
-                            return report;
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => panic!("read drain report {}: {error}", path.display()),
-                }
-                let mut event = watch;
-                // SAFETY: a live queue and one writable event; the null timeout waits for
-                // the kernel's directory-write event, never a test-owned deadline.
-                let received = unsafe {
-                    libc::kevent(
-                        queue.as_raw_fd(),
-                        std::ptr::null(),
-                        0,
-                        &mut event,
-                        1,
-                        std::ptr::null(),
-                    )
-                };
-                if received < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue;
-                }
-                assert_eq!(
-                    received,
-                    1,
-                    "wait for drain report {}: {}",
-                    path.display(),
-                    std::io::Error::last_os_error()
-                );
-                assert_eq!(
-                    event.flags & libc::EV_ERROR,
-                    0,
-                    "drain report watch {}: errno {}",
-                    path.display(),
-                    { event.data }
-                );
-            }
-        })
-        .await
-        .expect("the drain-report watcher")
+        publication::read_when(self.path.with_extension("drain"), ready).await
     }
 
     /// Let the gated jobs run to their end.

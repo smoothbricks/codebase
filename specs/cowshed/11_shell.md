@@ -1033,14 +1033,15 @@ admitted but never sealed. Two things put that right:
   group and the leader's immutable birth identity observed by its parent before reaping, plus the existing Darwin
   observer's retained running lives. Each life carries its pid and `p_uniqueid` under `kern.bootsessionuuid`: a reboot
   ends those lives, and a reused pid under another unique id is never signalled. The existing actor remains the sole
-  ledger writer; observer membership changes wake it without a periodic sweep. Every rewrite carries original
-  identities, never a fresh pid observation used to renew an old claim. The ledger names the supervisor that wrote it. A
-  watcher acts only on its own lost supervisor's ledger, never one a newer supervisor has written. New writers record
-  the leader's start time as `sysctl(KERN_PROC_PID)` reports it on macOS (`/proc/<pid>/stat` on Linux), which the kernel
-  answers for every process of any owner, running or exited and unreaped, so a pid another user's process now holds is
-  compared and found to be another process. Older protected ledgers with a recorded `proc_pid_rusage` birth remain
-  readable, but the kernel reads that birth back only for the caller's own processes: one whose pid another owner now
-  holds cannot be compared and stays a refusal, whatever process now holds that pid.
+  authority for current claims; observer membership changes wake it without a periodic sweep. A single off-actor
+  filesystem writer publishes the actor's immutable cuts, preserving original identities rather than renewing an old
+  claim from a fresh pid observation. The ledger names the supervisor that wrote it. A watcher acts only on its own lost
+  supervisor's ledger, never one a newer supervisor has written. New writers record the leader's start time as
+  `sysctl(KERN_PROC_PID)` reports it on macOS (`/proc/<pid>/stat` on Linux), which the kernel answers for every process
+  of any owner, running or exited and unreaped, so a pid another user's process now holds is compared and found to be
+  another process. Older protected ledgers with a recorded `proc_pid_rusage` birth remain readable, but the kernel reads
+  that birth back only for the caller's own processes: one whose pid another owner now holds cannot be compared and
+  stays a refusal, whatever process now holds that pid.
 
   Group recovery proves that the recorded leader held its id throughout the membership snapshot. Those proven members,
   and the separately retained exact lives from this boot, are signalled through kernel identities that cannot target a
@@ -1066,18 +1067,24 @@ admitted but never sealed. Two things put that right:
   released. A prior ended marker does not authorize force or erase that evidence. Unresolved groups are diagnosed
   through `doctor`; they do not prevent a new supervisor from serving safe commands.
 
-  Publication borrows the current job-group iterator and the inspected inherited entries directly into the existing JSON
-  field order; it does not materialize a second group inventory. A claim's observed member lives are shared from the
-  job's published process observation, not copied, and the boot session that fences them is read once per supervisor.
-  The actor prepares the destination and temporary paths once. Ordinary publications without inherited groups allocate
-  only their JSON output buffer; inherited recovery still owns the carried entries and inspection errors it returns.
-  This does not add an active-job frontier or change which unsealed and failed-wait groups remain recorded.
+  The actor freezes current job-group headers and shares each claim's observed member lives from the job's published
+  process observation, never copying the identity slice or reloading it on the writer. This transport cut is not another
+  authority or group inventory. One write may be in flight; subsequent changes replace the one latest pending cut, so
+  notifications during a stalled write coalesce into one successor publication. Cleared header buffers are reused. The
+  writer owns the recorder, prepared paths, once-read boot session and inspected inherited entries, and preserves the
+  existing JSON field order. It holds the served socket's existing fenced lease until its last write ends. Final
+  retirement closes admission, flushes the newest cut and drops that lease before acknowledging success; the actor
+  continues answering heartbeat round trips while the flush waits. A failed final publication is an error, not
+  retirement success. Ordinary writes allocate their JSON output buffer; inherited recovery owns carried entries and
+  inspection errors. This does not add an active-job frontier or change which unsealed and failed-wait groups remain
+  recorded.
 
   Runtime teardown uses the same native retirement, not a legacy group signal followed by unconditional claim release.
-  The actor transfers all parent handles and resource claims to one retirement worker and joins for a bounded interval.
-  A slow retirement keeps running with those handles retained; a refusal refreshes the same ledger with the known member
-  identities before handing it to recovery. Failure to write that handoff retains the native claims and names the
-  failure. Neither destructor completion nor an earlier terminal/sealed record is membership proof.
+  The actor transfers all parent handles and resource claims to that same writer for retirement and joins for a bounded
+  interval; no teardown writer can overlap a publication still in flight. A slow retirement keeps running with those
+  handles retained; a refusal refreshes the same ledger with the known member identities before handing it to recovery.
+  Failure to write that handoff retains the native claims and names the failure. Neither destructor completion nor an
+  earlier terminal/sealed record is membership proof.
 
 - **Sealing.** The next supervisor binds the workspace socket first, reconciles the predecessor's groups, then seals
   every admitted but unterminated record of the current incarnation as `failed` with `failure: supervisorLost` and a

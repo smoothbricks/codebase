@@ -9940,6 +9940,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // use: a spare activated ahead of demand is the next command's warm shell.
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: Some(super::job_groups::ledger_path(&socket)),
+            // Filled from the bound socket before start; None keeps no writer lease.
+            group_ledger_lease: None,
             membership_socket: Some(super::supervisor_socket::membership_socket_path(&socket)),
             // Each job's span is sealed beside the controller's commitments.
             telemetry_root: Some(self.telemetry_root.clone()),
@@ -10051,6 +10053,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // The socket first: holding it is what makes this the workspace's one supervisor, so
         // what the last one left running is this one's to end and seal.
         let listener = super::supervisor_socket::bind(&socket).await?;
+        // Writer custody of this same flock, held through serving errors and cancellation.
+        config.group_ledger_lease = Some(listener.publication_lease());
         self.seal_lost_jobs(&socket, &mut config).await?;
         // Every commitment goes to this process's own sink, the host's default, and is kept for
         // controllers that forward the workspace's commitments into sinks of their own.

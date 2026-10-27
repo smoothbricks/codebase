@@ -1014,16 +1014,27 @@ type Streams = Arc<Mutex<BTreeMap<JobId, mpsc::Sender<io::Result<Bytes>>>>>;
 /// workspace's grants and compile the profile for them.
 pub type Advances = mpsc::Sender<oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>>;
 
+/// Shared custody of one supervisor socket's existing fenced file lease.
+///
+/// The last drop releases that flock. Cloning does not take a new lock, path, or marker.
+#[derive(Clone, Debug)]
+#[must_use = "dropping the last clone releases the supervisor socket lease"]
+pub struct PublicationLease {
+    _lease: Arc<Fenced<std::fs::File>>,
+}
+
 /// Exclusive ownership of a workspace's supervisor socket, held while serving it or changing
 /// its substrate. The persistent file lease serializes binders; an older build is drained before
 /// a new build binds, and the occupant probe still refuses any live inherited listener. The
 /// listener and the lease are fenced: once either is closed, no child still being spawned holds
-/// it, so the next binder finds the socket stopped and the lease free (`fork_lock`).
+/// it, so the next binder finds the socket stopped and the lease free (`fork_lock`), unless a
+/// [`PublicationLease`] still shares that same lease.
 #[derive(Debug)]
 #[must_use = "hold the socket until serving or the workspace mutation has finished"]
 pub struct BoundSocket {
     pub(super) listener: Fenced<UnixListener>,
-    _lease: Fenced<std::fs::File>,
+    /// The socket flock, shared with every [`PublicationLease`] taken from it.
+    _lease: Arc<Fenced<std::fs::File>>,
     /// Where its socket file is: the workspace's socket path once published, a private name
     /// before.
     path: PathBuf,
@@ -1033,6 +1044,14 @@ pub struct BoundSocket {
 impl BoundSocket {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Another owner of this socket's fenced file lease: the same flock, not a new lock.
+    #[must_use = "hold it until the group-ledger writer drops it after its final snapshot"]
+    pub(crate) fn publication_lease(&self) -> PublicationLease {
+        PublicationLease {
+            _lease: Arc::clone(&self._lease),
+        }
     }
 }
 
@@ -1244,7 +1263,7 @@ pub async fn bind(path: &Path) -> Result<BoundSocket> {
     };
     let socket = BoundSocket {
         listener,
-        _lease: lease,
+        _lease: Arc::new(lease),
         path: fresh,
         instance,
     };
