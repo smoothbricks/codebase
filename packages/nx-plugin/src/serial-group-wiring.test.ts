@@ -271,7 +271,11 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
     expect(Object.keys(tasks.tasks).filter((id) => id === APFS_TEST_SWEEP_TASK)).toHaveLength(1);
     for (const group of [DEVICE_GROUP, HOST_GROUP]) {
       expect(tasks.dependencies[`${ROOT_PROJECT}:${group}`]).toContain(APFS_TEST_SWEEP_TASK);
-      expect(graph.nodes[ROOT_PROJECT]?.data.targets?.[group]?.options?.idleTimeoutMs).toBe(180000);
+      // A serial group is inferred only where its declared cfg holds, macOS: there it runs bounded by progress, and
+      // elsewhere its root entry only orders its dependencies and runs no command.
+      const runner = graph.nodes[ROOT_PROJECT]?.data.targets?.[group];
+      if (process.platform === 'darwin') expect(runner?.options?.idleTimeoutMs).toBe(180000);
+      else expect(runner?.options?.command).toBeUndefined();
     }
     for (const target of ['host-controller-test', 'integration-apfs']) {
       const declared = graph.nodes.cowshed?.data.targets?.[target];
