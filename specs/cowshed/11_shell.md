@@ -1149,9 +1149,10 @@ naming its pid): the jobs still running, then the ends no client has read, with 
 requester's exit, or the step of its retirement that failed. A failed step is said on stderr as well, and the supervisor
 then serves until it is killed; it never stops retiring in silence. The refusal below quotes the report of the pid that
 answered the `hello`. A report another pid wrote is a killed supervisor's and is not quoted, and one that does not
-decode is named as such. Measured 2026-10-21: after an install, drained supervisors of the replaced build refused
-commands for up to 15 minutes, and neither the refusal nor the log said whether a job, an unread end, or a failed
-retirement held them.
+decode is named as such. The report is a live-process diagnostic, atomically published at process durability without
+file or parent syncs, not power-loss authority. Measured 2026-10-21: after an install, drained supervisors of the
+replaced build refused commands for up to 15 minutes, and neither the refusal nor the log said whether a job, an unread
+end, or a failed retirement held them.
 
 Until a draining supervisor retires, a command of the new build that reaches it is refused by name: `exec` and every
 other verb that would run work there, because they cannot speak its protocol — except a land step (`exec --class gate`,

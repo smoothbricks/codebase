@@ -1518,8 +1518,23 @@ impl DrainReport {
         let published = serde_json::to_vec(&wire)
             .map_err(|error| error.to_string())
             .and_then(|bytes| {
-                crate::metadata::write_atomic_bytes(&self.path, &bytes)
-                    .map_err(|error| error.to_string())
+                cowshed_os::fsio::publish_private_file_with(
+                    &self.path,
+                    cowshed_os::fsio::Durability::Process,
+                    |writer| std::io::Write::write_all(writer, &bytes),
+                )
+                .map_err(|error| match error {
+                    cowshed_os::fsio::PublishError::Io { path, source } => {
+                        crate::metadata::MetadataError::Io { path, source }.to_string()
+                    }
+                    cowshed_os::fsio::PublishError::Write(source) => {
+                        crate::metadata::MetadataError::Io {
+                            path: self.path.clone(),
+                            source,
+                        }
+                        .to_string()
+                    }
+                })
             });
         if let Err(error) = published {
             cowshed_os::eprintln!(
@@ -4781,6 +4796,7 @@ mod drain_read_tests {
         let ours = u64::from(std::process::id());
         assert_eq!(DrainReport::read(&socket, ours), None, "nothing published");
 
+        cowshed_os::fsio::take_syncs();
         report.publish(DrainWait::Jobs {
             running: vec![job(12), job(13)],
             ended: vec![RequesterGone {
@@ -4789,6 +4805,11 @@ mod drain_read_tests {
                 observed: ExitObserved::Watched,
             }],
         });
+        assert_eq!(
+            cowshed_os::fsio::take_syncs(),
+            cowshed_os::fsio::Syncs::default(),
+            "the PID-bound live drain diagnostic requests no durability barriers"
+        );
         assert_eq!(
             DrainReport::read(&socket, ours).as_deref(),
             Some(
