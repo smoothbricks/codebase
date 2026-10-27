@@ -393,6 +393,21 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(() => scriptcBinModules(bins, scriptc, 'package.json', 'dist/ts')).toThrow(`package.json: ${message}`);
     });
 
+    it.each([
+      ['default', undefined, 'node-cli.js'],
+      ['override', { entries: { ['__proto__']: './dist/ts/native-cli.js' } }, 'native-cli.js'],
+    ] as const)('keeps __proto__ as an own module property with %s selection', (_name, scriptc, expected) => {
+      const modules = scriptcBinModules(
+        new Map([['__proto__', './dist/ts/node-cli.js']]),
+        scriptc,
+        'package.json',
+        'dist/ts',
+      );
+      expect(Object.hasOwn(modules, '__proto__')).toBe(true);
+      expect(Object.keys(modules)).toEqual(['__proto__']);
+      expect(modules['__proto__']).toBe(expected);
+    });
+
     it('validates public bin paths even when their native modules are overridden', () => {
       expect(() =>
         scriptcBinModules(

@@ -1240,7 +1240,7 @@ export function scriptcBinModules(
     }
     return emitted.slice(javascriptRoot.length + 1);
   };
-  const modules: Record<string, string> = {};
+  const modules: Record<string, string> = Object.fromEntries(bins);
   for (const [name, entry] of bins) {
     modules[name] = modulePath(name, entry, `bin.${name}`);
   }
