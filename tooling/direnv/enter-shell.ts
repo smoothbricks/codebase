@@ -34,9 +34,9 @@ const buildMarkerFile = 'node_modules/.cache/smoo/dist-verified';
 // smoo:cargo-fetch). Then it runs those tasks and starts the shell, whose hook runs again with everything installed. A
 // fresh checkout, or a runner that restored node_modules cached for another lockfile, has no working `ttsc` in the
 // first pass, and a failing hook aborts that capture ("Shell environment capture failed") before smoo:install could
-// make one. So only the entry proper rebuilds the plugin and syncs the runtime pins.
+// make one. So only the entry proper rebuilds the plugin and CLI and syncs the runtime pins.
 if ((process.env.DEVENV_SKIP_TASKS ?? '') === '') {
-  await rebuildNxPluginIfStale();
+  await rebuildWorkspaceToolsIfStale();
 
   await syncRuntimePinsIfDrifted();
 }
@@ -82,14 +82,13 @@ async function syncRuntimePinsIfDrifted(): Promise<void> {
 }
 
 /**
- * The plugin and, first, every workspace package it depends on at run time (its `workspace:*` `dependencies`, and
- * theirs): loading the plugin imports their `dist`, so a checkout without them cannot compute the graph that would
- * build them. Each comes before whatever depends on it.
+ * The plugin, CLI and their transitive workspace runtime dependencies, once each and dependency first. The plugin's
+ * closure comes first so a rebuild can invalidate only the Nx state it owns, never for CLI-only packages.
  */
-async function bootstrapPackages(): Promise<string[]> {
-  const ordered: string[] = [];
-  const visit = async (directory: string): Promise<void> => {
-    if (ordered.includes(directory)) return;
+async function bootstrapPackages(): Promise<{ directory: string; invalidatesPlugin: boolean }[]> {
+  const ordered: { directory: string; invalidatesPlugin: boolean }[] = [];
+  const visit = async (directory: string, invalidatesPlugin: boolean): Promise<void> => {
+    if (ordered.some((entry) => entry.directory === directory)) return;
     const manifest: unknown = JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'));
     const dependencies =
       typeof manifest === 'object' && manifest !== null && 'dependencies' in manifest
@@ -98,28 +97,27 @@ async function bootstrapPackages(): Promise<string[]> {
     if (typeof dependencies === 'object' && dependencies !== null) {
       for (const [name, range] of Object.entries(dependencies)) {
         if (range !== 'workspace:*') continue;
-        await visit(await realpath(path.join(directory, 'node_modules', name)));
+        await visit(await realpath(path.join(directory, 'node_modules', name)), invalidatesPlugin);
       }
     }
-    ordered.push(directory);
+    ordered.push({ directory, invalidatesPlugin });
   };
-  await visit(path.join(projectRoot, 'packages/nx-plugin'));
+  await visit(path.join(projectRoot, 'packages/nx-plugin'), true);
+  await visit(path.join(projectRoot, 'packages/cli'), false);
   return ordered;
 }
 
-async function rebuildNxPluginIfStale(): Promise<void> {
+async function rebuildWorkspaceToolsIfStale(): Promise<void> {
   let rebuilt = false;
-  for (const directory of await bootstrapPackages()) {
+  for (const { directory, invalidatesPlugin } of await bootstrapPackages()) {
     const buildMarker = path.join(directory, buildMarkerFile);
     const markerStat = await stat(buildMarker).catch(() => null);
     // The marker stands outside `dist`, so wiping `dist` leaves it behind: only a `dist` holding files can be current.
     const built = (await readdir(path.join(directory, 'dist')).catch(() => [])).length > 0;
     // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the build marker.
     if (markerStat && built && !(await hasFileNewerThanMarker(directory, markerStat.mtimeMs))) continue;
-    // Bootstrap must not call `nx`: the project graph loads this plugin and
-    // `require('typescript').readConfigFile`. A cold macOS shell (publish) has
-    // no prior graph cache, so `nx run nx-plugin:tsc-js` deadlocks on the plugin
-    // it is trying to build. `ttsc` only needs the package tsconfig.
+    // Bootstrap invokes neither nx (whose graph loads the plugin) nor smoo (whose launcher needs CLI dist).
+    // ttsc only needs the package tsconfig, so both tools can start from missing outputs without a cycle.
     await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit'], directory);
     // The marker records when dist was last VERIFIED current, not when tsc last
     // chose to write bytes. ttsc is content-incremental, so an mtime-only change —
@@ -130,7 +128,7 @@ async function rebuildNxPluginIfStale(): Promise<void> {
     // would rebuild and call clearNxDaemonState, permanently destroying Nx's task
     // cache for the whole repository.
     await recordBuild(buildMarker);
-    rebuilt = true;
+    rebuilt ||= invalidatesPlugin;
   }
   if (rebuilt) await clearNxDaemonState();
 }

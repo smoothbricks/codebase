@@ -22,8 +22,8 @@ The package exposes a Bun-native executable:
 smoo --help
 ```
 
-SmoothBricks itself self-hosts before `dist` exists by using `tooling/smoo`, which imports `packages/cli/src/cli.ts`
-directly. Published installs use the package binary in `bin/smoo`, which imports built JavaScript from `dist`.
+SmoothBricks' PATH entry `tooling/smoo` and the published `bin/smoo` both import built JavaScript from `dist`. Shell
+entry builds the CLI before it can be called; the launcher loads no source transformer and has no source fallback.
 
 ## Core Commands
 
@@ -88,7 +88,7 @@ It currently:
 
 - Updates managed CI, release, hook, and formatting files. The publish workflow is only written when the repo has owned
   release packages.
-- Ensures the local `tooling/smoo` source shim is executable when present.
+- Ensures the local `tooling/smoo` launcher is executable when present.
 - Synchronizes root runtime versions inside devenv, or when `--sync-runtime` is passed.
 - Applies safe publish metadata defaults to `npm:public` packages without inferring package ownership.
 - Normalizes internal workspace dependency ranges to `workspace:*`.
@@ -563,6 +563,12 @@ nothing when nothing changed:
   flake input: the live import makes generated pins part of devenv's evaluation dependencies as well as direnv's
   watches. Ordinary activation then selects changed pins while an unchanged shell stays cached; no forced refresh or
   second version witness is needed.
+- This repository's entry proper bootstraps the CLI and Nx plugin plus their transitive `workspace:*` runtime
+  dependencies, once each and dependency first, using `ttsc -p tsconfig.lib.json --emit` without calling Nx or smoo. The
+  existing `node_modules/.cache/smoo/dist-verified` markers gate emit, and absent or empty `dist` rebuilds even with a
+  marker. Bootstrap finishes before runtime-pin sync can invoke smoo. Install/postinstall and developer-link tasks run
+  their raw scripts and do not invoke the CLI. CLI-only rebuilds leave the plugin's Nx daemon and graph untouched. See
+  [Self-hosted shell bootstrap](../../specs/cli/01_workspace_reconciliation.md#self-hosted-shell-bootstrap).
 - `smoo:cargo-fetch` bounds each `cargo fetch --locked`, which holds Cargo's package-cache lock while it runs and so
   stops every cargo that shares `CARGO_HOME` while it stalls: the fetch runs in a process group of its own under a 300 s
   deadline that kills the group, and git's low-speed limits end a stalled HTTP(S) transfer after about a minute. A fetch

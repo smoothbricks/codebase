@@ -1,9 +1,3 @@
 #!/usr/bin/env bun
-// SmoothBricks self-hosts smoo before @smoothbricks/cli/dist exists.
-// Published installs use packages/cli/bin/smoo, which imports built JS.
-// Source execution needs the Typia/ttsc Bun preload so createIsParse transforms.
-// Consumers depend on @smoothbricks/cli only — preload is exported from the CLI.
-import '@smoothbricks/cli/bun/preload';
-
-const { runCli } = await import('../packages/cli/src/cli.ts');
+import { runCli } from '../packages/cli/dist/cli.js';
 await runCli();

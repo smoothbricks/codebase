@@ -33,15 +33,17 @@ const buildMarker = 'node_modules/.cache/smoo/dist-verified';
 function staleCheckout() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
   const plugin = join(root, 'packages/nx-plugin');
-  mkdirSync(join(plugin, 'src'), { recursive: true });
-  mkdirSync(join(plugin, 'dist'), { recursive: true });
-  writeFileSync(join(plugin, 'package.json'), '{}');
-  writeFileSync(join(plugin, 'tsconfig.lib.json'), '{}');
-  writeFileSync(join(plugin, 'src/index.ts'), 'export {};\n');
-  const marker = join(plugin, buildMarker);
-  mkdirSync(dirname(marker), { recursive: true });
-  writeFileSync(marker, '');
-  utimesSync(marker, new Date(0), new Date(0));
+  for (const directory of [plugin, join(root, 'packages/cli')]) {
+    mkdirSync(join(directory, 'src'), { recursive: true });
+    mkdirSync(join(directory, 'dist'), { recursive: true });
+    writeFileSync(join(directory, 'package.json'), '{}');
+    writeFileSync(join(directory, 'tsconfig.lib.json'), '{}');
+    writeFileSync(join(directory, 'src/index.ts'), 'export {};\n');
+    const marker = join(directory, buildMarker);
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, '');
+    utimesSync(marker, new Date(0), new Date(0));
+  }
 
   const volume = join(root, 'volume/nx/workspace-data');
   mkdirSync(volume, { recursive: true });
@@ -151,11 +153,13 @@ it('a stale plugin build leaves a Cargo resolution a concurrent Nx process holds
 it('the environment capture pass rebuilds nothing, the entry proper still does', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
   try {
-    const plugin = join(root, 'packages/nx-plugin');
-    mkdirSync(join(plugin, 'src'), { recursive: true });
-    writeFileSync(join(plugin, 'package.json'), '{}');
-    writeFileSync(join(plugin, 'tsconfig.lib.json'), '{}');
-    writeFileSync(join(plugin, 'src/index.ts'), 'export {};\n');
+    for (const name of ['nx-plugin', 'cli']) {
+      const directory = join(root, 'packages', name);
+      mkdirSync(join(directory, 'src'), { recursive: true });
+      writeFileSync(join(directory, 'package.json'), '{}');
+      writeFileSync(join(directory, 'tsconfig.lib.json'), '{}');
+      writeFileSync(join(directory, 'src/index.ts'), 'export {};\n');
+    }
     mkdirSync(join(root, 'tooling/direnv'), { recursive: true });
 
     // No build marker: the plugin is stale. This `ttsc` is the one a checkout without node_modules has.
@@ -191,13 +195,11 @@ it('the environment capture pass rebuilds nothing, the entry proper still does',
 });
 
 /**
- * Loading the plugin imports the workspace packages it depends on at run time, so their `dist` must exist before the
- * plugin's graph can build them: the entry rebuilds a stale one, and one whose `dist` is gone or empty, first, found
- * through the plugin's own `node_modules` link, and leaves a current one alone. The marker it records stands outside
- * `dist`, which the tsc-js build owns and empties of whatever its emit did not write, so a current package whose
- * `dist` holds no build info is not rebuilt, and the markers one entry recorded still hold for the next.
+ * The plugin and CLI load their workspace runtime dependencies from dist. Bootstrap visits their shared closure once,
+ * dependency first, rebuilds missing or empty output even with an existing marker, and skips current packages. Only
+ * the plugin's closure invalidates Nx state; a CLI-only rebuild leaves the daemon and graph alone.
  */
-it('a stale, unbuilt or emptied dependency of the plugin is rebuilt before the plugin, a current one is not', () => {
+it('a stale, unbuilt or emptied workspace dependency is rebuilt before the plugin and CLI, a current one is not', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'smoo-enter-shell-')));
   try {
     // `verified` is when the package's marker says its `dist` was last current; `dist` lists the files that holds.
@@ -220,6 +222,25 @@ it('a stale, unbuilt or emptied dependency of the plugin is rebuilt before the p
     const kept = join(root, 'packages/kept');
     const unbuilt = join(root, 'packages/unbuilt');
     const wiped = join(root, 'packages/wiped');
+    const cli = join(root, 'packages/cli');
+    const cliOnly = join(root, 'packages/cli-only');
+    packageAt(cliOnly, {}, never);
+    packageAt(
+      cli,
+      {
+        dependencies: {
+          '@fixture/tool': 'workspace:*',
+          '@fixture/cli-only': 'workspace:*',
+          '@fixture/plugin': 'workspace:*',
+        },
+      },
+      later,
+      null,
+    );
+    mkdirSync(join(cli, 'node_modules/@fixture'), { recursive: true });
+    symlinkSync('../../../tool', join(cli, 'node_modules/@fixture/tool'));
+    symlinkSync('../../../cli-only', join(cli, 'node_modules/@fixture/cli-only'));
+    symlinkSync('../../../nx-plugin', join(cli, 'node_modules/@fixture/plugin'));
     packageAt(tool, {}, never);
     packageAt(kept, {}, later);
     // The marker outlives a deleted or emptied `dist`; it does not make one current.
@@ -269,11 +290,33 @@ it('a stale, unbuilt or emptied dependency of the plugin is rebuilt before the p
       const entered = enter();
       expect(entered.status, `${entry} entry: ${entered.stdout}${entered.stderr}`).toBe(0);
       // The second entry rebuilds nothing: the markers the first recorded hold, with no build info in any `dist`.
-      expect(readFileSync(builds, 'utf8').trim().split('\n')).toEqual([tool, unbuilt, wiped, plugin]);
+      expect(readFileSync(builds, 'utf8').trim().split('\n')).toEqual([tool, unbuilt, wiped, plugin, cliOnly, cli]);
     }
-    for (const directory of [tool, unbuilt, wiped, plugin]) {
+    for (const directory of [tool, unbuilt, wiped, plugin, cliOnly, cli]) {
       expect(readdirSync(join(directory, 'dist'))).toEqual(['index.js']);
     }
+    const daemon = join(root, '.nx/workspace-data/d/server-process.json');
+    mkdirSync(dirname(daemon), { recursive: true });
+    writeFileSync(daemon, 'kept');
+    const graph = join(root, '.nx/workspace-data/project-graph.json');
+    writeFileSync(graph, 'kept');
+    // Stale CLI source and an emptied CLI-only dependency must not clear the plugin's daemon or graph.
+    utimesSync(join(cli, buildMarker), never, never);
+    rmSync(join(cliOnly, 'dist/index.js'));
+    const entered = enter();
+    expect(entered.status, entered.stderr).toBe(0);
+    expect(readFileSync(builds, 'utf8').trim().split('\n')).toEqual([
+      tool,
+      unbuilt,
+      wiped,
+      plugin,
+      cliOnly,
+      cli,
+      cliOnly,
+      cli,
+    ]);
+    expect(readFileSync(daemon, 'utf8')).toBe('kept');
+    expect(readFileSync(graph, 'utf8')).toBe('kept');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

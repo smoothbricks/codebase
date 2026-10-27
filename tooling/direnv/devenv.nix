@@ -160,8 +160,8 @@ in {
     "x86_64-apple-darwin"
   ];
 
-  # The managed prologue bootstraps dependencies first; this repo-owned extension
-  # then rebuilds the local Nx plugin when its sources are newer than its output.
+  # The managed tasks install dependencies first; this repo-owned extension
+  # then bootstraps the built CLI and Nx plugin before any smoo invocation.
   enterShell = ''
     bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
   '';
