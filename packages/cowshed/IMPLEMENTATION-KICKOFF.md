@@ -131,24 +131,18 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   supports concurrent/reconnecting clients. Every accepted exec gets an unreused positive workspace-local monotonic job
   ID, committed before spawn. Stdout/stderr are separate opaque byte streams under one exact combined quota (default 1
   GiB) with byte count, SHA-256, and bounded redacted summary. Capture starts in bounded memory; small terminal bytes
-  live as protected Arrow Binary, while `.cowshed/job/<id>/out|err` appears lazily only after threshold,
-  background/replay, or checkpoint promotion. No per-job stream path is promised.
+  live as protected Arrow Binary, while `.cowshed/job/<id>/out|err` appears lazily only after threshold or
+  background/replay promotion. No per-job stream path is promised.
 - **Frozen storage and publication DTOs**: `ProtectedOutput::{Inline{data:BinaryData},File{path}}`;
   `OutputStorage::{Captured{artifact},Redirect{source,artifact}}`; `StreamInfo{storage,bytes,sha256,summary}`;
-  `ProtectedRecord::{Job(JobArtifactRecord),CheckpointManifest(CheckpointManifestRecord)}`. `BinaryData` is a bounded
-  byte newtype whose JSON wire union is exact tagged `utf8|base64`; ordinary `JobInfo` may carry it, while controller
-  commitments never carry payload/path/summary fields. `Redirect.source` is mutable shell state; reads resolve its
-  independent protected artifact. Classify only an AST-proven redirect with a trusted actual descriptor and exact quota
-  accounting; never poll/tail/reopen. `ExecRequest.stdout_copy` / `stderr_copy` are
-  `Option<OutputPublication { path, policy: CreateNew|Replace }>` (camelCase in JSON/NAPI). CLI
-  `--stdout-copy`/`--stderr-copy` default CreateNew; one `--replace-output` switches all requested copies and is Usage
-  without a copy. Redirect snapshots and post-terminal publication use independent clone/reflink/copy, never hardlinks.
-- **Checkpoint artifact barrier**: admissions/artifact writes pause; running prefixes promote and files fsync. Append a
-  complete `CheckpointManifestRecord { version,repo_id,origin_incarnation,barrier_id,visible_jobs,records_sha256 }`;
-  each visible stream is `{storage_kind,bytes,sha256,protected_path}` with exact captured/redirect × inline/file kind
-  and path iff file. Clone while held; publish
-  `CheckpointCommitment { version,order,repo_id,origin_incarnation,checkpoint_id,barrier_id, manifest_batch_sha256 }`.
-  Terminal inline bytes resolve through prefix Job rows; running bytes are named fsynced files.
+  `JobArtifactRecord`. `BinaryData` is a bounded byte newtype whose JSON wire union is exact tagged `utf8|base64`;
+  ordinary `JobInfo` may carry it, while controller commitments never carry payload/path/summary fields.
+  `Redirect.source` is mutable shell state; reads resolve its independent protected artifact. Classify only an
+  AST-proven redirect with a trusted actual descriptor and exact quota accounting; never poll/tail/reopen.
+  `ExecRequest.stdout_copy` / `stderr_copy` are `Option<OutputPublication { path, policy: CreateNew|Replace }>`
+  (camelCase in JSON/NAPI). CLI `--stdout-copy`/`--stderr-copy` default CreateNew; one `--replace-output` switches all
+  requested copies and is Usage without a copy. Redirect snapshots and post-terminal publication use independent
+  clone/reflink/copy, never hardlinks.
 - **MCP authority delivery and consent**: coordinator authority is delivered only over an inherited dedicated file
   descriptor or socketpair from the spawner, then validated, closed, and made non-inheritable before any workspace
   process is spawned. It never appears in environment, argv, stderr, workspace files, or ordinary token text. Worker
@@ -168,25 +162,24 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 - **Gateway**: localhost daemon. npm + cargo mirrors (caching/dedupe, Keychain upstream creds) + the `repo mirror`
   control-plane verb (bare read-only git mirrors; no in-sandbox git broker). Granted egress is **intercepted by
   default** — per-workspace CA (private key gateway-side next to the grant file, public cert an in-image trust anchor;
-  minted at new/fork, preserved on restore, destroyed with the workspace), TLS terminated, Keychain credential +
-  traceparent injected, audited per-request; `--opaque` reverts a host to a pass-through CONNECT tunnel (pinned
-  clients). This **supersedes the old "no TLS MITM" line** and the per-authenticated-service endpoint roadmap (/github,
-  /anthropic): a granted host needs no bespoke endpoint. Engine = `hyper` + `rustls` + `rcgen` + `tokio`,
-  single-listener dynamic SNI (`ResolvesServerCert`), h1+h2 on both legs (SSE/streaming), LRU **leaf** cache,
-  upstream-health gate at the one outbound choke point — the Bun/Hero MITM production lessons ported as **normative
-  tests, not code** (05_gateway.md). Outbound is one `UpstreamConnector` over hyper/rustls. Per-workspace port block +
-  token → egress/repo policy; 7644 = control plane only.
-- **Telemetry and tiered authority = lmao Arrow**: protected Arrow is exact
-  `ProtectedRecord::{Job(JobArtifactRecord),CheckpointManifest(CheckpointManifestRecord)}`. Complete batches/sealed
-  files are content authority within the origin boundary. Controller continuity is exact
-  `ControllerCommitment::{Admission(AdmissionCommitment),Terminal(TerminalCommitment), Checkpoint(CheckpointCommitment),Fork(ForkCommitment),Restore(RestoreCommitment)}`
-  with exact fields frozen in 07_api.md/13_telemetry.md. It owns existence/status/order/lineage/count/hash/digests but
-  carries no raw payload, inline bytes, protected/redirect path, or summary. `order` is positive, globally unique,
-  contiguous, and strictly increasing; admission precedes the sole terminal, checkpoint/fork/restore sources exist, and
-  lineage is acyclic. Constructors, Arrow, and JSON run one row/collection validator with `CommitmentPriorContext`. Any
-  gap, contradiction, missing/altered content, invalid complete frame, or digest mismatch is `Integrity`; only an
-  incomplete trailing frame may be discarded and reported with its `batch_sha256`. W3C context still spans
-  CLI/Rust/MCP/CI/job/gateway boundaries. No on-disk NDJSON or telemetry daemon; `daemon-stderr.log` is pre-init only.
+  minted at new/fork, destroyed with the workspace), TLS terminated, Keychain credential + traceparent injected, audited
+  per-request; `--opaque` reverts a host to a pass-through CONNECT tunnel (pinned clients). This **supersedes the old
+  "no TLS MITM" line** and the per-authenticated-service endpoint roadmap (/github, /anthropic): a granted host needs no
+  bespoke endpoint. Engine = `hyper` + `rustls` + `rcgen` + `tokio`, single-listener dynamic SNI (`ResolvesServerCert`),
+  h1+h2 on both legs (SSE/streaming), LRU **leaf** cache, upstream-health gate at the one outbound choke point — the
+  Bun/Hero MITM production lessons ported as **normative tests, not code** (05_gateway.md). Outbound is one
+  `UpstreamConnector` over hyper/rustls. Per-workspace port block + token → egress/repo policy; 7644 = control plane
+  only.
+- **Telemetry and tiered authority = lmao Arrow**: protected Arrow is exact `JobArtifactRecord` rows, with `record_kind`
+  = `job`. Complete batches/sealed files are content authority within the origin boundary. Controller continuity is the
+  `ControllerCommitment` union in 13_telemetry.md, with exact fields frozen in 07_api.md/13_telemetry.md. It owns
+  existence/status/order/lineage/count/hash/digests but carries no raw payload, inline bytes, protected/redirect path,
+  or summary. `order` is positive, globally unique, contiguous, and strictly increasing; admission precedes the sole
+  terminal, fork sources exist, and lineage is acyclic. Constructors, Arrow, and JSON run one row/collection validator
+  with `CommitmentPriorContext`. Any gap, contradiction, missing/altered content, invalid complete frame, or digest
+  mismatch is `Integrity`; only an incomplete trailing frame may be discarded and reported with its `batch_sha256`. W3C
+  context still spans CLI/Rust/MCP/CI/job/gateway boundaries. No on-disk NDJSON or telemetry daemon; `daemon-stderr.log`
+  is pre-init only.
 - **Substrates**: `cowshed_core::Substrate` has APFS image and ZFS dataset contracts. Linux enforcement combines
   Landlock, a private-loopback network namespace, and a per-workspace gateway Unix socket, with the same grants,
   revision semantics, and exit taxonomy as macOS.

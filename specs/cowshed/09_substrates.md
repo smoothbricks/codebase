@@ -24,19 +24,6 @@ pub trait LifecyclePlanner: Send + Sync {
         from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<ForkPlan, PlanError>;
-    fn plan_checkpoint(
-        &self,
-        workspace: &LifecycleWorkspace,
-        label: CheckpointLabel,
-        pin: Pin,
-    ) -> Result<CheckpointPlan, PlanError>;
-    fn plan_restore(
-        &self,
-        workspace: &LifecycleWorkspace,
-        checkpoint: &CheckpointRef,
-        mode: RestoreMode,
-        identity: OperationIdentity,
-    ) -> Result<RestorePlan, PlanError>;
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError>;
 }
 
@@ -81,16 +68,15 @@ the separately required work on each candidate's artifacts. Standalone retiremen
 Nothing persists this selection, carries it across lock admission or changes recovery-image retention.
 
 A candidate's identity is a digest of what `stat` reports, plus the content of the small records beside an image. Each
-file it names contributes its path, length, allocated bytes and modification time. A record (grants sidecar, CA key,
-checkpoint and restore-recovery facts) also contributes its content; every other file, above all an image, contributes
-its device and inode and is never opened. An image is a sparse file of up to hundreds of gigabytes, `doctor` previews
-every retired workspace's checkpoint images, and `execute_gc` repeats the preview under the locks, so hashing contents
-would read the whole store twice for a fence the inode already gives: a replacement differs by inode, a write by
-modification time, a resize by length.
+file it names contributes its path, length, allocated bytes and modification time. A record (grants sidecar, CA key)
+also contributes its content; every other file, above all an image, contributes its device and inode and is never
+opened. An image is a sparse file of up to hundreds of gigabytes, `doctor` previews every retired workspace's images,
+and `execute_gc` repeats the preview under the locks, so hashing contents would read the whole store twice for a fence
+the inode already gives: a replacement differs by inode, a write by modification time, a resize by length.
 
-Adopt, create, fork, checkpoint, and restore are intentionally absent from `Substrate`'s execution methods. The APFS
-controller boundary is staged so that controller-owned state can be initialized or fenced while the lifecycle lock
-remains held. `ApfsSubstrate` exposes these methods:
+Adopt, create, and fork are intentionally absent from `Substrate`'s execution methods. The APFS controller boundary is
+staged so that controller-owned state can be initialized or fenced while the lifecycle lock remains held.
+`ApfsSubstrate` exposes these methods:
 
 ```rust
 impl<H, L> ApfsSubstrate<H, L>
@@ -142,26 +128,6 @@ where
         F: FnOnce(ForkStage, W::Output) -> Fut + Send,
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send + std::fmt::Display;
-
-    pub async fn execute_checkpoint_staged<F, Fut, E>(
-        &self,
-        plan: CheckpointPlan,
-        initialize: F,
-    ) -> Result<CheckpointRef, CheckpointExecutionError<E>>
-    where
-        F: FnOnce(CheckpointStage) -> Fut + Send,
-        Fut: Future<Output = Result<(), E>> + Send,
-        E: Send;
-
-    pub async fn execute_restore_staged<Fence, FenceFut, FenceError>(
-        &self,
-        plan: RestorePlan,
-        fence: Fence,
-    ) -> Result<RestoreReceipt, RestoreExecutionError<FenceError>>
-    where
-        Fence: FnOnce(RestoreFence) -> FenceFut + Send,
-        FenceFut: Future<Output = Result<(), FenceError>> + Send,
-        FenceError: Send;
 }
 ```
 
@@ -183,23 +149,10 @@ The executor contract is:
   request) drops the work and its output with it and runs nothing for them after, so the output is the resource's owner:
   dropped, it releases what it holds, and work dropped mid-flight releases what it makes once nobody is there to take
   it. A crash leaves the resource to the replayed operation's intent and to collection.
-- **The checkpoint callback is the artifact barrier.** With the lifecycle lock held and before cloning the checkpoint
-  image, the executor awaits `initialize`. The controller must flush live job writers, append and fsync the
-  `CheckpointManifestRecord` and its `barrier_id`, and return success only when that barrier is durable. Only then may
-  the executor clone and verify the image and publish its checkpoint fact. Callback failure or cancellation therefore
-  leaves no checkpoint snapshot whose filesystem state outruns its artifact manifest.
-- **Restore has a publication fence.** The executor stages, mints and validates a private replacement (or mounts and
-  validates the checkpoint read-only for a verification-only restore) and, for a replacement, swaps images and persists
-  `PendingPublicationFact` in one blocking-lane step, so no caller observes a half-prepared restore. It then calls
-  `fence(RestoreFence)` and only after the fence succeeds activates restored metadata and returns `RestoreReceipt`. The
-  fence is where the controller durably commits the incarnation/token/gateway/supervisor handoff; neither the old nor
-  new incarnation may be admitted across that barrier. Verification-only restore detaches and returns without a fence.
 - **Cancellation follows the same transaction boundaries as errors.** Dropping a future while an adopt/create/fork
   initialization callback is pending synchronously detaches its private attachment and reclaims any cloned staging image
-  before the lifecycle lock is released. Dropping a checkpoint future while its pre-clone barrier is pending creates no
-  image. Once restore has persisted `PendingPublicationFact`, rollback across the incarnation fence is forbidden: a
-  fence error, activation error, cancellation, or crash retains the typed pending fact, and the next recovery pass
-  completes publication forward. Recovery and `gc` also finish any idempotent cleanup left by an interrupted abort.
+  before the lifecycle lock is released. Recovery and `gc` also finish any idempotent cleanup left by an interrupted
+  abort.
 
 Plans remain pure, immutable, and capability-free: they contain validated logical names, expected incarnation/revision,
 and intended operations, but no open descriptors, caller-supplied mounted paths, or executed side effects. CLI commands
@@ -226,13 +179,12 @@ retained inputs are RAW and attach the same way with `-readonly`; any other form
 held mount-root/source identity before publication (01a_apfs.md, "Mounts"). There is no combined mountpoint attach,
 fallback or stale-family selection. Release unmounts each exact currently-owned mounted volume with `funmount` on its
 held, proven root descriptor, then guarded `hdiutil detach` of the exact physical whole device, retaining the existing
-grace/force/refusal contract (01a_apfs.md, "Release and device custody"). Detached checkpoint verification and resize,
-and blank-image formatting, intentionally attach without mounting. Deletion renames one file into a `.deleting`
-directory, and a background deletion frees it later (05_gateway.md, "Deleting released images"). Clones are logically
-independent of their source (no GC coupling), but inherit its extent map, so a fragmented main makes every clone's first
-write slow until `cowshed defrag main` (01a_apfs.md, "Clone cost follows extents, not size"), and they share its blocks
-until every sharer is released (01a_apfs.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance
-budgets").
+grace/force/refusal contract (01a_apfs.md, "Release and device custody"). Detached resize and blank-image formatting
+intentionally attach without mounting. Deletion renames one file into a `.deleting` directory, and a background deletion
+frees it later (05_gateway.md, "Deleting released images"). Clones are logically independent of their source (no GC
+coupling), but inherit its extent map, so a fragmented main makes every clone's first write slow until
+`cowshed defrag main` (01a_apfs.md, "Clone cost follows extents, not size"), and they share its blocks until every
+sharer is released (01a_apfs.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance budgets").
 
 Whole RAW backing images can share host APFS blocks through `clonefile`; files inside two separately mounted RAW images
 cannot. Each image contains its own APFS volume, and `clonefile` does not cross those volume boundaries; a fork clones
@@ -254,8 +206,6 @@ mbx creates (16_build_volumes.md); its build volume stays an image here like eve
 | session workspace                 | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`                                                                                                                                                                                                                                     |
 | workspace mounts                  | `mountpoint` inheritance on `…/ws` → `<mount-root>/<owner>/<repo>/<name>`                                                                                                                                                                                                              |
 | crash-consistent snapshot of main | `zfs snapshot main@cowshed:<name>` (transactionally atomic)                                                                                                                                                                                                                            |
-| `cowshed checkpoint <ws> <label>` | `zfs snapshot ws@<label>` — instant, zero-copy                                                                                                                                                                                                                                         |
-| `cowshed restore`                 | clone-swap (default; later checkpoints survive) or `--discard-newer` → `zfs rollback`                                                                                                                                                                                                  |
 | `cowshed fork [<src>] <ws>`       | `zfs snapshot src@cowshed:fork-<ws>` + clone; source defaults to main                                                                                                                                                                                                                  |
 | `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves)                                                                           |
 | capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                                                                                                      |
@@ -273,12 +223,11 @@ Markers, tokens, grant semantics, secrets gates, and the cache taxonomy are unch
 schema but `portBlock` is optional and omitted for ZFS/Linux. When a dataset is attached, the controller creates its
 private loopback-only netns, bind-mounts that incarnation's Unix gateway socket, and launches the trusted connector on
 namespace-local `127.0.0.1:7644`; package tools use that HTTP address, not a Unix-socket API. Detach drains and kills
-the connector cgroup and unlinks the socket before releasing the netns. Restore fences and drains the old connector
-before publishing the replacement incarnation, then creates a fresh socket and connector before admitting jobs. Layer-2
-extracted caches stay **in-dataset** and arrive via the clone, same as in-image: hardlinks cannot cross datasets, so a
-shared extracted cache would demote installs to copies. OpenZFS ≥ 2.2 block cloning (`copy_file_range` → BRT) makes
-reflink-grade copies work _across_ datasets in one pool; cowshed treats that as an opportunistic bonus, never
-load-bearing (it is version- and tunable-dependent).
+the connector cgroup and unlinks the socket before releasing the netns. Layer-2 extracted caches stay **in-dataset** and
+arrive via the clone, same as in-image: hardlinks cannot cross datasets, so a shared extracted cache would demote
+installs to copies. OpenZFS ≥ 2.2 block cloning (`copy_file_range` → BRT) makes reflink-grade copies work _across_
+datasets in one pool; cowshed treats that as an opportunistic bonus, never load-bearing (it is version- and
+tunable-dependent).
 
 ### The clone-origin dependency
 
@@ -309,13 +258,12 @@ it**:
 `zfs allow` delegation covers create/snapshot/clone/destroy but **not `mount(2)`**, which Linux gates on `CAP_SYS_ADMIN`
 regardless of delegation. Substrate mutations therefore go through `cowshed-helper`: a minimal root binary (installed by
 the package, auditable in one sitting) that accepts a fixed verb set
-(`create|clone|snapshot|destroy|rename|swap|promote|mount|unmount|set-mountpoint`) — `rename` serves retire's trash
-namespace, `swap` is the narrowly-constrained clone-swap that `cowshed restore` needs, and `promote` accepts only a
-build dataset (`…/<repo>/build/<id>`), and cowshed calls it only for an adoption: at land, or when collection completes
-an adoption whose pending promote the build volume's sidecar records and the link of the target it names confirms
-(01b_zfs.md, "Retiring a build dataset") — and refuses, on every verb, any dataset argument outside `<pool>/cowshed/`.
-Constrained sudoers entries are the supported alternative for hosts that forbid setuid helpers. Everything else —
-Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI — runs unprivileged.
+(`create|clone|snapshot|destroy|rename|promote|mount|unmount|set-mountpoint`) — `rename` serves retire's trash
+namespace, `promote` accepts only a build dataset (`…/<repo>/build/<id>`), and cowshed calls it only for an adoption: at
+land, or when collection completes an adoption whose pending promote the build volume's sidecar records and the link of
+the target it names confirms (01b_zfs.md, "Retiring a build dataset") — and refuses, on every verb, any dataset argument
+outside `<pool>/cowshed/`. Constrained sudoers entries are the supported alternative for hosts that forbid setuid
+helpers. Everything else — Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI — runs unprivileged.
 
 ### Linux host paths
 
@@ -351,38 +299,6 @@ its contents and no cowshed collection enters it. `projects` contains only works
 Creation, helper containment checks, discovery, send/receive, and GC all use these exact roots; the siblings are not
 configurable independently. A host that still has the `<pool>/cowshed/caches` dataset of an earlier release keeps it
 mounted, never creating one, until its retirement destroys it (03_caches.md, "Wiring").
-
-### Restore transaction
-
-Restore is one fenced transaction on both substrates:
-
-1. Acquire the workspace lifecycle lock and revalidate the plan's current `workspaceIncarnation`, grant revision,
-   checkpoint identity, format/dataset, and absence of a concurrent retire. Stop admitting jobs, drain the
-   revision-bound supervisor, and detach/unmount the current workspace.
-2. Prepare the replacement at a non-enumerated staging name. Clone the checkpoint, validate it (including fsck on APFS),
-   and validate the clone's own complete protected `CheckpointManifestRecord`: its frame matches its `batch_sha256`,
-   `records_sha256` hashes the record prefix before it, its `repo_id` and `origin_incarnation` match the marker, and
-   every visible stream matches its count, hash and path. The controller's `CheckpointCommitment` is audit telemetry and
-   is not read. Missing/altered content, invalid complete frames, or digest mismatch is typed `Integrity` before
-   publication; only an incomplete trailing frame may be discarded as reported recovery with its `batch_sha256`
-   retained. Preserve the logical workspace name, grant binding, CA, primary `repo_id`, and macOS `portBlock` only when
-   present. Linux preserves no port block.
-3. Mint the fresh `workspaceIncarnation` first. Then mint a fresh gateway token bound to that incarnation and write both
-   into staged marker/token files, flush, and verify while undiscoverable. Copied job records retain their producer
-   incarnation; allocation in the new incarnation starts above every inherited numeric job ID.
-4. Atomically swap the staged replacement into the canonical image/dataset name while moving the displaced workspace to
-   the undo checkpoint. Mount at the canonical path, then validate marker, incarnation, token, policy binding, and
-   grants.
-5. In one publication transaction, append
-   `RestoreCommitment { version,order,repo_id,source_checkpoint,source_incarnation,destination_incarnation }`, publish
-   detached metadata for the new incarnation with atomic replace + parent fsync, and switch gateway acceptance from the
-   old token to the new. Only then may the gateway, supervisor, or exec admit the incarnation; no interval admits both.
-6. On any failure before publication, unmount and remove the staged replacement, restore the displaced workspace under
-   its original name, remount it, and resume its original supervisor/token. After publication, recovery completes the
-   new state and never rolls back across the incarnation fence. `gc` resumes only idempotent cleanup.
-
-Default ZFS restore uses clone-swap so later checkpoints survive; `--discard-newer` may use rollback but follows the
-same fencing, token/incarnation, publication, and supervisor ordering.
 
 ### macOS ZFS, btrfs
 

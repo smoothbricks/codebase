@@ -27,9 +27,8 @@ On Linux, `programs.cowshed.linuxConnector` (and `services.cowshed-runner` in CI
 and declares the dedicated connector uid/process restrictions and cgroup subtree. The launcher may enter the already
 created workspace netns, bind only `127.0.0.1:7644`, and open only the bind-mounted per-workspace gateway socket; it has
 no credential-store, policy-file, CA-key, or upstream-network access. Workspace processes cannot signal, ptrace,
-inspect, or join that identity/cgroup. The module owns this host security setup, while attach/detach/restore create,
-drain, and remove each ephemeral connector instance. This is not a system-wide listener and allocates no Linux
-`portBlock`.
+inspect, or join that identity/cgroup. The module owns this host security setup, while attach/detach create, drain, and
+remove each ephemeral connector instance. This is not a system-wide listener and allocates no Linux `portBlock`.
 
 ## Ownership detection: validate, never mutate
 
@@ -51,11 +50,11 @@ not configured: HM-created symlinks resolve into `/nix/store` (verification item
 validation requires its URL to produce the recorded `repo_id`; discovery may propose a binding but never silently mint
 one. Multiple bindings may exist with exactly one primary, while a local-only repository requires an explicit `repo_id`.
 Trusted policy lives at `/private/cowshed/store/<owner>/<repo>/policy.json`, with `owner` and `repo` encoded as
-separate, path-safe components. It holds the project's checkpoint quotas and standing grants (04_sandbox.md).
-Home-manager, the trusted host bootstrap, and the operator's controller verbs (`cowshed grant --project-wide`,
-checkpoint-quota policy) write it; `adopt`, `setup`, workspaces, agents, and repository content may validate it but
-never create or rewrite it. Missing policy is the empty policy; an inconsistent binding is a bootstrap error with a
-declarative remediation hint, never an imperative fallback derived from a checkout path.
+separate, path-safe components. It holds the project's standing grants (04_sandbox.md). Home-manager, the trusted host
+bootstrap, and the operator's controller verbs (`cowshed grant --project-wide`) write it; `adopt`, `setup`, workspaces,
+agents, and repository content may validate it but never create or rewrite it. Missing policy is the empty policy; an
+inconsistent binding is a bootstrap error with a declarative remediation hint, never an imperative fallback derived from
+a checkout path.
 
 **What stays imperative always**, on every host: volume creation (`diskutil apfs addVolume` — stateful, hardware-
 adjacent) and every per-project/per-workspace artifact (images, grants, tokens, CA keys). Native volume creation is

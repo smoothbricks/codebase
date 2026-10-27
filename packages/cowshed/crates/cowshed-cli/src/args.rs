@@ -25,8 +25,6 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &SETUP,
     &FORK,
     &MOVE,
-    &CHECKPOINT,
-    &RESTORE,
     &LIST,
     &PATH,
     &BUILD_STATE,
@@ -40,7 +38,6 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &MOUNT,
     &RESIZE,
     &DEFRAG,
-    &RESEED,
     &CACHE,
     &REKEY,
     &GC,
@@ -88,8 +85,6 @@ pub enum Command {
     Setup(SetupArgs),
     Fork(ForkArgs),
     Move(MoveArgs),
-    Checkpoint(CheckpointArgs),
-    Restore(RestoreArgs),
     List(ListArgs),
     Path(PathArgs),
     /// Read the selected checkout's recorded build-state paths without opening its controller.
@@ -107,7 +102,6 @@ pub enum Command {
     Mount(MountArgs),
     Resize(ResizeArgs),
     Defrag(DefragArgs),
-    Reseed(ReseedArgs),
     Rekey(RekeyArgs),
     Cache(CacheCommand),
     Gc(GcArgs),
@@ -174,8 +168,6 @@ impl Command {
             Self::Adopt(_)
             | Self::Fork(_)
             | Self::Move(_)
-            | Self::Checkpoint(_)
-            | Self::Restore(_)
             | Self::Path(_)
             | Self::BuildState
             | Self::Exec(_)
@@ -185,7 +177,6 @@ impl Command {
             | Self::Attach(_)
             | Self::Resize(_)
             | Self::Defrag(_)
-            | Self::Reseed(_)
             | Self::Rekey(_)
             | Self::Gc(_)
             | Self::Push(_)
@@ -443,19 +434,6 @@ impl std::fmt::Display for MoveDestination {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointArgs {
-    pub workspace: Option<String>,
-    pub label: Option<OsString>,
-    pub keep: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RestoreArgs {
-    pub workspace: String,
-    pub label: OsString,
-}
-
 /// `landing` selects the view; `landed` selects the rows and implies the measurement. They are
 /// separate because their consumers are: a human triaging a project wants every row with its
 /// counts, and a script retiring landed workspaces wants nothing but the names it may safely pass
@@ -625,14 +603,6 @@ pub struct DefragArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CacheCommand {
     Clear { workspace: Option<String> },
-}
-
-/// `reseed <ws|main> [--from <target>] [--dry-run]` — discard live build state for a seed clone.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReseedArgs {
-    pub workspace: String,
-    pub from: String,
-    pub dry_run: bool,
 }
 
 /// `rekey <ws|main>` — rebuild one keyless workspace's CA identity.
@@ -954,17 +924,6 @@ pub fn cli_command() -> ClapCommand {
                 .arg(positional("dst", 0..=1))
                 .arg(value("repo-id")),
         )
-        .subcommand(
-            leaf("checkpoint")
-                .arg(positional("workspace", 0..=1))
-                .arg(positional("label", 0..=1))
-                .arg(flag("keep")),
-        )
-        .subcommand(
-            leaf("restore")
-                .arg(positional("workspace", 0..=1))
-                .arg(positional("label", 0..=1)),
-        )
         .subcommand(leaf("ls").args([flag("all"), flag("landing"), flag("landed")]))
         .subcommand(
             leaf("path")
@@ -1061,12 +1020,6 @@ pub fn cli_command() -> ClapCommand {
                 .arg(value_once("build")),
         )
         .subcommand(leaf("defrag").arg(positional("workspace", 0..=1)))
-        .subcommand(
-            leaf("reseed")
-                .arg(positional("workspace", 0..=1))
-                .arg(value_once("from"))
-                .arg(flag("dry-run")),
-        )
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
         .subcommand(
             leaf("cache")
@@ -1311,8 +1264,6 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "setup" => parse_setup(leaf, &global)?,
         "fork" => parse_fork(leaf)?,
         "mv" => parse_move(leaf)?,
-        "checkpoint" => parse_checkpoint(leaf)?,
-        "restore" => parse_restore(leaf)?,
         "ls" => parse_list(leaf)?,
         "path" => parse_path(leaf)?,
         "build-state" => Command::BuildState,
@@ -1326,7 +1277,6 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "mount" => parse_mount(leaf)?,
         "resize" => parse_resize(leaf)?,
         "defrag" => parse_defrag(leaf)?,
-        "reseed" => parse_reseed(leaf)?,
         "cache" => parse_cache(leaf)?,
         "rekey" => parse_rekey(leaf)?,
         "gc" => parse_gc(leaf)?,
@@ -2892,51 +2842,6 @@ fn checkout_destination(value: &OsStr, usage: &'static CommandSpec) -> Result<Pa
     Ok(path)
 }
 
-const CHECKPOINT: CommandSpec = CommandSpec {
-    name: "checkpoint",
-    missing: "checkpoint requires an argument",
-    args: "[<ws>] [label]",
-    trailing: "",
-    summary: "create a checkpoint",
-    about: &[
-        "Snapshots a workspace by clonefiling its image under a label (a UTC timestamp when you give none). The copy is taken after a supervisor barrier seals complete job output, so it is crash-consistent rather than merely recent. Omit the workspace to checkpoint the one you are standing in.",
-    ],
-    options: &[Opt {
-        spelling: "--keep",
-        meaning: "pin the checkpoint so expiry pruning never deletes it; an explicit label pins it too",
-    }],
-};
-
-fn parse_checkpoint(matches: &ArgMatches) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &CHECKPOINT;
-    Ok(Command::Checkpoint(CheckpointArgs {
-        workspace: optional_workspace(matches, "workspace", false, USAGE)?,
-        label: os(matches, "label"),
-        keep: flagged(matches, "keep"),
-    }))
-}
-
-const RESTORE: CommandSpec = CommandSpec {
-    name: "restore",
-    missing: "restore requires a workspace",
-    args: "<ws> <label>",
-    trailing: "",
-    summary: "restore a checkpoint",
-    about: &[
-        "Swaps the workspace's image for the checkpoint and mints a new workspace incarnation. The displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is itself undoable; a restore over unsaved work is refused.",
-    ],
-    options: &[],
-};
-
-fn parse_restore(matches: &ArgMatches) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &RESTORE;
-    Ok(Command::Restore(RestoreArgs {
-        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
-        label: os(matches, "label")
-            .ok_or_else(|| UsageError::new("restore requires a label", USAGE))?,
-    }))
-}
-
 const LIST: CommandSpec = CommandSpec {
     name: "ls",
     missing: "ls requires an argument",
@@ -3391,7 +3296,7 @@ const REVOKE: CommandSpec = CommandSpec {
     trailing: "",
     summary: "remove paths and network access",
     about: &[
-        "Removes the selected workspace's own grants; --project-wide selects standing project grants instead. Requires selectors or --all, never both. Absent selectors are no-ops. Port ownership never shrinks, and project checkpoint quotas are unchanged.",
+        "Removes the selected workspace's own grants; --project-wide selects standing project grants instead. Requires selectors or --all, never both. Absent selectors are no-ops. Port ownership never shrinks.",
         "--egress removes every rule for the host regardless of mode or ports. Invalid recorded keys are accepted verbatim for repair: cowshed revoke raven --egress api.example.com:443, then grant the bare api.example.com if reach is still wanted. No gateway reconciliation precedes recovery. Workspace revoke cannot remove project policy.",
     ],
     options: &[
@@ -3510,7 +3415,7 @@ const REMOVE: CommandSpec = CommandSpec {
     options: &[
         Opt {
             spelling: "--force",
-            meaning: "waive transient state only — a dirty tree, an in-progress merge, the workspace's own running jobs — and the ten-minute floor on a workspace's age; the deletion log records which of them it waived and which process asked. It does not waive the containment gate or a process cowshed does not run holding the mount, and it does not preserve what it waives: an uncommitted tree is destroyed with no bundle and no record, so commit it or `cowshed checkpoint` first if it is the only copy",
+            meaning: "waive transient state only — a dirty tree, an in-progress merge, the workspace's own running jobs — and the ten-minute floor on a workspace's age; the deletion log records which of them it waived and which process asked. It does not waive the containment gate or a process cowshed does not run holding the mount, and it does not preserve what it waives: an uncommitted tree is destroyed with no bundle and no record, so commit it first if it is the only copy",
         },
         Opt {
             spelling: "--restore",
@@ -3776,7 +3681,7 @@ const DEFRAG: CommandSpec = CommandSpec {
     summary: "rewrite source and build images contiguously",
     about: &[
         "Rewrites the workspace image, its registered live build source and every published seed of this incarnation. Doctor reports the actual source and seed counts separately. A fork warns, and proceeds, when a physical image generation has more than 7140 extents: a standalone first-write sensitivity limit from one loaded RAW observation at 140.046964 µs/extent, not a causal calibration or whole-fork latency guarantee. Multiple images and attach, mount, identity and proof work share the total budget.",
-        "The workspace is detached the way `resize` detaches it — a volume with a file open or a job running refuses before the image is touched — then its data is copied with plain reads and writes into a sibling, flushed, renamed over the image, verified by attaching it, and mounted again if it was mounted. The copy needs as much free space as the image has allocated, and keeps it while older clones and checkpoints still share the old blocks.",
+        "The workspace is detached the way `resize` detaches it — a volume with a file open or a job running refuses before the image is touched — then its data is copied with plain reads and writes into a sibling, flushed, renamed over the image, verified by attaching it, and mounted again if it was mounted. The copy needs as much free space as the image has allocated, and keeps it while older clones still share the old blocks.",
         "A refused pending clone may contain the only copy of dirty work. `defrag <pending-workspace>` rewrites that same payload without publishing or deleting it, and refuses while its original creator still holds the intent lease. Retry the original fork after the rewrite.",
     ],
     options: &[],
@@ -3823,39 +3728,6 @@ fn parse_cache(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Cache(command))
 }
 
-const RESEED: CommandSpec = CommandSpec {
-    name: "reseed",
-    missing: "reseed requires a workspace",
-    args: "<ws|main>",
-    trailing: "",
-    summary: "replace live build state from an existing seed",
-    about: &[
-        "Discards the workspace's live build-volume contents and replaces them with a new clone of the target's latest existing seed in its current incarnation (default main). The source tree, HEAD, index, dirty and untracked files stay untouched; only the excluded .cowshed/build link changes. Missing incremental work is rebuilt cold next time.",
-        "Never refreshes, writes or deletes any seed, including the workspace's own seed. A stale seed is used as-is; an absent seed refuses. Running jobs, land holds, filesystem holders and unfinished create/fork/adopt work refuse before publication; holders are named by PID and command, never killed or forcibly unmounted.",
-        "Prints reclaimed allocated image bytes (0 for --dry-run); --json returns ReseedResult. Preview reports the old allocation, seed-based replacement estimate and signed estimated reduction on stderr, without changing links, mounts, images or seeds. APFS shared extents mean allocation accounting is not a promise of physical free space.",
-    ],
-    options: &[
-        Opt {
-            spelling: "--from <target>",
-            meaning: "clone this target's latest existing seed instead of main's; never refresh it",
-        },
-        Opt {
-            spelling: "--dry-run",
-            meaning: "report volume identities and allocated-byte estimates without changing build state",
-        },
-    ],
-};
-
-fn parse_reseed(matches: &ArgMatches) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &RESEED;
-    Ok(Command::Reseed(ReseedArgs {
-        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
-        from: optional_workspace(matches, "from", false, USAGE)?
-            .unwrap_or_else(|| "main".to_owned()),
-        dry_run: flagged(matches, "dry-run"),
-    }))
-}
-
 const REKEY: CommandSpec = CommandSpec {
     name: "rekey",
     missing: "rekey requires a workspace",
@@ -3882,11 +3754,10 @@ const GC: CommandSpec = CommandSpec {
     trailing: "",
     summary: "free storage",
     about: &[
-        "Reclaims seven kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedPinned`, `retainedActive` and `releasedBytes`. Six of them need no flag; the seventh, `abandonedBundle`, is only ever collected under `--abandoned`. `rm`, `land`, and `restore` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
-        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars, checkpoints and empty mountpoint. Retirement already ran the containment gate, so these commits are in main, or an abandonment bundled them into a `<ws>-<tip>.bundle` file first. Safe. The `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are *not* this category and are never reclaimed without `--abandoned`: each is the only copy of the commits that removal gave up, so it stays until you reclaim it with `--abandoned` or delete it yourself.",
-        "`orphanStagingImage` and `orphanStagingMetadata` — a staged image, with or without its grants sidecar, or a sidecar with no image, under the project's `.staging/` in the store. Each is a lifecycle transaction — create, fork, restore — that died between writing the image and publishing it. The one sign a transaction is still running is its workspace lifecycle lock: an entry whose lock is held is retained and counted in `retainedActive`; an entry whose lock is free was never published under a workspace name, so nothing uses it. Safe.",
+        "Reclaims six kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedActive` and `releasedBytes`. Five of them need no flag; the sixth, `abandonedBundle`, is only ever collected under `--abandoned`. `rm` and `land` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
+        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars and empty mountpoint. Retirement already ran the containment gate, so these commits are in main, or an abandonment bundled them into a `<ws>-<tip>.bundle` file first. Safe. The `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are *not* this category and are never reclaimed without `--abandoned`: each is the only copy of the commits that removal gave up, so it stays until you reclaim it with `--abandoned` or delete it yourself.",
+        "`orphanStagingImage` and `orphanStagingMetadata` — a staged image, with or without its grants sidecar, or a sidecar with no image, under the project's `.staging/` in the store. Each is a lifecycle transaction — create or fork — that died between writing the image and publishing it. The one sign a transaction is still running is its workspace lifecycle lock: an entry whose lock is held is retained and counted in `retainedActive`; an entry whose lock is free was never published under a workspace name, so nothing uses it. Safe.",
         "`orphanStagingMount` — a mountpoint under the mount root's `.staging/` whose image is gone or was never published: an empty directory, or a volume an interrupted operation left attached. Attached volumes are detached before the directory goes, so an orphan that held tens of gigabytes stops charging for them. Safe; the same lock rule retains a mountpoint an operation still owns.",
-        "`expiredCheckpoint` — an automatic checkpoint that is neither one of the five most recent for its workspace nor younger than fourteen days. This is the category that can delete something you still want: an automatic checkpoint is a real crash-consistent copy of that workspace, and past those two thresholds it goes. Pinned checkpoints are never candidates, and `cowshed checkpoint --keep` or any explicitly labelled checkpoint is pinned; `retainedPinned` in the report counts what was spared for that reason.",
         "`orphanMountpoint` — a directory under the project's mount root that is no workspace's mountpoint: nothing is mounted at it and no image or retirement names it. Hidden files and files the project ignores are what late writers left after a volume went away, and go with the directory; any other file stops the removal and is named, so you move or delete it yourself.",
         "`abandonedBundle` — under `--abandoned` only, the `<ws>-<tip>.bundle` files in `sessions/.trash/` that `rm --abandon` verified and left behind, holding commits main does not contain, which is why no plain `gc` ever deletes one. A plain `gc` still says how many the trash keeps and their allocated bytes, as `doctor` and `ls --all` do, so they are never out of sight. Each bundle is the only copy of the commits it holds, so `--abandoned` deletes them and journals each deletion in the project's deletion log as `remove-abandoned-bundle`. `--dry-run --abandoned` lists them with their real allocated bytes first.",
         "A bare mountpoint whose only entry is root's `0700` `.fseventsd` is retained aside by an atomic, same-parent `.root-held-<uuid>` rename instead of deleting privileged debris. A mounted filesystem, symlink substitution, rename collision or another entry (hidden included) is never overwritten or moved. The retained log is named with a quoted privileged cleanup hint in `deferred`; it does not fail collection or make doctor unhealthy. Dry-run and doctor report it as information without renaming.",
@@ -4302,47 +4173,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reseed_parses_existing_seed_selection_and_nonmutating_preview() {
-        assert_eq!(
-            parse_args(["reseed", "raven"]).unwrap().command,
-            Command::Reseed(ReseedArgs {
-                workspace: "raven".into(),
-                from: "main".into(),
-                dry_run: false,
-            })
-        );
-        let cli = parse_args([
-            "reseed",
-            "main",
-            "--from",
-            "lane-base",
-            "--dry-run",
-            "--json",
-        ])
-        .unwrap();
-        assert!(cli.global.json);
-        assert_eq!(
-            cli.command,
-            Command::Reseed(ReseedArgs {
-                workspace: "main".into(),
-                from: "lane-base".into(),
-                dry_run: true,
-            })
-        );
-        for refused in [
-            &["reseed"][..],
-            &["reseed", "raven", "--from"],
-            &["reseed", "raven", "--from", "not/a/name"],
-            &["reseed", "not/a/name"],
-            &["reseed", "raven", "extra"],
-            &["reseed", "raven", "--from", "main", "--from", "lane"],
-            &["reseed", "raven", "--refresh"],
-        ] {
-            assert!(parse_args(refused).is_err(), "{refused:?}");
-        }
-    }
-
-    #[test]
     fn cache_clear_names_one_workspace_or_infers_it() {
         assert_eq!(
             parse_args(["cache", "clear", "raven"]).unwrap().command,
@@ -4424,36 +4254,6 @@ mod tests {
             &["gc", "--recover", image, "--to", "/r", "--abandoned"],
         ] {
             assert!(parse_args(refused).is_err(), "{refused:?}");
-        }
-    }
-
-    #[test]
-    fn reseed_help_explains_discard_without_manual_seed_refresh() {
-        for argv in [
-            &["help", "reseed"][..],
-            &["reseed", "--help"],
-            &["reseed", "--from", "--help"],
-        ] {
-            assert_eq!(
-                parse_args(argv.iter().copied()).unwrap().command,
-                Command::Help(Some(&RESEED))
-            );
-        }
-        let page = RESEED
-            .page()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        for fact in [
-            "--from <target>",
-            "--dry-run",
-            "rebuilt cold",
-            "absent seed refuses",
-            "Never refreshes",
-            "source tree, HEAD, index",
-            "not a promise of physical free space",
-        ] {
-            assert!(page.contains(fact), "missing {fact}: {page}");
         }
     }
 
@@ -5909,7 +5709,7 @@ mod tests {
     /// the workspace you are standing in is inferable, losing it is not.
     #[test]
     fn only_in_place_verbs_accept_an_omitted_workspace() {
-        for verb in ["rebase", "push", "checkpoint", "path"] {
+        for verb in ["rebase", "push", "path"] {
             let cli = parse_args([verb]).unwrap_or_else(|_| panic!("{verb} may infer its cwd"));
             let named = parse_args([verb, "raven"])
                 .unwrap_or_else(|_| panic!("{verb} still accepts a name"));
@@ -5922,7 +5722,7 @@ mod tests {
         // Retire, replace, rename, unmount: the workspace has to be named.
         // `attach` without a name is a different scope (the project's detached
         // sessions), not cwd inference of one workspace.
-        for verb in ["rm", "land", "restore", "mv", "detach", "exec"] {
+        for verb in ["rm", "land", "mv", "detach", "exec"] {
             assert!(
                 parse_args([verb]).is_err(),
                 "{verb} must not infer a workspace from the cwd"
@@ -5990,7 +5790,6 @@ mod tests {
     #[test]
     fn lifecycle_parsers_enforce_required_values_and_preserve_revision_bytes() {
         assert!(parse_args(["fork"]).is_err());
-        assert!(parse_args(["restore", "raven"]).is_err());
         assert!(parse_args(["push", "raven", "--branch"]).is_err());
         assert!(parse_args(["land", "raven", "--check"]).is_err());
         assert!(parse_args(["rm", "raven", "--restore"]).is_err());
@@ -6130,8 +5929,6 @@ mod tests {
             (&["fork", "raven"], Required),
             (&["fork", "raven", "falcon"], Required),
             (&["mv", "raven", "falcon"], Required),
-            (&["checkpoint", "raven"], Required),
-            (&["restore", "raven", "saved"], Required),
             (&["attach"], Required),
             (&["attach", "--all"], NotUsed),
             (&["ls"], Optional),
@@ -6145,8 +5942,6 @@ mod tests {
             (&["detach", "--all"], NotUsed),
             (&["resize", "raven", "32GiB"], Required),
             (&["defrag", "main"], Required),
-            (&["reseed", "raven"], Required),
-            (&["reseed", "main", "--from", "lane", "--dry-run"], Required),
             (&["rekey", "raven"], Required),
             (&["gc"], Required),
             (&["push", "raven"], Required),
@@ -6321,14 +6116,12 @@ mod tests {
         let cases = [
             (["fork"].as_slice(), "fork requires a destination workspace"),
             (&["mv"], "mv requires a workspace"),
-            (&["restore"], "restore requires a workspace"),
             (&["exec", "--", "true"], "exec requires a workspace"),
             (&["rm"], "rm requires a workspace"),
             (&["forget"], "forget requires an owner/repo"),
             (&["detach"], "detach requires a workspace"),
             (&["resize"], "resize requires a workspace"),
             (&["defrag"], "defrag requires a workspace"),
-            (&["reseed"], "reseed requires a workspace"),
             (&["rekey"], "rekey requires a workspace"),
             (&["land"], "land requires a workspace"),
             (&["gateway"], "gateway action is required"),

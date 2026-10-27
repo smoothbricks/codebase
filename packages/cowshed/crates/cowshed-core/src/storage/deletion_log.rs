@@ -612,24 +612,6 @@ fn project_and_workspace_for_image(image: &Path) -> Option<(PathBuf, String)> {
                 )
             }),
         _ => {
-            // `<project>/checkpoints/<workspace>/<label>.<ext>`: the workspace is the
-            // directory, the project two levels up.
-            if parent
-                .parent()
-                .and_then(|grandparent| grandparent.file_name())
-                .and_then(|name| name.to_str())
-                == Some("checkpoints")
-            {
-                let workspace = parent
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| WorkspaceName::new(*name).is_ok())
-                    .unwrap_or_default();
-                return parent
-                    .parent()
-                    .and_then(|grandparent| grandparent.parent())
-                    .map(|project| (project.to_path_buf(), workspace.to_owned()));
-            }
             // `<project>/main.<ext>`: the parent is the project root itself. Only the
             // literal main stem qualifies — any other filename here is not a layout
             // this module knows, and guessing would misplace the evidence.
@@ -1151,10 +1133,6 @@ mod tests {
             project_and_workspace_for_image(
                 &root.join(format!("sessions/.trash/demo-{incarnation}.dmg")),
             ),
-            Some((root.clone(), "demo".to_owned())),
-        );
-        assert_eq!(
-            project_and_workspace_for_image(&root.join("checkpoints/demo/one.dmg")),
             Some((root.clone(), "demo".to_owned())),
         );
         assert_eq!(

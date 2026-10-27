@@ -44,11 +44,10 @@ links back to the sections here.
   carries its label. A capacity gets a template of its own rather than a clone of another grown to fit: growing the
   container is a `diskutil apfs resizeContainer`, a second `storagekitd` call on every such mint (0.93–1.0 s measured on
   a loaded host), where a template costs one mint per store and capacity (0.57–0.63 s measured).
-- **Case-sensitive, always**: `-e` is the entire cost — one flag at creation. Clones copy the volume as it is, so
-  `fork`, `checkpoint`, and `restore` never repeat it. A case-sensitive volume holds every path a repository can
-  contain, including paths that differ only in case, which a case-insensitive volume merges. The checkout's own volume
-  does not matter: adopt copies from it and sets the copied repository's `core.ignorecase` to `false`
-  (02_workspaces.md).
+- **Case-sensitive, always**: `-e` is the entire cost — one flag at creation. Clones copy the volume as it is, so `fork`
+  never repeats it. A case-sensitive volume holds every path a repository can contain, including paths that differ only
+  in case, which a case-insensitive volume merges. The checkout's own volume does not matter: adopt copies from it and
+  sets the copied repository's `core.ignorecase` to `false` (02_workspaces.md).
 - **Capacity and allocation**: 100 GiB sparse. Capacity is a cap, not a reservation; a 300 GiB image does not reserve
   300 GiB on the host. Override per project via `.cowshed.toml` `capacity`. Creation uses only the sparse-file path
   above — a file created and lengthened with no disk tool — never `hdiutil create -type UDIF`, which preallocates the
@@ -69,8 +68,8 @@ links back to the sections here.
   `hdiutil compact` supports SPARSE and SPARSEBUNDLE, not RAW. Reclaim guest-freed space by the verified re-adoption
   transaction in 02_workspaces.md: copy the live filesystem into a fresh sparse RAW image, verify its contents and Git
   state, and retain the old image until verification passes. The host reclaims old blocks only when the retained image
-  and every clone or checkpoint sharing them are explicitly released. This costs a filesystem copy; neither `defrag` nor
-  a sparse-file copy identifies guest-freed nonzero blocks.
+  and every clone sharing them are explicitly released. This costs a filesystem copy; neither `defrag` nor a sparse-file
+  copy identifies guest-freed nonzero blocks.
 - **Clone cost follows extents, not size**: `clonefile` shares the source file's extent map, and the first mutation of
   either file copies that map, wherever it lands (a write at any offset, an append past the end, even a metadata-only
   `ftruncate`), at a cost that scales with the extent count, not the offset; every write after it is free.
@@ -82,11 +81,11 @@ links back to the sections here.
   the copy to the source's next write, after which the clone's first write is cheap. Writers of unrelated files on the
   container keep completing during most of it, so this is clone-family contention, not an intermittent container-wide
   stall; correlation with a live Nx freeze does not by itself identify which overlapping image operation caused it.
-  Fewer extents reduce map-copy work; yielding outside the syscall cannot split it ("Freeing an image"). When a clone or
-  checkpoint shares an image's blocks, rewritten blocks move to new runs. Writes into a workspace do not rewrite main's
-  extent map. Build state lives on volumes replaced at each land rather than in main's image (16_build_volumes.md, "Why
-  two volumes"). `doctor` counts each workspace source, live build source and build seed with one `F_LOG2PHYS_EXT` query
-  per contiguous run, reporting `main-extents`/`source-extents`, `pending-source-extents`, `build-source-extents` and
+  Fewer extents reduce map-copy work; yielding outside the syscall cannot split it ("Freeing an image"). When a clone
+  shares an image's blocks, rewritten blocks move to new runs. Writes into a workspace do not rewrite main's extent map.
+  Build state lives on volumes replaced at each land rather than in main's image (16_build_volumes.md, "Why two
+  volumes"). `doctor` counts each workspace source, live build source and build seed with one `F_LOG2PHYS_EXT` query per
+  contiguous run, reporting `main-extents`/`source-extents`, `pending-source-extents`, `build-source-extents` and
   `build-seed-extents` against the actual image path. Build diagnostics select published images of current owners; a
   retired incarnation is not the current owner's fork source or its defrag target. At **7,141 extents** doctor warns and
   names `cowshed defrag <workspace>`; 7,140 is the standalone first-write sensitivity bound from 60.845084042 s /
@@ -113,10 +112,10 @@ links back to the sections here.
   (another `O_SHLOCK` or `O_EXLOCK` open fails with `EAGAIN`), and `diskutil image resize` and
   `diskutil image create from` refuse it as well; an in-kernel attachment takes no lock ("Mounts"), and the verb's own
   detach and the registry exclude it. The copy needs, and keeps, free space equal to the image's allocated bytes while
-  earlier clones and checkpoints still share the old blocks; the verb refuses before detaching when the store volume
-  lacks it. Nothing enumerates `<image>.defrag` as an image or sidecar; the next `defrag` replaces one an interrupted
-  run left, and `doctor` names it until then. Mains are never detached implicitly (the gateway keeps them mounted), so
-  no path rewrites main on its own; main's detached seed is rewritten by seed compaction (16_build_volumes.md, "Seed
+  earlier clones still share the old blocks; the verb refuses before detaching when the store volume lacks it. Nothing
+  enumerates `<image>.defrag` as an image or sidecar; the next `defrag` replaces one an interrupted run left, and
+  `doctor` names it until then. Mains are never detached implicitly (the gateway keeps them mounted), so no path
+  rewrites main on its own; main's detached seed is rewritten by seed compaction (16_build_volumes.md, "Seed
   compaction") with this same copy. A refused resumed clone remains pending because it may contain the only copy of
   dirty or unlanded work. Its hint names `cowshed defrag <pending-destination>`, not its source: the command opens
   without replaying the failed fork, claims the existing creator-intent lease, revalidates the exact pending metadata
@@ -200,14 +199,14 @@ refusal retains the actual command status and diagnostics.
 After success, cowshed holds the requested mount root and verifies it is the filesystem root sourced from the pinned
 volume before publication or any in-image marker write. A failed attach, malformed reply, mount refusal or wrong
 root/device releases only the new owned attachment or reports its cleanup refusal. An already-attached formatted or
-recovered volume uses the same pinned `mount_apfs` boundary. Blank formatting, detached checkpoint verification, resize
-and fixtures deliberately exercising an unmounted state retain `--noMount` and explicit `fsck_apfs -q` where required.
-Namespace-only unmount and owned-image release use `funmount` on the same held, proven `OwnedVolumeRoot` descriptor, not
-a mountpoint path, BSD device name or Disk Arbitration view. The root's filesystem identity comes from `fstatfs` on that
-descriptor. Each ordinary attempt is unforced. The image lease and registry-proven raw volume pin preserve authority
-across namespace admission, the native operation and its compound postcondition. After every owned volume is absent and
-pins are released, guarded `hdiutil detach -verbose` releases the exact physical whole device, only when this euid owns
-the attachment or is root ("Release authority"). There is no general-eject, DA-unmount, path/device substitution or
+recovered volume uses the same pinned `mount_apfs` boundary. Blank formatting, resize and fixtures deliberately
+exercising an unmounted state retain `--noMount` and explicit `fsck_apfs -q` where required. Namespace-only unmount and
+owned-image release use `funmount` on the same held, proven `OwnedVolumeRoot` descriptor, not a mountpoint path, BSD
+device name or Disk Arbitration view. The root's filesystem identity comes from `fstatfs` on that descriptor. Each
+ordinary attempt is unforced. The image lease and registry-proven raw volume pin preserve authority across namespace
+admission, the native operation and its compound postcondition. After every owned volume is absent and pins are
+released, guarded `hdiutil detach -verbose` releases the exact physical whole device, only when this euid owns the
+attachment or is root ("Release authority"). There is no general-eject, DA-unmount, path/device substitution or
 automatic fallback. This does not claim Spotlight releases departed references.
 
 ### Owned-registry mount boundary
@@ -783,21 +782,21 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    `DISharedBuffer::init: Can't map buffer at user address … size 2097152 to kernel` and
    `DIDeviceRequestPool::AllocateRequests: Can't allocate all buffers, allocated 0/36`, and the attach fails with "error
    code 150" ("Failed to initialize IO manager: Driver returned error code -536870210", `kIOReturnNoResources`). So does
-   every `diskutil image info`, every new workspace, build volume, checkpoint and cold mount; images already attached
-   keep working, and legacy `hdiutil attach` of UDIF still attaches. It is not the user wire limit (17.8 GB wired
-   against a 116.8 GB `vm.global_user_wire_limit`). The space leaks through helpers that outlive their image: detach
-   does not always end the image's `diskimagesiod`, and an orphaned helper (running, no `AppleDiskImageDevice` behind
-   it) keeps its mapping. Measured: a host about 20,000 attaches into its uptime held 330 images at once, then failed at
-   128 after about 300 more attach→detach cycles, then at 114, 100 and 98, with ten orphaned helpers running; detaching
-   images freed at most one attach each. `launchctl kill` of an orphan's job is refused even to root ("Not privileged to
-   signal service"), but `sudo kill -9 <pid>` of the ten orphans freed their mappings and the next attach succeeded with
-   no reboot. An attached image is therefore a standing 72 MiB of kernel mapping, an orphaned helper the same until root
-   kills it, and every attach a cycle that can orphan one: an operation or test pays the fewest attach cycles that prove
-   its behavior, and `doctor` names orphaned helpers (a `diskimagesiod` whose pid created no attached device's user
-   client) with the root command that clears them. Idle-unmount is dropped because it reclaims nothing. Idle workspaces
-   remain mounted; source and build images are released by explicit lifecycle operations, not a background idle-unmount
-   policy. The one exception is the IOMedia match-notification ceiling (below): a verb whose attach would reach it first
-   detaches idle workspaces, then and for that reason, never on a timer.
+   every `diskutil image info`, every new workspace, build volume and cold mount; images already attached keep working,
+   and legacy `hdiutil attach` of UDIF still attaches. It is not the user wire limit (17.8 GB wired against a 116.8 GB
+   `vm.global_user_wire_limit`). The space leaks through helpers that outlive their image: detach does not always end
+   the image's `diskimagesiod`, and an orphaned helper (running, no `AppleDiskImageDevice` behind it) keeps its mapping.
+   Measured: a host about 20,000 attaches into its uptime held 330 images at once, then failed at 128 after about 300
+   more attach→detach cycles, then at 114, 100 and 98, with ten orphaned helpers running; detaching images freed at most
+   one attach each. `launchctl kill` of an orphan's job is refused even to root ("Not privileged to signal service"),
+   but `sudo kill -9 <pid>` of the ten orphans freed their mappings and the next attach succeeded with no reboot. An
+   attached image is therefore a standing 72 MiB of kernel mapping, an orphaned helper the same until root kills it, and
+   every attach a cycle that can orphan one: an operation or test pays the fewest attach cycles that prove its behavior,
+   and `doctor` names orphaned helpers (a `diskimagesiod` whose pid created no attached device's user client) with the
+   root command that clears them. Idle-unmount is dropped because it reclaims nothing. Idle workspaces remain mounted;
+   source and build images are released by explicit lifecycle operations, not a background idle-unmount policy. The one
+   exception is the IOMedia match-notification ceiling (below): a verb whose attach would reach it first detaches idle
+   workspaces, then and for that reason, never on a timer.
 
    The same error has a second cause: **leaked image devices**, which a reboot frees, and which killing the one stalled
    helper that retains them frees without one ("The IOMedia match-notification ceiling"). Every attach creates an
@@ -1228,8 +1227,7 @@ workspace from the fork made out of it; that is why cloning rewrites the marker 
 clone is ever published. Volume UUIDs are therefore not recorded and not used. The label is not rewritten there: a clone
 is published under the label it inherited, and the workspace's supervisor, once it serves, reads the file system's own
 name for its image's mounted volume (`getattrlist`) and relabels it in the background when it differs. The label is
-cosmetic, so nothing on the provisioning path waits on it. Replacement restores and identity changes still relabel
-synchronously.
+cosmetic, so nothing on the provisioning path waits on it. Identity changes still relabel synchronously.
 
 A volume is named only through its own mount root, held open and proven to be owned media (`OwnedVolumeRoot`), with
 `fsetattrlist(ATTR_VOL_NAME)` on that descriptor. Nothing names a volume through a path or through Disk Arbitration:
@@ -1254,13 +1252,13 @@ So the runner refuses `diskutil rename` and `renameVolume`, in any spelling, for
 `cowshed disk-command` alike, `CommandRunFailure::VolumeRename`), before anything spawns. Nothing outside cowshed's
 store labels renames a volume at all: the `bounded-exec` RAM volume is created under its final name, marked on a private
 `mount_apfs` mount, and only then placed at `/Volumes/<name>` by Disk Arbitration (nx-plugin README). A store image's
-volume (the supervisor's relabel, the build volume's after a land, the restore staging relabel, the identity change's)
-is named through an `OwnedVolumeRoot`, which only `cowshed-apfs` can prove, by image, never by mountpoint. The native
-host refuses an image outside the store root, and the rename acts only on the volume device the kernel's attachment
-inventory maps that image to. An image no attachment holds names nothing (`NotAttached`); one held twice, or held
-unformatted, is an inventory fault and is refused. One whose volume the kernel mount table does not list names nothing
-(`NotMounted`). Both skips are typed outcomes, not errors, and the supervisor says each one in the daemon log. Under the
-image's lease and a raw IOMedia pin that re-proves the mapping, the mountpoint is opened as an event-only directory
+volume (the supervisor's relabel, the build volume's after a land, the identity change's) is named through an
+`OwnedVolumeRoot`, which only `cowshed-apfs` can prove, by image, never by mountpoint. The native host refuses an image
+outside the store root, and the rename acts only on the volume device the kernel's attachment inventory maps that image
+to. An image no attachment holds names nothing (`NotAttached`); one held twice, or held unformatted, is an inventory
+fault and is refused. One whose volume the kernel mount table does not list names nothing (`NotMounted`). Both skips are
+typed outcomes, not errors, and the supervisor says each one in the daemon log. Under the image's lease and a raw
+IOMedia pin that re-proves the mapping, the mountpoint is opened as an event-only directory
 (`O_EVTONLY|O_DIRECTORY|O_NOFOLLOW`) and the filesystem that descriptor lies on read (`fstatfs`), retaining its actual
 filesystem identity. Anything but the image's volume device, or a directory inside it rather than its root, is refused
 (`RenameTargetNotMounted`). A host disk is no attachment of any image, so its volumes are never an `OwnedVolumeRoot`.
@@ -1283,8 +1281,8 @@ store churn:
 
 - **`cowshed.store`**, mounted at `/private/cowshed/store` — images, grant sidecars, waivers, quarantine, gateway config
   and audit, telemetry. Mostly rebuildable, with a small unique window: uncommitted work between autosaves
-  (02_workspaces.md); durability is still git. Same-volume clonefile is preserved by construction — main → sessions →
-  checkpoints and trash renames all stay within `cowshed.store`.
+  (02_workspaces.md); durability is still git. Same-volume clonefile is preserved by construction — main → sessions and
+  trash renames all stay within `cowshed.store`.
 - **`cowshed.build-cache`**, mounted at `/private/var/folders/cowshed/shared/build-cache` — the one shared mbx store and
   its managed targets, beside other host tools' own trees
   ([Dedicated build-cache volume](#dedicated-build-cache-volume)). Nothing cowshed keeps on it is the only copy of
@@ -1537,19 +1535,6 @@ present-by-label, prototype adopted by UUID without deletion, mis-mounted, unenc
 mountpoint, foreign `shared` parent refused, foreign top-level entries never reclaimed or listed), doctor finding
 goldens for each state above, and a real-APFS boot-mount cell proving the installed script mounts a throwaway second
 volume by UUID at its canonical path under a user-owned parent (08_testing.md).
-
-## Restore publication custody
-
-During macOS restore, `<canonical-image>.restore.json` is the sole recovery fact for an interrupted image/metadata
-publication. Its exact v2, unknown-field-denying schema is
-`{version, repoId, workspace, sourceCheckpoint, sourceIncarnation, replacedIncarnation, destinationIncarnation}`.
-`sourceCheckpoint` and `sourceIncarnation` identify the retained checkpoint and must match its detached metadata;
-`replacedIncarnation` must match the displaced image/grant/CA generation; and `destinationIncarnation` must match both
-the canonical pending metadata and the `pre-restore-<destinationIncarnation>` undo name. The fact is fsynced before
-pending metadata publication and removed, with a parent-directory fsync, only after detached metadata is activated (the
-restore's audit record is emitted on the way, and gates nothing). Recovery uses that complete identity tuple to ignore
-retained older undo generations and choose rollback or idempotent completion. There is no runtime restore journal,
-`.restore-fences` directory, database row, or second mutable source of truth.
 
 ## Retired mountpoint debris
 

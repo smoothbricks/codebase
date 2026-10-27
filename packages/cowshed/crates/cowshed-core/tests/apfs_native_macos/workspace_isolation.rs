@@ -82,7 +82,7 @@ fn retire_and_crash_after_commit(canonical: &Path, trash: &Path) {
 }
 
 /// The B20 failure: one workspace's read failed because a sibling's record was missing or
-/// corrupt. A named snapshot reads the named workspace's own record, mount and checkpoints only.
+/// corrupt. A named snapshot reads the named workspace's own record and mount only.
 #[test]
 fn named_snapshot_reads_only_its_own_record_beside_broken_siblings() {
     const OWN: &str = "00000000000000000000000000000011";
@@ -91,34 +91,15 @@ fn named_snapshot_reads_only_its_own_record_beside_broken_siblings() {
     let host = native_host(&fixture, RecordingRunner::default());
     let name = WorkspaceName::session("raven").expect("session");
     let own = published_session(&layout, "raven", OWN);
-    let label = CheckpointLabel::new("ready").expect("label");
-    let checkpoint = layout
-        .checkpoint_image(&name, &label)
-        .expect("checkpoint")
-        .image()
-        .to_owned();
-    create_image(&checkpoint);
-    write_session_metadata(&checkpoint, "raven", OWN);
-    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(3), Pin::Pinned)
-        .expect("checkpoint fact");
 
     let missing = published_session(&layout, "missing", "00000000000000000000000000000012");
     std::fs::remove_file(sidecar_path(&missing)).expect("lose the sibling's record");
     let corrupt_name = WorkspaceName::session("corrupt").expect("session");
     let corrupt = published_session(&layout, "corrupt", "00000000000000000000000000000013");
     std::fs::write(sidecar_path(&corrupt), b"{ not a record").expect("corrupt sibling record");
-    let corrupt_checkpoint = layout
-        .checkpoint_image(&corrupt_name, &label)
-        .expect("sibling checkpoint")
-        .image()
-        .to_owned();
-    create_image(&corrupt_checkpoint);
-    std::fs::write(checkpoint_fact_path(&corrupt_checkpoint), b"{ not a fact")
-        .expect("corrupt sibling checkpoint fact");
 
     // Control: the project-wide reads visit every sibling and fail closed on the corrupt ones.
     assert!(host.list(&repo()).is_err());
-    assert!(host.checkpoints(&repo()).is_err());
 
     let (derived, metadata) = host
         .workspace_snapshot(&repo(), &name)
@@ -127,18 +108,6 @@ fn named_snapshot_reads_only_its_own_record_beside_broken_siblings() {
     assert_eq!(derived.workspace.name(), &name);
     assert_eq!(derived.workspace.incarnation().as_str(), OWN);
     assert_eq!(derived.mount_state, MountState::Detached);
-    assert_eq!(
-        derived
-            .checkpoints
-            .iter()
-            .map(|checkpoint| (
-                checkpoint.label.as_str(),
-                checkpoint.revision,
-                checkpoint.pin
-            ))
-            .collect::<Vec<_>>(),
-        vec![("ready", Revision::new(3), Pin::Pinned)]
-    );
     assert_eq!(
         metadata,
         DetachedWorkspaceMetadata::read_for_image(&own).expect("own record")
@@ -316,7 +285,7 @@ fn retirement_publishes_a_complete_trash_record_before_its_image_commit() {
     assert!(ca_key_path(&kite_trash).exists());
 }
 
-/// A recovery pass run under workspace locks names those workspaces' canonical, staged and undo
+/// A recovery pass run under workspace locks names those workspaces' canonical and staged
 /// records before reading any record, so a broken sibling or foreign project never fails it.
 #[test]
 fn locked_recovery_settles_only_its_own_workspace_and_never_reads_a_broken_neighbour() {
@@ -348,11 +317,6 @@ fn locked_recovery_settles_only_its_own_workspace_and_never_reads_a_broken_neigh
         .project_root
         .join(".staging")
         .join(format!("broken-{SIBLING}.dmg"));
-    let undo = layout
-        .project()
-        .checkpoints
-        .join("broken")
-        .join(format!("pre-restore-{SIBLING}.dmg"));
     let foreign_layout = StorageLayout::new(
         &fixture.root,
         &RepoId::parse("other/thing").expect("foreign repo"),
@@ -367,7 +331,6 @@ fn locked_recovery_settles_only_its_own_workspace_and_never_reads_a_broken_neigh
     let poisoned = [
         sidecar_path(&broken_canonical),
         sidecar_path(&staged),
-        sidecar_path(&undo),
         sidecar_path(&foreign),
     ];
     for record in &poisoned {

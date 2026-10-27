@@ -129,14 +129,13 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
   macOS block base. Run `cowshed attach`; `doctor` distinguishes a detached workspace, absent/dead connector, missing or
   wrong per-incarnation socket mount, and a dead host gateway. A healthy workspace uses
   `http://cowshed:<token>@127.0.0.1:7644` in `HTTP_PROXY`/`HTTPS_PROXY` (plus lowercase forms), the token as userinfo.
-  Detach and restore intentionally drain old connections; retry only after the new attachment is admitted.
+  Detach intentionally drains old connections; retry only after the new attachment is admitted.
 - **407 versus 403**: 407 means the endpoint/credential pair did not authenticate — most often proxy variables that lost
-  their userinfo, or stale pre-restore wiring. A client without the credential gets one 407 with
-  `Proxy-Authenticate: Basic realm="cowshed"` and stops; cargo instead reads a bare tunnel failure as a spurious network
-  error and grinds through its retry ladder, so a cargo command that hangs for minutes on `CONNECT tunnel failed` is a
-  credential problem, not a slow network. 403 means endpoint and credential authenticated but policy denied the
-  destination; use the gateway's grant hint. Port 7644 by itself is not workspace identity: the private netns plus
-  mounted socket inode selects the workspace.
+  their userinfo. A client without the credential gets one 407 with `Proxy-Authenticate: Basic realm="cowshed"` and
+  stops; cargo instead reads a bare tunnel failure as a spurious network error and grinds through its retry ladder, so a
+  cargo command that hangs for minutes on `CONNECT tunnel failed` is a credential problem, not a slow network. 403 means
+  endpoint and credential authenticated but policy denied the destination; use the gateway's grant hint. Port 7644 by
+  itself is not workspace identity: the private netns plus mounted socket inode selects the workspace.
 - **`go` denied writing under `~/go`**: a Go project shares exactly `~/go/pkg/mod` (and the user cache directory's
   `go-build`); `GOPATH`, and with it `go install`'s binaries, stays at Go's default under the private `HOME`. A write
   anywhere else in the host's `~/go` means something passed the host `GOPATH` explicitly. Find that setting; never grant
@@ -158,18 +157,14 @@ and the gateway audit events for egress (Arrow segments under `/private/cowshed/
 
 Exit 7 means protected content is missing, mutated, rolled back, or written by an incarnation outside the workspace's
 lineage for `(repo_id, workspace_incarnation, job_id)`. It is not a child exit, sandbox denial, or summary mismatch, and
-retries or grants do not repair it. Preserve the workspace/checkpoint and follow the `cowshed doctor` integrity report;
-cowshed fails closed rather than choosing the caller-visible redirect source, a publication copy, or whichever record
-looks newer.
+retries or grants do not repair it. Preserve the workspace and follow the `cowshed doctor` integrity report; cowshed
+fails closed rather than choosing the caller-visible redirect source, a publication copy, or whichever record looks
+newer.
 
 An `artifact ordering failure` is different: every frame may still be complete and readable while two independent
 writers allocated the same sequence. Run `cowshed doctor --repair`; it repairs only that fully validated ordering case
-and preserves the exact original beside the log. A digest, trailer, Arrow, record, or checkpoint-prefix failure is
-content corruption and the repair refuses to rewrite it.
-
-**Checkpoint was not pruned.** GC keeps the union of three sets: explicit pins, every checkpoint younger than 14 days,
-and the newest five checkpoints per workspace. A user label and `cowshed checkpoint --keep` both pin; age or count does
-not override a pin. Unpin explicitly before expecting GC to remove it.
+and preserves the exact original beside the log. A digest, trailer, Arrow, or record failure is content corruption and
+the repair refuses to rewrite it.
 
 ## Disk usage
 
@@ -179,10 +174,9 @@ automatically: in the RAW measurement, a deleted 1 GiB payload kept its host all
 clean unmount and detach. `hdiutil compact` does not support RAW. To reclaim the space, run a verified re-adoption
 (`cowshed adopt <checkout> --re-adopt`, 02_workspaces.md): the filesystem is copied into a fresh sparse RAW image,
 verified, and the old image is kept until you remove it after verification. The host frees the old blocks only after the
-retained image and every clone or checkpoint sharing them are released.
+retained image and every clone sharing them are released.
 
-`cowshed gc` reclaims retired images, removes orphans, and prunes expired checkpoints (`--dry-run` lists each candidate
-first):
+`cowshed gc` reclaims retired images and removes orphans (`--dry-run` lists each candidate first):
 
 ```
 $ cowshed gc --dry-run
@@ -233,10 +227,9 @@ unit that rebuilt:
 - **No fingerprint at all** — the selected seed never held that unit (for example, another Cargo profile or toolchain),
   so the fork builds that delta once. If the target built it after freezing its seed, the next fork refreshes
   automatically unless a named holder refuses writer exclusion. Close that holder and fork again; no manual seed-refresh
-  or warm step exists. `cowshed reseed` only discards a workspace's build state for an existing seed clone, so it cannot
-  make that seed warmer and may require a cold rebuild. `doctor` reports target-only `seed-age`, `seed-tree-behind` and
-  `target-moved-outside-land`; after an external Git fast-forward, keep the warm landing workspace alive until the next
-  fork can capture its exactly matching tree.
+  or warm step exists. `doctor` reports target-only `seed-age`, `seed-tree-behind` and `target-moved-outside-land`;
+  after an external Git fast-forward, keep the warm landing workspace alive until the next fork can capture its exactly
+  matching tree.
 - **`PathToSourceChanged`** — a dependency was built under another `$CARGO_HOME`; see the shared cargo caches above.
 - **`the rerun-if-changed instructions changed`** — a build script watches a path outside its package by absolute path;
   print it relative to the package instead, which is how cargo resolves it.
@@ -313,8 +306,7 @@ is also why you cannot verify it from a shell that has the project environment l
 bloat every backup (and, on the Data volume, every hourly local snapshot — that is why they live on a dedicated volume
 at all; see 01a_apfs.md). Source follows the durability rules below; the shared tool caches are the tools' own
 directories in your HOME, rebuildable from their registries and never anything to restore. Protected job content is
-authoritative within its origin incarnation/checkpoint snapshot, but a workspace image is still not an off-machine
-backup.
+authoritative within its origin incarnation, but a workspace image is still not an off-machine backup.
 
 - Committed + pushed (`cowshed push`, or merged in main): it's in main's repo — and main's off-machine durability is its
   **origin remote**, exactly as before adoption. Keep pushing main to origin as usual; the store volume is not a backup.
@@ -323,9 +315,9 @@ backup.
 - **Uncommitted work exists only in the workspace image.** Nothing saves it in the background.
 
 Restoring a machine: clone main's repo from its origin remote, `cowshed adopt` again; workspaces are recreated from
-their pushed branches (`cowshed fork x --ref refs/cowshed/x/heads/<branch>`). Checkpoints and images are not backup
-artifacts — never treat them as one. Export any terminal job stream you need to retain independently; cowshed
-materializes a clone, reflink, or copy, never a hardlink to protected content.
+their pushed branches (`cowshed fork x --ref refs/cowshed/x/heads/<branch>`). Images are not backup artifacts — never
+treat them as one. Export any terminal job stream you need to retain independently; cowshed materializes a clone,
+reflink, or copy, never a hardlink to protected content.
 
 ## ZFS pool and hierarchy
 
@@ -335,12 +327,6 @@ dataset from an earlier release is kept mounted at `/private/cowshed/caches` unt
 holds and `cowshed setup --retire-caches-volume` destroys it. If `statfs` does not locate a suitable delegated ZFS
 dataset, configure `[substrate] kind = "zfs"` and `pool = "<pool>"`; cowshed deliberately refuses to scan pools or
 guess. `cowshed doctor` reports the selected pool and any missing sibling, mountpoint, or delegation.
-
-**Restore interrupted.** Before detached metadata publication, recovery restores the displaced workspace, old
-incarnation, and old token. After publication, recovery completes the replacement forward; it never rolls back across
-the incarnation fence. A healthy restore always drains the old supervisor, stages and verifies the replacement, mints
-the new incarnation then token, swaps and mounts, publishes metadata atomically, revokes the old token, and only then
-admits a supervisor or job. No state should accept both tokens; `cowshed doctor` reports a publication mismatch.
 
 ## `cowshed exec` says the cowshed daemon is not reachable
 
@@ -393,9 +379,9 @@ in the workspace's own `.envrc` activation.
 
 `cowshed doctor --json` is the bounded bug-report payload: it includes versions, invariant results, continuity metadata,
 hashes, and the last few operations from the telemetry store, never raw job stdout/stderr. Workspace lifecycle can be
-re-derived after detach, but protected job content exists only in its origin incarnation/checkpoint or an independent
-export. To reset attachment state, detach each workspace with `cowshed detach`; subsequent commands re-derive mounts and
-controller wiring. There is no cache to clear and no database to reset.
+re-derived after detach, but protected job content exists only in its origin incarnation or an independent export. To
+reset attachment state, detach each workspace with `cowshed detach`; subsequent commands re-derive mounts and controller
+wiring. There is no cache to clear and no database to reset.
 
 A corrupt shared cache is the tool's own problem, solved the tool's own way: nothing unique lives in one, so delete that
 tool's cache directory (`~/.cargo/registry`, `~/.bun/install/cache`, `~/.cache/uv`, …) and the tool refetches or

@@ -242,7 +242,6 @@ export interface Coordinator {
   revokeProject(delta: Api.ProjectGrantDelta): Promise<Api.ProjectGrants>;
   rebase(workspace: string, options?: RebaseOptions): Promise<Api.RebaseReport>;
   land(workspace: string, options?: LandOptions): Promise<Api.LandReport>;
-  restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;
   resize(workspace: string, capacity: string, volume: Api.ResizeVolume): Promise<Api.ResizeResult>;
   /** Rewrites the workspace's image contiguously; a busy workspace refuses before its image is touched. */
@@ -251,8 +250,6 @@ export interface Coordinator {
   clearNxState(workspace: string): Promise<Api.NxStateClearResult>;
   /** Rebuilds one keyless workspace's CA identity at its preserved incarnation. */
   rekey(workspace: string): Promise<Api.RekeyResult>;
-  /** Discard live build state for an existing seed clone; never refresh a seed or alter source files. */
-  reseed(workspace: string, from: string, dryRun: boolean): Promise<Api.ReseedResult>;
   remove(workspace: string, options?: Api.RemoveOptions): Promise<Api.RemoveReport>;
   /** Removes the adopted project end to end: every session, its images and main's adoption. */
   removeProject(options?: Api.RemoveProjectOptions): Promise<Api.RemoveProjectReport>;
@@ -282,7 +279,6 @@ export interface WorkspaceHandle {
   job(id: number): Promise<JobHandle>;
   /** Returns null only when the key is provably absent in this workspace incarnation; failures reject. */
   jobByKey(admissionKey: Api.AdmissionKey): Promise<JobHandle | null>;
-  checkpoint(options?: Api.CheckpointOptions): Promise<string>;
   push(options?: Api.PushOptions): Promise<Api.PushReport>;
   grants(): Promise<Api.GrantSet>;
 }

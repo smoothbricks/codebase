@@ -42,11 +42,9 @@
     "into": { "workspace": "main", "incarnation": "fedcba9876543210fedcba9876543210" },
     "options": { "retire": true, "pushOnly": false }
   },
-  "coordinator.restore": { "repoId": "acme/widget", "workspace": "feature", "label": "before" },
   "coordinator.resize": { "repoId": "acme/widget", "workspace": "feature", "capacity": "64G", "volume": "build" },
   "coordinator.defragment": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.rekey": { "repoId": "acme/widget", "workspace": "feature" },
-  "coordinator.reseed": { "repoId": "acme/widget", "workspace": "feature", "from": "main", "dryRun": false },
   "coordinator.clearNxState": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.detach": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.assignSlot": { "repoId": "acme/widget", "workspace": "feature", "slot": 3 },
@@ -66,11 +64,6 @@
     "repoId": "acme/widget",
     "workspace": "feature",
     "url": "https://example.com/acme/widget.git"
-  },
-  "coordinator.setCheckpointQuota": {
-    "repoId": "acme/widget",
-    "workspace": "feature",
-    "quota": { "maxCount": 5, "maxBytes": 1073741824 }
   },
   "coordinator.doctor": { "repoId": "acme/widget" },
   "coordinator.worker": { "repoId": "acme/widget", "workspace": "feature" },
@@ -145,12 +138,6 @@
     "workspace": "feature",
     "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
     "admissionKey": "operation-7"
-  },
-  "worker.checkpoint": {
-    "repoId": "acme/widget",
-    "workspace": "feature",
-    "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
-    "options": { "keep": false }
   },
   "worker.push": {
     "repoId": "acme/widget",

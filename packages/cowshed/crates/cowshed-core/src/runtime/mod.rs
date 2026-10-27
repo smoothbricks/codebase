@@ -58,7 +58,7 @@ pub use project::{
     ProjectSnapshots, RecoveryScope, RuntimeLogChunk, SEED_COMPACTION_VERB, WorkspaceSnapshot,
 };
 pub use supervisor::{
-    CheckpointBarrier, CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk,
-    SessionSnapshot, SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisor,
-    WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+    CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk, SessionSnapshot,
+    SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+    WorkspaceSupervisorHandle,
 };

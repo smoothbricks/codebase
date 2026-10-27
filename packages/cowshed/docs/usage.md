@@ -14,7 +14,7 @@ host
 ```
 
 A host may adopt any number of repositories. Each repository identity (`repo_id`) owns exactly one `main`, plus its own
-workspace names, checkpoints, gateway sessions, and lifecycle state. `main` is repository-scoped, never host-global.
+workspace names, gateway sessions, and lifecycle state. `main` is repository-scoped, never host-global.
 
 ## How cowshed chooses a repository
 
@@ -155,17 +155,14 @@ cowshed exec "$WS" -- git status --porcelain
 Under a workspace `.envrc`, the workspace supervisor keeps an activated shell and activates a fresh one only when an
 input direnv recorded for it changes (11_shell.md). Processes already running keep the environment they launched with.
 
-Before a risky operation, create a checkpoint:
+Before a risky operation, fork the workspace and do the step in the fork. The source keeps its state:
 
 ```sh
-cowshed checkpoint "$WS" before-refactor
+cowshed fork "$WS" before-refactor
 ```
 
-Restore it if needed:
-
-```sh
-cowshed restore "$WS" before-refactor
-```
+Keep the fork if the step works. Discard it with `cowshed rm before-refactor --force --abandon` if it does not;
+`--abandon` keeps any commits the attempt made in a recoverable bundle.
 
 Land the work, then remove the workspace:
 
@@ -206,9 +203,9 @@ Why agents should prefer `cowshed exec` over merely `cd`-ing into the mount:
 A useful retry pattern:
 
 ```sh
-cowshed checkpoint "$WS" before-migration --project "$PROJECT"
-if ! cowshed exec "$WS" --project "$PROJECT" -- ./scripts/migrate; then
-  cowshed restore "$WS" before-migration --project "$PROJECT"
+cowshed fork "$WS" migrate-try --project "$PROJECT"
+if ! cowshed exec migrate-try --project "$PROJECT" -- ./scripts/migrate; then
+  cowshed rm migrate-try --project "$PROJECT" --force --abandon
 fi
 ```
 
@@ -378,12 +375,10 @@ images are unaffected.
 | List selected repository                        | `cowshed ls`                                                                         |
 | Resolve/attach a mount                          | `cowshed path <workspace>`                                                           |
 | Run a sandboxed command                         | `cowshed exec <workspace> -- <argv...>`                                              |
-| Checkpoint / restore                            | `cowshed checkpoint <workspace> [label]`, `cowshed restore <workspace> <label>`      |
 | Detach / attach                                 | `cowshed detach <workspace>`, `cowshed attach <workspace>`                           |
 | Preserve Git work                               | `cowshed push <workspace>`, `cowshed rebase <workspace>`, `cowshed land <workspace>` |
 | Remove a workspace                              | `cowshed rm <workspace>`                                                             |
 | Preview / run reclamation                       | `cowshed gc --dry-run`, `cowshed gc`                                                 |
-| Replace rebuildable build state                 | `cowshed reseed <ws> [--from <target>] [--dry-run]` (default target: main)           |
 | Clear a workspace's and the project's Nx caches | `cowshed cache clear [<ws>]` (not `nx reset`, which only removes the links)          |
 | Make `fork` fast on an old main                 | `cowshed defrag main` (idle checkout; `doctor` warns `main-extents` when it is due)  |
 | Diagnose host state                             | `cowshed doctor`                                                                     |
@@ -391,13 +386,6 @@ images are unaffected.
 
 `--project <git-root>`, `--json`, and `--quiet` are global options accepted by repository-scoped commands. Gateway
 service commands are host-global and reject `--project`.
-
-`reseed` discards live build-volume contents for a new clone of the target's current-incarnation latest existing seed.
-It leaves source files, HEAD, index, dirty and untracked work untouched; missing incremental work rebuilds cold. It
-never refreshes or deletes a seed: stale seeds are used as-is and an absent seed refuses. Run it while idle; jobs, land
-holds, filesystem holders and unfinished lifecycle work refuse. Preview changes no build state and reports
-allocated-byte estimates; execution reports removed-image allocation, not unique physical savings on APFS shared
-extents. See [the CLI reference](cli.md) for JSON fields and full refusal/accounting rules.
 
 ## Related guides
 

@@ -28,7 +28,6 @@ use crate::metadata::{
 };
 use crate::repository::RepoId;
 use crate::storage::StorageLayout;
-use crate::storage::apfs::native::{checkpoint_fact_path, restore_recovery_fact_path};
 use crate::storage::apfs::{companion_path, split_retired_stem};
 use crate::storage::deletion_log::{self, DeletionKind};
 use crate::storage::recovery::{ABANDON_BUNDLE_EXTENSION, TRASH_NAMESPACE};
@@ -239,14 +238,8 @@ impl Manifest {
 
 /// Every file a recovery image's move can carry, in the order it moves: its companions, then the
 /// image itself. Derived from the image's own path, never read back from a manifest.
-fn movable(image: &Path) -> [PathBuf; 5] {
-    [
-        sidecar_path(image),
-        companion_path(image),
-        checkpoint_fact_path(image),
-        restore_recovery_fact_path(image),
-        image.to_owned(),
-    ]
+fn movable(image: &Path) -> [PathBuf; 3] {
+    [sidecar_path(image), companion_path(image), image.to_owned()]
 }
 
 /// Whether `files` names only files [`movable`] derives for `image`, each once and in its order,

@@ -56,8 +56,8 @@ Propagation across cowshed's own boundaries:
   `trace_id` / `thread_id` / `span_id` / `parent_thread_id` / `parent_span_id`, `grant_revision`, and `env_hash`
   (11_shell.md). `job_id` joins the span to job control and protected evidence representation-transparently; it promises
   no per-job file path and never substitutes for `span_id`. The durable key is
-  `(repo_id, workspace_incarnation, job_id)` (camelCase `(repoId, workspaceIncarnation,jobId)`), so copied checkpoint
-  history remains distinct from jobs submitted in a later incarnation.
+  `(repo_id, workspace_incarnation, job_id)` (camelCase `(repoId, workspaceIncarnation,jobId)`), so copied fork history
+  remains distinct from jobs submitted in a later incarnation.
 - **Deferred work** — `rm` teardown, `gc` completing interrupted cleanup, autosave ticks (02_workspaces.md) — persists
   the originating traceparent in the trash entry / grants sidecar and continues as a **deferred span**; a causal (not
   parental) relation to the originating trace is a span **link**, not a parent.
@@ -75,9 +75,8 @@ it. This is what upgrades a first-party tool's traffic from tier-2 to tier-1 att
 - **Gateway request spans.** Each mirror fetch and intercepted request is a span (05_gateway.md), workspace-attributed
   by port, with the upstream leg as a child span.
 - **CoW-lineage links.** The in-image marker gains `createdTrace` (01_storage.md); `fork` links the child's trace to the
-  source workspace's trace, `restore` links to the checkpoint's, `checkpoint` links to the workspace's. The clone graph
-  becomes a queryable provenance graph — from any gateway denial you can walk back to which task created this workspace
-  from which state of main.
+  source workspace's trace. The clone graph becomes a queryable provenance graph — from any gateway denial you can walk
+  back to which task created this workspace from which state of main.
 - **Wait spans.** A wait on another cowshed process that expires (05_gateway.md, "Deadlines") is a `cowshed.wait` span,
   so `lmao-q errors` lists the expiry with its cause (below, "Wait spans").
 - **Grant-mutation spans.** Each `grant`/`revoke` (04_sandbox.md) records the trace that caused it, so
@@ -484,31 +483,31 @@ Primary sources:
 Cowshed uses Arrow IPC for both, but placement and authority differ:
 
 - **Protected in-volume evidence** — `.cowshed/job/records.arrow` contains allocation/lifecycle batches, terminal exec
-  records, checkpoint manifests, bounded summaries, and small terminal stdout/stderr as Arrow Binary. Larger or
-  checkpoint-forced streams spill lazily to protected `.cowshed/job/<job_id>/out|err` files. Complete batches and sealed
-  files are authoritative captured-content evidence only within their recorded origin incarnation/checkpoint boundary.
-  They are not workspace-writable: the supervisor is the sole live writer and the mandatory child profile denies every
-  mutation beneath `.cowshed/job/**` before repository-controlled startup (04_sandbox.md/11_shell.md). The workspace
-  marker the image carries (`.cowshed/workspace.json`) names the incarnation and its **lineage** — the ancestor
-  incarnations the image was cloned from, nearest first, written by the controller when it mints the incarnation — and
-  that lineage is what authorizes records an ancestor wrote into a cloned image.
+  records, bounded summaries, and small terminal stdout/stderr as Arrow Binary. Larger streams spill lazily to protected
+  `.cowshed/job/<job_id>/out|err` files. Complete batches and sealed files are authoritative captured-content evidence
+  only within their recorded origin incarnation boundary. They are not workspace-writable: the supervisor is the sole
+  live writer and the mandatory child profile denies every mutation beneath `.cowshed/job/**` before
+  repository-controlled startup (04_sandbox.md/11_shell.md). The workspace marker the image carries
+  (`.cowshed/workspace.json`) names the incarnation and its **lineage** — the ancestor incarnations the image was cloned
+  from, nearest first, written by the controller when it mints the incarnation — and that lineage is what authorizes
+  records an ancestor wrote into a cloned image.
 - **Authority is the host inventory.** What workspaces exist, which incarnation each is, which are retired, which
   lineage an image carries, and which port block and grants belong to a workspace are read from the images and mounts
   under `/private/cowshed/store/`, the per-workspace grants files, and the controller lock. No log is replayed for any
   of these decisions; a controller that opens a project reads the inventory once and starts.
 - **Controller audit records** — every controller act (workspace introduced/retired, job admission and terminal state,
-  checkpoint, fork, restore, each land whose build-volume step completes and returns its actual result, and each cache
-  miss a land's output restoration found) is emitted as one typed `ControllerCommitment` record to an audit sink. A land
-  outcome records whether the landing volume seeded the target and whether adoption succeeded or skipped, including the
-  exact skip reason and its holders. The records never contain inline output, a protected artifact path, a redirect
-  source, or any other raw stdout/stderr payload duplication. **Nothing reads them for a decision.** The sink is
-  selected when the project opens (`COWSHED_CONTINUITY_AUDIT`): `arrow` (default for the standalone CLI) writes sealed
-  per-writer segments under `/private/cowshed/store/telemetry/`, `off` discards, and a supervising runtime injects its
-  own sink through `ProjectRuntime::open_existing_with_audit` (routing the same records into its own durable log). A
-  sink that refuses a record is a `doctor` finding (`audit-sink`), never a reason to fail the act it describes. Job
-  admission, terminal and checkpoint records come from the workspace supervisors, which are processes of their own
-  (11_shell.md): each records to the host's default sink, and a controller with a sink of its own reads each
-  supervisor's records after the last cursor it forwarded, records them, and acknowledges them by cursor.
+  fork, each land whose build-volume step completes and returns its actual result, and each cache miss a land's output
+  restoration found) is emitted as one typed `ControllerCommitment` record to an audit sink. A land outcome records
+  whether the landing volume seeded the target and whether adoption succeeded or skipped, including the exact skip
+  reason and its holders. The records never contain inline output, a protected artifact path, a redirect source, or any
+  other raw stdout/stderr payload duplication. **Nothing reads them for a decision.** The sink is selected when the
+  project opens (`COWSHED_CONTINUITY_AUDIT`): `arrow` (default for the standalone CLI) writes sealed per-writer segments
+  under `/private/cowshed/store/telemetry/`, `off` discards, and a supervising runtime injects its own sink through
+  `ProjectRuntime::open_existing_with_audit` (routing the same records into its own durable log). A sink that refuses a
+  record is a `doctor` finding (`audit-sink`), never a reason to fail the act it describes. Job admission and terminal
+  records come from the workspace supervisors, which are processes of their own (11_shell.md): each records to the
+  host's default sink, and a controller with a sink of its own reads each supervisor's records after the last cursor it
+  forwarded, records them, and acknowledges them by cursor.
 - **Arrow audit segments** — one Arrow IPC batch holding one row per record, one to 64 records per segment, at
   `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC partition is an exact
   calendar date, `writer_uuid` is the lowercase hyphenated UUID of the controller process that wrote it, and `order` is
@@ -578,44 +577,15 @@ bytes. Unknown fields/encodings, malformed data, NUL, elements above 128 KiB, ag
 argv/`argv[0]` reject before RPC, spawn, or protected evidence mutation. Common UTF-8 arguments therefore remain
 readable without base64 or lossy conversion. A script job carries `JobInfo.script` instead (07_api.md, 11_shell.md).
 
-## Protected exec and checkpoint schema
+## Protected exec schema
 
-Protected Arrow is the exact tagged/versioned union:
+Protected Arrow rows are exactly `JobArtifactRecord`, with `record_kind` as the leading column and its one live value
+`job`.
 
-```rust
-enum ProtectedRecord {
-    Job(JobArtifactRecord),
-    CheckpointManifest(CheckpointManifestRecord),
-}
-struct CheckpointManifestRecord {
-    version: u16,
-    repo_id: RepoId,
-    origin_incarnation: WorkspaceIncarnation,
-    barrier_id: u64,
-    visible_jobs: Vec<VisibleJobCommitment>,
-    records_sha256: Sha256Digest,
-}
-struct VisibleJobCommitment {
-    workspace_incarnation: WorkspaceIncarnation,
-    job_id: JobId,
-    state: JobState,
-    stdout: VisibleStreamCommitment,
-    stderr: VisibleStreamCommitment,
-}
-struct VisibleStreamCommitment {
-    storage_kind: VisibleStorageKind,
-    bytes: u64,
-    sha256: Sha256Digest,
-    protected_path: Option<WorkspacePath>,
-}
-```
-
-`barrier_id` is positive and monotonic within `origin_incarnation`. `VisibleStorageKind` is exactly
-`captured-inline|captured-file|redirect-inline|redirect-file`; `protected_path` is present exactly for a file kind.
-`records_sha256` hashes the bytes of the complete protected-record stream prefix immediately before the manifest batch.
-All running memory-only prefixes promote and all files fsync before this record is appended; terminal inline bytes live
-in a prior `ProtectedRecord::Job` covered by the prefix digest. Recovery frames retain their `batch_sha256`; recovery
-may discard/report only an incomplete trailing frame.
+The protected-record columns `origin_incarnation`, `barrier_id`, `visible_jobs` and `records_sha256` are retired: they
+stay in the schema at their indices, and writers write them null. The `checkpointManifest` record kind is retired: a
+store a writer from before checkpoints were removed used may hold one, and recovery passes over it, since it names no
+job. Recovery frames retain their `batch_sha256`; recovery may discard/report only an incomplete trailing frame.
 
 The file is the 8-byte magic `CSARROW1`, then one frame per record: `CSBATCH1`, the payload length as a little-endian
 `u64`, that length's bitwise complement as a little-endian `u64`, the payload — an Arrow IPC stream holding exactly one
@@ -652,9 +622,8 @@ ran with no build volume; the macOS source's two byte columns are null together,
 pair is present exactly for `linuxCgroupV2`; any other null combination is rejected. Records are written and read at
 `record_version` 9 only: a store holding a record in an earlier layout is set aside whole and never read (11_shell.md),
 and a batch whose layout and version disagree is rejected; each version is its predecessor with columns appended, so an
-earlier reader meets a later record as a newer writer's. A CheckpointManifest row instead uses
-`origin_incarnation, barrier_id, visible_jobs, records_sha256`, with
-`visible_jobs: List<Struct<workspace_incarnation,job_id,state,stdout,stderr>>`. Columns outside the selected variant are
+earlier reader meets a later record as a newer writer's. The protected-record columns `origin_incarnation`,
+`barrier_id`, `visible_jobs` and `records_sha256` are retired and always null. Columns outside the selected variant are
 null and validators reject every other null combination. Job recovery validates non-null raw argv elements, the
 non-empty first argument, NUL exclusion, the 128 KiB element limit, and the 1 MiB total before allocating OS strings,
 and decodes and validates a script record's JSON.
@@ -669,9 +638,7 @@ enum ControllerCommitment {
     WorkspaceRetired(WorkspaceRetiredCommitment),
     Admission(AdmissionCommitment),
     Terminal(TerminalCommitment),
-    Checkpoint(CheckpointCommitment),
     Fork(ForkCommitment),
-    Restore(RestoreCommitment),
     LandAdoption(LandAdoptionCommitment),
     LandOutcome(LandOutcomeCommitment),
 }
@@ -693,18 +660,9 @@ struct TerminalCommitment {
     stdout_bytes: u64, stdout_sha256: Sha256Digest,
     stderr_bytes: u64, stderr_sha256: Sha256Digest, batch_sha256: Sha256Digest,
 }
-struct CheckpointCommitment {
-    version: u16, order: u64, repo_id: RepoId, origin_incarnation: WorkspaceIncarnation,
-    checkpoint_id: String, barrier_id: u64, manifest_batch_sha256: Sha256Digest,
-}
 struct ForkCommitment {
     version: u16, order: u64, repo_id: RepoId,
     source_incarnation: WorkspaceIncarnation, destination_incarnation: WorkspaceIncarnation,
-}
-struct RestoreCommitment {
-    version: u16, order: u64, repo_id: RepoId, source_checkpoint: String,
-    source_incarnation: WorkspaceIncarnation, replaced_incarnation: WorkspaceIncarnation,
-    destination_incarnation: WorkspaceIncarnation,
 }
 struct LandAdoptionCommitment {
     version: u16, order: u64, repo_id: RepoId,
@@ -744,7 +702,10 @@ A `landAdoption` or `landOutcome` row carries its landing and target incarnation
 `inputs_digest` (Binary); `landOutcome` alone carries `seeded` (Boolean) and `adoption_skip` (nullable Utf8, the exact
 JSON `AdoptionSkip` value). Non-selected fields are null and the tag controls required fields. Missing columns are null
 for every kind that does not require them. A row requiring a column its segment lacks is malformed and refused. Sealed
-segments are never rewritten.
+segments are never rewritten. The checkpoint and restore columns (`origin_incarnation`, `checkpoint_id`, `barrier_id`,
+`manifest_batch_sha256`, `source_checkpoint` and `replaced_incarnation`) are retired and always null: they stay in place
+at their indices, and writers write nulls. Older segments may hold rows of the retired kinds `checkpoint` and `restore`;
+readers skip exactly those two kinds, and any other unknown kind is still an error.
 
 `order` is the writing controller's own positive, strictly increasing sequence from 1; across writers a segment is
 identified by `(order, writer_uuid)`, and nothing requires a host-global order because nothing replays the segments.
@@ -758,11 +719,10 @@ The segment set is never enumerated to decide anything: a writer assigns its own
 wrote. A draft is acknowledged exactly once only after its immutable segment is durable.
 
 No commitment variant contains `inline_bytes`, `protected_path`, `source_path`, summary text, or output payload. The
-protected records are self-validating — frame digests, the manifest's `records_sha256`, stream hashes — and recovery
-types missing/altered content or an invalid complete frame as `Integrity`; an incomplete trailing frame alone is
-successful reported recovery with its `batch_sha256` retained for diagnosis. The audit records repeat the counts and
-hashes so an after-the-fact query can compare them against what the image holds, but no controller decision performs
-that comparison.
+protected records are self-validating — frame digests, stream hashes — and recovery types missing/altered content or an
+invalid complete frame as `Integrity`; an incomplete trailing frame alone is successful reported recovery with its
+`batch_sha256` retained for diagnosis. The audit records repeat the counts and hashes so an after-the-fact query can
+compare them against what the image holds, but no controller decision performs that comparison.
 
 ## Inspection
 
@@ -797,8 +757,8 @@ as its own spans.
   audit records and telemetry. A worker queries one workspace's reconciled lifecycle view and reads captured bytes
   representation-transparently from protected in-volume artifacts. Controller rows never serve raw output, and protected
   rows alone never claim cross-incarnation completeness.
-- **Integrity joins** can require the protected terminal/manifest batch digests, counts, and stream hashes to match the
-  audit records — an after-the-fact query over telemetry, not a gate.
+- **Integrity joins** can require the protected terminal batch digests, counts, and stream hashes to match the audit
+  records — an after-the-fact query over telemetry, not a gate.
 - **`cowshed doctor --bench`** reports real p50/p99 from accumulated lifecycle spans, turning the 08_testing.md budgets
   into SLOs monitored over actual usage.
 
@@ -813,7 +773,7 @@ as its own spans.
 - **Cheap diagnostic retention** — dictionary + zstd columnar spans are far smaller than NDJSON; gc may drop ordinary
   diagnostic segments. Controller audit segments are telemetry too: retention is the operator's policy, and no reader
   depends on their completeness.
-- **Checkpoint evidence diffing** — "diff the job histories of these two forks" is a query; a coordinator can select the
+- **Fork evidence diffing** — "diff the job histories of these two forks" is a query; a coordinator can select the
   winning fork of a `land --check` by its trace.
 
 ## Tradeoffs
@@ -835,9 +795,9 @@ crash window is the accepted cost, bounded by the decision-boundary/short-timer 
 
 **Tiered job authority.** Protected in-volume records and artifacts are not editable convenience projections: the child
 profile makes them supervisor-only, and complete batches/sealed files are authoritative captured-content evidence inside
-their origin incarnation/checkpoint boundary. They cannot prove that a later job or incarnation was not omitted by
-restoring the entire image — and cowshed does not try to: a restore is a controller verb the workspace cannot perform on
-itself, so "was something rolled back" is a question for the audit trail after the fact, not a fact any decision depends
-on. The compact audit records carry existence/status/order/lineage and the hashes such a query needs, never raw output.
-Within the image, disagreement between a frame and its digests is typed `Integrity`; no blanket “outside wins” or “newer
-wins” rule exists.
+their origin incarnation boundary. They cannot prove that a later job or incarnation was not omitted by rolling the
+entire image back out of band — and cowshed does not try to: it performs no image rollback itself, so "was something
+rolled back" is a question for the audit trail after the fact, not a fact any decision depends on. The compact audit
+records carry existence/status/order/lineage and the hashes such a query needs, never raw output. Within the image,
+disagreement between a frame and its digests is typed `Integrity`; no blanket “outside wins” or “newer wins” rule
+exists.

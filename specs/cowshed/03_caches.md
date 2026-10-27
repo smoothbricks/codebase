@@ -141,13 +141,13 @@ off-image freely, because nothing reflinks or hardlinks out of them.
 
 ## Wiring
 
-Wiring is carried primarily by **files and host paths**. Files travel with the image through clone/fork/checkpoint and
-cover processes cowshed never spawned (IDE terminals, launchd jobs, CI runner steps). The exception is standard generic
-HTTP proxy variables, which are emitted by the workspace environment wiring because ordinary proxy-aware tools consume
-them there; they contain the endpoint URL, whose userinfo is the workspace token (below).
+Wiring is carried primarily by **files and host paths**. Files travel with the image through clone/fork and cover
+processes cowshed never spawned (IDE terminals, launchd jobs, CI runner steps). The exception is standard generic HTTP
+proxy variables, which are emitted by the workspace environment wiring because ordinary proxy-aware tools consume them
+there; they contain the endpoint URL, whose userinfo is the workspace token (below).
 
-- **Private-environment config files**, written when the workspace is minted (adopt/fork, and rekey/restore's fresh CA)
-  and republished before every exec, so a moved environment is never served stale. They live in the workspace's private
+- **Private-environment config files**, written when the workspace is minted (adopt/fork, and rekey's fresh CA) and
+  republished before every exec, so a moved environment is never served stale. They live in the workspace's private
   environment — `.cowshed/{home,config,cache}`, which a cowshed-spawned child gets as `HOME`, `XDG_CONFIG_HOME` and
   `XDG_CACHE_HOME` — never in a tracked file, so a rewrite never dirties `git status`. A read-only exec gets the same
   files under its exec-temp environment. Define `GATEWAY_HTTP` as `http://127.0.0.1:<portBlock.base>` on macOS and

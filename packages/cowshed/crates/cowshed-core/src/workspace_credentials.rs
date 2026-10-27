@@ -159,7 +159,7 @@ pub fn mint_workspace_ca(common_name: String) -> Result<WorkspaceCa, WorkspaceCr
 /// Derives `.cowshed/env` from the image's published token, the workspace's recorded platform
 /// and port block, and, at a served mount, the trusted host install PATH, sandbox `TMPDIR`,
 /// runtime link and private Node compile cache. This is the
-/// file's one writer: adopt, clone and restore publish it as they mint, and every supervisor
+/// file's one writer: adopt and clone publish it as they mint, and every supervisor
 /// start publishes it again served, so a live workspace's file follows its metadata — a
 /// workspace minted before a variable existed gains it on its next start.
 pub fn publish_workspace_environment(

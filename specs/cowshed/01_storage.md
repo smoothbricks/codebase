@@ -13,8 +13,8 @@ rules answer.
 
 A _project_ is a checkout bound to one or more stable repository identities. A `repo_id` is machine-independent and has
 exactly two validated components. A Cowshed installation may adopt any number of projects. Each project's primary
-`repo_id` owns exactly one warm `main` workspace plus its own session/checkpoint namespace; `main` is never a
-machine-global singleton.
+`repo_id` owns exactly one warm `main` workspace plus its own session namespace; `main` is never a machine-global
+singleton.
 
 ```
 repo_id = lowercase(owner) + "/" + lowercase(repo)
@@ -70,7 +70,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     repository.json                  # chosen remote binding, alternate identities, and primary designation
     checkout-root.json               # where the checkout was when main was last removed (written then, read to reopen)
     slot-bindings.json               # build slot → workspace bindings (`fork --slot`, 06_cli.md)
-    policy.json                      # trusted project policy (checkpoint quotas, standing grants); controller-owned, 0600
+    policy.json                      # trusted project policy (standing grants); controller-owned, 0600
     waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
     lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
@@ -79,7 +79,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     main.dmg.grants.json             # controller-owned grants + detached metadata
     main.dmg.ca.key                  # main's workspace CA private key, 0600
     main.dmg.lock                    # flock target for lifecycle operations
-    .staging/                        # restore stages, never enumerated
+    .staging/                        # re-adoption stages, never enumerated
     sessions/
       <workspace>.dmg                # one image per workspace
       <workspace>.dmg.grants.json    # grants + detached metadata (see 04_sandbox.md)
@@ -89,8 +89,6 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
       <workspace>.land.lock          # flock a land or an rm of <workspace> holds for its run (02 "A land and an rm of one workspace exclude each other")
       .trash/                        # recovery images of dirty, unlanded or only-copy removals, kept until gc --recover
       .deleting/<name>.dmg           # committed releases of the project's other images (a removed workspace's as <ws>-<inc>.dmg, any other as reclaimed-<fresh 32-hex>.dmg), each waiting for the gateway's cleanup
-    checkpoints/
-      <workspace>/<label>.dmg        # clonefile snapshot
     build/
       <id>.dmg                       # one build volume (16_build_volumes.md owns what it holds)
       <id>.dmg.json                  # its sidecar: built-at tree, linking checkout, checked-out tree when placed, seed flag, created
@@ -110,7 +108,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     <digest>.drain                   # a draining supervisor's report; the lease's holder owns it and its temps (11_shell.md)
     <digest>.groups                  # that supervisor's process-group ledger
     gateway/                         # Linux only, 0700: per-incarnation data-plane Unix sockets, each mode 0600
-      <workspaceIncarnation>.sock    # bind-mounted into exactly one attached workspace; absent after detach/restore fence
+      <workspaceIncarnation>.sock    # bind-mounted into exactly one attached workspace; absent after detach
   telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
     <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
   (rebuildable caches are not beneath this tree: each tool keeps its own in the host HOME; see 03_caches.md)
@@ -294,7 +292,7 @@ fork of those names was refused as running in another process.
 
 ### In-image marker: `.cowshed/workspace.json`
 
-Written at adopt/fork/restore, at the volume root; travels with every clone:
+Written at adopt/fork, at the volume root; travels with every clone:
 
 ```json
 {
@@ -302,41 +300,41 @@ Written at adopt/fork/restore, at the volume root; travels with every clone:
   "repoId": "acme/widget",
   "projectRoot": "<project-root>",
   "workspace": "raven",
-  "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80", // fresh controller-minted 128-bit id on create/fork/restore
+  "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80", // fresh controller-minted 128-bit id on create/fork
   "role": "workspace", // "main" | "workspace"
   "baseCommit": "8f31c2d…", // main's HEAD at creation
   "createdAt": "2026-07-11T12:00:00Z",
   "forkedFrom": null, // workspace name when created by `cowshed fork`
-  "createdTrace": "4bf92f…" // trace id of the fork/restore that created this image (13_telemetry.md)
+  "createdTrace": "4bf92f…" // trace id of the fork that created this image (13_telemetry.md)
 }
 ```
 
-`workspaceIncarnation` identifies one mutable workspace timeline. Checkpoints retain the incarnation in their copied job
-records; a fork destination and every restore result mint a fresh incarnation, so a reused numeric job id cannot collide
-with controller telemetry from a discarded or sibling timeline. It is public identity, not a credential. The sibling
-host sidecar carries the current incarnation for detached discovery; each job record carries the incarnation that
-actually produced it.
+`workspaceIncarnation` identifies one mutable workspace timeline. Forked copies retain the incarnation in their copied
+job records; a fork destination mint a fresh incarnation, so a reused numeric job id cannot collide with controller
+telemetry from a discarded or sibling timeline. It is public identity, not a credential. The sibling host sidecar
+carries the current incarnation for detached discovery; each job record carries the incarnation that actually produced
+it.
 
-`createdTrace` is the CoW-lineage anchor: `fork`/`restore`/`checkpoint` link the new trace to it, so the clone graph is
-a queryable provenance graph (13_telemetry.md). The in-image `.cowshed/` directory also holds `token` (the gateway
-identity, 0600, rewritten on fork/restore so identities never duplicate), the workspace CA **certificate** (the public
-trust anchor for egress interception — the private key stays controller-side, 04_sandbox.md/05_gateway.md), the in-image
-cache roots (03_caches.md), and the protected `.cowshed/job/` authority domain.
+`createdTrace` is the CoW-lineage anchor: `fork` links the new trace to it, so the clone graph is a queryable provenance
+graph (13_telemetry.md). The in-image `.cowshed/` directory also holds `token` (the gateway identity, 0600, rewritten on
+fork so identities never duplicate), the workspace CA **certificate** (the public trust anchor for egress interception —
+the private key stays controller-side, 04_sandbox.md/05_gateway.md), the in-image cache roots (03_caches.md), and the
+protected `.cowshed/job/` authority domain.
 
 The trusted supervisor is the only live writer beneath `.cowshed/job/**`; every executed shell, named session, startup
 hook, and descendant receives the mandatory child restriction before repository-controlled code runs (04_sandbox.md).
-`.cowshed/job/records.arrow` is the framed protected `ProtectedRecord` stream: `Job(JobArtifactRecord)` or
-`CheckpointManifest(CheckpointManifestRecord)`. Small terminal stdout/stderr may live as Arrow Binary in a Job row. A
-stream promotes lazily to `.cowshed/job/<numeric-id>/out` or `err` only when it exceeds the bounded inline limit or a
-checkpoint/background/replay requirement forces residency; no per-job path is promised. Each stream records byte count,
-SHA-256, bounded summary, and exact captured/redirect plus inline/file discriminants. Checkpoint manifests carry
-`version, repo_id, origin_incarnation, barrier_id, visible_jobs, records_sha256`; the visible stream commitment is
-`storage_kind, bytes, sha256, protected_path` with path present iff file. Complete Arrow batches and sealed spills are
-immutable. A records file legitimately holds frames its ancestor incarnations wrote, because fork and restore clone the
+`.cowshed/job/records.arrow` is the framed protected `JobArtifactRecord` stream. Its `record_kind` column has one live
+value, `job`; a `checkpointManifest` frame, a retired kind an older writer may have left, names no job and recovery
+passes over it. Small terminal stdout/stderr may live as Arrow Binary in a Job row. A stream promotes lazily to
+`.cowshed/job/<numeric-id>/out` or `err` only when it exceeds the bounded inline limit or a background/replay
+requirement forces residency; no per-job path is promised. Each stream records byte count, SHA-256, bounded summary, and
+exact captured/redirect plus inline/file discriminants. The protected-record columns `origin_incarnation`, `barrier_id`,
+`visible_jobs` and `records_sha256` are retired: they stay in the schema, always null. Complete Arrow batches and sealed
+spills are immutable. A records file legitimately holds frames its ancestor incarnations wrote, because fork clones the
 source image; the image's marker lineage (02_workspaces.md) is what authorizes them, and a frame from any other
-incarnation is an integrity fault. The controller additionally emits compact Admission/Terminal/Checkpoint/Fork/Restore
-audit records — existence/status/order/lineage and expected hashes/digests, never raw payload or artifact paths — to an
-optional sink that nothing reads for a decision (07_api.md/13_telemetry.md).
+incarnation is an integrity fault. The controller additionally emits compact `ControllerCommitment` audit records
+(13_telemetry.md) — existence/status/order/lineage and expected hashes/digests, never raw payload or artifact paths — to
+an optional sink that nothing reads for a decision (07_api.md/13_telemetry.md).
 
 ### Grant files live outside the volume
 
@@ -351,22 +349,17 @@ info snapshot described above. Linux sidecars omit `portBlock`. The workspace's 
 (`<image>.ca.key`, 0600, same controller-only, sandbox-denied treatment) — the gateway signs per-host interception
 leaves with it; only the public CA cert ever enters the image (04_sandbox.md/05_gateway.md). Schema in 04_sandbox.md.
 
-The APFS adapter's interrupted image/metadata publication protocol is specified in
-[Restore publication custody](./01a_apfs.md#restore-publication-custody).
-
 ## Retention
 
-Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces, abandon bundles, ZFS origin pins
-(09_substrates.md), and APFS image-size ratchet all grow silently. `cowshed gc` enforces retention conventions.
-Reclaiming an image, whatever reclaims it, is releasing it: one rename into a `.deleting` directory, then a nudge to the
-gateway, which deletes it in the background (05_gateway.md, "Deleting released images"). Background deletion handles
-only explicitly released images (build volumes, the sources of clean removals, the orphan, expired and staged images
-that `gc` and failed verbs release) and provably dead scratch, never idle workspaces:
+Copy-on-write divergence only ever accumulates — idle workspaces, abandon bundles, ZFS origin pins (09_substrates.md),
+and APFS image-size ratchet all grow silently. `cowshed gc` enforces retention conventions. Reclaiming an image,
+whatever reclaims it, is releasing it: one rename into a `.deleting` directory, then a nudge to the gateway, which
+deletes it in the background (05_gateway.md, "Deleting released images"). Background deletion handles only explicitly
+released images (build volumes, the sources of clean removals, the orphan and staged images that `gc` and failed verbs
+release) and provably dead scratch, never idle workspaces:
 
 | Object                                       | Default retention                                                                                                                                             | Exempt / override                                                                                                                                                            |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Checkpoints                                  | all younger than 14 days **plus the newest five per workspace, whichever keeps more**                                                                         | explicit pin from a label or `cowshed checkpoint --keep`; pins never expire until unpinned                                                                                   |
-| CI failure checkpoints                       | same checkpoint rule as above                                                                                                                                 | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                                                                                                    |
 | Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**                                                                                 | landing/removal is always explicit                                                                                                                                           |
 | Recovery images (`sessions/.trash/…`)        | retained even when their record is missing; never deleted by startup or generic `gc`                                                                          | `cowshed gc --recover <image> --to <dir>` moves one out of the store with a manifest (02_workspaces.md); clean landed source images are released to `.deleting`, not here    |
 | Released images (`.deleting/…`)              | a committed release waits there, named by nothing, until it is freed in the background                                                                        | each is nudged to the gateway, whose `image-cleanup` thread lists every `.deleting` each pass (05_gateway.md); no verb frees it: `rm`, `land` and `gc` only commit and nudge |
@@ -374,28 +367,18 @@ that `gc` and failed verbs release) and provably dead scratch, never idle worksp
 | Dead shared-temp scratch                     | sockets/empty locks deleted; all other contents renamed to `<store>/.trash/scratch/`                                                                          | unknown/live owners kept; archived evidence kept for 24 hours before background deletion                                                                                     |
 | mbx store and managed targets (`<bc>/mbx`)   | mbx's own collection budgets (03_caches.md); `cowshed gc` never lists or collects them, nor any other top-level entry of the build-cache volume (01a_apfs.md) | none                                                                                                                                                                         |
 
-- `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
-  14 days old **and** is not among the newest five for that workspace. A user-supplied label creates an explicit pin;
-  `--keep` pins the generated or supplied label. Pin state is authoritative detached metadata, not inferred from a
-  filename, and an explicit unpin is required before such a checkpoint is eligible.
-- Checkpoint quota accounting is per workspace. One authoritative `SubstrateStats` read reports the active image's
-  logical and allocated bytes, all published checkpoint allocated bytes/count, and the pinned checkpoint byte subset.
-  Admission projects `existing checkpoint bytes + active allocated bytes` and `existing count + 1`; pinned and automatic
-  checkpoints both consume the cap. Exact `<=` boundaries are admitted, while `>` returns `Conflict` before cloning or
-  publishing any checkpoint image, fact, or detached metadata. A sibling workspace never consumes this workspace's
-  coordinator-owned quota.
 - Garbage collection is two-phase. `preview_gc(repo, options)` is a read-only enumeration that returns an immutable plan
   of exact candidates with stable SHA-256 identity, host path, allocated bytes, and closed reason. The plan records its
-  sweep options. Pinned checkpoints are retained and never become candidates. `execute_gc(plan)` acquires all plan locks
-  without waiting, re-enumerates at the plan's observation time under the same options, and rejects a
-  pin/incarnation/path/byte/concurrency change as stale before any mutation. Only an unchanged plan releases retired
-  workspaces' trash, orphan staging and session images and expired checkpoints to the gateway's cleanup (05_gateway.md,
-  "Deleting released images"), removes orphan mountpoints and staging metadata, and, only under `--abandoned`, reclaims
-  abandon bundles; execution reports the allocated bytes of the images it released, which their deletions free after it
-  answers. Nothing compacts an image: guest-freed space stays allocated, so an image's allocation tracks its high-water
-  mark ([APFS Images](./01a_apfs.md#images), "Space reclamation"). A candidate whose own cleanup cannot finish is
-  deferred by path and diagnostic while the sweep attempts the others. Uncertain ownership, invalid identity, or a stale
-  whole plan still refuse: proceeding through those could delete data that does not belong to the candidate.
+  sweep options. `execute_gc(plan)` acquires all plan locks without waiting, re-enumerates at the plan's observation
+  time under the same options, and rejects an incarnation/path/byte/concurrency change as stale before any mutation.
+  Only an unchanged plan releases retired workspaces' trash, orphan staging and session images to the gateway's cleanup
+  (05_gateway.md, "Deleting released images"), removes orphan mountpoints and staging metadata, and, only under
+  `--abandoned`, reclaims abandon bundles; execution reports the allocated bytes of the images it released, which their
+  deletions free after it answers. Nothing compacts an image: guest-freed space stays allocated, so an image's
+  allocation tracks its high-water mark ([APFS Images](./01a_apfs.md#images), "Space reclamation"). A candidate whose
+  own cleanup cannot finish is deferred by path and diagnostic while the sweep attempts the others. Uncertain ownership,
+  invalid identity, or a stale whole plan still refuse: proceeding through those could delete data that does not belong
+  to the candidate.
 - Abandon bundles are regular `*.bundle` files directly in `sessions/.trash`; staged `.partial` siblings and symlinks
   are not bundle candidates. Plain `gc`, opportunistic collection, and `doctor --repair` never authorize their
   reclamation. Only explicit `--abandoned` (`GcOptions.abandoned: true`) adds the `abandonedBundle` category to the
@@ -406,17 +389,16 @@ that `gc` and failed verbs release) and provably dead scratch, never idle worksp
   hiding them: a plain `gc` reports how many the trash keeps and their allocated bytes, `doctor` reports them as an
   `abandon-bundles` info finding, and `ls --all` names each project's after its table. Naming them authorizes nothing;
   the plain sweep's own plan still never holds one.
-- Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
-  one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
+- Explicit workspace retirement: its exact trash metadata authorizes one workspace-scoped cleanup plan that includes the
   trash image and empty mountpoint, each image released for background deletion (05_gateway.md, "Deleting released
-  images"). Preview and execution validate the repository, workspace, incarnation, checkpoint facts, and every
-  associated artifact under the workspace lock; any change makes the plan stale before mutation. Cleanup deletes the
-  retirement trash metadata last so an interrupted pass retains authority for the next idempotent GC pass. A missing
-  canonical image or orphan checkpoint fact alone never authorizes deletion. APFS-specific handling of late root-owned
-  filesystem event logs is specified in [Retired mountpoint debris](./01a_apfs.md#retired-mountpoint-debris).
-- `cowshed du` reports **written vs referenced** bytes per workspace and per checkpoint (the number that matters for CoW
-  substrates — referenced is shared with the base, written is the true cost). `--json` for fleet dashboards. This is how
-  a coordinator decides which long-lived workspaces to `cowshed rebase --fresh` (02_workspaces.md) to shed accumulated
+  images"). Preview and execution validate the repository, workspace, incarnation, and every associated artifact under
+  the workspace lock; any change makes the plan stale before mutation. Cleanup deletes the retirement trash metadata
+  last so an interrupted pass retains authority for the next idempotent GC pass. A missing canonical image alone never
+  authorizes deletion. APFS-specific handling of late root-owned filesystem event logs is specified in
+  [Retired mountpoint debris](./01a_apfs.md#retired-mountpoint-debris).
+- `cowshed du` reports **written vs referenced** bytes per workspace (the number that matters for CoW substrates —
+  referenced is shared with the base, written is the true cost). `--json` for fleet dashboards. This is how a
+  coordinator decides which long-lived workspaces to `cowshed rebase --fresh` (02_workspaces.md) to shed accumulated
   divergence.
 
 ### Shared temporary scratch

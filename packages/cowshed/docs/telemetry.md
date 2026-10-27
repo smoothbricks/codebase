@@ -67,8 +67,8 @@ bound and exit code. The final error boundary reuses that receipt, never samplin
 ## Tiered job authority and writers
 
 Every job is identified durably by `(repo_id, workspace_incarnation, job_id)`. Protected records and canonical stream
-artifacts inside the volume are authoritative for content within the incarnation and checkpoint snapshot that created
-them. Each stream is `StreamInfo { storage, bytes, sha256, summary }`, where `storage` is `Captured { artifact }` or
+artifacts inside the volume are authoritative for content within the incarnation that created them. Each stream is
+`StreamInfo { storage, bytes, sha256, summary }`, where `storage` is `Captured { artifact }` or
 `Redirect { source, artifact }`, and the protected `artifact` is `Inline { data: BinaryData }` or
 `File { path: WorkspacePath }`. `Redirect.source` is live caller-visible state, never authority. Small terminal content
 may remain inline as Arrow Binary; protected spill files under `.cowshed/job/**` are created lazily. In-volume Arrow
@@ -85,30 +85,24 @@ failure.
 Authority is the host inventory, not a log. What workspaces exist, which incarnation each is, which are retired, and
 which ancestors an image was cloned from are read from the images and mounts under `/private/cowshed/store/`, the marker
 each image carries (`.cowshed/workspace.json`: incarnation and `lineage`, nearest ancestor first — written by the
-controller when it mints the incarnation, because a fork or restore clones the source image together with the job
-records its ancestors wrote, and the lineage is what authorizes those records), the per-workspace grants files, and the
-controller lock. A controller opening a project reads the inventory once and starts; per-command cost does not grow with
-history.
+controller when it mints the incarnation, because a fork clones the source image together with the job records its
+ancestors wrote, and the lineage is what authorizes those records), the per-workspace grants files, and the controller
+lock. A controller opening a project reads the inventory once and starts; per-command cost does not grow with history.
 
 Controller audit records are telemetry. Every controller act — workspace introduced/retired, job admission and terminal
-state, checkpoint, fork, restore — is emitted as one typed record carrying existence, lifecycle/status, a writer-local
-order, lineage, grant revision, byte counts, stream SHA-256 digests, and terminal-batch digest, never inline bytes,
-spill paths, or duplicated raw payload. Nothing reads them for a decision. The sink is chosen when the project opens
-(`COWSHED_CONTINUITY_AUDIT`): `arrow` (the standalone default) group-commits records into sealed Arrow IPC segments
-under `/private/cowshed/store/telemetry/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow` — every record already
-queued joins one segment, up to 64, with no added wait; one fsync (and, when a record must survive power loss,
-`F_FULLFSYNC` plus a directory sync) covers the segment, and each record is acknowledged only after it; private mode,
-create-new rename, no lock and no global order because names are unique per writer, `order` being the segment's first
-record's; `off` writes nothing; and a runtime that supervises the controller injects its own sink through
+state, fork — is emitted as one typed record carrying existence, lifecycle/status, a writer-local order, lineage, grant
+revision, byte counts, stream SHA-256 digests, and terminal-batch digest, never inline bytes, spill paths, or duplicated
+raw payload. Nothing reads them for a decision. The sink is chosen when the project opens (`COWSHED_CONTINUITY_AUDIT`):
+`arrow` (the standalone default) group-commits records into sealed Arrow IPC segments under
+`/private/cowshed/store/telemetry/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow` — every record already queued
+joins one segment, up to 64, with no added wait; one fsync (and, when a record must survive power loss, `F_FULLFSYNC`
+plus a directory sync) covers the segment, and each record is acknowledged only after it; private mode, create-new
+rename, no lock and no global order because names are unique per writer, `order` being the segment's first record's;
+`off` writes nothing; and a runtime that supervises the controller injects its own sink through
 `ProjectRuntime::open_existing_with_audit`, routing the same records into its durable log instead of files. A sink that
 refuses a record is an `audit-sink` finding in `cowshed doctor`, never a failed act. Rollback and omission are therefore
-after-the-fact questions for the audit trail: a restore is a controller verb a workspace cannot perform on itself, so no
-decision waits on proving one did not happen.
-
-Checkpoint publication crosses a supervisor barrier that seals complete batches and spill files and writes a manifest
-covering every checkpoint-resident job byte. Restoring that snapshot mints a new workspace incarnation; controller
-commitments preserve the lineage and detect omission or rollback, while the protected content remains scoped to its
-origin snapshot.
+after-the-fact questions for the audit trail: cowshed performs no image rollback, so no decision waits on proving one
+did not happen.
 
 stdout and stderr share a configurable capture quota, default 1 GiB, whose accounting includes persisted and in-flight
 bytes. A crossing yields TERM/grace/KILL of the process group, pipe drain, and the explicit authoritative `output-limit`
@@ -127,8 +121,8 @@ cowshed uses W3C `traceparent`. Every entry point **mints or adopts** a trace:
   source kind, bytes delivered, EOF completion, and an optional normalized workspace-relative file path. Inline binary
   input is never stored in telemetry. The framed stdin channel preserves backpressure and cancellation semantics while
   keeping input separate from shell text.
-- **CoW lineage is linked**: a workspace's marker records the trace that created it, and `fork`/`restore`/`checkpoint`
-  link back — from a gateway denial you can walk to which task cloned this workspace from which state of main.
+- **CoW lineage is linked**: a workspace's marker records the trace that created it, and `fork` links back — from a
+  gateway denial you can walk to which task cloned this workspace from which state of main.
 
 The payoff you'll feel most: **the grant-escalation loop is one trace.** A denial (exit 6), the worker asking its
 coordinator, the `grant`, and the retry are four events under one trace id — one filter on that id gives the whole

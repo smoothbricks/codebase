@@ -29,9 +29,9 @@ use cowshed_core::storage::apfs::{
 };
 use cowshed_core::storage::lifecycle::{
     AdoptHandoff, AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent,
-    MountState, OperationIdentity, Pin, RestoreMode, Revision, StorageGcOptions, Substrate,
+    MountState, OperationIdentity, Revision, StorageGcOptions, Substrate,
 };
-use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
+use cowshed_core::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
 #[path = "../../../cowshed-apfs/tests/support/blank_image.rs"]
@@ -112,7 +112,7 @@ impl Drop for ChurnGuard {
 }
 
 /// One complete substrate lifecycle on real APFS images — adopt, mount, a stream write, clone
-/// under writer churn, checkpoint, restore, stats, defragment (a busy refusal, then the rewrite of
+/// under writer churn, stats, defragment (a busy refusal, then the rewrite of
 /// main's image fragmented under a clone), retire, reclaim, GC, detach — bounded by the harness's
 /// PER-TEST deadline. The defragment phase lives here, not in a test of its own, because its own
 /// test pays adopt's attaches again: one did, and under host contention stalled past the 30s
@@ -234,7 +234,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         assert_eq!(volume_name(&checkout_path)?, blank_image::SHARED_TEMPLATE_LABEL);
 
         let payload = checkout_path.join("payload.txt");
-        fs::write(&payload, b"checkpoint baseline\n")?;
+        fs::write(&payload, b"baseline\n")?;
         fs::write(checkout_path.join("Case"), b"upper")?;
         fs::write(checkout_path.join("case"), b"lower")?;
         let stream = checkout_path.join("stream.bin");
@@ -287,7 +287,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             .map_err(|error| std::io::Error::other(format!("ensure fork: {error}")))?;
         assert_eq!(
             fs::read(fork_mount.join("payload.txt"))?,
-            b"checkpoint baseline\n"
+            b"baseline\n"
         );
         // The clone carries its source's volume, case sensitivity included.
         assert_eq!(fs::read(fork_mount.join("Case"))?, b"upper");
@@ -301,55 +301,28 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         // the volume later, off the path that creates it.
         assert_eq!(volume_name(&fork_mount)?, blank_image::SHARED_TEMPLATE_LABEL);
 
-        let checkpoint_plan = substrate.plan_checkpoint(
-            &main,
-            CheckpointLabel::new("before-mutation")?,
-            Pin::Pinned,
-        )?;
-        let checkpoint = substrate
-            .execute_checkpoint_staged(checkpoint_plan, |_| async { Ok::<(), &'static str>(()) })
-            .await
-            .map_err(|error| std::io::Error::other(format!("checkpoint: {error}")))?;
-        fs::write(&payload, b"mutated after checkpoint\n")?;
-        let restore_plan =
-            substrate.plan_restore(&main, &checkpoint, RestoreMode::Replace, identity()?)?;
-        let restored = substrate
-            .execute_restore_staged(
-                restore_plan,
-                |_| async { Ok::<(), &'static str>(()) },
-            )
-            .await
-            .map_err(|error| std::io::Error::other(format!("restore: {error}")))?
-            .workspace;
-        assert_ne!(restored.incarnation(), main.incarnation());
-        assert_eq!(fs::read(&payload)?, b"checkpoint baseline\n");
-
-        let stats = substrate
-            .stats(&restored)
-            .await
-            .map_err(|error| std::io::Error::other(format!("stats: {error}")))?;
-        assert!(stats.logical_bytes > 0);
-        assert!(stats.allocated_bytes > 0);
-        assert!(stats.allocated_bytes <= stats.logical_bytes);
-        assert!(
-            stats.checkpoint_count >= 2,
-            "source + pre-restore undo checkpoints"
-        );
-
-        // Defragment: main fragments by taking writes while a clone shares its blocks. Rewrite
-        // every other page of the detached image under a clone, then the verb, busy and idle.
         // Lifecycle verbs take the workspace as the store derives it now, revision included.
-        let defragment_phase = Instant::now();
-        let restored = substrate
+        let main = substrate
             .list(&repo)
             .await
             .map_err(|error| std::io::Error::other(format!("list: {error}")))?
             .into_iter()
             .map(|derived| derived.workspace)
             .find(|workspace| workspace.name().is_main())
-            .ok_or("restored main is not listed")?;
+            .ok_or("main is not listed")?;
+        let stats = substrate
+            .stats(&main)
+            .await
+            .map_err(|error| std::io::Error::other(format!("stats: {error}")))?;
+        assert!(stats.logical_bytes > 0);
+        assert!(stats.allocated_bytes > 0);
+        assert!(stats.allocated_bytes <= stats.logical_bytes);
+
+        // Defragment: main fragments by taking writes while a clone shares its blocks. Rewrite
+        // every other page of the detached image under a clone, then the verb, busy and idle.
+        let defragment_phase = Instant::now();
         substrate
-            .unmount(&restored)
+            .unmount(&main)
             .await
             .map_err(|error| std::io::Error::other(format!("unmount main: {error}")))?;
         let image = StorageLayout::new(&store, &repo)?
@@ -363,14 +336,14 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             "rewriting {rewritten_pages} pages under a clone left only {fragmented} extents"
         );
         substrate
-            .ensure_mounted(&restored, MountIntent { browse: false })
+            .ensure_mounted(&main, MountIntent { browse: false })
             .await
             .map_err(|error| std::io::Error::other(format!("remount main: {error}")))?;
         // An open file is work in flight: the rewrite refuses before it touches the image.
         let held = File::open(&payload)?;
         let inode = fs::metadata(&image)?.ino();
         substrate
-            .defragment(&restored)
+            .defragment(&main)
             .await
             .expect_err("a busy main refuses the rewrite");
         assert_eq!(
@@ -382,7 +355,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         drop(held);
         let defragment_started = Instant::now();
         let defragmented = substrate
-            .defragment(&restored)
+            .defragment(&main)
             .await
             .map_err(|error| std::io::Error::other(format!("defragment: {error}")))?;
         let defragment_elapsed = defragment_started.elapsed();
@@ -395,19 +368,19 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
         assert!(!fs::exists(rewrite_sibling(&image))?);
         assert!(matches!(
             substrate
-                .mount_state(&restored)
+                .mount_state(&main)
                 .await
                 .map_err(|error| std::io::Error::other(format!("mount state: {error}")))?,
             MountState::Mounted { .. }
         ));
-        assert_eq!(fs::read(&payload)?, b"checkpoint baseline\n");
+        assert_eq!(fs::read(&payload)?, b"baseline\n");
         let streamed = fs::read(&stream)?;
         assert_eq!(streamed.len(), STREAM_MEBIBYTES * 1024 * 1024);
         assert!(streamed.iter().all(|byte| *byte == 0x5a));
         let marker = cowshed_core::metadata::WorkspaceMarker::read_from(
             &checkout_path.join(WORKSPACE_MARKER_PATH),
         )?;
-        assert_eq!(&marker.workspace_incarnation, restored.incarnation());
+        assert_eq!(&marker.workspace_incarnation, main.incarnation());
         let defragment_phase = defragment_phase.elapsed();
 
         let retire = substrate.plan_retire(&fork)?;
@@ -429,11 +402,10 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             .map_err(|error| std::io::Error::other(format!("execute gc: {error}")))?;
 
         Ok(format!(
-            "lifecycle={:?}, fork={fork_elapsed:?}, logical={}, allocated={}, checkpoints={}, defragment phase={defragment_phase:?} verb={defragment_elapsed:?} ({rewritten_pages} pages rewritten under a clone, extents {} -> {})",
+            "lifecycle={:?}, fork={fork_elapsed:?}, logical={}, allocated={}, defragment phase={defragment_phase:?} verb={defragment_elapsed:?} ({rewritten_pages} pages rewritten under a clone, extents {} -> {})",
             started.elapsed(),
             stats.logical_bytes,
             stats.allocated_bytes,
-            stats.checkpoint_count,
             defragmented.previous,
             defragmented.extents
         ))

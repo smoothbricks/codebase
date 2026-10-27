@@ -1,7 +1,7 @@
 //! Store recovery, retirement reclamation and garbage collection over directory payloads.
 //!
 //! Every decision reads the same records the image store writes - grants sidecars, CA
-//! companions, checkpoint and restore-recovery facts, trash names, lifecycle locks - so an
+//! companions, trash names, lifecycle locks - so an
 //! interrupted operation converges the same way. Only the payload differs: a directory, read
 //! in place (a marker is a file in it, not a mount away) and removed as a tree.
 
@@ -20,18 +20,13 @@ use super::{
 };
 use crate::metadata::{
     DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, PublicationState, WorkspaceIncarnation,
-    WorkspaceMarker, WorkspaceName, sidecar_path,
+    WorkspaceName, sidecar_path,
 };
-use crate::repository::{
-    CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, QUARANTINE_DIRECTORY, RepoId, SESSIONS_DIRECTORY,
-};
+use crate::repository::{EXEC_TEMP_DIRECTORY, QUARANTINE_DIRECTORY, RepoId, SESSIONS_DIRECTORY};
 use crate::storage::apfs::native::{
-    CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, HeldScope, QuarantineTombstone,
-    RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire, abandon_bundles,
-    canonical_recovery_sidecars, checkpoint_fact_path, collect_restore_sidecars,
+    HeldScope, QuarantineTombstone, abandon_bundles, canonical_recovery_sidecars,
     directory_children, gc_candidate_failure_is_fatal, grants_sidecar_missing, image_from_sidecar,
-    io_error, metadata_workspace_ref, path_exists, regular_file_children,
-    restore_recovery_fact_path, swap_paths, sync_parent_path, validate_restore_recovery_lineage,
+    io_error, metadata_workspace_ref, path_exists, regular_file_children, sync_parent_path,
     warn_session_image_issue,
 };
 use crate::storage::apfs::{
@@ -44,12 +39,11 @@ use crate::storage::lifecycle::{
     StorageGcReason, StorageGcReport, StorageGcRetained,
 };
 use crate::storage::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
-use crate::storage::{CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH};
 use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
 use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
 
-/// Whether a retirement may collect the artifacts keyed on its workspace name - its checkpoint
-/// directory, exec temp directory and mountpoint - which re-minting the name hands the next
+/// Whether a retirement may collect the artifacts keyed on its workspace name - its exec temp
+/// directory and mountpoint - which re-minting the name hands the next
 /// lifetime. They belong to the live canonical payload when there is one, else to the newest
 /// retirement of that name in the trash.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,7 +54,6 @@ enum NameScope {
 
 /// What a retired workspace's reclamation removes beyond its trash payload.
 struct RetiredCleanup {
-    checkpoint_images: Vec<PathBuf>,
     paths: Vec<PathBuf>,
     mount_point: Option<PathBuf>,
 }
@@ -71,7 +64,8 @@ fn is_grants_sidecar(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
 }
 
-/// The workspace a staging stem (`<name>-<incarnation>`, or recovery's `recover-` form) names.
+/// The workspace a staging stem (`<name>-<incarnation>`, or the `recover-` form a pre-cutover
+/// recovery left) names. The prefix is stripped so such a mount still takes its workspace's lock.
 fn staged_stem_workspace(stem: &str) -> Option<WorkspaceName> {
     let stem = stem.strip_prefix("recover-").unwrap_or(stem);
     let (workspace, incarnation) = stem.rsplit_once('-')?;
@@ -81,13 +75,7 @@ fn staged_stem_workspace(stem: &str) -> Option<WorkspaceName> {
 
 /// Every path a reclaimed payload leaves behind it.
 fn payload_gc_paths(image: &Path) -> Vec<PathBuf> {
-    vec![
-        image.to_owned(),
-        sidecar_path(image),
-        companion_path(image),
-        checkpoint_fact_path(image),
-        restore_recovery_fact_path(image),
-    ]
+    vec![image.to_owned(), sidecar_path(image), companion_path(image)]
 }
 
 /// The identity of one reclamation, fencing it against any change between preview and
@@ -263,22 +251,6 @@ impl DirectoryExecutionHost {
         .map(|guard| guard.is_some())
     }
 
-    /// The incarnation the marker inside a detached payload names: read in place.
-    fn payload_incarnation(image: &Path) -> Result<String, ApfsStorageError> {
-        WorkspaceMarker::read_from(&image.join(WORKSPACE_MARKER_PATH))
-            .map(|marker| marker.workspace_incarnation.to_string())
-            .map_err(host_error)
-    }
-
-    fn companions_match(left: &Path, right: &Path) -> Result<bool, ApfsStorageError> {
-        let left_metadata = fs::symlink_metadata(left)
-            .map_err(|error| io_error("inspect recovery CA identity", left, error))?;
-        let right_metadata = fs::symlink_metadata(right)
-            .map_err(|error| io_error("inspect recovery CA identity", right, error))?;
-        Ok(left_metadata.dev() == right_metadata.dev()
-            && left_metadata.ino() == right_metadata.ino())
-    }
-
     /// A published payload whose CA companion is missing or invalid has its sidecar (and
     /// companion, if any) quarantined with a tombstone, the payload kept in place, so one
     /// workspace's lost identity never stops the store-wide pass.
@@ -352,7 +324,7 @@ impl DirectoryExecutionHost {
         Ok(tombstone)
     }
 
-    /// Converge every interrupted publication, restore and retirement in the store from what
+    /// Converge every interrupted publication and retirement in the store from what
     /// is on disk, under each canonical name's lock.
     pub(super) fn recover_store(
         &self,
@@ -364,7 +336,6 @@ impl DirectoryExecutionHost {
         {
             self.recover_canonical_sidecars(config, &project, workspaces.as_ref(), held_locks)?;
             self.recover_staged_sidecars(config, &project, workspaces.as_ref(), held_locks)?;
-            self.recover_restores(config, &project, workspaces.as_ref(), held_locks)?;
         }
         Ok(())
     }
@@ -390,9 +361,7 @@ impl DirectoryExecutionHost {
                     let metadata = read_metadata(&canonical)?;
                     // A create, fork or adopt behind its init fence is resumed by its lifecycle
                     // intent; generic recovery neither blesses nor reclaims it.
-                    if metadata.publication_state == PublicationState::PendingFence
-                        && !path_exists(&restore_recovery_fact_path(&canonical))?
-                    {
+                    if metadata.publication_state == PublicationState::PendingFence {
                         continue;
                     }
                     self.check_canonical_companion(project, &metadata, &canonical)?;
@@ -412,10 +381,6 @@ impl DirectoryExecutionHost {
                 };
                 if path_exists(&canonical)? {
                     self.check_canonical_companion(project, &metadata, &canonical)?;
-                    continue;
-                }
-                // A restore in flight owns this state; the restore pass decides it.
-                if path_exists(&restore_recovery_fact_path(&canonical))? {
                     continue;
                 }
                 // The payload is gone - a publication that died before it, or a retirement that
@@ -475,17 +440,6 @@ impl DirectoryExecutionHost {
             if read_metadata(&staged)? != metadata {
                 continue;
             }
-            let restore_undo = storage
-                .project()
-                .checkpoints
-                .join(metadata.workspace.as_str())
-                .join(format!(
-                    "{PRE_RESTORE_PREFIX}{}.{IMAGE_EXTENSION}",
-                    metadata.workspace_incarnation,
-                ));
-            if path_exists(&sidecar_path(&restore_undo))? {
-                continue;
-            }
             if path_exists(&staged)? {
                 // An unnamed staged pair is an orphan the GC sweep reclaims under its lock.
                 if path_exists(&companion_path(&staged))? {
@@ -507,309 +461,6 @@ impl DirectoryExecutionHost {
             }
         }
         Ok(())
-    }
-
-    /// Finish or roll back every restore an undo generation still records.
-    fn recover_restores(
-        &self,
-        config: &ApfsSubstrateConfig,
-        project: &Path,
-        workspaces: Option<&BTreeSet<WorkspaceName>>,
-        held_locks: &[PathBuf],
-    ) -> Result<(), ApfsStorageError> {
-        let mut undo_sidecars = Vec::new();
-        collect_restore_sidecars(project, workspaces, &mut undo_sidecars)?;
-        undo_sidecars.sort();
-        for undo_sidecar in undo_sidecars {
-            let undo = image_from_sidecar(&undo_sidecar)?;
-            if !is_image_path(&undo) {
-                continue;
-            }
-            let Some(replacement_incarnation) = undo
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.strip_prefix(PRE_RESTORE_PREFIX))
-                .filter(|stem| WorkspaceIncarnation::new(*stem).is_ok())
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            let old_metadata = read_metadata(&undo)?;
-            let storage = layout(config, &old_metadata.repo_id)?;
-            let expected_directory = storage
-                .project()
-                .checkpoints
-                .join(old_metadata.workspace.as_str());
-            if storage.project().project_root != project
-                || undo.parent() != Some(expected_directory.as_path())
-            {
-                continue;
-            }
-            let canonical = storage
-                .canonical_image(&old_metadata.workspace)?
-                .image()
-                .to_owned();
-            let Some(_guard) = self.recovery_lock(&canonical, held_locks)? else {
-                continue;
-            };
-            if read_metadata(&undo)? != old_metadata {
-                continue;
-            }
-            let staged = storage
-                .project()
-                .project_root
-                .join(STAGING_NAMESPACE)
-                .join(format!(
-                    "{}-{replacement_incarnation}.{IMAGE_EXTENSION}",
-                    old_metadata.workspace.as_str(),
-                ));
-            self.recover_restore(
-                config,
-                &old_metadata,
-                &replacement_incarnation,
-                &canonical,
-                &staged,
-                &undo,
-                &undo_sidecar,
-            )?;
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn recover_restore(
-        &self,
-        config: &ApfsSubstrateConfig,
-        old_metadata: &DetachedWorkspaceMetadata,
-        replacement_incarnation: &str,
-        canonical: &Path,
-        staged: &Path,
-        undo: &Path,
-        undo_sidecar: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        let mismatch = |message: String| Err(ApfsStorageError::MarkerMismatch(message));
-        let recovery_fact_path = restore_recovery_fact_path(canonical);
-        if !path_exists(canonical)? {
-            if !path_exists(staged)? && !path_exists(&recovery_fact_path)? {
-                return Ok(());
-            }
-            return mismatch(format!(
-                "restore recovery has no canonical payload: canonical={}, staged={}, fact={}, undo_sidecar={}",
-                canonical.display(),
-                staged.display(),
-                recovery_fact_path.display(),
-                undo_sidecar.display()
-            ));
-        }
-        let canonical_sidecar = sidecar_path(canonical);
-        if path_exists(&recovery_fact_path)? {
-            let fact: RestoreRecoveryFactWire =
-                crate::metadata::read_json(&recovery_fact_path).map_err(host_error)?;
-            if fact.destination_incarnation.as_str() != replacement_incarnation {
-                return Ok(());
-            }
-            if fact.version != RESTORE_RECOVERY_FACT_VERSION
-                || fact.repo_id != old_metadata.repo_id
-                || fact.workspace != old_metadata.workspace
-                || fact.replaced_incarnation != old_metadata.workspace_incarnation
-                || fact.replaced_incarnation == fact.destination_incarnation
-                || fact.source_incarnation == fact.destination_incarnation
-            {
-                return mismatch(format!(
-                    "restore recovery fact disagrees with selected undo generation: fact={}, undo_sidecar={}",
-                    recovery_fact_path.display(),
-                    undo_sidecar.display()
-                ));
-            }
-            validate_restore_recovery_lineage(config, &fact)?;
-        } else if !path_exists(staged)?
-            && path_exists(&canonical_sidecar)?
-            && read_metadata(canonical)?.workspace_incarnation != old_metadata.workspace_incarnation
-        {
-            return Ok(());
-        }
-        // Recovery renames and exchanges these payloads, and a rename moves a mount record, not
-        // the payload it names: every one present comes home first, as the executor unmounts
-        // before its own exchanges. The published canonical is left mounted; nothing below moves
-        // it.
-        for payload in [staged, undo] {
-            if path_exists(payload)? {
-                super::release_mount(payload, cowshed_apfs::DetachIntent::Release)?;
-            }
-        }
-        let canonical_companion =
-            self.recovery_companion(canonical, "restore recovery canonical payload")?;
-        let undo_companion = self.recovery_companion(undo, "restore recovery undo metadata")?;
-        let staged_companion = companion_path(staged);
-        let canonical_metadata = if path_exists(&canonical_sidecar)? {
-            Some(read_metadata(canonical)?)
-        } else {
-            None
-        };
-        let published = canonical_metadata.as_ref().is_some_and(|metadata| {
-            metadata.workspace_incarnation.as_str() == replacement_incarnation
-        });
-        if published {
-            if Self::companions_match(&canonical_companion, &undo_companion)? {
-                return mismatch(format!(
-                    "published restore pairs replacement payload with old CA key: canonical={}, canonical_companion={}, undo_companion={}",
-                    canonical.display(),
-                    canonical_companion.display(),
-                    undo_companion.display()
-                ));
-            }
-            if path_exists(undo)? {
-                if path_exists(staged)? {
-                    self.delete_payload(staged)?;
-                }
-            } else if path_exists(staged)? {
-                let displaced =
-                    self.recovery_companion(staged, "restore displaced staged payload")?;
-                if !Self::companions_match(&displaced, &undo_companion)? {
-                    return mismatch(format!(
-                        "displaced restore payload has the wrong CA key: staged={}, staged_companion={}, undo_companion={}",
-                        staged.display(),
-                        displaced.display(),
-                        undo_companion.display()
-                    ));
-                }
-                fs::rename(staged, undo)
-                    .map_err(|error| io_error("complete restore undo rename", undo, error))?;
-            } else {
-                return mismatch(format!(
-                    "published restore is missing its old payload: canonical={}, undo={}, staged={}",
-                    canonical.display(),
-                    undo.display(),
-                    staged.display()
-                ));
-            }
-            Self::remove_sidecar(staged)?;
-            Self::remove_companion(staged)?;
-            return sync_parent_path(canonical);
-        }
-        if canonical_metadata.as_ref().is_some_and(|metadata| {
-            metadata.workspace_incarnation != old_metadata.workspace_incarnation
-        }) {
-            return mismatch(format!(
-                "restore metadata matches neither generation: canonical={}, undo_sidecar={}, staged={}",
-                canonical.display(),
-                undo_sidecar.display(),
-                staged.display()
-            ));
-        }
-        super::release_mount(canonical, cowshed_apfs::DetachIntent::Release)?;
-        let incarnation = Self::payload_incarnation(canonical)?;
-        let canonical_is_replacement = if incarnation == replacement_incarnation {
-            true
-        } else if incarnation == old_metadata.workspace_incarnation.as_str() {
-            false
-        } else {
-            return mismatch(format!(
-                "restore marker matches neither generation: canonical={}, marker={incarnation}, old={}, replacement={replacement_incarnation}",
-                canonical.display(),
-                old_metadata.workspace_incarnation,
-            ));
-        };
-        let canonical_has_old_key = Self::companions_match(&canonical_companion, &undo_companion)?;
-        let link_old_key = |label: &'static str| -> Result<(), ApfsStorageError> {
-            if !path_exists(&staged_companion)? {
-                fs::hard_link(&undo_companion, &staged_companion).map_err(|error| {
-                    io_error("stage retained old CA key", &staged_companion, error)
-                })?;
-            }
-            let staged_key = self.recovery_companion(staged, label)?;
-            if Self::companions_match(&staged_key, &undo_companion)? {
-                Ok(())
-            } else {
-                Err(ApfsStorageError::MarkerMismatch(format!(
-                    "restore cannot identify old CA key: canonical_companion={}, staged_companion={}, undo_companion={}",
-                    canonical_companion.display(),
-                    staged_key.display(),
-                    undo_companion.display()
-                )))
-            }
-        };
-        if canonical_is_replacement {
-            if path_exists(undo)? {
-                if path_exists(staged)? {
-                    return mismatch(format!(
-                        "restore has both staged and undo old payloads: staged={}, undo={}",
-                        staged.display(),
-                        undo.display()
-                    ));
-                }
-                fs::rename(undo, staged)
-                    .map_err(|error| io_error("stage interrupted restore undo", staged, error))?;
-            } else if !path_exists(staged)? {
-                return mismatch(format!(
-                    "restore cannot roll back without old payload: canonical={}, staged={}, undo={}",
-                    canonical.display(),
-                    staged.display(),
-                    undo.display()
-                ));
-            }
-            if canonical_has_old_key {
-                let staged_key =
-                    self.recovery_companion(staged, "restore replacement staged payload")?;
-                if Self::companions_match(&staged_key, &undo_companion)? {
-                    return mismatch(format!(
-                        "restore lost replacement CA key: canonical_companion={}, staged_companion={}, undo_companion={}",
-                        canonical_companion.display(),
-                        staged_key.display(),
-                        undo_companion.display()
-                    ));
-                }
-                swap_paths(canonical, staged)?;
-            } else {
-                link_old_key("restore displaced staged payload")?;
-                swap_paths(canonical, staged)?;
-                swap_paths(&canonical_companion, &staged_companion)?;
-            }
-        } else {
-            if path_exists(undo)? {
-                return mismatch(format!(
-                    "old canonical restore layout still has undo payload: canonical={}, undo={}",
-                    canonical.display(),
-                    undo.display()
-                ));
-            }
-            if !canonical_has_old_key {
-                link_old_key("restore old staged CA key")?;
-                swap_paths(&canonical_companion, &staged_companion)?;
-            } else if path_exists(staged)? {
-                let staged_key =
-                    self.recovery_companion(staged, "restore replacement staged payload")?;
-                if Self::companions_match(&staged_key, &undo_companion)? {
-                    return mismatch(format!(
-                        "old and replacement payloads share old CA key: canonical={}, staged={}, undo_companion={}",
-                        canonical.display(),
-                        staged.display(),
-                        undo_companion.display()
-                    ));
-                }
-            }
-        }
-        if path_exists(staged)? {
-            self.delete_payload(staged)?;
-        }
-        Self::remove_sidecar(staged)?;
-        Self::remove_companion(staged)?;
-        if path_exists(&canonical_sidecar)? {
-            fs::remove_file(undo_sidecar).map_err(|error| {
-                io_error("remove redundant restore metadata", undo_sidecar, error)
-            })?;
-        } else {
-            fs::rename(undo_sidecar, &canonical_sidecar).map_err(|error| {
-                io_error(
-                    "restore interrupted canonical metadata",
-                    &canonical_sidecar,
-                    error,
-                )
-            })?;
-        }
-        fs::remove_file(&undo_companion)
-            .map_err(|error| io_error("remove redundant restore CA key", &undo_companion, error))?;
-        sync_parent_path(canonical)
     }
 
     pub(super) fn reclaim_retired_record(
@@ -915,93 +566,6 @@ impl DirectoryExecutionHost {
         })
     }
 
-    /// The checkpoint payloads and records of a retired name, every one accounted for: an
-    /// artifact the retirement cannot name refuses the reclaim rather than being deleted.
-    fn retired_checkpoint_artifacts(
-        project: &Path,
-        retired: &RetiredRef,
-    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), ApfsStorageError> {
-        let directory = project
-            .join(CHECKPOINTS_DIRECTORY)
-            .join(retired.workspace().name().as_str());
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries
-                .map(|entry| {
-                    entry.map(|entry| entry.path()).map_err(|error| {
-                        io_error("read retired checkpoint entry", &directory, error)
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), Vec::new()));
-            }
-            Err(error) => {
-                return Err(io_error("enumerate retired checkpoints", &directory, error));
-            }
-        };
-        let mut images = BTreeSet::new();
-        for path in &entries {
-            if is_image_path(path) {
-                images.insert(path.clone());
-            } else if is_grants_sidecar(path) {
-                let image = image_from_sidecar(path)?;
-                if is_image_path(&image) {
-                    images.insert(image);
-                }
-            }
-        }
-        let images = images.into_iter().collect::<Vec<_>>();
-        let mut expected = BTreeSet::new();
-        let mut labels = BTreeSet::new();
-        for image in &images {
-            let metadata = read_metadata(image)?;
-            if metadata.repo_id != *retired.workspace().repo()
-                || metadata.workspace != *retired.workspace().name()
-                || metadata.publication_state != PublicationState::Active
-            {
-                return Err(ApfsStorageError::MarkerMismatch(format!(
-                    "retired checkpoint metadata disagrees with {}",
-                    image.display()
-                )));
-            }
-            let stem = Self::checkpoint_label(image)?;
-            if let Some(destination) = stem.strip_prefix(PRE_RESTORE_PREFIX) {
-                WorkspaceIncarnation::new(destination).map_err(host_error)?;
-            } else {
-                let label = CheckpointLabel::new(stem).map_err(host_error)?;
-                if !labels.insert(label.clone()) {
-                    return Err(ApfsStorageError::Host(format!(
-                        "duplicate retired checkpoint label {label}"
-                    )));
-                }
-                let fact_path = checkpoint_fact_path(image);
-                match crate::metadata::read_json::<CheckpointFactWire>(&fact_path) {
-                    Ok(fact)
-                        if fact.version == CHECKPOINT_FACT_VERSION
-                            && fact.repo_id == *retired.workspace().repo()
-                            && fact.workspace == *retired.workspace().name()
-                            && fact.label == label => {}
-                    Ok(_) => {
-                        return Err(ApfsStorageError::Host(format!(
-                            "checkpoint fact does not match retired payload path: {}",
-                            fact_path.display()
-                        )));
-                    }
-                    Err(_) if !path_exists(image)? && !path_exists(&fact_path)? => {}
-                    Err(error) => return Err(host_error(error)),
-                }
-            }
-            expected.extend(payload_gc_paths(image));
-        }
-        if let Some(unrecognized) = entries.iter().find(|path| !expected.contains(*path)) {
-            return Err(ApfsStorageError::Host(format!(
-                "unrecognized retired checkpoint artifact: {}",
-                unrecognized.display()
-            )));
-        }
-        Ok((images, expected.into_iter().collect()))
-    }
-
     /// The mountpoint a retirement may remove: an empty directory. Anything a late writer left
     /// there is named, never deleted.
     fn retired_mount_point(
@@ -1028,20 +592,15 @@ impl DirectoryExecutionHost {
 
     fn retired_cleanup(
         &self,
-        project: &Path,
         retired: &RetiredRef,
         trash_image: &Path,
         scope: NameScope,
     ) -> Result<RetiredCleanup, ApfsStorageError> {
         let mut cleanup = RetiredCleanup {
-            checkpoint_images: Vec::new(),
             paths: Vec::new(),
             mount_point: None,
         };
         if scope == NameScope::Owned {
-            let (images, paths) = Self::retired_checkpoint_artifacts(project, retired)?;
-            cleanup.checkpoint_images = images;
-            cleanup.paths = paths;
             cleanup.mount_point = self.retired_mount_point(retired)?;
         }
         cleanup.paths.extend(payload_gc_paths(trash_image));
@@ -1129,7 +688,7 @@ impl DirectoryExecutionHost {
     }
 
     /// Disposable environment only; the caller has already proved this retirement owns
-    /// the name. Source payloads, checkpoints and their records remain separate custody.
+    /// the name. Source payloads and their records remain separate custody.
     fn reclaim_exec_temp(
         project: &Path,
         authority: &RetiredRef,
@@ -1177,10 +736,7 @@ impl DirectoryExecutionHost {
         trash_image: &Path,
         scope: NameScope,
     ) -> Result<(), ApfsStorageError> {
-        let cleanup = self.retired_cleanup(project, authority, trash_image, scope)?;
-        for image in &cleanup.checkpoint_images {
-            self.reclaim_image(image)?;
-        }
+        let cleanup = self.retired_cleanup(authority, trash_image, scope)?;
         let name = authority.workspace().name().as_str();
         let log = |artifact: &Path| {
             deletion_log::log_deletion(
@@ -1193,21 +749,6 @@ impl DirectoryExecutionHost {
             );
         };
         if scope == NameScope::Owned {
-            let checkpoint_directory = project.join(CHECKPOINTS_DIRECTORY).join(name);
-            match fs::remove_dir(&checkpoint_directory) {
-                Ok(()) => {
-                    log(&checkpoint_directory);
-                    sync_parent_path(&checkpoint_directory)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(io_error(
-                        "remove retired checkpoint directory",
-                        &checkpoint_directory,
-                        error,
-                    ));
-                }
-            }
             Self::reclaim_exec_temp(project, authority, trash_image)?;
         }
         if let Some(mount_point) = cleanup.mount_point {
@@ -1280,7 +821,7 @@ impl DirectoryExecutionHost {
             };
             let scope =
                 self.retired_name_scope(&retired, owners.get(retired.workspace().name()))?;
-            let cleanup = self.retired_cleanup(project, &retired, &path, scope)?;
+            let cleanup = self.retired_cleanup(&retired, &path, scope)?;
             if path_exists(&path)? {
                 // Recovery payloads are not garbage; abandon-bundle authority is not
                 // authority to destroy uncommitted or ignored source content.
@@ -1349,7 +890,7 @@ impl DirectoryExecutionHost {
             )?);
         }
 
-        // Staging payloads and records no operation, restore or recovery still names.
+        // Staging payloads and records no operation or recovery still names.
         let storage = layout(&self.config, repo)?;
         let staging = project.join(STAGING_NAMESPACE);
         let recoverable = Self::recoverable_staged_stems(project)?;
@@ -1375,18 +916,6 @@ impl DirectoryExecutionHost {
             };
             if recoverable.contains(stem) {
                 continue;
-            }
-            if let Some((_, incarnation)) = stem.rsplit_once('-') {
-                let undo = storage
-                    .project()
-                    .checkpoints
-                    .join(workspace.as_str())
-                    .join(format!(
-                        "{PRE_RESTORE_PREFIX}{incarnation}.{IMAGE_EXTENSION}"
-                    ));
-                if path_exists(&sidecar_path(&undo))? {
-                    continue;
-                }
             }
             let lock = workspace_lock_path(&self.config, repo, &workspace)?;
             if !self.lock_is_free(&lock, held_locks)? {
@@ -1434,73 +963,6 @@ impl DirectoryExecutionHost {
                 std::slice::from_ref(&mount_point),
                 &[],
             )?);
-        }
-
-        // Checkpoints: pinned and recent ones stay; the rest expire. A checkpoint's age is its
-        // fact's, written once when it was published: a payload directory's own time is its
-        // source's, which the clone carried over.
-        for workspace_directory in directory_children(&storage.project().checkpoints)? {
-            let Some(workspace_name) = workspace_directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| WorkspaceName::new(name).ok())
-            else {
-                continue;
-            };
-            if owners.get(&workspace_name).is_some()
-                && !path_exists(storage.canonical_image(&workspace_name)?.image())?
-            {
-                continue;
-            }
-            let mut checkpoints = Vec::new();
-            for image in Self::checkpoint_payloads(&workspace_directory)? {
-                lock_paths.push(workspace_lock_path(&self.config, repo, &workspace_name)?);
-                let fact_path = checkpoint_fact_path(&image);
-                let fact_metadata = match fs::metadata(&fact_path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(io_error("read checkpoint age", &fact_path, error)),
-                };
-                let fact: CheckpointFactWire =
-                    crate::metadata::read_json(&fact_path).map_err(host_error)?;
-                if fact.version != CHECKPOINT_FACT_VERSION
-                    || fact.repo_id != *repo
-                    || fact.workspace != workspace_name
-                    || fact.label.as_str() != Self::checkpoint_label(&image)?
-                {
-                    return Err(ApfsStorageError::Host(format!(
-                        "checkpoint fact does not match payload path: {}",
-                        fact_path.display()
-                    )));
-                }
-                let modified = fact_metadata
-                    .modified()
-                    .map_err(|error| io_error("read checkpoint age", &fact_path, error))?;
-                checkpoints.push((modified, image, fact));
-            }
-            checkpoints
-                .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-            for (index, (modified, image, fact)) in checkpoints.into_iter().enumerate() {
-                checked_increment(&mut examined)?;
-                if fact.pin == CheckpointPinWire::Pinned {
-                    checked_increment(&mut retained.pinned)?;
-                    continue;
-                }
-                let young = observed_at.duration_since(modified).map_or(true, |age| {
-                    age < std::time::Duration::from_secs(14 * 24 * 60 * 60)
-                });
-                if index < 5 || young {
-                    checked_increment(&mut retained.recent)?;
-                    continue;
-                }
-                let identity = serde_json::to_vec(&fact).map_err(host_error)?;
-                candidates.push(gc_candidate(
-                    StorageGcReason::ExpiredCheckpoint,
-                    &image,
-                    &payload_gc_paths(&image),
-                    &identity,
-                )?);
-            }
         }
 
         candidates.sort_by(|left, right| {
@@ -1553,8 +1015,6 @@ impl DirectoryExecutionHost {
         }
         let mut report = StorageGcReport {
             examined: plan.examined(),
-            retained_pinned: plan.retained_pinned(),
-            retained_recent: plan.retained_recent(),
             retained_active: plan.retained_active(),
             ..StorageGcReport::default()
         };
@@ -1568,9 +1028,9 @@ impl DirectoryExecutionHost {
                     None,
                     Some(&mut owners),
                 ),
-                StorageGcReason::OrphanSessionImage
-                | StorageGcReason::OrphanStagingImage
-                | StorageGcReason::ExpiredCheckpoint => self.reclaim_image(path),
+                StorageGcReason::OrphanSessionImage | StorageGcReason::OrphanStagingImage => {
+                    self.reclaim_image(path)
+                }
                 StorageGcReason::OrphanStagingMetadata => fs::remove_file(path)
                     .map_err(|error| io_error("remove orphan staging metadata", path, error))
                     .and_then(|()| {

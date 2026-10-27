@@ -515,14 +515,13 @@ Notes:
   propose an identity but never silently mint one. For that identity cowshed computes the canonical-path union of (1)
   built-in secret and control-plane denies and (2) additional denies declared by the repository. Repository-controlled
   config may add denies but cannot remove, replace, mask, or carve back the built-in layer. The trusted project policy
-  `/private/cowshed/store/<owner>/<repo>/policy.json` carries no host-path denies: it holds the project's checkpoint
-  quotas, standing read/egress grants and workspace-relative write denies
-  ([Project-standing grants](#project-standing-grants)). Its path is constructed as
-  `/private/cowshed/store/<owner>/<repo>/policy.json`: `owner` and `repo` are separately lowercased and validated as
-  non-empty `[a-z0-9._-]+` segments; `.`, `..`, separators, percent-encoded separators, and decoded aliases are rejected
-  before any join. The policy is read by the controller, never through a repository-relative path. Missing policy is the
-  empty policy; a malformed or unreadable one, or one with a field cowshed does not know, fails closed before supervisor
-  launch and serves no gateway session of the project.
+  `/private/cowshed/store/<owner>/<repo>/policy.json` carries no host-path denies: it holds the project's standing
+  read/egress grants and workspace-relative write denies ([Project-standing grants](#project-standing-grants)). Its path
+  is constructed as `/private/cowshed/store/<owner>/<repo>/policy.json`: `owner` and `repo` are separately lowercased
+  and validated as non-empty `[a-z0-9._-]+` segments; `.`, `..`, separators, percent-encoded separators, and decoded
+  aliases are rejected before any join. The policy is read by the controller, never through a repository-relative path.
+  Missing policy is the empty policy; a malformed or unreadable one, or one with a field cowshed does not know, fails
+  closed before supervisor launch and serves no gateway session of the project.
 
 ## Process inspection
 
@@ -634,9 +633,9 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   repository deny narrows old grants without rewriting them.
 - `denyWrite` and `deny` are workspace-relative. They are kept in the controller-owned grant snapshot, and a project
   policy can add denies to every workspace without giving workspace jobs authority over that policy.
-- `workspaceIncarnation` is public detached identity, not authority or a credential. Create/fork/restore mint it as
-  specified in 01/02; job records retain the incarnation that produced them so numeric job IDs remain unambiguous across
-  copied or discarded timelines.
+- `workspaceIncarnation` is public detached identity, not authority or a credential. Create/fork mint it as specified in
+  01/02; job records retain the incarnation that produced them so numeric job IDs remain unambiguous across copied or
+  discarded timelines.
 - `revision` increments on every effective grant change; execs and the gateway log the revision they enforced, making
   audit trails reconstructible.
 - Egress entries contain a host, an optional port list (default 443/80), and an optional `mode: "intercept" | "opaque"`
@@ -682,18 +681,18 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   `.cowshed/env` (a detached one gets it at its next attach). A newer claim another record carries — an intent, a
   pending fence, a sidecar outside the inventory — is not doctor's to rewrite: the finding names that record, which
   changes when its operation finishes or is retired. A pending clone whose fenced grant collides is refused before it is
-  activated. It is allocated at fork (adopt, for main), preserved across restore, never inherited by a fork, and omitted
-  on Linux. Linux records no synthetic port alias; its per-workspace Unix gateway socket and private loopback namespace
-  are runtime topology, not grant authority. Unpublished allocations claim every initial-size 64-port grid cell they
-  touch, even when a legacy 16-port block grows into an upper-half 32-port block. Cell claims and newly owned kernel
-  listeners stay held through the authoritative inventory re-read and durable grant publication. A block is held for the
-  workspace's whole life, attached or detached: detach closes the gateway listener on `base` but releases no port, and
-  only retirement frees the block and its retained blocks. With one initial-size block per workspace, capacity is
-  `floor(R / S)`, where R is the configured reserved range's port count and S the initial block size. Mixed-size and
-  retained blocks consume their actual port footprint; admission requires a free aligned block, never a fixed
-  workspace-count ceiling. The range ends just below the macOS ephemeral range (`net.inet.ip.portrange.first`, 49152),
-  so no outbound connection's local port falls inside a block. Port blocks already allocated in the earlier range
-  starting at 40960 remain valid; that former range is not a host workspace limit.
+  activated. It is allocated at fork (adopt, for main), never inherited by a fork, and omitted on Linux. Linux records
+  no synthetic port alias; its per-workspace Unix gateway socket and private loopback namespace are runtime topology,
+  not grant authority. Unpublished allocations claim every initial-size 64-port grid cell they touch, even when a legacy
+  16-port block grows into an upper-half 32-port block. Cell claims and newly owned kernel listeners stay held through
+  the authoritative inventory re-read and durable grant publication. A block is held for the workspace's whole life,
+  attached or detached: detach closes the gateway listener on `base` but releases no port, and only retirement frees the
+  block and its retained blocks. With one initial-size block per workspace, capacity is `floor(R / S)`, where R is the
+  configured reserved range's port count and S the initial block size. Mixed-size and retained blocks consume their
+  actual port footprint; admission requires a free aligned block, never a fixed workspace-count ceiling. The range ends
+  just below the macOS ephemeral range (`net.inet.ip.portrange.first`, 49152), so no outbound connection's local port
+  falls inside a block. Port blocks already allocated in the earlier range starting at 40960 remain valid; that former
+  range is not a host workspace limit.
 - **Port capacity grows only by grant.** `GrantDelta.service_ports = N` (`cowshed grant <ws> --ports <N>`) requires the
   block to hold at least N service ports, the gateway port excluded: the target size is the smallest power of two of at
   least N+1. Growth is monotone — a count the current block already holds leaves the block, the revision, and the
@@ -720,12 +719,11 @@ Controller-owned, host-readable while the image is detached, outside the workspa
 ### Project-standing grants
 
 A project's standing policy combines read paths, egress hosts and workspace-relative write and read+write denies for
-every workspace — main, new workspaces and forks. It lives in the trusted project policy, beside its checkpoint quotas;
-a workspace grant delta cannot remove a project deny.
+every workspace — main, new workspaces and forks. It lives in the trusted project policy; a workspace grant delta cannot
+remove a project deny.
 
 ```json
 {
-  "checkpointQuotas": { "raven": { "maxCount": 4, "maxBytes": 10737418240 } },
   "grants": {
     "revision": 3,
     "read": ["<home>/Dev/acme/shared-fixtures"],
@@ -807,12 +805,12 @@ Rust API: `Coordinator::grant(ws, delta)` / `Coordinator::revoke(ws, delta)` and
 egress only as the task proves the need.
 
 Revoke requires selectors or `--all`, never both. `--all` removes the selected authority's own grant vectors under the
-observed revision's CAS; it preserves workspace port ownership and project checkpoint quotas. Revoking a workspace's own
-rule cannot remove standing project policy. Egress revoke matches by host regardless of mode or ports. A valid host
-selector uses the shared canonical grammar; an invalid recorded key is also accepted **verbatim** for repair, without
-interpreting an authority as a host or widening any grant. Removing one invalid key must succeed even when other invalid
-keys remain, so the operator can repair them individually. Grant/revoke do not require a gateway policy reconcile before
-mutation. Exec continues to fail closed until all invalid keys in the reconciled snapshot have been removed.
+observed revision's CAS; it preserves workspace port ownership. Revoking a workspace's own rule cannot remove standing
+project policy. Egress revoke matches by host regardless of mode or ports. A valid host selector uses the shared
+canonical grammar; an invalid recorded key is also accepted **verbatim** for repair, without interpreting an authority
+as a host or widening any grant. Removing one invalid key must succeed even when other invalid keys remain, so the
+operator can repair them individually. Grant/revoke do not require a gateway policy reconcile before mutation. Exec
+continues to fail closed until all invalid keys in the reconciled snapshot have been removed.
 
 Propagation:
 
@@ -889,10 +887,9 @@ These anchors are trust configuration, not secrets, so they are exported/written
 2. Snapshot grants; validate cwd against policy; refuse commands whose cwd escapes the mount in rw mode. Ensure the
    served revision follows [11_shell.md, Grant-change propagation](11_shell.md#grant-change-propagation) before
    admitting the exec.
-3. Allocate the next workspace-local monotonic numeric job ID, append a complete
-   `ProtectedRecord::Job(JobArtifactRecord)` admission batch, and record the audit
-   `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted supervisor opens the
-   protected record stream; the audit record is telemetry and gates nothing.
+3. Allocate the next workspace-local monotonic numeric job ID, append a complete `JobArtifactRecord` admission batch,
+   and record the audit `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted
+   supervisor opens the protected record stream; the audit record is telemetry and gates nothing.
 4. Compile the child profile before starting shell activation. Every `sandbox-exec` launch reads its profile from a
    file, `sandbox-exec -f <store>/run/profiles/<sha256>.sb`, never from an argument: a profile passes the 128 KiB a
    command argument may hold, and a job's process observation reads the launch argv back. The profile text is a pure
@@ -919,8 +916,8 @@ These anchors are trust configuration, not secrets, so they are exported/written
    the configured workspace ceiling is read-only; a read-write request cannot widen a read-only ceiling.
 5. Read stdout and stderr as separate opaque byte streams, incrementally hash and quota-account them, and begin in
    bounded memory. Terminal streams at or below the inline limit are stored as Arrow Binary in a complete protected
-   batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a checkpoint/live
-   replay requirement forces promotion; promotion writes the complete buffered prefix before appending. AST-proven shell
+   batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a live replay
+   requirement forces promotion; promotion writes the complete buffered prefix before appending. AST-proven shell
    redirection is authoritative only when the supervisor controls the actual writable descriptor and applies the same
    exact quota boundary; polling/tailing a path is forbidden. Explicit post-terminal publication and protected redirect
    snapshots use independent clone/reflink/copy artifacts, never hardlinks (11_shell.md). Drain, fsync, seal, and
@@ -1024,13 +1021,13 @@ directory, `<store>/<owner>/<repo>/tmp/<workspace>` (01_storage.md). Both are pr
 the supervisor starts — an `exec`, a named session's command, a land check. The temporary directory lies outside every
 checkout, because a tool may need scratch space outside the project it builds (a transform whose scratch directory must
 not sit under the project root), and outside the image, so a clone starts with an empty one and never copies another
-workspace's scratch. It is keyed by the workspace's name like its checkpoints, survives a restore, and goes when the
-retired image is reclaimed (`rm`, or `gc` for a retirement a crash stranded). The child may write these scoped
-directories, but the baseline still denies writes to the world-shared `/private/tmp`, apart from the fixture roots of
-[Fixture roots under /tmp](#fixture-roots-under-tmp), and to the host user's own temporary directory under
-`/private/var/folders`; shell activation does not require a blanket temporary-directory grant. A process that reaches a
-temporary directory by any other route than `TMPDIR` finds none it can write: `xcrun`, for one, then fails to create its
-cache, prints its `mkstemp` path, and resolves every lookup the slow way.
+workspace's scratch. It is keyed by the workspace's name and goes when the retired image is reclaimed (`rm`, or `gc` for
+a retirement a crash stranded). The child may write these scoped directories, but the baseline still denies writes to
+the world-shared `/private/tmp`, apart from the fixture roots of [Fixture roots under /tmp](#fixture-roots-under-tmp),
+and to the host user's own temporary directory under `/private/var/folders`; shell activation does not require a blanket
+temporary-directory grant. A process that reaches a temporary directory by any other route than `TMPDIR` finds none it
+can write: `xcrun`, for one, then fails to create its cache, prints its `mkstemp` path, and resolves every lookup the
+slow way.
 
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
@@ -1408,8 +1405,8 @@ the gateway, and the same exit code 6 on a grant that intersects the deny set.
   Linux workspace identity, and every request must still pass endpoint selection and `Proxy-Authorization` token checks
   at the gateway (05_gateway.md). Private loopback lets workspaces reuse service ports without collisions or sibling
   reachability. No veth, DNAT, host listener, shared data port, or `portBlock` is allocated on Linux. Attach creates the
-  socket/netns/connector before exec admission; detach and restore stop admissions, drain connector connections with the
-  supervisor, kill the connector cgroup, and unlink the socket before releasing or replacing the namespace.
+  socket/netns/connector before exec admission; detach stops admissions, drain connector connections with the
+  supervisor, kill the connector cgroup, and unlink the socket before releasing the namespace.
 
 - **direnv/devenv, secrets scanner, marker/token handling**: unchanged — they are substrate- and OS-independent pure
   logic plus the daemon-socket Nix access described above.

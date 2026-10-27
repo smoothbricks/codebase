@@ -178,15 +178,6 @@ pub const PARITY: &[Row] = &[
     row("mv", "dst", field(&[("coordinator.rename", "destination"), ("coordinator.moveCheckout", "destination")], &[argument("Coordinator.rename", 1, ""), argument("Coordinator.moveCheckout", 0, "")])),
     row("mv", "repo-id", field(&[("coordinator.changeRepoId", "newRepoId")], &[argument("Coordinator.changeRepoId", 0, "")])),
 
-    row("checkpoint", "", field(&[("worker.checkpoint", "")], &[member("WorkspaceHandle.checkpoint")])),
-    row("checkpoint", "workspace", field(&[("coordinator.worker", "workspace")], &[argument("Coordinator.worker", 0, "")])),
-    row("checkpoint", "label", field(&[("worker.checkpoint", "options.label")], &[argument("WorkspaceHandle.checkpoint", 0, "label")])),
-    row("checkpoint", "keep", field(&[("worker.checkpoint", "options.keep")], &[argument("WorkspaceHandle.checkpoint", 0, "keep")])),
-
-    row("restore", "", field(&[("coordinator.restore", "")], &[member("Coordinator.restore")])),
-    row("restore", "workspace", field(&[("coordinator.restore", "workspace")], &[argument("Coordinator.restore", 0, "")])),
-    row("restore", "label", field(&[("coordinator.restore", "label")], &[argument("Coordinator.restore", 1, "")])),
-
     row("ls", "", field(&[("project.list", "")], &[member("Project.listWorkspaces")])),
     row("ls", "all", field(&[("host.listProjects", "")], &[member("Host.listProjects")])),
     row("ls", "landing", field(&[("project.list", "landing"), ("host.listProjects", "landing")], &[argument("Project.listWorkspaces", 0, "landing"), argument("Host.listProjects", 0, "landing")])),
@@ -272,10 +263,6 @@ pub const PARITY: &[Row] = &[
     row("defrag", "", field(&[("coordinator.defragment", "")], &[member("Coordinator.defragment")])),
     row("defrag", "workspace", field(&[("coordinator.defragment", "workspace")], &[argument("Coordinator.defragment", 0, "")])),
 
-    row("reseed", "", field(&[("coordinator.reseed", "")], &[member("Coordinator.reseed")])),
-    row("reseed", "workspace", field(&[("coordinator.reseed", "workspace")], &[argument("Coordinator.reseed", 0, "")])),
-    row("reseed", "from", field(&[("coordinator.reseed", "from")], &[argument("Coordinator.reseed", 1, "")])),
-    row("reseed", "dry-run", field(&[("coordinator.reseed", "dryRun")], &[argument("Coordinator.reseed", 2, "")])),
 
     row("rekey", "", field(&[("coordinator.rekey", "")], &[member("Coordinator.rekey")])),
     row("rekey", "workspace", field(&[("coordinator.rekey", "workspace")], &[argument("Coordinator.rekey", 0, "")])),

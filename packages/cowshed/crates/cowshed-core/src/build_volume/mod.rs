@@ -1231,8 +1231,8 @@ impl BuildVolumeLayout {
     /// The volume `checkout`'s build link should name, given that it names `linked`
     /// (16_build_volumes.md, "One link per checkout"). The link is kept when its volume is
     /// recorded as `checkout`'s, published or still registered (a first touch the link already
-    /// names, which the next refresh finishes). Otherwise the link is stale: a restored checkpoint carries
-    /// the link it had when taken, and an interrupted land can leave a target naming the
+    /// names, which the next refresh finishes). Otherwise the link is stale: an interrupted land
+    /// can leave a target naming the
     /// landing volume before its record moved. It is then re-pointed at the one volume recorded
     /// as `checkout`'s. When `checkout` owns none and `linked` is another checkout's live
     /// volume, a target adopted it from this checkout before a `land --no-retire` reforked it:
@@ -2053,8 +2053,8 @@ mod tests {
         assert!(error.message.contains("target/sub"), "{error:?}");
     }
 
-    /// A restored checkpoint, or a land interrupted between moving a target's link and its
-    /// records, leaves a link naming a volume the checkout does not own: mounting re-points it at
+    /// A land interrupted between moving a target's link and its records leaves a link naming a
+    /// volume the checkout does not own: mounting re-points it at
     /// the checkout's own volume, and refuses when there is none to point at.
     #[test]
     fn a_stale_build_link_is_repointed_at_the_checkouts_own_volume() {

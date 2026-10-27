@@ -9,7 +9,7 @@ pub use crate::metadata::{
 use crate::project_retirement::ProjectRetirementReport;
 use crate::repository::{BoundIdentity, RepoId};
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
-use crate::storage::lifecycle::{DerivedWorkspace, MountRefusal, MountState, Pin as LifecyclePin};
+use crate::storage::lifecycle::{DerivedWorkspace, MountRefusal, MountState};
 use base64::Engine;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -794,14 +794,6 @@ pub enum WorkspaceState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckpointInfo {
-    pub label: String,
-    pub revision: u64,
-    pub pinned: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceInfo {
     pub repo_id: RepoId,
     pub workspace: WorkspaceName,
@@ -815,7 +807,6 @@ pub struct WorkspaceInfo {
     pub base_commit: Option<GitOid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<UtcTimestamp>,
-    pub checkpoints: Vec<CheckpointInfo>,
     pub snapshot_stale: bool,
     /// Filled in only for a caller that asked to pay for the measurement (`project.list` with a
     /// landing selection); absent everywhere else, so `default` is what keeps decoding those honest.
@@ -866,15 +857,6 @@ impl WorkspaceInfo {
             branch: snapshot.branch.clone(),
             base_commit,
             created_at,
-            checkpoints: derived
-                .checkpoints
-                .iter()
-                .map(|checkpoint| CheckpointInfo {
-                    label: checkpoint.label.to_string(),
-                    revision: checkpoint.revision.get(),
-                    pinned: checkpoint.pin == LifecyclePin::Pinned,
-                })
-                .collect(),
             snapshot_stale: snapshot.stale,
             landing: None,
         })
@@ -1160,12 +1142,6 @@ pub struct MountResult {
 #[serde(deny_unknown_fields)]
 pub struct EmptyResult {}
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckpointResult {
-    pub label: String,
-}
-
 /// The answer to `cowshed rekey <ws>`: the rotated workspace identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1233,7 +1209,6 @@ pub enum GcReason {
     OrphanStagingMount,
     OrphanSessionImage,
     OrphanMountpoint,
-    ExpiredCheckpoint,
     /// The `<ws>-<tip>.bundle` recovery bundle `rm --abandon` keeps in `sessions/.trash/`, whose
     /// tips main's repository keeps as refs before it is reclaimed. A candidate only under a sweep
     /// that explicitly authorizes it (`GcOptions.abandoned`).
@@ -1271,7 +1246,6 @@ pub struct GcDeferred {
 pub struct GcReport {
     pub examined: u64,
     pub reclaimed: u64,
-    pub retained_pinned: u64,
     /// Staging entries an operation still holds the lifecycle lock for: not garbage yet.
     pub retained_active: u64,
     pub released_bytes: u64,
@@ -2068,35 +2042,11 @@ pub struct TerminalCommitment {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckpointCommitment {
-    pub version: u16,
-    pub order: u64,
-    pub repo_id: RepoId,
-    pub origin_incarnation: WorkspaceIncarnation,
-    pub checkpoint_id: String,
-    pub barrier_id: u64,
-    pub manifest_batch_sha256: Sha256Digest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ForkCommitment {
     pub version: u16,
     pub order: u64,
     pub repo_id: RepoId,
     pub source_incarnation: WorkspaceIncarnation,
-    pub destination_incarnation: WorkspaceIncarnation,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RestoreCommitment {
-    pub version: u16,
-    pub order: u64,
-    pub repo_id: RepoId,
-    pub source_checkpoint: String,
-    pub source_incarnation: WorkspaceIncarnation,
-    pub replaced_incarnation: WorkspaceIncarnation,
     pub destination_incarnation: WorkspaceIncarnation,
 }
 
@@ -2147,9 +2097,7 @@ pub enum ControllerCommitment {
     WorkspaceRetired(WorkspaceRetiredCommitment),
     Admission(AdmissionCommitment),
     Terminal(TerminalCommitment),
-    Checkpoint(CheckpointCommitment),
     Fork(ForkCommitment),
-    Restore(RestoreCommitment),
     LandAdoption(LandAdoptionCommitment),
     LandOutcome(LandOutcomeCommitment),
 }
@@ -2161,9 +2109,7 @@ impl ControllerCommitment {
             Self::WorkspaceRetired(value) => value.version,
             Self::Admission(value) => value.version,
             Self::Terminal(value) => value.version,
-            Self::Checkpoint(value) => value.version,
             Self::Fork(value) => value.version,
-            Self::Restore(value) => value.version,
             Self::LandAdoption(value) => value.version,
             Self::LandOutcome(value) => value.version,
         }
@@ -2175,9 +2121,7 @@ impl ControllerCommitment {
             Self::WorkspaceRetired(value) => value.order,
             Self::Admission(value) => value.order,
             Self::Terminal(value) => value.order,
-            Self::Checkpoint(value) => value.order,
             Self::Fork(value) => value.order,
-            Self::Restore(value) => value.order,
             Self::LandAdoption(value) => value.order,
             Self::LandOutcome(value) => value.order,
         }
@@ -2189,9 +2133,7 @@ impl ControllerCommitment {
             Self::WorkspaceRetired(value) => &value.repo_id,
             Self::Admission(value) => &value.repo_id,
             Self::Terminal(value) => &value.repo_id,
-            Self::Checkpoint(value) => &value.repo_id,
             Self::Fork(value) => &value.repo_id,
-            Self::Restore(value) => &value.repo_id,
             Self::LandAdoption(value) => &value.repo_id,
             Self::LandOutcome(value) => &value.repo_id,
         }
@@ -2229,28 +2171,9 @@ impl ControllerCommitment {
                     "terminal output limit crossing must exceed its limit",
                 ))
             }
-            Self::Checkpoint(value) if !valid_commitment_id(&value.checkpoint_id) => Err(
-                DtoError::InvalidJobProjection("checkpoint commitment id is invalid"),
-            ),
-            Self::Checkpoint(value) if value.barrier_id == 0 => Err(
-                DtoError::InvalidJobProjection("checkpoint barrier id must be positive"),
-            ),
             Self::Fork(value) if value.source_incarnation == value.destination_incarnation => {
                 Err(DtoError::InvalidJobProjection(
                     "fork source and destination incarnations must differ",
-                ))
-            }
-            Self::Restore(value) if !valid_commitment_id(&value.source_checkpoint) => Err(
-                DtoError::InvalidJobProjection("restore source checkpoint id is invalid"),
-            ),
-            Self::Restore(value) if value.source_incarnation == value.destination_incarnation => {
-                Err(DtoError::InvalidJobProjection(
-                    "restore source and destination incarnations must differ",
-                ))
-            }
-            Self::Restore(value) if value.replaced_incarnation == value.destination_incarnation => {
-                Err(DtoError::InvalidJobProjection(
-                    "restore replaced and destination incarnations must differ",
                 ))
             }
             Self::LandAdoption(value) if value.landing_incarnation == value.target_incarnation => {
@@ -2273,13 +2196,6 @@ impl ControllerCommitment {
     }
 }
 
-pub(crate) fn valid_commitment_id(value: &str) -> bool {
-    (1..=128).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum ControllerCommitmentRef<'a> {
@@ -2287,9 +2203,7 @@ enum ControllerCommitmentRef<'a> {
     WorkspaceRetired(&'a WorkspaceRetiredCommitment),
     Admission(&'a AdmissionCommitment),
     Terminal(&'a TerminalCommitment),
-    Checkpoint(&'a CheckpointCommitment),
     Fork(&'a ForkCommitment),
-    Restore(&'a RestoreCommitment),
     LandAdoption(&'a LandAdoptionCommitment),
     LandOutcome(&'a LandOutcomeCommitment),
 }
@@ -2301,9 +2215,7 @@ enum ControllerCommitmentWire {
     WorkspaceRetired(WorkspaceRetiredCommitment),
     Admission(AdmissionCommitment),
     Terminal(TerminalCommitment),
-    Checkpoint(CheckpointCommitment),
     Fork(ForkCommitment),
-    Restore(RestoreCommitment),
     LandAdoption(LandAdoptionCommitment),
     LandOutcome(LandOutcomeCommitment),
 }
@@ -2319,9 +2231,7 @@ impl Serialize for ControllerCommitment {
             Self::WorkspaceRetired(value) => ControllerCommitmentRef::WorkspaceRetired(value),
             Self::Admission(value) => ControllerCommitmentRef::Admission(value),
             Self::Terminal(value) => ControllerCommitmentRef::Terminal(value),
-            Self::Checkpoint(value) => ControllerCommitmentRef::Checkpoint(value),
             Self::Fork(value) => ControllerCommitmentRef::Fork(value),
-            Self::Restore(value) => ControllerCommitmentRef::Restore(value),
             Self::LandAdoption(value) => ControllerCommitmentRef::LandAdoption(value),
             Self::LandOutcome(value) => ControllerCommitmentRef::LandOutcome(value),
         }
@@ -2341,9 +2251,7 @@ impl<'de> Deserialize<'de> for ControllerCommitment {
             ControllerCommitmentWire::WorkspaceRetired(value) => Self::WorkspaceRetired(value),
             ControllerCommitmentWire::Admission(value) => Self::Admission(value),
             ControllerCommitmentWire::Terminal(value) => Self::Terminal(value),
-            ControllerCommitmentWire::Checkpoint(value) => Self::Checkpoint(value),
             ControllerCommitmentWire::Fork(value) => Self::Fork(value),
-            ControllerCommitmentWire::Restore(value) => Self::Restore(value),
             ControllerCommitmentWire::LandAdoption(value) => Self::LandAdoption(value),
             ControllerCommitmentWire::LandOutcome(value) => Self::LandOutcome(value),
         };
@@ -3540,8 +3448,7 @@ pub struct ForkOptions {
     /// host-side state that accumulates one entry per workspace and outlives an interrupted retire.
     pub register: bool,
     /// Mint a registered linked worktree of main's repository instead of a standalone clone: one
-    /// object store and one ref namespace, at the cost of requiring main mounted and giving up
-    /// checkpoint and restore.
+    /// object store and one ref namespace, at the cost of requiring main mounted.
     pub git_worktree: bool,
     /// The caller's edit is pure Markdown, disjoint from code edits: the fork is refused, because
     /// such an edit belongs in place in the checkout and no workspace should be minted for it.
@@ -3591,26 +3498,6 @@ pub struct DefragmentResult {
     pub bytes: u64,
 }
 
-/// Replacing a workspace's live build state with a clone of an existing target seed.
-///
-/// Byte counts are allocated image bytes, like GC accounting, not unique physical bytes:
-/// APFS clones may share extents. A preview estimates replacement allocation from the seed,
-/// names no replacement volume, and frees nothing. No seed is refreshed by this operation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReseedResult {
-    pub workspace: WorkspaceName,
-    pub from: WorkspaceName,
-    pub previous_volume: String,
-    pub seed: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replacement_volume: Option<String>,
-    pub previous_bytes: u64,
-    pub replacement_bytes: u64,
-    pub released_bytes: u64,
-    pub dry_run: bool,
-}
-
 /// What `cowshed cache clear` deleted from one checkout's Nx state on its build volume
 /// (16_build_volumes.md, "Clearing a checkout's Nx state"): the entries directly in every
 /// `.nx/cache` and every `.nx/workspace-data` directory the volume holds, deleted together
@@ -3640,14 +3527,6 @@ pub struct NxStoreClearResult {
 pub struct CacheClearReport {
     pub workspace: NxStateClearResult,
     pub store: NxStoreClearResult,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckpointOptions {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub keep: bool,
 }
 
 /// What `cowshed rm` is allowed to override.
@@ -4652,13 +4531,6 @@ pub struct MirrorInfo {
     pub mirror: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckpointQuota {
-    pub max_count: u32,
-    pub max_bytes: u64,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GatewayStatus {
@@ -4944,12 +4816,10 @@ result_bodies!(
     DoctorReport,
     GcReport,
     RecoveredImage,
-    CheckpointResult,
     RekeyResult,
     RebaseReport,
     ResizeResult,
     DefragmentResult,
-    ReseedResult,
     NxStateClearResult,
     CacheClearReport,
     SlotResult,

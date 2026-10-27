@@ -420,10 +420,6 @@ class CoordinatorImpl implements Coordinator {
     return callNativeAsync(() => N.coordinatorLand(this.#native, { workspace, into: target, options: rest }));
   }
 
-  async restore(workspace: string, label: string): Promise<void> {
-    await callNativeAsync(() => N.coordinatorRestore(this.#native, { workspace, label }));
-  }
-
   async detach(workspace: string): Promise<void> {
     await callNativeAsync(() => N.coordinatorDetach(this.#native, { workspace }));
   }
@@ -442,10 +438,6 @@ class CoordinatorImpl implements Coordinator {
 
   async rekey(workspace: string): Promise<Api.RekeyResult> {
     return callNativeAsync(() => N.coordinatorRekey(this.#native, { workspace }));
-  }
-
-  async reseed(workspace: string, from: string, dryRun: boolean): Promise<Api.ReseedResult> {
-    return callNativeAsync(() => N.coordinatorReseed(this.#native, { workspace, from, dryRun }));
   }
 
   async remove(workspace: string, options?: Api.RemoveOptions): Promise<Api.RemoveReport> {
@@ -534,11 +526,6 @@ class WorkspaceHandleImpl implements WorkspaceHandle {
   async jobByKey(admissionKey: Api.AdmissionKey): Promise<JobHandle | null> {
     const job = await callNativeAsync(() => N.workerJobByKey(this.#native, { admissionKey }));
     return job === null ? null : new JobHandleImpl(job);
-  }
-
-  async checkpoint(options?: Api.CheckpointOptions): Promise<string> {
-    const { label } = await callNativeAsync(() => N.workerCheckpoint(this.#native, { options: options ?? {} }));
-    return label;
   }
 
   async push(options?: Api.PushOptions): Promise<Api.PushReport> {

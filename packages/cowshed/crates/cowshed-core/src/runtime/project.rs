@@ -17,13 +17,12 @@ use crate::api::dto::GitOid;
 #[cfg(target_os = "macos")]
 use crate::api::dto::{AbandonedPreservation, AbandonedWork};
 use crate::api::dto::{
-    AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions,
-    GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
-    JobTailLimits, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants,
-    PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, RemovedWorkspace, SealedJob, StdinSource,
-    WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    AdmissionKey, AdoptOptions, AttachOptions, CommandArg, DoctorReport, EmptyResult, ExecRequest,
+    ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor,
+    JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport, MirrorInfo,
+    ProjectGrantDelta, ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport,
+    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, RemovedWorkspace,
+    SealedJob, StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 #[cfg(target_os = "macos")]
 use crate::api::dto::{BranchLandings, LandingCommits, UnlandedPaths};
@@ -249,23 +248,10 @@ pub trait ProjectRuntimeHost: Send + 'static {
 
     /// Rebuild one keyless workspace's CA identity at its preserved incarnation.
     async fn rekey(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::RekeyResult>;
-    async fn reseed(
-        &mut self,
-        workspace: WorkspaceName,
-        from: WorkspaceName,
-        dry_run: bool,
-    ) -> Result<crate::api::dto::ReseedResult>;
     async fn clear_nx_state(
         &mut self,
         workspace: WorkspaceName,
     ) -> Result<crate::api::dto::NxStateClearResult>;
-    async fn checkpoint(
-        &mut self,
-        workspace: WorkspaceName,
-        expected_incarnation: Option<WorkspaceIncarnation>,
-        options: CheckpointOptions,
-    ) -> Result<CheckpointResult>;
-    async fn restore(&mut self, workspace: WorkspaceName, label: String) -> Result<()>;
     async fn remove(
         &mut self,
         workspace: WorkspaceName,
@@ -305,11 +291,6 @@ pub trait ProjectRuntimeHost: Send + 'static {
         revoke: bool,
     ) -> Result<ProjectGrants>;
     async fn assign_slot(&mut self, workspace: WorkspaceName, slot: u32) -> Result<()>;
-    async fn set_checkpoint_quota(
-        &mut self,
-        workspace: WorkspaceName,
-        quota: CheckpointQuota,
-    ) -> Result<()>;
     /// Rebase `workspace` onto what it lands into: `into`'s checked-out branch, or main's when
     /// `into` is `None`.
     async fn rebase(
@@ -568,7 +549,7 @@ pub enum RecoveryScope {
     /// since is that operation's, or the next ordinary command's, to finish.
     Supervisor(WorkspaceName),
     /// Inspection (`doctor` without `--repair`): the opening finishes nothing. No lifecycle intent
-    /// is replayed, `main`'s included; no interrupted publication or restore is completed; no
+    /// is replayed, `main`'s included; no interrupted publication is completed; no
     /// retired image is reclaimed; no identity change is finished; no healed binding is written.
     /// The opening reads the store as it is, and doctor reports what any other opening would
     /// finish as findings.
@@ -1488,12 +1469,6 @@ impl ProjectActor {
                     .await?;
                 respond::<operations::CoordinatorLand>(&report)
             }
-            Op::CoordinatorRestore(params) => {
-                self.require_repo(&params.repo_id)?;
-                self.host.make_media_room(demand).await;
-                self.host.restore(params.workspace, params.label).await?;
-                respond::<operations::CoordinatorRestore>(&EmptyResult {})
-            }
             Op::CoordinatorResize(params) => {
                 self.require_repo(&params.repo_id)?;
                 self.host.make_media_room(demand).await;
@@ -1514,16 +1489,6 @@ impl ProjectActor {
                 self.require_repo(&params.repo_id)?;
                 self.host.make_media_room(demand).await;
                 respond::<operations::CoordinatorRekey>(&self.host.rekey(params.workspace).await?)
-            }
-            Op::CoordinatorReseed(params) => {
-                self.require_repo(&params.repo_id)?;
-                self.host.make_media_room(demand).await;
-                respond::<operations::CoordinatorReseed>(
-                    &self
-                        .host
-                        .reseed(params.workspace, params.from, params.dry_run)
-                        .await?,
-                )
             }
             Op::CoordinatorClearNxState(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -1590,13 +1555,6 @@ impl ProjectActor {
                 respond::<operations::CoordinatorRepoMirror>(
                     &self.host.repo_mirror(params.workspace, url).await?,
                 )
-            }
-            Op::CoordinatorSetCheckpointQuota(params) => {
-                self.require_repo(&params.repo_id)?;
-                self.host
-                    .set_checkpoint_quota(params.workspace, params.quota)
-                    .await?;
-                respond::<operations::CoordinatorSetCheckpointQuota>(&EmptyResult {})
             }
             Op::CoordinatorDoctor(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -1703,21 +1661,6 @@ impl ProjectActor {
                             params.workspace,
                             params.workspace_incarnation,
                             params.job_id,
-                        )
-                        .await?,
-                )
-            }
-            Op::WorkerCheckpoint(params) => {
-                self.require_scoped_workspace(&authority, &params.repo_id, &params.workspace)
-                    .await?;
-                self.host.make_media_room(demand).await;
-                respond::<operations::WorkerCheckpoint>(
-                    &self
-                        .host
-                        .checkpoint(
-                            params.workspace,
-                            Some(params.workspace_incarnation),
-                            params.options,
                         )
                         .await?,
                 )
@@ -3354,10 +3297,10 @@ fn release_failed(what: &str, path: &Path, error: std::io::Error) -> CowshedErro
 
 /// The project store trees an unbinding deletes once main is retired and its build volumes are
 /// released; they may hold nothing but empty directories and zero-length locks by then. In
-/// 02_workspaces.md's order, which puts `sessions/` before the checkpoints and temp dirs its
-/// images own, so a refusal names a live workspace's image rather than what that image keeps.
+/// 02_workspaces.md's order, which puts `sessions/` before the temp dirs its images own, so a
+/// refusal names a live workspace's image rather than what that image keeps.
 #[cfg(target_os = "macos")]
-const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
+const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 4] = [
     (
         crate::storage::recovery::STAGING_NAMESPACE,
         ReleasedFirst::Nothing,
@@ -3365,10 +3308,6 @@ const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
     (
         crate::repository::SESSIONS_DIRECTORY,
         ReleasedFirst::Deleting,
-    ),
-    (
-        crate::repository::CHECKPOINTS_DIRECTORY,
-        ReleasedFirst::MainsOwn,
     ),
     (
         crate::repository::EXEC_TEMP_DIRECTORY,
@@ -3383,7 +3322,7 @@ const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
 /// Refuses a main restore while a recovery image stands in `sessions/.trash`, naming it and the
 /// export that takes it out of the store (02_workspaces.md, "Recovering a recovery image"): it may
 /// hold the only copy of its workspace's work, which no gc reclaims, and it keeps that workspace's
-/// checkpoints and temp dir, which the terminal plan would otherwise name in its place.
+/// temp dir, which the terminal plan would otherwise name in its place.
 #[cfg(target_os = "macos")]
 fn require_no_recovery_image(project_root: &Path) -> Result<()> {
     let trash = project_root
@@ -3412,8 +3351,8 @@ fn require_no_recovery_image(project_root: &Path) -> Result<()> {
                     image.display()
                 ),
                 format!(
-                    "it may hold the only copy of {workspace}'s work and keeps its checkpoints and \
-                     temp dir; move it out of the store with cowshed gc --recover {} --to <dir>, \
+                    "it may hold the only copy of {workspace}'s work and keeps its temp dir; move it out \
+                     of the store with cowshed gc --recover {} --to <dir>, \
                      then retry",
                     image.display()
                 ),
@@ -3424,13 +3363,13 @@ fn require_no_recovery_image(project_root: &Path) -> Result<()> {
 }
 
 /// Refuses a main restore whose terminal storage the unbinding could not delete: a live
-/// workspace's image, grants or temp dir, an unreclaimed retired image, a staged image, another
-/// workspace's checkpoint, an `rm --abandon` bundle kept for its owner, or anything in `build/`
-/// that is not a build volume's image, record or hold (a legacy payload, a stray file). Main's own
-/// checkpoints and temp dir are exempt: main's retirement reclaims them with its image. So are
-/// build volumes: the unbinding releases them all before it deletes `build/`, and refuses while
-/// the project is still bound if one stays. The restore checks this before it retires main,
-/// because the same refusal after it leaves a binding only a retry of the restore removes.
+/// workspace's image, grants or temp dir, an unreclaimed retired image, a staged image, an
+/// `rm --abandon` bundle kept for its owner, or anything in `build/` that is not a build
+/// volume's image, record or hold (a legacy payload, a stray file). Main's own temp dir is exempt:
+/// main's retirement reclaims it with its image. So are build volumes: the unbinding releases them
+/// all before it deletes `build/`, and refuses while the project is still bound if one stays. The
+/// restore checks this before it retires main, because the same refusal after it leaves a binding
+/// only a retry of the restore removes.
 #[cfg(target_os = "macos")]
 fn require_terminal_storage(project_root: &Path) -> Result<()> {
     require_no_recovery_image(project_root)?;
@@ -3812,45 +3751,6 @@ fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) 
     plan.push(path.to_owned());
     Ok(())
 }
-
-/// The pending restores an opening may activate. The store-wide pass (`scoped` false) takes the
-/// store's locks and every restore with them; a scoped opening activates only a restore whose
-/// image lock it holds (`held`): one another process holds is that restore's own, still fencing,
-/// and is left to it (07_api.md, "Authority model").
-#[cfg(any(test, target_os = "macos"))]
-fn restorable_publications(
-    pending: &[crate::storage::apfs::PendingPublicationFact],
-    scoped: bool,
-    held: &[PathBuf],
-) -> Vec<crate::storage::apfs::PendingPublicationFact> {
-    pending
-        .iter()
-        .filter(|fact| {
-            !scoped || {
-                let mut lock = fact.image.clone().into_os_string();
-                lock.push(".lock");
-                held.contains(&PathBuf::from(lock))
-            }
-        })
-        .cloned()
-        .collect()
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn verified_recovery_facts<'a>(
-    facts: &'a [crate::storage::lifecycle::StorageFact],
-    pending: &[crate::storage::apfs::PendingPublicationFact],
-) -> Vec<&'a crate::storage::lifecycle::StorageFact> {
-    let pending_destinations = pending
-        .iter()
-        .map(|fact| fact.destination_incarnation.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    facts
-        .iter()
-        .filter(|fact| !pending_destinations.contains(fact.workspace.incarnation()))
-        .collect()
-}
-
 #[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     #[allow(
@@ -4159,7 +4059,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             names.insert(origin.workspace.clone());
         }
         let retired_names = observation_names.clone();
-        let (host, facts, pending, restorable, lifecycle_intents, publication_guards) =
+        let (host, facts, lifecycle_intents) =
             crate::storage::lifecycle::dispatch_blocking(move || {
                 let lifecycle_intents = match replay_journal {
                     Some(journal) => journal,
@@ -4182,6 +4082,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 // next opening's, to finish (07_api.md, "Authority model"). So `ls`, `exec` and
                 // every verb that names a workspace never wait on another's fork of main.
                 let mut held = Vec::with_capacity(publication_locks.len());
+                // The image locks last through this opening's recovery and are released when the
+                // recovery task returns, before the opening finishes the store's residue.
                 let mut guards = Vec::with_capacity(publication_locks.len());
                 if repairs {
                     for lock in &publication_locks {
@@ -4233,20 +4135,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         facts
                     }
                 };
-                let pending = host
-                    .pending_publications_for(&recovery_repo, observation_names.as_ref())
-                    .map_err(native_storage_error)?;
-                let restorable =
-                    restorable_publications(&pending, !publication_locks.is_empty(), &held);
-                // Only a restore's activation needs the locks past this point; with none to
-                // activate they are let go here, before anything else the opening does.
-                let guards = if restorable.is_empty() {
-                    drop(guards);
-                    Vec::new()
-                } else {
-                    guards
-                };
-                Ok::<_, CowshedError>((host, facts, pending, restorable, lifecycle_intents, guards))
+                Ok::<_, CowshedError>((host, facts, lifecycle_intents))
             })
             .await
             .map_err(|error| {
@@ -4266,7 +4155,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         .map_err(|error| {
             CowshedError::internal(format!("retired workspace recovery task failed: {error}"))
         })??;
-        let verified_facts = verified_recovery_facts(&facts, &pending);
         if let Some(origin) = origin.as_ref() {
             // The exact old input may have been restored read-only at main while its
             // replacement is pending. It is admitted only to finish that recorded recovery,
@@ -4292,7 +4180,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 validate_workspace_origin_against_inventory(
                     origin,
                     &binding.owned_repo_ids().map_err(native_integrity_error)?,
-                    &verified_facts,
+                    &facts,
                 )?;
             }
         }
@@ -4305,7 +4193,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .iter()
                 .map(|fact| fact.workspace().incarnation())
                 .collect::<std::collections::BTreeSet<_>>();
-            if let Some(conflict) = verified_facts
+            if let Some(conflict) = facts
                 .iter()
                 .find(|fact| retired_incarnations.contains(fact.workspace.incarnation()))
             {
@@ -4325,7 +4213,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             continuity,
             crate::storage::audit::ContinuityAudit::External(_)
         );
-        let mut commitments = {
+        let commitments = {
             let _span = cowshed_os::timing::span("open", "commitments");
             super::supervisor::CommitmentPublisher::open(
                 &telemetry_root,
@@ -4333,17 +4221,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ROUTER_CAPACITY,
             )?
         };
-        let substrate = finish_store_residue(
-            host,
-            config.clone(),
-            &repo_id,
-            &restorable,
-            retired,
-            &mut commitments,
-            &recovery_scope,
-        )
-        .await?;
-        drop(publication_guards);
+        let substrate =
+            finish_store_residue(host, config.clone(), &repo_id, retired, &recovery_scope).await?;
         let descriptor = ProjectDescriptor {
             repo_id,
             binding: std::sync::Arc::new(binding),
@@ -6482,14 +6361,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok((locked, refreshed.superseded.take()))
     }
 
-    /// Seed compaction's lineage (16_build_volumes.md, "Seed compaction"): move main's live build
-    /// volume onto a clone of `seed`, the compacted seed just published, through the workspace
-    /// reseed of main from main ("Workspace reseed"), with no lock held by the compaction (the
-    /// reseed takes main's image lock itself, and both of its participants are main, so it takes
-    /// it once). The reseed refuses when the volume holds a write the seed lacks. Held, behind,
-    /// detached, with another seed latest by then, or failing, main's volume is kept and the
-    /// answer says why: nothing is stopped but its own Nx daemon, which every capture of it
-    /// stops too.
+    /// Move main onto the compacted seed only when its live volume holds no newer write
+    /// (16_build_volumes.md, "Seed compaction"). Held, behind, detached, changed-seed or failed
+    /// moves keep main's volume and say why; only its own Nx daemon may be stopped.
     async fn move_main_onto(
         &self,
         volumes: &super::build_volumes::BuildVolumes<H>,
@@ -6507,8 +6381,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             });
         }
         let workspace =
-            self.reseed_participant(main, current.derived.workspace.incarnation().clone())?;
-        let moved = match volumes.preview_reseed(workspace.clone(), workspace).await {
+            self.seed_move_participant(main, current.derived.workspace.incarnation().clone())?;
+        let moved = match volumes.plan_move_onto_seed(workspace).await {
             Ok(plan) if plan.seed() == seed => volumes.move_onto_seed(plan).await,
             Ok(plan) => {
                 return Ok(MainLineage::Kept {
@@ -6521,15 +6395,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             Err(error) => Err(error),
         };
         match moved {
-            Ok(moved) => moved
-                .replacement_volume
-                .map(|volume| MainLineage::Moved {
-                    previous: moved.previous_volume,
-                    volume,
-                })
-                .ok_or_else(|| {
-                    CowshedError::internal("a reseed that ran answered no replacement volume")
-                }),
+            Ok(moved) => Ok(MainLineage::Moved {
+                previous: moved.previous_volume,
+                volume: moved.replacement_volume,
+            }),
             // The seed is compacted and published whatever happens here: a move that cannot be
             // made is said in the report, never a failed compaction that would hold back lands.
             Err(error) => Ok(MainLineage::Kept {
@@ -6538,14 +6407,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
     }
 
-    /// A workspace as the workspace reseed names it (16_build_volumes.md, "Workspace reseed").
-    fn reseed_participant(
+    /// The workspace whose live volume compaction moves (16_build_volumes.md, "Seed compaction").
+    fn seed_move_participant(
         &self,
         name: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-    ) -> Result<super::build_volumes::ReseedWorkspace> {
+    ) -> Result<super::build_volumes::SeedMoveWorkspace> {
         use crate::storage::recovery::INTENT_LEASE_SUFFIX;
-        Ok(super::build_volumes::ReseedWorkspace {
+        Ok(super::build_volumes::SeedMoveWorkspace {
             checkout: self.workspace_mount_path(&name)?,
             image: self
                 .layout
@@ -7500,60 +7369,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             lifecycle_revision: workspace.derived.workspace.revision().get(),
             topology_revision: workspace.derived.workspace.topology_revision().get(),
         })
-    }
-
-    async fn checkpoint_quota(&self, workspace: &WorkspaceName) -> Result<Option<CheckpointQuota>> {
-        let path = self.layout.project().policy.clone();
-        let workspace = workspace.clone();
-        crate::storage::lifecycle::dispatch_blocking(move || {
-            read_project_policy(&path)
-                .map(|policy| policy.checkpoint_quotas.get(&workspace).copied())
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("checkpoint quota task failed: {error}")))?
-    }
-
-    async fn enforce_checkpoint_quota(&self, workspace: &NativeWorkspace) -> Result<()> {
-        use crate::storage::lifecycle::Substrate;
-
-        let Some(quota) = self
-            .checkpoint_quota(workspace.derived.workspace.name())
-            .await?
-        else {
-            return Ok(());
-        };
-        let stats = self
-            .substrate
-            .stats(&workspace.derived.workspace)
-            .await
-            .map_err(native_storage_error)?;
-        if stats.pinned_checkpoint_bytes > stats.checkpoint_bytes {
-            return Err(CowshedError::integrity(
-                "pinned checkpoint bytes exceed total checkpoint bytes",
-                "run cowshed doctor --json",
-            ));
-        }
-        let projected_count = stats.checkpoint_count.checked_add(1).ok_or_else(|| {
-            CowshedError::integrity("checkpoint count overflow", "run cowshed gc")
-        })?;
-        let projected_bytes = stats
-            .checkpoint_bytes
-            .checked_add(stats.allocated_bytes)
-            .ok_or_else(|| {
-                CowshedError::integrity("checkpoint byte accounting overflow", "run cowshed gc")
-            })?;
-        if projected_count > u64::from(quota.max_count) || projected_bytes > quota.max_bytes {
-            return Err(CowshedError::conflict(
-                format!(
-                    "checkpoint quota exceeded for {}: projected {projected_count} checkpoints and {projected_bytes} bytes, limit {} checkpoints and {} bytes",
-                    workspace.derived.workspace.name(),
-                    quota.max_count,
-                    quota.max_bytes
-                ),
-                "remove or unpin checkpoints, raise the workspace quota, or run cowshed gc",
-            ));
-        }
-        Ok(())
     }
 
     async fn operation_identity(
@@ -11123,35 +10938,18 @@ fn require_vacant_move_destination(destination: &Path) -> Result<()> {
     }
 }
 
-/// Finish interrupted restore publications before serving. Recovery trash, with or without
-/// its sidecar, is preserved; a missing record never authorizes deletion.
+/// Finish the store residue an opening owns before serving. Recovery trash, with or without its
+/// sidecar, is preserved; a missing record never authorizes deletion.
 #[cfg(target_os = "macos")]
 async fn finish_store_residue<H: crate::storage::apfs::ApfsExecutionHost>(
     host: H,
     config: crate::storage::apfs::ApfsSubstrateConfig,
     repo_id: &RepoId,
-    restored: &[crate::storage::apfs::PendingPublicationFact],
     retired: RetiredTrash,
-    commitments: &mut super::supervisor::CommitmentPublisherHandle,
     scope: &RecoveryScope,
 ) -> Result<crate::storage::apfs::ApfsSubstrate<H>> {
-    use super::supervisor::{CommitmentDraft, CommitmentSink};
-
     if !scope.repairs() {
         return Ok(crate::storage::apfs::ApfsSubstrate::new(config, host));
-    }
-    for publication in restored {
-        commitments
-            .record(CommitmentDraft::Restore {
-                repo_id: repo_id.clone(),
-                source_checkpoint: publication.source_checkpoint.clone(),
-                source_incarnation: publication.source_incarnation.clone(),
-                replaced_incarnation: publication.replaced_incarnation.clone(),
-                destination_incarnation: publication.destination_incarnation.clone(),
-            })
-            .await?;
-        host.activate_restored_metadata(&publication.image)
-            .map_err(native_storage_error)?;
     }
     if !retired.recorded.is_empty() {
         cowshed_os::eprintln!(
@@ -15346,46 +15144,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         })
     }
 
-    /// Replace only rebuildable incremental state. Unlike resize, refuse admitted jobs instead
-    /// of stopping them. The supervisor resolves and grants the new build volume at its next
-    /// admission, exactly as it does after land's atomic build-link swap.
-    async fn reseed(
-        &mut self,
-        workspace: WorkspaceName,
-        from: WorkspaceName,
-        dry_run: bool,
-    ) -> Result<crate::api::dto::ReseedResult> {
-        self.validate_binding().await?;
-        let current = self.current(&workspace).await?;
-        if !matches!(
-            current.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
-        ) {
-            return Err(CowshedError::conflict(
-                format!("workspace {workspace} is detached, so its build link cannot be read"),
-                format!("cowshed attach {workspace}, then retry the reseed"),
-            ));
-        }
-        let target = self.current(&from).await?;
-        let volumes = self.build_volumes()?;
-        let plan = volumes
-            .preview_reseed(
-                self.reseed_participant(
-                    workspace,
-                    current.derived.workspace.incarnation().clone(),
-                )?,
-                self.reseed_participant(from, target.derived.workspace.incarnation().clone())?,
-            )
-            .await?;
-        if dry_run {
-            Ok(plan.preview())
-        } else {
-            volumes.execute_reseed(plan).await
-        }
-    }
-
     /// Delete the Nx state on the workspace's build volume (16_build_volumes.md, "Clearing a
-    /// checkout's Nx state"). Like reseed it refuses running work instead of stopping it.
+    /// checkout's Nx state"). It refuses running work instead of stopping it.
     async fn clear_nx_state(
         &mut self,
         workspace: WorkspaceName,
@@ -15411,143 +15171,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.build_volumes()?
             .clear_nx_state(workspace, checkout, image_lock)
             .await
-    }
-
-    async fn checkpoint(
-        &mut self,
-        workspace: WorkspaceName,
-        expected_incarnation: Option<WorkspaceIncarnation>,
-        options: CheckpointOptions,
-    ) -> Result<CheckpointResult> {
-        use crate::storage::lifecycle::LifecyclePlanner;
-
-        self.validate_binding().await?;
-        let current = self.current(&workspace).await?;
-        if let Some(expected) = expected_incarnation.as_ref() {
-            Self::require_exact_incarnation(&current, expected)?;
-        }
-        require_checkpointable(&workspace, &current.metadata, "checkpoint")?;
-        let explicitly_labeled = options.label.is_some();
-        let label = match options.label {
-            Some(value) => {
-                crate::storage::CheckpointLabel::new(value).map_err(native_integrity_error)?
-            }
-            None => crate::storage::CheckpointLabel::utc_default(
-                std::time::SystemTime::now(),
-                |candidate| {
-                    current
-                        .derived
-                        .checkpoints
-                        .iter()
-                        .any(|fact| fact.label.as_str() == candidate)
-                },
-            ),
-        };
-        self.enforce_checkpoint_quota(&current).await?;
-        let handle = self.ensure_supervisor(&workspace).await?;
-        let barrier = handle.checkpoint_barrier(label.to_string()).await?;
-        let plan = self
-            .substrate
-            .plan_checkpoint(
-                &current.derived.workspace,
-                label.clone(),
-                if options.keep || explicitly_labeled {
-                    crate::storage::lifecycle::Pin::Pinned
-                } else {
-                    crate::storage::lifecycle::Pin::Automatic
-                },
-            )
-            .map_err(native_integrity_error)?;
-        self.substrate
-            .execute_checkpoint_staged(plan, move |stage| async move {
-                if stage.checkpoint.label().as_str() != barrier.checkpoint_id {
-                    return Err(CowshedError::integrity(
-                        "supervisor checkpoint barrier identity changed",
-                        "cowshed doctor --json",
-                    ));
-                }
-                Ok(())
-            })
-            .await
-            .map_err(native_staged_error)?;
-        Ok(CheckpointResult {
-            label: label.to_string(),
-        })
-    }
-
-    async fn restore(&mut self, workspace: WorkspaceName, label: String) -> Result<()> {
-        use super::supervisor::{CommitmentDraft, CommitmentSink};
-        use crate::storage::lifecycle::LifecyclePlanner;
-
-        self.validate_binding().await?;
-        let current = self.current(&workspace).await?;
-        require_checkpointable(&workspace, &current.metadata, "restore")?;
-        let label = crate::storage::CheckpointLabel::new(label).map_err(native_integrity_error)?;
-        let checkpoint = current
-            .derived
-            .checkpoints
-            .iter()
-            .find(|checkpoint| checkpoint.label == label)
-            .cloned()
-            .ok_or_else(|| {
-                CowshedError::not_found(
-                    format!("checkpoint {label} does not exist"),
-                    "list workspace checkpoints and retry",
-                )
-            })?;
-        let info = &current.metadata.info_snapshot;
-        let identity = self
-            .operation_identity(
-                current.metadata.grants.clone(),
-                info.branch.clone(),
-                info.forked_from.clone(),
-                info.git_worktree,
-            )
-            .await?;
-        let stopped = self.stop_supervisor(&workspace).await?;
-        require_lost_groups_released(&workspace, &stopped, "restore").await?;
-        let checkpoint_ref = crate::storage::lifecycle::CheckpointRef::new(
-            current.derived.workspace.clone(),
-            checkpoint.label.clone(),
-            checkpoint.revision,
-            matches!(checkpoint.pin, crate::storage::lifecycle::Pin::Pinned),
-        );
-        let plan = self
-            .substrate
-            .plan_restore(
-                &current.derived.workspace,
-                &checkpoint_ref,
-                crate::storage::lifecycle::RestoreMode::Replace,
-                identity,
-            )
-            .map_err(native_integrity_error)?;
-        let mut commitments = self.commitments.clone();
-        let result = self
-            .substrate
-            .execute_restore_staged(plan, move |fence| async move {
-                commitments
-                    .record(CommitmentDraft::Restore {
-                        repo_id: fence.pending.workspace.repo().clone(),
-                        source_checkpoint: fence.pending.source_checkpoint,
-                        source_incarnation: fence.pending.source_incarnation,
-                        replaced_incarnation: fence.pending.replaced_incarnation,
-                        destination_incarnation: fence.pending.workspace.incarnation().clone(),
-                    })
-                    .await
-                    .map(|_| ())
-            })
-            .await;
-        drop(stopped);
-        match result {
-            // The restored image carries the build link it had when the checkpoint was taken;
-            // mounting it re-points a stale one at the workspace's own volume
-            // (`BuildVolumeLayout::resolve_link`), so a restore never rewinds the build volume.
-            Ok(_) => {
-                self.ensure_supervisor(&workspace).await?;
-                Ok(())
-            }
-            Err(error) => Err(native_restore_error(error)),
-        }
     }
 
     async fn remove(
@@ -15663,9 +15286,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     StorageGcReason::OrphanSessionImage => {
                         crate::api::dto::GcReason::OrphanSessionImage
                     }
-                    StorageGcReason::ExpiredCheckpoint => {
-                        crate::api::dto::GcReason::ExpiredCheckpoint
-                    }
                     StorageGcReason::AbandonedBundle => crate::api::dto::GcReason::AbandonedBundle,
                 },
             })
@@ -15688,8 +15308,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .map_err(|_| CowshedError::internal("GC count overflow"))?
                     + build.examined,
                 reclaimed: 0,
-                retained_pinned: u64::try_from(plan.retained_pinned())
-                    .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 retained_active: u64::try_from(plan.retained_active())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 released_bytes: released_bytes.saturating_add(build.released_bytes),
@@ -15784,8 +15402,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             reclaimed: u64::try_from(report.reclaimed)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?
                 + build.reclaimed,
-            retained_pinned: u64::try_from(report.retained_pinned)
-                .map_err(|_| CowshedError::internal("GC count overflow"))?,
             retained_active: u64::try_from(report.retained_active)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
             released_bytes: report.released_bytes.saturating_add(build.released_bytes),
@@ -16239,23 +15855,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             self.ensure_supervisor(&workspace).await?;
         }
         Ok(())
-    }
-
-    async fn set_checkpoint_quota(
-        &mut self,
-        workspace: WorkspaceName,
-        quota: CheckpointQuota,
-    ) -> Result<()> {
-        self.validate_binding().await?;
-        self.current(&workspace).await?;
-        let path = self.layout.project().policy.clone();
-        crate::storage::lifecycle::dispatch_blocking(move || -> Result<()> {
-            let mut policy = read_project_policy(&path)?;
-            policy.checkpoint_quotas.insert(workspace, quota);
-            policy.write(&path).map_err(native_integrity_error)
-        })
-        .await
-        .map_err(|error| CowshedError::internal(error.to_string()))?
     }
 
     async fn rebase(
@@ -18188,7 +17787,7 @@ async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<Work
 fn validate_workspace_origin_against_inventory(
     origin: &WorkspaceOrigin,
     owned_repo_ids: &OwnedRepoIds,
-    facts: &[&crate::storage::lifecycle::StorageFact],
+    facts: &[crate::storage::lifecycle::StorageFact],
 ) -> Result<()> {
     if !owned_repo_ids.accepts(&origin.repo_id) {
         return Err(CowshedError::conflict(
@@ -20002,9 +19601,9 @@ mod removal_supervisor_tests {
         },
         error::{CowshedError, Result},
         runtime::supervisor::{
-            ArtifactSeal, ArtifactSink, ArtifactWrite, CheckpointBarrier, CommitmentDraft,
-            CommitmentSink, NxDaemonRetirement, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
-            RunningProcess, SpawnSink, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+            ArtifactSeal, ArtifactSink, ArtifactWrite, CommitmentDraft, CommitmentSink,
+            NxDaemonRetirement, ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess,
+            SpawnSink, WorkspaceSupervisor, WorkspaceSupervisorConfig,
         },
         storage::job_artifact::{JobEnding, StreamKind},
     };
@@ -20084,14 +19683,6 @@ mod removal_supervisor_tests {
                 terminal_batch_sha256: Sha256Digest::compute(&[]),
                 output_limit: None,
                 publication_failure: None,
-            })
-        }
-
-        fn checkpoint(&mut self) -> Result<CheckpointBarrier> {
-            Ok(CheckpointBarrier {
-                checkpoint_id: "test".into(),
-                barrier_id: 0,
-                manifest_batch_sha256: Sha256Digest::compute(&[]),
             })
         }
 
@@ -23121,13 +22712,7 @@ mod retired_recovery_tests {
             &root,
             root.join("checkout"),
         );
-        let mut commitments = super::super::supervisor::CommitmentPublisher::open(
-            root.join("telemetry"),
-            crate::storage::audit::ContinuityAudit::Off,
-            ROUTER_CAPACITY,
-        )
-        .unwrap();
-        let mut open = async |scope: RecoveryScope| {
+        let open = async |scope: RecoveryScope| {
             let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
                 NoDiskCommands,
                 config.clone(),
@@ -23140,17 +22725,9 @@ mod retired_recovery_tests {
             >(&project_root, &repo_id, None)
             .unwrap();
             assert_eq!(retired.recorded.len(), 1, "the retired image is found");
-            finish_store_residue(
-                host,
-                config.clone(),
-                &repo_id,
-                &[],
-                retired,
-                &mut commitments,
-                &scope,
-            )
-            .await
-            .unwrap();
+            finish_store_residue(host, config.clone(), &repo_id, retired, &scope)
+                .await
+                .unwrap();
         };
 
         open(RecoveryScope::Inspect).await;
@@ -23193,13 +22770,7 @@ mod retired_recovery_tests {
             &root,
             root.join("checkout"),
         );
-        let mut commitments = super::super::supervisor::CommitmentPublisher::open(
-            root.join("telemetry"),
-            crate::storage::audit::ContinuityAudit::Off,
-            ROUTER_CAPACITY,
-        )
-        .unwrap();
-        let mut open = async |scope: RecoveryScope| {
+        let open = async |scope: RecoveryScope| {
             let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
                 NoDiskCommands,
                 config.clone(),
@@ -23213,17 +22784,9 @@ mod retired_recovery_tests {
             .expect("a sidecarless trash image does not fail the open");
             assert!(retired.recorded.is_empty());
             assert_eq!(retired.unrecorded, std::slice::from_ref(&image));
-            finish_store_residue(
-                host,
-                config.clone(),
-                &repo_id,
-                &[],
-                retired,
-                &mut commitments,
-                &scope,
-            )
-            .await
-            .unwrap();
+            finish_store_residue(host, config.clone(), &repo_id, retired, &scope)
+                .await
+                .unwrap();
         };
 
         open(RecoveryScope::Inspect).await;
@@ -23289,19 +22852,6 @@ fn native_retire_error(
     match error {
         crate::storage::apfs::RetireExecutionError::Storage(error) => native_storage_error(error),
         crate::storage::apfs::RetireExecutionError::Fence { source, .. } => source,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn native_restore_error(
-    error: crate::storage::apfs::RestoreExecutionError<CowshedError>,
-) -> CowshedError {
-    match error {
-        crate::storage::apfs::RestoreExecutionError::Storage(error) => native_storage_error(error),
-        crate::storage::apfs::RestoreExecutionError::Activation { source: error, .. } => {
-            native_storage_error(*error)
-        }
-        crate::storage::apfs::RestoreExecutionError::Fence { source: error, .. } => error,
     }
 }
 
@@ -23394,8 +22944,8 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
             "retry: garbage collection plans again from the store as it is now",
         ),
         crate::storage::apfs::ApfsStorageError::PendingPublication(path) => CowshedError::conflict(
-            format!("restore publication is pending at {}", path.display()),
-            "repair the image or gateway evidence and retry restore",
+            format!("workspace publication is pending at {}", path.display()),
+            "repair the image or gateway evidence and retry",
         ),
         // Asking to shrink, or to resize to the size it already is, is a mistake in the request,
         // not a broken host: report it as usage so the caller is told to name a larger capacity.
@@ -24313,32 +23863,6 @@ async fn repair_git_worktree_link(
         .await
 }
 
-/// Refuse `checkpoint` and `restore` on a git-worktree workspace.
-///
-/// Its image is not self-contained: the tree is here and the history is in main. A checkpoint
-/// clone would capture half a repository, and restoring one would resurrect a registration for a
-/// worktree id main has since pruned, quietly claiming a branch another workspace may now hold.
-/// The refusal lands before any quota read or barrier, because nothing about the workspace's size
-/// or its supervisor changes the answer, and the hints name the two honest substitutes.
-#[cfg(target_os = "macos")]
-fn require_checkpointable(
-    name: &WorkspaceName,
-    metadata: &crate::metadata::DetachedWorkspaceMetadata,
-    verb: &str,
-) -> Result<()> {
-    if !is_git_worktree(metadata) {
-        return Ok(());
-    }
-    Err(CowshedError::conflict(
-        format!(
-            "git-worktree workspace {name} cannot {verb}: its history lives in main, not in its image"
-        ),
-        format!(
-            "commit and cowshed land {name}, or cowshed fork <name> for a checkpointable workspace"
-        ),
-    ))
-}
-
 /// Whether this workspace is a registered linked worktree of main's repository.
 ///
 /// Read from the store-side sidecar, so it answers while the workspace is detached — which is
@@ -24380,7 +23904,7 @@ fn abandoned_clone_origin(
     }
 }
 
-/// Whether a process holds `image`'s lifecycle lock right now — the lock a create, fork, restore
+/// Whether a process holds `image`'s lifecycle lock right now — the lock a create, fork
 /// or retirement holds on the image for as long as it works on it. A probe that takes the lock
 /// holds it until it is dropped, so it is fenced like every lease (`fork_lock`).
 #[cfg(target_os = "macos")]
@@ -24932,7 +24456,7 @@ mod unresolved_retirement_tests {
             .await
             .unwrap();
 
-        for operation in ["remove", "restore", "restore main"] {
+        for operation in ["remove", "restore main"] {
             let error = require_lost_groups_released(&workspace, &stopped, operation)
                 .await
                 .unwrap_err();
@@ -26024,26 +25548,6 @@ mod git_worktree_tests {
     }
 
     #[test]
-    fn checkpoint_and_restore_refuse_a_git_worktree_workspace_and_name_both_substitutes() {
-        let name = WorkspaceName::new("raven").expect("workspace name");
-        require_checkpointable(&name, &sidecar(false), "checkpoint")
-            .expect("a standalone workspace checkpoints");
-        require_checkpointable(&name, &sidecar(false), "restore")
-            .expect("a standalone workspace restores");
-
-        for verb in ["checkpoint", "restore"] {
-            let error = require_checkpointable(&name, &sidecar(true), verb)
-                .expect_err("a git-worktree workspace must refuse");
-            // Exit 4: the workspace is fine, the operation is the thing that cannot be done.
-            assert_eq!(error.exit_code(), 4);
-            assert!(error.message.contains(verb));
-            // Both honest substitutes: keep the work, or mint something checkpointable.
-            assert!(error.hint.contains("cowshed land raven"), "{}", error.hint);
-            assert!(error.hint.contains("cowshed fork"), "{}", error.hint);
-        }
-    }
-
-    #[test]
     fn only_a_git_worktree_workspace_reaches_into_mains_repository() {
         let main_mount = PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/main");
         assert_eq!(
@@ -26528,16 +26032,24 @@ mod workspace_origin_tests {
             volume_key: "disk-stale-session".to_owned(),
         };
         let owned = OwnedRepoIds::sole(origin.repo_id.clone());
-        validate_workspace_origin_against_inventory(&origin, &owned, &[&stale_session_fact])
-            .expect_err("marker and active storage incarnations must agree");
-        validate_workspace_origin_against_inventory(&origin, &owned, &[&session_fact])
-            .expect("marker repo, workspace, and incarnation match storage");
+        validate_workspace_origin_against_inventory(
+            &origin,
+            &owned,
+            std::slice::from_ref(&stale_session_fact),
+        )
+        .expect_err("marker and active storage incarnations must agree");
+        validate_workspace_origin_against_inventory(
+            &origin,
+            &owned,
+            std::slice::from_ref(&session_fact),
+        )
+        .expect("marker repo, workspace, and incarnation match storage");
         // A marker naming an identity the project does not own is still refused, which is what
         // keeps the membership test from becoming "any repo id".
         validate_workspace_origin_against_inventory(
             &origin,
             &OwnedRepoIds::sole(RepoId::parse("acme/unrelated").expect("repo")),
-            &[&session_fact],
+            std::slice::from_ref(&session_fact),
         )
         .expect_err("a marker identity the project does not own must be refused");
 
@@ -26549,7 +26061,6 @@ mod workspace_origin_tests {
                 WorkspaceRole::Workspace,
             ),
             mount_state: MountState::Mounted { mount_id: 7 },
-            checkpoints: Vec::new(),
         };
         let mut session_metadata = main_metadata(&persisted_old_root, session_incarnation);
         session_metadata.workspace = WorkspaceName::new("task").expect("task");
@@ -26566,7 +26077,6 @@ mod workspace_origin_tests {
         let main = DerivedWorkspace {
             workspace: lifecycle_workspace("main", main_incarnation.clone(), WorkspaceRole::Main),
             mount_state: MountState::Detached,
-            checkpoints: Vec::new(),
         };
         let metadata = main_metadata(&persisted_old_root, main_incarnation);
         validate_workspace_controller_root(
@@ -26634,7 +26144,6 @@ mod workspace_origin_tests {
         let main = DerivedWorkspace {
             workspace: lifecycle_workspace("main", main_incarnation.clone(), WorkspaceRole::Main),
             mount_state: MountState::Mounted { mount_id: 42 },
-            checkpoints: Vec::new(),
         };
         let metadata = main_metadata(Path::new("/historical/a"), main_incarnation);
 
@@ -27363,153 +26872,6 @@ mod binding_tests {
         );
 
         std::fs::remove_dir_all(&root).expect("fixture cleanup");
-    }
-
-    #[tokio::test]
-    async fn startup_pending_restore_destination_is_absent_until_restore_fence() {
-        use crate::metadata::WorkspaceRole;
-        use crate::runtime::supervisor::{CommitmentDraft, CommitmentPublisher, CommitmentSink};
-        use crate::storage::apfs::PendingPublicationFact;
-        use crate::storage::lifecycle::{LifecycleWorkspace, Revision, StorageFact};
-
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-project-pending-restore-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let telemetry = root.join("telemetry");
-        let repo = repo_id("acme/widget");
-        let source = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("source");
-        let destination =
-            WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").expect("destination");
-        let source_workspace = LifecycleWorkspace::new(
-            repo.clone(),
-            WorkspaceName::new("main").expect("main"),
-            source.clone(),
-            Revision::new(1),
-            Revision::new(11),
-            WorkspaceRole::Main,
-        )
-        .expect("source workspace");
-        let destination_workspace = LifecycleWorkspace::new(
-            repo.clone(),
-            WorkspaceName::new("main").expect("main"),
-            destination.clone(),
-            Revision::new(2),
-            Revision::new(11),
-            WorkspaceRole::Main,
-        )
-        .expect("destination workspace");
-        let facts = vec![
-            StorageFact {
-                workspace: source_workspace,
-                volume_key: "cowshed.acme--widget.main".to_owned(),
-            },
-            StorageFact {
-                workspace: destination_workspace.clone(),
-                volume_key: "cowshed.acme--widget.main".to_owned(),
-            },
-        ];
-        let pending = PendingPublicationFact {
-            workspace: destination_workspace,
-            image: root.join("main.dmg"),
-            mount_point: root.join("mount"),
-            source_checkpoint: "baseline".to_owned(),
-            source_incarnation: source.clone(),
-            replaced_incarnation: source.clone(),
-            destination_incarnation: destination.clone(),
-        };
-        let pending_slice = std::slice::from_ref(&pending);
-        let verified = verified_recovery_facts(&facts, pending_slice);
-        assert_eq!(verified.len(), 1);
-        assert_eq!(verified[0].workspace.incarnation(), &source);
-
-        // The pending destination is not an active fact until its restore fence activates the
-        // image; the audit record of the restore is telemetry and gates nothing.
-        let mut commitments =
-            CommitmentPublisher::open(&telemetry, crate::storage::audit::ContinuityAudit::Arrow, 8)
-                .expect("open audit publisher");
-        commitments
-            .record(CommitmentDraft::Restore {
-                repo_id: repo,
-                source_checkpoint: pending.source_checkpoint.clone(),
-                source_incarnation: pending.source_incarnation.clone(),
-                replaced_incarnation: pending.replaced_incarnation.clone(),
-                destination_incarnation: pending.destination_incarnation.clone(),
-            })
-            .await
-            .expect("record recovered restore");
-        let health = commitments.health().await.expect("audit health");
-        assert_eq!((health.recorded, health.failed), (1, 0));
-        drop(destination);
-        drop(commitments);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A scoped opening activates only the pending restores whose image lock it holds: a restore
-    /// of main fencing under main's lock in another process is left to it, while the store-wide
-    /// pass and an opening holding main's lock take it.
-    #[test]
-    fn an_opening_activates_only_the_restores_whose_image_lock_it_holds() {
-        use crate::metadata::WorkspaceRole;
-        use crate::storage::apfs::PendingPublicationFact;
-        use crate::storage::lifecycle::{LifecycleWorkspace, Revision};
-
-        let store = PathBuf::from("/private/cowshed/store/acme/widget");
-        let replaced =
-            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("replaced");
-        let destination =
-            WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").expect("destination");
-        let pending = [PendingPublicationFact {
-            workspace: LifecycleWorkspace::new(
-                repo_id("acme/widget"),
-                WorkspaceName::new("main").expect("main"),
-                destination.clone(),
-                Revision::new(2),
-                Revision::new(11),
-                WorkspaceRole::Main,
-            )
-            .expect("destination workspace"),
-            image: store.join("main.dmg"),
-            mount_point: store.join("mount"),
-            source_checkpoint: "baseline".to_owned(),
-            source_incarnation: replaced.clone(),
-            replaced_incarnation: replaced,
-            destination_incarnation: destination,
-        }];
-        let incarnations = |restorable: Vec<PendingPublicationFact>| {
-            restorable
-                .into_iter()
-                .map(|fact| fact.destination_incarnation)
-                .collect::<Vec<_>>()
-        };
-        let all = vec![pending[0].destination_incarnation.clone()];
-
-        assert_eq!(
-            incarnations(restorable_publications(&pending, true, &[])),
-            Vec::new(),
-            "a restore whose lock another process holds stays that process's"
-        );
-        assert_eq!(
-            incarnations(restorable_publications(
-                &pending,
-                true,
-                &[store.join("sessions/raven.dmg.lock")]
-            )),
-            Vec::new(),
-            "another workspace's lock is not the restore's"
-        );
-        assert_eq!(
-            incarnations(restorable_publications(
-                &pending,
-                true,
-                &[store.join("main.dmg.lock")]
-            )),
-            all
-        );
-        assert_eq!(
-            incarnations(restorable_publications(&pending, false, &[])),
-            all
-        );
     }
 }
 
@@ -28389,7 +27751,6 @@ mod terminal_project_cleanup_tests {
         let root = root("safe");
         let binding = root.join("repository.json");
         std::fs::create_dir_all(root.join(".staging")).expect("staging");
-        std::fs::create_dir_all(root.join("checkpoints/main")).expect("checkpoints");
         std::fs::create_dir_all(root.join("sessions/.trash")).expect("trash");
         std::fs::write(root.join("sessions/raven.dmg.lock"), b"").expect("session lock");
         std::fs::write(root.join("main.dmg.lock"), b"").expect("main lock");
@@ -28403,7 +27764,6 @@ mod terminal_project_cleanup_tests {
             b"preserve"
         );
         assert!(!root.join(".staging").exists());
-        assert!(!root.join("checkpoints").exists());
         assert!(!root.join("sessions").exists());
         assert!(!root.join("main.dmg.lock").exists());
         std::fs::remove_dir_all(root).expect("cleanup");
@@ -28586,7 +27946,6 @@ mod terminal_project_cleanup_tests {
             ("bundle", "sessions/.trash/raven-0123.bundle"),
             ("session", "sessions/raven.dmg.grants.json"),
             ("staged", ".staging/raven-4567.dmg"),
-            ("checkpoint", "checkpoints/raven/before.dmg"),
             ("temp", "tmp/raven/scratch"),
         ] {
             let (root, paths) = project(label);
@@ -28697,37 +28056,31 @@ mod terminal_project_cleanup_tests {
         std::fs::remove_dir_all(root).expect("cleanup");
     }
     #[test]
-    fn mains_own_checkpoints_and_temp_dir_do_not_refuse_its_restore() {
-        let (root, paths) = project("main-checkpoint");
-        let checkpoint = paths.checkpoints.join("main/before.dmg");
+    fn mains_own_temp_dir_does_not_refuse_its_restore() {
+        let (root, paths) = project("main-temp");
         let scratch = paths.exec_temp.join("main/scratch");
-        for owned in [&checkpoint, &scratch] {
-            std::fs::create_dir_all(owned.parent().expect("parent")).expect("parent");
-            std::fs::write(owned, b"main's own").expect("owned artifact");
-        }
+        std::fs::create_dir_all(scratch.parent().expect("parent")).expect("parent");
+        std::fs::write(&scratch, b"main's own").expect("owned artifact");
 
         require_terminal_storage(&paths.project_root)
-            .expect("main's retirement reclaims its own checkpoints and temp dir");
-        for owned in [&checkpoint, &scratch] {
-            assert_eq!(std::fs::read(owned).expect("kept"), b"main's own");
-        }
+            .expect("main's retirement reclaims its own temp dir");
+        assert_eq!(std::fs::read(&scratch).expect("kept"), b"main's own");
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     const VOLUME: &str = "0123456789abcdef0123456789abcdef";
 
-    /// A recovery image keeps its workspace's checkpoints and temp dir until it is exported, so
+    /// A recovery image keeps its workspace's temp dir until it is exported, so
     /// main's restore names the image and the export that takes it out of the store, never what
     /// it keeps.
     #[test]
-    fn a_recovery_image_is_named_before_the_checkpoints_and_temp_dir_it_keeps() {
+    fn a_recovery_image_is_named_before_the_temp_dir_it_keeps() {
         let (root, paths) = project("recovery-image");
         let image = paths.sessions.join(format!(".trash/raven-{VOLUME}.dmg"));
         for kept in [
             image.clone(),
             crate::metadata::sidecar_path(&image),
             paths.exec_temp.join("raven/scratch"),
-            paths.checkpoints.join("raven/before.dmg"),
         ] {
             std::fs::create_dir_all(kept.parent().expect("parent")).expect("parent");
             std::fs::write(&kept, b"retained").expect("kept");
@@ -28997,8 +28350,7 @@ mod terminal_project_cleanup_tests {
     /// nothing. The actual recovery export then runs its scoped ephemeral cleanup
     /// under the held name lock before any transfer: the whole temp dir goes, the
     /// image and its companions arrive at the destination byte for byte, and the same
-    /// guard admits the restore. (An independently retained checkpoint would still
-    /// block it; this fixture's workspace has none, as the cleanup's scope states.)
+    /// guard admits the restore.
     #[tokio::test]
     async fn mains_restore_admits_the_state_a_recovered_workspaces_export_leaves() {
         use crate::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};

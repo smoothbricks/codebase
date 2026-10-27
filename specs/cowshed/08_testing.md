@@ -65,7 +65,7 @@ No mounts, no root, no network — pure functions with table-driven cases:
   (`*.github.com`), port defaults, canonical host admission shared with exec, host:port refusal before write, verbatim
   invalid-key revoke and no-op recovery, and closed own/standing-only fork inheritance. Gateway denial hints must name
   hosts the grant parser admits.
-- **Marker files**: round-trip, unknown-version rejection, role transitions (new/fork/restore).
+- **Marker files**: round-trip, unknown-version rejection, role transitions (new/fork).
 - **CLI/error contract**: stdout shape per command, all `CowshedError` mappings including `Integrity` → own exit 7,
   exec-wrapper 106, MCP -32006, and `next:` hints. A child 7 still passes through unchanged. Golden tests make any
   taxonomy/shape change explicitly breaking. Wire-corpus acceptance also widens each object document, including each
@@ -107,17 +107,16 @@ No mounts, no root, no network — pure functions with table-driven cases:
   sharing a pipe emit each complete bounded report in one write; the reader keeps its strict record grammar rather than
   accepting interleaved fields.
 - **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe `attach`;
-  `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant reads; only
-  `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy. Compile-fail fixtures
-  prove forbidden methods and cross-workspace construction are unavailable. Every declared operation, including
-  `job.processes` and `job.processEvents`, has one request in `operations.corpus.json`; the codec, controller authority
-  routing, and served-handle decoding tests consume that same corpus. Process-tree and process-event reply goldens cover
-  omitted observations, observed exits, sparse changes, and coverage gaps through core serialization and the generated
-  public validators. `cowshed:wire-fixtures` regenerates those goldens before the workspace's `cargo-test-archive`
-  compiles them with `include_str!`; the archive hashes the produced JSON. Generated JSON is never edited by hand. The
-  target renders and formats the corpus in a git-ignored staging directory and publishes it with one rename, so a reader
-  running beside it (`cowshed:lint`) sees the old corpus or the new one, never a truncated or unformatted file;
-  `cowshed:wire-fixtures-test` witnesses that.
+  `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/push/grant reads; only `Coordinator` exposes
+  grant/revoke/destroy/rebase/land/gc/repo-mirror. Compile-fail fixtures prove forbidden methods and cross-workspace
+  construction are unavailable. Every declared operation, including `job.processes` and `job.processEvents`, has one
+  request in `operations.corpus.json`; the codec, controller authority routing, and served-handle decoding tests consume
+  that same corpus. Process-tree and process-event reply goldens cover omitted observations, observed exits, sparse
+  changes, and coverage gaps through core serialization and the generated public validators. `cowshed:wire-fixtures`
+  regenerates those goldens before the workspace's `cargo-test-archive` compiles them with `include_str!`; the archive
+  hashes the produced JSON. Generated JSON is never edited by hand. The target renders and formats the corpus in a
+  git-ignored staging directory and publishes it with one rename, so a reader running beside it (`cowshed:lint`) sees
+  the old corpus or the new one, never a truncated or unformatted file; `cowshed:wire-fixtures-test` witnesses that.
 - **Public declaration IR:** `cowshed:declaration-model-test` admits the actual owner model through its generated Typia
   Equals guards in one setup, pins `get`/`as-str`/`display` projection metadata, and refuses missing, unknown and extra
   metadata through both assertion and JSON parsing. It consumes the prebuilt owner generator, without an N-API wire
@@ -144,19 +143,14 @@ No mounts, no root, no network — pure functions with table-driven cases:
   past its PATH writer; a failing start refuses by name and makes no commit. Either way main's daemon record bytes and
   its live `d.sock` are untouched. The cli package's `nx-socket-dir.test.ts` proves the socket owner refuses an unserved
   workspace and a runtime link that leads to another checkout.
-- **Per-workspace aggregate checkpoint quota**: substrate stats fixtures freeze active allocated bytes, total checkpoint
-  bytes/count, and the pinned-byte subset across mixed pinned/automatic images. Runtime state machines prove
-  `existing checkpoints + one active-image charge`, exact-boundary admission, one-byte/count overflow refusal with zero
-  image/fact/metadata effect, and two-workspace isolation.
 - **GC plan purity and revalidation**: preview fixtures freeze candidate identity/path/allocated-byte/reason ordering
-  and byte sums, exclude every pinned checkpoint, and compare repeated previews. Dry-run preserves every image, sidecar,
-  fact, and metadata byte. Pin/incarnation/size changes and a held lifecycle lock make execution return stale-plan
-  `Conflict` before mutation; a fresh unchanged plan reclaims exactly its candidates. A preview and reclaim over a
-  retired workspace whose 100 GiB sparse checkpoint images are mode 000 succeed, because identity is taken from `stat`
-  and never opens an image; a same-size, same-time replacement image and a same-length, same-time rewritten record each
-  change the identity. The unreadable-inventory fixture uses ordinary RAW `.dmg` candidates: the first candidate is
-  deferred on its inventory error while the later candidate is reclaimed. A file that is not a `.dmg` is never a GC
-  candidate.
+  and byte sums, and compare repeated previews. Dry-run preserves every image, sidecar, fact, and metadata byte.
+  Incarnation/size changes and a held lifecycle lock make execution return stale-plan `Conflict` before mutation; a
+  fresh unchanged plan reclaims exactly its candidates. A preview and reclaim over a retired workspace whose 100 GiB
+  sparse session images are mode 000 succeed, because identity is taken from `stat` and never opens an image; a
+  same-size, same-time replacement image and a same-length, same-time rewritten record each change the identity. The
+  unreadable-inventory fixture uses ordinary RAW `.dmg` candidates: the first candidate is deferred on its inventory
+  error while the later candidate is reclaimed. A file that is not a `.dmg` is never a GC candidate.
 - **Push CAS and preservation model**: pure state-machine tables cover each omitted/satisfied/mismatched combination of
   expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
   `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID
@@ -543,16 +537,16 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   fragmented file on the host's filesystem, cut a few steps, abandoned, and finished by a second release that counts
   only what was left. The deleting directory's crash points are witnessed the same way. A release returns with its entry
   whole and unlocked and frees nothing, whatever it releases (a build volume, a removed workspace's image, an orphan
-  session or staging image, an expired checkpoint, a failed restore's staged clone) and whether or not a gateway takes
-  its nudge: the image is off its name, every byte waits in `.deleting`, and a retry finds the commit already made,
-  makes its rename durable and answers. A link in place of the deleting directory refuses. A directory store's release
-  of a tree a process holds anything inside answers with the tree committed whole to its `.deleting` directory, deletes
-  nothing and nudges nothing, and `finish_build_releases` leaves a build-volume tree while it is held and deletes it
-  once it is not. An unsynced native entry still requires all rename syncs before its owner's retry answers. Directory
-  regressions replace the deleting directory's pathname after acquisition: neither retry confirmation nor the finisher
-  may follow the foreign tree. The finisher syncs both held directories while the unsynced entry is still intact, then
-  deletes through those descriptors; a replaced opened child and foreign symlink targets remain untouched. A real
-  self-held payload stays, but the finisher's own observation does not retain it.
+  session or staging image) and whether or not a gateway takes its nudge: the image is off its name, every byte waits in
+  `.deleting`, and a retry finds the commit already made, makes its rename durable and answers. A link in place of the
+  deleting directory refuses. A directory store's release of a tree a process holds anything inside answers with the
+  tree committed whole to its `.deleting` directory, deletes nothing and nudges nothing, and `finish_build_releases`
+  leaves a build-volume tree while it is held and deletes it once it is not. An unsynced native entry still requires all
+  rename syncs before its owner's retry answers. Directory regressions replace the deleting directory's pathname after
+  acquisition: neither retry confirmation nor the finisher may follow the foreign tree. The finisher syncs both held
+  directories while the unsynced entry is still intact, then deletes through those descriptors; a replaced opened child
+  and foreign symlink targets remain untouched. A real self-held payload stays, but the finisher's own observation does
+  not retain it.
 - **Released images are nudged to the gateway and freed by its cleanup** (05_gateway.md, "Deleting released images"). A
   release through a store whose configuration names no gateway (a function call over a fixture store no test gave one)
   returns with its entry whole in `.deleting` and says so once per process. The nudge is a function call to a listener
@@ -581,12 +575,6 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   workspace and holds its lock in another process: the supervisor, a process of its own, says once on stderr that it
   waits for that lock, naming the holder's PID, and mounts and serves only after the test releases the holder, its
   socket's publication waking the test.
-- **Stateless restore recovery boundaries**: interrupt after undo-sidecar publication, each image/CA-key swap and
-  rename, each canonical/undo parent fsync, pending metadata rename/fsync, staged-metadata removal, and final parent
-  fsync. Restart twice from every fixture. Recovery must derive rollback/forward state only from APFS image, detached
-  metadata, grant/CA, and `.restore.json` facts; converge idempotently; accept only the corresponding token/incarnation;
-  and leave no `.restore-fences`, runtime journal, or second mutable fact (the restore audit record may be emitted more
-  than once across retries — it gates nothing).
 
 ## Integration tests (real substrate)
 
@@ -1139,16 +1127,16 @@ Covered flows:
   the recorded branch, HEAD, status, bytes, and index remain byte-for-byte unchanged. Assert no preservation claim is
   made for objects reachable only from a temporary ref or `FETCH_HEAD`, retire the source only after the durable ref is
   installed, and recover the exact commit graph after retirement.
-- **Writable handoff and fork recovery**: checkpoint a quiesced writable workspace containing committed and uncommitted
-  state, hand the same live workspace to a successive writer, and prove it can edit, execute, commit, and push. Repeat
-  by creating a live CoW fork at handoff; prove the fork is independently writable with fresh identity and
-  closed-baseline grants, then simulate writer failure and recover from both the retained source/checkpoint and the
-  unaffected fork without losing the pre-handoff state.
-- **Push compare-and-swap conflicts**: race workspace restore against expected-incarnation push, a new source commit
-  against expected-source-head push, and another preservation update against expected-destination-head push (including
-  expected-missing versus an existing ref). Every stale attempt must return `Conflict`, identify the moved expectation,
-  leave the destination object ID and main working tree/index unchanged, and retain the source workspace. A retry with
-  freshly read expectations must preserve exactly the newly selected source head.
+- **Writable handoff and fork recovery**: quiesce a writable workspace containing committed and uncommitted state, hand
+  the same live workspace to a successive writer, and prove it can edit, execute, commit, and push. Repeat by creating a
+  live CoW fork at handoff; prove the fork is independently writable with fresh identity and closed-baseline grants,
+  then simulate writer failure and recover from both the retained source and the unaffected fork without losing the
+  pre-handoff state.
+- **Push compare-and-swap conflicts**: race a new source commit against expected-source-head push, and another
+  preservation update against expected-destination-head push (including expected-missing versus an existing ref). Every
+  stale attempt must return `Conflict`, identify the moved expectation, leave the destination object ID and main working
+  tree/index unchanged, and retain the source workspace. A retry with freshly read expectations must preserve exactly
+  the newly selected source head.
 - **Checked-out target fast-forward**: create a clean main workspace with the selected target branch checked out, land a
   reviewed workspace onto that branch, and assert the target ref, `HEAD`, index, tracked files, and worktree tree all
   advance to the exact validated source object ID. Assert no hidden or namespaced ref is accepted as a substitute for
@@ -1180,8 +1168,8 @@ Covered flows:
   and every captured/redirect × inline/file discriminant. Valid UTF-8 serializes as `{encoding:"utf8",data}`, other
   bytes as `{encoding:"base64",data}`; both decoders enforce the decoded inline bound and preserve bytes exactly.
   Ordinary `JobInfo` JSON permits this bounded union, while controller audit records reject every payload/path field.
-  File variants have no inline data and inline variants invent no path. Logs/follow/reconnect/ checkpoint readers return
-  identical raw bytes without caller representation branches.
+  File variants have no inline data and inline variants invent no path. Logs/follow/reconnect readers return identical
+  raw bytes without caller representation branches.
 - **supervisor grant-revision advance**: start a long-running job at revision N, apply an effective filesystem grant or
   revoke, and assert the manager advances the same supervisor to N+1 and starts no second one before the next exec. The
   running job completes under N, an inner per-command profile can only narrow N and cannot broaden it, the next exec
@@ -1194,25 +1182,23 @@ Covered flows:
   the owned attachment or names its cleanup refusal. Foreign/stale descendants are neither targets nor vetoes. No
   combined `--mountPoint` attach, fallback or retry is permitted. Detached verification/resize and unformatted RAW
   retain intentional unmounted fixtures;
-- **Live captures stay mounted; build seeds retain writer exclusion**: a live capture (`fork`, `checkpoint`) flushes the
-  source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
-  mount flags are unchanged (01a_apfs.md, "Images"). `fork` and `restore` pass a formatted clone to the one exact-image
-  no-mount attach, pinned `fsck_apfs -q` and `mount_apfs` path and verify the resulting held mount identity. A failed
-  operation refuses publication and cleans up only the destination, never the live source (02_workspaces.md, fork step
-  4). A build seed (16_build_volumes.md, "Targets and seeds") uses the same block-atomic mounted descriptor clone with
-  supervised admission closed and the Nx guard — and, in a project without the mbx capability, the existing
-  Cargo-profile guards — held through capture and publication. Tests require an exempt index/cache reader to survive
-  with source identity and mounts unchanged; an Nx state holder or a held known Cargo profile refuses seed replacement.
-  The new-host-profile gap remains explicit in that contract for a project that keeps its Cargo target in the build
-  volume; a project with mbx holds no Cargo profile there for it to gap over, and its capture takes no Cargo lock. No
-  fencing of the gap case is claimed. RAW has no outer allocation map for a live capture to split (02_workspaces.md,
-  fork step 2).
+- **Live captures stay mounted; build seeds retain writer exclusion**: a live capture (`fork`) flushes the source volume
+  and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and mount flags are
+  unchanged (01a_apfs.md, "Images"). `fork` passes a formatted clone to the one exact-image no-mount attach, pinned
+  `fsck_apfs -q` and `mount_apfs` path and verify the resulting held mount identity. A failed operation refuses
+  publication and cleans up only the destination, never the live source (02_workspaces.md, fork step 4). A build seed
+  (16_build_volumes.md, "Targets and seeds") uses the same block-atomic mounted descriptor clone with supervised
+  admission closed and the Nx guard — and, in a project without the mbx capability, the existing Cargo-profile guards —
+  held through capture and publication. Tests require an exempt index/cache reader to survive with source identity and
+  mounts unchanged; an Nx state holder or a held known Cargo profile refuses seed replacement. The new-host-profile gap
+  remains explicit in that contract for a project that keeps its Cargo target in the build volume; a project with mbx
+  holds no Cargo profile there for it to gap over, and its capture takes no Cargo lock. No fencing of the gap case is
+  claimed. RAW has no outer allocation map for a live capture to split (02_workspaces.md, fork step 2).
 - **mbx target link at fork**: fork a project with the mbx capability whose source checkout has a `target` link naming
   the source's managed target on the build-cache volume; the fork starts with that inherited link deleted, its build
   image otherwise cloned as any other, and cowshed's refresh neither recreates nor retargets the link — the first build
   through mbx creates the fork's own (16_build_volumes.md). A project without mbx forks with its build-volume `target`
   exactly as today.
-- checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
   unchanged (01a_apfs.md, "Clone cost follows extents, not size");
@@ -1220,10 +1206,10 @@ Covered flows:
   canonical-flag remount, 01a_apfs.md), stub `.envrc`;
 - lazy volume creation at adopt: the store volume created idempotently before the first image;
 - rm-while-busy (open file handle → grace → force detach);
-- gc: release of retired trash, orphan session and staging images and expired checkpoints, each nudged to the gateway's
-  cleanup, orphan mountpoint removal; real root-owned `0700` event-log debris on an unmounted directory is retained by a
-  no-replace, same-parent rename, never blocks image reclamation or healthy doctor info, and mixed work, symlink
-  substitutions, collisions and mounted filesystems remain protected;
+- gc: release of retired trash, orphan session and staging images, each nudged to the gateway's cleanup, orphan
+  mountpoint removal; real root-owned `0700` event-log debris on an unmounted directory is retained by a no-replace,
+  same-parent rename, never blocks image reclamation or healthy doctor info, and mixed work, symlink substitutions,
+  collisions and mounted filesystems remain protected;
 - gateway: mirror hit/miss against a local fixture registry, token→policy mapping, 403 hint body, audit records, CONNECT
   allow/deny, `repo mirror` fetch into a read-only bare mirror;
 - **Linux connector end to end**: for an attached workspace, assert exactly one connector exists in its private netns,
@@ -1233,8 +1219,7 @@ Covered flows:
   behavior, and no direct fallback. None of these clients may use a Unix-socket transport. Run two workspaces with the
   same address/port and prove neither can reach the other's connector or socket. Detach must stop admission, drain
   connections, kill the connector cgroup, unlink the socket, and leave 7644 unbound; attach must create exactly one
-  fresh connector before exec admission. Restore must drain old connections and make the old connector/socket/token
-  unusable before publishing the new incarnation.
+  fresh connector before exec admission.
 - gateway interception (05_gateway.md): an intercepted host serves a workspace-CA leaf the in-image anchor trusts,
   injects the Keychain credential, and records a **request-granular** audit line; an `--opaque` host tunnels without
   injection; the **upstream-health gate** fails a dead upstream fast with a classifiable error (not a per-request
@@ -1253,29 +1238,20 @@ Covered flows:
   replace/rename/unlink/link/metadata mutation beneath `.cowshed/job/**`, inherited writable protected FDs, and symlink,
   hardlink, bind-mount, alternate-spelling, and `/proc` reach-arounds. The trusted supervisor alone can append.
 - **audit sink and record channel**: prove the writer capability is close-on-exec/non-inheritable. Round-trip exact
-  Admission/Terminal/Checkpoint/Fork/Restore variants through the Arrow sink (one sealed segment per record,
-  writer-local order, private mode, temporary cleaned on a crash before rename, sealed segment kept on a crash after),
-  through `off`, and through an injected sink whose refusals surface as `doctor` health, never as a failed act.
-  Controller Arrow carries only the frozen identity/order/ lineage/state/count/hash/batch-digest fields; adding
-  `inline_bytes`, `protected_path`, `source_path`, summary, or raw payload rejects. Protected Arrow round-trips exact
-  Job/CheckpointManifest variants and rejects tag/null mismatches. Mutate/delete protected artifacts, forge controller
-  rows, alter complete frames, contradict lineage, and remove each side in turn: status/read/restore/publication returns
-  typed `Integrity`, preserves both sides, and never picks outside/newer. Only an incomplete trailing frame is
-  discardable; its retained `batch_sha256` appears in recovery.
+  `ControllerCommitment` variants (13_telemetry.md) through the Arrow sink (one sealed segment per record, writer-local
+  order, private mode, temporary cleaned on a crash before rename, sealed segment kept on a crash after), through `off`,
+  and through an injected sink whose refusals surface as `doctor` health, never as a failed act. Controller Arrow
+  carries only the frozen identity/order/ lineage/state/count/hash/batch-digest fields; adding `inline_bytes`,
+  `protected_path`, `source_path`, summary, or raw payload rejects. Protected Arrow round-trips exact Job variant and
+  rejects tag/null mismatches. Mutate/delete protected artifacts, forge controller rows, alter complete frames,
+  contradict lineage, and remove each side in turn: status/read/publication returns typed `Integrity`, preserves both
+  sides, and never picks outside/newer. Only an incomplete trailing frame is discardable; its retained `batch_sha256`
+  appears in recovery.
 - **lineage authorizes inherited records**: open a records file containing frames from the workspace's marker lineage
   and assert it opens; a frame from an incarnation outside the lineage is `Integrity`; a marker written before lineage
-  was recorded is healed once from the foreign origins already in its records and is strict afterwards; fork and restore
-  write the clone source's incarnation followed by the source's own lineage into the new marker; a marker from another
-  repository is never an ancestor.
-- **checkpoint barrier and resident bytes**: checkpoint while two jobs have below-inline-limit bytes only in supervisor
-  memory and another appends to a spill. Assert admission/artifact mutation pauses and every running prefix promotes and
-  fsyncs. The exact
-  `CheckpointManifestRecord { version,repo_id,origin_incarnation,barrier_id,visible_jobs, records_sha256 }` is the
-  complete manifest batch; each visible stream has exact storage kind/count/hash/path and path iff file. Clone while
-  held, then record the matching
-  `CheckpointCommitment { version,order,repo_id,origin_incarnation,checkpoint_id,barrier_id,manifest_batch_sha256 }`
-  audit record. Restore exposes exactly this boundary: terminal inline bytes resolve through prefix Job rows, running
-  bytes through files, and no checkpointed byte remains only in process memory.
+  was recorded is healed once from the foreign origins already in its records and is strict afterwards; fork write the
+  clone source's incarnation followed by the source's own lineage into the new marker; a marker from another repository
+  is never an ancestor.
 - **combined job-output quota**: race separate stdout/stderr writers through memory and file promotion. Assert one exact
   crossing over protected plus in-flight bytes, no post-boundary payload retention, process-group TERM/grace/KILL, both
   pipes drained without deadlock, artifact sealing before the terminal audit record, and explicit `outputLimit`. Repeat
@@ -1352,7 +1328,6 @@ registration.
 | -------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------- |
 | `cowshed fork` cold              | ≤ 1 s                   | clonefile + attach + `fsck_apfs -q` + `mount_apfs` (the mount pays the extent copy)            |
 | `cowshed rm` complete retirement | No measured bound       | detach and the release's rename finish before success; the gateway thread frees it, off-budget |
-| `cowshed checkpoint`             | ≤ 1 s                   | descriptor-clone path                                                                          |
 | `cowshed path` / `ls`            | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design                                   |
 | exec sandbox overhead            | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                                              |
 

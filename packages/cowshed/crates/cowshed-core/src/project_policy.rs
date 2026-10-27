@@ -1,27 +1,23 @@
 //! The trusted project policy: `/private/cowshed/store/<owner>/<repo>/policy.json`.
 //!
 //! Controller-owned, mode 0600, on the store volume every sandbox is denied. It holds what the
-//! operator decided for the whole project rather than for one workspace: checkpoint quotas,
-//! standing read/egress grants and workspace-relative write denies. A workspace's own grants
+//! operator decided for the whole project rather than for one workspace: standing read/egress
+//! grants and workspace-relative write denies. A workspace's own grants
 //! add on top; a workspace grant delta cannot remove a project deny.
 //!
 //! A missing file is the empty policy. A file that does not parse as exactly this shape fails
 //! closed: an unknown field is refused rather than ignored, because a policy the controller cannot
 //! read completely is not one it may partially apply.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::dto::CheckpointQuota;
-use crate::metadata::{EgressRule, GrantSet, MetadataError, WorkspaceName, read_json, write_json};
+use crate::metadata::{EgressRule, GrantSet, MetadataError, read_json, write_json};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectPolicy {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub checkpoint_quotas: BTreeMap<WorkspaceName, CheckpointQuota>,
     #[serde(default)]
     pub grants: ProjectGrants,
 }
@@ -215,20 +211,14 @@ mod tests {
             ProjectPolicy::default()
         );
 
-        let mut policy = ProjectPolicy::default();
-        policy.checkpoint_quotas.insert(
-            WorkspaceName::new("raven").unwrap(),
-            CheckpointQuota {
-                max_count: 2,
-                max_bytes: 1024,
+        let policy = ProjectPolicy {
+            grants: ProjectGrants {
+                revision: 1,
+                read: vec![PathBuf::from("/opt/shared")],
+                egress: vec![rule("registry.example.test", &[])],
+                deny_write: Vec::new(),
+                deny: vec![PathBuf::from(".runtime")],
             },
-        );
-        policy.grants = ProjectGrants {
-            revision: 1,
-            read: vec![PathBuf::from("/opt/shared")],
-            egress: vec![rule("registry.example.test", &[])],
-            deny_write: Vec::new(),
-            deny: vec![PathBuf::from(".runtime")],
         };
         policy.write(&path).unwrap();
         assert_eq!(ProjectPolicy::read(&path).unwrap(), policy);
@@ -237,7 +227,6 @@ mod tests {
         assert_eq!(
             written,
             serde_json::json!({
-                "checkpointQuotas": { "raven": { "maxCount": 2, "maxBytes": 1024 } },
                 "grants": {
                     "revision": 1,
                     "read": ["/opt/shared"],
@@ -247,7 +236,7 @@ mod tests {
             })
         );
 
-        // The flat workspace → quota map this file used to be is not silently read as policy.
+        // A flat map of workspace entries is not silently read as policy.
         std::fs::write(
             &path,
             br#"{ "raven": { "maxCount": 2, "maxBytes": 1024 } }"#,

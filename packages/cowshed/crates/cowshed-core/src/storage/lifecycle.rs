@@ -10,8 +10,6 @@ use crate::metadata::{GrantSet, WorkspaceIncarnation, WorkspaceName, WorkspaceRo
 use crate::repository::RepoId;
 use cowshed_apfs::image::ImageCapacity;
 
-use super::CheckpointLabel;
-
 /// A monotonic controller-visible revision.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Revision(u64);
@@ -77,54 +75,6 @@ impl LifecycleWorkspace {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointRef {
-    workspace: LifecycleWorkspace,
-    label: CheckpointLabel,
-    revision: Revision,
-    pinned: bool,
-}
-
-impl CheckpointRef {
-    pub fn new(
-        workspace: LifecycleWorkspace,
-        label: CheckpointLabel,
-        revision: Revision,
-        pinned: bool,
-    ) -> Self {
-        Self {
-            workspace,
-            label,
-            revision,
-            pinned,
-        }
-    }
-    pub fn workspace(&self) -> &LifecycleWorkspace {
-        &self.workspace
-    }
-    pub fn label(&self) -> &CheckpointLabel {
-        &self.label
-    }
-    pub const fn revision(&self) -> Revision {
-        self.revision
-    }
-    pub const fn pinned(&self) -> bool {
-        self.pinned
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Pin {
-    Pinned,
-    Automatic,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RestoreMode {
-    Replace,
-    VerifyOnly,
-}
-
 /// One authoritative lifecycle fact, whether a planner asserted it or a substrate observed it.
 ///
 /// Expectation and observation are the same fact at two moments, so they are one type: a plan
@@ -146,12 +96,6 @@ pub enum LifecycleFact {
         repo: RepoId,
         name: WorkspaceName,
         topology_revision: Revision,
-    },
-    Checkpoint {
-        repo: RepoId,
-        workspace: WorkspaceName,
-        label: CheckpointLabel,
-        revision: Revision,
     },
 }
 
@@ -221,8 +165,6 @@ macro_rules! plan_type {
 plan_type!(AdoptPlan);
 plan_type!(CreatePlan);
 plan_type!(ForkPlan);
-plan_type!(CheckpointPlan);
-plan_type!(RestorePlan);
 plan_type!(RetirePlan);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -257,17 +199,6 @@ pub enum Operation {
     Fork {
         source: WorkspaceName,
         destination: WorkspaceName,
-        identity: OperationIdentity,
-    },
-    Checkpoint {
-        workspace: WorkspaceName,
-        label: CheckpointLabel,
-        pin: Pin,
-    },
-    Restore {
-        workspace: WorkspaceName,
-        label: CheckpointLabel,
-        mode: RestoreMode,
         identity: OperationIdentity,
     },
     Retire {
@@ -342,8 +273,6 @@ pub enum PlanError {
     MainDestination,
     #[error("source and destination repositories differ")]
     RepositoryMismatch,
-    #[error("checkpoint belongs to a different workspace version")]
-    CheckpointMismatch,
     #[error("main cannot be retired or reclaimed")]
     MainIsPermanent,
     #[error(
@@ -367,19 +296,6 @@ pub trait LifecyclePlanner: Send + Sync {
         from: &LifecycleWorkspace,
         destination: Destination,
     ) -> Result<ForkPlan, PlanError>;
-    fn plan_checkpoint(
-        &self,
-        workspace: &LifecycleWorkspace,
-        label: CheckpointLabel,
-        pin: Pin,
-    ) -> Result<CheckpointPlan, PlanError>;
-    fn plan_restore(
-        &self,
-        workspace: &LifecycleWorkspace,
-        checkpoint: &CheckpointRef,
-        mode: RestoreMode,
-        identity: OperationIdentity,
-    ) -> Result<RestorePlan, PlanError>;
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError>;
 }
 
@@ -462,52 +378,6 @@ impl LifecyclePlanner for PurePlanner {
             },
         })
     }
-    fn plan_checkpoint(
-        &self,
-        workspace: &LifecycleWorkspace,
-        label: CheckpointLabel,
-        pin: Pin,
-    ) -> Result<CheckpointPlan, PlanError> {
-        Ok(CheckpointPlan {
-            expected: vec![LifecycleFact::active(workspace)],
-            operation: Operation::Checkpoint {
-                workspace: workspace.name.clone(),
-                label,
-                pin,
-            },
-        })
-    }
-    fn plan_restore(
-        &self,
-        workspace: &LifecycleWorkspace,
-        checkpoint: &CheckpointRef,
-        mode: RestoreMode,
-        identity: OperationIdentity,
-    ) -> Result<RestorePlan, PlanError> {
-        if checkpoint.workspace.repo != workspace.repo
-            || checkpoint.workspace.name != workspace.name
-            || checkpoint.workspace.incarnation != workspace.incarnation
-        {
-            return Err(PlanError::CheckpointMismatch);
-        }
-        Ok(RestorePlan {
-            expected: vec![
-                LifecycleFact::active(workspace),
-                LifecycleFact::Checkpoint {
-                    repo: workspace.repo.clone(),
-                    workspace: workspace.name.clone(),
-                    label: checkpoint.label.clone(),
-                    revision: checkpoint.revision,
-                },
-            ],
-            operation: Operation::Restore {
-                workspace: workspace.name.clone(),
-                label: checkpoint.label.clone(),
-                mode,
-                identity,
-            },
-        })
-    }
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
         if workspace.name.is_main() {
             return Err(PlanError::MainIsPermanent);
@@ -526,14 +396,7 @@ pub trait ImmutablePlan: Send + Sync {
     fn operation(&self) -> &Operation;
 }
 macro_rules! immutable_plan { ($($ty:ty),+ $(,)?) => {$ (impl ImmutablePlan for $ty { fn expected(&self) -> &[LifecycleFact] { self.expected() } fn operation(&self) -> &Operation { self.operation() } })+}; }
-immutable_plan!(
-    AdoptPlan,
-    CreatePlan,
-    ForkPlan,
-    CheckpointPlan,
-    RestorePlan,
-    RetirePlan,
-);
+immutable_plan!(AdoptPlan, CreatePlan, ForkPlan, RetirePlan,);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LifecycleReceipt {
@@ -565,21 +428,6 @@ impl RetiredRef {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointFact {
-    pub repo: RepoId,
-    pub workspace: WorkspaceName,
-    pub label: CheckpointLabel,
-    pub revision: Revision,
-    pub pin: Pin,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RestoreReceipt {
-    pub previous_incarnation: WorkspaceIncarnation,
-    pub workspace: LifecycleWorkspace,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageGcReason {
     RetiredWorkspace,
@@ -596,7 +444,6 @@ pub enum StorageGcReason {
     /// late writers left after a volume was retired - junk by the project's own rules, or a
     /// visible file gc names and keeps.
     OrphanMountpoint,
-    ExpiredCheckpoint,
     /// A `<ws>-<tip>.bundle` file in `sessions/.trash/`: the recovery bundle `rm --abandon`
     /// verifies and writes there before retiring unlanded work, whose tips main's repository also
     /// keeps (02_workspaces.md, `rm` step 1). It becomes a candidate only under a sweep that
@@ -712,10 +559,6 @@ impl RootHeldMountpoint {
 /// What a sweep examined and deliberately left alone, by the rule that spared it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StorageGcRetained {
-    /// Checkpoints pinned by label or `--keep`.
-    pub pinned: usize,
-    /// Automatic checkpoints inside the recency window.
-    pub recent: usize,
     /// Staging entries whose workspace lifecycle lock is held: an operation is still
     /// writing them, so they are not garbage yet.
     pub active: usize,
@@ -764,14 +607,6 @@ impl StorageGcPlan {
         self.examined
     }
 
-    pub const fn retained_pinned(&self) -> usize {
-        self.retained.pinned
-    }
-
-    pub const fn retained_recent(&self) -> usize {
-        self.retained.recent
-    }
-
     pub const fn retained_active(&self) -> usize {
         self.retained.active
     }
@@ -790,8 +625,6 @@ pub struct StorageGcDeferred {
 pub struct StorageGcReport {
     pub examined: usize,
     pub reclaimed: usize,
-    pub retained_pinned: usize,
-    pub retained_recent: usize,
     pub retained_active: usize,
     pub released_bytes: u64,
     /// Candidate-local failures; the sweep continues with the remaining candidates.
@@ -804,11 +637,6 @@ pub struct StorageGcReport {
 pub struct SubstrateStats {
     pub logical_bytes: u64,
     pub allocated_bytes: u64,
-    pub checkpoint_count: u64,
-    /// Allocated bytes consumed by every published checkpoint for this workspace.
-    pub checkpoint_bytes: u64,
-    /// The authoritative pinned subset of `checkpoint_bytes`.
-    pub pinned_checkpoint_bytes: u64,
 }
 
 /// Where a published workspace stands against the kernel mount table.
@@ -1003,10 +831,9 @@ fn refusal_message(refusal: &MountRefusal) -> String {
 pub struct DerivedWorkspace {
     pub workspace: LifecycleWorkspace,
     pub mount_state: MountState,
-    pub checkpoints: Vec<CheckpointFact>,
 }
 
-/// Derive enumeration from canonical storage, kernel mounts, and versioned checkpoint facts.
+/// Derive enumeration from canonical storage and kernel mounts.
 ///
 /// A refused join derives its workspace [`MountState::Unproven`] and fails nothing: which
 /// operation a refusal fails is decided by the operation that names the workspace
@@ -1014,7 +841,6 @@ pub struct DerivedWorkspace {
 pub fn derive_workspaces(
     storage: impl IntoIterator<Item = StorageFact>,
     mounts: impl IntoIterator<Item = impl Into<MountJoin>>,
-    checkpoints: impl IntoIterator<Item = CheckpointFact>,
 ) -> Result<Vec<DerivedWorkspace>, DerivationError> {
     let storage: Vec<_> = storage.into_iter().collect();
     let mut seen_workspaces = BTreeSet::new();
@@ -1046,40 +872,15 @@ pub fn derive_workspaces(
             } => (volume_key, MountState::Unproven(refusal)),
         })
         .collect();
-    let mut seen_checkpoints = BTreeSet::new();
-    let mut checkpoints_by_workspace: BTreeMap<(RepoId, WorkspaceName), Vec<CheckpointFact>> =
-        BTreeMap::new();
-    for checkpoint in checkpoints {
-        let key = (
-            checkpoint.repo.clone(),
-            checkpoint.workspace.clone(),
-            checkpoint.label.clone(),
-        );
-        if !seen_checkpoints.insert(key) {
-            return Err(DerivationError::DuplicateCheckpoint {
-                workspace: checkpoint.workspace,
-                label: checkpoint.label,
-            });
-        }
-        checkpoints_by_workspace
-            .entry((checkpoint.repo.clone(), checkpoint.workspace.clone()))
-            .or_default()
-            .push(checkpoint);
-    }
 
     let mut result = Vec::with_capacity(storage.len());
     for fact in storage {
         let mount_state = mounts
             .remove(&fact.volume_key)
             .unwrap_or(MountState::Detached);
-        let mut checkpoints = checkpoints_by_workspace
-            .remove(&(fact.workspace.repo.clone(), fact.workspace.name.clone()))
-            .unwrap_or_default();
-        checkpoints.sort_by(|left, right| left.label.cmp(&right.label));
         result.push(DerivedWorkspace {
             workspace: fact.workspace,
             mount_state,
-            checkpoints,
         });
     }
     result.sort_by(|a, b| a.workspace.name.cmp(&b.workspace.name));
@@ -1092,11 +893,6 @@ pub enum DerivationError {
     DuplicateWorkspace(WorkspaceName),
     #[error("duplicate canonical volume name {0}")]
     DuplicateVolumeKey(String),
-    #[error("duplicate checkpoint {workspace}/{label}")]
-    DuplicateCheckpoint {
-        workspace: WorkspaceName,
-        label: CheckpointLabel,
-    },
 }
 
 /// Dispatch a blocking command or filesystem operation away from async runtime workers, inside

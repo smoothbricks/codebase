@@ -40,10 +40,8 @@ forwarding either way; it is still never accepted in a request URL, cookie, alte
 
 The endpoint selects the workspace; the token is defense in depth. A missing or wrong credential is `407` with
 `Proxy-Authenticate: Basic realm="cowshed"` — one terminal round trip, so a client either answers with the credential it
-holds or aborts instead of retrying a tunnel that will never open. Restore rotates the token and CA, drains and kills
-the old Linux connector cgroup, closes all old gateway connections, recreates the Linux socket/netns connector, and
-atomically rewrites client wiring; a preserved macOS port therefore does not preserve authority. Detach drains and
-removes the connector/socket before releasing the netns; attach creates exactly one before admitting execs.
+holds or aborts instead of retrying a tunnel that will never open. Detach drains and removes the connector/socket before
+releasing the netns; attach creates exactly one before admitting execs.
 
 Five jobs:
 
@@ -183,7 +181,7 @@ daemon is build X; this cowshed is build Y" — leaves the host as it was, and i
 
 Workspace jobs (`exec`, shells, and job observation) inspect only their selected workspace. Starting work reconciles
 only that workspace's gateway session; a missing or corrupt sibling grants file cannot refuse its admission or polling.
-Attach, detach, restore, removal, and other lifecycle/maintenance paths reconcile the current project, replacing changed
+Attach, detach, removal, and other lifecycle/maintenance paths reconcile the current project, replacing changed
 revisions/tokens and removing stale project sessions. The gateway's session table is a cache of host inventory, never an
 authority of its own: project maintenance may evict a foreign-project session holding a newly assigned endpoint, but
 only after confirming no live workspace anywhere still claims that identity. A workspace job never enumerates foreign
@@ -307,9 +305,9 @@ objects are length- and digest-verified on fill and every read, atomically commi
 ## Why per-workspace CA interception is bounded
 
 The CA authenticates only the gateway's client-facing TLS server and is scoped to one workspace. The private key stays
-controller-owned outside mounts and rotates on restore; the public certificate is only a trust anchor. This limits blast
-radius without turning the CA into workspace identity or upstream authentication. The explicit costs are tool-specific
-trust wiring, opaque fallback for pinned clients, and gateway visibility into intercepted plaintext.
+controller-owned outside mounts; the public certificate is only a trust anchor. This limits blast radius without turning
+the CA into workspace identity or upstream authentication. The explicit costs are tool-specific trust wiring, opaque
+fallback for pinned clients, and gateway visibility into intercepted plaintext.
 
 ## Reading the audit events
 

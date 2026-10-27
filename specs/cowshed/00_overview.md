@@ -127,7 +127,7 @@ nevertheless the sole live writer of that in-volume evidence; the controller emi
 record to an optional sink.
 
 Observability is distributed tracing into Arrow columns (13_telemetry.md). Protected in-volume complete job batches and
-sealed artifacts own captured content within an origin incarnation/checkpoint boundary. Controller audit records carry
+sealed artifacts own captured content within an origin incarnation boundary. Controller audit records carry
 existence/status/order/lineage and hashes but never duplicate raw output, and nothing reads them for a decision — they
 are telemetry, written to Arrow segments by the standalone CLI, to a host's own durable log when a runtime supervises
 the controller, or nowhere. Lifecycle, gateway, and audit spans share lmao Arrow transport; there is no telemetry daemon

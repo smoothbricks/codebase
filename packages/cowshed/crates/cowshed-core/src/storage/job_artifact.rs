@@ -18,20 +18,18 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, Schema};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::api::dto::{
-    AdmissionCommitment, AdmissionKey, BinaryData, CheckpointCommitment, CommandArg,
-    ControllerCommitment, DtoError, ExecCommand, ExecScope, ExitStatus, ForkCommitment, GitOid,
-    JobId, JobState, LandAdoptionCommitment, LandOutcomeCommitment, MAX_ARGV_BYTES,
-    MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
-    OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RestoreCommitment,
-    RunSandboxMode, Sha256Digest, StreamInfo, TerminalCommitment, UtcTimestamp,
-    WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
-    validate_command_argv,
+    AdmissionCommitment, AdmissionKey, BinaryData, CommandArg, ControllerCommitment, DtoError,
+    ExecCommand, ExecScope, ExitStatus, ForkCommitment, GitOid, JobId, JobState,
+    LandAdoptionCommitment, LandOutcomeCommitment, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
+    MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
+    ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest, StreamInfo,
+    TerminalCommitment, UtcTimestamp, WorkspaceIntroducedCommitment, WorkspacePath,
+    WorkspaceRetiredCommitment, validate_command_argv,
 };
 use crate::api::process::{JobContainment, OutlivedProcess};
 use crate::api::resources::{
@@ -52,8 +50,8 @@ use crate::storage::verify_no_symlinks;
 /// How durable a job's own state is before the job is admitted, backgrounded or answered as
 /// ended: one `fsync(2)` per record batch, per spilled stream and per published copy, and no sync
 /// of the directory entries they add. Power loss ends every job anyway, and a job whose record it
-/// took is sealed lost at the next supervisor start (11_shell.md "Job control"). Checkpoint
-/// manifests and every lifecycle record stay at [`Durability::PowerLoss`].
+/// took is sealed lost at the next supervisor start (11_shell.md "Job control"). Every
+/// lifecycle record stays at [`Durability::PowerLoss`].
 const JOB_RECORD_DURABILITY: Durability = Durability::Device;
 
 const RECORD_MAGIC: &[u8; 8] = b"CSARROW1";
@@ -67,7 +65,6 @@ pub(super) const PROTECTED_DIRECTORY: &str = ".cowshed";
 const JOB_DIRECTORY: &str = "job";
 const RECORDS_FILE: &str = "records.arrow";
 const RECORD_SEQUENCE_FILE: &str = "records.sequence";
-const CHECKPOINT_BARRIER_FILE_PREFIX: &str = "records.barrier.";
 /// The job id every store set aside so far had allocated up to: the empty store that replaces
 /// one allocates above it, so no id an earlier store handed out is handed out again.
 const JOB_FLOOR_FILE: &str = "records.job-floor";
@@ -84,10 +81,6 @@ const COUNTER_BYTES: usize = 24;
 const RECORD_SEQUENCE: CounterFile = CounterFile {
     magic: b"CSSEQ001",
     what: "record sequence counter",
-};
-const CHECKPOINT_BARRIER: CounterFile = CounterFile {
-    magic: b"CSBAR001",
-    what: "checkpoint barrier counter",
 };
 const JOB_FLOOR: CounterFile = CounterFile {
     magic: b"CSJOB001",
@@ -351,7 +344,7 @@ pub struct ArtifactConfig {
     pub supervisor_buffer_budget_bytes: usize,
     pub combined_output_quota_bytes: u64,
     pub retained_recovery_budget_bytes: usize,
-    /// The workspace's ancestor incarnations, from its marker lineage: every fork and restore
+    /// The workspace's ancestor incarnations, from its marker lineage: every fork
     /// clones the source image, so a records file legitimately holds frames the ancestors wrote.
     /// A frame from any other incarnation is an integrity fault.
     pub historical_incarnations: BTreeSet<WorkspaceIncarnation>,
@@ -642,9 +635,7 @@ impl AdmissionIndex {
     ) -> Result<Self, ArtifactError> {
         let mut keys = BTreeMap::<AdmissionKey, Admitted>::new();
         for frame in &recovery.frames {
-            let ProtectedRecord::Job(record) = &frame.record else {
-                continue;
-            };
+            let record = &frame.record;
             let Some(admission) = &record.admission else {
                 continue;
             };
@@ -821,6 +812,14 @@ fn history_set_aside(
 }
 
 impl JobArtifactRecord {
+    fn repo_id(&self) -> &RepoId {
+        &self.repo_id
+    }
+
+    fn origin_incarnation(&self) -> &WorkspaceIncarnation {
+        &self.workspace_incarnation
+    }
+
     pub fn validate(&self) -> Result<(), ArtifactError> {
         self.command.validate()?;
         if self.failure.is_some() && self.state != JobState::Failed {
@@ -977,216 +976,14 @@ fn validate_protected_path(
     Ok(())
 }
 
-fn validate_visible_path(
-    job_id: JobId,
-    stream: StreamKind,
-    info: &VisibleStreamCommitment,
-) -> Result<(), ArtifactError> {
-    let Some(path) = &info.protected_path else {
-        return Ok(());
-    };
-    let expected = protected_stream_path(job_id, stream);
-    if path.as_path() != Path::new(&expected) {
-        return Err(integrity(
-            0,
-            &format!(
-                "visible {} path does not match job {}",
-                stream.leaf(),
-                job_id.get()
-            ),
-        ));
-    }
-    Ok(())
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum VisibleStorageKind {
-    CapturedInline,
-    CapturedFile,
-    RedirectInline,
-    RedirectFile,
-}
-
-impl VisibleStorageKind {
-    fn is_file(self) -> bool {
-        matches!(self, Self::CapturedFile | Self::RedirectFile)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct VisibleStreamCommitment {
-    pub storage_kind: VisibleStorageKind,
-    pub bytes: u64,
-    pub sha256: Sha256Digest,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub protected_path: Option<WorkspacePath>,
-}
-
-impl VisibleStreamCommitment {
-    pub fn from_stream(stream: &StreamInfo) -> Self {
-        let path = match stream.storage.artifact() {
-            ProtectedOutput::Inline { .. } => None,
-            ProtectedOutput::File { path } => Some(path),
-        };
-        Self::from_parts(
-            matches!(stream.storage, OutputStorage::Redirect { .. }),
-            stream.bytes,
-            stream.sha256,
-            path,
-        )
-    }
-
-    fn from_sealed(stream: &SealedStream) -> Self {
-        let path = match &stream.storage {
-            SealedStorage::Inline(_) => None,
-            SealedStorage::File { path, .. } => Some(path),
-        };
-        Self::from_parts(stream.source.is_some(), stream.bytes, stream.sha256, path)
-    }
-
-    fn from_parts(
-        redirected: bool,
-        bytes: u64,
-        sha256: Sha256Digest,
-        path: Option<&WorkspacePath>,
-    ) -> Self {
-        let storage_kind = match (redirected, path.is_some()) {
-            (false, false) => VisibleStorageKind::CapturedInline,
-            (false, true) => VisibleStorageKind::CapturedFile,
-            (true, false) => VisibleStorageKind::RedirectInline,
-            (true, true) => VisibleStorageKind::RedirectFile,
-        };
-        Self {
-            storage_kind,
-            bytes,
-            sha256,
-            protected_path: path.cloned(),
-        }
-    }
-
-    fn validate(&self) -> Result<(), ArtifactError> {
-        if self.storage_kind.is_file() != self.protected_path.is_some() {
-            return Err(ArtifactError::Integrity {
-                offset: 0,
-                message: "visible stream protected path does not match storage kind".into(),
-            });
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct VisibleJobCommitment {
-    pub workspace_incarnation: WorkspaceIncarnation,
-    pub job_id: JobId,
-    pub state: JobState,
-    pub stdout: VisibleStreamCommitment,
-    pub stderr: VisibleStreamCommitment,
-}
-
-impl VisibleJobCommitment {
-    fn from_record(record: &ValidatedJob) -> (JobId, Self) {
-        (
-            record.job_id,
-            Self {
-                workspace_incarnation: record.workspace_incarnation.clone(),
-                job_id: record.job_id,
-                state: record.state,
-                stdout: VisibleStreamCommitment::from_sealed(&record.stdout),
-                stderr: VisibleStreamCommitment::from_sealed(&record.stderr),
-            },
-        )
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckpointManifestRecord {
-    pub version: u16,
-    pub repo_id: RepoId,
-    pub origin_incarnation: WorkspaceIncarnation,
-    pub barrier_id: u64,
-    pub visible_jobs: Vec<VisibleJobCommitment>,
-    pub records_sha256: Sha256Digest,
-}
-
-impl CheckpointManifestRecord {
-    pub fn validate(&self) -> Result<(), ArtifactError> {
-        if u64::from(self.version) != RECORD_SCHEMA_VERSION || self.barrier_id == 0 {
-            return Err(ArtifactError::Integrity {
-                offset: 0,
-                message: "invalid checkpoint manifest version or barrier".into(),
-            });
-        }
-        let mut keys = BTreeSet::new();
-        for job in &self.visible_jobs {
-            job.stdout.validate()?;
-            job.stderr.validate()?;
-            validate_visible_path(job.job_id, StreamKind::Stdout, &job.stdout)?;
-            validate_visible_path(job.job_id, StreamKind::Stderr, &job.stderr)?;
-            if !keys.insert((job.workspace_incarnation.clone(), job.job_id)) {
-                return Err(ArtifactError::Integrity {
-                    offset: 0,
-                    message: "checkpoint manifest contains a duplicate job".into(),
-                });
-            }
-            if !job.state.is_terminal()
-                && (!job.stdout.storage_kind.is_file() || !job.stderr.storage_kind.is_file())
-            {
-                return Err(ArtifactError::Integrity {
-                    offset: 0,
-                    message: "running manifest streams must be promoted to protected files".into(),
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "protected records stay inline to avoid an allocation per durable frame"
-)]
-pub enum ProtectedRecord {
-    Job(JobArtifactRecord),
-    CheckpointManifest(CheckpointManifestRecord),
-}
-
-impl ProtectedRecord {
-    fn validate(&self) -> Result<(), ArtifactError> {
-        match self {
-            Self::Job(value) => value.validate(),
-            Self::CheckpointManifest(value) => value.validate(),
-        }
-    }
-
-    fn repo_id(&self) -> &RepoId {
-        match self {
-            Self::Job(value) => &value.repo_id,
-            Self::CheckpointManifest(value) => &value.repo_id,
-        }
-    }
-
-    fn origin_incarnation(&self) -> &WorkspaceIncarnation {
-        match self {
-            Self::Job(value) => &value.workspace_incarnation,
-            Self::CheckpointManifest(value) => &value.origin_incarnation,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredFrame {
-    pub record: ProtectedRecord,
+    pub record: JobArtifactRecord,
     pub batch_sha256: Sha256Digest,
 }
 
 /// A store whose records an earlier cowshed wrote in an earlier layout, moved whole -- records,
-/// sequence and barrier counters, and with the records every checkpoint manifest -- so an empty
-/// store starts in its place.
+/// and their sequence counter -- so an empty store starts in its place.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetAsideStore {
     /// The layout version of the first record that was not in the current layout.
@@ -1223,8 +1020,6 @@ pub struct ArtifactStore {
     /// and re-hashing the whole log; any other writer's append, a torn tail it left, or a
     /// replacement changes one of the two and brings the full recovery back.
     records_seen: Option<RecordsIdentity>,
-    /// The latest manifest whose captured prefixes this snapshot already validated.
-    validated_manifest: Option<Sha256Digest>,
 }
 
 type ValidatedJob = JobArtifactRecord<SealedStream>;
@@ -1635,17 +1430,13 @@ impl ArtifactStore {
         validate_recovered_authority(&owned_repo_ids, &workspace_incarnation, &config, &recovery)?;
         let RecoveredFiles {
             new_jobs: committed_jobs,
-            validated_manifest,
             ..
         } = validate_recovered_files(&workspace_root, &workspace_incarnation, &recovery)?;
         let directory_max = scan_job_directories(&workspace_root)?;
         let record_max = recovery
             .frames
             .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::Job(record) => Some(record.job_id.get()),
-                ProtectedRecord::CheckpointManifest(_) => None,
-            })
+            .map(|frame| frame.record.job_id.get())
             .max()
             .unwrap_or(0);
         let retained_job_floor = read_counter(&job_floor_path(&lock)?, &JOB_FLOOR)?;
@@ -1657,7 +1448,6 @@ impl ArtifactStore {
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
         recovery.next_job_id = JobId::new(next_job_id)?;
         ensure_record_sequence_counter(&lock, &recovery)?;
-        ensure_checkpoint_barrier_counter(&lock, &recovery, &workspace_incarnation)?;
         let job_root = lock
             .records
             .parent()
@@ -1673,14 +1463,8 @@ impl ArtifactStore {
         let readable_jobs = recovery
             .frames
             .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::Job(record)
-                    if record.workspace_incarnation == workspace_incarnation =>
-                {
-                    Some(record.job_id)
-                }
-                _ => None,
-            })
+            .filter(|frame| frame.record.workspace_incarnation == workspace_incarnation)
+            .map(|frame| frame.record.job_id)
             .collect();
         let records_seen = RecordsIdentity::of(&records_path)?;
         drop(lock);
@@ -1704,7 +1488,6 @@ impl ArtifactStore {
             recovery,
             config,
             records_seen,
-            validated_manifest,
         })
     }
 
@@ -1746,7 +1529,7 @@ impl ArtifactStore {
         Ok(None)
     }
 
-    /// One validated generation for reads, appends and checkpoints. Advancing record identity
+    /// One validated generation for reads and appends. Advancing record identity
     /// always advances its readable rows, terminal rows and key authority together.
     fn refresh_under_lock(&mut self, lock: &RecordsLock<'_>) -> Result<(), ArtifactError> {
         let seen = RecordsIdentity::of(lock.records)?;
@@ -1788,28 +1571,20 @@ impl ArtifactStore {
         let readable_jobs = recovery
             .frames
             .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::Job(record)
-                    if record.workspace_incarnation == self.workspace_incarnation =>
-                {
-                    Some(record.job_id)
-                }
-                _ => None,
-            })
+            .filter(|frame| frame.record.workspace_incarnation == self.workspace_incarnation)
+            .map(|frame| frame.record.job_id)
             .collect();
         let RecoveredFiles {
             terminal_jobs,
             mut new_jobs,
-            validated_manifest,
         } = validate_recovered_files_since(
             &self.workspace_root,
             &self.workspace_incarnation,
             recovery
                 .frames
                 .into_iter()
-                .map(|frame| (std::borrow::Cow::Owned(frame.record), frame.batch_sha256)),
+                .map(|frame| std::borrow::Cow::Owned(frame.record)),
             Some(&self.committed_jobs),
-            self.validated_manifest,
         )?;
         if let Some(set_aside) = &set_aside
             && set_aside.layout >= FIRST_KEYED_LAYOUT
@@ -1834,7 +1609,6 @@ impl ArtifactStore {
         self.unread_history = unread_history;
         self.retained_job_floor = retained_job_floor;
         self.records_seen = records_seen;
-        self.validated_manifest = validated_manifest;
         Ok(())
     }
 
@@ -1941,17 +1715,14 @@ impl ArtifactStore {
             .recovery
             .frames
             .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::Job(record)
-                    if record.workspace_incarnation == self.workspace_incarnation
-                        && !record.state.is_terminal()
-                        && !self.committed_jobs.contains_key(&record.job_id)
-                        && !self.live_jobs.contains_key(&record.job_id) =>
-                {
-                    Some((record.job_id, record.clone()))
-                }
-                _ => None,
+            .filter(|frame| {
+                let record = &frame.record;
+                record.workspace_incarnation == self.workspace_incarnation
+                    && !record.state.is_terminal()
+                    && !self.committed_jobs.contains_key(&record.job_id)
+                    && !self.live_jobs.contains_key(&record.job_id)
             })
+            .map(|frame| (frame.record.job_id, frame.record.clone()))
             .collect();
         let mut sealed = Vec::with_capacity(admitted.len());
         for (job_id, admission) in admitted {
@@ -2035,70 +1806,6 @@ impl ArtifactStore {
         }
         self.records_seen = RecordsIdentity::of(&path)?;
         Ok((record, digest))
-    }
-
-    /// Take the checkpoint artifact barrier: force every visible stream prefix durable and append
-    /// the manifest. The store allocates the barrier id from this incarnation's durable barrier
-    /// counter — the same ownership as job record sequences — so a checkpoint that fails after its
-    /// barrier merely skips an id instead of leaving a consumed id that every later checkpoint
-    /// trips over.
-    pub fn checkpoint(&mut self) -> Result<SealedCheckpointManifest, ArtifactError> {
-        let mut visible = BTreeMap::new();
-        let workspace_root = &self.workspace_root;
-        let workspace_incarnation = &self.workspace_incarnation;
-        let budget = &mut self.budget;
-        for (&job_id, state) in &mut self.live_jobs {
-            let commitment =
-                state.durable_commitment(workspace_root, budget, workspace_incarnation, job_id)?;
-            visible.insert(job_id, commitment);
-        }
-        let path = records_path(&self.workspace_root);
-        let lock = RecordsLock::acquire(&path, CONTROL)?;
-        self.refresh_under_lock(&lock)?;
-        for record in self.committed_jobs.values() {
-            visible
-                .entry(record.job_id)
-                .or_insert_with(|| VisibleJobCommitment::from_record(record).1);
-        }
-        let barrier_id = allocate_checkpoint_barrier(&lock, &self.workspace_incarnation)?;
-        let records_sha256 = match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.len() == 0 => Sha256Digest::compute(RECORD_MAGIC),
-            Ok(_) => hash_file_incrementally(&path)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Sha256Digest::compute(RECORD_MAGIC)
-            }
-            Err(error) => return Err(io_error(&path, error)),
-        };
-        let record = CheckpointManifestRecord {
-            version: RECORD_SCHEMA_VERSION as u16,
-            repo_id: self.owned_repo_ids.current().clone(),
-            origin_incarnation: self.workspace_incarnation.clone(),
-            barrier_id,
-            visible_jobs: visible.into_values().collect(),
-            records_sha256,
-        };
-        record.validate()?;
-        let batch = checkpoint_manifest_to_batch(&record)?;
-        let payload = encode_batch(&batch)?;
-        let manifest_batch_sha256 = Sha256Digest::compute(&payload);
-        append_framed_batch_under_lock(
-            &lock,
-            &payload,
-            manifest_batch_sha256,
-            Durability::PowerLoss,
-            None,
-        )?;
-        let records_seen = RecordsIdentity::of(&path)?;
-        self.records_seen = records_seen;
-        self.validated_manifest = Some(manifest_batch_sha256);
-        Ok(SealedCheckpointManifest {
-            record,
-            manifest_batch_sha256,
-        })
-    }
-
-    pub fn records_prefix_sha256(&self) -> Result<Sha256Digest, ArtifactError> {
-        hash_file_incrementally(&records_path(&self.workspace_root))
     }
 }
 
@@ -2276,30 +1983,6 @@ struct LiveJobState {
 }
 
 impl LiveJobState {
-    fn durable_commitment(
-        &mut self,
-        workspace_root: &Path,
-        budget: &mut BufferBudget,
-        workspace_incarnation: &WorkspaceIncarnation,
-        job_id: JobId,
-    ) -> Result<VisibleJobCommitment, ArtifactError> {
-        if self.failed {
-            return Err(ArtifactError::TokenConflict {
-                job_id,
-                message: "job artifact stream failed; abort is required",
-            });
-        }
-        let stdout = self.stdout.durable_prefix(workspace_root, budget, job_id)?;
-        let stderr = self.stderr.durable_prefix(workspace_root, budget, job_id)?;
-        Ok(VisibleJobCommitment {
-            workspace_incarnation: workspace_incarnation.clone(),
-            job_id,
-            state: JobState::Running,
-            stdout: VisibleStreamCommitment::from_stream(&stdout),
-            stderr: VisibleStreamCommitment::from_stream(&stderr),
-        })
-    }
-
     fn release_budget(&mut self, budget: &mut BufferBudget) {
         self.stdout.release_reserved(budget);
         self.stderr.release_reserved(budget);
@@ -2336,12 +2019,6 @@ pub struct CompletedJobArtifacts {
     pub sealed: SealedJobArtifacts,
     pub stdout_publication: Option<Result<(), ArtifactError>>,
     pub stderr_publication: Option<Result<(), ArtifactError>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedCheckpointManifest {
-    pub record: CheckpointManifestRecord,
-    pub manifest_batch_sha256: Sha256Digest,
 }
 
 impl ArtifactStore {
@@ -3040,24 +2717,6 @@ fn open_artifact_no_follow(
     }
 }
 
-fn hash_file_incrementally(path: &Path) -> Result<Sha256Digest, ArtifactError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path).map_err(|error| io_error(path, error))?;
-    let (_, digest) = hash_reader(
-        &mut file,
-        |_, _| Ok(()),
-        |error| io_error(path, error),
-        integrity(0, "file byte count overflow"),
-    )?;
-    Ok(digest)
-}
-
 fn validate_recovered_authority(
     owned_repo_ids: &OwnedRepoIds,
     current_incarnation: &WorkspaceIncarnation,
@@ -3094,7 +2753,6 @@ fn validate_recovered_authority(
 struct RecoveredFiles {
     terminal_jobs: BTreeSet<JobId>,
     new_jobs: BTreeMap<JobId, Arc<ValidatedJob>>,
-    validated_manifest: Option<Sha256Digest>,
 }
 
 fn validate_recovered_files(
@@ -3105,13 +2763,10 @@ fn validate_recovered_files(
     validate_recovered_files_since(
         workspace_root,
         current_incarnation,
-        recovery.frames.iter().map(|frame| {
-            (
-                std::borrow::Cow::Borrowed(&frame.record),
-                frame.batch_sha256,
-            )
-        }),
-        None,
+        recovery
+            .frames
+            .iter()
+            .map(|frame| std::borrow::Cow::Borrowed(&frame.record)),
         None,
     )
 }
@@ -3119,100 +2774,52 @@ fn validate_recovered_files(
 fn validate_recovered_files_since<'a>(
     workspace_root: &Path,
     current_incarnation: &WorkspaceIncarnation,
-    records: impl IntoIterator<Item = (std::borrow::Cow<'a, ProtectedRecord>, Sha256Digest)>,
+    records: impl IntoIterator<Item = std::borrow::Cow<'a, JobArtifactRecord>>,
     known: Option<&BTreeMap<JobId, Arc<ValidatedJob>>>,
-    known_manifest: Option<Sha256Digest>,
 ) -> Result<RecoveredFiles, ArtifactError> {
     let mut terminal_jobs = BTreeSet::new();
     let mut new_jobs = BTreeMap::new();
-    let mut latest_manifest = None;
-    for (record, digest) in records {
-        match record.as_ref() {
-            ProtectedRecord::Job(raw)
-                if &raw.workspace_incarnation == current_incarnation && raw.state.is_terminal() =>
-            {
-                let job_id = raw.job_id;
-                if !terminal_jobs.insert(job_id) {
-                    return Err(integrity(
-                        0,
-                        "duplicate terminal artifact record for current job id",
-                    ));
-                }
-                // Opening clones only newly learned terminals out of its retained recovery report.
-                // A changed refresh owns its recovered rows and moves them through this same path.
-                let ProtectedRecord::Job(raw) = record.into_owned() else {
-                    unreachable!("the selected record is a terminal job");
-                };
-                let before = known.and_then(|known| known.get(&job_id));
-                let validated = raw.try_map_streams(
-                    |info| {
-                        SealedStream::recovered(
-                            workspace_root,
-                            info,
-                            before.map(|record| &record.stdout),
-                        )
-                    },
-                    |info| {
-                        SealedStream::recovered(
-                            workspace_root,
-                            info,
-                            before.map(|record| &record.stderr),
-                        )
-                    },
-                )?;
-                match before {
-                    Some(before) if before.as_ref() == &validated => {}
-                    Some(_) => {
-                        return Err(integrity(
-                            0,
-                            "a validated terminal record changed its immutable facts",
-                        ));
-                    }
-                    None => {
-                        new_jobs.insert(job_id, Arc::new(validated));
-                    }
-                }
-            }
-            ProtectedRecord::CheckpointManifest(manifest)
-                if &manifest.origin_incarnation == current_incarnation =>
-            {
-                latest_manifest = Some((record, digest));
-            }
-            _ => {}
+    for record in records {
+        if &record.workspace_incarnation != current_incarnation || !record.state.is_terminal() {
+            continue;
         }
-    }
-    if let Some((record, digest)) = &latest_manifest
-        && known_manifest != Some(*digest)
-    {
-        let ProtectedRecord::CheckpointManifest(manifest) = record.as_ref() else {
-            unreachable!("the selected record is a checkpoint manifest");
-        };
-        for job in &manifest.visible_jobs {
-            if &job.workspace_incarnation != current_incarnation
-                || terminal_jobs.contains(&job.job_id)
-            {
-                continue;
+        let job_id = record.job_id;
+        if !terminal_jobs.insert(job_id) {
+            return Err(integrity(
+                0,
+                "duplicate terminal artifact record for current job id",
+            ));
+        }
+        // Opening clones only newly learned terminals out of its retained recovery report.
+        // A changed refresh owns its recovered rows and moves them through this same path.
+        let before = known.and_then(|known| known.get(&job_id));
+        let validated = record.into_owned().try_map_streams(
+            |info| {
+                SealedStream::recovered(workspace_root, info, before.map(|record| &record.stdout))
+            },
+            |info| {
+                SealedStream::recovered(workspace_root, info, before.map(|record| &record.stderr))
+            },
+        )?;
+        match before {
+            Some(before) if before.as_ref() == &validated => {}
+            Some(_) => {
+                return Err(integrity(
+                    0,
+                    "a validated terminal record changed its immutable facts",
+                ));
             }
-            validate_visible_file(workspace_root, &job.stdout)?;
-            validate_visible_file(workspace_root, &job.stderr)?;
+            None => {
+                new_jobs.insert(job_id, Arc::new(validated));
+            }
         }
     }
     Ok(RecoveredFiles {
         terminal_jobs,
         new_jobs,
-        validated_manifest: latest_manifest.map(|(_, digest)| digest),
     })
 }
 
-fn validate_visible_file(
-    workspace_root: &Path,
-    stream: &VisibleStreamCommitment,
-) -> Result<(), ArtifactError> {
-    if let Some(path) = &stream.protected_path {
-        verify_file_content(workspace_root, path, stream.bytes, stream.sha256)?;
-    }
-    Ok(())
-}
 #[cfg(unix)]
 fn reject_hardlink(path: &Path, metadata: &fs::Metadata) -> Result<(), ArtifactError> {
     use std::os::unix::fs::MetadataExt;
@@ -3322,10 +2929,7 @@ fn highest_record_sequence(recovery: &RecoveryReport) -> u64 {
     recovery
         .frames
         .iter()
-        .filter_map(|frame| match &frame.record {
-            ProtectedRecord::Job(record) => Some(record.sequence),
-            ProtectedRecord::CheckpointManifest(_) => None,
-        })
+        .map(|frame| frame.record.sequence)
         .max()
         .unwrap_or(0)
 }
@@ -3411,7 +3015,7 @@ fn ensure_record_sequence_counter(
         //
         // Advancing is not the resequencing this module refuses. Resequencing
         // rewrites `job.sequence` inside framed bytes, which changes the digest
-        // and lets the new manifest attest to bytes it just wrote. Advancing
+        // and lets the rewritten frame attest to its own bytes. Advancing
         // writes only the sidecar: every frame keeps its bytes and its digest,
         // and the next allocation is `observed + 1`, so no sequence can be
         // handed out twice. Refusing instead would strand a store whose records
@@ -3449,118 +3053,6 @@ fn allocate_record_sequence(lock: &RecordsLock<'_>) -> Result<u64, ArtifactError
     // loss rolled back behind the log is advanced to the log's highest sequence at the next open
     // (`ensure_record_sequence_counter`), before anything allocates.
     publish_record_sequence_counter(lock, next, Durability::Process)?;
-    Ok(next)
-}
-
-/// The barrier counter is scoped to one incarnation: barrier ids are dense and start at 1 for
-/// every incarnation, so a clone that inherits an ancestor's records — and its ancestor's counter
-/// file — must still begin its own sequence at 1. The incarnation is 32 lowercase hex characters,
-/// so it is a safe single path component and no two incarnations can name the same counter.
-fn checkpoint_barrier_path(
-    lock: &RecordsLock<'_>,
-    incarnation: &WorkspaceIncarnation,
-) -> Result<PathBuf, ArtifactError> {
-    let job_root = lock
-        .records
-        .parent()
-        .ok_or_else(|| integrity(0, "records path has no job parent"))?;
-    Ok(job_root.join(format!(
-        "{CHECKPOINT_BARRIER_FILE_PREFIX}{}",
-        incarnation.as_str()
-    )))
-}
-
-fn highest_checkpoint_barrier(
-    recovery: &RecoveryReport,
-    incarnation: &WorkspaceIncarnation,
-) -> u64 {
-    recovery
-        .frames
-        .iter()
-        .filter_map(|frame| match &frame.record {
-            ProtectedRecord::CheckpointManifest(manifest)
-                if manifest.origin_incarnation == *incarnation =>
-            {
-                Some(manifest.barrier_id)
-            }
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-fn read_checkpoint_barrier_counter(
-    lock: &RecordsLock<'_>,
-    incarnation: &WorkspaceIncarnation,
-) -> Result<Option<u64>, ArtifactError> {
-    read_counter(
-        &checkpoint_barrier_path(lock, incarnation)?,
-        &CHECKPOINT_BARRIER,
-    )
-}
-
-fn publish_checkpoint_barrier_counter(
-    lock: &RecordsLock<'_>,
-    incarnation: &WorkspaceIncarnation,
-    current: u64,
-) -> Result<(), ArtifactError> {
-    publish_counter(
-        &checkpoint_barrier_path(lock, incarnation)?,
-        &CHECKPOINT_BARRIER,
-        current,
-        Durability::PowerLoss,
-    )
-}
-
-fn ensure_checkpoint_barrier_counter(
-    lock: &RecordsLock<'_>,
-    recovery: &RecoveryReport,
-    incarnation: &WorkspaceIncarnation,
-) -> Result<(), ArtifactError> {
-    let observed = highest_checkpoint_barrier(recovery, incarnation);
-    match read_checkpoint_barrier_counter(lock, incarnation)? {
-        Some(durable) if durable < observed => Err(integrity(
-            0,
-            &format!(
-                "checkpoint barrier counter {durable} trails durable checkpoint barrier {observed}"
-            ),
-        )),
-        Some(_) => Ok(()),
-        None if recovery.truncated_bytes != 0 => Err(integrity(
-            0,
-            "cannot initialize checkpoint barrier counter after an incomplete tail; create a fresh store",
-        )),
-        None => {
-            // An incarnation that has never checkpointed here observes zero and starts at 1; a
-            // pre-counter store is migrated once from its own manifests. Either way the counter is
-            // published while holding the append lock, so from here on checkpoints never derive a
-            // barrier from recovered frames and tail loss can only leave the counter ahead of the
-            // log, which preserves monotonic allocation.
-            publish_checkpoint_barrier_counter(lock, incarnation, observed)
-        }
-    }
-}
-
-fn allocate_checkpoint_barrier(
-    lock: &RecordsLock<'_>,
-    incarnation: &WorkspaceIncarnation,
-) -> Result<u64, ArtifactError> {
-    // Opening the store publishes this incarnation's counter, so its absence is the same integrity
-    // fault as a missing record sequence counter: the file that names every barrier already handed
-    // out is gone, and the log alone cannot say what it held — a lost tail erases exactly the
-    // manifests whose barriers a fold would need.
-    let durable = read_checkpoint_barrier_counter(lock, incarnation)?.ok_or_else(|| {
-        integrity(
-            0,
-            "checkpoint barrier counter is missing after store initialization",
-        )
-    })?;
-    let next = durable.checked_add(1).ok_or(ArtifactError::InvalidConfig(
-        "checkpoint barrier allocation exhausted",
-    ))?;
-    // Publish before appending: a crash may leave a gap, but can never hand the barrier out twice.
-    // Both writes remain under the same cross-process lock.
-    publish_checkpoint_barrier_counter(lock, incarnation, next)?;
     Ok(next)
 }
 
@@ -3963,8 +3455,6 @@ fn recover_records_with_budget_under_lock(
     let mut offset = RECORD_MAGIC.len();
     let mut retained = 0_usize;
     let mut records = Vec::new();
-    let mut prefix_hasher = Sha256::new();
-    prefix_hasher.update(RECORD_MAGIC);
     let mut previous_job: Option<JobArtifactRecord> = None;
     let mut terminal_jobs = BTreeSet::new();
     // Once a record in an earlier layout is met: that layout, and the highest job id the store
@@ -4069,10 +3559,7 @@ fn recover_records_with_budget_under_lock(
         if let Some(layout) = earlier_layout(&batch) {
             let floor = records
                 .iter()
-                .filter_map(|frame: &RecoveredFrame| match &frame.record {
-                    ProtectedRecord::Job(record) => Some(record.job_id.get()),
-                    ProtectedRecord::CheckpointManifest(_) => None,
-                })
+                .map(|frame: &RecoveredFrame| frame.record.job_id.get())
                 .fold(
                     leading_job_id(&batch)
                         .map_err(|error| integrity(frame_start, &error.to_string()))?,
@@ -4085,42 +3572,35 @@ fn recover_records_with_budget_under_lock(
                 .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
             continue;
         }
+        if is_retired_manifest(&batch) {
+            retained = required;
+            offset = offset
+                .checked_add(frame_len)
+                .ok_or_else(|| integrity(frame_start, "records offset overflow"))?;
+            continue;
+        }
         let record = batch_to_protected_record(&batch)
             .map_err(|error| integrity(frame_start, &error.to_string()))?;
         record
             .validate()
             .map_err(|error| integrity(frame_start, &error.to_string()))?;
-        match &record {
-            ProtectedRecord::Job(current) => {
-                if let Some(previous) = previous_job.as_ref()
-                    && current.sequence <= previous.sequence
-                {
-                    return Err(ArtifactError::SequenceOrdering {
-                        offset: frame_start as u64,
-                        previous: previous.sequence,
-                        current: current.sequence,
-                    });
-                }
-                previous_job = Some(current.clone());
-                if current.state.is_terminal()
-                    && !terminal_jobs
-                        .insert((current.workspace_incarnation.clone(), current.job_id))
-                {
-                    return Err(integrity(
-                        frame_start,
-                        "duplicate terminal artifact record for job id",
-                    ));
-                }
-            }
-            ProtectedRecord::CheckpointManifest(manifest) => {
-                let observed = Sha256Digest::from_bytes(prefix_hasher.clone().finalize().into());
-                if manifest.records_sha256 != observed {
-                    return Err(integrity(
-                        frame_start,
-                        "checkpoint manifest records prefix digest mismatch",
-                    ));
-                }
-            }
+        if let Some(previous) = previous_job.as_ref()
+            && record.sequence <= previous.sequence
+        {
+            return Err(ArtifactError::SequenceOrdering {
+                offset: frame_start as u64,
+                previous: previous.sequence,
+                current: record.sequence,
+            });
+        }
+        previous_job = Some(record.clone());
+        if record.state.is_terminal()
+            && !terminal_jobs.insert((record.workspace_incarnation.clone(), record.job_id))
+        {
+            return Err(integrity(
+                frame_start,
+                "duplicate terminal artifact record for job id",
+            ));
         }
         records
             .try_reserve(1)
@@ -4129,10 +3609,6 @@ fn recover_records_with_budget_under_lock(
             record,
             batch_sha256: expected_digest,
         });
-        prefix_hasher.update(header);
-        prefix_hasher.update(&payload);
-        prefix_hasher.update(digest_bytes);
-        prefix_hasher.update(trailer);
         retained = required;
         offset = offset
             .checked_add(frame_len)
@@ -4153,10 +3629,7 @@ fn recover_records_with_budget_under_lock(
     }
     let next = records
         .iter()
-        .filter_map(|frame| match &frame.record {
-            ProtectedRecord::Job(record) => Some(record.job_id.get()),
-            ProtectedRecord::CheckpointManifest(_) => None,
-        })
+        .map(|frame| frame.record.job_id.get())
         .max()
         .unwrap_or(0)
         .checked_add(1)
@@ -4169,8 +3642,8 @@ fn recover_records_with_budget_under_lock(
     })
 }
 
-/// The allocation identity in an intact frame's common header. A checkpoint has no job id;
-/// malformed or missing job metadata is an error, never a fabricated zero allocation floor.
+/// The allocation identity in an intact frame's common header.
+/// Malformed or missing job metadata is an error, never a fabricated zero allocation floor.
 fn leading_job_id(batch: &RecordBatch) -> Result<u64, ArtifactError> {
     let current = protected_record_schema();
     if batch.num_rows() != 1
@@ -4190,16 +3663,16 @@ fn leading_job_id(batch: &RecordBatch) -> Result<u64, ArtifactError> {
     let column = uint64(batch, 4)?;
     match kind.value(0) {
         "job" if column.is_valid(0) => Ok(JobId::new(column.value(0))?.get()),
-        "checkpointManifest" if column.is_null(0) => Ok(0),
+        RETIRED_MANIFEST_KIND if column.is_null(0) => Ok(0),
         value => Err(ArtifactError::Arrow(format!(
             "protected allocation header has an invalid job_id for record kind {value:?}"
         ))),
     }
 }
 
-/// Move the store `lock` guards -- its records, its sequence counter and every incarnation's
-/// barrier counter -- into a directory under `set-aside/` named for the earlier `layout` its first
-/// unreadable record is in, and say so on stderr.
+/// Move the store `lock` guards -- its records and their sequence counter -- into a directory
+/// under `set-aside/` named for the earlier `layout` its first unreadable record is in, and say
+/// so on stderr.
 ///
 /// First the job id floor rises to `floor`, the highest id the store handed out: the job
 /// directories stay, but an inline job left none, so the empty store that starts allocates above
@@ -4242,24 +3715,11 @@ fn set_aside_records(
     }
     let destination = destination
         .ok_or_else(|| integrity(0, "every set-aside directory name for this layout is taken"))?;
-    let mut counters = vec![RECORD_SEQUENCE_FILE.to_owned()];
-    for entry in fs::read_dir(job_root).map_err(|error| io_error(job_root, error))? {
-        let name = entry
-            .map_err(|error| io_error(job_root, error))?
-            .file_name();
-        if let Some(name) = name.to_str()
-            && name.starts_with(CHECKPOINT_BARRIER_FILE_PREFIX)
-        {
-            counters.push(name.to_owned());
-        }
-    }
-    for name in counters {
-        let source = job_root.join(&name);
-        match fs::rename(&source, destination.join(&name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(&source, error)),
-        }
+    let source = job_root.join(RECORD_SEQUENCE_FILE);
+    match fs::rename(&source, destination.join(RECORD_SEQUENCE_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(&source, error)),
     }
     sync_directory(&destination)?;
     sync_directory(&parent)?;
@@ -4270,9 +3730,8 @@ fn set_aside_records(
     sync_directory(job_root)?;
     cowshed_os::eprintln!(
         "cowshed: set aside the job records in {} -- written in record layout {layout}, before \
-     layout {RECORD_SCHEMA_VERSION}, the only one this cowshed reads -- into {}, with the \
-     checkpoint manifests among them; a new empty store starts in their place, allocating \
-     job ids above {floor}",
+     layout {RECORD_SCHEMA_VERSION}, the only one this cowshed reads -- into {}; a new empty \
+     store starts in their place, allocating job ids above {floor}",
         job_root.display(),
         destination.display()
     );
@@ -5628,142 +5087,18 @@ fn decode_admission(
     }))
 }
 
-fn visible_storage_name(kind: VisibleStorageKind) -> &'static str {
-    match kind {
-        VisibleStorageKind::CapturedInline => "captured-inline",
-        VisibleStorageKind::CapturedFile => "captured-file",
-        VisibleStorageKind::RedirectInline => "redirect-inline",
-        VisibleStorageKind::RedirectFile => "redirect-file",
-    }
+/// The record kind of a checkpoint manifest, retired with checkpoints (01_storage.md). A store a
+/// writer from before then used can still hold one: it names no job, so recovery passes over it.
+const RETIRED_MANIFEST_KIND: &str = "checkpointManifest";
+
+fn is_retired_manifest(batch: &RecordBatch) -> bool {
+    batch.num_rows() == 1
+        && is_current_layout(batch)
+        && string(batch, 0)
+            .is_ok_and(|kind| kind.is_valid(0) && kind.value(0) == RETIRED_MANIFEST_KIND)
 }
 
-fn parse_visible_storage(value: &str) -> Result<VisibleStorageKind, ArtifactError> {
-    match value {
-        "captured-inline" => Ok(VisibleStorageKind::CapturedInline),
-        "captured-file" => Ok(VisibleStorageKind::CapturedFile),
-        "redirect-inline" => Ok(VisibleStorageKind::RedirectInline),
-        "redirect-file" => Ok(VisibleStorageKind::RedirectFile),
-        _ => Err(ArtifactError::Arrow(format!(
-            "unknown visible storage kind {value:?}"
-        ))),
-    }
-}
-
-fn visible_stream_array(
-    jobs: &[VisibleJobCommitment],
-    select: impl Fn(&VisibleJobCommitment) -> &VisibleStreamCommitment,
-) -> StructArray {
-    let values: Vec<_> = jobs.iter().map(select).collect();
-    StructArray::new(
-        visible_stream_fields(),
-        vec![
-            Arc::new(StringArray::from(
-                values
-                    .iter()
-                    .map(|value| visible_storage_name(value.storage_kind))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                values.iter().map(|value| value.bytes).collect::<Vec<_>>(),
-            )),
-            Arc::new(BinaryArray::from(
-                values
-                    .iter()
-                    .map(|value| Some(value.sha256.as_bytes().as_slice()))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                values
-                    .iter()
-                    .map(|value| {
-                        value.protected_path.as_ref().map(|path| {
-                            path.as_path()
-                                .to_str()
-                                .expect("WorkspacePath is always UTF-8")
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )),
-        ],
-        None,
-    )
-}
-
-fn visible_jobs_array(jobs: &[VisibleJobCommitment]) -> Result<ListArray, ArtifactError> {
-    let stream_fields = visible_stream_fields();
-    let job_fields = Fields::from(vec![
-        field("workspace_incarnation", DataType::Utf8, false),
-        field("job_id", DataType::UInt64, false),
-        field("state", DataType::Utf8, false),
-        field("stdout", DataType::Struct(stream_fields.clone()), false),
-        field("stderr", DataType::Struct(stream_fields), false),
-    ]);
-    let values = StructArray::new(
-        job_fields.clone(),
-        vec![
-            Arc::new(StringArray::from(
-                jobs.iter()
-                    .map(|job| job.workspace_incarnation.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt64Array::from(
-                jobs.iter().map(|job| job.job_id.get()).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                jobs.iter()
-                    .map(|job| state_name(job.state))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(visible_stream_array(jobs, |job| &job.stdout)),
-            Arc::new(visible_stream_array(jobs, |job| &job.stderr)),
-        ],
-        None,
-    );
-    let count = i32::try_from(jobs.len())
-        .map_err(|_| ArtifactError::Arrow("too many visible jobs".into()))?;
-    Ok(ListArray::new(
-        Arc::new(field("item", DataType::Struct(job_fields), false)),
-        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, count])),
-        Arc::new(values),
-        None,
-    ))
-}
-
-fn checkpoint_manifest_to_batch(
-    record: &CheckpointManifestRecord,
-) -> Result<RecordBatch, ArtifactError> {
-    record.validate()?;
-    let schema = protected_record_schema();
-    let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
-    columns.push(Arc::new(StringArray::from(vec!["checkpointManifest"])));
-    columns.push(Arc::new(UInt64Array::from(vec![record.version as u64])));
-    columns.push(Arc::new(StringArray::from(vec![record.repo_id.as_str()])));
-    for index in 3..26 {
-        columns.push(new_null_array(schema.field(index).data_type(), 1));
-    }
-    columns.push(Arc::new(StringArray::from(vec![Some(
-        record.origin_incarnation.as_str(),
-    )])));
-    columns.push(Arc::new(UInt64Array::from(vec![Some(record.barrier_id)])));
-    columns.push(Arc::new(visible_jobs_array(&record.visible_jobs)?));
-    columns.push(Arc::new(BinaryArray::from(vec![Some(
-        record.records_sha256.as_bytes().as_slice(),
-    )])));
-    for index in 30..schema.fields().len() {
-        columns.push(new_null_array(schema.field(index).data_type(), 1));
-    }
-    RecordBatch::try_new(schema, columns).map_err(|error| ArtifactError::Arrow(error.to_string()))
-}
-
-#[cfg(test)]
-fn protected_record_to_batch(record: &ProtectedRecord) -> Result<RecordBatch, ArtifactError> {
-    match record {
-        ProtectedRecord::Job(value) => job_record_to_batch(value),
-        ProtectedRecord::CheckpointManifest(value) => checkpoint_manifest_to_batch(value),
-    }
-}
-
-fn batch_to_protected_record(batch: &RecordBatch) -> Result<ProtectedRecord, ArtifactError> {
+fn batch_to_protected_record(batch: &RecordBatch) -> Result<JobArtifactRecord, ArtifactError> {
     if batch.num_rows() != 1 {
         return Err(ArtifactError::Arrow(format!(
             "a protected batch holds exactly one record, this one {} rows",
@@ -5777,76 +5112,14 @@ fn batch_to_protected_record(batch: &RecordBatch) -> Result<ProtectedRecord, Art
         )));
     }
     match string(batch, 0)?.value(0) {
-        "job" => Ok(ProtectedRecord::Job(batch_to_job_record(batch)?)),
-        "checkpointManifest" => Ok(ProtectedRecord::CheckpointManifest(
-            batch_to_checkpoint_manifest(batch)?,
+        "job" => batch_to_job_record(batch),
+        RETIRED_MANIFEST_KIND => Err(ArtifactError::Arrow(
+            "retired protected record kind \"checkpointManifest\" cannot be read".into(),
         )),
         value => Err(ArtifactError::Arrow(format!(
             "unknown protected record kind {value:?}"
         ))),
     }
-}
-
-fn batch_to_checkpoint_manifest(
-    batch: &RecordBatch,
-) -> Result<CheckpointManifestRecord, ArtifactError> {
-    require_protected_columns(batch, 0, &[26, 27, 28, 29])?;
-    let version = u16::try_from(uint64(batch, 1)?.value(0))
-        .map_err(|_| ArtifactError::Arrow("manifest version does not fit u16".into()))?;
-    let repo_id = RepoId::parse(string(batch, 2)?.value(0))
-        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-    let origin_incarnation = WorkspaceIncarnation::new(string(batch, 26)?.value(0))
-        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-    let jobs = list(batch, 28)?;
-    let values = downcast::<StructArray>(jobs.values().as_ref(), "visible_jobs.values")?;
-    let mut visible_jobs = Vec::with_capacity(values.len());
-    for row in 0..values.len() {
-        visible_jobs.push(VisibleJobCommitment {
-            workspace_incarnation: WorkspaceIncarnation::new(
-                struct_string(values, "workspace_incarnation")?.value(row),
-            )
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))?,
-            job_id: JobId::new(struct_u64(values, "job_id")?.value(row))?,
-            state: parse_state(struct_string(values, "state")?.value(row))?,
-            stdout: decode_visible_stream(struct_struct(values, "stdout")?, row)?,
-            stderr: decode_visible_stream(struct_struct(values, "stderr")?, row)?,
-        });
-    }
-    let digest: [u8; 32] = binary(batch, 29)?
-        .value(0)
-        .try_into()
-        .map_err(|_| ArtifactError::Arrow("records digest is not 32 bytes".into()))?;
-    let record = CheckpointManifestRecord {
-        version,
-        repo_id,
-        origin_incarnation,
-        barrier_id: uint64(batch, 27)?.value(0),
-        visible_jobs,
-        records_sha256: Sha256Digest::from_bytes(digest),
-    };
-    record.validate()?;
-    Ok(record)
-}
-
-fn decode_visible_stream(
-    values: &StructArray,
-    row: usize,
-) -> Result<VisibleStreamCommitment, ArtifactError> {
-    let paths = struct_string(values, "protected_path")?;
-    let digest: [u8; 32] = struct_binary(values, "sha256")?
-        .value(row)
-        .try_into()
-        .map_err(|_| ArtifactError::Arrow("visible stream digest is not 32 bytes".into()))?;
-    let value = VisibleStreamCommitment {
-        storage_kind: parse_visible_storage(struct_string(values, "storage_kind")?.value(row))?,
-        bytes: struct_u64(values, "bytes")?.value(row),
-        sha256: Sha256Digest::from_bytes(digest),
-        protected_path: (!paths.is_null(row))
-            .then(|| WorkspacePath::new(paths.value(row)))
-            .transpose()?,
-    };
-    value.validate()?;
-    Ok(value)
 }
 
 fn decode_stream(batch: &RecordBatch, offset: usize) -> Result<StreamInfo, ArtifactError> {
@@ -6030,33 +5303,6 @@ fn struct_string<'a>(
     downcast(column.as_ref(), name)
 }
 
-fn struct_u64<'a>(values: &'a StructArray, name: &str) -> Result<&'a UInt64Array, ArtifactError> {
-    let column = values
-        .column_by_name(name)
-        .ok_or_else(|| ArtifactError::Arrow(format!("missing struct field {name}")))?;
-    downcast(column.as_ref(), name)
-}
-
-fn struct_binary<'a>(
-    values: &'a StructArray,
-    name: &str,
-) -> Result<&'a BinaryArray, ArtifactError> {
-    let column = values
-        .column_by_name(name)
-        .ok_or_else(|| ArtifactError::Arrow(format!("missing struct field {name}")))?;
-    downcast(column.as_ref(), name)
-}
-
-fn struct_struct<'a>(
-    values: &'a StructArray,
-    name: &str,
-) -> Result<&'a StructArray, ArtifactError> {
-    let column = values
-        .column_by_name(name)
-        .ok_or_else(|| ArtifactError::Arrow(format!("missing struct field {name}")))?;
-    downcast(column.as_ref(), name)
-}
-
 /// A job state's wire name, the one spelling every Arrow record of it carries.
 pub(crate) fn state_name(state: JobState) -> &'static str {
     match state {
@@ -6165,16 +5411,10 @@ struct ControllerFlatRow<'a> {
     stderr_bytes: Option<u64>,
     stderr_sha256: Option<&'a [u8]>,
     batch_sha256: Option<&'a [u8]>,
-    origin_incarnation: Option<&'a str>,
     output_limit_bytes: Option<u64>,
     output_crossing_bytes: Option<u64>,
-    checkpoint_id: Option<&'a str>,
-    barrier_id: Option<u64>,
-    manifest_batch_sha256: Option<&'a [u8]>,
     source_incarnation: Option<&'a str>,
     destination_incarnation: Option<&'a str>,
-    source_checkpoint: Option<&'a str>,
-    replaced_incarnation: Option<&'a str>,
     landed_head: Option<&'a str>,
     task: Option<&'a str>,
     task_hash: Option<&'a str>,
@@ -6198,16 +5438,10 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
         stderr_bytes: None,
         stderr_sha256: None,
         batch_sha256: None,
-        origin_incarnation: None,
         output_limit_bytes: None,
         output_crossing_bytes: None,
-        checkpoint_id: None,
-        barrier_id: None,
-        manifest_batch_sha256: None,
         source_incarnation: None,
         destination_incarnation: None,
-        source_checkpoint: None,
-        replaced_incarnation: None,
         landed_head: None,
         task: None,
         task_hash: None,
@@ -6247,24 +5481,10 @@ fn flatten_controller(value: &ControllerCommitment) -> ControllerFlatRow<'_> {
             row.stderr_sha256 = Some(value.stderr_sha256.as_bytes());
             row.batch_sha256 = Some(value.batch_sha256.as_bytes());
         }
-        ControllerCommitment::Checkpoint(value) => {
-            row.kind = "checkpoint";
-            row.origin_incarnation = Some(value.origin_incarnation.as_str());
-            row.checkpoint_id = Some(&value.checkpoint_id);
-            row.barrier_id = Some(value.barrier_id);
-            row.manifest_batch_sha256 = Some(value.manifest_batch_sha256.as_bytes());
-        }
         ControllerCommitment::Fork(value) => {
             row.kind = "fork";
             row.source_incarnation = Some(value.source_incarnation.as_str());
             row.destination_incarnation = Some(value.destination_incarnation.as_str());
-        }
-        ControllerCommitment::Restore(value) => {
-            row.kind = "restore";
-            row.source_incarnation = Some(value.source_incarnation.as_str());
-            row.replaced_incarnation = Some(value.replaced_incarnation.as_str());
-            row.destination_incarnation = Some(value.destination_incarnation.as_str());
-            row.source_checkpoint = Some(&value.source_checkpoint);
         }
         ControllerCommitment::LandAdoption(value) => {
             row.kind = "landAdoption";
@@ -6347,22 +5567,11 @@ pub fn controller_commitments_to_batch(
         Arc::new(BinaryArray::from(
             rows.iter().map(|row| row.batch_sha256).collect::<Vec<_>>(),
         )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.origin_incarnation)
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter().map(|row| row.checkpoint_id).collect::<Vec<_>>(),
-        )),
-        Arc::new(UInt64Array::from(
-            rows.iter().map(|row| row.barrier_id).collect::<Vec<_>>(),
-        )),
-        Arc::new(BinaryArray::from(
-            rows.iter()
-                .map(|row| row.manifest_batch_sha256)
-                .collect::<Vec<_>>(),
-        )),
+        // The checkpoint and restore columns are retired: no commitment fills them (13_telemetry.md).
+        new_null_array(&DataType::Utf8, rows.len()),
+        new_null_array(&DataType::Utf8, rows.len()),
+        new_null_array(&DataType::UInt64, rows.len()),
+        new_null_array(&DataType::Binary, rows.len()),
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| row.source_incarnation)
@@ -6373,11 +5582,7 @@ pub fn controller_commitments_to_batch(
                 .map(|row| row.destination_incarnation)
                 .collect::<Vec<_>>(),
         )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.source_checkpoint)
-                .collect::<Vec<_>>(),
-        )),
+        new_null_array(&DataType::Utf8, rows.len()),
         Arc::new(UInt64Array::from(
             rows.iter()
                 .map(|row| row.output_limit_bytes)
@@ -6388,11 +5593,7 @@ pub fn controller_commitments_to_batch(
                 .map(|row| row.output_crossing_bytes)
                 .collect::<Vec<_>>(),
         )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.replaced_incarnation)
-                .collect::<Vec<_>>(),
-        )),
+        new_null_array(&DataType::Utf8, rows.len()),
         Arc::new(StringArray::from(
             rows.iter().map(|row| row.landed_head).collect::<Vec<_>>(),
         )),
@@ -6479,6 +5680,11 @@ pub fn decode_controller_commitments(
         .map_err(|_| ArtifactError::BufferAllocation)?;
     for row in 0..batch.num_rows() {
         let kind = required_string(batch, 0, row)?;
+        // Retired kinds an older segment may still hold (13_telemetry.md): skipped so the land
+        // telemetry beside them stays readable. Any other unknown kind is still an error below.
+        if matches!(kind, "checkpoint" | "restore") {
+            continue;
+        }
         let version = u16::try_from(required_u64(batch, 1, row)?)
             .map_err(|_| ArtifactError::Arrow("commitment version does not fit u16".into()))?;
         let order = required_u64(batch, 2, row)?;
@@ -6546,18 +5752,6 @@ pub fn decode_controller_commitments(
                     output_limit,
                 })
             }
-            "checkpoint" => {
-                require_variant_columns(batch, row, &[13, 14, 15, 16])?;
-                ControllerCommitment::Checkpoint(CheckpointCommitment {
-                    version,
-                    order,
-                    repo_id,
-                    origin_incarnation: required_incarnation(batch, 13, row)?,
-                    checkpoint_id: required_string(batch, 14, row)?.to_owned(),
-                    barrier_id: required_u64(batch, 15, row)?,
-                    manifest_batch_sha256: required_digest(batch, 16, row)?,
-                })
-            }
             "fork" => {
                 require_variant_columns(batch, row, &[17, 18])?;
                 ControllerCommitment::Fork(ForkCommitment {
@@ -6565,18 +5759,6 @@ pub fn decode_controller_commitments(
                     order,
                     repo_id,
                     source_incarnation: required_incarnation(batch, 17, row)?,
-                    destination_incarnation: required_incarnation(batch, 18, row)?,
-                })
-            }
-            "restore" => {
-                require_variant_columns(batch, row, &[17, 18, 19, 22])?;
-                ControllerCommitment::Restore(RestoreCommitment {
-                    version,
-                    order,
-                    repo_id,
-                    source_checkpoint: required_string(batch, 19, row)?.to_owned(),
-                    source_incarnation: required_incarnation(batch, 17, row)?,
-                    replaced_incarnation: required_incarnation(batch, 22, row)?,
                     destination_incarnation: required_incarnation(batch, 18, row)?,
                 })
             }
@@ -6724,25 +5906,7 @@ fn require_job_columns(batch: &RecordBatch, row: usize) -> Result<(), ArtifactEr
     for column in 26..30 {
         if !batch.column(column).is_null(row) {
             return Err(ArtifactError::Arrow(format!(
-                "job record contains manifest column {}",
-                batch.schema().field(column).name()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn require_protected_columns(
-    batch: &RecordBatch,
-    row: usize,
-    selected: &[usize],
-) -> Result<(), ArtifactError> {
-    for column in 3..batch.num_columns() {
-        let should_be_present = selected.contains(&column);
-        if should_be_present == batch.column(column).is_null(row) {
-            return Err(ArtifactError::Arrow(format!(
-                "protected record {} nullability mismatch for {}",
-                string(batch, 0)?.value(row),
+                "job record contains retired checkpoint column {}",
                 batch.schema().field(column).name()
             )));
         }
@@ -6756,7 +5920,7 @@ pub fn repair_workspace_record_sequences(
 ) -> Result<(), ArtifactError> {
     let path = records_path(workspace_root);
     let lock = RecordsLock::acquire(&path, CONTROL)?;
-    // The manifest authenticates the exact serialized prefix. Rewriting sequences changes that
+    // Each frame's digest authenticates its exact serialized bytes. Rewriting sequences changes that
     // identity, while recomputing the in-file digest would let the rewrite attest to itself.
     // Holding the append lock makes the diagnosis stable; preserving identity requires refusal.
     match recover_records_with_budget_under_lock(&lock, retained_budget_bytes) {
@@ -6782,7 +5946,6 @@ mod tests {
     };
     use crate::api::resources::{CpuMicrosDelta, StorageIoBytesDelta};
     use cowshed_os::test_backstop::ChildBackstop as _;
-    use proptest::prelude::*;
     use std::sync::Barrier;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7426,7 +6589,7 @@ mod tests {
     }
 
     /// A store an earlier cowshed wrote is set aside whole the first time this one opens it --
-    /// records, sequence and barrier counters -- and an empty store starts. Its jobs here were all
+    /// records and their sequence counter -- and an empty store starts. Its jobs here were all
     /// inline and left no directory, so only the job id floor keeps the empty store from handing
     /// their ids out again, on this open and every later one; a job directory above the floor
     /// still wins. A second store in the same layout gets a directory of its own.
@@ -7434,13 +6597,11 @@ mod tests {
     fn a_store_in_an_earlier_layout_is_set_aside_whole_and_its_job_ids_stay_taken() {
         let root = temp_root("earlier-layout");
         drop(store_at(&root, ArtifactConfig::default()));
-        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        append_protected_record(&root, valid_job_record(1));
         append_batch(&root, &earlier_batch(&valid_job_record(2), 4, 3));
         append_batch(&root, &earlier_batch(&valid_job_record(5), 3, 4));
         let job_root = root.join(PROTECTED_DIRECTORY).join(JOB_DIRECTORY);
         let old_records = fs::read(records_path(&root)).unwrap();
-        let barrier = format!("{CHECKPOINT_BARRIER_FILE_PREFIX}{}", incarnation().as_str());
-        assert!(job_root.join(&barrier).exists(), "the store has a barrier");
         assert_eq!(scan_job_directories(&root).unwrap(), 0, "inline jobs only");
 
         let store = store_at(&root, ArtifactConfig::default());
@@ -7459,7 +6620,6 @@ mod tests {
         assert_eq!(store.next_job_id().unwrap().get(), 6);
         assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
         assert!(set_aside.join(RECORD_SEQUENCE_FILE).exists());
-        assert!(set_aside.join(&barrier).exists());
         drop(store);
 
         let reopened = store_at(&root, ArtifactConfig::default());
@@ -7638,11 +6798,7 @@ mod tests {
             ..valid_job_record(7)
         };
         for record in [lost, exited, signaled] {
-            let ProtectedRecord::Job(read) =
-                batch_to_protected_record(&job_record_to_batch(&record).unwrap()).unwrap()
-            else {
-                panic!("a job record");
-            };
+            let read = batch_to_protected_record(&job_record_to_batch(&record).unwrap()).unwrap();
             assert_eq!(read, record);
         }
 
@@ -7778,11 +6934,7 @@ mod tests {
             argv: image.argv.to_vec(),
             truncated: image.truncated,
         });
-        let ProtectedRecord::Job(read) =
-            batch_to_protected_record(&job_record_to_batch(&cut).unwrap()).unwrap()
-        else {
-            panic!("a job record");
-        };
+        let read = batch_to_protected_record(&job_record_to_batch(&cut).unwrap()).unwrap();
         assert_eq!(read, cut);
         let Some(JobResourceSample {
             leaf: JobLeafAttribution::Attributed { leaf, .. },
@@ -7838,9 +6990,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|sample| sample.volumes.build.is_none())
             );
-            let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
-                panic!("a job record");
-            };
+            let read = batch_to_protected_record(&batch).unwrap();
             assert_eq!(read, record);
         }
 
@@ -7899,9 +7049,7 @@ mod tests {
             ..valid_job_record(9)
         };
         let batch = job_record_to_batch(&sampled).unwrap();
-        let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
-            panic!("a job record");
-        };
+        let read = batch_to_protected_record(&batch).unwrap();
         assert_eq!(read, sampled);
         assert_eq!(
             read.resources
@@ -8106,10 +7254,7 @@ mod tests {
     /// `record` through its batch and back: the job record the batch holds.
     fn round_trip(record: &JobArtifactRecord) -> JobArtifactRecord {
         let batch = job_record_to_batch(record).unwrap();
-        let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
-            panic!("a job record");
-        };
-        read
+        batch_to_protected_record(&batch).unwrap()
     }
 
     /// A job record whose resource sample is `resources`, with the rest of the record valid.
@@ -8268,8 +7413,8 @@ mod tests {
         }
     }
 
-    fn append_protected_record(root: &Path, record: ProtectedRecord) {
-        let batch = protected_record_to_batch(&record).unwrap();
+    fn append_protected_record(root: &Path, record: JobArtifactRecord) {
+        let batch = job_record_to_batch(&record).unwrap();
         let payload = encode_batch(&batch).unwrap();
         append_framed_batch(
             &records_path(root),
@@ -8287,7 +7432,7 @@ mod tests {
         let root = temp_root("frame-extent");
         drop(store_at(&root, ArtifactConfig::default()));
         let before = fs::metadata(records_path(&root)).map_or(0, |metadata| metadata.len());
-        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        append_protected_record(&root, valid_job_record(1));
         let log = fs::read(records_path(&root)).unwrap();
         let start = usize::try_from(before).unwrap().max(RECORD_MAGIC.len());
         let frame = &log[start..];
@@ -8325,6 +7470,36 @@ mod tests {
         .unwrap();
     }
 
+    /// A store a writer from before checkpoints were removed used can hold a checkpoint manifest
+    /// frame. Recovery passes over that retired kind and reads the jobs around it.
+    #[test]
+    fn a_retired_checkpoint_manifest_frame_is_passed_over() {
+        let root = temp_root("retired-manifest");
+        drop(store_at(&root, ArtifactConfig::default()));
+        append_protected_record(&root, valid_job_record(1));
+        let job = job_record_to_batch(&valid_job_record(2)).unwrap();
+        let kind: ArrayRef = Arc::new(StringArray::from(vec![RETIRED_MANIFEST_KIND]));
+        append_batch(&root, &null_column(&replace_column(&job, 0, kind), 4));
+        append_protected_record(
+            &root,
+            JobArtifactRecord {
+                sequence: 2,
+                ..valid_job_record(2)
+            },
+        );
+
+        let report = recover_records(&records_path(&root)).unwrap();
+        assert_eq!(
+            report
+                .frames
+                .iter()
+                .map(|frame| frame.record.job_id.get())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(report.next_job_id.get(), 3);
+    }
+
     /// A newer cowshed's record is intact: recovery names it as newer, with both layouts, and
     /// leaves every byte of it in place. A batch that is no record at all stays an integrity
     /// failure, and says which way it is not one.
@@ -8333,7 +7508,7 @@ mod tests {
         let root = temp_root("newer-layout");
         let store = store_at(&root, ArtifactConfig::default());
         drop(store);
-        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        append_protected_record(&root, valid_job_record(1));
         let newer_offset = fs::metadata(records_path(&root)).unwrap().len();
         let current = job_record_to_batch(&valid_job_record(2)).unwrap();
         let mut fields = current.schema().fields().to_vec();
@@ -8385,7 +7560,7 @@ mod tests {
     }
 
     #[test]
-    fn record_and_manifest_validation_reject_every_invalid_boundary() {
+    fn record_validation_rejects_every_invalid_boundary() {
         let valid = valid_job_record(1);
         let mut invalid_records = Vec::new();
 
@@ -8433,95 +7608,7 @@ mod tests {
                 "{case} must be rejected"
             );
             assert!(
-                matches!(
-                    ProtectedRecord::Job(record).validate(),
-                    Err(ArtifactError::Integrity { .. })
-                ),
-                "{case} must also be rejected through protected-record validation"
-            );
-        }
-
-        let visible = VisibleJobCommitment {
-            workspace_incarnation: incarnation(),
-            job_id: JobId::new(1).unwrap(),
-            state: JobState::Exited,
-            stdout: VisibleStreamCommitment::from_stream(&inline_stream(b"")),
-            stderr: VisibleStreamCommitment::from_stream(&inline_stream(b"")),
-        };
-        let valid_manifest = CheckpointManifestRecord {
-            version: RECORD_SCHEMA_VERSION as u16,
-            repo_id: repo(),
-            origin_incarnation: incarnation(),
-            barrier_id: 1,
-            visible_jobs: vec![visible.clone()],
-            records_sha256: Sha256Digest::compute(RECORD_MAGIC),
-        };
-        valid_manifest.validate().unwrap();
-
-        let mut manifests = Vec::new();
-        for (version, barrier_id) in [(0, 1), (1, 0), (0, 0)] {
-            let mut manifest = valid_manifest.clone();
-            manifest.version = version;
-            manifest.barrier_id = barrier_id;
-            manifests.push(("version/barrier boundary", manifest));
-        }
-
-        let mut duplicate = valid_manifest.clone();
-        duplicate.visible_jobs.push(visible.clone());
-        manifests.push(("duplicate visible job", duplicate));
-
-        let mut wrong_path = valid_manifest.clone();
-        wrong_path.visible_jobs[0].stdout = VisibleStreamCommitment {
-            storage_kind: VisibleStorageKind::CapturedFile,
-            bytes: 0,
-            sha256: Sha256Digest::compute(b""),
-            protected_path: Some(WorkspacePath::new(".cowshed/job/2/out").unwrap()),
-        };
-        manifests.push(("wrong visible protected path", wrong_path));
-
-        let mut missing_path = valid_manifest.clone();
-        missing_path.visible_jobs[0].stdout.storage_kind = VisibleStorageKind::CapturedFile;
-        manifests.push(("file commitment without path", missing_path));
-
-        let mut running_inline = valid_manifest.clone();
-        running_inline.visible_jobs[0].state = JobState::Running;
-        manifests.push(("running inline prefix", running_inline));
-
-        let mut running_stdout_only = valid_manifest.clone();
-        running_stdout_only.visible_jobs[0].state = JobState::Running;
-        running_stdout_only.visible_jobs[0].stdout = VisibleStreamCommitment {
-            storage_kind: VisibleStorageKind::CapturedFile,
-            bytes: 0,
-            sha256: Sha256Digest::compute(b""),
-            protected_path: Some(WorkspacePath::new(".cowshed/job/1/out").unwrap()),
-        };
-        manifests.push(("running with only stdout durable", running_stdout_only));
-
-        let mut running_stderr_only = valid_manifest.clone();
-        running_stderr_only.visible_jobs[0].state = JobState::Running;
-        running_stderr_only.visible_jobs[0].stderr = VisibleStreamCommitment {
-            storage_kind: VisibleStorageKind::CapturedFile,
-            bytes: 0,
-            sha256: Sha256Digest::compute(b""),
-            protected_path: Some(WorkspacePath::new(".cowshed/job/1/err").unwrap()),
-        };
-        manifests.push(("running with only stderr durable", running_stderr_only));
-
-        let mut inline_with_path = valid_manifest.clone();
-        inline_with_path.visible_jobs[0].stdout.protected_path =
-            Some(WorkspacePath::new(".cowshed/job/1/out").unwrap());
-        manifests.push(("inline commitment with protected path", inline_with_path));
-
-        for (case, manifest) in manifests {
-            assert!(
-                matches!(manifest.validate(), Err(ArtifactError::Integrity { .. })),
-                "{case} must be rejected"
-            );
-            assert!(
-                matches!(
-                    ProtectedRecord::CheckpointManifest(manifest).validate(),
-                    Err(ArtifactError::Integrity { .. })
-                ),
+                matches!(record.validate(), Err(ArtifactError::Integrity { .. })),
                 "{case} must also be rejected through protected-record validation"
             );
         }
@@ -8608,9 +7695,7 @@ mod tests {
                 "admission_stderr_copy_policy",
             ],
         );
-        let ProtectedRecord::Job(read) = batch_to_protected_record(&batch).unwrap() else {
-            panic!("a job record");
-        };
+        let read = batch_to_protected_record(&batch).unwrap();
         assert_eq!(
             read, record,
             "accounting, volumes and admission survive together"
@@ -9382,7 +8467,7 @@ mod tests {
             );
         }
         let read = batch_to_protected_record(&decode_single_batch(&payload).unwrap()).unwrap();
-        assert_eq!(read, ProtectedRecord::Job(record));
+        assert_eq!(read, record);
     }
 
     /// A keyed row requires one exactly-32-byte digest, including for an empty public environment.
@@ -9416,9 +8501,9 @@ mod tests {
         }
     }
 
-    /// Unkeyed job and lifecycle records carry no authored environment commitment.
+    /// Unkeyed job records carry no authored environment commitment.
     #[test]
-    fn unkeyed_and_lifecycle_records_have_no_environment_digest() {
+    fn unkeyed_records_have_no_environment_digest() {
         let record = valid_job_record(9);
         let unkeyed = admitted(&record);
         assert!(unkeyed.column(ADMISSION_ENV_SHA256_COLUMN).is_null(0));
@@ -9430,25 +8515,6 @@ mod tests {
         assert_damage(
             &replace_column(&unkeyed, ADMISSION_ENV_SHA256_COLUMN, Arc::clone(&digest)),
             "an unkeyed record carrying an environment commitment",
-        );
-
-        let manifest = CheckpointManifestRecord {
-            version: RECORD_SCHEMA_VERSION as u16,
-            repo_id: repo(),
-            origin_incarnation: incarnation(),
-            barrier_id: 1,
-            visible_jobs: Vec::new(),
-            records_sha256: Sha256Digest::compute(RECORD_MAGIC),
-        };
-        let lifecycle = checkpoint_manifest_to_batch(&manifest).unwrap();
-        assert!(lifecycle.column(ADMISSION_ENV_SHA256_COLUMN).is_null(0));
-        assert_eq!(
-            batch_to_protected_record(&lifecycle).unwrap(),
-            ProtectedRecord::CheckpointManifest(manifest)
-        );
-        assert_damage(
-            &replace_column(&lifecycle, ADMISSION_ENV_SHA256_COLUMN, digest),
-            "a lifecycle record carrying a keyed environment commitment",
         );
     }
 
@@ -9783,9 +8849,7 @@ mod tests {
 
         let reopened = store_at(&root, ArtifactConfig::default());
         for frame in &reopened.recovery().frames {
-            let ProtectedRecord::Job(record) = &frame.record else {
-                panic!("this store contains only the admitted job's records");
-            };
+            let record = &frame.record;
             assert_eq!(
                 record.admission.as_ref().unwrap().env_sha256,
                 inline.env_sha256,
@@ -9815,7 +8879,7 @@ mod tests {
     /// it stays unprovable, an id above it is absent, and a row a refresh cannot authorize is
     /// integrity, never absence. The pre-key layout does not widen keyed admission authority.
     #[test]
-    fn an_unread_store_retains_numeric_authority_across_readers_and_checkpoints() {
+    fn an_unread_store_retains_numeric_authority_across_readers() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = temp_root("unread-store-authority");
@@ -9858,7 +8922,7 @@ mod tests {
 
         // A reader opened before the next writer's terminal append must refresh a miss.
         let mut reader = store_at(&root, ArtifactConfig::default());
-        let mut untouched = store_at(&root, ArtifactConfig::default());
+        let untouched = store_at(&root, ArtifactConfig::default());
         let readable_id = store.next_job_id().unwrap();
         let token = store
             .begin_job(
@@ -9884,16 +8948,6 @@ mod tests {
         fs::rename(&retained_records, records_path(&root)).unwrap();
         drop(running_reader);
         store.finish(token, JobState::Failed).unwrap();
-        // The manifest names the readable job from the records themselves, with no sealed read first.
-        let manifest = untouched.checkpoint().unwrap();
-        assert!(
-            manifest
-                .record
-                .visible_jobs
-                .iter()
-                .any(|job| job.job_id == readable_id && job.workspace_incarnation == incarnation()),
-            "a checkpoint names the readable current job without any prior sealed read"
-        );
         assert_eq!(
             reader
                 .sealed(readable_id)
@@ -9976,7 +9030,7 @@ mod tests {
                 "is neither current nor in the workspace's lineage",
             ),
         ] {
-            append_protected_record(&root, ProtectedRecord::Job(row));
+            append_protected_record(&root, row);
             assert!(
                 matches!(
                     reader.sealed(above_floor),
@@ -10376,110 +9430,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_hashes_missing_and_exactly_empty_records_as_magic_prefix() {
-        for (case, precreate_empty) in [("missing", false), ("empty", true)] {
-            let root = temp_root(case);
-            let mut store = store_at(&root, ArtifactConfig::default());
-            if precreate_empty {
-                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-                let path = records_path(&root);
-                ensure_private_job_root(&root).unwrap();
-                OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&path)
-                    .unwrap();
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-                assert_eq!(fs::metadata(&path).unwrap().len(), 0);
-            }
-
-            let checkpoint = store.checkpoint().unwrap();
-            assert_eq!(
-                checkpoint.record.records_sha256,
-                Sha256Digest::compute(RECORD_MAGIC),
-                "{case} records must commit the initialized magic prefix"
-            );
-            drop(store);
-            fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn checkpoint_preserves_non_not_found_metadata_errors() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = temp_root("checkpoint-metadata-error");
-        let mut store = store_at(&root, ArtifactConfig::default());
-        let job_root = ensure_private_job_root(&root).unwrap();
-        fs::set_permissions(&job_root, fs::Permissions::from_mode(0o000)).unwrap();
-
-        let error = store.checkpoint().unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                ArtifactError::Integrity { message, .. }
-                    if message.contains("Permission denied")
-            ),
-            "checkpoint must return the protected metadata error without attempting publication: {error:?}"
-        );
-
-        fs::set_permissions(&job_root, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn reopened_checkpoint_barriers_are_scoped_to_their_manifest_origin() {
-        let historical = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let historical_root = temp_root("historical-manifest");
-        append_protected_record(
-            &historical_root,
-            ProtectedRecord::CheckpointManifest(CheckpointManifestRecord {
-                version: RECORD_SCHEMA_VERSION as u16,
-                repo_id: repo(),
-                origin_incarnation: historical.clone(),
-                barrier_id: 50,
-                visible_jobs: Vec::new(),
-                records_sha256: Sha256Digest::compute(RECORD_MAGIC),
-            }),
-        );
-        assert!(matches!(
-            ArtifactStore::open(
-                &historical_root,
-                OwnedRepoIds::sole(repo()),
-                incarnation(),
-                ArtifactConfig::default()
-            ),
-            Err(ArtifactError::Integrity { .. })
-        ));
-        let mut historical_store = ArtifactStore::open(
-            &historical_root,
-            OwnedRepoIds::sole(repo()),
-            incarnation(),
-            ArtifactConfig {
-                historical_incarnations: BTreeSet::from([historical]),
-                ..ArtifactConfig::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(historical_store.checkpoint().unwrap().record.barrier_id, 1);
-        drop(historical_store);
-        fs::remove_dir_all(historical_root).unwrap();
-
-        let current_root = temp_root("current-manifest");
-        let mut current_store = store_at(&current_root, ArtifactConfig::default());
-        assert_eq!(current_store.checkpoint().unwrap().record.barrier_id, 1);
-        drop(current_store);
-        // Reopening replays the durable manifest sequence: allocation continues, never repeats.
-        let mut reopened = store_at(&current_root, ArtifactConfig::default());
-        assert_eq!(reopened.checkpoint().unwrap().record.barrier_id, 2);
-        drop(reopened);
-        fs::remove_dir_all(current_root).unwrap();
-    }
-
-    #[test]
     fn recorded_historical_incarnations_names_every_foreign_origin_once_and_never_current() {
         let ancestor = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
         let older = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
@@ -10649,13 +9599,6 @@ mod tests {
         assert_eq!(metadata.nlink(), 1);
         assert_eq!(metadata.len(), b"protected".len() as u64);
         drop(opened);
-        use std::os::unix::fs::symlink;
-        let hash_alias = root.join("hash-alias");
-        symlink(&path, &hash_alias).unwrap();
-        assert!(matches!(
-            hash_file_incrementally(&hash_alias),
-            Err(ArtifactError::Io { .. })
-        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -10871,44 +9814,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_wrong_manifest_prefix_and_duplicate_terminal_ids() {
-        let wrong_root = temp_root("wrong-prefix");
-        let mut wrong_store = store_at(&wrong_root, ArtifactConfig::default());
-        let wrong_token = wrong_store
-            .begin_job(
-                JobId::new(1).unwrap(),
-                1,
-                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
-                JobScheduling::default(),
-                OutputTargets::default(),
-            )
-            .unwrap();
-        let wrong = CheckpointManifestRecord {
-            version: RECORD_SCHEMA_VERSION as u16,
-            repo_id: repo(),
-            origin_incarnation: incarnation(),
-            barrier_id: 1,
-            visible_jobs: Vec::new(),
-            records_sha256: Sha256Digest::compute(b"wrong"),
-        };
-        let batch = protected_record_to_batch(&ProtectedRecord::CheckpointManifest(wrong)).unwrap();
-        let payload = encode_batch(&batch).unwrap();
-        append_framed_batch(
-            &records_path(&wrong_root),
-            &payload,
-            Sha256Digest::compute(&payload),
-        )
-        .unwrap();
-        assert!(matches!(
-            recover_records(&records_path(&wrong_root)),
-            Err(ArtifactError::Integrity { message, .. })
-                if message.contains("prefix digest")
-        ));
-        wrong_store.abort(wrong_token).unwrap();
-        drop(wrong_store);
-        fs::remove_dir_all(wrong_root).unwrap();
-
+    fn recovery_rejects_duplicate_terminal_ids() {
         let duplicate_root = temp_root("duplicate-terminal");
         let mut duplicate_store = store_at(&duplicate_root, ArtifactConfig::default());
         let duplicate_token = duplicate_store
@@ -10926,7 +9832,7 @@ mod tests {
             .unwrap();
         let mut duplicate = sealed.record.clone();
         duplicate.sequence += 1;
-        let batch = protected_record_to_batch(&ProtectedRecord::Job(duplicate)).unwrap();
+        let batch = job_record_to_batch(&duplicate).unwrap();
         let payload = encode_batch(&batch).unwrap();
         append_framed_batch(
             &records_path(&duplicate_root),
@@ -10944,139 +9850,9 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_snapshots_only_messages_sequenced_before_the_barrier() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = temp_root("actor-checkpoint-order");
-        let mut store = store_at(&root, ArtifactConfig::default());
-        let token = store
-            .begin_job(
-                JobId::new(1).unwrap(),
-                1,
-                &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
-                None,
-                JobScheduling::default(),
-                OutputTargets::default(),
-            )
-            .unwrap();
-        store
-            .append(&token, StreamKind::Stdout, b"before-checkpoint")
-            .unwrap();
-        let first = store.checkpoint().unwrap();
-        let first_visible = &first.record.visible_jobs[0].stdout;
-        assert_eq!(first_visible.bytes, b"before-checkpoint".len() as u64);
-        assert_eq!(
-            first_visible.sha256,
-            Sha256Digest::compute(b"before-checkpoint")
-        );
-
-        assert_eq!(
-            store.validated_manifest,
-            Some(first.manifest_batch_sha256),
-            "own publication keeps the already-computed validated manifest digest"
-        );
-        let mut reader = store_at(&root, ArtifactConfig::default());
-        let prefix_path = root.join(
-            first_visible
-                .protected_path
-                .as_ref()
-                .expect("a nonempty live checkpoint prefix is promoted to a protected file")
-                .as_path(),
-        );
-        let original_prefix = fs::read(&prefix_path).unwrap();
-        let sealed_first_mode = fs::metadata(&prefix_path).unwrap().permissions();
-        let mut writable_first = sealed_first_mode.clone();
-        writable_first.set_mode(sealed_first_mode.mode() | 0o200);
-        let mut corrupted_prefix = original_prefix.clone();
-        corrupted_prefix[0] ^= 0xff;
-        fs::set_permissions(&prefix_path, writable_first.clone()).unwrap();
-        fs::write(&prefix_path, &corrupted_prefix).unwrap();
-        fs::set_permissions(&prefix_path, sealed_first_mode.clone()).unwrap();
-        assert!(
-            reader.sealed(JobId::new(2).unwrap()).unwrap().is_none(),
-            "unchanged records do not re-hash a prefix whose manifest was already validated"
-        );
-        let other_id = store.next_job_id().unwrap();
-        let other = store
-            .begin_job(
-                other_id,
-                1,
-                &argv_true(),
-                None,
-                JobScheduling::default(),
-                OutputTargets::default(),
-            )
-            .unwrap();
-        store.finish(other, JobState::Failed).unwrap();
-        assert!(
-            reader.sealed(JobId::new(3).unwrap()).unwrap().is_none(),
-            "a new record does not re-hash the identical already-validated manifest"
-        );
-        fs::set_permissions(&prefix_path, writable_first.clone()).unwrap();
-        fs::write(&prefix_path, &original_prefix).unwrap();
-        fs::set_permissions(&prefix_path, sealed_first_mode.clone()).unwrap();
-
-        store.append(&token, StreamKind::Stdout, b"-after").unwrap();
-        let second = store.checkpoint().unwrap();
-        let second_visible = &second.record.visible_jobs[0].stdout;
-        assert_eq!(
-            second_visible.bytes,
-            b"before-checkpoint-after".len() as u64
-        );
-        assert_eq!(
-            second_visible.sha256,
-            Sha256Digest::compute(b"before-checkpoint-after")
-        );
-        let second_prefix_path = root.join(
-            second_visible
-                .protected_path
-                .as_ref()
-                .expect("a nonempty live checkpoint prefix is promoted to a protected file")
-                .as_path(),
-        );
-        let sealed_second_mode = fs::metadata(&second_prefix_path).unwrap().permissions();
-        let mut writable_second = sealed_second_mode.clone();
-        writable_second.set_mode(sealed_second_mode.mode() | 0o200);
-        let current_prefix = fs::read(&second_prefix_path).unwrap();
-        let mut corrupted_current = current_prefix.clone();
-        corrupted_current[0] ^= 0xff;
-        fs::set_permissions(&second_prefix_path, writable_second.clone()).unwrap();
-        fs::write(&second_prefix_path, &corrupted_current).unwrap();
-        fs::set_permissions(&second_prefix_path, sealed_second_mode.clone()).unwrap();
-        assert!(
-            matches!(
-                reader.sealed(JobId::new(3).unwrap()),
-                Err(ArtifactError::Integrity { .. }),
-            ),
-            "a newly learned manifest still validates its captured prefixes"
-        );
-        fs::set_permissions(&second_prefix_path, writable_second.clone()).unwrap();
-        fs::write(&second_prefix_path, &current_prefix).unwrap();
-        fs::set_permissions(&second_prefix_path, sealed_second_mode.clone()).unwrap();
-        assert_eq!(
-            first.record.visible_jobs[0].stdout.bytes,
-            b"before-checkpoint".len() as u64
-        );
-
-        let sealed = store.finish(token, JobState::Exited).unwrap();
-        assert_eq!(
-            store
-                .sealed(sealed.record.job_id)
-                .unwrap()
-                .expect("sealed checkpoint job")
-                .read_range(StreamKind::Stdout, 0..sealed.record.stdout.bytes)
-                .unwrap(),
-            b"before-checkpoint-after"
-        );
-        drop(store);
-        drop(reader);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn former_repository_identity_is_accepted_but_foreign_identity_is_not() {
         let root = temp_root("former-repo-id");
-        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        append_protected_record(&root, valid_job_record(1));
         let first = repo();
         let binding =
             crate::repository::RepositoryBinding::new(vec![crate::repository::BoundIdentity {
@@ -11150,7 +9926,7 @@ mod tests {
         let root = temp_root("migrate-record-sequence");
         let mut existing = valid_job_record(1);
         existing.sequence = 7;
-        append_protected_record(&root, ProtectedRecord::Job(existing));
+        append_protected_record(&root, existing);
         let counter = root
             .join(PROTECTED_DIRECTORY)
             .join(JOB_DIRECTORY)
@@ -11261,29 +10037,6 @@ mod tests {
     }
 
     #[test]
-    fn serialized_checkpoint_preserves_barrier_after_a_truncated_tail() {
-        let root = temp_root("serialized-truncated-tail-barrier");
-        let mut store = store_at(&root, ArtifactConfig::default());
-        let first = store.checkpoint().unwrap().record.barrier_id;
-        let path = records_path(&root);
-        let retained_len = fs::metadata(&path).unwrap().len();
-        let second = store.checkpoint().unwrap().record.barrier_id;
-        assert_eq!((first, second), (1, 2));
-
-        let file = OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
-            .unwrap();
-        file.sync_data().unwrap();
-
-        let after_tail_loss = store.checkpoint().unwrap().record.barrier_id;
-        assert!(
-            after_tail_loss > second,
-            "a serialized checkpoint reused handed-out barrier {second} after recovering an incomplete tail: {after_tail_loss}",
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn handed_out_sequence_remains_monotonic_across_repair() {
         let root = temp_root("repair-sequence-watermark");
         let mut store = store_at(&root, ArtifactConfig::default());
@@ -11328,50 +10081,6 @@ mod tests {
     }
 
     #[test]
-    fn handed_out_barrier_remains_monotonic_across_repair() {
-        let root = temp_root("repair-barrier-watermark");
-        let mut store = store_at(&root, ArtifactConfig::default());
-        let path = records_path(&root);
-        store
-            .append_record(AppendJob::Terminal(
-                ValidatedJob::from_inline(valid_job_record(1)).unwrap(),
-            ))
-            .unwrap();
-        let retained_len = fs::metadata(&path).unwrap().len();
-        let before_repair = store.checkpoint().unwrap().record.barrier_id;
-        let counter = root
-            .join(PROTECTED_DIRECTORY)
-            .join(JOB_DIRECTORY)
-            .join(format!(
-                "{CHECKPOINT_BARRIER_FILE_PREFIX}{}",
-                incarnation().as_str()
-            ));
-        let published = fs::read(&counter).unwrap();
-
-        let file = OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
-            .unwrap();
-        file.sync_data().unwrap();
-        repair_workspace_record_sequences(
-            &root,
-            ArtifactConfig::default().retained_recovery_budget_bytes,
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read(&counter).unwrap(),
-            published,
-            "repair rewrote the durable barrier watermark",
-        );
-        let after_repair = store.checkpoint().unwrap().record.barrier_id;
-        assert!(
-            after_repair > before_repair,
-            "repair lowered the durable barrier watermark from {before_repair} to {after_repair}",
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn repair_refuses_sequence_collisions_without_rewriting_identity() {
         let root = temp_root("repair-sequence-refusal");
         let mut first_running = valid_job_record(1);
@@ -11385,7 +10094,7 @@ mod tests {
         let mut second_exited = valid_job_record(2);
         second_exited.sequence = 3;
         for record in [first_running, first_exited, second_running, second_exited] {
-            append_protected_record(&root, ProtectedRecord::Job(record));
+            append_protected_record(&root, record);
         }
         let path = records_path(&root);
         let original = fs::read(&path).unwrap();
@@ -11436,7 +10145,7 @@ mod tests {
     #[test]
     fn repair_refuses_unreadable_payload_without_writing_a_backup() {
         let root = temp_root("repair-refuses-corruption");
-        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        append_protected_record(&root, valid_job_record(1));
         let path = records_path(&root);
         let mut corrupted = fs::read(&path).unwrap();
         corrupted[RECORD_MAGIC.len() + FRAME_HEADER_BYTES + 10] ^= 1;
@@ -11512,65 +10221,11 @@ mod tests {
                 return Err(format!("invalid trailer at byte {frame_start}"));
             }
             let batch = decode_single_batch(payload).map_err(|error| error.to_string())?;
-            if let ProtectedRecord::Job(record) =
-                batch_to_protected_record(&batch).map_err(|error| error.to_string())?
-            {
-                records.push(record);
-            }
+            let record = batch_to_protected_record(&batch).map_err(|error| error.to_string())?;
+            records.push(record);
             offset = trailer_end;
         }
         Ok(records)
-    }
-
-    /// One step a controller can take against a records log, plus the one thing a crash can do
-    /// to it: lose the bytes of the frame that was mid-append.
-    #[derive(Clone, Copy, Debug)]
-    enum RecordsStep {
-        AppendRecord,
-        Checkpoint,
-        LoseTail,
-    }
-
-    fn records_steps() -> impl Strategy<Value = Vec<RecordsStep>> {
-        prop::collection::vec(
-            prop_oneof![
-                2 => Just(RecordsStep::AppendRecord),
-                3 => Just(RecordsStep::Checkpoint),
-                2 => Just(RecordsStep::LoseTail),
-            ],
-            1..=12,
-        )
-    }
-
-    /// Drop the final byte of the records log, which always lands inside the last frame: a frame
-    /// is at least `FRAME_OVERHEAD_BYTES` long, so recovery reaches its start with fewer bytes
-    /// remaining than the header promises and truncates the incomplete tail.
-    fn lose_records_tail(path: &Path) {
-        let Ok(metadata) = fs::metadata(path) else {
-            return;
-        };
-        if metadata.len() <= RECORD_MAGIC.len() as u64 + FRAME_OVERHEAD_BYTES as u64 {
-            return;
-        }
-        let file = OpenOptions::new().write(true).open(path).unwrap();
-        file.set_len(metadata.len() - 1).unwrap();
-        file.sync_data().unwrap();
-    }
-
-    fn durable_barrier_ids(path: &Path, incarnation: &WorkspaceIncarnation) -> Vec<u64> {
-        recover_records(path)
-            .unwrap()
-            .frames
-            .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::CheckpointManifest(manifest)
-                    if manifest.origin_incarnation == *incarnation =>
-                {
-                    Some(manifest.barrier_id)
-                }
-                _ => None,
-            })
-            .collect()
     }
 
     /// Concurrent store instances serialize sequence allocation on the records flock, so the
@@ -11674,66 +10329,44 @@ mod tests {
         }
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(32))]
-
-        /// Barrier ids belong to the store, not to whatever a later recovery can still see: for
-        /// any interleaving of its checkpoints, other writers' appends and lost tails, every
-        /// barrier the store hands out is strictly above every barrier it handed out before, and
-        /// no durable manifest of this incarnation carries a barrier twice.
-        #[test]
-        fn checkpoint_barriers_never_repeat_across_appends_and_lost_tails(
-            steps in records_steps(),
-        ) {
-            let root = temp_root("barrier-uniqueness");
-            let mut store = store_at(&root, ArtifactConfig::default());
-            let path = records_path(&root);
-            let mut handed_out: Vec<u64> = Vec::new();
-            let mut next_job_id = 1_u64;
-            for step in &steps {
-                match step {
-                    RecordsStep::AppendRecord => {
-                        // Each append is another writer's, so a lost tail only ever cuts a job
-                        // frame no live reader has validated.
-                        store_at(&root, ArtifactConfig::default())
-                            .append_record(AppendJob::Terminal(ValidatedJob::from_inline(valid_job_record(next_job_id)).unwrap()))
-                            .unwrap();
-                        next_job_id += 1;
-                    }
-                    RecordsStep::Checkpoint => {
-                        let barrier = store.checkpoint().unwrap().record.barrier_id;
-                        if let Some(&previous) = handed_out.iter().max() {
-                            prop_assert!(
-                                barrier > previous,
-                                "steps={:?}: checkpoint handed out barrier {} at or below the already handed-out {}",
-                                steps,
-                                barrier,
-                                previous,
-                            );
-                        }
-                        handed_out.push(barrier);
-                    }
-                    RecordsStep::LoseTail => lose_records_tail(&path),
+    /// A segment an older writer sealed still holds "checkpoint" rows. Decoding skips them, so the
+    /// land telemetry beside them stays readable (13_telemetry.md).
+    #[test]
+    fn retired_checkpoint_rows_are_skipped_beside_surviving_commitments() {
+        let repo = repo();
+        let source = incarnation();
+        let destination = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let version = u64::from(crate::api::dto::CONTROLLER_COMMITMENT_VERSION);
+        let schema = controller_commitment_schema();
+        // Row 0 is a retired "checkpoint" row: kind, version, order and repo are set and every other
+        // column is null, as the unchanged schema lays it out. Row 1 is a fork.
+        let columns: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| -> ArrayRef {
+                match index {
+                    0 => Arc::new(StringArray::from(vec!["checkpoint", "fork"])),
+                    1 => Arc::new(UInt64Array::from(vec![version, version])),
+                    2 => Arc::new(UInt64Array::from(vec![1, 2])),
+                    3 => Arc::new(StringArray::from(vec![repo.as_str(), repo.as_str()])),
+                    17 => Arc::new(StringArray::from(vec![None, Some(source.as_str())])),
+                    18 => Arc::new(StringArray::from(vec![None, Some(destination.as_str())])),
+                    _ => new_null_array(field.data_type(), 2),
                 }
-            }
-            let durable = durable_barrier_ids(&path, &incarnation());
-            prop_assert_eq!(
-                durable.iter().copied().collect::<BTreeSet<_>>().len(),
-                durable.len(),
-                "steps={:?}: durable barrier ids repeat: {:?}",
-                steps,
-                durable,
-            );
-            for barrier in &durable {
-                prop_assert!(
-                    handed_out.contains(barrier),
-                    "steps={:?}: durable barrier {} was never handed out: {:?}",
-                    steps,
-                    barrier,
-                    handed_out,
-                );
-            }
-            fs::remove_dir_all(root).unwrap();
-        }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+
+        assert_eq!(
+            decode_controller_commitments(&batch).unwrap(),
+            vec![ControllerCommitment::Fork(ForkCommitment {
+                version: crate::api::dto::CONTROLLER_COMMITMENT_VERSION,
+                order: 2,
+                repo_id: repo,
+                source_incarnation: source,
+                destination_incarnation: destination,
+            })],
+        );
     }
 }

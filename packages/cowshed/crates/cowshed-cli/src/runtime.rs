@@ -18,17 +18,16 @@ use cowshed_core::api::operations::{ListLanding, ReAdoption};
 use cowshed_core::api::server::serve_controller_connection;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection_in_process};
 use cowshed_core::api::{
-    AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName, CheckpointInfo,
-    CheckpointOptions, CheckpointResult, CommandArg, Coordinator, DefragmentResult, DoctorReport,
-    EmptyResult, ExecRequest, ExpectedRefHead, Finding, FindingSeverity, FoldKept, FoldOutcome,
-    FoldedWorkspace, ForkOptions, GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta,
-    GrantSet, JobInfo, JobStream, LandOptions, LandReport, LandTurnName, LandingCommits,
-    MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants, PublicationPolicy,
-    PushOptions, PushReport, RebaseOptions, RebaseReport, RefLockPath, RekeyResult, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
-    UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName, CommandArg,
+    Coordinator, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, ExpectedRefHead,
+    Finding, FindingSeverity, FoldKept, FoldOutcome, FoldedWorkspace, ForkOptions, GatewayStatus,
+    GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions,
+    LandReport, LandTurnName, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta,
+    ProjectGrants, PublicationPolicy, PushOptions, PushReport, RebaseOptions, RebaseReport,
+    RefLockPath, RekeyResult, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
+    RemoveReport, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
+    StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo,
+    WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -51,7 +50,7 @@ use cowshed_core::storage::host_config::{
 use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, records_lock_held, repair_workspace_record_sequences,
 };
-use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
+use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Substrate};
 use cowshed_core::storage::recovery::KeptAbandonBundles;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
@@ -120,8 +119,6 @@ pub trait CliService: Send {
             "repository identity changes are unavailable for this CLI service",
         ))
     }
-    async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
-    async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo>;
     /// The project's rows, and each workspace whose mount is unproven, which has none.
     async fn list(&mut self, landing: Option<ListLanding>) -> Result<ProjectWorkspaces>;
@@ -154,7 +151,6 @@ pub trait CliService: Send {
         volume: ResizeVolume,
     ) -> Result<ResizeResult>;
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult>;
-    async fn reseed(&mut self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult>;
     /// Delete the workspace's Nx state on its build volume (`coordinator.clearNxState`).
     async fn clear_nx_state(
         &mut self,
@@ -239,8 +235,6 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         Command::Adopt(_)
         | Command::Fork(_)
         | Command::Move(_)
-        | Command::Checkpoint(_)
-        | Command::Restore(_)
         | Command::Path(_)
         | Command::Exec(_)
         | Command::Grant(_)
@@ -253,7 +247,6 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Detach(_)
         | Command::Resize(_)
         | Command::Defrag(_)
-        | Command::Reseed(_)
         | Command::Cache(_)
         | Command::Rekey(_)
         | Command::Gc(_)
@@ -315,8 +308,6 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         }
         Command::Fork(_)
         | Command::Move(_)
-        | Command::Checkpoint(_)
-        | Command::Restore(_)
         | Command::List(_)
         | Command::Path(_)
         | Command::BuildState
@@ -329,7 +320,6 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Detach(_)
         | Command::Resize(_)
         | Command::Defrag(_)
-        | Command::Reseed(_)
         | Command::Cache(_)
         | Command::Rekey(_)
         | Command::Gc(_)
@@ -395,9 +385,8 @@ fn binds_re_adoption_primary(command: &Command, resuming_re_adoption: bool) -> b
 /// journaled intent, so it adds nothing; a removal alone refuses one before opening, because
 /// its scope is the name. `gc` is store maintenance and finishes residue everywhere. `doctor`
 /// never mutates: its open finishes nothing and it reports what another open would finish; only
-/// `doctor --repair` opens the way other mutating verbs do. `reseed` inspects too: its operation
-/// must refuse unfinished create/fork/adopt work, never finish it before making that decision.
-/// `defrag` likewise opens without replay: it must be able to rewrite a pending clone whose
+/// doctor --repair opens the way other mutating verbs do. defrag opens without replay: it
+/// must be able to rewrite a pending clone whose
 /// physical-generation extent gate is the reason publication cannot finish. `land --preflight`
 /// inspects as well: it reads land's fences and must finish nothing.
 fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
@@ -416,7 +405,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
             .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?,
         Command::Gc(_) => RecoveryScope::Store,
         Command::Doctor(args) if !args.repair => RecoveryScope::Inspect,
-        Command::Reseed(_) | Command::Defrag(_) => RecoveryScope::Inspect,
+        Command::Defrag(_) => RecoveryScope::Inspect,
         Command::Land(args) if args.preflight => RecoveryScope::Inspect,
         Command::Fork(args) => named([args.source.as_deref(), Some(args.destination.as_str())]),
         Command::Move(args) => match &args.destination {
@@ -427,7 +416,6 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
                 named([Some(args.source.as_str())])
             }
         },
-        Command::Restore(args) => named([Some(args.workspace.as_str())]),
         Command::Exec(args) => named([Some(args.workspace.as_str())]),
         Command::Grant(args) => match &args.target {
             GrantTarget::Workspace(workspace) => named([Some(workspace.as_str())]),
@@ -440,7 +428,6 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         Command::Resize(args) => named([Some(args.workspace.as_str())]),
         Command::Rekey(args) => named([Some(args.workspace.as_str())]),
         Command::Land(args) => named([Some(args.workspace.as_str())]),
-        Command::Checkpoint(args) => named([args.workspace.as_deref()]),
         Command::Path(args) => named([args.workspace.as_deref()]),
         Command::Attach(args) => named([args.workspace.as_deref()]),
         Command::Detach(args) => named([args.workspace.as_deref()]),
@@ -839,24 +826,6 @@ impl CliService for ActorBridge {
             .into_info())
     }
 
-    async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String> {
-        self.coordinator()?
-            .worker(workspace)
-            .await?
-            .checkpoint(options)
-            .await
-    }
-
-    async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo> {
-        self.coordinator()?.restore(workspace, label).await?;
-        self.coordinator()?
-            .project()
-            .workspace(workspace)
-            .await?
-            .refresh_info()
-            .await
-    }
-
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo> {
         self.coordinator()?
             .project()
@@ -964,10 +933,6 @@ impl CliService for ActorBridge {
 
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult> {
         self.coordinator()?.defragment(workspace).await
-    }
-
-    async fn reseed(&mut self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult> {
-        self.coordinator()?.reseed(workspace, from, dry_run).await
     }
 
     async fn clear_nx_state(
@@ -1671,36 +1636,6 @@ where
                 .map_err(output_error)?;
             Ok(success())
         }
-        Command::Checkpoint(args) => {
-            let workspace = resolve_workspace(service, args.workspace, "checkpoint").await?;
-            let label = service
-                .checkpoint(
-                    &workspace,
-                    CheckpointOptions {
-                        label: args.label.map(os_utf8).transpose()?,
-                        keep: args.keep,
-                    },
-                )
-                .await?;
-            if json {
-                output
-                    .success(CheckpointResult { label })
-                    .map_err(output_error)?;
-            } else {
-                output.bare_line(label.as_bytes()).map_err(output_error)?;
-            }
-            Ok(success())
-        }
-        Command::Restore(args) => {
-            let label = os_utf8(args.label)?;
-            let info = service.restore(&args.workspace, &label).await?;
-            service.reconcile_gateway().await?;
-            emit_mount(output, json, &info)?;
-            output
-                .hint(&format!("cowshed exec {} -- git status", args.workspace))
-                .map_err(output_error)?;
-            Ok(success())
-        }
         Command::List(args) => {
             if args.all {
                 let projects = list_projects(listing_landing(args)).await?;
@@ -2066,16 +2001,6 @@ where
                     previous.observed_first_write_cost()
                 ))
                 .map_err(output_error)?;
-            Ok(success())
-        }
-        Command::Reseed(args) => {
-            let result = service
-                .reseed(&args.workspace, &args.from, args.dry_run)
-                .await?;
-            if !result.dry_run {
-                service.reconcile_gateway().await?;
-            }
-            emit_reseed_result(output, json, result)?;
             Ok(success())
         }
         Command::Cache(CacheCommand::Clear { workspace }) => {
@@ -3340,15 +3265,6 @@ fn store_workspace_info(
         branch: snapshot.branch.clone(),
         base_commit,
         created_at,
-        checkpoints: derived
-            .checkpoints
-            .iter()
-            .map(|checkpoint| CheckpointInfo {
-                label: checkpoint.label.to_string(),
-                revision: checkpoint.revision.get(),
-                pinned: checkpoint.pin == Pin::Pinned,
-            })
-            .collect(),
         snapshot_stale: snapshot.stale,
         landing: None,
     })
@@ -3692,56 +3608,6 @@ fn emit_cache_clear_report<W: Write, E: Write>(
         .map_err(output_error)
 }
 
-fn emit_reseed_result<W: Write, E: Write>(
-    output: &mut Output<W, E>,
-    json: bool,
-    result: ReseedResult,
-) -> Result<()> {
-    if result.dry_run {
-        let reduction = i128::from(result.previous_bytes) - i128::from(result.replacement_bytes);
-        output
-            .guidance(&format!(
-                "would discard workspace {} build volume {} ({} allocated bytes) and clone {}'s existing seed {} ({} allocated bytes estimated); estimated allocation reduction: {reduction:+} bytes; no changes made",
-                result.workspace,
-                result.previous_volume,
-                result.previous_bytes,
-                result.from,
-                result.seed,
-                result.replacement_bytes,
-            ))
-            .map_err(output_error)?;
-    } else {
-        output
-            .guidance(&format!(
-                "workspace {} build state replaced from {}'s existing seed {}: {} allocated bytes before, {} after; {} allocated image bytes reclaimed",
-                result.workspace,
-                result.from,
-                result.seed,
-                result.previous_bytes,
-                result.replacement_bytes,
-                result.released_bytes,
-            ))
-            .map_err(output_error)?;
-    }
-    output
-        .guidance(if result.dry_run {
-            "source tree, HEAD, index, dirty and untracked files untouched; execution would discard live build-volume contents, missing incremental work rebuilds cold; no seed refreshed"
-        } else {
-            "source tree, HEAD, index, dirty and untracked files untouched; build-volume contents discarded, missing incremental work rebuilds cold; no seed refreshed"
-        })
-        .map_err(output_error)?;
-    output
-        .guidance("allocated image bytes are GC accounting, not unique physical bytes or a promise of physical free space: APFS clones share extents")
-        .map_err(output_error)?;
-    if json {
-        output.success(result).map_err(output_error)
-    } else {
-        output
-            .bare_line(result.released_bytes.to_string().as_bytes())
-            .map_err(output_error)
-    }
-}
-
 fn emit_gc_candidates<W: Write, E: Write>(
     output: &mut Output<W, E>,
     report: &GcReport,
@@ -3767,7 +3633,6 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::OrphanStagingMount => "orphaned staging mountpoint",
         GcReason::OrphanSessionImage => "orphaned session image without metadata",
         GcReason::OrphanMountpoint => "orphaned mountpoint",
-        GcReason::ExpiredCheckpoint => "expired checkpoint",
         GcReason::AbandonedBundle => {
             "abandon bundle of commits main does not contain; the bundle is the only copy"
         }
@@ -5770,69 +5635,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn reseed_control_output_preserves_the_named_envelope_and_allocation_units() {
-        for dry_run in [false, true] {
-            for json in [false, true] {
-                for quiet in [false, true] {
-                    let result = ReseedResult {
-                        workspace: WorkspaceName::new("raven").unwrap(),
-                        from: WorkspaceName::main(),
-                        previous_volume: "old-volume".into(),
-                        seed: "main-seed".into(),
-                        replacement_volume: (!dry_run).then(|| "replacement-volume".into()),
-                        previous_bytes: 128,
-                        replacement_bytes: 256,
-                        released_bytes: if dry_run { 0 } else { 128 },
-                        dry_run,
-                    };
-                    let expected = result.clone();
-                    let mut output = Output::new(Vec::new(), Vec::new(), quiet);
-                    emit_reseed_result(&mut output, json, result).expect("reseed output");
-                    let (stdout, stderr) = output.into_inner();
-                    if json {
-                        assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
-                        let envelope: cowshed_core::api::JsonEnvelope<ReseedResult> =
-                            serde_json::from_slice(&stdout).expect("named reseed envelope");
-                        assert_eq!(envelope, cowshed_core::api::JsonEnvelope::success(expected));
-                        let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-                        assert_eq!(value.as_object().unwrap().len(), 2);
-                        assert_eq!(value["ok"], true);
-                        assert_eq!(value["result"].get("replacementVolume").is_none(), dry_run);
-                    } else {
-                        assert_eq!(
-                            stdout,
-                            if dry_run {
-                                b"0\n".to_vec()
-                            } else {
-                                b"128\n".to_vec()
-                            }
-                        );
-                    }
-                    let stderr = String::from_utf8(stderr).unwrap();
-                    if quiet {
-                        assert!(stderr.is_empty());
-                    } else {
-                        for fact in [
-                            "source tree, HEAD, index, dirty and untracked files untouched",
-                            "missing incremental work rebuilds cold",
-                            "no seed refreshed",
-                            "not unique physical bytes",
-                        ] {
-                            assert!(stderr.contains(fact), "{stderr}");
-                        }
-                        if dry_run {
-                            assert!(stderr.contains("estimated allocation reduction: -128 bytes"));
-                            assert!(stderr.contains("no changes made"));
-                        } else {
-                            assert!(stderr.contains("128 allocated image bytes reclaimed"));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn host_scope_discovers_store_authority_before_control_operations() {
         use ProjectPreflightOrder::{AtDispatch, BeforeControl};
         let cases: &[(&[&str], ProjectPreflightOrder)] = &[
@@ -5898,14 +5700,10 @@ mod tests {
             &["fork", "raven"],
             &["fork", "raven", "crow"],
             &["mv", "raven", "crow"],
-            &["checkpoint", "raven", "before"],
-            &["restore", "raven", "before"],
             &["path", "raven"],
             &["attach", "raven"],
             &["detach", "raven"],
             &["resize", "raven", "200g"],
-            &["reseed", "raven"],
-            &["reseed", "raven", "--dry-run"],
             &["land", "raven", "--target", "main"],
             &["rebase", "raven"],
             &["push", "raven", "--branch", "review"],
@@ -6250,7 +6048,6 @@ mod tests {
                             branch: None,
                             base_commit: None,
                             created_at: None,
-                            checkpoints: Vec::new(),
                             snapshot_stale: false,
                             landing: None,
                         },
@@ -7777,11 +7574,6 @@ mod tests {
                 vec!["fork", "raven", "falcon"],
                 RuntimeOpenMode::ExistingOnly,
             ),
-            (vec!["checkpoint", "raven"], RuntimeOpenMode::ExistingOnly),
-            (
-                vec!["restore", "raven", "stable"],
-                RuntimeOpenMode::ExistingOnly,
-            ),
             (vec!["attach", "--all"], RuntimeOpenMode::ExistingOnly),
             (vec!["ls"], RuntimeOpenMode::ExistingOnly),
             (vec!["path", "raven"], RuntimeOpenMode::ExistingOnly),
@@ -7929,9 +7721,7 @@ mod tests {
         assert_eq!(scope(&["doctor"]).unwrap(), RecoveryScope::Inspect);
         assert_eq!(scope(&["doctor", "--repair"]).unwrap(), names(&[]));
         for argv in [
-            &["reseed", "raven"][..],
-            &["reseed", "raven", "--from", "lane", "--dry-run"],
-            &["defrag", "raven"],
+            &["defrag", "raven"][..],
             &["land", "raven", "--preflight"],
             &["land", "raven", "--into", "lane", "--preflight"],
         ] {

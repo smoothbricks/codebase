@@ -98,12 +98,9 @@ Notes for harness integration:
   standalone Markdown unrelated to any shed's code goes straight to main through the repository's doc route, whenever it
   is ready, and the batch's land rebases over it. The commands and their refusals are in
   [usage.md](usage.md#lanes-one-change-built-by-several-workspaces).
-- If a task needs a _snapshot to retry from_, `cowshed checkpoint <ws> <label>` before the risky step and
-  `cowshed restore <ws> <label>` on failure — both are milliseconds, and far cheaper than re-creating the workspace.
-  Checkpoint publication first crosses a supervisor barrier: complete Arrow batches and spill files are sealed, and a
-  manifest commits every checkpoint-resident job byte. A restored checkpoint starts a new workspace incarnation; the
-  captured content remains authoritative only for the snapshot that created it; the restored image's marker records its
-  lineage, and the controller's audit record of the restore carries the hashes for after-the-fact comparison.
+- If a task needs a _point to retry from_, fork before the risky step with `cowshed fork <ws> <ws>-try` and run the step
+  in the fork. The source is untouched, so a failed attempt is discarded with `cowshed rm <ws>-try --force --abandon`;
+  `--abandon` keeps any commits the attempt made in a recoverable bundle.
 - Parallel exploration: `cowshed fork <ws> <ws>-alt` mid-task gives you two divergent futures from the same state. Forks
   start with a closed sandbox regardless of the source's grants.
 
@@ -117,10 +114,10 @@ node packages/cowshed/bin/cache-advisor.cjs \
   bun nx run-many -t gate --parallel=2 --nx-bail=false
 ```
 
-This is not a cowshed lifecycle verb: it does not rebase, reseed, replace or delete an image, and does not run gate
-targets. It hashes the workspace tree once and compares those same keys with both candidates. It needs read access to
-both checkouts and their resolved build volumes; when invoked through a workspace grant, request those reads through the
-normal coordinator rather than widening authority silently.
+This is not a cowshed lifecycle verb: it does not rebase, replace or delete an image, and does not run gate targets. It
+hashes the workspace tree once and compares those same keys with both candidates. It needs read access to both checkouts
+and their resolved build volumes; when invoked through a workspace grant, request those reads through the normal
+coordinator rather than widening authority silently.
 
 The one JSON report includes per-task keys, independent own/main HIT/MISS, exclusive hit classes, mean miss weights with
 sample count and min/max, coverage, unresolved reasons, serial task-second totals and probe wall time. Positive
@@ -163,8 +160,8 @@ surface decision, are governed by
 [16_build_volumes.md §Read-only cache-reuse advisor](../../../specs/cowshed/16_build_volumes.md#read-only-cache-reuse-advisor).
 
 This is cowshed's layered capability model: the trusted coordinator holds policy authority; workers run closed and ask.
-A worker handle controls exactly one workspace's exec, shells, jobs, quota-limited checkpoints, push, and read-only
-grants. It cannot grant/revoke, restore/destroy/rebase/land, run gc, mirror repositories, or select another workspace.
+A worker handle controls exactly one workspace's exec, shells, jobs, push, and read-only grants. It cannot grant/revoke,
+destroy/rebase/land, run gc, mirror repositories, or select another workspace.
 
 ## Bounded job results and raw artifacts
 
@@ -298,8 +295,8 @@ workspace-local numeric job id to resume status, raw logs, or attachment. The du
 `(repo_id, workspace_incarnation, job_id)`. A client disconnect never unlinks the socket or stops the job.
 
 Protected in-volume Arrow records and canonical `Inline`/`File` artifacts are the captured-content authority within
-their originating incarnation and checkpoint snapshot; a `Redirect.source` never is. The controller's audit records
-(sealed Arrow segments by default, or a supervising runtime's own sink) carry compact telemetry of job existence,
-lifecycle, ordering, lineage, terminal state, byte counts, stream hashes, and terminal-batch digest. They carry no
-artifact payload or path, never duplicate raw stdout/stderr, and are never read for a decision. Neither tier silently
-wins a mismatch: missing committed content or a digest disagreement is an integrity failure.
+their originating incarnation; a `Redirect.source` never is. The controller's audit records (sealed Arrow segments by
+default, or a supervising runtime's own sink) carry compact telemetry of job existence, lifecycle, ordering, lineage,
+terminal state, byte counts, stream hashes, and terminal-batch digest. They carry no artifact payload or path, never
+duplicate raw stdout/stderr, and are never read for a decision. Neither tier silently wins a mismatch: missing committed
+content or a digest disagreement is an integrity failure.

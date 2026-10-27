@@ -18,8 +18,8 @@ Every cowshed command follows the same I/O discipline:
 | 0    | ok                               | —                                                                                                                                                                                                                                                                                                                                    |
 | 1    | internal error (bug — report it) | panic, unexpected hdiutil/diskutil failure                                                                                                                                                                                                                                                                                           |
 | 2    | usage                            | unknown flag, missing argument                                                                                                                                                                                                                                                                                                       |
-| 3    | not-found                        | no such workspace/project/checkpoint                                                                                                                                                                                                                                                                                                 |
-| 4    | conflict                         | name in use, workspace busy, restore over unsaved work                                                                                                                                                                                                                                                                               |
+| 3    | not-found                        | no such workspace/project                                                                                                                                                                                                                                                                                                            |
+| 4    | conflict                         | name in use, workspace busy                                                                                                                                                                                                                                                                                                          |
 | 5    | env-missing                      | gateway, storage, mount, or executable unavailable                                                                                                                                                                                                                                                                                   |
 | 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence, with stderr naming the path/domain and the grant that would allow it; or the shell running cowshed is itself sandboxed away from cowshed's store (EPERM on a store path), where no grant helps and the hint is to rerun from a shell allowed to write the store |
 | 7    | integrity                        | committed job content missing, mutated, rolled back, or from outside the workspace's lineage                                                                                                                                                                                                                                         |
@@ -67,9 +67,9 @@ Workspace names are `[a-z0-9][a-z0-9-]*`, unique per project. Commands taking `<
 sense. `cowshed exec main -- ...` uses the same closed sandbox and explicit grants as every other workspace.
 
 A host may adopt many repositories. Each repository binding owns one `main` and an independent namespace of workspace
-names and checkpoints. cwd or `--project` selects the repository before a command interprets its workspace argument;
-`main` is therefore repository-scoped, not host-global. `--repo-id` selects an explicit identity while adopting and
-repairs an adopted identity with `cowshed mv main --repo-id`.
+names. cwd or `--project` selects the repository before a command interprets its workspace argument; `main` is therefore
+repository-scoped, not host-global. `--repo-id` selects an explicit identity while adopting and repairs an adopted
+identity with `cowshed mv main --repo-id`.
 
 ## Lifecycle
 
@@ -122,10 +122,10 @@ and exits non-zero with a `conflict`. An installed cowshed that records nothing 
 commit — never blocks an install; an installed record that cannot be read is an `integrity` refusal. `--downgrade`
 installs the invoking build without judging it; it is refused with `--uninstall` and `--force`, which install nothing.
 
-The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
-`exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `cache clear`, `rekey`, `gc`, `push`,
-`rebase`, `land` — first ask the daemon whether it runs their build, before they open the project or change anything. A
-daemon of another build refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
+The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `path`, `exec`, `grant`, `rm`,
+`forget`, `attach`, `detach`, `resize`, `defrag`, `cache clear`, `rekey`, `gc`, `push`, `rebase`, `land` — first ask the
+daemon whether it runs their build, before they open the project or change anything. A daemon of another build refuses
+them up front (exit 4), naming both builds, with the remedy this verb provides:
 
 ```
 $ cowshed rm raven
@@ -443,7 +443,7 @@ its format and path, and never converted.
 RAW images are sparse at creation: capacity is a cap, not a reservation, and nothing returns guest-freed space
 automatically. In the RAW measurement, a deleted 1 GiB payload kept its host allocation after guest sync, image fsync,
 clean unmount and detach. Space returns only after verification and explicit release of the retained old image and every
-clone or checkpoint sharing its blocks. See 02_workspaces.md §Re-adoption and 01a_apfs.md, "Space reclamation".
+clone sharing its blocks. See 02_workspaces.md §Re-adoption and 01a_apfs.md, "Space reclamation".
 
 Workspace environment lives in the image at `.cowshed/env` and is rewritten on token rotation. The repository `.envrc`
 is a two-liner that sources that file. Cowshed does not authorize direnv or devenv trust databases. Reattach a detached
@@ -678,7 +678,7 @@ next: land the workspace: cowshed land raven
 $ cowshed rm raven --abandon
 cowshed: abandoned 9 commits at 9b2e77d… that main (at 6f3a2c1…) did not contain
 cowshed: bundled to /private/cowshed/store/acme/api/sessions/.trash/raven-9b2e77d….bundle
-next: cowshed gc   # free space from old checkpoints too
+next: cowshed gc   # free space from old images too
 ```
 
 Recover abandoned work from the bundle:
@@ -840,8 +840,8 @@ private loopback in its own network namespace, so fixed service ports do not col
 tools still use `http://127.0.0.1:7644/…`: exactly one controller-owned, non-signalable connector in that namespace
 binds that address and forwards bytes only to the workspace's mounted `/run/cowshed/gateway.sock`. It holds no policy or
 credentials and is not a general TCP/Unix-socket forwarder; the socket inode, namespace, and opaque token retain the
-authority boundary. Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration
-rather than assuming host-wide loopback.
+authority boundary. Detach drains and kills it. Tools must use cowshed's platform-specific configuration rather than
+assuming host-wide loopback.
 
 On macOS, `.cowshed/env` and every job's environment carry `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE`: the block
 is `base … base+size-1`. Its size is 64 for a new workspace, may be larger after a `--ports` grant, and older workspaces
@@ -996,44 +996,8 @@ image, verified by attaching it, and mounted again if it was mounted. A copy tha
 the workspace back on its mount.
 
 The copy needs as much free space on the store volume as the image has allocated, checked before anything is detached,
-and it keeps that space: clones and checkpoints taken earlier still share the old blocks, so the space comes back only
-as they are removed. Main fragments again as it takes writes while new clones share it; rerun the verb when `doctor`
-warns.
-
-### `cowshed reseed <name|main> [--from <target>] [--dry-run]`
-
-Discard one workspace's live build-volume contents and replace them with a new clone of an existing seed. The target
-defaults to main; `--from <target>` selects another workspace's latest seed in its current incarnation.
-
-```
-cowshed reseed raven --dry-run
-cowshed reseed raven --from main
-cowshed reseed main --from lane-base --dry-run --json
-```
-
-This replaces only rebuildable build-volume state: Cargo targets, Nx cache/workspace data, indexes and declared build
-state reached through the excluded `.cowshed/build` link. Source files, HEAD, the index, dirty and untracked files stay
-untouched; declared outputs on the source volume are not deleted. Any incremental work missing from the selected seed
-must rebuild cold on the next build.
-
-The seed is used as-is, even when stale. A missing seed refuses instead of refreshing it or manufacturing an empty one.
-No seed is refreshed, written or deleted, including the destination workspace's own seed. Automatic seed refresh remains
-part of fork and land; this is not a manual warm/refreeze command
-([16 Build volumes](../../../specs/cowshed/16_build_volumes.md#targets-and-seeds)).
-
-Run while idle. Live job/land holds, filesystem holders, held lifecycle/image locks and unfinished create/fork/adopt
-work refuse before publication, with the volume and holder identity named. Opening for reseed does not complete that
-unfinished work first. Only the old build volume's Nx daemon may be stopped under its exclusive hold; jobs are never
-terminated and the old volume is never forcibly unmounted.
-
-Bare stdout is the removed image's allocated byte count (`0` with `--dry-run`); guidance stays on stderr. `--json`
-returns the frozen success envelope with
-`ReseedResult { workspace, from, previousVolume, seed, replacementVolume?, previousBytes, replacementBytes, releasedBytes, dryRun }`.
-Preview changes no link, mount, image or seed: `replacementVolume` is omitted, `replacementBytes` estimates the new
-allocation from the seed and `releasedBytes` is zero. Execution reports actual replacement allocation and removed
-old-image allocation. The signed preview reduction is `previousBytes - replacementBytes`, not execution's stdout. These
-are GC-style allocated image bytes, not unique physical bytes: APFS shares extents, so no corresponding increase in
-physical free space is promised.
+and it keeps that space: clones taken earlier still share the old blocks, so the space comes back only as they are
+removed. Main fragments again as it takes writes while new clones share it; rerun the verb when `doctor` warns.
 
 ### `cowshed cache clear [<name|main>]`
 
@@ -1201,17 +1165,16 @@ revision handling, recovery, and propagation.
 ## Authority boundaries
 
 Project lookup is discovery-only. Workspace inspection may safely attach. A worker capability controls one workspace's
-exec, shell, jobs, quota-limited checkpoints, push, and grant reads. Only a trusted coordinator may grant/revoke,
-restore/destroy/rebase/land, run gc, or mirror repositories. The persistent per-workspace supervisor socket is
-permission- and peer-checked, supports concurrent clients and reconnect, and is never unlinked merely because one client
-disconnects.
+exec, shell, jobs, push, and grant reads. Only a trusted coordinator may grant/revoke, destroy/rebase/land, run gc, or
+mirror repositories. The persistent per-workspace supervisor socket is permission- and peer-checked, supports concurrent
+clients and reconnect, and is never unlinked merely because one client disconnects.
 
 Protected in-volume Arrow records, inline bytes, and spill files are captured-content authority within their origin
-incarnation/checkpoint snapshot. The image's marker carries the incarnation and its lineage, which is what authorizes
-records an ancestor wrote into a cloned image; the controller's audit records (telemetry, never read for a decision)
-carry job existence, lifecycle, order, lineage, terminal state, byte counts, hashes, and batch digest without payload or
-path. Every shell/session/descendant is restricted from writing `.cowshed/job/**` before repository-controlled startup.
-A frame from outside the workspace's lineage, or content that fails its own digests, is a typed integrity failure.
+incarnation snapshot. The image's marker carries the incarnation and its lineage, which is what authorizes records an
+ancestor wrote into a cloned image; the controller's audit records (telemetry, never read for a decision) carry job
+existence, lifecycle, order, lineage, terminal state, byte counts, hashes, and batch digest without payload or path.
+Every shell/session/descendant is restricted from writing `.cowshed/job/**` before repository-controlled startup. A
+frame from outside the workspace's lineage, or content that fails its own digests, is a typed integrity failure.
 
 MCP coordinator authority is delivered only through an inherited FD/socketpair, never stderr, argv, environment, or a
 workspace file. Worker descriptors are 256-bit, one-use, expire after 30 seconds, are atomically consumed, restart-
@@ -1396,29 +1359,6 @@ Escaping symlinks are resolved against `<src>` before Git or environment prepara
 `main`. In-tree links keep their relative bytes; a refused source target writes no link changes and the refused clone is
 reclaimed, so the same fork, rerun after its source is repaired, clones the repaired source. This repair does not change
 the fork's inherited branch or remotes.
-
-### `cowshed checkpoint <name> [label]` / `cowshed restore <name> <label>`
-
-Checkpoint captures the workspace image while it stays mounted: with the supervisor barrier holding writes quiesced,
-cowshed syncs for filesystem freshness and descriptor-clones the live image under a label — generated from the UTC
-timestamp when you don't give one. Nothing detaches or unmounts the source. A RAW image has no outer allocation map, so
-the clone is only filesystem crash-consistent, not an application-state transaction; `restore` validates it, including
-`fsck_apfs`, before its first mount. Before publication, a supervisor barrier seals complete Arrow batches and spill
-files; a manifest commits every checkpoint-resident job byte. Recovery may discard only incomplete trailing data.
-
-Restore swaps the current image for the checkpoint (detach → clone → reattach) and mints a new workspace incarnation.
-Protected content remains authoritative for the restored snapshot's origin boundary; the restored marker records the
-lineage, and the controller's audit record of the restore carries the hashes. Restore refuses over unsaved work (exit
-4); the displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is itself undoable. List
-checkpoints with `cowshed ls --json`.
-
-```
-$ cowshed checkpoint raven pre-refactor
-pre-refactor
-$ cowshed restore raven pre-refactor
-cowshed: raven restored to pre-refactor (previous image kept as pre-restore-2026-07-11T14-22-09Z)
-next: cowshed exec raven -- git status
-```
 
 ## Infrastructure
 
@@ -1750,9 +1690,9 @@ instead ([APFS ownership](../../../specs/cowshed/01a_apfs.md#ownership-identity-
 
 ### `cowshed gc`
 
-Releases retired and orphaned images for background deletion, removes stale mountpoint dirs, prunes expired checkpoints,
-and reports the allocated bytes of the images it released, not bytes freed: their deletions free the space after the
-command returns. Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
+Releases retired and orphaned images for background deletion, removes stale mountpoint dirs, and reports the allocated
+bytes of the images it released, not bytes freed: their deletions free the space after the command returns. Safe to run
+anytime; `rm` and `land` also run it opportunistically.
 
 A removal that could not prove every source byte held elsewhere — a forced dirty or in-progress tree, abandoned commits,
 or an untracked file no ignore rule covers and main's checkout lacks — keeps the complete image as a recovery image,
@@ -1769,14 +1709,14 @@ is copied or deleted: each file is renamed. On another filesystem each is copied
 bypassing the page cache, verified byte for byte, and only then removed from the trash. The directory must be outside
 the store; a retry after an interruption finishes the same move.
 
-Every other image a command lets go of — a clean removal's image, the build volumes `rm`, `land`, `reseed` and `gc`
-release, the seeds a fork or land replaces, an orphan or expired image `gc` collects, the staged image a failed restore
-or creation leaves — is renamed into the project's `sessions/.deleting/` or `build/.deleting/`, and the command nudges
-the gateway and answers at once; the gateway frees the image a bounded cut at a time, one image at a time, and free
-space catches up while it does, not when the command returns. If the gateway is down or does not answer, the command
-says so on stderr and still answers: the image is released, and the gateway's next listing finds it. Removing the whole
-project with `cowshed rm main --restore` frees nothing itself either: it moves its released images into the store's
-`.deleting/` and nudges the gateway before it deletes the project's store directory.
+Every other image a command lets go of — a clean removal's image, the build volumes `rm`, `land` and `gc` release, the
+seeds a fork or land replaces, an orphan image `gc` collects, the staged image a failed creation leaves — is renamed
+into the project's `sessions/.deleting/` or `build/.deleting/`, and the command nudges the gateway and answers at once;
+the gateway frees the image a bounded cut at a time, one image at a time, and free space catches up while it does, not
+when the command returns. If the gateway is down or does not answer, the command says so on stderr and still answers:
+the image is released, and the gateway's next listing finds it. Removing the whole project with
+`cowshed rm main --restore` frees nothing itself either: it moves its released images into the store's `.deleting/` and
+nudges the gateway before it deletes the project's store directory.
 
 An image under `sessions/` without its grants sidecar is skipped by other commands with a named warning; `doctor`
 reports it, and `gc` can release it as an orphan after mount and lock checks. `gc` keeps going when an individual
@@ -1822,18 +1762,17 @@ records an error finding named `project-checks-skipped`. It never silently skips
 `healthy: true`.
 
 Opening the project for its checks finishes nothing, unlike every other command's open: no unfinished lifecycle
-operation is replayed (`main`'s included), no interrupted publication or restore is completed, no retired image is
-reclaimed, no repository identity change is finished and no moved remote URL is written to the binding. Doctor reports
-each instead — `unfinished-intent`, `interrupted-publication`, `pending-publication`, `retired-trash`,
-`identity-change-unfinished` and `binding-moved` — and the next command that opens the project finishes them.
-`cowshed doctor --repair` opens the project the way every other command does.
+operation is replayed (`main`'s included), no interrupted publication is completed, no retired image is reclaimed, no
+repository identity change is finished and no moved remote URL is written to the binding. Doctor reports each instead —
+`unfinished-intent`, `interrupted-publication`, `pending-publication`, `retired-trash`, `identity-change-unfinished` and
+`binding-moved` — and the next command that opens the project finishes them. `cowshed doctor --repair` opens the project
+the way every other command does.
 
 `cowshed doctor --repair` validates the protected artifact journal under its append lock. It refuses out-of-order
-sequences rather than resequencing them: changing complete records would change the identity authenticated by checkpoint
-manifests. Complete batches and checkpoint prefix digests are not rewritten; normal recovery discards only an incomplete
-trailing batch. Other integrity failures propagate. The
-[job-control contract](../../../specs/cowshed/11_shell.md#job-control) defines the journal's allocation and recovery
-rules.
+sequences rather than resequencing them: changing complete records would change the digests that authenticate them.
+Complete batches are not rewritten; normal recovery discards only an incomplete trailing batch. Other integrity failures
+propagate. The [job-control contract](../../../specs/cowshed/11_shell.md#job-control) defines the journal's allocation
+and recovery rules.
 
 ```
 $ cowshed doctor

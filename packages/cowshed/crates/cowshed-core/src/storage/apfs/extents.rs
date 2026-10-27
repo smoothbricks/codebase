@@ -214,8 +214,8 @@ pub fn rewrite_sibling(image: &Path) -> PathBuf {
 
 /// Refuse a rewrite the image's volume has no room for, before anything is detached.
 ///
-/// The copy needs as many free bytes as the image has allocated, and keeps them: clones and
-/// checkpoints still share the old blocks, so the space is not given back when the copy replaces
+/// The copy needs as many free bytes as the image has allocated, and keeps them: clones still
+/// share the old blocks, so the space is not given back when the copy replaces the image.
 /// the image.
 pub fn require_room_for_rewrite(image: &Path) -> Result<u64, ApfsStorageError> {
     let needed = allocated_bytes(image)?;

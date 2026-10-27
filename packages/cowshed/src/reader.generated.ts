@@ -41,8 +41,6 @@ type ReaderName =
   | 'BUILD_VOLUME'
   | 'CACHE_MISS'
   | 'CHARGED_MEMORY_USAGE'
-  | 'CHECKPOINT_INFO'
-  | 'CHECKPOINT_RESULT'
   | 'CPU_TOTALS'
   | 'CREDENTIAL_REPORT'
   | 'CREDENTIAL_ROUTE'
@@ -224,7 +222,6 @@ type ReaderName =
   | 'REMOVED_WORKSPACE'
   | 'REMOVE_PROJECT_REPORT'
   | 'REMOVE_REPORT'
-  | 'RESEED_RESULT'
   | 'RESIZE_RESULT'
   | 'RESIZE_VOLUME'
   | 'RE_ADOPTION'
@@ -238,7 +235,6 @@ type ReaderName =
   | 'SEQ__BRANCH_LANDING'
   | 'SEQ__BUILD_STATE_LINK'
   | 'SEQ__CACHE_MISS'
-  | 'SEQ__CHECKPOINT_INFO'
   | 'SEQ__CREDENTIAL_ROUTE'
   | 'SEQ__DATABASE_HOLDER'
   | 'SEQ__EGRESS_RULE'
@@ -517,15 +513,6 @@ const READERS: Readers<ReaderName> = {
       ['peakBytes', 'LEAF'],
     ],
   },
-  CHECKPOINT_INFO: {
-    kind: 'record',
-    fields: [
-      ['label', 'LEAF'],
-      ['revision', 'LEAF'],
-      ['pinned', 'LEAF'],
-    ],
-  },
-  CHECKPOINT_RESULT: { kind: 'record', fields: [['label', 'LEAF']] },
   CPU_TOTALS: {
     kind: 'record',
     fields: [
@@ -786,7 +773,6 @@ const READERS: Readers<ReaderName> = {
       ['orphanStagingMount', 'LEAF'],
       ['orphanSessionImage', 'LEAF'],
       ['orphanMountpoint', 'LEAF'],
-      ['expiredCheckpoint', 'LEAF'],
       ['abandonedBundle', 'LEAF'],
       ['unlinkedBuildVolume', 'LEAF'],
       ['supersededSeed', 'LEAF'],
@@ -798,7 +784,6 @@ const READERS: Readers<ReaderName> = {
     fields: [
       ['examined', 'LEAF'],
       ['reclaimed', 'LEAF'],
-      ['retainedPinned', 'LEAF'],
       ['retainedActive', 'LEAF'],
       ['releasedBytes', 'LEAF'],
       ['dryRun', 'LEAF'],
@@ -1353,8 +1338,6 @@ const READERS: Readers<ReaderName> = {
       ['re-adopt', 'LEAF'],
       ['create', 'LEAF'],
       ['fork', 'LEAF'],
-      ['checkpoint', 'LEAF'],
-      ['restore', 'LEAF'],
       ['retire', 'LEAF'],
       ['retire-unpublished', 'LEAF'],
       ['repair-unpublished', 'LEAF'],
@@ -1367,7 +1350,7 @@ const READERS: Readers<ReaderName> = {
       ['recover', 'LEAF'],
       ['gc', 'LEAF'],
       ['land', 'LEAF'],
-      ['reseed', 'LEAF'],
+      ['move-onto-seed', 'LEAF'],
       ['clear-nx-state', 'LEAF'],
       ['repair-ports', 'LEAF'],
       ['grant', 'LEAF'],
@@ -1716,20 +1699,6 @@ const READERS: Readers<ReaderName> = {
     ],
   },
   REMOVE_REPORT: { kind: 'record', fields: [['abandoned', 'ABANDONED_WORK']] },
-  RESEED_RESULT: {
-    kind: 'record',
-    fields: [
-      ['workspace', 'LEAF'],
-      ['from', 'LEAF'],
-      ['previousVolume', 'LEAF'],
-      ['seed', 'LEAF'],
-      ['replacementVolume', 'LEAF'],
-      ['previousBytes', 'LEAF'],
-      ['replacementBytes', 'LEAF'],
-      ['releasedBytes', 'LEAF'],
-      ['dryRun', 'LEAF'],
-    ],
-  },
   RESIZE_RESULT: {
     kind: 'record',
     fields: [
@@ -1812,7 +1781,6 @@ const READERS: Readers<ReaderName> = {
   SEQ__BRANCH_LANDING: { kind: 'seq', element: 'BRANCH_LANDING' },
   SEQ__BUILD_STATE_LINK: { kind: 'seq', element: 'BUILD_STATE_LINK' },
   SEQ__CACHE_MISS: { kind: 'seq', element: 'CACHE_MISS' },
-  SEQ__CHECKPOINT_INFO: { kind: 'seq', element: 'CHECKPOINT_INFO' },
   SEQ__CREDENTIAL_ROUTE: { kind: 'seq', element: 'CREDENTIAL_ROUTE' },
   SEQ__DATABASE_HOLDER: { kind: 'seq', element: 'DATABASE_HOLDER' },
   SEQ__EGRESS_RULE: { kind: 'seq', element: 'EGRESS_RULE' },
@@ -2116,7 +2084,6 @@ const READERS: Readers<ReaderName> = {
       ['branch', 'LEAF'],
       ['baseCommit', 'LEAF'],
       ['createdAt', 'LEAF'],
-      ['checkpoints', 'SEQ__CHECKPOINT_INFO'],
       ['snapshotStale', 'LEAF'],
       ['landing', 'WORKSPACE_LANDING'],
     ],
@@ -2164,9 +2131,6 @@ export const readBuildStateListing = (json: string): Api.BuildStateListing =>
 
 export const readBuildVolume = (json: string): Api.BuildVolume =>
   V.assertBuildVolume(project(JSON.parse(json), 'BUILD_VOLUME', READERS));
-
-export const readCheckpointResult = (json: string): Api.CheckpointResult =>
-  V.assertCheckpointResult(project(JSON.parse(json), 'CHECKPOINT_RESULT', READERS));
 
 export const readCredentialReport = (json: string): Api.CredentialReport =>
   V.assertCredentialReport(project(JSON.parse(json), 'CREDENTIAL_REPORT', READERS));
@@ -2274,9 +2238,6 @@ export const readRemoveProjectReport = (json: string): Api.RemoveProjectReport =
 
 export const readRemoveReport = (json: string): Api.RemoveReport =>
   V.assertRemoveReport(project(JSON.parse(json), 'REMOVE_REPORT', READERS));
-
-export const readReseedResult = (json: string): Api.ReseedResult =>
-  V.assertReseedResult(project(JSON.parse(json), 'RESEED_RESULT', READERS));
 
 export const readResizeResult = (json: string): Api.ResizeResult =>
   V.assertResizeResult(project(JSON.parse(json), 'RESIZE_RESULT', READERS));

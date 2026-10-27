@@ -72,7 +72,7 @@ mod macos {
                 if !metadata.is_file() {
                     continue;
                 }
-                // Every RAW image: workspaces, checkpoints and retained re-adoption inputs.
+                // Every RAW image in the tree: workspaces and retained re-adoption inputs.
                 if cowshed_apfs::image::is_image_path(&path) {
                     if directory == sessions {
                         let name =

@@ -52,7 +52,7 @@
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=0 direnv land-attribution.test land-decide.test land-host.test land-install.test land-pick.test land-publish.test && python3 -B -m unittest test_nx_patch.py",
+          "command": "bun test --timeout=0 direnv land-attribution.test land-decide.test land-host.test land-install.test land-publish.test && python3 -B -m unittest test_nx_patch.py",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000

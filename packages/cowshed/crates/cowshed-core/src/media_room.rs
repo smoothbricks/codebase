@@ -214,17 +214,12 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
             AttachDemand::of(0, [WorkspaceName::main()])
         }
         Op::CoordinatorResize(request) => AttachDemand::of(1, [request.workspace.clone()]),
-        Op::CoordinatorReseed(request) if request.dry_run => AttachDemand::default(),
-        Op::CoordinatorReseed(request) => {
-            AttachDemand::of(1, [request.workspace.clone(), request.from.clone()])
-        }
         Op::CoordinatorRebase(request) => into(&request.workspace, request.into.as_ref()),
         Op::CoordinatorLand(request) if request.options.preflight => AttachDemand::default(),
         Op::CoordinatorLand(request) => into(&request.workspace, request.into.as_ref()),
         Op::WorkspaceAttach(request) if request.options.aggregate => AttachDemand::default(),
         Op::WorkspaceAttach(request) => one(&request.workspace),
         Op::CoordinatorGrant(request) | Op::CoordinatorRevoke(request) => one(&request.workspace),
-        Op::CoordinatorRestore(request) => one(&request.workspace),
         Op::CoordinatorDefragment(request)
         | Op::CoordinatorRekey(request)
         | Op::CoordinatorClearNxState(request)
@@ -232,7 +227,6 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         | Op::CoordinatorRefreshBuildState(request) => one(&request.workspace),
         Op::CoordinatorExec(params) | Op::WorkerExec(params) => one(&params.workspace),
         Op::WorkerShell(request) => one(&request.workspace),
-        Op::WorkerCheckpoint(request) => one(&request.workspace),
         Op::WorkerPush(request) => one(&request.workspace),
         Op::ProjectOpen(_)
         | Op::ProjectWorkspace(_)
@@ -252,7 +246,6 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         | Op::CoordinatorRecoverImage(_)
         | Op::CoordinatorRemoveProject(_)
         | Op::CoordinatorRepoMirror(_)
-        | Op::CoordinatorSetCheckpointQuota(_)
         | Op::CoordinatorDoctor(_)
         | Op::CoordinatorServeSupervisor(_)
         | Op::CoordinatorCompactSeed(_)
@@ -910,17 +903,16 @@ mod tests {
 
     /// A controller operation's demand comes from its request alone: a fork keeps its destination
     /// and its source, main when it names none; a land keeps what it lands into, main when
-    /// it names none, but a land preflight attaches nothing; a reseed attaches one image beside
-    /// its own, none for a dry run; a worker
-    /// keeps its workspace; a detach and a read attach nothing.
+    /// it names none, but a land preflight attaches nothing; a worker keeps its workspace;
+    /// a detach and a read attach nothing.
     #[test]
     fn an_operations_attach_demand_follows_its_request() {
         use crate::api::dto::{
             AttachOptions, ForkOptions, LandOptions, WorkspaceIncarnation, WorkspaceTarget,
         };
         use crate::api::operations::{
-            ForkRequest, LandRequest, OperationRequest as Op, ReseedRequest,
-            WorkspaceAttachRequest, WorkspaceRequest,
+            ForkRequest, LandRequest, OperationRequest as Op, WorkspaceAttachRequest,
+            WorkspaceRequest,
         };
         use crate::metadata::WorkspaceName;
         use crate::repository::RepoId;
@@ -974,19 +966,6 @@ mod tests {
         );
         assert_eq!(land(None, true), AttachDemand::default());
         assert_eq!(land(Some(lane), true), AttachDemand::default());
-        let reseed = |dry_run| {
-            attach_demand(&Op::CoordinatorReseed(ReseedRequest {
-                repo_id: repo.clone(),
-                workspace: session("raven"),
-                from: session("lane"),
-                dry_run,
-            }))
-        };
-        assert_eq!(reseed(true), AttachDemand::default());
-        assert_eq!(
-            reseed(false),
-            demand(1, &[session("raven"), session("lane")])
-        );
         let request = || WorkspaceRequest {
             repo_id: repo.clone(),
             workspace: session("raven"),

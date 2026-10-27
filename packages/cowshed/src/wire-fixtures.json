@@ -67,36 +67,30 @@
           "bytes": 6144,
           "identity": "e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db",
           "path": "/Users/fixture/Dev/.cowshed/gc/5",
-          "reason": "expiredCheckpoint"
+          "reason": "orphanSessionImage"
         },
         {
           "bytes": 7168,
           "identity": "67586e98fad27da0b9968bc039a1ef34c939b9b8e523a8bef89d478608c5ecf6",
           "path": "/Users/fixture/Dev/.cowshed/gc/6",
-          "reason": "orphanSessionImage"
+          "reason": "abandonedBundle"
         },
         {
           "bytes": 8192,
           "identity": "ca358758f6d27e6cf45272937977a748fd88391db679ceda7dc7bf1f005ee879",
           "path": "/Users/fixture/Dev/.cowshed/gc/7",
-          "reason": "abandonedBundle"
+          "reason": "unlinkedBuildVolume"
         },
         {
           "bytes": 9216,
           "identity": "beead77994cf573341ec17b58bbf7eb34d2711c993c1d976b128b3188dc1829a",
           "path": "/Users/fixture/Dev/.cowshed/gc/8",
-          "reason": "unlinkedBuildVolume"
+          "reason": "supersededSeed"
         },
         {
           "bytes": 10240,
           "identity": "2b4c342f5433ebe591a1da77e013d1b72475562d48578dca8b84bac6651c3cb9",
           "path": "/Users/fixture/Dev/.cowshed/gc/9",
-          "reason": "supersededSeed"
-        },
-        {
-          "bytes": 11264,
-          "identity": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
-          "path": "/Users/fixture/Dev/.cowshed/gc/10",
           "reason": "interruptedBuildVolume"
         }
       ],
@@ -105,8 +99,7 @@
       "examined": 7,
       "reclaimed": 0,
       "releasedBytes": 0,
-      "retainedActive": 1,
-      "retainedPinned": 1
+      "retainedActive": 1
     },
     "swept": {
       "candidates": [],
@@ -120,8 +113,7 @@
       "examined": 7,
       "reclaimed": 5,
       "releasedBytes": 21504,
-      "retainedActive": 0,
-      "retainedPinned": 1
+      "retainedActive": 0
     }
   },
   "GrantSet": {
@@ -3276,7 +3268,6 @@
   },
   "WorkspaceInfo": {
     "landingIndeterminate": {
-      "checkpoints": [],
       "landing": {
         "branches": {
           "reason": "the target branch does not exist",
@@ -3298,18 +3289,6 @@
     "landingMeasured": {
       "baseCommit": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
       "branch": "cowshed/cs-seam",
-      "checkpoints": [
-        {
-          "label": "pre-rebase",
-          "pinned": true,
-          "revision": 3
-        },
-        {
-          "label": "nightly",
-          "pinned": false,
-          "revision": 4
-        }
-      ],
       "createdAt": "2026-01-02T03:04:05Z",
       "landing": {
         "branches": {
@@ -3354,7 +3333,6 @@
     },
     "list": [
       {
-        "checkpoints": [],
         "mount": "/Users/fixture/Dev/codebase",
         "repoId": "smoothbricks/codebase",
         "role": "main",
@@ -3366,18 +3344,6 @@
       {
         "baseCommit": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
         "branch": "cowshed/cs-seam",
-        "checkpoints": [
-          {
-            "label": "pre-rebase",
-            "pinned": true,
-            "revision": 3
-          },
-          {
-            "label": "nightly",
-            "pinned": false,
-            "revision": 4
-          }
-        ],
         "createdAt": "2026-01-02T03:04:05Z",
         "landing": {
           "branches": {
@@ -3421,7 +3387,6 @@
         "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
       },
       {
-        "checkpoints": [],
         "landing": {
           "branches": {
             "reason": "the target branch does not exist",
@@ -3442,7 +3407,6 @@
       }
     ],
     "main": {
-      "checkpoints": [],
       "mount": "/Users/fixture/Dev/codebase",
       "repoId": "smoothbricks/codebase",
       "role": "main",

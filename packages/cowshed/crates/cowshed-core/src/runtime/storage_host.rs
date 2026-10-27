@@ -38,12 +38,6 @@ pub(crate) trait RuntimeStorageHost:
         repo: &RepoId,
         workspace: &WorkspaceName,
     ) -> Result<Option<DetachedWorkspaceMetadata>, ApfsStorageError>;
-    fn pending_publications_for(
-        &self,
-        repo: &RepoId,
-        workspaces: Option<&std::collections::BTreeSet<WorkspaceName>>,
-    ) -> Result<Vec<crate::storage::apfs::PendingPublicationFact>, ApfsStorageError>;
-
     fn workspace_snapshot(
         &self,
         repo: &RepoId,

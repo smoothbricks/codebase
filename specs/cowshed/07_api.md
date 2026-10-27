@@ -14,12 +14,11 @@ workspace.** Authority is attached to explicit capabilities, never inferred from
 - **`WorkspaceRef`** — inspection plus safe attachment for one workspace. It exposes identity, mount path, state,
   grants, and `attach`; it cannot detach, exec, open a shell, mutate lifecycle, or mint a worker capability.
 - **`WorkspaceHandle`** — a worker's non-escalating capability over exactly one workspace: exec, shell, job control,
-  checkpoint subject to controller-configured checkpoint quotas, push, and read-only grant inspection. It has no
-  grant/revoke, restore/destroy/rebase/land/gc/reseed, repo-mirror, or cross-workspace access.
+  push, and read-only grant inspection. It has no grant/revoke, destroy/rebase/land/gc, repo-mirror, or cross-workspace
+  access.
 - **`Coordinator`** — the sole project mutation, diagnostics, and cross-workspace authority: adopt/create/fork,
-  grant/revoke, restore/destroy/rebase/land, build-volume reseed, garbage collection, repository mirroring, doctor, slot
-  assignment, checkpoint-quota policy, and minting one-workspace handles. A trusted unsandboxed controller holds it;
-  workers never do.
+  grant/revoke, destroy/rebase/land, garbage collection, repository mirroring, doctor, slot assignment, and minting
+  one-workspace handles. A trusted unsandboxed controller holds it; workers never do.
 
 `CoordinatorToken` is an affine, opaque, non-serializable proof acquired only by consuming a controller-provided
 inherited Unix stream descriptor. Acquisition validates that the descriptor is a connected socket owned by the current
@@ -55,11 +54,10 @@ missing or corrupt sibling session/grants record cannot refuse another workspace
 logs, resources, or session operations. Project enumeration still reports its own inventory faults. Mount assurance and
 publication recovery on a workspace request use that same scope: held canonical image locks select the exact workspaces
 to recover before any sidecar is read. An opening takes those locks without waiting. A selected lock another process
-holds is a live lifecycle operation's, such as a fork's of `main` or a restore's still fencing, and that workspace's
-publication, a pending restore's activation included, is left to the holder or the next opening; with every selected
-lock held the opening recovers nothing, and never falls back to the store-wide pass. So no opening, `cowshed ls`'s and
-`cowshed exec`'s included, waits for another process's fork. Store-wide recovery is an explicit startup/maintenance
-pass, not a dependency of a live job's supervisor lookup.
+holds is a live lifecycle operation's, such as a fork's of `main`, and that workspace's publication is left to the
+holder or the next opening; with every selected lock held the opening recovers nothing, and never falls back to the
+store-wide pass. So no opening, `cowshed ls`'s and `cowshed exec`'s included, waits for another process's fork.
+Store-wide recovery is an explicit startup/maintenance pass, not a dependency of a live job's supervisor lookup.
 
 A cold `Workspaces`, `Removal` or `Supervisor` opening observes main and its explicitly selected names, filtering
 pending and retired records before reading their sidecars. It additionally observes the invocation-origin workspace only
@@ -69,11 +67,11 @@ lock or intent replay. Selected identity, marker, project binding and active-ver
 
 A `Supervisor` opening, the one `cowshed __workspace-supervisor` makes before it serves (11_shell.md, "Supervisor"),
 observes exactly what a `Workspaces` opening naming its one workspace observes and finishes nothing, as `Inspect` does:
-it replays no intent, `main`'s included, completes no publication or restore, reclaims no trash, finishes no identity
-change and writes no binding, so it takes no image lock. The command that asked for the supervisor has already opened
-under its own scope and finished what was its; a lock held now is a live lifecycle operation's, such as a fork's, which
-holds its source's lock, `main`'s included, across the source's `clonefile`s and seed refresh only, or to its end when
-it is a git-worktree fork (16_build_volumes.md, "Fork" step 1). Residue left since stays for that operation, or the next
+it replays no intent, `main`'s included, completes no publication, reclaims no trash, finishes no identity change and
+writes no binding, so it takes no image lock. The command that asked for the supervisor has already opened under its own
+scope and finished what was its; a lock held now is a live lifecycle operation's, such as a fork's, which holds its
+source's lock, `main`'s included, across the source's `clonefile`s and seed refresh only, or to its end when it is a
+git-worktree fork (16_build_volumes.md, "Fork" step 1). Residue left since stays for that operation, or the next
 ordinary command, to finish.
 
 The supervisor's start serves a settled mount without waiting either. With the workspace's image lock free it settles
@@ -347,33 +345,6 @@ pub enum AdmittedStdin {
     WorkspaceFile(WorkspacePath),
 }
 pub enum AdmittedSession { None, Unnamed(Uuid), Named(String) }
-#[serde(rename_all = "kebab-case")]
-pub enum VisibleStorageKind { CapturedInline, CapturedFile, RedirectInline, RedirectFile }
-pub struct VisibleStreamCommitment {
-    pub storage_kind: VisibleStorageKind,
-    pub bytes: u64,
-    pub sha256: Sha256Digest,
-    pub protected_path: Option<WorkspacePath>, // present exactly for *File
-}
-pub struct VisibleJobCommitment {
-    pub workspace_incarnation: WorkspaceIncarnation,
-    pub job_id: JobId,
-    pub state: JobState,
-    pub stdout: VisibleStreamCommitment,
-    pub stderr: VisibleStreamCommitment,
-}
-pub struct CheckpointManifestRecord {
-    pub version: u16,
-    pub repo_id: RepoId,
-    pub origin_incarnation: WorkspaceIncarnation,
-    pub barrier_id: u64,
-    pub visible_jobs: Vec<VisibleJobCommitment>,
-    pub records_sha256: Sha256Digest,
-}
-pub enum ProtectedRecord {
-    Job(JobArtifactRecord),
-    CheckpointManifest(CheckpointManifestRecord),
-}
 
 /// Compact controller audit schema — telemetry, never read for a decision. Every record flattens identity and carries
 /// `version` + `order` (the writing controller's own sequence).
@@ -390,30 +361,15 @@ pub struct TerminalCommitment {
     pub batch_sha256: Sha256Digest,
 }
 
-pub struct CheckpointCommitment {
-    pub version: u16, pub order: u64, pub repo_id: RepoId,
-    pub origin_incarnation: WorkspaceIncarnation, pub checkpoint_id: String,
-    pub barrier_id: u64, pub manifest_batch_sha256: Sha256Digest,
-}
 pub struct ForkCommitment {
     pub version: u16, pub order: u64, pub repo_id: RepoId,
     pub source_incarnation: WorkspaceIncarnation, pub destination_incarnation: WorkspaceIncarnation,
 }
-pub struct RestoreCommitment {
-    pub version: u16, pub order: u64, pub repo_id: RepoId, pub source_checkpoint: String,
-    pub source_incarnation: WorkspaceIncarnation, pub destination_incarnation: WorkspaceIncarnation,
-}
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum ControllerCommitment {
-    Admission(AdmissionCommitment),
-    Terminal(TerminalCommitment),
-    Checkpoint(CheckpointCommitment),
-    Fork(ForkCommitment),
-    Restore(RestoreCommitment),
-}
+
+The `ControllerCommitment` union of these event structs is defined in 13_telemetry.md (Controller audit record schema).
 
 For queued/running/draining `JobInfo`, `StreamInfo` is a current bounded view; its artifact becomes authoritative only when the
-corresponding protected batch/file is complete and sealed. Background acknowledgement and checkpointing force any
+corresponding protected batch/file is complete and sealed. Background acknowledgement forces any
 memory-only prefix to `File`. Terminal state freezes `storage`, `bytes`, and `sha256`.
 
 /// The single lifecycle/result DTO reused by core, CLI JSON, N-API, MCP, and Arrow projections.
@@ -639,8 +595,8 @@ pub enum FoldKept {
 
 ```rust
 /// The sole mutation, diagnostics, and cross-workspace authority over a project. It is the only capability that can
-/// adopt, destroy, fork, grant, revoke, restore, rebase, land, collect garbage, diagnose controller state,
-/// mirror repositories, set checkpoint quotas, or assign slots.
+/// adopt, destroy, fork, grant, revoke, rebase, land, collect garbage, diagnose controller state,
+/// mirror repositories, or assign slots.
 pub struct Coordinator { /* Project + authenticated controller identity */ }
 impl Coordinator {
     // The daemon's refusal of this controller's build (`OtherBuild`), once any call on this
@@ -661,10 +617,7 @@ impl Coordinator {
     // `into`: the lane base the workspace lands into, main when None (02: "Lanes").
     pub async fn rebase(&self, ws: &str, into: Option<&WorkspaceRef>, opts: RebaseOptions) -> Result<RebaseReport, CowshedError>;
     pub async fn land(&self, ws: &str, into: Option<&WorkspaceRef>, opts: LandOptions) -> Result<LandReport, CowshedError>;
-    pub async fn restore(&self, ws: &str, label: &str) -> Result<(), CowshedError>;
     pub async fn detach(&self, ws: &str) -> Result<EmptyResult, CowshedError>;
-    /// Clone an existing target seed into a new live build volume; never refresh a seed or alter source Git state.
-    pub async fn reseed(&self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult, CowshedError>;
     pub async fn assign_slot(&self, ws: &str, slot: u32) -> Result<(), CowshedError>;
     pub async fn destroy(&self, ws: &str, opts: RemoveOptions) -> Result<(), CowshedError>;
     pub async fn gc(&self, opts: GcOptions) -> Result<GcReport, CowshedError>;
@@ -674,7 +627,6 @@ impl Coordinator {
     // (`retry_source()`, wire `"retry": {"reason": "gcPlanStale"}`): call again, nothing done is repeated.
     pub async fn remove_project(&self, opts: RemoveProjectOptions) -> Result<RemoveProjectReport, CowshedError>;
     pub async fn repo_mirror(&self, ws: &str, url: &Url) -> Result<MirrorInfo, CowshedError>;
-    pub async fn set_checkpoint_quota(&self, ws: &str, quota: CheckpointQuota) -> Result<(), CowshedError>;
     pub async fn doctor(&self) -> Result<DoctorReport, CowshedError>;
     /// Hand a worker a capability scoped to exactly one workspace.
     pub async fn worker(&self, ws: &str) -> Result<WorkspaceHandle, CowshedError>;
@@ -715,19 +667,9 @@ impl WorkspaceHandle {
     // An ended job's terminal record and a handle reading its sealed output, also for a job an
     // earlier supervisor of the incarnation ran (11_shell.md "Draining a supervisor of another build").
     pub async fn sealed(&self, id: JobId) -> Result<(SealedJob, JobHandle), CowshedError>;
-    pub async fn checkpoint(&self, opts: CheckpointOptions) -> Result<String, CowshedError>; // quota-enforced atomically
     pub async fn push(&self, opts: PushOptions) -> Result<PushReport, CowshedError>;
     pub async fn grants(&self) -> Result<GrantSet, CowshedError>;   // read-only: observe, never mutate
-    // No grant/revoke, restore/destroy/rebase/land/gc, repo mirror, detach, or cross-workspace access.
-}
-```
-
-`CheckpointOptions` carries both the optional validated label and explicit retention intent:
-
-```rust
-pub struct CheckpointOptions {
-    pub label: Option<String>,
-    pub keep: bool,
+    // No grant/revoke, destroy/rebase/land/gc, repo mirror, detach, or cross-workspace access.
 }
 ```
 
@@ -761,19 +703,6 @@ caller assert first publication rather than accepting an overwrite. After succes
 all commits that must survive are reachable from the returned durable ref. Remote publication and workflow policy are
 not part of this API.
 
-`WorkspaceHandle::checkpoint` is intentionally available to a worker for retry points, but it is not unbounded storage
-authority. `Coordinator::set_checkpoint_quota(ws, quota)` owns a cap for exactly that workspace. Before the supervisor
-barrier, admission reads authoritative `SubstrateStats`: projected count is that workspace's existing checkpoint count
-plus one; projected bytes are all of its existing checkpoint allocated bytes (pinned and unpinned) plus the target
-active image's allocated bytes. `pinned_checkpoint_bytes` is an authoritative reporting subset, not an exclusion from
-quota. Sibling workspaces consume none of the cap. Exact `<=` boundaries pass; `>` is `CowshedError::Conflict` before
-any checkpoint image, fact, metadata, or barrier publication. Only then does cowshed run the 02_workspaces.md barrier,
-clone while held, and record the audit `CheckpointCommitment`. Restore validates the checkpoint's own manifest and
-returns `CowshedError::Integrity` on any mismatch (09_substrates.md). Restore remains coordinator-only. On controller
-startup, restore retryability is derived only from APFS `PendingPublicationFact`s backed by exact `.restore.json`
-substrate recovery facts. The coordinator idempotently republishes the matching `RestoreCommitment`, activates the
-pending detached metadata, and removes the fact; no runtime journal or `.restore-fences` capability exists.
-
 `JobInfo.state = OutputLimit` is the explicit result when the configurable combined stdout+stderr quota (default 1 GiB)
 is crossed. Accounting includes protected and in-flight bytes; the supervisor admits no payload beyond the exact
 boundary, terminates the process group, drains pipes, seals artifacts, and only then publishes terminal state. Summaries
@@ -792,15 +721,15 @@ The shell connection is a reconnectable view over the persistent, permission-che
 supervisor socket (11_shell.md). Dropping a `Session`, `JobHandle`, or transport never unlinks that socket or stops the
 job. Protected complete in-volume Arrow batches and sealed artifacts are the authoritative evidence of a job; controller
 commitments are audit telemetry that no API reads for a decision (11_shell.md). APIs return `Integrity` for a missing or
-altered artifact, an invalid complete batch, a checkpoint-barrier counter behind a durable barrier, or an incarnation
-outside the marker lineage; nothing silently wins. Authorization, grant, and gateway audit authority remain
-controller-owned. A ranged read of a sealed file returns bytes only from the generation the store fully verified at seal
-or open: device, inode, length, mode, link count, and nanosecond modification and change times. The digest pass observes
-the same opened descriptor before and after hashing and accepts evidence only when both generations and the commitment
-agree. Each bounded positioned read checks that generation before and after reading; a changed generation is
-`Integrity`, never altered bytes. Generation evidence is process-local and published beside the immutable terminal
-record in the validated snapshot, not persisted or accompanied by a payload cache. Paging B bytes reads O(B) payload
-bytes after the required seal/open digest pass, without reading or hashing preceding prefixes.
+altered artifact, an invalid complete batch, or an incarnation outside the marker lineage; nothing silently wins.
+Authorization, grant, and gateway audit authority remain controller-owned. A ranged read of a sealed file returns bytes
+only from the generation the store fully verified at seal or open: device, inode, length, mode, link count, and
+nanosecond modification and change times. The digest pass observes the same opened descriptor before and after hashing
+and accepts evidence only when both generations and the commitment agree. Each bounded positioned read checks that
+generation before and after reading; a changed generation is `Integrity`, never altered bytes. Generation evidence is
+process-local and published beside the immutable terminal record in the validated snapshot, not persisted or accompanied
+by a payload cache. Paging B bytes reads O(B) payload bytes after the required seal/open digest pass, without reading or
+hashing preceding prefixes.
 
 The artifact sink's `sealed(jobId)` returns `Result<Option<SealedJobReader>>`: one owned projection sharing the
 canonical validated terminal entry and workspace root for both streams. `Ok(None)` means the current protected-store
@@ -810,17 +739,11 @@ wire `SealedJob` DTO. A supervisor-held unsealed job answers that fact before an
 still answers its record. A readable current-incarnation admission row likewise proves that its job has no terminal row,
 rather than making that known job an unread-history unknown.
 
-A cache miss refreshes under the existing records lock through the same authoritative snapshot that append and
-checkpoint use. Unchanged validated inode/length within the retained budget reads no record payload and re-hashes no
-sealed stream. Changed records validate repository/lineage and row invariants; only newly learned terminal spill files
-are hashed. The snapshot also keeps the already-computed validated manifest batch digest: an identical manifest skips
-its captured-prefix hashes, while a new manifest validates its prefixes and own checkpoint publication retains its
-digest. No manifest body or stream payload is copied into a second cache. Read and recovery failures retain their causes
-and never become `None`. Snapshot publication advances readable-job presence, immutable terminal rows, key authority,
-record identity and the validated manifest digest together. A checkpoint derives its manifest from that snapshot,
-independent of earlier read traffic. A checkpoint makes this store's live prefixes durable before taking the records
-lock, then refreshes and joins their commitments with the current sealed rows. A live commitment wins for the same job;
-prefix I/O holds no cross-process records lock.
+A cache miss refreshes under the existing records lock through the same authoritative snapshot that append uses.
+Unchanged validated inode/length within the retained budget reads no record payload and re-hashes no sealed stream.
+Changed records validate repository/lineage and row invariants; only newly learned terminal spill files are hashed. Read
+and recovery failures retain their causes and never become `None`. Snapshot publication advances readable-job presence,
+immutable terminal rows, key authority, record identity together.
 
 Any unread layout can hold numeric job ids at or below its valid retained `records.job-floor`. A missing id above that
 floor is proven not to come from the unread store and reaches the ordinary missing-job error. With unread history but no
@@ -877,15 +800,15 @@ and byte-backed string units use their actual Display, never a guessed as_str or
 
 Externally projected types are defined **once** in `cowshed-core` and reused verbatim by the CLI (`--json` bodies),
 NAPI, and MCP — no adapter redefines a field, and contract goldens (08_testing.md) pin their shapes: `WorkspaceInfo`,
-`CheckpointInfo`, `GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`,
-`ProtectedOutput`, `BinaryData`, `OutputSummary`, `OutputPublication`, `PublicationPolicy`, `ControllerCommitment` and
-its five event structs, `PushReport`, `LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/
-`RepoRule`/`SimVerb`, `GatewayStatus`, `AuditEvent`, and every `*Options` type (`AdoptOptions`, `ForkOptions`,
-`AttachOptions`, `CheckpointOptions`, `RemoveOptions`, `GcOptions`, `RebaseOptions`, `LandOptions`, `PushOptions`).
+`GcReport`, `Finding`, `JobId`, `JobState`, `JobInfo`, `StreamInfo`, `OutputStorage`, `ProtectedOutput`, `BinaryData`,
+`OutputSummary`, `OutputPublication`, `PublicationPolicy`, `ControllerCommitment` and its event structs, `PushReport`,
+`LandReport`, `RevisionTarget`, `GrantSet`/`GrantDelta`/`PortBlock`/`EgressRule`/ `RepoRule`/`SimVerb`, `GatewayStatus`,
+`AuditEvent`, and every `*Options` type (`AdoptOptions`, `ForkOptions`, `AttachOptions`, `RemoveOptions`, `GcOptions`,
+`RebaseOptions`, `LandOptions`, `PushOptions`).
 
-`JobArtifactRecord`, `ProtectedRecord`, `CheckpointManifestRecord`, and `VisibleJobCommitment` are canonical internal
-storage/Arrow contracts, not CLI/N-API/MCP JSON envelopes. Adapters expose only their bounded constituent result types
-and payload-free controller commitments; they never reveal protected paths or inline storage records.
+`JobArtifactRecord` is a canonical internal storage/Arrow contract, not CLI/N-API/MCP JSON envelopes. Adapters expose
+only their bounded constituent result types and payload-free controller commitments; they never reveal protected paths
+or inline storage records.
 
 Field sketches elsewhere in this spec are illustrative; the freeze rule — one definition, reused, versioned together —
 is the contract. `GrantSet.port_block` is the platform union: macOS always `PortBlock`, while Linux carries `None` and
@@ -909,8 +832,8 @@ camel-case, but `ErrorCode` values are taxonomy tokens: every adapter uses the s
 `environment-missing`, and `sandbox-denied` plus the unhyphenated `integrity`; no adapter rewrites an error code.
 
 Public request/result and controller-commitment definitions live in `cowshed_core::api::dto`; the protected
-`JobArtifactRecord`/manifest/record envelope and Arrow projections live in `cowshed_core::storage::job_artifact` and
-reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission rather than `null`.
+`JobArtifactRecord`/record envelope and Arrow projections live in `cowshed_core::storage::job_artifact` and reuse those
+DTOs. Serde uses `camelCase`, documented enum strings, and omission rather than `null`.
 
 ### Reader projection
 
@@ -930,29 +853,6 @@ through `read<Result>` in `reader.generated.ts`, which walks the same derived re
 the result's strict `assert*` validator. Every request, a controller routing a call to itself, and every
 `assert*`/`parse*` validator stay strict. A result only internal operations answer never crosses a connection, so its
 reader drops nothing.
-
-### Build-volume reseed
-
-`coordinator.reseed` is a coordinator-only, JSON-only operation:
-`ReseedRequest { repoId: RepoId, workspace: WorkspaceName, from: WorkspaceName, dryRun: bool } -> ReseedResult`. The CLI
-supplies `from: "main"` by default; protocol callers explicitly name the target and preview mode. No worker,
-workspace-ref or project-discovery capability serves it. Rust `Coordinator::reseed` and the TypeScript coordinator's
-`reseed(workspace, from, dryRun)` use the same operation and result.
-
-`ReseedResult` is the named core DTO with `workspace`, `from`, `previousVolume`, `seed`, optional `replacementVolume`,
-`previousBytes`, `replacementBytes`, `releasedBytes`, and `dryRun`. Preview omits `replacementVolume`, observes the old
-allocated image bytes, estimates replacement bytes from the seed and releases nothing. Execution reports the actual new
-image allocation and removed old image allocation. These counts use GC allocation accounting, not unique physical bytes;
-APFS shared extents mean neither the counts nor their signed difference promise physical free space, and the release of
-the old image only commits it: a background deletion frees it later (16_build_volumes.md, "Garbage collection").
-
-The operation discards only live build-volume contents and atomically replaces the excluded `.cowshed/build` link.
-Source files, HEAD, index, dirty and untracked files remain untouched. Missing incremental work rebuilds cold. Only the
-target's current-incarnation latest existing seed may be cloned: a stale seed is used unchanged; an absent seed refuses.
-No seed is refreshed, written or deleted, including the destination's own seed. Held jobs/land work, filesystem holders,
-lifecycle/image locks and unfinished create/fork/adopt work refuse; opening for this operation inspects rather than
-replays that work. The storage and publication rules remain 16_build_volumes.md §One link per checkout, §Targets and
-seeds and §Garbage collection.
 
 ### Nx state clear
 
@@ -1002,8 +902,7 @@ the repository root. Its declared generator writes `src/api.generated.ts`, `src/
 `packages/cowshed/.cache/api-generator/cowshed-api-gen write packages/cowshed`; the target builds that canonical
 generator first when needed. Generated files are changed only by this generator. Handwritten TypeScript capability
 facades call the generated adapters with the generated DTO types; they do not redefine protocol records. The operation
-corpus covers the same operation table, including coordinator-only reseed; CLI/N-API option parity is its own gate (see
-"CLI and N-API option parity").
+corpus covers the same operation table; CLI/N-API option parity is its own gate (see "CLI and N-API option parity").
 
 ### Job monitoring
 
@@ -1590,11 +1489,9 @@ supervisor that ran the job retires.
 
 ### Frozen wire projections
 
-- `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, mount, state, branch?, baseCommit?, createdAt?, checkpoints, snapshotStale }`;
-  `state` is `"attached" | "detached"`. `checkpoints` is always an array of
-  `CheckpointInfo = { label, revision, pinned }` facts derived from canonical storage. Detached rows without a cached
-  marker snapshot omit all three marker-derived optionals but still report checkpoint facts.
-  `MountResult = { workspace, mount, baseCommit? }`; lifecycle creation/restoration fills `baseCommit`, while
+- `WorkspaceInfo = { repoId, workspace, workspaceIncarnation, role, mount, state, branch?, baseCommit?, createdAt?, snapshotStale }`;
+  `state` is `"attached" | "detached"`. Detached rows without a cached marker snapshot omit all three marker-derived
+  optionals. `MountResult = { workspace, mount, baseCommit? }`; lifecycle creation fills `baseCommit`, while
   attachment/query results may omit it. `EmptyResult` serializes as exactly `{}`.
 - `UnprovenWorkspace = { workspace, workspaceIncarnation, mount, reason }` names a published workspace whose mount does
   not prove itself the workspace's (01a_apfs.md, "Ownership, identity, and the volume label"). It is neither attached
@@ -1607,22 +1504,20 @@ supervisor that ran the job retires.
   the object is a breaking wire change, and a client of an older build cannot decode it. A consumer that keys on the
   listed workspaces counts an unproven one as present: it is the project's, and only its mount is in doubt.
 - `AdoptOptions.repoId` is optional only because a trusted remote binding can supply it; local-only adoption requires
-  the explicit value. `CheckpointOptions = { label?, keep }` carries pin intent without granting quota mutation
-  authority. `RemoveOptions.restore` selects the reversible `main` adoption rollback; it is not an alias for forced
-  retirement.
+  the explicit value. `RemoveOptions.restore` selects the reversible `main` adoption rollback; it is not an alias for
+  forced retirement.
 - `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
   `"info" | "warning" | "error"`. `GcCandidate = { identity: Sha256Digest, path, bytes, reason }`, where reason is the
   closed
-  `retiredWorkspace | orphanSessionImage | orphanStagingImage | orphanStagingMetadata | orphanStagingMount | orphanMountpoint | expiredCheckpoint | abandonedBundle`
-  enum.
-  `GcReport = { examined, reclaimed, retainedPinned, retainedActive, releasedBytes, dryRun, candidates, deferred }`.
-  `reclaimed` counts the candidates the run collected and `releasedBytes` the allocated bytes of the images among them
-  that it released for deletion; their background deletions free the space after the report (05_gateway.md, "Deleting
-  released images"). `deferred` contains `{ path, diagnostic }` for each candidate this run left behind; one deferral
-  does not stop later candidates. Dry-run candidates are the exact immutable substrate plan and never mutable handles;
-  execution revalidates the plan under the same sweep options before the first effect. `abandonedBundle` names a regular
-  recovery bundle in `sessions/.trash` only when `GcOptions.abandoned` is explicitly true; a default sweep never names
-  or reclaims one.
+  `retiredWorkspace | orphanSessionImage | orphanStagingImage | orphanStagingMetadata | orphanStagingMount | orphanMountpoint | abandonedBundle`
+  enum. `GcReport = { examined, reclaimed, retainedActive, releasedBytes, dryRun, candidates, deferred }`. `reclaimed`
+  counts the candidates the run collected and `releasedBytes` the allocated bytes of the images among them that it
+  released for deletion; their background deletions free the space after the report (05_gateway.md, "Deleting released
+  images"). `deferred` contains `{ path, diagnostic }` for each candidate this run left behind; one deferral does not
+  stop later candidates. Dry-run candidates are the exact immutable substrate plan and never mutable handles; execution
+  revalidates the plan under the same sweep options before the first effect. `abandonedBundle` names a regular recovery
+  bundle in `sessions/.trash` only when `GcOptions.abandoned` is explicitly true; a default sweep never names or
+  reclaims one.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, resources?, containment?, outlived?, outlivedIncomplete?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.
@@ -1687,13 +1582,14 @@ supervisor that ran the job retires.
   validated relative `WorkspacePath` domain type: no empty component, `.`/`..`, prefix, NUL, or symlink-following open.
   Public capability methods convert non-UTF8 host paths into typed `CowshedError::Usage`; they never pass a `Path` to
   `json!` or panic while constructing a controller request.
-- `ProtectedRecord` is exactly `Job(JobArtifactRecord) | CheckpointManifest(CheckpointManifestRecord)`. The Job fields
-  are `{repoId,workspaceIncarnation,jobId,sequence,state,grantRevision,stdout,stderr}`. Protected Arrow begins
-  `record_kind,record_version,repo_id`; Job uses the frozen flat stream columns, while CheckpointManifest uses
-  `{origin_incarnation,barrier_id,visible_jobs,records_sha256}`. Variant-invalid null combinations reject.
-- `ControllerCommitment` is exactly the tagged Admission/Terminal/Checkpoint/Fork/Restore union defined above. Its Arrow
-  prefix is `commitment_kind,commitment_version,commitment_order,repo_id`; it never contains payload/path/summary
-  fields.
+- The protected stream holds `JobArtifactRecord` rows, and `record_kind` has one live value, `job`. The Job fields are
+  `{repoId,workspaceIncarnation,jobId,sequence,state,grantRevision,stdout,stderr}`. Protected Arrow begins
+  `record_kind,record_version,repo_id`; Job uses the frozen flat stream columns. The protected-record columns
+  `origin_incarnation`, `barrier_id`, `visible_jobs` and `records_sha256` are retired and always null; the
+  `checkpointManifest` record kind is retired, and recovery passes over a frame of that kind (it names no job). Null
+  combinations invalid for a `job` row reject.
+- `ControllerCommitment` is the tagged union of event structs defined in 13_telemetry.md. Its Arrow prefix is
+  `commitment_kind,commitment_version,commitment_order,repo_id`; it never contains payload/path/summary fields.
 - `RevisionTarget` projects as an exact one-key object `{branch}`, `{ref}`, or `{oid}` and rejects ambiguous/multi-key
   objects. `RevisionTarget::parse_cli` classifies lowercase 40/64-hex first as `GitOid`, then any `refs/...` input as a
   validated `GitRef`, and otherwise as a validated `BranchName`. Invalid values return `DtoError`; git rev expressions
@@ -1741,8 +1637,7 @@ supervisor that ran the job retires.
   `LandPreflight = { workspaceIncarnation, sourceHead, targetBranch, targetHead: ExpectedRefHead }`;
   `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume, folded }`;
   `FoldedWorkspace = { workspace, head, outcome: { kind: "retired" } | { kind: "kept", reason: { kind: "dirty", files } | { kind: "refused", code, message } } }`;
-  preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`;
-  `CheckpointQuota = { maxCount, maxBytes }`.
+  preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`.
 - `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, scheduling?, pendingInstall?, landTurns, landTurnsError? }`;
   `pendingInstall?: true` says an install holds the install slot (`dev.cowshed/install.lock`, read without taking it),
   absent while the slot is free (05_gateway.md "A pending install is visible");
@@ -2037,11 +1932,6 @@ export interface ExecOptions {
   admissionKey?: string;
 }
 
-export interface CheckpointOptions {
-  label?: string;
-  keep?: boolean;
-}
-
 export interface WorkspaceHandle {
   readonly name: string;
   readonly mountPath: string;
@@ -2050,7 +1940,6 @@ export interface WorkspaceHandle {
   listJobs(): Promise<JobInfo[]>;
   job(id: JobId): Promise<JobHandle>;
   jobByKey(key: string): Promise<JobHandle | null>;
-  checkpoint(opts?: CheckpointOptions): Promise<string>;
   push(opts?: PushOptions): Promise<PushReport>;
   grants(): Promise<GrantSet>; // read-only
 }

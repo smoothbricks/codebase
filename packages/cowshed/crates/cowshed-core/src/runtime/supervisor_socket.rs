@@ -28,8 +28,8 @@ use tokio::sync::{mpsc, oneshot};
 use super::job_groups::{ExitObserved, Process};
 use super::process_stream::JobProcessStream;
 use super::supervisor::{
-    CheckpointBarrier, Command, LogChunk, NxDaemonRetirement, RetireWhen, SessionSnapshot,
-    SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
+    Command, LogChunk, NxDaemonRetirement, RetireWhen, SessionSnapshot, SessionToken,
+    WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use super::wait_spans::{WaitFailure, peer_pid};
 use crate::api::dto::{
@@ -396,10 +396,6 @@ enum Call {
         limits: JobTailLimits,
     },
     #[serde(rename_all = "camelCase")]
-    Checkpoint {
-        checkpoint_id: String,
-    },
-    #[serde(rename_all = "camelCase")]
     Retire {
         nx_daemon: NxDaemonRetirement,
         when: RetireWhen,
@@ -442,7 +438,6 @@ impl Call {
             Self::Hold { .. } => "hold",
             Self::LogRead { .. } => "log-read",
             Self::Tail { .. } => "tail",
-            Self::Checkpoint { .. } => "checkpoint",
             Self::Retire { .. } => "retire",
             Self::StopNxKeeper => "stop-nx-keeper",
             Self::NameBuildVolume { .. } => "name-build-volume",
@@ -579,14 +574,6 @@ struct SessionSnapshotWire {
 struct LogChunkWire {
     next_offset: u64,
     eof: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CheckpointWire {
-    checkpoint_id: String,
-    barrier_id: u64,
-    manifest_batch_sha256: Sha256Digest,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3081,17 +3068,6 @@ async fn answer(
             to_value(&supervisor.tail(job_id, cursor, limits).await?)?,
             Bytes::new(),
         ),
-        Call::Checkpoint { checkpoint_id } => {
-            let barrier = supervisor.checkpoint_barrier(checkpoint_id).await?;
-            (
-                to_value(&CheckpointWire {
-                    checkpoint_id: barrier.checkpoint_id,
-                    barrier_id: barrier.barrier_id,
-                    manifest_batch_sha256: barrier.manifest_batch_sha256,
-                })?,
-                Bytes::new(),
-            )
-        }
         Call::Retire { nx_daemon, when } => {
             match when {
                 RetireWhen::Now => supervisor.retire(nx_daemon).await?,
@@ -3867,25 +3843,6 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 )
                 .await,
             );
-        }
-        Command::Checkpoint {
-            authority,
-            checkpoint_id,
-            reply,
-        } => {
-            let result = call::<CheckpointWire>(
-                path,
-                &authority,
-                Call::Checkpoint { checkpoint_id },
-                Bytes::new(),
-            )
-            .await
-            .map(|wire| CheckpointBarrier {
-                checkpoint_id: wire.checkpoint_id,
-                barrier_id: wire.barrier_id,
-                manifest_batch_sha256: wire.manifest_batch_sha256,
-            });
-            let _ = reply.send(result);
         }
         // Only the supervisor's own process may close its admission without retiring it
         // (`WorkspaceSupervisorHandle::quiesce`): a remote caller that went away afterwards would

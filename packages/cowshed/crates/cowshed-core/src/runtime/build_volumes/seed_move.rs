@@ -1,6 +1,6 @@
-//! Explicit workspace cache replacement, not a target seed refresh (16_build_volumes.md,
-//! "Workspace reseed"). Preview reads only; execution rechecks the exact identities under the
-//! existing lifecycle/image locks and the old volume's exclusive job-admission claim.
+//! Move a workspace onto its own compacted seed without losing newer writes
+//! (16_build_volumes.md, "Seed compaction"). Execution rechecks the observed identities under
+//! its lifecycle/image locks and the old volume's exclusive job-admission claim.
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::{BuildVolumes, Owner, RuntimeStorageHost, io, storage};
-use crate::api::dto::ReseedResult;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
     Registrant, Registration, link, nx,
@@ -20,7 +19,7 @@ use crate::{CowshedError, Result};
 use cowshed_apfs::store_lock::LockMode;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReseedWorkspace {
+pub(crate) struct SeedMoveWorkspace {
     pub owner: Owner,
     pub checkout: PathBuf,
     pub image: ImagePaths,
@@ -32,16 +31,13 @@ struct ImageObservation {
     device: u64,
     inode: u64,
     modified: SystemTime,
-    bytes: u64,
 }
 
 /// An immutable observation, never authority to delete an image after its identity changes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReseedPlan {
-    workspace: ReseedWorkspace,
-    from: ReseedWorkspace,
+pub(crate) struct SeedMovePlan {
+    workspace: SeedMoveWorkspace,
     source_identity: (u64, u64),
-    target_identity: (u64, u64),
     previous: BuildVolumeId,
     previous_record: BuildVolumeRecord,
     previous_image: ImageObservation,
@@ -50,65 +46,30 @@ pub(crate) struct ReseedPlan {
     seed_image: ImageObservation,
 }
 
-impl ReseedPlan {
+impl SeedMovePlan {
     /// The seed the workspace is given a clone of.
     pub fn seed(&self) -> &BuildVolumeId {
         &self.seed
     }
-    pub fn preview(&self) -> ReseedResult {
-        ReseedResult {
-            workspace: self.workspace.owner.name.clone(),
-            from: self.from.owner.name.clone(),
-            previous_volume: self.previous.to_string(),
-            seed: self.seed.to_string(),
-            replacement_volume: None,
-            previous_bytes: self.previous_image.bytes,
-            replacement_bytes: self.seed_image.bytes,
-            released_bytes: 0,
-            dry_run: true,
-        }
-    }
 }
 
-/// What of the old volume's build state a reseed may discard.
-#[derive(Clone, Copy, Debug)]
-enum Discard {
-    /// Any of it: `cowshed reseed` replaces accumulated build state by design.
-    Any,
-    /// None: the old volume may hold no write after the seed's freshness mark, the comparison
-    /// every reseed of a seed makes (16_build_volumes.md, "Targets and seeds": behind is one
-    /// comparison of two modification times). It is made under the exclusive claim with the Nx
-    /// daemon stopped and the volume flushed, before the clone, and again once the replacement is
-    /// cloned, immediately before the old volume is sealed: a host process the claim does not
-    /// fence can write while the replacement is cloned. It cannot be made after the seal: the
-    /// unmount writes the image itself (measured 2026-10-26: a volume nothing wrote read 5,188 ms
-    /// behind its mark once sealed), so it would refuse every move. The exclusive build hold,
-    /// taken before the first comparison and held through the seal, refuses every job admission
-    /// (the daemon keeper's restart included), so between the last comparison and the unmount only
-    /// a host process outside any cowshed job can write, the writer no capture fences either; one
-    /// still holding a file open refuses the unforced seal.
-    Nothing,
+/// The live volume and its guaranteed replacement after a successful compaction move.
+#[derive(Debug)]
+pub(crate) struct MovedVolume {
+    pub previous_volume: String,
+    pub replacement_volume: String,
 }
 
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
-    pub async fn preview_reseed(
-        &self,
-        workspace: ReseedWorkspace,
-        from: ReseedWorkspace,
-    ) -> Result<ReseedPlan> {
-        self.blocking(move |_, layout| observe(layout, workspace, from))
+    pub async fn plan_move_onto_seed(&self, workspace: SeedMoveWorkspace) -> Result<SeedMovePlan> {
+        self.blocking(move |_, layout| observe(layout, workspace))
             .await
     }
 
-    pub async fn execute_reseed(&self, plan: ReseedPlan) -> Result<ReseedResult> {
-        self.replace(plan, Discard::Any, || {}).await
-    }
-
-    /// Seed compaction's lineage (16_build_volumes.md, "Seed compaction"): the reseed `plan`
-    /// names, of a target from its own seed, refused as a conflict when the target's volume holds
-    /// a write the seed lacks, so no build state is lost and only the extent lineage changes.
-    pub async fn move_onto_seed(&self, plan: ReseedPlan) -> Result<ReseedResult> {
-        self.replace(plan, Discard::Nothing, || {}).await
+    /// Seed compaction's lineage (16_build_volumes.md, "Seed compaction"): move a workspace
+    /// onto its own seed only when its live volume holds no write the seed lacks.
+    pub async fn move_onto_seed(&self, plan: SeedMovePlan) -> Result<MovedVolume> {
+        self.move_onto_seed_with(plan, || {}).await
     }
 
     /// [`Self::move_onto_seed`], running `sealing` once the replacement is cloned and mounted
@@ -116,29 +77,24 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     #[cfg(test)]
     pub async fn move_onto_seed_racing(
         &self,
-        plan: ReseedPlan,
+        plan: SeedMovePlan,
         sealing: impl FnOnce() + Send + 'static,
-    ) -> Result<ReseedResult> {
-        self.replace(plan, Discard::Nothing, sealing).await
+    ) -> Result<MovedVolume> {
+        self.move_onto_seed_with(plan, sealing).await
     }
 
-    async fn replace(
+    async fn move_onto_seed_with(
         &self,
-        plan: ReseedPlan,
-        discard: Discard,
+        plan: SeedMovePlan,
         sealing: impl FnOnce() + Send + 'static,
-    ) -> Result<ReseedResult> {
+    ) -> Result<MovedVolume> {
         self.blocking(move |host, layout| {
-            let mut locks = vec![
+            let locks = [
                 plan.workspace.image.lock().to_owned(),
-                plan.from.image.lock().to_owned(),
                 plan.workspace.intent_lease.clone(),
-                plan.from.intent_lease.clone(),
             ];
-            locks.sort();
-            locks.dedup();
             let holding = crate::api::held_lock::LockHolding::of(
-                crate::api::held_lock::LockOperation::Reseed,
+                crate::api::held_lock::LockOperation::MoveOntoSeed,
                 &plan.workspace.owner.name,
             );
             let Some(_locked) = host
@@ -147,15 +103,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             else {
                 let mut holders = Vec::new();
                 for lock in &locks {
-                    let open = nx::holders(lock).map_err(|error| io("name reseed lock holders", lock, &error))?;
+                    let open = nx::holders(lock).map_err(|error| io("name seed move lock holders", lock, &error))?;
                     if !open.is_empty() {
                         holders.push(format!("{} held by {}", lock.display(), named(&open)));
                     }
                 }
                 return Err(CowshedError::conflict(
-                    format!("cannot reseed {}: lifecycle/image lock {}", plan.workspace.owner.name,
+                    format!("cannot move {} onto its seed: lifecycle/image lock {}", plan.workspace.owner.name,
                         if holders.is_empty() { "held by a process this user cannot see".to_owned() } else { holders.join("; ") }),
-                    "let the named lifecycle operation finish, then retry the reseed",
+                    "let the named lifecycle operation finish, then retry the seed move",
                 ));
             };
             require_current(layout, &plan)?;
@@ -165,7 +121,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     let hold = layout.hold_path(&plan.previous);
                     let holders = nx::holders(&hold).map_err(|error| io("name build hold holders", &hold, &error))?;
                     return Err(CowshedError::conflict(
-                        format!("cannot reseed {}: build volume {} hold {} is held by {}; volume open by {}",
+                        format!("cannot move {} onto its seed: build volume {} hold {} is held by {}; volume open by {}",
                             plan.workspace.owner.name, plan.previous, hold.display(), named(&holders), named(&open)),
                         "let the named job or land finish, then retry; no jobs were stopped",
                     ));
@@ -175,20 +131,18 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let (old_mount, _) = host.mount_build_volume(layout, &plan.previous).map_err(storage)?;
             let state = BuildVolumeState::read(&old_mount)?;
             if let Err(busy) = nx::close(&old_mount, &state)
-                .map_err(|error| io("close the reseeded volume's Nx state", &old_mount, &error))?
+                .map_err(|error| io("close the moving volume's Nx state", &old_mount, &error))?
             {
                 return Err(CowshedError::conflict(
-                    format!("cannot reseed {}: build volume {} is held: {busy}", plan.workspace.owner.name, plan.previous),
+                    format!("cannot move {} onto its seed: build volume {} is held: {busy}", plan.workspace.owner.name, plan.previous),
                     "stop the named holder, then retry; no jobs were stopped",
                 ));
             }
-            if let Discard::Nothing = discard {
-                require_no_newer_write(host, layout, &plan)?;
-            }
+            require_no_newer_write(host, layout, &plan)?;
             let replacement = BuildVolumeId::mint();
             let creating = layout.hold_new(&replacement)
-                .map_err(|error| io("hold the reseed replacement", &layout.hold_path(&replacement), &error))?;
-            let prepared: Result<(u64, u64)> = (|| {
+                .map_err(|error| io("hold the seed move replacement", &layout.hold_path(&replacement), &error))?;
+            let prepared: Result<()> = (|| {
                 host.clone_build_volume(layout, &plan.seed, &replacement, &Registration::new(
                     BuildVolumeRecord::new(
                         plan.seed_record.tree.clone(),
@@ -201,37 +155,31 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 nx::discard_daemon_records(&mount, &state)
                     .map_err(|error| io("discard the seed's Nx daemon record", &mount, &error))?;
                 sealing();
-                if let Discard::Nothing = discard {
-                    require_no_newer_write(host, layout, &plan)?;
-                }
+                require_no_newer_write(host, layout, &plan)?;
                 host.detach_claimed_build_volume(layout, &claim).map_err(|error| {
                     if matches!(&error, crate::storage::apfs::ApfsStorageError::BuildVolumeHeld { .. }) {
                         CowshedError::conflict(
-                            format!("cannot reseed {}: old build volume {} refused its non-forced seal: {error}", plan.workspace.owner.name, plan.previous),
+                            format!("cannot move {} onto its seed: old build volume {} refused its non-forced seal: {error}", plan.workspace.owner.name, plan.previous),
                             "stop the named holder, then retry; the old build link is unchanged",
                         )
                     } else {
                         storage(error)
                     }
                 })?;
-                // The seal may flush pending image blocks: execution accounts the allocation
-                // actually deleted, not the earlier preview's sample.
-                let previous_bytes = allocated_image_bytes(&layout.image(&plan.previous))?;
-                let replacement_bytes = allocated_image_bytes(&layout.image(&replacement))?;
                 link::point(&plan.workspace.checkout, &mount)?;
-                Ok((previous_bytes, replacement_bytes))
+                Ok(())
             })();
-            let (previous_bytes, replacement_bytes) = match prepared {
-                Ok(bytes) => bytes,
+            match prepared {
+                Ok(()) => {}
                 Err(error) => {
                     // Nothing published: the original link still names the original image.
                     if let Err(restore) = host.mount_build_volume(layout, &plan.previous) {
-                        cowshed_os::eprintln!("cowshed: restoring {}'s original build volume {} after reseed refusal failed: {restore}", plan.workspace.owner.name, plan.previous);
+                        cowshed_os::eprintln!("cowshed: restoring {}'s original build volume {} after seed move refusal failed: {restore}", plan.workspace.owner.name, plan.previous);
                     }
                     drop(creating);
                     match host.release_build_volume(layout, &replacement) {
-                        Ok(release) => super::say_release(&replacement, "unpublished reseed replacement", &release),
-                        Err(cleanup) => cowshed_os::eprintln!("cowshed: releasing unpublished reseed replacement {replacement} failed: {cleanup}"),
+                        Ok(release) => super::say_release(&replacement, "unpublished seed move replacement", &release),
+                        Err(cleanup) => cowshed_os::eprintln!("cowshed: releasing unpublished seed move replacement {replacement} failed: {cleanup}"),
                     }
                     return Err(error);
                 }
@@ -239,7 +187,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             // The replacement record preceded the atomic link, so an interruption on either
             // side leaves one owned link and the other volume still recorded as the workspace's.
             // The previous volume stays the workspace's, at its incarnation, until this release
-            // deletes it: a release that fails is the reseed's error, and the record still names
+            // deletes it: a release that fails is the move's error, and the record still names
             // its owner.
             layout.write_record(&plan.previous, &BuildVolumeRecord {
                 role: BuildVolumeRole::Superseded {
@@ -251,38 +199,36 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             host.release_claimed(layout, claim)
                 .map_err(storage)?;
             drop(creating);
-            Ok(ReseedResult {
-                replacement_volume: Some(replacement.to_string()),
-                previous_bytes,
-                replacement_bytes,
-                released_bytes: previous_bytes,
-                dry_run: false,
-                ..plan.preview()
+            Ok(MovedVolume {
+                previous_volume: plan.previous.to_string(),
+                replacement_volume: replacement.to_string(),
             })
         }).await
     }
 }
 
-fn require_current(layout: &BuildVolumeLayout, plan: &ReseedPlan) -> Result<()> {
-    let current = observe(layout, plan.workspace.clone(), plan.from.clone())?;
+fn require_current(layout: &BuildVolumeLayout, plan: &SeedMovePlan) -> Result<()> {
+    let current = observe(layout, plan.workspace.clone())?;
     if &current != plan {
         return Err(CowshedError::conflict(
             format!(
-                "reseed plan for {} from {} is stale: the workspace, build link, image allocation/identity or latest seed changed",
-                plan.workspace.owner.name, plan.from.owner.name
+                "seed move plan for {} is stale: the workspace, build link, image identity or latest seed changed",
+                plan.workspace.owner.name
             ),
-            "run cowshed reseed again to preview the current images; nothing was replaced",
+            "retry compaction against the current images; nothing was replaced",
         ));
     }
     Ok(())
 }
 
-/// [`Discard::Nothing`]: a conflict when the workspace's old volume, flushed, was written after
-/// the seed's freshness mark; nothing has been replaced when it answers.
+/// Refuse a write after the seed's mark before cloning and again immediately before sealing.
+/// The exclusive claim fences jobs and Nx restarts, but not a host writer during the clone;
+/// checking after the seal would mistake the unmount's own writes for newer build state.
+/// (16_build_volumes.md, "Seed compaction").
 fn require_no_newer_write(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
-    plan: &ReseedPlan,
+    plan: &SeedMovePlan,
 ) -> Result<()> {
     let live = host
         .build_volume_written(layout, &plan.previous)
@@ -305,34 +251,29 @@ fn require_no_newer_write(
     }
 }
 
-fn observe(
-    layout: &BuildVolumeLayout,
-    workspace: ReseedWorkspace,
-    from: ReseedWorkspace,
-) -> Result<ReseedPlan> {
+fn observe(layout: &BuildVolumeLayout, workspace: SeedMoveWorkspace) -> Result<SeedMovePlan> {
     let journal_path = layout.project_root().join(LIFECYCLE_INTENTS_FILE);
     let journal = LifecycleIntentJournal::load(&journal_path)?;
     for name in journal.forming() {
-        if name == &workspace.owner.name || name == &from.owner.name {
+        if name == &workspace.owner.name {
             let record = journal
                 .get(name)
                 .expect("forming entries are journal entries");
             return Err(CowshedError::conflict(
                 format!(
-                    "cannot reseed {} from {}: unfinished lifecycle journal entry for {name} at {}: {:?}",
+                    "cannot move {} onto its seed: unfinished lifecycle journal entry for {name} at {}: {:?}",
                     workspace.owner.name,
-                    from.owner.name,
                     journal_path.display(),
                     record.operation
                 ),
-                "finish the named create/fork/adopt before reseeding; no lifecycle work was replayed",
+                "finish the named create/fork/adopt before moving onto the seed; no lifecycle work was replayed",
             ));
         }
     }
     let previous = layout.linked(&workspace.checkout)?.ok_or_else(|| {
         CowshedError::not_found(
             format!("workspace {} links no build volume", workspace.owner.name),
-            "there is no accumulated build volume to reseed",
+            "there is no live build volume to move onto the seed",
         )
     })?;
     let previous_record = layout.read_record(&previous)?;
@@ -346,18 +287,23 @@ fn observe(
             "cowshed doctor --json",
         ));
     }
-    let (seed, seed_record) = layout.seed_of(&from.owner.name, &from.owner.incarnation)?
-        .ok_or_else(|| CowshedError::not_found(
-            format!("target {} at incarnation {} has no current seed to reseed {} from", from.owner.name, from.owner.incarnation.as_str(), workspace.owner.name),
-            "a normal fork or land creates the target's seed; reseed never refreshes or creates a seed",
-        ))?;
-    Ok(ReseedPlan {
+    let (seed, seed_record) = layout
+        .seed_of(&workspace.owner.name, &workspace.owner.incarnation)?
+        .ok_or_else(|| {
+            CowshedError::not_found(
+                format!(
+                    "workspace {} at incarnation {} has no current seed",
+                    workspace.owner.name,
+                    workspace.owner.incarnation.as_str()
+                ),
+                "a normal fork or land creates the seed; compaction never creates a fallback",
+            )
+        })?;
+    Ok(SeedMovePlan {
         source_identity: identity(workspace.image.image())?,
-        target_identity: identity(from.image.image())?,
         previous_image: image_observation(&layout.image(&previous))?,
         seed_image: image_observation(&layout.image(&seed))?,
         workspace,
-        from,
         previous,
         previous_record,
         seed,
@@ -373,27 +319,14 @@ fn identity(path: &Path) -> Result<(u64, u64)> {
 
 fn image_observation(path: &Path) -> Result<ImageObservation> {
     let metadata =
-        fs::metadata(path).map_err(|error| io("observe a reseed image", path, &error))?;
+        fs::metadata(path).map_err(|error| io("observe a seed move image", path, &error))?;
     Ok(ImageObservation {
         device: metadata.dev(),
         inode: metadata.ino(),
         modified: metadata
             .modified()
-            .map_err(|error| io("read reseed image clock", path, &error))?,
-        bytes: allocated_image_bytes(path)?,
+            .map_err(|error| io("read seed move image clock", path, &error))?,
     })
-}
-
-/// The same allocation basis as build-volume GC; shared APFS extents are not unique bytes.
-fn allocated_image_bytes(path: &Path) -> Result<u64> {
-    let metadata =
-        fs::metadata(path).map_err(|error| io("measure reseed image allocation", path, &error))?;
-    if metadata.is_dir() {
-        crate::storage::directory::allocated_tree_bytes(path)
-            .map_err(|error| io("measure reseed volume allocation", path, &error))
-    } else {
-        Ok(metadata.blocks().saturating_mul(512))
-    }
 }
 
 pub(super) fn named(holders: &[cowshed_os::process::Holder]) -> String {

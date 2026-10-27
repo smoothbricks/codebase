@@ -2,7 +2,7 @@
 
 On Linux, cowshed workspaces are ZFS datasets instead of disk images. Commands, grants, gateway policy, and cache
 semantics match macOS, while enforcement and data-plane topology are platform-specific. On ZFS almost everything gets
-faster: there is no attach step, no fsck pass, and checkpoints are literal `zfs snapshot`s.
+faster: there is no attach step and no fsck pass.
 
 cowshed picks the substrate by looking at the filesystem your project root sits on: APFS → image substrate, ZFS → zfs
 substrate.
@@ -18,7 +18,6 @@ chooses one.
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | Main workspace                                           | dataset `<pool>/cowshed/projects/<owner>/<repo>/main`, mounted at the original path                 |
 | Session workspaces                                       | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`, mounted at `<mount-root>/<owner>/<repo>/<name>` |
-| Checkpoints                                              | `zfs snapshot`s on the workspace dataset                                                            |
 | Shared caches (Cargo, sccache, zig, Gradle, Go, Nix)     | each tool's own default in your HOME, e.g. `~/.cargo/registry`, `~/.cache/sccache`, `~/go/pkg/mod`  |
 | Gateway registry/repository mirrors                      | `$XDG_CACHE_HOME/cowshed/{mirror,repo-mirrors}` (default `~/.cache/cowshed`); gateway-only          |
 | Bindings, trusted policy, grants, waivers, gateway state | `<pool>/cowshed/store` at `/private/cowshed/store`; policy is `<owner>/<repo>/policy.json`          |
@@ -82,28 +81,14 @@ next: cowshed exec raven -- <cmd>
 - **`cowshed fork` is tens of milliseconds.** Snapshot + clone are O(1) metadata operations, and the clone mounts as
   part of creation. No 250 ms attach, and no fsck pass — ZFS snapshots are transactionally consistent by construction,
   so the crash-consistency dance the image substrate does (sync, clone, verify) simply doesn't exist.
-- **`cowshed checkpoint raven before-refactor` is instant and pinned.** Publication first crosses the same supervisor
-  barrier as APFS: complete Arrow batches and protected spill files are sealed, and a manifest commits every
-  checkpoint-resident job byte. Small terminal streams may remain inline in Arrow, so checkpointing does not force one
-  output file per stream. Every supplied label and `--keep` creates an explicit pin. GC retains all pinned checkpoints,
-  all checkpoints younger than 14 days, and always the newest five per workspace; only an explicit unpin makes a pinned
-  checkpoint eligible.
-- **`cowshed restore`** is a fenced clone-swap by default: drain the supervisor and trusted connector, prepare and
-  verify the hidden replacement, mint the new incarnation then its token, swap, mount and validate, create its new Unix
-  gateway socket/netns connector, atomically publish detached metadata, revoke the old token, then admit jobs. Protected
-  job content is authoritative only for its origin snapshot; controller commitments carry lifecycle/order/lineage and
-  hashes across the new-incarnation fence without duplicating raw bytes. Failure before publication restores the old
-  dataset/token; after publication recovery completes forward. Recovery may discard only incomplete trailing job data; a
-  missing manifest entry or hash mismatch is an integrity failure. `--discard-newer` may use `zfs rollback`, but follows
-  the identical fence and ordering.
 - **Quotas are real:** each workspace dataset carries a `refquota` instead of a sparse-image capacity cap.
 - **Dev servers bind their default ports.** Every exec joins a private-loopback network namespace, so
   vite/metro/`devenv up` listen on their usual ports with no cross-workspace collisions — the macOS port-block scheme
   isn't needed for isolation here. Linux sidecars omit `portBlock`; there is no synthetic base and no
   `COWSHED_PORT_BASE` or `COWSHED_PORT_BLOCK_SIZE`. Ordinary package and proxy clients use the namespace-local trusted
   connector at `http://127.0.0.1:7644`; it binds only that loopback address and forwards unchanged bytes only to the
-  workspace's mounted per-incarnation Unix gateway socket. The socket inode plus netns remains identity, and
-  detach/restore drain and remove the connector before releasing the old attachment.
+  workspace's mounted per-incarnation Unix gateway socket. The socket inode plus netns remains identity, and detach
+  drains and removes the connector before releasing the old attachment.
 
 ## The origin-snapshot lifecycle
 

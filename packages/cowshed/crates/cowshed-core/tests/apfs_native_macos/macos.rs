@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
@@ -25,8 +25,7 @@ use cowshed_core::metadata::{
 };
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::apfs::native::{
-    KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource, RestoreFailpoint,
-    SystemKernelMountSource,
+    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, FoundMount, Labelled,
@@ -35,10 +34,9 @@ use cowshed_core::storage::apfs::{
 use cowshed_core::storage::deletion_log::DELETION_LOG_FILE;
 use cowshed_core::storage::lifecycle::{
     LifecycleFact, LifecycleWorkspace, MountJoin, MountRefusalReason, MountState,
-    OperationIdentity, Pin, RetiredRef, Revision, StorageGcOptions, StorageGcReason,
-    derive_workspaces,
+    OperationIdentity, RetiredRef, Revision, StorageGcOptions, StorageGcReason, derive_workspaces,
 };
-use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
+use cowshed_core::storage::{StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
@@ -394,25 +392,6 @@ impl CommandRunner for UnreadableFirstInventoryRunner {
                 image.display()
             ),
         ))
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ByteRecoveryMarkers;
-
-impl RecoveryMarkerSource for ByteRecoveryMarkers {
-    fn incarnation(&self, image: &Path) -> Result<String, ApfsStorageError> {
-        match std::fs::read(image)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?
-            .as_slice()
-        {
-            b"old generation" => Ok("00000000000000000000000000000001".to_owned()),
-            b"new generation" => Ok("00000000000000000000000000000002".to_owned()),
-            _ => Err(ApfsStorageError::Host(format!(
-                "unexpected recovery image bytes: {}",
-                image.display()
-            ))),
-        }
     }
 }
 
@@ -901,24 +880,18 @@ fn native_host(
     fixture: &Fixture,
     runner: RecordingRunner,
 ) -> MacOsApfsExecutionHost<RecordingRunner> {
-    MacOsApfsExecutionHost::with_recovery_sources(
-        runner,
-        fixture.config(),
-        SystemKernelMountSource,
-        ByteRecoveryMarkers,
-    )
-    .expect("native APFS host")
+    MacOsApfsExecutionHost::with_mount_source(runner, fixture.config(), SystemKernelMountSource)
+        .expect("native APFS host")
 }
 
 fn native_host_at(
     namespace: HostNamespace,
     root: &Path,
 ) -> MacOsApfsExecutionHost<RecordingRunner> {
-    MacOsApfsExecutionHost::with_recovery_sources(
+    MacOsApfsExecutionHost::with_mount_source(
         RecordingRunner::default(),
         ApfsSubstrateConfig::new(namespace, root, root.join("mount")),
         SystemKernelMountSource,
-        ByteRecoveryMarkers,
     )
     .expect("native APFS host")
 }
@@ -941,38 +914,6 @@ fn identity_at(root: &Path) -> OperationIdentity {
         ))
         .expect("grants"),
     }
-}
-
-fn set_modified(path: &Path, seconds_since_epoch: u64) {
-    let file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("open image for timestamp");
-    file.set_times(
-        FileTimes::new()
-            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds_since_epoch)),
-    )
-    .expect("set image timestamp");
-}
-
-fn make_old(path: &Path) {
-    set_modified(path, 946_684_800);
-}
-
-fn make_future(path: &Path) {
-    set_modified(path, 4_102_444_800);
-}
-
-fn checkpoint_fact_path(image: &Path) -> PathBuf {
-    let mut path = image.as_os_str().to_owned();
-    path.push(".checkpoint.json");
-    PathBuf::from(path)
-}
-
-fn restore_recovery_fact_path(image: &Path) -> PathBuf {
-    let mut path = image.as_os_str().to_owned();
-    path.push(".restore.json");
-    PathBuf::from(path)
 }
 
 fn ca_key_path(image: &Path) -> PathBuf {
@@ -1046,119 +987,15 @@ fn a_clone_into_a_path_that_is_not_a_dmg_image_fails_before_any_command() {
 }
 
 #[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_restore_swap_keeps_old_metadata_until_verified_publication_and_rolls_back_generations()
- {
-    let fixture = Fixture::new("restore-swap");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000002.dmg");
-    let undo = layout
-        .project()
-        .checkpoints
-        .join("main/pre-restore-00000000000000000000000000000002.dmg");
-    create_image(canonical.image());
-    std::fs::write(canonical.image(), b"old generation").expect("old image");
-    create_image(&staged);
-    std::fs::write(&staged, b"new generation").expect("new image");
-    let mut next_metadata = metadata();
-    next_metadata.workspace_incarnation =
-        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("next incarnation");
-    next_metadata
-        .write_for_image(&staged)
-        .expect("next metadata");
-    let host = native_host(&fixture, RecordingRunner::default());
-
-    host.restore_swap(&staged, canonical.image(), &undo)
-        .expect("restore swap");
-    assert_eq!(
-        std::fs::read(canonical.image()).expect("canonical"),
-        b"new generation"
-    );
-    assert_eq!(std::fs::read(&undo).expect("undo"), b"old generation");
-    assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(canonical.image())
-            .expect("pre-publication metadata")
-            .workspace_incarnation,
-        metadata().workspace_incarnation
-    );
-    assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(&undo)
-            .expect("undo metadata")
-            .workspace_incarnation,
-        metadata().workspace_incarnation
-    );
-
-    host.rollback_restore(canonical.image(), &undo, &staged)
-        .expect("rollback");
-    assert_eq!(
-        std::fs::read(canonical.image()).expect("canonical"),
-        b"old generation"
-    );
-    assert!(!staged.exists());
-    assert!(!sidecar_path(&staged).exists());
-    assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(canonical.image())
-            .expect("restored metadata")
-            .workspace_incarnation,
-        metadata().workspace_incarnation
-    );
-}
-
-#[test]
 fn stats_count_only_images_and_gc_preserves_recorded_recovery_trash() {
     let fixture = Fixture::new("stats-gc");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image().expect("canonical");
     create_image(canonical.image());
-    let checkpoints = &layout.project().checkpoints.join("main");
-    let first = checkpoints.join("one.dmg");
-    let second = checkpoints.join("two.dmg");
-    let pre_restore = checkpoints.join("pre-restore-00000000000000000000000000000002.dmg");
-    create_image(&first);
-    create_image(&second);
-    create_image(&pre_restore);
-    std::fs::write(checkpoints.join("not-an-image.txt"), b"ignored").expect("noise");
     let runner = RecordingRunner::default();
     let host = native_host(&fixture, runner.clone());
-    host.publish_checkpoint_fact(
-        &first,
-        &CheckpointLabel::new("one").expect("label"),
-        Revision::new(2),
-        Pin::Pinned,
-    )
-    .expect("pinned fact");
-    host.publish_checkpoint_fact(
-        &second,
-        &CheckpointLabel::new("two").expect("label"),
-        Revision::new(3),
-        Pin::Automatic,
-    )
-    .expect("automatic fact");
-
     let stats = host.stats(&workspace(), canonical.image()).expect("stats");
     assert_eq!(stats.logical_bytes, b"fixture".len() as u64);
-    assert_eq!(stats.checkpoint_count, 3);
-    let first_bytes = std::fs::metadata(&first)
-        .expect("first metadata")
-        .blocks()
-        .saturating_mul(512);
-    let second_bytes = std::fs::metadata(&second)
-        .expect("second metadata")
-        .blocks()
-        .saturating_mul(512);
-    let pre_restore_bytes = std::fs::metadata(&pre_restore)
-        .expect("pre-restore metadata")
-        .blocks()
-        .saturating_mul(512);
-    assert_eq!(
-        stats.checkpoint_bytes,
-        first_bytes + second_bytes + pre_restore_bytes
-    );
-    assert_eq!(stats.pinned_checkpoint_bytes, first_bytes);
 
     let active_name = WorkspaceName::session("active").expect("workspace");
     let active = layout.session_image(&active_name).expect("active");
@@ -1185,8 +1022,8 @@ fn stats_count_only_images_and_gc_preserves_recorded_recovery_trash() {
     create_image(&cache_image);
 
     let report = execute_gc(&host, &fixture.config()).expect("gc");
-    // Recovery trash is evidence, not a candidate; the two checkpoints retain their facts.
-    assert_eq!(report.examined, 2);
+    // Recovery trash is evidence, not a candidate, and a sidecar-backed image is not examined.
+    assert_eq!(report.examined, 0);
     assert_eq!(report.reclaimed, 0);
     assert!(trash.exists());
     assert!(sidecar_path(&trash).exists());
@@ -1401,11 +1238,6 @@ fn sparse_images_and_their_sidecars_are_invisible_to_recovery_listing_and_gc() {
 
     host.recover_pending(&config, &[])
         .expect("recovery does not read a SPARSE sidecar");
-    assert!(
-        host.pending_publications(&repo())
-            .expect("pending publications")
-            .is_empty()
-    );
     let facts = host
         .list(&repo())
         .expect("listing does not read a SPARSE sidecar");
@@ -1877,7 +1709,7 @@ fn write_marker_owned_links_revision_follows_the_copy_that_produced_the_marker()
         None,
         &identity(&fixture),
     )
-    .expect("legacy restore copy");
+    .expect("legacy same-workspace copy");
     assert_eq!(
         read_revision(&legacy_copy),
         0,
@@ -1898,7 +1730,7 @@ fn write_marker_owned_links_revision_follows_the_copy_that_produced_the_marker()
         None,
         &identity(&fixture),
     )
-    .expect("current restore copy");
+    .expect("current same-workspace copy");
     assert_eq!(
         read_revision(&current_copy),
         OWNED_LINKS_REVISION,
@@ -1950,35 +1782,6 @@ fn retirement_moves_image_and_sidecar_atomically_and_reclaim_is_idempotent() {
     assert!(!trash.exists());
     assert!(!sidecar_path(&trash).exists());
     assert!(!ca_key_path(&trash).exists());
-}
-
-#[test]
-fn restore_swap_rejects_an_undo_sidecar_without_touching_generations() {
-    let fixture = Fixture::new("undo-sidecar-conflict");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000002.dmg");
-    let undo = layout
-        .project()
-        .checkpoints
-        .join("main/pre-restore-00000000000000000000000000000002.dmg");
-    create_image(canonical.image());
-    std::fs::write(canonical.image(), b"old").expect("old");
-    create_image(&staged);
-    std::fs::write(&staged, b"new").expect("new");
-    std::fs::create_dir_all(undo.parent().expect("undo parent")).expect("undo parent");
-    std::fs::write(sidecar_path(&undo), b"occupied").expect("undo sidecar");
-    let host = native_host(&fixture, RecordingRunner::default());
-
-    host.restore_swap(&staged, canonical.image(), &undo)
-        .expect_err("undo sidecar is a conflict");
-
-    assert_eq!(std::fs::read(canonical.image()).expect("canonical"), b"old");
-    assert_eq!(std::fs::read(&staged).expect("staged"), b"new");
-    assert!(!undo.exists());
 }
 
 #[test]
@@ -2061,54 +1864,6 @@ fn fresh_session_metadata_persists_branch_fork_and_original_project_root() {
 }
 
 #[test]
-fn preserved_metadata_keeps_origin_facts_and_refreshes_capture_time() {
-    let fixture = Fixture::new("preserved-info-snapshot");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let source = layout.main_image().expect("source");
-    let destination = layout
-        .checkpoint_image(
-            &WorkspaceName::new("main").expect("main"),
-            &cowshed_core::storage::CheckpointLabel::new("saved").expect("label"),
-        )
-        .expect("destination");
-    create_image(source.image());
-    create_image(destination.image());
-    let host = native_host(&fixture, RecordingRunner::default());
-    let workspace = workspace();
-    let original = identity(&fixture);
-    host.publish_metadata(
-        source.image(),
-        &workspace,
-        Revision::new(1),
-        MetadataPolicy::Fresh,
-        Some(&original),
-        None,
-    )
-    .expect("fresh source");
-    let mut refresh = identity(&fixture);
-    refresh.created_at = "2026-07-14T01:02:03Z".to_owned();
-    refresh.branch = Some("wrong-new-branch".to_owned());
-    host.publish_metadata(
-        destination.image(),
-        &workspace,
-        Revision::new(2),
-        MetadataPolicy::Preserve,
-        Some(&refresh),
-        Some(source.image()),
-    )
-    .expect("preserve metadata");
-
-    let published =
-        DetachedWorkspaceMetadata::read_for_image(destination.image()).expect("preserved metadata");
-    let info = published.info_snapshot;
-    assert_eq!(info.project_root, fixture.root.join("project"));
-    assert_eq!(info.created_at, "2026-07-13T00:00:00Z");
-    assert_eq!(info.branch.as_deref(), Some("main"));
-    assert_eq!(info.captured_at, "2026-07-14T01:02:03Z");
-    assert!(!info.stale);
-}
-
-#[test]
 fn canonical_identity_mismatches_are_rejected_one_dimension_at_a_time() {
     for (test, mutate) in [("repo", 0_u8), ("workspace", 1_u8)] {
         let fixture = Fixture::new(test);
@@ -2139,211 +1894,7 @@ fn canonical_identity_mismatches_are_rejected_one_dimension_at_a_time() {
 }
 
 #[test]
-fn checkpoint_observation_reads_authoritative_detached_metadata() {
-    let fixture = Fixture::new("checkpoint-observe");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let label = cowshed_core::storage::CheckpointLabel::new("ready").expect("label");
-    let checkpoint = layout
-        .checkpoint_image(&WorkspaceName::new("main").expect("main"), &label)
-        .expect("checkpoint");
-    create_image(checkpoint.image());
-    let host = native_host(&fixture, RecordingRunner::default());
-
-    let observed = host
-        .observe(&[LifecycleFact::Checkpoint {
-            repo: repo(),
-            workspace: WorkspaceName::new("main").expect("main"),
-            label: label.clone(),
-            revision: Revision::new(0),
-        }])
-        .expect("observe checkpoint");
-
-    assert!(matches!(
-        observed.as_slice(),
-        [cowshed_core::storage::lifecycle::LifecycleFact::Checkpoint {
-            repo: observed_repo,
-            workspace,
-            label: observed_label,
-            revision,
-        }] if observed_repo == &repo()
-            && workspace.is_main()
-            && observed_label == &label
-            && *revision == Revision::new(0)
-    ));
-}
-
-#[test]
-fn checkpoint_enumeration_reads_regular_image_files() {
-    let fixture = Fixture::new("checkpoint-regular-files");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let main = WorkspaceName::new("main").expect("main");
-    let host = native_host(&fixture, RecordingRunner::default());
-
-    for (name, revision, pin) in [("first", 11, Pin::Pinned), ("second", 12, Pin::Automatic)] {
-        let label = CheckpointLabel::new(name).expect("label");
-        let image = layout
-            .checkpoint_image(&main, &label)
-            .expect("checkpoint")
-            .image()
-            .to_owned();
-        create_image(&image);
-        host.publish_checkpoint_fact(&image, &label, Revision::new(revision), pin)
-            .expect("checkpoint fact");
-    }
-
-    let facts = host.checkpoints(&repo()).expect("checkpoint facts");
-    let observed = facts
-        .iter()
-        .map(|fact| (fact.label.as_str(), fact.revision, fact.pin))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        observed,
-        vec![
-            ("first", Revision::new(11), Pin::Pinned),
-            ("second", Revision::new(12), Pin::Automatic),
-        ]
-    );
-    assert!(
-        facts
-            .iter()
-            .all(|fact| fact.repo == repo() && fact.workspace == main)
-    );
-}
-
-#[test]
-fn checkpoint_gc_reclaims_only_expired_automatic_regular_files_and_sidecars() {
-    let fixture = Fixture::new("checkpoint-retention");
-    let config = fixture.config();
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let main = WorkspaceName::new("main").expect("main");
-    let host = native_host(&fixture, RecordingRunner::default());
-    let create_checkpoint = |name: &str, revision: u64, pin: Pin| {
-        let label = CheckpointLabel::new(name).expect("label");
-        let image = layout
-            .checkpoint_image(&main, &label)
-            .expect("checkpoint")
-            .image()
-            .to_owned();
-        create_image(&image);
-        host.publish_checkpoint_fact(&image, &label, Revision::new(revision), pin)
-            .expect("checkpoint fact");
-        image
-    };
-
-    let mut newest_five = Vec::new();
-    for index in 0..5 {
-        let image = create_checkpoint(&format!("future-{index}"), index + 1, Pin::Automatic);
-        make_future(&image);
-        newest_five.push(image);
-    }
-    let young = create_checkpoint("young", 6, Pin::Automatic);
-    let expired = create_checkpoint("expired", 7, Pin::Automatic);
-    make_old(&expired);
-    let pinned = create_checkpoint("pinned-old", 8, Pin::Pinned);
-    make_old(&pinned);
-    drop(host);
-
-    let restarted = native_host(&fixture, RecordingRunner::default());
-    assert_eq!(
-        restarted.checkpoints(&repo()).expect("restart facts").len(),
-        8
-    );
-
-    let plan = restarted
-        .preview_gc(&config, &repo(), StorageGcOptions::default())
-        .expect("GC preview");
-    let repeated = restarted
-        .preview_gc(&config, &repo(), StorageGcOptions::default())
-        .expect("repeated preview");
-    assert_eq!(plan.candidates().len(), 1);
-    assert_eq!(
-        plan.candidates()[0].identity(),
-        repeated.candidates()[0].identity(),
-        "unchanged candidates have stable identities"
-    );
-    let candidate = &plan.candidates()[0];
-    assert_eq!(candidate.path(), expired);
-    assert_eq!(candidate.reason(), StorageGcReason::ExpiredCheckpoint);
-    let expected_bytes = [
-        expired.clone(),
-        sidecar_path(&expired),
-        ca_key_path(&expired),
-        checkpoint_fact_path(&expired),
-    ]
-    .into_iter()
-    .map(|path| {
-        std::fs::metadata(path)
-            .expect("candidate component")
-            .blocks()
-            .saturating_mul(512)
-    })
-    .sum::<u64>();
-    assert_eq!(candidate.bytes(), expected_bytes);
-    assert!(
-        plan.candidates()
-            .iter()
-            .all(|candidate| candidate.path() != pinned),
-        "pinned checkpoints are never candidates"
-    );
-    assert!(expired.exists(), "preview must not mutate");
-
-    restarted
-        .publish_checkpoint_fact(
-            &expired,
-            &CheckpointLabel::new("expired").expect("label"),
-            Revision::new(7),
-            Pin::Pinned,
-        )
-        .expect("pin after preview");
-    let stale = restarted
-        .execute_gc(&config, plan)
-        .expect_err("pin change makes plan stale");
-    assert!(matches!(stale, ApfsStorageError::GcPlanStale));
-    assert!(expired.exists(), "stale execution must not mutate");
-    restarted
-        .publish_checkpoint_fact(
-            &expired,
-            &CheckpointLabel::new("expired").expect("label"),
-            Revision::new(7),
-            Pin::Automatic,
-        )
-        .expect("restore automatic pin");
-    let plan = restarted
-        .preview_gc(&config, &repo(), StorageGcOptions::default())
-        .expect("fresh preview");
-    let report = restarted.execute_gc(&config, plan).expect("checkpoint gc");
-    assert_eq!(report.examined, 8);
-    assert_eq!(report.reclaimed, 1);
-    assert_eq!(report.retained_pinned, 1);
-    assert_eq!(report.retained_recent, 6);
-    assert!(newest_five.iter().all(|image| image.exists()));
-    assert!(young.exists(), "young automatic checkpoint must survive");
-    assert!(pinned.exists(), "old pinned checkpoint must survive");
-    assert!(
-        !expired.exists(),
-        "expired automatic checkpoint is reclaimed"
-    );
-    assert!(
-        !sidecar_path(&expired).exists(),
-        "grants sidecar is reclaimed"
-    );
-    assert!(
-        !checkpoint_fact_path(&expired).exists(),
-        "checkpoint fact sidecar is reclaimed"
-    );
-    let surviving = restarted.checkpoints(&repo()).expect("surviving facts");
-    assert_eq!(surviving.len(), 7);
-    assert!(
-        surviving
-            .iter()
-            .all(|fact| fact.label.as_str() != "expired")
-    );
-}
-
-#[test]
-fn retired_reclaim_excludes_workspace_immediately_and_removes_every_restore_artifact() {
-    const FIRST: &str = "00000000000000000000000000000001";
-    const SECOND: &str = "00000000000000000000000000000002";
+fn retired_reclaim_excludes_workspace_immediately_and_removes_its_image_and_mountpoint() {
     const CURRENT: &str = "00000000000000000000000000000003";
     let fixture = Fixture::new("retired-complete-reclaim");
     let config = fixture.config();
@@ -2356,24 +1907,6 @@ fn retired_reclaim_excludes_workspace_immediately_and_removes_every_restore_arti
     create_image(canonical.image());
     write_session_metadata(canonical.image(), "retired", CURRENT);
 
-    let label = CheckpointLabel::new("pinned").expect("checkpoint label");
-    let checkpoint = layout
-        .checkpoint_image(&name, &label)
-        .expect("checkpoint")
-        .image()
-        .to_owned();
-    create_image(&checkpoint);
-    write_session_metadata(&checkpoint, "retired", FIRST);
-    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(3), Pin::Pinned)
-        .expect("pinned checkpoint fact");
-
-    let checkpoint_directory = layout.project().checkpoints.join("retired");
-    let first_undo = checkpoint_directory.join(format!("pre-restore-{SECOND}.dmg"));
-    create_image(&first_undo);
-    write_session_metadata(&first_undo, "retired", FIRST);
-    let second_undo = checkpoint_directory.join(format!("pre-restore-{CURRENT}.dmg"));
-    create_image(&second_undo);
-    write_session_metadata(&second_undo, "retired", SECOND);
     let mountpoint = layout.workspace_mount(&name).expect("workspace mountpoint");
     std::fs::create_dir_all(&mountpoint).expect("empty mountpoint");
 
@@ -2389,9 +1922,8 @@ fn retired_reclaim_excludes_workspace_immediately_and_removes_every_restore_arti
     let derived = derive_workspaces(
         restarted.list(&repo()).expect("published facts"),
         restarted.mounts(&repo()).expect("kernel mounts"),
-        restarted.checkpoints(&repo()).expect("checkpoint facts"),
     )
-    .expect("retired checkpoints do not republish the workspace");
+    .expect("a retired workspace is not republished");
     assert_eq!(derived.len(), 1);
     assert!(derived[0].workspace.name().is_main());
 
@@ -2403,39 +1935,29 @@ fn retired_reclaim_excludes_workspace_immediately_and_removes_every_restore_arti
         .reclaim_retired(&config, &retired)
         .expect("idempotent repeated reclaim");
 
-    for image in [&trash, &checkpoint, &first_undo, &second_undo] {
-        assert!(!image.exists(), "{} image remains", image.display());
-        assert!(
-            !sidecar_path(image).exists(),
-            "{} grants remain",
-            image.display()
-        );
-        assert!(
-            !ca_key_path(image).exists(),
-            "{} CA key remains",
-            image.display()
-        );
-        assert!(
-            !checkpoint_fact_path(image).exists(),
-            "{} checkpoint fact remains",
-            image.display()
-        );
-    }
-    assert!(!checkpoint_directory.exists());
+    assert!(!trash.exists(), "{} image remains", trash.display());
+    assert!(
+        !sidecar_path(&trash).exists(),
+        "{} grants remain",
+        trash.display()
+    );
+    assert!(
+        !ca_key_path(&trash).exists(),
+        "{} CA key remains",
+        trash.display()
+    );
     assert!(!mountpoint.exists());
 }
 
-/// A retired workspace's checkpoint images are hundreds of gigabytes of sparse blocks, and `cowshed
+/// A retired workspace's trash image is hundreds of gigabytes of sparse blocks, and `cowshed
 /// doctor` previews their collection. The preview, and the identical one the reclaim repeats under
 /// the locks, once hashed every image in full: 1.5 TB of reads and 23 CPU-minutes for one doctor.
-/// The images here are 100 GiB and mode 000, so any open of one to read it fails the preview.
+/// The image here is 100 GiB and mode 000, so any open of one to read it fails the preview.
 #[test]
-fn gc_preview_and_reclaim_of_a_retired_workspace_never_read_its_checkpoint_images() {
-    const FIRST: &str = "00000000000000000000000000000001";
-    const SECOND: &str = "00000000000000000000000000000002";
+fn gc_preview_and_reclaim_of_a_retired_workspace_never_read_its_sparse_trash_image() {
     const CURRENT: &str = "00000000000000000000000000000003";
     const HUNDRED_GIB: u64 = 100 << 30;
-    let fixture = Fixture::new("retired-sparse-checkpoints");
+    let fixture = Fixture::new("retired-sparse-trash");
     let config = fixture.config();
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let host = native_host(&fixture, RecordingRunner::default());
@@ -2445,23 +1967,6 @@ fn gc_preview_and_reclaim_of_a_retired_workspace_never_read_its_checkpoint_image
     create_image(canonical.image());
     write_session_metadata(canonical.image(), "retired", CURRENT);
 
-    let label = CheckpointLabel::new("pinned").expect("checkpoint label");
-    let checkpoint = layout
-        .checkpoint_image(&name, &label)
-        .expect("checkpoint")
-        .image()
-        .to_owned();
-    create_image(&checkpoint);
-    write_session_metadata(&checkpoint, "retired", FIRST);
-    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(3), Pin::Pinned)
-        .expect("pinned checkpoint fact");
-    let undo = layout
-        .project()
-        .checkpoints
-        .join("retired")
-        .join(format!("pre-restore-{SECOND}.dmg"));
-    create_image(&undo);
-    write_session_metadata(&undo, "retired", FIRST);
     let trash = layout
         .project()
         .sessions
@@ -2469,23 +1974,21 @@ fn gc_preview_and_reclaim_of_a_retired_workspace_never_read_its_checkpoint_image
     host.retire_image(canonical.image(), &trash)
         .expect("logical retirement");
 
-    for image in [&checkpoint, &undo] {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(image)
-            .and_then(|file| file.set_len(HUNDRED_GIB))
-            .expect("sparse length");
-        std::fs::set_permissions(image, std::fs::Permissions::from_mode(0o000))
-            .expect("unreadable image");
-        assert!(
-            std::fs::File::open(image).is_err(),
-            "this test needs a process that mode 000 binds, not root"
-        );
-    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&trash)
+        .and_then(|file| file.set_len(HUNDRED_GIB))
+        .expect("sparse length");
+    std::fs::set_permissions(&trash, std::fs::Permissions::from_mode(0o000))
+        .expect("unreadable image");
+    assert!(
+        std::fs::File::open(&trash).is_err(),
+        "this test needs a process that mode 000 binds, not root"
+    );
 
     let plan = host
         .preview_gc(&config, &repo(), StorageGcOptions::default())
-        .expect("a preview over sparse checkpoint images reads none of them");
+        .expect("a preview over a sparse trash image reads none of it");
     assert!(
         plan.candidates().is_empty(),
         "recovery images are not generic GC candidates"
@@ -2496,9 +1999,7 @@ fn gc_preview_and_reclaim_of_a_retired_workspace_never_read_its_checkpoint_image
     let retired = RetiredRef::new(session_workspace("retired", CURRENT), Revision::new(1));
     host.reclaim_retired(&config, &retired)
         .expect("explicit scoped reclamation reads no image bytes");
-    for image in [&trash, &checkpoint, &undo] {
-        assert!(!image.exists(), "{} image remains", image.display());
-    }
+    assert!(!trash.exists(), "{} image remains", trash.display());
 }
 
 #[test]
@@ -2546,7 +2047,7 @@ fn retired_pending_clone_reclaims_without_touching_reused_name() {
     assert_eq!(current.workspace_incarnation.as_str(), LIVE);
 }
 
-/// Trash entries are keyed `<name>-<incarnation>`, but `checkpoints/<name>`, the temp dir and the
+/// Trash entries are keyed `<name>-<incarnation>`, but the temp dir and the
 /// mountpoint are keyed on the name alone. Re-minting a retired name hands the new lifetime those
 /// same paths, so a live workspace has to withhold them from a stranded retirement of its name
 /// without withholding that retirement's own per-incarnation artifacts — which are garbage either
@@ -2568,16 +2069,6 @@ fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name()
     create_image(live.image());
     write_session_metadata(live.image(), "lockfree-doctrine", LIVE);
 
-    let label = CheckpointLabel::new("pinned").expect("checkpoint label");
-    let checkpoint = layout
-        .checkpoint_image(&name, &label)
-        .expect("checkpoint")
-        .image()
-        .to_owned();
-    create_image(&checkpoint);
-    write_session_metadata(&checkpoint, "lockfree-doctrine", LIVE);
-    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(3), Pin::Pinned)
-        .expect("pinned checkpoint fact");
     let mountpoint = layout.workspace_mount(&name).expect("workspace mountpoint");
     std::fs::create_dir_all(&mountpoint).expect("live mountpoint");
     let exec_temp = layout.exec_temp_dir(&name).expect("temp dir");
@@ -2637,14 +2128,6 @@ fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name()
     assert!(
         sidecar_path(live.image()).exists(),
         "live workspace grants were collected"
-    );
-    assert!(
-        checkpoint.exists(),
-        "live lifetime checkpoint was collected"
-    );
-    assert!(
-        checkpoint_fact_path(&checkpoint).exists(),
-        "live lifetime checkpoint fact was collected"
     );
     assert!(
         mountpoint.exists(),
@@ -2713,17 +2196,6 @@ fn gc_collects_every_stranded_retirement_of_one_name_and_its_shared_paths_once()
     create_image(main.image());
 
     let name = WorkspaceName::session("lockfree-doctrine").expect("session workspace");
-    let label = CheckpointLabel::new("keep").expect("checkpoint label");
-    let checkpoint = layout
-        .checkpoint_image(&name, &label)
-        .expect("checkpoint")
-        .image()
-        .to_owned();
-    create_image(&checkpoint);
-    write_session_metadata(&checkpoint, "lockfree-doctrine", SECOND);
-    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(2), Pin::Pinned)
-        .expect("pinned checkpoint fact");
-    let checkpoint_directory = layout.project().checkpoints.join("lockfree-doctrine");
     let mountpoint = layout.workspace_mount(&name).expect("workspace mountpoint");
     std::fs::create_dir_all(&mountpoint).expect("empty mountpoint");
     let exec_temp = layout.exec_temp_dir(&name).expect("temp dir");
@@ -2765,15 +2237,6 @@ fn gc_collects_every_stranded_retirement_of_one_name_and_its_shared_paths_once()
             image.display()
         );
     }
-    assert!(!checkpoint.exists(), "shared checkpoint image remains");
-    assert!(
-        !checkpoint_fact_path(&checkpoint).exists(),
-        "shared checkpoint fact remains"
-    );
-    assert!(
-        !checkpoint_directory.exists(),
-        "shared checkpoint directory remains"
-    );
     assert!(!mountpoint.exists(), "shared mountpoint remains");
     assert!(!exec_temp.exists(), "shared temp dir remains");
 }
@@ -2789,21 +2252,6 @@ fn retired_gc_revalidates_stale_plans_and_resumes_from_sidecar_authority() {
     let canonical = layout.session_image(&name).expect("session image");
     create_image(canonical.image());
     write_session_metadata(canonical.image(), "retired", CURRENT);
-    let checkpoint_label = CheckpointLabel::new("keep").expect("checkpoint label");
-    let checkpoint = layout
-        .checkpoint_image(&name, &checkpoint_label)
-        .expect("checkpoint")
-        .image()
-        .to_owned();
-    create_image(&checkpoint);
-    write_session_metadata(&checkpoint, "retired", CURRENT);
-    host.publish_checkpoint_fact(
-        &checkpoint,
-        &checkpoint_label,
-        Revision::new(2),
-        Pin::Pinned,
-    )
-    .expect("pinned fact");
     let trash = layout
         .project()
         .sessions
@@ -2820,14 +2268,14 @@ fn retired_gc_revalidates_stale_plans_and_resumes_from_sidecar_authority() {
         stale_plan.candidates()[0].reason(),
         StorageGcReason::RetiredWorkspace
     );
-    assert_eq!(stale_plan.retained_pinned(), 0);
-    host.publish_checkpoint_fact(
-        &checkpoint,
-        &checkpoint_label,
-        Revision::new(2),
-        Pin::Automatic,
-    )
-    .expect("change checkpoint after preview");
+    // The grants sidecar is the retirement's authority, and a plan fences its content: rewriting
+    // it after the preview makes the plan stale.
+    let mut authority =
+        DetachedWorkspaceMetadata::read_for_image(&trash).expect("retirement authority");
+    authority.updated_at = "2026-07-14T00:00:00Z".to_owned();
+    authority
+        .write_for_image(&trash)
+        .expect("rewritten retirement authority");
     let stale = host
         .execute_gc(&config, stale_plan)
         .expect_err("changed retired artifact makes plan stale");
@@ -2836,17 +2284,7 @@ fn retired_gc_revalidates_stale_plans_and_resumes_from_sidecar_authority() {
         sidecar_path(&trash).exists(),
         "stale plan mutated retirement authority"
     );
-    assert!(checkpoint.exists(), "stale plan mutated checkpoint");
 
-    host.publish_checkpoint_fact(
-        &checkpoint,
-        &checkpoint_label,
-        Revision::new(2),
-        Pin::Pinned,
-    )
-    .expect("restore pinned checkpoint");
-    std::fs::remove_file(&checkpoint)
-        .expect("simulate checkpoint image deletion before sidecar cleanup");
     drop(host);
 
     let restarted = native_host(&fixture, RecordingRunner::default());
@@ -2854,53 +2292,12 @@ fn retired_gc_revalidates_stale_plans_and_resumes_from_sidecar_authority() {
         .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("sidecar resumes retired cleanup");
     assert_eq!(plan.candidates().len(), 1);
-    assert_eq!(plan.retained_pinned(), 0);
     let report = restarted
         .execute_gc(&config, plan)
         .expect("resume interrupted retirement GC");
     assert_eq!(report.reclaimed, 1);
-    assert!(!checkpoint.exists());
-    assert!(!sidecar_path(&checkpoint).exists());
-    assert!(!checkpoint_fact_path(&checkpoint).exists());
     assert!(!sidecar_path(&trash).exists());
     assert!(!ca_key_path(&trash).exists());
-}
-
-#[test]
-fn malformed_foreign_orphan_checkpoint_is_rejected_without_cleanup_authority() {
-    let fixture = Fixture::new("malformed-orphan-checkpoint");
-    let config = fixture.config();
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let host = native_host(&fixture, RecordingRunner::default());
-    let name = WorkspaceName::session("orphan").expect("orphan workspace");
-    let label = CheckpointLabel::new("foreign").expect("checkpoint label");
-    let checkpoint = layout
-        .checkpoint_image(&name, &label)
-        .expect("checkpoint")
-        .image()
-        .to_owned();
-    create_image(&checkpoint);
-    write_session_metadata(&checkpoint, "orphan", "00000000000000000000000000000001");
-    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(1), Pin::Pinned)
-        .expect("checkpoint fact");
-    let fact_path = checkpoint_fact_path(&checkpoint);
-    let mut fact: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&fact_path).expect("read fact")).expect("JSON fact");
-    fact["repoId"] = serde_json::Value::String("foreign/project".to_owned());
-    std::fs::write(
-        &fact_path,
-        serde_json::to_vec_pretty(&fact).expect("serialize fact"),
-    )
-    .expect("write foreign fact");
-
-    assert!(host.checkpoints(&repo()).is_err());
-    assert!(
-        host.preview_gc(&config, &repo(), StorageGcOptions::default())
-            .is_err()
-    );
-    assert!(checkpoint.exists(), "malformed orphan was deleted");
-    assert!(sidecar_path(&checkpoint).exists());
-    assert!(checkpoint_fact_path(&checkpoint).exists());
 }
 
 #[test]
@@ -2926,26 +2323,6 @@ fn missing_and_invalid_gc_namespaces_have_distinct_behavior() {
     std::fs::remove_dir(project.join("sessions")).expect("remove sessions");
     std::fs::write(project.join("sessions"), b"not a directory").expect("sessions file");
     assert!(execute_gc(&host, &fixture.config()).is_err());
-}
-
-#[test]
-fn stats_distinguish_a_missing_checkpoint_directory_from_an_invalid_one() {
-    let fixture = Fixture::new("stats-missing");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    create_image(canonical.image());
-    let host = native_host(&fixture, RecordingRunner::default());
-    assert_eq!(
-        host.stats(&workspace(), canonical.image())
-            .expect("missing checkpoint directory")
-            .checkpoint_count,
-        0
-    );
-
-    let checkpoint_path = layout.project().checkpoints.join("main");
-    std::fs::create_dir_all(checkpoint_path.parent().expect("parent")).expect("parent");
-    std::fs::write(&checkpoint_path, b"not a directory").expect("checkpoint file");
-    assert!(host.stats(&workspace(), canonical.image()).is_err());
 }
 
 #[test]
@@ -4416,44 +3793,6 @@ fn direct_mount_handoff_refuses_a_checkout_it_did_not_take_over() {
     );
 }
 
-fn interrupted_restore_image_publication(
-    fixture: &Fixture,
-    failpoint: RestoreFailpoint,
-) -> (
-    MacOsApfsExecutionHost<RecordingRunner>,
-    PathBuf,
-    PathBuf,
-    PathBuf,
-    DetachedWorkspaceMetadata,
-) {
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    adopt_owner(&layout);
-    let canonical = layout.main_image().expect("canonical").image().to_owned();
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000002.dmg");
-    let undo = layout
-        .project()
-        .checkpoints
-        .join("main/pre-restore-00000000000000000000000000000002.dmg");
-    create_image(&canonical);
-    std::fs::write(&canonical, b"old generation").expect("old image");
-    create_image(&staged);
-    std::fs::write(&staged, b"new generation").expect("new image");
-    let mut replacement = metadata();
-    replacement.workspace_incarnation =
-        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("next incarnation");
-    replacement
-        .write_for_image(&staged)
-        .expect("replacement metadata");
-    let host = native_host(fixture, RecordingRunner::default());
-    host.set_restore_failpoint(failpoint);
-    host.restore_swap(&staged, &canonical, &undo)
-        .expect_err("injected image publication crash");
-    (host, canonical, staged, undo, replacement)
-}
-
 #[test]
 fn recovery_quarantines_a_canonical_image_missing_its_ca_companion() {
     let missing = Fixture::new("recovery-missing-ca");
@@ -4767,47 +4106,6 @@ fn a_keyless_staged_session_image_is_left_to_gc_instead_of_failing_every_verb() 
         .expect("repeated recovery is idempotent");
 }
 
-/// The boundary of the reconciliation above: an in-flight restore is the one reading of a missing
-/// canonical image that is not "the payload is gone", so it keeps its evidence and still refuses.
-#[test]
-fn an_imageless_publication_with_a_restore_in_flight_keeps_its_evidence_and_still_refuses() {
-    let fixture = Fixture::new("orphan-publication-restore-in-flight");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    adopt_owner(&layout);
-    let canonical = layout.main_image().expect("canonical");
-    let undo = layout
-        .project()
-        .checkpoints
-        .join("main/pre-restore-00000000000000000000000000000002.dmg");
-    create_image(canonical.image());
-    create_image(&undo);
-    std::fs::write(&undo, b"old generation").expect("undo payload");
-    std::fs::remove_file(canonical.image()).expect("lose the canonical image");
-    std::fs::write(restore_recovery_fact_path(canonical.image()), b"{}")
-        .expect("restore recovery fact");
-
-    let error = native_host(&fixture, RecordingRunner::default())
-        .recover_pending(&fixture.config(), &[])
-        .expect_err("an in-flight restore is ambiguous and must still fail closed");
-    match error {
-        ApfsStorageError::MarkerMismatch(message) => {
-            assert!(message.contains("restore recovery has no canonical image"));
-            assert!(message.contains(&canonical.image().display().to_string()));
-        }
-        other => panic!("expected typed restore integrity error, got {other:?}"),
-    }
-    assert!(
-        sidecar_path(canonical.image()).exists(),
-        "reconciliation must not consume the evidence the restore pass reads"
-    );
-    assert!(ca_key_path(canonical.image()).exists());
-    assert_eq!(
-        std::fs::read(&undo).expect("undo"),
-        b"old generation",
-        "the retained undo generation is the payload and must survive"
-    );
-}
-
 /// Staging is judged by ownership, not by shape: an image with its grants sidecar and one
 /// without are both garbage once nothing runs and nothing publishes them, while a staged image a
 /// crashed sidecar-first publication still names is recovery's evidence and stays.
@@ -4985,38 +4283,7 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
     let invalid_name = real_staging.join("manual-backup.dmg");
     std::fs::write(&invalid_name, b"not a transaction").expect("manual staging file");
 
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let escaped_label = CheckpointLabel::new("escaped").expect("escaped label");
-    let escaped_checkpoint = layout
-        .checkpoint_image(&WorkspaceName::new("main").expect("main"), &escaped_label)
-        .expect("escaped checkpoint")
-        .image()
-        .to_owned();
-    std::fs::create_dir_all(escaped_checkpoint.parent().expect("checkpoint directory"))
-        .expect("checkpoint directory");
-    std::os::unix::fs::symlink(&image_target, &escaped_checkpoint).expect("checkpoint symlink");
-    metadata()
-        .write_for_image(&escaped_checkpoint)
-        .expect("escaped checkpoint metadata");
     let host = native_host(&fixture, RecordingRunner::default());
-    let error = host
-        .publish_checkpoint_fact(
-            &escaped_checkpoint,
-            &escaped_label,
-            Revision::new(99),
-            Pin::Automatic,
-        )
-        .expect_err("symlinked checkpoint publication must fail closed");
-    assert!(matches!(
-        error,
-        ApfsStorageError::Layout(StorageLayoutError::SymlinkComponent(path))
-            if path == escaped_checkpoint
-    ));
-    assert!(
-        host.checkpoints(&repo())
-            .expect("checkpoint enumeration")
-            .is_empty()
-    );
 
     let report = execute_gc(&host, &fixture.config()).expect("contained gc");
 
@@ -5030,12 +4297,6 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
         assert_eq!(std::fs::read(path).expect("external target"), contents);
     }
     assert!(
-        std::fs::symlink_metadata(&escaped_checkpoint)
-            .expect("checkpoint link")
-            .file_type()
-            .is_symlink()
-    );
-    assert!(
         std::fs::symlink_metadata(&image_link)
             .expect("image link")
             .file_type()
@@ -5045,155 +4306,6 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
         std::fs::read(&invalid_name).expect("invalid staging name"),
         b"not a transaction"
     );
-}
-
-#[test]
-fn checkpoint_pin_facts_survive_restart_and_gc_prunes_only_old_automatic_excess() {
-    let fixture = Fixture::new("checkpoint-retention");
-    let config = fixture.config();
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let main = WorkspaceName::new("main").expect("main");
-    let host = native_host(&fixture, RecordingRunner::default());
-    let create_checkpoint = |name: &str, revision: u64, pin: Pin| {
-        let label = CheckpointLabel::new(name).expect("label");
-        let image = layout
-            .checkpoint_image(&main, &label)
-            .expect("checkpoint")
-            .image()
-            .to_owned();
-        create_image(&image);
-        host.publish_checkpoint_fact(&image, &label, Revision::new(revision), pin)
-            .expect("checkpoint fact");
-        image
-    };
-
-    let mut newest_five = Vec::new();
-    for index in 0..5 {
-        let image = create_checkpoint(&format!("future-{index}"), index + 1, Pin::Automatic);
-        make_future(&image);
-        newest_five.push(image);
-    }
-    let young = create_checkpoint("young", 6, Pin::Automatic);
-    let expired = create_checkpoint("expired", 7, Pin::Automatic);
-    make_old(&expired);
-    let pinned = create_checkpoint("pinned-old", 8, Pin::Pinned);
-    make_old(&pinned);
-    drop(host);
-
-    let restarted = native_host(&fixture, RecordingRunner::default());
-    let facts = restarted.checkpoints(&repo()).expect("restart facts");
-    assert_eq!(facts.len(), 8);
-    assert!(facts.iter().any(|fact| {
-        fact.label.as_str() == "young"
-            && fact.revision == Revision::new(6)
-            && fact.pin == Pin::Automatic
-    }));
-    assert!(facts.iter().any(|fact| {
-        fact.label.as_str() == "pinned-old"
-            && fact.revision == Revision::new(8)
-            && fact.pin == Pin::Pinned
-    }));
-
-    let report = execute_gc(&restarted, &config).expect("gc");
-    assert_eq!(report.examined, 8);
-    assert_eq!(report.reclaimed, 1);
-    assert_eq!(report.retained_pinned, 1);
-    assert_eq!(report.retained_recent, 6);
-    assert!(newest_five.iter().all(|image| image.exists()));
-    assert!(
-        young.exists(),
-        "young checkpoint must survive beyond newest five"
-    );
-    assert!(pinned.exists(), "old pinned checkpoint must survive");
-    assert!(
-        !expired.exists(),
-        "old automatic checkpoint beyond five is pruned"
-    );
-    assert!(!sidecar_path(&expired).exists(), "grants sidecar is pruned");
-    assert!(
-        !checkpoint_fact_path(&expired).exists(),
-        "checkpoint fact sidecar is pruned"
-    );
-
-    let surviving = restarted.checkpoints(&repo()).expect("surviving facts");
-    assert_eq!(surviving.len(), 7);
-    assert_eq!(
-        surviving
-            .iter()
-            .filter(|fact| fact.pin == Pin::Pinned)
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn recovery_ignores_unscoped_and_non_internal_restore_lookalikes() {
-    let fixture = Fixture::new("restore-lookalikes");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    adopt_owner(&layout);
-    let canonical = layout.main_image().expect("canonical");
-    create_image(canonical.image());
-    std::fs::write(canonical.image(), b"live generation").expect("canonical");
-
-    for root in [
-        fixture.root.join("caches"),
-        fixture.root.join("mnt"),
-        fixture.root.join("telemetry"),
-    ] {
-        std::fs::create_dir_all(&root).expect("lookalike root");
-        std::fs::write(
-            root.join("pre-restore-00000000000000000000000000000002.dmg.grants.json"),
-            b"not metadata",
-        )
-        .expect("lookalike");
-    }
-    let invalid_checkpoints = [
-        "pre-restore-user.dmg",
-        "pre-restore-0000000000000000000000000000000.dmg",
-        "pre-restore-gggggggggggggggggggggggggggggggg.dmg",
-    ]
-    .map(|name| layout.project().checkpoints.join("main").join(name));
-    for checkpoint in &invalid_checkpoints {
-        create_image(checkpoint);
-        std::fs::write(checkpoint, b"user checkpoint").expect("checkpoint");
-    }
-
-    let session = WorkspaceName::new("session-a").expect("session");
-    let session_canonical = layout.session_image(&session).expect("session canonical");
-    create_image(session_canonical.image());
-    std::fs::write(session_canonical.image(), b"live session").expect("session");
-    let mut session_metadata = metadata();
-    set_metadata_workspace(&mut session_metadata, session.clone());
-    session_metadata
-        .write_for_image(session_canonical.image())
-        .expect("session metadata");
-    let mismatched_undo = layout
-        .project()
-        .checkpoints
-        .join("main/pre-restore-00000000000000000000000000000002.dmg");
-    create_image(&mismatched_undo);
-    std::fs::write(&mismatched_undo, b"unrelated undo").expect("undo");
-    session_metadata
-        .write_for_image(&mismatched_undo)
-        .expect("mismatched undo metadata");
-
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config(), &[])
-        .expect("ignore lookalikes");
-    assert_eq!(
-        std::fs::read(canonical.image()).expect("canonical"),
-        b"live generation"
-    );
-    assert!(
-        invalid_checkpoints
-            .iter()
-            .all(|checkpoint| checkpoint.exists())
-    );
-    assert_eq!(
-        std::fs::read(session_canonical.image()).expect("session"),
-        b"live session"
-    );
-    assert!(mismatched_undo.exists());
 }
 
 #[test]
@@ -5240,771 +4352,6 @@ fn recovery_never_publishes_metadata_without_its_staged_image() {
         .expect("recovery");
     assert!(sidecar_path(&staged).exists());
     assert!(!sidecar_path(canonical.image()).exists());
-}
-
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_recovery_rolls_forward_published_metadata_before_undo_rename() {
-    let fixture = Fixture::new("published-before-undo");
-    let (host, canonical, staged, undo, replacement) =
-        interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterImageSwap);
-    replacement
-        .write_for_image(&canonical)
-        .expect("simulate committed metadata");
-
-    drop(host);
-    let runner = RecordingRunner::default();
-    let host = native_host(&fixture, runner.clone());
-    host.recover_pending(&fixture.config(), &[])
-        .expect("roll forward");
-
-    assert_eq!(
-        std::fs::read(&canonical).expect("canonical"),
-        b"new generation"
-    );
-    assert_eq!(std::fs::read(&undo).expect("undo"), b"old generation");
-    assert!(!staged.exists());
-    assert!(
-        runner.requests().is_empty(),
-        "roll-forward rename must preserve the retained undo without deleting an absent staging image"
-    );
-    assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(&canonical)
-            .expect("canonical metadata")
-            .workspace_incarnation,
-        replacement.workspace_incarnation
-    );
-}
-
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_restore_recovery_rejects_published_new_image_with_old_ca_key() {
-    let fixture = Fixture::new("published-new-image-old-ca");
-    let (host, canonical, staged, undo, replacement) =
-        interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterRestoreImageSwap);
-    replacement
-        .write_for_image(&canonical)
-        .expect("simulate published replacement metadata");
-    drop(host);
-
-    let error = native_host(&fixture, RecordingRunner::default())
-        .recover_pending(&fixture.config(), &[])
-        .expect_err("old CA key must not authenticate replacement image");
-    match error {
-        ApfsStorageError::MarkerMismatch(message) => {
-            assert!(message.contains(&canonical.display().to_string()));
-            assert!(message.contains(&ca_key_path(&canonical).display().to_string()));
-            assert!(message.contains(&ca_key_path(&undo).display().to_string()));
-        }
-        other => panic!("expected typed restore integrity error, got {other:?}"),
-    }
-    assert!(canonical.exists());
-    assert!(staged.exists());
-}
-
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_recovery_rolls_back_when_published_metadata_is_missing() {
-    let fixture = Fixture::new("published-metadata-missing");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    adopt_owner(&layout);
-    let canonical = layout.main_image().expect("canonical");
-    let staged = layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000002.dmg");
-    let undo = layout
-        .project()
-        .checkpoints
-        .join("main/pre-restore-00000000000000000000000000000002.dmg");
-    let source_checkpoint = layout
-        .project()
-        .checkpoints
-        .join("main/recovery-source.dmg");
-    create_image(&source_checkpoint);
-    write_ca_key(&source_checkpoint, b"source-ca-key");
-    create_image(canonical.image());
-    std::fs::write(canonical.image(), b"old generation").expect("old image");
-    create_image(&staged);
-    std::fs::write(&staged, b"new generation").expect("new image");
-    let next_incarnation =
-        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("next incarnation");
-    let mut next_metadata = metadata();
-    next_metadata.workspace_incarnation = next_incarnation.clone();
-    next_metadata
-        .write_for_image(&staged)
-        .expect("next metadata");
-    let replacement = LifecycleWorkspace::new(
-        repo(),
-        WorkspaceName::new("main").expect("main"),
-        next_incarnation,
-        Revision::new(2),
-        Revision::new(1),
-        WorkspaceRole::Main,
-    )
-    .expect("replacement");
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.restore_swap(&staged, canonical.image(), &undo)
-        .expect("image publication");
-    host.set_restore_failpoint(RestoreFailpoint::AfterMetadataPublish);
-    host.publish_restored_metadata(
-        &staged,
-        canonical.image(),
-        &replacement,
-        replacement.revision(),
-        &source_checkpoint,
-        &metadata().workspace_incarnation,
-    )
-    .expect_err("metadata failpoint");
-    std::fs::remove_file(sidecar_path(canonical.image())).expect("remove published metadata");
-
-    drop(host);
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config(), &[])
-        .expect("missing publication evidence rolls back");
-    assert_eq!(
-        std::fs::read(canonical.image()).expect("canonical"),
-        b"old generation"
-    );
-    assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(canonical.image())
-            .expect("restored metadata")
-            .workspace_incarnation,
-        metadata().workspace_incarnation
-    );
-}
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_recovery_accepts_an_already_rolled_back_canonical_layout() {
-    let fixture = Fixture::new("already-rolled-back");
-    let (host, canonical, staged, _, _) =
-        interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterImageSwap);
-    let temporary = canonical.with_extension("swap");
-    std::fs::rename(&canonical, &temporary).expect("stage new canonical");
-    std::fs::rename(&staged, &canonical).expect("restore old canonical");
-    std::fs::rename(&temporary, &staged).expect("restage replacement");
-
-    drop(host);
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config(), &[])
-        .expect("recognize old canonical");
-
-    assert_eq!(
-        std::fs::read(&canonical).expect("canonical"),
-        b"old generation"
-    );
-    assert!(!staged.exists());
-}
-
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_recovery_restores_missing_prepublication_canonical_metadata() {
-    let fixture = Fixture::new("missing-canonical-metadata");
-    let (host, canonical, staged, undo, _) =
-        interrupted_restore_image_publication(&fixture, RestoreFailpoint::AfterUndoRename);
-    std::fs::remove_file(sidecar_path(&canonical)).expect("remove interrupted sidecar");
-
-    drop(host);
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config(), &[])
-        .expect("restore metadata from undo");
-
-    assert_eq!(
-        std::fs::read(&canonical).expect("canonical"),
-        b"old generation"
-    );
-    assert!(!staged.exists());
-    assert!(!undo.exists());
-    assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(&canonical)
-            .expect("canonical metadata")
-            .workspace_incarnation,
-        metadata().workspace_incarnation
-    );
-}
-
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_restored_publication_preserves_authoritative_workspace_topology() {
-    let fixture = Fixture::new("authoritative-restored-publication");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    let canonical = layout.main_image().expect("canonical");
-    let destination =
-        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("destination");
-    let staged = layout
-        .project()
-        .project_root
-        .join(format!(".staging/main-{destination}.dmg"));
-    let undo = layout
-        .project()
-        .checkpoints
-        .join(format!("main/pre-restore-{destination}.dmg"));
-    let source = layout.project().checkpoints.join("main/baseline.dmg");
-    create_image(canonical.image());
-    create_image(&source);
-    create_image(&staged);
-    let mut staged_metadata = metadata();
-    staged_metadata.workspace_incarnation = destination.clone();
-    staged_metadata
-        .write_for_image(&staged)
-        .expect("destination metadata");
-    let authoritative = LifecycleWorkspace::new(
-        repo(),
-        WorkspaceName::new("main").expect("main"),
-        destination.clone(),
-        Revision::new(2),
-        Revision::new(47),
-        WorkspaceRole::Main,
-    )
-    .expect("authoritative replacement");
-    let replaced = metadata().workspace_incarnation;
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.restore_swap(&staged, canonical.image(), &undo)
-        .expect("restore swap");
-
-    let fact = host
-        .publish_restored_metadata(
-            &staged,
-            canonical.image(),
-            &authoritative,
-            authoritative.revision(),
-            &source,
-            &replaced,
-        )
-        .expect("publish restored metadata");
-
-    assert_eq!(fact.workspace, authoritative);
-    assert_eq!(fact.source_checkpoint, "baseline");
-    assert_eq!(fact.source_incarnation, replaced);
-    assert_eq!(fact.replaced_incarnation, replaced);
-    assert_eq!(fact.destination_incarnation, destination);
-}
-
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_stateless_restore_recovery_converges_each_publication_boundary() {
-    for failpoint in [
-        RestoreFailpoint::AfterUndoSidecar,
-        RestoreFailpoint::AfterRestoreImageSwap,
-        RestoreFailpoint::AfterImageSwap,
-        RestoreFailpoint::AfterRestoreUndoImageRename,
-        RestoreFailpoint::AfterUndoRename,
-        RestoreFailpoint::AfterRestoreCanonicalParentFsync,
-        RestoreFailpoint::AfterRestoreUndoParentFsync,
-        RestoreFailpoint::AfterMetadataPublish,
-        RestoreFailpoint::AfterMetadataFsync,
-        RestoreFailpoint::AfterStagedMetadataRemoval,
-        RestoreFailpoint::AfterRestoreMetadataParentFsync,
-    ] {
-        let fixture = Fixture::new(&format!("stateless-restore-{failpoint:?}"));
-        let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-        adopt_owner(&layout);
-        let canonical = layout.main_image().expect("canonical");
-        let staged = layout
-            .project()
-            .project_root
-            .join(".staging/main-00000000000000000000000000000002.dmg");
-        let undo = layout
-            .project()
-            .checkpoints
-            .join("main/pre-restore-00000000000000000000000000000002.dmg");
-        let source_checkpoint = layout
-            .project()
-            .checkpoints
-            .join("main/recovery-source.dmg");
-        create_image(&source_checkpoint);
-        write_ca_key(&source_checkpoint, b"source-ca-key");
-        create_image(canonical.image());
-        std::fs::write(canonical.image(), b"old generation").expect("old image");
-        write_ca_key(canonical.image(), b"old-ca-key");
-        create_image(&staged);
-        std::fs::write(&staged, b"new generation").expect("new image");
-        write_ca_key(&staged, b"new-ca-key");
-        let next_incarnation = WorkspaceIncarnation::new("00000000000000000000000000000002")
-            .expect("next incarnation");
-        let mut next_metadata = metadata();
-        next_metadata.workspace_incarnation = next_incarnation.clone();
-        next_metadata
-            .write_for_image(&staged)
-            .expect("next metadata");
-        let replacement = LifecycleWorkspace::new(
-            repo(),
-            WorkspaceName::new("main").expect("main"),
-            next_incarnation.clone(),
-            Revision::new(2),
-            Revision::new(1),
-            WorkspaceRole::Main,
-        )
-        .expect("replacement");
-        let old_credential_mount = fixture.root.join("old-credential-mount");
-        let new_credential_mount = fixture.root.join("new-credential-mount");
-        std::fs::create_dir_all(&old_credential_mount).expect("old credential mount");
-        std::fs::create_dir_all(&new_credential_mount).expect("new credential mount");
-        mint_credentials(
-            &workspace(),
-            &old_credential_mount,
-            &ca_key_path(canonical.image()),
-        )
-        .expect("old credentials");
-        mint_credentials(&replacement, &new_credential_mount, &ca_key_path(&staged))
-            .expect("replacement credentials");
-        let old_ca_key = std::fs::read(ca_key_path(canonical.image())).expect("old CA key");
-        let new_ca_key = std::fs::read(ca_key_path(&staged)).expect("new CA key");
-        let host = native_host(&fixture, RecordingRunner::default());
-        host.set_restore_failpoint(failpoint);
-        let image_phase = matches!(
-            failpoint,
-            RestoreFailpoint::AfterUndoSidecar
-                | RestoreFailpoint::AfterRestoreImageSwap
-                | RestoreFailpoint::AfterImageSwap
-                | RestoreFailpoint::AfterRestoreUndoImageRename
-                | RestoreFailpoint::AfterUndoRename
-                | RestoreFailpoint::AfterRestoreCanonicalParentFsync
-                | RestoreFailpoint::AfterRestoreUndoParentFsync
-        );
-        if image_phase {
-            host.restore_swap(&staged, canonical.image(), &undo)
-                .expect_err("injected image publication crash");
-        } else {
-            host.restore_swap(&staged, canonical.image(), &undo)
-                .expect("image publication");
-            host.publish_restored_metadata(
-                &staged,
-                canonical.image(),
-                &replacement,
-                replacement.revision(),
-                &source_checkpoint,
-                &metadata().workspace_incarnation,
-            )
-            .expect_err("injected metadata publication crash");
-        }
-
-        drop(host);
-        let host = native_host(&fixture, RecordingRunner::default());
-        host.recover_pending(&fixture.config(), &[])
-            .expect("restart recovery");
-        host.recover_pending(&fixture.config(), &[])
-            .expect("repeated restart recovery is idempotent");
-        let pending = host.pending_publications(&repo()).expect("pending facts");
-        let metadata_was_published = !pending.is_empty();
-        if metadata_was_published {
-            assert_eq!(pending.len(), 1, "{failpoint:?}");
-            assert_eq!(
-                pending[0].source_incarnation,
-                metadata().workspace_incarnation
-            );
-            assert_eq!(pending[0].source_checkpoint, "recovery-source");
-            assert_eq!(pending[0].destination_incarnation, next_incarnation);
-            host.activate_restored_metadata(&pending[0].image)
-                .expect("idempotent forward activation");
-            assert!(
-                host.pending_publications(&repo())
-                    .expect("activated pending facts")
-                    .is_empty()
-            );
-        } else {
-            assert!(pending.is_empty(), "{failpoint:?}");
-        }
-        assert!(
-            !restore_recovery_fact_path(canonical.image()).exists(),
-            "{failpoint:?}"
-        );
-        assert_eq!(
-            std::fs::read(canonical.image()).expect("canonical bytes"),
-            if metadata_was_published {
-                b"new generation".as_slice()
-            } else {
-                b"old generation".as_slice()
-            },
-            "{failpoint:?}"
-        );
-        assert_eq!(
-            std::fs::read(ca_key_path(canonical.image())).expect("canonical CA key"),
-            if metadata_was_published {
-                new_ca_key.as_slice()
-            } else {
-                old_ca_key.as_slice()
-            },
-            "{failpoint:?}"
-        );
-        if metadata_was_published {
-            assert_eq!(std::fs::read(&undo).expect("undo image"), b"old generation");
-            assert_eq!(
-                std::fs::read(ca_key_path(&undo)).expect("undo CA key"),
-                old_ca_key
-            );
-        } else {
-            assert!(!undo.exists(), "{failpoint:?}");
-            assert!(!ca_key_path(&undo).exists(), "{failpoint:?}");
-        }
-        assert!(!staged.exists(), "{failpoint:?}");
-        assert!(!sidecar_path(&staged).exists(), "{failpoint:?}");
-        assert!(!ca_key_path(&staged).exists(), "{failpoint:?}");
-        let canonical_metadata =
-            DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("metadata");
-        assert_eq!(
-            canonical_metadata.workspace_incarnation,
-            if metadata_was_published {
-                next_incarnation
-            } else {
-                metadata().workspace_incarnation
-            },
-            "{failpoint:?}"
-        );
-    }
-}
-
-#[test]
-#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-fn host_controller_restore_recovery_selects_current_undo_generation_among_older_history() {
-    let fixture = Fixture::new("restore-current-undo-generation");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    adopt_owner(&layout);
-    let canonical = layout.main_image().expect("canonical");
-    let first_destination =
-        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("first destination");
-    let second_destination =
-        WorkspaceIncarnation::new("00000000000000000000000000000003").expect("second destination");
-    let original_incarnation = metadata().workspace_incarnation;
-    let checkpoint_directory = layout.project().checkpoints.join("main");
-    let source_checkpoint = checkpoint_directory.join("second-restore.dmg");
-    create_image(&source_checkpoint);
-    write_ca_key(&source_checkpoint, b"checkpoint-source-ca-key");
-    let older_undo = checkpoint_directory.join(format!("pre-restore-{first_destination}.dmg"));
-    let current_undo = checkpoint_directory.join(format!("pre-restore-{second_destination}.dmg"));
-
-    create_image(&current_undo);
-    std::fs::write(&current_undo, b"first restored generation").expect("current undo image");
-    let mut current_undo_metadata = metadata();
-    current_undo_metadata.workspace_incarnation = first_destination.clone();
-    current_undo_metadata
-        .write_for_image(&current_undo)
-        .expect("current undo metadata");
-
-    create_image(&older_undo);
-    std::fs::write(&older_undo, b"original generation").expect("older undo image");
-    assert!(
-        older_undo.file_name() < current_undo.file_name(),
-        "sorted recovery enumeration must encounter the older restore first"
-    );
-
-    create_image(canonical.image());
-    std::fs::write(canonical.image(), b"second restored generation").expect("canonical image");
-    let mut pending_metadata = metadata();
-    pending_metadata.workspace_incarnation = second_destination.clone();
-    pending_metadata.publication_state = PublicationState::PendingFence;
-    pending_metadata
-        .write_for_image(canonical.image())
-        .expect("pending canonical metadata");
-    let recovery_fact = serde_json::json!({
-        "version": 2,
-        "repoId": repo(),
-        "workspace": "main",
-        "sourceCheckpoint": "second-restore",
-        "sourceIncarnation": original_incarnation.clone(),
-        "replacedIncarnation": first_destination.clone(),
-        "destinationIncarnation": second_destination.clone(),
-    });
-    std::fs::write(
-        restore_recovery_fact_path(canonical.image()),
-        serde_json::to_vec(&recovery_fact).expect("restore recovery fact JSON"),
-    )
-    .expect("restore recovery fact");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(restore_recovery_fact_path(canonical.image()))
-                .expect("read restore recovery fact"),
-        )
-        .expect("decode restore recovery fact"),
-        recovery_fact,
-        "restore recovery fact has an exact v2 schema"
-    );
-
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config(), &[])
-        .expect("first startup recovery");
-    host.recover_pending(&fixture.config(), &[])
-        .expect("repeated startup recovery");
-
-    assert_eq!(
-        std::fs::read(canonical.image()).expect("canonical bytes"),
-        b"second restored generation"
-    );
-    assert_eq!(
-        std::fs::read(&current_undo).expect("current undo bytes"),
-        b"first restored generation"
-    );
-    assert_eq!(
-        std::fs::read(&older_undo).expect("older undo bytes"),
-        b"original generation"
-    );
-    assert!(sidecar_path(&older_undo).exists());
-    assert!(ca_key_path(&older_undo).exists());
-    let pending = host.pending_publications(&repo()).expect("pending restore");
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].source_incarnation, original_incarnation);
-    assert_eq!(
-        pending[0].replaced_incarnation,
-        current_undo_metadata.workspace_incarnation
-    );
-    assert_eq!(pending[0].destination_incarnation, second_destination);
-    assert_eq!(pending[0].source_checkpoint, "second-restore");
-    let invalid_facts = [
-        (
-            "source checkpoint",
-            serde_json::json!({
-                "version": 2,
-                "repoId": repo(),
-                "workspace": "main",
-                "sourceCheckpoint": "missing-source",
-                "sourceIncarnation": original_incarnation.clone(),
-                "replacedIncarnation": first_destination.clone(),
-                "destinationIncarnation": second_destination.clone(),
-            }),
-        ),
-        (
-            "source incarnation",
-            serde_json::json!({
-                "version": 2,
-                "repoId": repo(),
-                "workspace": "main",
-                "sourceCheckpoint": "second-restore",
-                "sourceIncarnation": first_destination.clone(),
-                "replacedIncarnation": first_destination.clone(),
-                "destinationIncarnation": second_destination.clone(),
-            }),
-        ),
-        (
-            "replaced incarnation",
-            serde_json::json!({
-                "version": 2,
-                "repoId": repo(),
-                "workspace": "main",
-                "sourceCheckpoint": "second-restore",
-                "sourceIncarnation": original_incarnation.clone(),
-                "replacedIncarnation": original_incarnation.clone(),
-                "destinationIncarnation": second_destination.clone(),
-            }),
-        ),
-        (
-            "destination incarnation",
-            serde_json::json!({
-                "version": 2,
-                "repoId": repo(),
-                "workspace": "main",
-                "sourceCheckpoint": "second-restore",
-                "sourceIncarnation": original_incarnation.clone(),
-                "replacedIncarnation": first_destination.clone(),
-                "destinationIncarnation": first_destination.clone(),
-            }),
-        ),
-        (
-            "unknown field",
-            serde_json::json!({
-                "version": 2,
-                "repoId": repo(),
-                "workspace": "main",
-                "sourceCheckpoint": "second-restore",
-                "sourceIncarnation": original_incarnation.clone(),
-                "replacedIncarnation": first_destination.clone(),
-                "destinationIncarnation": second_destination.clone(),
-                "runtimeJournal": true,
-            }),
-        ),
-    ];
-    for (field, invalid_fact) in invalid_facts {
-        std::fs::write(
-            restore_recovery_fact_path(canonical.image()),
-            serde_json::to_vec(&invalid_fact).expect("invalid fact JSON"),
-        )
-        .expect("invalid restore fact");
-        assert!(
-            host.pending_publications(&repo()).is_err(),
-            "forged or unknown {field} must be rejected"
-        );
-    }
-    std::fs::write(
-        restore_recovery_fact_path(canonical.image()),
-        serde_json::to_vec(&recovery_fact).expect("valid fact JSON"),
-    )
-    .expect("restore valid recovery fact");
-
-    host.activate_restored_metadata(canonical.image())
-        .expect("activate recovered restore");
-    std::fs::write(
-        restore_recovery_fact_path(canonical.image()),
-        serde_json::to_vec(&recovery_fact).expect("lingering fact JSON"),
-    )
-    .expect("simulate crash before activation fact cleanup");
-    host.activate_restored_metadata(canonical.image())
-        .expect("clean lingering activation fact");
-    host.activate_restored_metadata(canonical.image())
-        .expect("repeated activation is idempotent");
-    host.recover_pending(&fixture.config(), &[])
-        .expect("post-activation recovery");
-    host.recover_pending(&fixture.config(), &[])
-        .expect("repeated post-activation recovery");
-    assert!(
-        host.pending_publications(&repo())
-            .expect("active facts")
-            .is_empty()
-    );
-    assert!(!restore_recovery_fact_path(canonical.image()).exists());
-    assert!(
-        older_undo.exists(),
-        "older undo remains a retention candidate"
-    );
-    assert!(
-        current_undo.exists(),
-        "current undo remains a retention candidate"
-    );
-    assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(canonical.image())
-            .expect("activated metadata")
-            .workspace_incarnation,
-        WorkspaceIncarnation::new("00000000000000000000000000000003").expect("second destination")
-    );
-    pending_metadata
-        .write_for_image(canonical.image())
-        .expect("restore pending metadata for forged fact");
-    let forged_fact = serde_json::json!({
-        "version": 2,
-        "repoId": repo(),
-        "workspace": "main",
-        "sourceCheckpoint": "second-restore",
-        "sourceIncarnation": original_incarnation.clone(),
-        "replacedIncarnation": original_incarnation.clone(),
-        "destinationIncarnation": second_destination,
-    });
-    std::fs::write(
-        restore_recovery_fact_path(canonical.image()),
-        serde_json::to_vec(&forged_fact).expect("forged fact JSON"),
-    )
-    .expect("forged restore fact");
-    let error = host
-        .recover_pending(&fixture.config(), &[])
-        .expect_err("forged replaced incarnation must be rejected");
-    assert!(matches!(error, ApfsStorageError::MarkerMismatch(_)));
-    let legacy_v1_fact = serde_json::json!({
-        "version": 1,
-        "repoId": repo(),
-        "workspace": "main",
-        "sourceCheckpoint": "second-restore",
-        "sourceIncarnation": original_incarnation.clone(),
-        "destinationIncarnation": WorkspaceIncarnation::new(
-            "00000000000000000000000000000003"
-        )
-        .expect("second destination"),
-    });
-    std::fs::write(
-        restore_recovery_fact_path(canonical.image()),
-        serde_json::to_vec(&legacy_v1_fact).expect("legacy fact JSON"),
-    )
-    .expect("legacy restore fact");
-    assert!(
-        host.pending_publications(&repo()).is_err(),
-        "v1 facts without replacedIncarnation require clean restore recreation"
-    );
-    assert_ne!(
-        original_incarnation,
-        current_undo_metadata.workspace_incarnation
-    );
-}
-
-#[test]
-fn retired_workspace_restart_ignores_multiple_retained_restore_generations() {
-    let fixture = Fixture::new("retired-repeated-restore-history");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    adopt_owner(&layout);
-    let workspace_name = WorkspaceName::session("raven").expect("workspace");
-    let canonical = layout.session_image(&workspace_name).expect("canonical");
-    let original = WorkspaceIncarnation::new("00000000000000000000000000000001").expect("original");
-    let first_destination =
-        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("first destination");
-    let second_destination =
-        WorkspaceIncarnation::new("00000000000000000000000000000003").expect("second destination");
-    let checkpoint_directory = layout.project().checkpoints.join("raven");
-    let first_undo = checkpoint_directory.join(format!("pre-restore-{first_destination}.dmg"));
-    let second_undo = checkpoint_directory.join(format!("pre-restore-{second_destination}.dmg"));
-    let write_generation = |image: &Path, incarnation: &WorkspaceIncarnation| {
-        create_image(image);
-        let mut detached = metadata();
-        set_metadata_workspace(&mut detached, workspace_name.clone());
-        detached.workspace_incarnation = incarnation.clone();
-        detached
-            .write_for_image(image)
-            .expect("generation metadata");
-    };
-    write_generation(&first_undo, &original);
-    write_generation(&second_undo, &first_destination);
-    write_generation(canonical.image(), &second_destination);
-    let trash = layout
-        .project()
-        .sessions
-        .join(".trash")
-        .join(format!("raven-{second_destination}.dmg"));
-    std::fs::create_dir_all(trash.parent().expect("trash parent")).expect("trash directory");
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.retire_image(canonical.image(), &trash)
-        .expect("retire restored workspace");
-    drop(host);
-
-    let host = native_host(&fixture, RecordingRunner::default());
-    host.recover_pending(&fixture.config(), &[])
-        .expect("retained undo history is not pending recovery");
-    host.recover_pending(&fixture.config(), &[])
-        .expect("repeated restart remains converged");
-
-    assert!(!canonical.image().exists());
-    assert!(!restore_recovery_fact_path(canonical.image()).exists());
-    for retained in [&first_undo, &second_undo] {
-        assert!(retained.exists());
-        assert!(sidecar_path(retained).exists());
-        assert!(ca_key_path(retained).exists());
-    }
-    assert!(trash.exists());
-    assert!(sidecar_path(&trash).exists());
-    assert!(ca_key_path(&trash).exists());
-}
-
-#[test]
-fn restore_recovery_rejects_fact_without_canonical_image() {
-    let fixture = Fixture::new("restore-fact-without-canonical");
-    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
-    adopt_owner(&layout);
-    let canonical = layout.main_image().expect("canonical");
-    let destination =
-        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("destination");
-    let undo = layout
-        .project()
-        .checkpoints
-        .join(format!("main/pre-restore-{destination}.dmg"));
-    create_image(&undo);
-    let fact_path = restore_recovery_fact_path(canonical.image());
-    std::fs::write(
-        &fact_path,
-        serde_json::to_vec(&serde_json::json!({
-            "version": 2,
-            "repoId": repo(),
-            "workspace": "main",
-            "sourceCheckpoint": "baseline",
-            "sourceIncarnation": metadata().workspace_incarnation,
-            "replacedIncarnation": metadata().workspace_incarnation,
-            "destinationIncarnation": destination,
-        }))
-        .expect("fact JSON"),
-    )
-    .expect("orphan fact");
-
-    let error = native_host(&fixture, RecordingRunner::default())
-        .recover_pending(&fixture.config(), &[])
-        .expect_err("fact without canonical must fail closed");
-    let ApfsStorageError::MarkerMismatch(message) = error else {
-        panic!("expected restore integrity error, got {error:?}");
-    };
-    assert!(message.contains(&canonical.image().display().to_string()));
-    assert!(message.contains(&fact_path.display().to_string()));
-    assert!(undo.exists());
 }
 
 #[test]

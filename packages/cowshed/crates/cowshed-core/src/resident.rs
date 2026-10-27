@@ -757,7 +757,6 @@ mod tests {
                     revision: 1,
                     ..Default::default()
                 },
-                ..Default::default()
             },
         )
         .expect("policy");

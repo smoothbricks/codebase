@@ -139,8 +139,6 @@ pub enum LockOperation {
     ReAdopt,
     Create,
     Fork,
-    Checkpoint,
-    Restore,
     Retire,
     /// Retiring an unfinished clone without publishing it.
     RetireUnpublished,
@@ -161,7 +159,8 @@ pub enum LockOperation {
     Gc,
     /// A land's freeze of its target's seed and move of its build link.
     Land,
-    Reseed,
+    /// Seed compaction's move of a workspace onto its own seed.
+    MoveOntoSeed,
     /// `cowshed cache clear` of a workspace's Nx state.
     ClearNxState,
     /// Moving a workspace off a port block another holds.
@@ -184,8 +183,6 @@ impl LockOperation {
             Self::ReAdopt => "re-adopt",
             Self::Create => "create",
             Self::Fork => "fork",
-            Self::Checkpoint => "checkpoint",
-            Self::Restore => "restore",
             Self::Retire => "retire",
             Self::RetireUnpublished => "retire-unpublished",
             Self::RepairUnpublished => "repair-unpublished",
@@ -198,7 +195,7 @@ impl LockOperation {
             Self::Recover => "recover",
             Self::Gc => "gc",
             Self::Land => "land",
-            Self::Reseed => "reseed",
+            Self::MoveOntoSeed => "move-onto-seed",
             Self::ClearNxState => "clear-nx-state",
             Self::RepairPorts => "repair-ports",
             Self::Grant => "grant",

@@ -1,7 +1,7 @@
 //! Controller audit records — telemetry, never authority.
 //!
 //! Every lifecycle act the controller performs (introduce / retire a workspace, admit a job and
-//! seal its terminal state, checkpoint, fork, restore) is emitted as one typed
+//! seal its terminal state, fork) is emitted as one typed
 //! [`ControllerCommitment`] record to an [`AuditSink`]. Nothing reads the sink back for a
 //! decision: authority is the image inventory under `/private/cowshed/store` (the `.dmg` images,
 //! their mounts, and the marker each image carries — incarnation, lineage), the host-side grant
@@ -35,10 +35,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::api::dto::{
-    AdmissionCommitment, AdoptionSkip, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment,
-    ControllerCommitment, ForkCommitment, GitOid, JobId, JobState, LandAdoptionCommitment,
-    LandOutcomeCommitment, OutputLimitInfo, RestoreCommitment, Sha256Digest, TerminalCommitment,
-    WorkspaceIntroducedCommitment, WorkspaceRetiredCommitment,
+    AdmissionCommitment, AdoptionSkip, CONTROLLER_COMMITMENT_VERSION, ControllerCommitment,
+    ForkCommitment, GitOid, JobId, JobState, LandAdoptionCommitment, LandOutcomeCommitment,
+    OutputLimitInfo, Sha256Digest, TerminalCommitment, WorkspaceIntroducedCommitment,
+    WorkspaceRetiredCommitment,
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
@@ -61,9 +61,7 @@ fn commitment_durability(commitment: &ControllerCommitment) -> Durability {
         }
         ControllerCommitment::WorkspaceIntroduced(_)
         | ControllerCommitment::WorkspaceRetired(_)
-        | ControllerCommitment::Checkpoint(_)
         | ControllerCommitment::Fork(_)
-        | ControllerCommitment::Restore(_)
         | ControllerCommitment::LandAdoption(_)
         | ControllerCommitment::LandOutcome(_) => Durability::PowerLoss,
     }
@@ -162,23 +160,9 @@ pub enum CommitmentDraft {
         batch_sha256: Sha256Digest,
         output_limit: Option<OutputLimitInfo>,
     },
-    Checkpoint {
-        repo_id: RepoId,
-        origin_incarnation: WorkspaceIncarnation,
-        checkpoint_id: String,
-        barrier_id: u64,
-        manifest_batch_sha256: Sha256Digest,
-    },
     Fork {
         repo_id: RepoId,
         source_incarnation: WorkspaceIncarnation,
-        destination_incarnation: WorkspaceIncarnation,
-    },
-    Restore {
-        repo_id: RepoId,
-        source_checkpoint: String,
-        source_incarnation: WorkspaceIncarnation,
-        replaced_incarnation: WorkspaceIncarnation,
         destination_incarnation: WorkspaceIncarnation,
     },
     LandAdoption {
@@ -261,21 +245,6 @@ impl CommitmentDraft {
                 batch_sha256,
                 output_limit,
             }),
-            Self::Checkpoint {
-                repo_id,
-                origin_incarnation,
-                checkpoint_id,
-                barrier_id,
-                manifest_batch_sha256,
-            } => ControllerCommitment::Checkpoint(CheckpointCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                origin_incarnation,
-                checkpoint_id,
-                barrier_id,
-                manifest_batch_sha256,
-            }),
             Self::Fork {
                 repo_id,
                 source_incarnation,
@@ -285,21 +254,6 @@ impl CommitmentDraft {
                 order,
                 repo_id,
                 source_incarnation,
-                destination_incarnation,
-            }),
-            Self::Restore {
-                repo_id,
-                source_checkpoint,
-                source_incarnation,
-                replaced_incarnation,
-                destination_incarnation,
-            } => ControllerCommitment::Restore(RestoreCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                source_checkpoint,
-                source_incarnation,
-                replaced_incarnation,
                 destination_incarnation,
             }),
             Self::LandAdoption {

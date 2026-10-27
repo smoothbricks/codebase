@@ -329,11 +329,6 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
         branch: Some("raven".into()),
         base_commit: Some(oid('a')),
         created_at: Some(timestamp()),
-        checkpoints: vec![CheckpointInfo {
-            label: "before-write".into(),
-            revision: 7,
-            pinned: true,
-        }],
         snapshot_stale: false,
         // A landing measurement is opt-in, so the frozen shape is the one without it. The
         // populated shape is pinned separately below.
@@ -351,12 +346,7 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
             "branch": "raven",
             "baseCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "createdAt": "2026-07-11T12:34:56Z",
-            "snapshotStale": false,
-            "checkpoints": [{
-                "label": "before-write",
-                "revision": 7,
-                "pinned": true
-            }]
+            "snapshotStale": false
         })
     );
 
@@ -614,19 +604,18 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
         })
     );
 
-    let gc_identity = Sha256Digest::compute(b"expired-checkpoint");
+    let gc_identity = Sha256Digest::compute(b"orphan-session-image");
     let gc = GcReport {
         examined: 9,
         reclaimed: 3,
-        retained_pinned: 2,
         retained_active: 0,
         released_bytes: 4096,
         dry_run: true,
         candidates: vec![GcCandidate {
             identity: gc_identity,
-            path: PathBuf::from("/store/checkpoints/raven/old.dmg"),
+            path: PathBuf::from("/store/sessions/raven/old.dmg"),
             bytes: 4096,
-            reason: GcReason::ExpiredCheckpoint,
+            reason: GcReason::OrphanSessionImage,
         }],
         deferred: Vec::new(),
     };
@@ -635,15 +624,14 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
         json!({
             "examined":9,
             "reclaimed":3,
-            "retainedPinned":2,
             "retainedActive":0,
             "releasedBytes":4096,
             "dryRun":true,
             "candidates":[{
                 "identity":gc_identity.to_string(),
-                "path":"/store/checkpoints/raven/old.dmg",
+                "path":"/store/sessions/raven/old.dmg",
                 "bytes":4096,
-                "reason":"expiredCheckpoint"
+                "reason":"orphanSessionImage"
             }],
             "deferred": []
         })
@@ -1056,14 +1044,6 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             "unlandedCommits":3,
             "bundle":"/store/acme/widget/sessions/.trash/raven-tip.bundle"
         }})
-    );
-    assert_eq!(
-        serde_json::to_value(CheckpointOptions {
-            label: Some("before-write".into()),
-            keep: true,
-        })
-        .unwrap(),
-        json!({"label":"before-write","keep":true})
     );
     assert_eq!(
         serde_json::to_value(GcOptions {
@@ -1525,11 +1505,10 @@ const CAPABILITY_CASES: [(&str, &str, &[&str]); 9] = [
     ),
     (
         "worker_authority",
-        "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.grant(); value.revoke(); value.restore(); value.destroy(); value.rebase(); value.land(); value.gc(); value.repo_mirror(); value.detach(); value.workspace(\"other\"); }\n",
+        "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.grant(); value.revoke(); value.destroy(); value.rebase(); value.land(); value.gc(); value.repo_mirror(); value.detach(); value.workspace(\"other\"); }\n",
         &[
             "grant",
             "revoke",
-            "restore",
             "destroy",
             "rebase",
             "land",

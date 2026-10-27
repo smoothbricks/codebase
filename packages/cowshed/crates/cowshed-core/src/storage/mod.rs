@@ -1,11 +1,8 @@
 use std::ffi::OsStr;
-use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::metadata::{
@@ -30,90 +27,7 @@ pub mod trace_columns;
 pub mod trace_segment;
 
 pub const WORKSPACE_MARKER_PATH: &str = ".cowshed/workspace.json";
-/// The undo-image grammar [`CheckpointLabel`] refuses and the restorer writes. One constant,
-/// because a label admitted here that later collides with a controller undo image would
-/// silently overwrite the only crash-consistent copy of a workspace.
-pub const PRE_RESTORE_PREFIX: &str = "pre-restore-";
 use recovery::STAGING_NAMESPACE;
-
-/// A validated, path-safe checkpoint label.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CheckpointLabel(String);
-
-impl CheckpointLabel {
-    pub fn new(value: impl Into<String>) -> Result<Self, StorageLayoutError> {
-        let value = value.into();
-        let bytes = value.as_bytes();
-        let valid = (1..=128).contains(&bytes.len())
-            && !value.starts_with(PRE_RESTORE_PREFIX)
-            && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-            && bytes.iter().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'.' | b'_' | b'-')
-            });
-        if valid {
-            Ok(Self(value))
-        } else {
-            Err(StorageLayoutError::InvalidCheckpointLabel(value))
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// The default label for an unlabeled checkpoint: the UTC second of the request, rendered in
-    /// the label alphabet (`2026-07-11t120309z`). Workspace revision is the wrong key — it does
-    /// not advance between checkpoints, so a revision-derived default collides deterministically
-    /// on the second unlabeled checkpoint. A checkpoint image may be the only crash-consistent
-    /// copy, so an existing label is never reused or overwritten: a same-second collision takes
-    /// `-2`, `-3`, … instead.
-    pub fn utc_default(now: SystemTime, mut is_taken: impl FnMut(&str) -> bool) -> Self {
-        let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let (year, month, day) = civil_from_days(seconds / 86_400);
-        let clock = seconds % 86_400;
-        let base = format!(
-            "{year:04}-{month:02}-{day:02}t{:02}{:02}{:02}z",
-            clock / 3_600,
-            clock % 3_600 / 60,
-            clock % 60,
-        );
-        if !is_taken(&base) {
-            return Self(base);
-        }
-        (2_u64..)
-            .map(|ordinal| format!("{base}-{ordinal}"))
-            .find(|candidate| !is_taken(candidate))
-            .map(Self)
-            .expect("existing checkpoint labels are finite")
-    }
-}
-
-impl fmt::Display for CheckpointLabel {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl Serialize for CheckpointLabel {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for CheckpointLabel {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
 
 /// All controller-owned sibling paths associated with one image.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,20 +149,11 @@ impl StorageLayout {
         }
     }
 
-    pub fn checkpoint_image(
-        &self,
-        workspace: &WorkspaceName,
-        label: &CheckpointLabel,
-    ) -> Result<ImagePaths, StorageLayoutError> {
-        let workspace_directory = checked_child(&self.project.checkpoints, workspace.as_str())?;
-        self.image_below(&workspace_directory, label.as_str())
-    }
-
     /// The `TMPDIR` of every process the workspace's sandbox runs: in the project's store
     /// directory, so no workspace reaches another's (the store is denied to every sandbox and
     /// this directory is the one carve-back), and outside every checkout, so a tool that must put
-    /// scratch files outside the project it builds finds a writable place. Keyed by name like the
-    /// workspace's checkpoints, and reclaimed with its retired image.
+    /// scratch files outside the project it builds finds a writable place. Keyed by name, and
+    /// reclaimed with its retired image.
     pub fn exec_temp_dir(&self, workspace: &WorkspaceName) -> Result<PathBuf, StorageLayoutError> {
         checked_child(&self.project.exec_temp, workspace.as_str())
     }
@@ -401,7 +306,7 @@ fn image_stem(file_name: &str) -> Option<&str> {
 
 /// Days since 1970-01-01 to a proleptic-Gregorian civil date (Howard Hinnant's algorithm,
 /// restricted to the non-negative domain). Total over every `u64` second count, unlike
-/// `libc::gmtime_r`, which rejects out-of-range `time_t` — a label generator must not fail.
+/// `libc::gmtime_r`, which rejects out-of-range `time_t` — a timestamp formatter must not fail.
 pub(crate) const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let z = days + 719_468;
     let era = z / 146_097;
@@ -538,8 +443,6 @@ fn reject_symlink(path: &Path) -> Result<(), StorageLayoutError> {
 
 #[derive(Debug, Error)]
 pub enum StorageLayoutError {
-    #[error("invalid checkpoint label {0:?}")]
-    InvalidCheckpointLabel(String),
     #[error("workspace `main` is not a session")]
     MainIsNotSession,
     #[error("unsafe storage path component {0:?}")]
@@ -661,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_the_dmg_image_and_its_complete_sibling_suffixes() {
+    fn maps_session_main_staging_and_mount_paths() {
         let layout = layout();
         let raven = WorkspaceName::session("raven").unwrap();
         let paths = layout.session_image(&raven).unwrap();
@@ -682,13 +585,6 @@ mod tests {
             Path::new("/private/cowshed/store/acme/widget/sessions/raven.dmg.ca.key")
         );
         crate::metadata::validate_image_path(&paths.image).unwrap();
-    }
-
-    #[test]
-    fn maps_main_staging_checkpoint_and_mount_paths() {
-        let layout = layout();
-        let raven = WorkspaceName::session("raven").unwrap();
-        let label = CheckpointLabel::new("ci-fail.2026-07-11").unwrap();
         assert_eq!(
             layout.main_image().unwrap().image,
             Path::new("/private/cowshed/store/acme/widget/main.dmg")
@@ -696,12 +592,6 @@ mod tests {
         assert_eq!(
             layout.staged_main_image().unwrap().image,
             Path::new("/private/cowshed/store/acme/widget/.staging/main.dmg")
-        );
-        assert_eq!(
-            layout.checkpoint_image(&raven, &label).unwrap().image,
-            Path::new(
-                "/private/cowshed/store/acme/widget/checkpoints/raven/ci-fail.2026-07-11.dmg"
-            )
         );
         assert_eq!(
             layout.workspace_mount(&raven).unwrap(),
@@ -831,66 +721,8 @@ mod tests {
     }
 
     #[test]
-    fn labels_are_immutable_validated_components() {
-        for valid in ["a", "ci-fail", "2026-07-11t120000z", "release_1.2"] {
-            let label = CheckpointLabel::new(valid).unwrap();
-            assert_eq!(label.to_string(), valid);
-            let encoded = serde_json::to_string(&label).unwrap();
-            assert_eq!(
-                serde_json::from_str::<CheckpointLabel>(&encoded).unwrap(),
-                label
-            );
-        }
-        for invalid in [
-            "",
-            ".",
-            "..",
-            "Upper",
-            "-leading",
-            "slash/name",
-            "a b",
-            "pre-restore-user",
-            "pre-restore-00000000000000000000000000000002",
-        ] {
-            assert!(
-                CheckpointLabel::new(invalid).is_err(),
-                "accepted {invalid:?}"
-            );
-        }
-    }
-
-    fn at(seconds: u64) -> SystemTime {
-        UNIX_EPOCH + std::time::Duration::from_secs(seconds)
-    }
-
-    #[test]
-    fn the_default_label_is_the_documented_utc_second() {
-        for (seconds, expected) in [
-            (0, "1970-01-01t000000z"),
-            (1_783_771_200, "2026-07-11t120000z"),
-            // Leap day and both neighbours: a leap-year error shifts one of the three.
-            (1_835_395_199, "2028-02-28t235959z"),
-            (1_835_395_200, "2028-02-29t000000z"),
-            (1_835_481_600, "2028-03-01t000000z"),
-            // Year boundary at exactly midnight UTC.
-            (1_893_455_999, "2029-12-31t235959z"),
-            (1_893_456_000, "2030-01-01t000000z"),
-            // 2100 is the century rule's first bite: divisible by 4 but not a leap year.
-            (4_107_542_399, "2100-02-28t235959z"),
-            (4_107_542_400, "2100-03-01t000000z"),
-            // 2400 restores the 400-year exception, so its February 29th exists.
-            (13_574_585_228, "2400-02-29t060708z"),
-        ] {
-            let label = CheckpointLabel::utc_default(at(seconds), |_| false);
-            assert_eq!(label.as_str(), expected, "at {seconds}s");
-            // Every generated default must survive the validator it bypasses.
-            assert_eq!(CheckpointLabel::new(expected).unwrap(), label);
-        }
-    }
-
-    #[test]
     fn civil_from_days_pins_known_unix_epoch_dates() {
-        // Independent of the label formatter: a wrong calendar goes red even if it is
+        // Independent of the timestamp formatters: a wrong calendar goes red even if it is
         // self-inverse. Day numbers are unix seconds / 86400.
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(days_from_civil(1970, 1, 1), Some(0));
@@ -907,24 +739,6 @@ mod tests {
         assert_eq!(days_from_civil(1900, 2, 29), None);
         assert_eq!(days_from_civil(1900, 2, 28), None);
         assert!(days_from_civil(2400, 2, 29).is_some());
-    }
-
-    #[test]
-    fn a_same_second_collision_takes_the_next_ordinal_and_never_reuses_a_label() {
-        let now = at(1_783_771_200);
-        let base = CheckpointLabel::utc_default(now, |_| false);
-        assert_eq!(base.as_str(), "2026-07-11t120000z");
-
-        let taken = [base.as_str().to_owned()];
-        let second =
-            CheckpointLabel::utc_default(now, |candidate| taken.iter().any(|l| l == candidate));
-        assert_eq!(second.as_str(), "2026-07-11t120000z-2");
-
-        let taken = [taken[0].clone(), second.as_str().to_owned()];
-        let third =
-            CheckpointLabel::utc_default(now, |candidate| taken.iter().any(|l| l == candidate));
-        assert_eq!(third.as_str(), "2026-07-11t120000z-3");
-        assert_eq!(CheckpointLabel::new(third.as_str()).unwrap(), third);
     }
 
     #[test]

@@ -9,7 +9,6 @@ use cowshed_core::metadata::{
     WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
-use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::lifecycle::*;
 use proptest::prelude::*;
 
@@ -202,25 +201,6 @@ impl LifecyclePlanner for ContractSubstrate {
         PurePlanner.plan_fork(from, destination)
     }
 
-    fn plan_checkpoint(
-        &self,
-        workspace: &LifecycleWorkspace,
-        label: CheckpointLabel,
-        pin: Pin,
-    ) -> Result<CheckpointPlan, PlanError> {
-        PurePlanner.plan_checkpoint(workspace, label, pin)
-    }
-
-    fn plan_restore(
-        &self,
-        workspace: &LifecycleWorkspace,
-        checkpoint: &CheckpointRef,
-        mode: RestoreMode,
-        identity: OperationIdentity,
-    ) -> Result<RestorePlan, PlanError> {
-        PurePlanner.plan_restore(workspace, checkpoint, mode, identity)
-    }
-
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
         PurePlanner.plan_retire(workspace)
     }
@@ -257,7 +237,6 @@ impl Substrate for ContractSubstrate {
             Ok(vec![DerivedWorkspace {
                 workspace: self.workspace.clone(),
                 mount_state: MountState::Mounted { mount_id: 77 },
-                checkpoints: Vec::new(),
             }])
         } else {
             Err("wrong repository")
@@ -327,9 +306,6 @@ impl Substrate for ContractSubstrate {
             Ok(SubstrateStats {
                 logical_bytes: workspace.revision().get(),
                 allocated_bytes: workspace.topology_revision().get(),
-                checkpoint_count: 2,
-                checkpoint_bytes: 13,
-                pinned_checkpoint_bytes: 8,
             })
         } else {
             Err("wrong workspace")
@@ -376,9 +352,6 @@ async fn finalized_substrate_surface_returns_direct_values_and_canonical_paths()
         SubstrateStats {
             logical_bytes: 3,
             allocated_bytes: 5,
-            checkpoint_count: 2,
-            checkpoint_bytes: 13,
-            pinned_checkpoint_bytes: 8,
         }
     );
 
@@ -395,22 +368,6 @@ async fn finalized_substrate_surface_returns_direct_values_and_canonical_paths()
 fn value_accessors_and_every_fact_field_are_observable() {
     assert_eq!(Revision::new(42).get(), 42);
     let ws = workspace("topic", 3, 5);
-    let checkpoint = CheckpointRef::new(
-        ws.clone(),
-        CheckpointLabel::new("safe").unwrap(),
-        Revision::new(8),
-        true,
-    );
-    assert!(checkpoint.pinned());
-    assert!(
-        !CheckpointRef::new(
-            ws.clone(),
-            CheckpointLabel::new("automatic").unwrap(),
-            Revision::new(9),
-            false,
-        )
-        .pinned()
-    );
 
     let destination = Destination {
         repo: repo(),
@@ -421,35 +378,6 @@ fn value_accessors_and_every_fact_field_are_observable() {
     let create = PurePlanner.plan_create(&ws, destination).unwrap();
     let create_actual = create.expected().to_vec();
     assert_eq!(revalidate(create.expected(), &create_actual), Ok(()));
-
-    let restore = PurePlanner
-        .plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity())
-        .unwrap();
-    let restore_actual = restore.expected().to_vec();
-    assert_eq!(revalidate(restore.expected(), &restore_actual), Ok(()));
-
-    for actual in [
-        LifecycleFact::Checkpoint {
-            repo: RepoId::parse("other/project").unwrap(),
-            workspace: ws.name().clone(),
-            label: checkpoint.label().clone(),
-            revision: checkpoint.revision(),
-        },
-        LifecycleFact::Checkpoint {
-            repo: repo(),
-            workspace: WorkspaceName::session("other").unwrap(),
-            label: checkpoint.label().clone(),
-            revision: checkpoint.revision(),
-        },
-        LifecycleFact::Checkpoint {
-            repo: repo(),
-            workspace: ws.name().clone(),
-            label: CheckpointLabel::new("other").unwrap(),
-            revision: checkpoint.revision(),
-        },
-    ] {
-        assert!(revalidate(&restore.expected()[1..], &[actual]).is_err());
-    }
 
     let absent = &create.expected()[1..];
     for actual in [
@@ -473,44 +401,6 @@ fn value_accessors_and_every_fact_field_are_observable() {
     }
 }
 
-#[test]
-fn restore_rejects_each_checkpoint_identity_mismatch() {
-    let ws = workspace("topic", 3, 5);
-    let variants = [
-        LifecycleWorkspace::new(
-            RepoId::parse("other/project").unwrap(),
-            ws.name().clone(),
-            ws.incarnation().clone(),
-            ws.revision(),
-            ws.topology_revision(),
-            ws.role(),
-        )
-        .unwrap(),
-        workspace("other", 3, 5),
-        LifecycleWorkspace::new(
-            repo(),
-            ws.name().clone(),
-            make_incarnation('b'),
-            ws.revision(),
-            ws.topology_revision(),
-            ws.role(),
-        )
-        .unwrap(),
-    ];
-    for checkpoint_workspace in variants {
-        let checkpoint = CheckpointRef::new(
-            checkpoint_workspace,
-            CheckpointLabel::new("safe").unwrap(),
-            Revision::new(8),
-            false,
-        );
-        assert_eq!(
-            PurePlanner.plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity()),
-            Err(PlanError::CheckpointMismatch)
-        );
-    }
-}
-
 #[tokio::test]
 async fn execute_acquires_rereads_revalidates_then_mutates() {
     let plan = PurePlanner.plan_retire(&workspace("topic", 3, 5)).unwrap();
@@ -525,15 +415,13 @@ async fn execute_acquires_rereads_revalidates_then_mutates() {
 #[tokio::test]
 async fn every_stale_precondition_conflicts_with_zero_effects() {
     let ws = workspace("topic", 3, 5);
-    let checkpoint = CheckpointRef::new(
-        ws.clone(),
-        CheckpointLabel::new("safe").unwrap(),
-        Revision::new(8),
-        false,
-    );
-    let plan = PurePlanner
-        .plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity())
-        .unwrap();
+    let destination = Destination {
+        repo: repo(),
+        name: WorkspaceName::session("destination").unwrap(),
+        topology_revision: Revision::new(5),
+        identity: identity(),
+    };
+    let plan = PurePlanner.plan_create(&ws, destination).unwrap();
     let canonical = plan.expected().to_vec();
     let mut stale_matrix = Vec::new();
 
@@ -560,11 +448,6 @@ async fn every_stale_precondition_conflicts_with_zero_effects() {
         *retired = true;
     }
     stale_matrix.push(stale);
-    let mut stale = canonical;
-    if let LifecycleFact::Checkpoint { revision, .. } = &mut stale[1] {
-        *revision = Revision::new(9);
-    }
-    stale_matrix.push(stale);
 
     for actual in stale_matrix {
         let spy = backend(actual);
@@ -586,32 +469,6 @@ async fn every_stale_precondition_conflicts_with_zero_effects() {
 #[test]
 fn revalidate_refuses_short_observations_and_substituted_variants() {
     let ws = workspace("topic", 3, 5);
-    let checkpoint = CheckpointRef::new(
-        ws.clone(),
-        CheckpointLabel::new("safe").unwrap(),
-        Revision::new(8),
-        false,
-    );
-    let restore = PurePlanner
-        .plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity())
-        .unwrap();
-    let canonical = restore.expected().to_vec();
-
-    assert_eq!(
-        revalidate(restore.expected(), &canonical[..1]),
-        Err(Conflict::FactCount {
-            expected: 2,
-            actual: 1,
-        })
-    );
-    assert_eq!(
-        revalidate(&restore.expected()[..1], &canonical),
-        Err(Conflict::FactCount {
-            expected: 1,
-            actual: 2,
-        })
-    );
-
     let destination = Destination {
         repo: repo(),
         name: WorkspaceName::session("destination").unwrap(),
@@ -619,6 +476,23 @@ fn revalidate_refuses_short_observations_and_substituted_variants() {
         identity: identity(),
     };
     let create = PurePlanner.plan_create(&ws, destination).unwrap();
+    let canonical = create.expected().to_vec();
+
+    assert_eq!(
+        revalidate(create.expected(), &canonical[..1]),
+        Err(Conflict::FactCount {
+            expected: 2,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        revalidate(&create.expected()[..1], &canonical),
+        Err(Conflict::FactCount {
+            expected: 1,
+            actual: 2,
+        })
+    );
+
     let taken = LifecycleFact::Exists {
         repo: repo(),
         name: WorkspaceName::session("destination").unwrap(),
@@ -685,68 +559,12 @@ fn duplicate_canonical_volume_keys_are_rejected_before_mount_joining() {
 
     for mounts in mount_tables {
         assert_eq!(
-            derive_workspaces(storage(), mounts, Vec::new()),
+            derive_workspaces(storage(), mounts),
             Err(DerivationError::DuplicateVolumeKey(
                 "shared-volume".to_owned()
             ))
         );
     }
-}
-
-#[test]
-fn validated_retired_checkpoint_facts_do_not_republish_a_missing_workspace() {
-    let main = StorageFact {
-        workspace: workspace("main", 7, 9),
-        volume_key: "main-volume".to_owned(),
-    };
-    let retired = CheckpointFact {
-        repo: repo(),
-        workspace: WorkspaceName::session("retired").expect("retired workspace"),
-        label: CheckpointLabel::new("keep").expect("checkpoint label"),
-        revision: Revision::new(4),
-        pin: Pin::Pinned,
-    };
-
-    let derived = derive_workspaces(
-        vec![main.clone()],
-        vec![KernelMountFact {
-            mount_id: 42,
-            volume_key: main.volume_key,
-        }],
-        vec![retired],
-    )
-    .expect("retired checkpoint facts are asynchronous cleanup debris");
-
-    assert_eq!(derived.len(), 1);
-    assert!(derived[0].workspace.name().is_main());
-    assert_eq!(derived[0].mount_state, MountState::Mounted { mount_id: 42 });
-    assert!(derived[0].checkpoints.is_empty());
-}
-
-#[test]
-fn duplicate_retired_checkpoint_facts_are_rejected_before_exclusion() {
-    let checkpoint = CheckpointFact {
-        repo: repo(),
-        workspace: WorkspaceName::session("retired").expect("retired workspace"),
-        label: CheckpointLabel::new("duplicate").expect("checkpoint label"),
-        revision: Revision::new(4),
-        pin: Pin::Automatic,
-    };
-
-    assert_eq!(
-        derive_workspaces(
-            vec![StorageFact {
-                workspace: workspace("main", 1, 1),
-                volume_key: "main-volume".to_owned(),
-            }],
-            Vec::<MountJoin>::new(),
-            vec![checkpoint.clone(), checkpoint],
-        ),
-        Err(DerivationError::DuplicateCheckpoint {
-            workspace: WorkspaceName::session("retired").expect("retired workspace"),
-            label: CheckpointLabel::new("duplicate").expect("checkpoint label"),
-        })
-    );
 }
 
 proptest! {
@@ -761,7 +579,7 @@ proptest! {
     fn derived_enumeration_uses_only_storage_and_kernel_facts(mounted in proptest::collection::btree_set(0u8..20, 0..20), count in 0u8..20) {
         let storage: Vec<_> = (0..count).map(|index| StorageFact { workspace: workspace(&format!("ws-{index}"), 0, 0), volume_key: format!("volume-{index}") }).collect();
         let mounts: Vec<_> = mounted.iter().map(|index| KernelMountFact { mount_id: u64::from(*index) + 100, volume_key: format!("volume-{index}") }).collect();
-        let derived = derive_workspaces(storage, mounts, Vec::new()).unwrap();
+        let derived = derive_workspaces(storage, mounts).unwrap();
         prop_assert_eq!(derived.len(), usize::from(count));
         for item in derived {
             let index: u8 = item.workspace.name().as_str().strip_prefix("ws-").unwrap().parse().unwrap();
@@ -780,7 +598,7 @@ proptest! {
         verdicts in proptest::collection::vec(0u8..5, 0..16),
         neighbour in any::<proptest::sample::Index>(),
     ) {
-        let derived = derive_workspaces(verdict_storage(verdicts.len()), verdict_joins(&verdicts), Vec::new())
+        let derived = derive_workspaces(verdict_storage(verdicts.len()), verdict_joins(&verdicts))
             .expect("a refused join never fails the enumeration");
         prop_assert_eq!(derived.len(), verdicts.len());
         for item in &derived {
@@ -809,7 +627,7 @@ proptest! {
             let refused = neighbour.index(verdicts.len());
             let mut with_refusal = verdicts.clone();
             with_refusal[refused] = 2;
-            let after = derive_workspaces(verdict_storage(verdicts.len()), verdict_joins(&with_refusal), Vec::new())
+            let after = derive_workspaces(verdict_storage(verdicts.len()), verdict_joins(&with_refusal))
                 .expect("a neighbour's refusal never fails the enumeration");
             for (before, after) in derived.iter().zip(&after) {
                 if before.workspace.name().as_str() != format!("ws-{refused}") {
@@ -844,7 +662,7 @@ proptest! {
         }];
 
         prop_assert_eq!(
-            derive_workspaces(storage, mounts, Vec::new()),
+            derive_workspaces(storage, mounts),
             Err(DerivationError::DuplicateVolumeKey(volume_key))
         );
     }

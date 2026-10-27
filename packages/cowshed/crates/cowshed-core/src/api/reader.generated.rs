@@ -121,9 +121,6 @@ static CACHE_MISS: Reader = Reader::Record(&[
 ]);
 static CHARGED_MEMORY_USAGE: Reader =
     Reader::Record(&[("currentBytes", &LEAF), ("peakBytes", &LEAF)]);
-static CHECKPOINT_INFO: Reader =
-    Reader::Record(&[("label", &LEAF), ("revision", &LEAF), ("pinned", &LEAF)]);
-static CHECKPOINT_RESULT: Reader = Reader::Record(&[("label", &LEAF)]);
 static CPU_TOTALS: Reader = Reader::Record(&[("userUs", &LEAF), ("sysUs", &LEAF)]);
 static CREDENTIAL_REPORT: Reader = Reader::Record(&[("routes", &SEQ__CREDENTIAL_ROUTE)]);
 static CREDENTIAL_ROUTE: Reader = Reader::Record(&[
@@ -266,7 +263,6 @@ static GC_REASON: Reader = Reader::External(&[
     ("orphanStagingMount", &LEAF),
     ("orphanSessionImage", &LEAF),
     ("orphanMountpoint", &LEAF),
-    ("expiredCheckpoint", &LEAF),
     ("abandonedBundle", &LEAF),
     ("unlinkedBuildVolume", &LEAF),
     ("supersededSeed", &LEAF),
@@ -275,7 +271,6 @@ static GC_REASON: Reader = Reader::External(&[
 static GC_REPORT: Reader = Reader::Record(&[
     ("examined", &LEAF),
     ("reclaimed", &LEAF),
-    ("retainedPinned", &LEAF),
     ("retainedActive", &LEAF),
     ("releasedBytes", &LEAF),
     ("dryRun", &LEAF),
@@ -632,8 +627,6 @@ static LOCK_OPERATION: Reader = Reader::External(&[
     ("re-adopt", &LEAF),
     ("create", &LEAF),
     ("fork", &LEAF),
-    ("checkpoint", &LEAF),
-    ("restore", &LEAF),
     ("retire", &LEAF),
     ("retire-unpublished", &LEAF),
     ("repair-unpublished", &LEAF),
@@ -646,7 +639,7 @@ static LOCK_OPERATION: Reader = Reader::External(&[
     ("recover", &LEAF),
     ("gc", &LEAF),
     ("land", &LEAF),
-    ("reseed", &LEAF),
+    ("move-onto-seed", &LEAF),
     ("clear-nx-state", &LEAF),
     ("repair-ports", &LEAF),
     ("grant", &LEAF),
@@ -880,17 +873,6 @@ static REPOSITORY_BINDING: Reader = Reader::Record(&[
     ("identities", &SEQ__BOUND_IDENTITY),
     ("formerIdentities", &LEAF),
 ]);
-static RESEED_RESULT: Reader = Reader::Record(&[
-    ("workspace", &LEAF),
-    ("from", &LEAF),
-    ("previousVolume", &LEAF),
-    ("seed", &LEAF),
-    ("replacementVolume", &LEAF),
-    ("previousBytes", &LEAF),
-    ("replacementBytes", &LEAF),
-    ("releasedBytes", &LEAF),
-    ("dryRun", &LEAF),
-]);
 static RESIZE_RESULT: Reader = Reader::Record(&[
     ("workspace", &LEAF),
     ("volume", &RESIZE_VOLUME),
@@ -937,7 +919,6 @@ static SEQ__BOUND_IDENTITY: Reader = Reader::Seq(&BOUND_IDENTITY);
 static SEQ__BRANCH_LANDING: Reader = Reader::Seq(&BRANCH_LANDING);
 static SEQ__BUILD_STATE_LINK: Reader = Reader::Seq(&BUILD_STATE_LINK);
 static SEQ__CACHE_MISS: Reader = Reader::Seq(&CACHE_MISS);
-static SEQ__CHECKPOINT_INFO: Reader = Reader::Seq(&CHECKPOINT_INFO);
 static SEQ__CREDENTIAL_ROUTE: Reader = Reader::Seq(&CREDENTIAL_ROUTE);
 static SEQ__DATABASE_HOLDER: Reader = Reader::Seq(&DATABASE_HOLDER);
 static SEQ__EGRESS_RULE: Reader = Reader::Seq(&EGRESS_RULE);
@@ -1137,7 +1118,6 @@ static WORKSPACE_INFO: Reader = Reader::Record(&[
     ("branch", &LEAF),
     ("baseCommit", &LEAF),
     ("createdAt", &LEAF),
-    ("checkpoints", &SEQ__CHECKPOINT_INFO),
     ("snapshotStale", &LEAF),
     ("landing", &WORKSPACE_LANDING),
 ]);
@@ -1169,10 +1149,6 @@ impl Projected for crate::build_volume::BuildStateRefresh {
 
 impl Projected for crate::api::operations::BuildVolume {
     const READER: &'static Reader = &BUILD_VOLUME;
-}
-
-impl Projected for crate::api::dto::CheckpointResult {
-    const READER: &'static Reader = &CHECKPOINT_RESULT;
 }
 
 impl Projected for crate::api::dto::CredentialReport {
@@ -1313,10 +1289,6 @@ impl Projected for crate::api::dto::RemoveProjectReport {
 
 impl Projected for crate::api::dto::RemoveReport {
     const READER: &'static Reader = &REMOVE_REPORT;
-}
-
-impl Projected for crate::api::dto::ReseedResult {
-    const READER: &'static Reader = &RESEED_RESULT;
 }
 
 impl Projected for crate::api::dto::ResizeResult {

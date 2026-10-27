@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::reseed::named;
+use super::seed_move::named;
 use super::{BuildVolumes, RuntimeStorageHost, io, storage};
 use crate::api::dto::NxStateClearResult;
 use crate::build_volume::{BuildVolumeState, nx};

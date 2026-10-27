@@ -253,7 +253,7 @@ describe('Cowshed attachment Node-API boundary', () => {
               info: {
                 ...fence,
                 role: 'main', mount: '/w/widget', state: 'attached',
-                checkpoints: [], snapshotStale: false,
+                snapshotStale: false,
               },
               grants: { egress: [], read: [], revision: 0, sim: [], write: [] },
             });

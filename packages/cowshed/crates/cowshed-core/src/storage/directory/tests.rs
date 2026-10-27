@@ -247,30 +247,11 @@ fn directory_named_snapshot_and_mount_fence_ignore_broken_siblings() {
     fs::remove_file(sidecar_path(&missing)).unwrap();
     let (_, corrupt, _) = published_directory(&scratch, "corrupt", 3);
     fs::write(sidecar_path(&corrupt), b"{ corrupt").unwrap();
-    let store = layout(&host.config, &metadata.repo_id).unwrap();
-    let label = CheckpointLabel::new("ready").unwrap();
-    let checkpoint = store
-        .checkpoint_image(&metadata.workspace, &label)
-        .unwrap()
-        .image()
-        .to_owned();
-    fs::create_dir_all(&checkpoint).unwrap();
-    metadata.write_for_image(&checkpoint).unwrap();
-    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(3), Pin::Pinned)
-        .unwrap();
-    let poisoned_checkpoint = store.project().checkpoints.join("corrupt/bad.dmg");
-    fs::create_dir_all(&poisoned_checkpoint).unwrap();
-    fs::write(checkpoint_fact_path(&poisoned_checkpoint), b"{ corrupt").unwrap();
-    assert!(host.list(&metadata.repo_id).is_err());
-    assert!(host.checkpoints(&metadata.repo_id).is_err());
     let (detached, _) = host
         .workspace_snapshot(&metadata.repo_id, &metadata.workspace)
         .unwrap()
         .unwrap();
     assert_eq!(detached.mount_state, MountState::Detached);
-    assert_eq!(detached.checkpoints.len(), 1);
-    assert_eq!(detached.checkpoints[0].revision, Revision::new(3));
-    assert_eq!(detached.checkpoints[0].pin, Pin::Pinned);
     let mount =
         main_aware_mount_point(&host.config, &metadata.repo_id, &metadata.workspace).unwrap();
     bind(&image, &mount).unwrap();
@@ -313,15 +294,15 @@ fn directory_source_release_keeps_canonical_authority_on_cleanup_refusal() {
     let workspace = metadata_workspace_ref(&metadata).unwrap();
     let retired = RetiredRef::new(workspace, Revision::new(1));
     let storage = layout(&host.config, &metadata.repo_id).unwrap();
-    let checkpoints = storage.project().checkpoints.join("selected");
-    fs::create_dir_all(&checkpoints).unwrap();
-    let foreign = checkpoints.join("only-copy");
-    fs::write(&foreign, b"preserve checkpoint evidence").unwrap();
+    let mountpoint = storage.project().mount_root.join("selected");
+    fs::create_dir_all(&mountpoint).unwrap();
+    let foreign = mountpoint.join("late-write");
+    fs::write(&foreign, b"preserve late writes").unwrap();
     assert!(host.release_workspace(&host.config, &retired).is_err());
     assert!(image.exists());
     assert!(sidecar_path(&image).exists());
     assert!(companion_path(&image).exists());
-    assert_eq!(fs::read(&foreign).unwrap(), b"preserve checkpoint evidence");
+    assert_eq!(fs::read(&foreign).unwrap(), b"preserve late writes");
     fs::remove_file(&foreign).unwrap();
     host.release_workspace(&host.config, &retired).unwrap();
     assert!(!image.exists());
@@ -967,12 +948,6 @@ fn directory_retirement_retry_and_held_recovery_keep_complete_authority() {
                 .project()
                 .project_root
                 .join(format!(".staging/broken-{:032x}.dmg", 3)),
-        ),
-        sidecar_path(
-            &storage
-                .project()
-                .checkpoints
-                .join(format!("broken/pre-restore-{:032x}.dmg", 3)),
         ),
         sidecar_path(&host.config.store_root.join("foreign/project/main.dmg")),
     ];

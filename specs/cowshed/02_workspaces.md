@@ -10,11 +10,10 @@ Operations that update only a non-checked-out ref in its repository do not chang
 working tree.
 
 Every use of `main` in this specification is project-scoped. A host may adopt any number of repositories, each with its
-own warm `main`, sessions, checkpoints, grants, gateway identity, and standalone Git object store under its primary
-`repo_id`. Commands select the project explicitly with global `--project <git-root>` or derive it from cwd;
-`detach <ws>` and, outside any project, `rm <ws>` derive it instead from the one project whose store holds a session of
-that name. `fork`, `checkpoint`, `restore`, `push`, and `land` never select a machine-global main or cross repository
-boundaries.
+own warm `main`, sessions, grants, gateway identity, and standalone Git object store under its primary `repo_id`.
+Commands select the project explicitly with global `--project <git-root>` or derive it from cwd; `detach <ws>` and,
+outside any project, `rm <ws>` derive it instead from the one project whose store holds a session of that name. `fork`,
+`push`, and `land` never select a machine-global main or cross repository boundaries.
 
 ## The safe-to-clone-main invariant
 
@@ -333,36 +332,35 @@ each released image of its project, from `build/.deleting` and `sessions/.deleti
 `<store>/.deleting/<fresh id>.dmg` and nudges the gateway for each one (05_gateway.md, "Deleting released images"). It
 frees nothing itself, and a cut in progress moves with its entry, held open by the cleanup. Anything there that is not a
 released image stays, and the removal of terminal storage that follows refuses, naming it. Unbinding then removes
-terminal storage (`.staging/`, `sessions/`, `checkpoints/`, `tmp/` and `build/`, which by then may hold only empty
-directories and zero-length locks and holds; anything else refuses, named, before one entry is removed) and the empty
-mount trees (`<owner>/<repo>` and `.build/<owner>/<repo>` under the host mount root). It then unlinks the validated
-binding and syncs its held parent directory. Only this durable unbinding authorizes removal of the controller's
-lifecycle journal, recovery-export proofs, deletion log and slot bindings; the checkout-root record goes afterward. An
-unlink failure or interruption before the sync keeps that authority. A retry finding the binding absent still performs
-the directory durability barrier before releasing controller metadata. What the user wrote stays: `policy.json`,
-`waivers.json` and `quarantine/` keep the store directory. Once the project is unbound, the identity's project lease
+terminal storage (`.staging/`, `sessions/`, `tmp/` and `build/`, which by then may hold only empty directories and
+zero-length locks and holds; anything else refuses, named, before one entry is removed) and the empty mount trees
+(`<owner>/<repo>` and `.build/<owner>/<repo>` under the host mount root). It then unlinks the validated binding and
+syncs its held parent directory. Only this durable unbinding authorizes removal of the controller's lifecycle journal,
+recovery-export proofs, deletion log and slot bindings; the checkout-root record goes afterward. An unlink failure or
+interruption before the sync keeps that authority. A retry finding the binding absent still performs the directory
+durability barrier before releasing controller metadata. What the user wrote stays: `policy.json`, `waivers.json` and
+`quarantine/` keep the store directory. Once the project is unbound, the identity's project lease
 `.retirements/<owner>/<repo>.lease` goes too, and with it an owner directory it leaves empty, but only under the lease
 itself: the unbinding's own shared hold must upgrade to exclusive without waiting, and no `<repo>.json` retirement
 record may stand beside it. Another holder (the gateway, a command still open on the project) or a record keeps it, said
 on stderr, and the unbinding keeps its shared hold. Because every holder rechecks the lease's inode after locking
 (`forget`, below), removing it cannot split them. The restore checks terminal storage before it retires main, exempting
-what main's retirement and this release remove (main's own checkpoints and temp dir, every build volume's image and
-record, and the deleting directories of `build/` and `sessions/`, which the unbinding finishes first), so its refusal
-leaves main in place. The refusal names what owns the rest first: a recovery image in `sessions/.trash`, with the
-`gc --recover` that exports it, before the checkpoints and temp dir it keeps, then `sessions/` before `checkpoints/` and
-`tmp/`, so a live workspace's image is named rather than its temp dir. Binding removal becomes completion only after its
-parent sync; a retry finishes controller cleanup before removing the lease, without recreating project directories. A
-fresh controller can discover an interrupted unbinding from the exact canonical checkout-root record and a typed,
-unfinished `Mutating Retire(main, restore=true)` in the source journal, even for a checkout with no remote. This is
-read-only recovery admission, never active inventory or registration. Live bindings retain precedence; ambiguous
-matching continuation records refuse rather than choosing one. That unfinished record is the restore's own: no startup
-replay or other verb completes it while the project is bound, and a restore is never answered from a completed record,
-so a retry after any failed unbinding (a stray file, a release that cannot move) runs the unbinding again rather than
-reporting success while the binding stands. A released image the unbinding lists but finds already unlinked by the
-gateway's cleanup is released, not an error. The lifecycle journal is released after the other controller records, so
-failures in their removal retain the continuation. A death after releasing the journal but before deleting the checkout
-record can leave only that unbound bookkeeping record; it holds no recovery authority, and a later adoption's main image
-outranks it.
+what main's retirement and this release remove (main's temp dir, every build volume's image and record, and the deleting
+directories of `build/` and `sessions/`, which the unbinding finishes first), so its refusal leaves main in place. The
+refusal names what owns the rest first: a recovery image in `sessions/.trash`, with the `gc --recover` that exports it,
+before the temp dir it keeps, then `sessions/` before `tmp/`, so a live workspace's image is named rather than its temp
+dir. Binding removal becomes completion only after its parent sync; a retry finishes controller cleanup before removing
+the lease, without recreating project directories. A fresh controller can discover an interrupted unbinding from the
+exact canonical checkout-root record and a typed, unfinished `Mutating Retire(main, restore=true)` in the source
+journal, even for a checkout with no remote. This is read-only recovery admission, never active inventory or
+registration. Live bindings retain precedence; ambiguous matching continuation records refuse rather than choosing one.
+That unfinished record is the restore's own: no startup replay or other verb completes it while the project is bound,
+and a restore is never answered from a completed record, so a retry after any failed unbinding (a stray file, a release
+that cannot move) runs the unbinding again rather than reporting success while the binding stands. A released image the
+unbinding lists but finds already unlinked by the gateway's cleanup is released, not an error. The lifecycle journal is
+released after the other controller records, so failures in their removal retain the continuation. A death after
+releasing the journal but before deleting the checkout record can leave only that unbound bookkeeping record; it holds
+no recovery authority, and a later adoption's main image outranks it.
 
 ## `cowshed forget <owner/repo> --abandon` — retire from store authority
 
@@ -395,9 +393,9 @@ The monotonic phases are:
    no-follow inode hold prevents reattachment between release and archival. Registration drift, changed image identity
    or any remaining attachment refuses and preserves the record.
 4. **`archived`**: atomically rename the complete project store tree into `.retired-projects/<operation-id>`, preserving
-   its images, dirty Git state inside them, checkpoints, build state, grants, keys and diagnostic records. Preservation
-   and removal from the live registration namespace are one rename; neither the missing checkout nor its `.pre-cowshed`
-   tree is deleted. Record the completed receipt after syncing the directory changes.
+   its images, dirty Git state inside them, build state, grants, keys and diagnostic records. Preservation and removal
+   from the live registration namespace are one rename; neither the missing checkout nor its `.pre-cowshed` tree is
+   deleted. Record the completed receipt after syncing the directory changes.
 
 Retry resumes the recorded operation. A crash after rename but before the final phase write is recognized by the exact
 archive and registration digest, not by absence alone. Startup discovery excludes positively pending retirements from
@@ -419,21 +417,6 @@ The native qualification runs ten complete attach/mount/busy-refusal/holder-clos
 `DIDeviceIOUserClient` at 163 in every pair, and `IOMedia` at 176; `AppleAPFSVolume` grew by one per detach, 2185
 to 2195. That departed-volume retention is separate from image-device leaks and from retained archive bytes; the run
 performed no daemon restart or helper kill and does not claim to fix Disk Arbitration's retained volume references.
-
-## `cowshed reseed` — replace only accumulated build state
-
-`cowshed reseed <ws> [--from <target>] [--dry-run]` leaves the workspace's source and Git state in place and replaces
-only its live build volume with a clone of the target's existing latest seed (`main` by default). It is not a rebase,
-restore, re-adoption or seed refresh. Dirty tracked files, staged changes, untracked source, refs and HEAD stay as they
-are. The mounted workspace's excluded `.cowshed/build` link is the sole source-volume change. The next build pays a cold
-rebuild for work absent from that seed. A stale seed is used unchanged; an absent current-incarnation seed refuses.
-
-Before replacing anything it refuses an admitted job or land's build hold, a held lifecycle/image lock, an unfinished
-create/fork/adopt journal entry, or a filesystem holder of the old volume, naming the recorded operation or the holder's
-PID and command. It never kills a job or forces an unmount. Dry-run is read-only and reports per-image allocated bytes;
-those bytes are not a promise of unique APFS physical space because other clones and seeds can retain shared extents.
-The exact planning, writer-exclusion, publication and accounting contract lives in 16_build_volumes.md §Workspace
-reseed.
 
 ## `cowshed mv` — rename a workspace or move the checkout
 
@@ -839,14 +822,6 @@ controller Git holds no such grant and keeps running the repository's drivers (0
 own Git inside a git-worktree workspace keeps only the `.git` carve-back, so an include into main's checkout still fails
 there; widening the job profile is not part of this.
 
-**Checkpoint and restore refuse** on a git-worktree workspace, exit 4, with `next:` hints. The image is not
-self-contained: a checkpoint clone would capture a tree whose history lives in a repository it does not include, so the
-clone is not a restorable state — it is half a repository. Restoring one is worse than useless, because the fresh
-incarnation would resurrect a registration for a worktree id that main has since pruned and quietly claim a branch
-another workspace may now hold. The hints name the two honest substitutes: commit and `cowshed land` to keep the work,
-or `cowshed fork` a standalone workspace when checkpointing is what is actually wanted. Cowshed refuses rather than
-checkpointing something that cannot be restored.
-
 `cowshed rm` drops the registration as part of retirement, in the same host-side-state-first step that drops a reverse
 remote: remove the worktree registration from main's repository, then retire the image. Unregistering is the removal of
 that worktree's administrative directory and nothing else, because both commands that look more obvious are wrong here.
@@ -858,8 +833,8 @@ workspace looks exactly like that. A registration orphaned by an interrupted ret
 the mere observation that a registered worktree's path is not mounted.
 
 The mode is recorded store-side, in the workspace's detached sidecar, for the same reason: every decision it drives —
-refusing checkpoint, requiring main mounted, pruning the registration at retirement — has to be made while the workspace
-is detached and its mount can say nothing. A standalone workspace's sidecar omits the field.
+requiring main mounted, pruning the registration at retirement — has to be made while the workspace is detached and its
+mount can say nothing. A standalone workspace's sidecar omits the field.
 
 `cowshed mv` repairs registrations. Moving main under direct mount moves the gitdir every git-worktree workspace points
 at, and moving a workspace moves the path main's registration records; both directions are repaired inside the same
@@ -893,77 +868,15 @@ should not be rewriting it where the user lives.
 `git worktree list` as the inventory, and reviewing a workspace's commits from main with no fetch step at all. It is a
 deliberate trade of isolation for immediacy, taken per workspace, and never by default.
 
-## `cowshed checkpoint <ws> [label]` / `cowshed restore <ws> <label>`
+### Writer handoff
 
-- Both verbs refuse a git-worktree workspace before any quota is read or any barrier is taken (exit 4, `next:` hints —
-  see "Git-worktree workspaces"). Its history lives outside the image, so there is no self-contained state to capture
-  and nothing coherent to restore.
-- Before pausing the supervisor or cloning, cowshed reads the target workspace's coordinator-owned `CheckpointQuota` and
-  authoritative substrate stats. The projected count is its existing published checkpoint count plus one. The projected
-  bytes are its existing published checkpoint allocated bytes (pinned and automatic) plus the active image's
-  conservative allocated-byte charge. Other workspaces are isolated from this cap. Exact boundaries are allowed; an
-  over-boundary projection is `Conflict` with no checkpoint image, fact, detached-metadata, or barrier publication.
-- Checkpoint is a supervisor/filesystem barrier. Under the lifecycle lock, cowshed pauses admissions and artifact
-  writes, promotes every running memory-only stream prefix, and fsyncs protected files. It then appends and fsyncs
-  exactly
-  `ProtectedRecord::CheckpointManifest(CheckpointManifestRecord { version, repo_id, origin_incarnation, barrier_id, visible_jobs, records_sha256 })`.
-  `barrier_id` is positive and monotonic within `origin_incarnation`; `records_sha256` hashes the complete
-  protected-record stream prefix immediately before the manifest batch. `visible_jobs` contains
-  `VisibleJobCommitment { workspace_incarnation, job_id, state, stdout, stderr }`; each stream commitment is
-  `{storage_kind, bytes, sha256, protected_path}` with `storage_kind` exactly
-  `captured-inline|captured-file|redirect-inline|redirect-file` and `protected_path` present iff file.
-- With writes still quiesced, cowshed syncs for filesystem freshness and clones the image. The controller records the
-  audit
-  `ControllerCommitment::Checkpoint(CheckpointCommitment { version, order, repo_id, origin_incarnation, checkpoint_id, barrier_id, manifest_batch_sha256 })`,
-  then resumes. `manifest_batch_sha256` is the recovery frame's digest for the complete manifest batch. The manifest
-  defines every checkpoint-resident byte: terminal inline data is in a prior protected Job record covered by
-  `records_sha256`; every running prefix is an fsynced protected file. Complete batches/sealed files are immutable;
-  recovery may discard only an incomplete trailing frame while retaining and reporting its `batch_sha256`. Committed
-  digest/count mismatch is `Integrity`.
-- Restore follows the substrate transaction in 09_substrates.md: lock and revalidate the old incarnation/revision; stop
-  admissions and drain the supervisor and, on Linux, the connector; detach; prepare and verify a non-enumerated
-  same-format clone; verify its protected checkpoint manifest is complete and self-consistent (the manifest's own
-  `records_sha256` and batch digests); mint and write the fresh `workspaceIncarnation` and its `lineage` (the
-  checkpoint's origin incarnation, then that image's own ancestors) **before** minting its fresh token; atomically swap
-  the clone into the canonical name; attach and validate; on Linux create the fresh per-incarnation socket and
-  connector. At the same atomic publication boundary, publish detached metadata and switch gateway acceptance from the
-  old endpoint/token to the new; record the audit
-  `ControllerCommitment::Restore(RestoreCommitment { version, order, repo_id, source_checkpoint, source_incarnation, destination_incarnation })`;
-  only then admit the new supervisor. A missing artifact, hash/count/batch-digest mismatch, or malformed complete frame
-  fails restore as `Integrity`; cowshed never chooses the newer-looking side. The logical workspace identity, primary
-  `repo_id`, CA, and grant binding carry through; a macOS `portBlock` carries through only when present, while Linux has
-  none. The displaced image becomes `checkpoints/<ws>/pre-restore-<destination_incarnation>.<ext>` with its original
-  extension, so restore is undoable. The checkpoint source incarnation, the replaced active incarnation, and the fresh
-  destination incarnation are distinct roles; on repeated restore the checkpoint source can differ from the replaced
-  active generation. Before publication, failure restores the displaced workspace and old token and commits the staged
-  clone to `.deleting` like every other release; after the incarnation fence is published, recovery completes forward
-  and never exposes both tokens. Copied job records retain the incarnation that produced them, while the new incarnation
-  allocates workspace-local monotonic numeric job IDs above every inherited allocation. Restore restart recovery reads
-  only substrate facts: the canonical/pending detached metadata, the destination-keyed displaced image/grant/CA
-  sidecars, and the exact sibling `.restore.json` recovery fact described in 01a_apfs.md, "Restore publication custody".
-  Before durable pending-metadata publication it restores the old generation; afterward it leaves the new generation
-  pending for idempotent activation (the restore's audit record is emitted again on the way — the sink is telemetry, so
-  a repeat costs nothing it protects). Repeating startup recovery and activation cleanup has the same result. The
-  project runtime persists no restore fence, journal, or `.restore-fences` path.
-
-- `cowshed gc` retains every pinned checkpoint, every checkpoint younger than 14 days, and always the newest five per
-  workspace. A supplied label and `--keep` both create explicit pins; only an explicit unpin makes them eligible.
-  `CheckpointOptions.keep` carries the same pin request for programmatic callers. `WorkspaceInfo.checkpoints` always
-  projects the canonical `{label, revision, pinned}` facts (an empty array when none exist), so detached workspaces do
-  not need a mount or cached marker to report their retry points.
-
-### Checkpoint before writer handoff
-
-Before write responsibility passes from one writer to another, the current writer creates a checkpoint after stopping or
-quiescing its workspace writes. The checkpoint barrier also makes every supervisor-resident captured byte durable and
-publishes the protected manifest described above (and records the checkpoint audit record). That checkpoint is the
-recovery boundary for the handoff and includes the complete live workspace state, including committed and uncommitted
-files, plus exactly the job evidence committed by its manifest. The next writer may receive a fresh capability for the
-same attached, writable workspace, or the handoff may create a live copy-on-write fork from that workspace. A fork
-receives its own identity and closed-baseline grants as described above; the source and its checkpoint remain
-recoverable until the fork is accepted or independently preserved. A failed writer can therefore be replaced on the same
-workspace, or its attempt can be abandoned in favor of the validated checkpoint or an unaffected fork, without
-conflating handoff with publication or retirement.
+Before write responsibility passes from one writer to another, the current writer stops the workspace's jobs and
+quiesces its writes. The next writer then receives either a fresh capability for the same attached, writable workspace,
+or a live copy-on-write fork of that workspace (`cowshed fork`). A fork receives its own identity and closed-baseline
+grants as described above and starts from the workspace's state at the moment it is cloned, committed and uncommitted
+files alike. The source workspace is not changed by the fork and remains recoverable until the fork is accepted or
+independently preserved. A failed writer can therefore be replaced on the same workspace, or its attempt abandoned in
+favor of an unaffected fork, without conflating handoff with publication or retirement.
 
 ## `cowshed push <ws> [--branch <name>]`
 
@@ -1537,22 +1450,22 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    volume or failed release refuses while the source image and unfinished retirement journal remain.
 5. **Clean landed source: commit the release in this operation, free it in the background.** After the final
    dirty/in-progress, HEAD-stability and all-branch containment fences, detach the exact source and remove its scoped
-   checkpoints, restore artifacts, temporary directory and empty mountpoint through the existing retirement checks. Then
-   commit the release with one rename of the canonical source image, never replacing a file, to
-   `sessions/.deleting/<ws>-<incarnation>.dmg` and sync both directories, opening no byte of the image: before the
-   rename the workspace is whole, and after it nothing mounts, forks, fences or reads the image again. Right after the
-   rename is durable the removal nudges the gateway with one one-shot `released` request that returns at once
-   (05_gateway.md, "Deleting released images"), removes the CA companion, grants sidecar and facts and answers; it frees
-   no byte of the image and never waits for the free (16_build_volumes.md, "Garbage collection"), so no reply of this
-   verb waits for source-image bytes, and until the gateway's cleanup has freed the entry, the store's container still
-   holds the image's allocation: free space lags the removal. A gateway that is absent, does not answer or refuses is
-   said once on stderr and fails nothing, since the rename is the release: the entry waits for the gateway's next
-   listing. A failure before the rename refuses with the owner metadata and mutating intent kept for the same removal to
-   retry. `sessions/.deleting/` holds released images waiting to be freed, not a crash journal: a crash after the rename
-   leaves the entry, which nothing names, for the gateway's next start, and the next lifecycle open or recovery
-   reconciles the record the rename left imageless without waiting for the entry or freeing it, because the reconcile of
-   a canonical sidecar whose image is gone never depended on the bytes being freed. The removal's retry finds the
-   workspace already gone. An open confined to other workspaces neither reads nor waits for it.
+   temporary directory and empty mountpoint through the existing retirement checks. Then commit the release with one
+   rename of the canonical source image, never replacing a file, to `sessions/.deleting/<ws>-<incarnation>.dmg` and sync
+   both directories, opening no byte of the image: before the rename the workspace is whole, and after it nothing
+   mounts, forks, fences or reads the image again. Right after the rename is durable the removal nudges the gateway with
+   one one-shot `released` request that returns at once (05_gateway.md, "Deleting released images"), removes the CA
+   companion, grants sidecar and facts and answers; it frees no byte of the image and never waits for the free
+   (16_build_volumes.md, "Garbage collection"), so no reply of this verb waits for source-image bytes, and until the
+   gateway's cleanup has freed the entry, the store's container still holds the image's allocation: free space lags the
+   removal. A gateway that is absent, does not answer or refuses is said once on stderr and fails nothing, since the
+   rename is the release: the entry waits for the gateway's next listing. A failure before the rename refuses with the
+   owner metadata and mutating intent kept for the same removal to retry. `sessions/.deleting/` holds released images
+   waiting to be freed, not a crash journal: a crash after the rename leaves the entry, which nothing names, for the
+   gateway's next start, and the next lifecycle open or recovery reconciles the record the rename left imageless without
+   waiting for the entry or freeing it, because the reconcile of a canonical sidecar whose image is gone never depended
+   on the bytes being freed. The removal's retry finds the workspace already gone. An open confined to other workspaces
+   neither reads nor waits for it.
 
    A gitignored path is disposable by the project's own declaration and never keeps a recovery image: one ignored by the
    workspace's own rules (`.gitignore`, `.git/info/exclude`, the user's excludes file) or by the surviving target
@@ -1592,15 +1505,15 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    The destination directory and `recovery.json` become durable before any source transfer. The manifest records the
    project, workspace, incarnation, trash path, ordered file names, grants presence, recovery time and retirement reason
    (`unrecorded` when the deletion log has none). Files are derived from the image path: grants sidecar, CA companion,
-   checkpoint fact, restore-recovery fact, then the image. A foreign name, duplicate, wrong order, omitted companion
-   present on either side, or inconsistent grants flag refuses. Every component of the canonical directory chain opens
-   without following a symlink; held directory descriptors anchor file operations.
+   then the image. A foreign name, duplicate, wrong order, omitted companion present on either side, or inconsistent
+   grants flag refuses. Every component of the canonical directory chain opens without following a symlink; held
+   directory descriptors anchor file operations.
 
    After this admission and before transferring source bytes, the backend may reclaim the whole owned exec-temp
    environment under the same name lock. Only validated retired authority authorizes that ephemeral cleanup; a missing
    grants sidecar authorizes no inferred-name deletion. A live canonical or newer retired incarnation keeps the name's
    environment foreign and untouched. A mounted subtree refuses before source transfer. This cleanup deletes neither the
-   image nor checkpoints. Independently owned checkpoint data can still block terminal restore.
+   image.
 
    A version-1 same-filesystem manifest resumes the original ordered renames: companions first, image last, no
    replacement, both directories synced after each rename and before answering. Cross-filesystem recovery uses the
@@ -1758,19 +1671,18 @@ commits of the ceiling and how many more images fit: a warning while fewer than 
 error.
 
 An operation's demand is read from its request alone (`cowshed_core::media_room::attach_demand`). One that works in a
-workspace (attach, exec, a shell, a checkpoint, a push, a restore, a land or rebase, a grant, a defragment, a rekey, an
-Nx state clear, a worker handle, the build-state refresh `cowshed setup` runs) attaches it and its build volume, two
-images, when it is detached, and its build volume alone when only that is or when its checkout links none yet, since the
-build-state refresh may mint its first (16_build_volumes.md, "One link per checkout"): a mounted workspace's linked
-build volume is read from its build link, and both mounts from the kernel mount table, so an operation in a mounted
-workspace with its build volume never reads the IOKit count. A fork or rename attaches its destination the same way:
-new, and so detached, unless a resumed one is already mounted. Adoption attaches main and its first build volume; a
-resize or reseed one build image or seed beside the workspace's own; moving the checkout or changing the repository
-identity main. Reads, job and session traffic, `rm`, `detach`, `gc`, `doctor`, previews (`reseed --dry-run`,
-`land --preflight`) and project-wide grants attach nothing. The workspaces an operation names (a fork's or rename's
-destination and source, a land's or rebase's `into`, main when it names none, a reseed's `from`) are its own and never
-detached for it. A host whose count leaves room is read once, and nothing else happens; an `exec` of a mounted, served
-workspace answers before any of this (06_cli.md, "Resident workspaces").
+workspace (attach, exec, a shell, a push, a land or rebase, a grant, a defragment, a rekey, an Nx state clear, a worker
+handle, the build-state refresh `cowshed setup` runs) attaches it and its build volume, two images, when it is detached,
+and its build volume alone when only that is or when its checkout links none yet, since the build-state refresh may mint
+its first (16_build_volumes.md, "One link per checkout"): a mounted workspace's linked build volume is read from its
+build link, and both mounts from the kernel mount table, so an operation in a mounted workspace with its build volume
+never reads the IOKit count. A fork or rename attaches its destination the same way: new, and so detached, unless a
+resumed one is already mounted. Adoption attaches main and its first build volume; a resize one build image or seed
+beside the workspace's own; moving the checkout or changing the repository identity main. Reads, job and session
+traffic, `rm`, `detach`, `gc`, `doctor`, `land --preflight` and project-wide grants attach nothing. The workspaces an
+operation names (a fork's or rename's destination and source, a land's or rebase's `into`, main when it names none) are
+its own and never detached for it. A host whose count leaves room is read once, and nothing else happens; an `exec` of a
+mounted, served workspace answers before any of this (06_cli.md, "Resident workspaces").
 
 Three paths attach without making room. Attaching every detached session (`attach` with no name, `attach --all`) is an
 aggregate: detaching some sessions to attach others frees nothing, so each of its attaches says so in its request
@@ -2044,15 +1956,15 @@ endpoint and read-only flag, `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and `NX_SELF_H
 root as `COWSHED_BUILD_CACHE` (01a_apfs.md, "Dedicated build-cache volume"), the one spelling every consumer reads; a
 host without one omits the line. It never exports the bare token: a file every shell of the workspace sources hands its
 exports to every child, and `.cowshed/workspace.json`, not an environment variable, marks a workspace. One function
-derives the file from the workspace's recorded platform and block, and it is the file's only writer: create, fork and
-restore publish it as they mint, and every supervisor start publishes it again, so values are always current — a
-workspace minted before a variable existed gains it on its next start. The supervisor start alone also exports the
-sandbox's `TMPDIR` and `COWSHED_RUNTIME_LINK`, the workspace's short runtime link (04_sandbox.md): a mint may run at a
-staging mount, and the link is named after the mount the workspace is served at. Nothing is derived from cwd, guessed
-from a slot, or trusted from a marker alone.
+derives the file from the workspace's recorded platform and block, and it is the file's only writer: create and fork
+publish it as they mint, and every supervisor start publishes it again, so values are always current — a workspace
+minted before a variable existed gains it on its next start. The supervisor start alone also exports the sandbox's
+`TMPDIR` and `COWSHED_RUNTIME_LINK`, the workspace's short runtime link (04_sandbox.md): a mint may run at a staging
+mount, and the link is named after the mount the workspace is served at. Nothing is derived from cwd, guessed from a
+slot, or trusted from a marker alone.
 
-Shell hooks are optional repository input. Cowshed never creates or rewrites `.envrc` or `.envrc-local`, and adoption,
-fork and restore do not require either file or any ignore rule for it. A repository with no shell configuration uses the
+Shell hooks are optional repository input. Cowshed never creates or rewrites `.envrc` or `.envrc-local`, and adoption
+and fork do not require either file or any ignore rule for it. A repository with no shell configuration uses the
 ordinary sandbox environment; a project-owned `.envrc` needs no cowshed-specific loader.
 
 Projects that want interactive direnv shells to receive the published workspace values may add this optional line to
@@ -2100,7 +2012,7 @@ because it is used. The secrets invariant is what makes this safe; it is enforce
 teardown, a gitdir that is invalid the moment the image is cloned, and a workspace that is unusable whenever main is
 detached. A standalone `.git` arrives via CoW at zero marginal cost and the pull-based `cowshed push` replaces
 shared-state semantics with an explicit, auditable hand-back — so clone is what `cowshed fork` does. `--git-worktree`
-takes the trade deliberately, per workspace, and gives up checkpoint and restore for it (see "Git-worktree workspaces").
+takes the trade deliberately, per workspace (see "Git-worktree workspaces").
 
 **A git credential broker rejected — sandboxed git fetches, never pushes.** A smart-HTTP credential broker on the
 gateway would let sandboxed git reach real remotes with push, a git wire protocol to proxy faithfully, and

@@ -88,11 +88,9 @@ export interface NativeCoordinatorOperations
     NativeCoordinatorRevokeProject,
     NativeCoordinatorRebase,
     NativeCoordinatorLand,
-    NativeCoordinatorRestore,
     NativeCoordinatorResize,
     NativeCoordinatorDefragment,
     NativeCoordinatorRekey,
-    NativeCoordinatorReseed,
     NativeCoordinatorClearNxState,
     NativeCoordinatorDetach,
     NativeCoordinatorAssignSlot,
@@ -101,7 +99,6 @@ export interface NativeCoordinatorOperations
     NativeCoordinatorRecoverImage,
     NativeCoordinatorRemoveProject,
     NativeCoordinatorRepoMirror,
-    NativeCoordinatorSetCheckpointQuota,
     NativeCoordinatorDoctor,
     NativeCoordinatorWorker,
     NativeCoordinatorExec {}
@@ -116,7 +113,6 @@ export interface NativeWorkspaceHandleOperations
     NativeWorkerListJobs,
     NativeWorkerJob,
     NativeWorkerJobByKey,
-    NativeWorkerCheckpoint,
     NativeWorkerPush,
     NativeSessionClose {}
 
@@ -559,24 +555,6 @@ export async function coordinatorRepoMirror(
   return R.readMirrorInfo(await handle.repoMirror(JSON.stringify(args)));
 }
 
-/** A handle that serves `coordinator.reseed`. */
-export interface NativeCoordinatorReseed {
-  reseed(argumentsJson: string): Promise<string>;
-}
-
-/** The request fields a `coordinator.reseed` caller names; its handle binds the rest. */
-export type CoordinatorReseedArguments = Pick<Api.ReseedRequest, 'workspace' | 'from' | 'dryRun'>;
-
-/**
- * Replaces a workspace's build volume with a clone of an existing target seed.
- */
-export async function coordinatorReseed(
-  handle: NativeCoordinatorReseed,
-  args: CoordinatorReseedArguments,
-): Promise<Api.ReseedResult> {
-  return R.readReseedResult(await handle.reseed(JSON.stringify(args)));
-}
-
 /** A handle that serves `coordinator.resize`. */
 export interface NativeCoordinatorResize {
   resize(argumentsJson: string): Promise<string>;
@@ -593,24 +571,6 @@ export async function coordinatorResize(
   args: CoordinatorResizeArguments,
 ): Promise<Api.ResizeResult> {
   return R.readResizeResult(await handle.resize(JSON.stringify(args)));
-}
-
-/** A handle that serves `coordinator.restore`. */
-export interface NativeCoordinatorRestore {
-  restore(argumentsJson: string): Promise<string>;
-}
-
-/** The request fields a `coordinator.restore` caller names; its handle binds the rest. */
-export type CoordinatorRestoreArguments = Pick<Api.RestoreRequest, 'workspace' | 'label'>;
-
-/**
- * Restores a workspace to a checkpoint.
- */
-export async function coordinatorRestore(
-  handle: NativeCoordinatorRestore,
-  args: CoordinatorRestoreArguments,
-): Promise<Api.EmptyResult> {
-  return R.readEmptyResult(await handle.restore(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.revoke`. */
@@ -647,24 +607,6 @@ export async function coordinatorRevokeProject(
   args: CoordinatorRevokeProjectArguments,
 ): Promise<Api.ProjectGrants> {
   return R.readProjectGrants(await handle.revokeProject(JSON.stringify(args)));
-}
-
-/** A handle that serves `coordinator.setCheckpointQuota`. */
-export interface NativeCoordinatorSetCheckpointQuota {
-  setCheckpointQuota(argumentsJson: string): Promise<string>;
-}
-
-/** The request fields a `coordinator.setCheckpointQuota` caller names; its handle binds the rest. */
-export type CoordinatorSetCheckpointQuotaArguments = Pick<Api.QuotaRequest, 'workspace' | 'quota'>;
-
-/**
- * Sets a workspace's checkpoint quota.
- */
-export async function coordinatorSetCheckpointQuota(
-  handle: NativeCoordinatorSetCheckpointQuota,
-  args: CoordinatorSetCheckpointQuotaArguments,
-): Promise<Api.EmptyResult> {
-  return R.readEmptyResult(await handle.setCheckpointQuota(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.worker`. */
@@ -1435,24 +1377,6 @@ export type SessionCloseArguments = Pick<Api.SessionRequest, 'session'>;
  */
 export async function sessionClose(handle: NativeSessionClose, args: SessionCloseArguments): Promise<Api.EmptyResult> {
   return R.readEmptyResult(await handle.close(JSON.stringify(args)));
-}
-
-/** A handle that serves `worker.checkpoint`. */
-export interface NativeWorkerCheckpoint {
-  checkpoint(argumentsJson: string): Promise<string>;
-}
-
-/** The request fields a `worker.checkpoint` caller names; its handle binds the rest. */
-export type WorkerCheckpointArguments = Pick<Api.CheckpointRequest, 'options'>;
-
-/**
- * Takes a checkpoint.
- */
-export async function workerCheckpoint(
-  handle: NativeWorkerCheckpoint,
-  args: WorkerCheckpointArguments,
-): Promise<Api.CheckpointResult> {
-  return R.readCheckpointResult(await handle.checkpoint(JSON.stringify(args)));
 }
 
 /** A handle that serves `worker.exec`. */

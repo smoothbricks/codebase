@@ -33,14 +33,6 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         DirectoryExecutionHost::canonical_metadata(self, repo, workspace)
     }
 
-    fn pending_publications_for(
-        &self,
-        repo: &RepoId,
-        workspaces: Option<&std::collections::BTreeSet<WorkspaceName>>,
-    ) -> Result<Vec<crate::storage::apfs::PendingPublicationFact>, ApfsStorageError> {
-        DirectoryExecutionHost::pending_publications_for(self, repo, workspaces)
-    }
-
     fn workspace_snapshot(
         &self,
         repo: &RepoId,

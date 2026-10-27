@@ -12,7 +12,6 @@ use cowshed_core::metadata::{
     WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
-use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, Alongside, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError,
     ApfsSubstrate, ApfsSubstrateConfig, Beside, DEFAULT_IMAGE_CAPACITY, FoundMount,
@@ -20,11 +19,10 @@ use cowshed_core::storage::apfs::{
     ResumableClone, ResumedMount, RetireExecutionError, StagedExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptHandoff, AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount,
-    KernelMountFact, LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountJoin,
-    MountState, OperationIdentity, Pin, PlanError, ResizeOutcome, RestoreMode, RetiredRef,
-    Revision, StorageFact, StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate,
-    SubstrateStats,
+    AdoptHandoff, AdoptRequest, DefragmentOutcome, Destination, ExtentCount, KernelMountFact,
+    LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountJoin, MountState,
+    OperationIdentity, PlanError, ResizeOutcome, RetiredRef, Revision, StorageFact,
+    StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
 };
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use proptest::prelude::*;
@@ -39,7 +37,6 @@ struct FakeState {
     mounted: BTreeMap<(RepoId, WorkspaceName), KernelMountFact>,
     staged: BTreeMap<PathBuf, StorageFact>,
     pending: BTreeMap<PathBuf, StorageFact>,
-    checkpoints: Vec<CheckpointFact>,
     next_mount_id: u64,
     paths: Vec<PathBuf>,
     mount_paths: Vec<PathBuf>,
@@ -53,8 +50,6 @@ struct FakeState {
 struct FakeHost {
     state: Arc<Mutex<FakeState>>,
     marker_validations_before_failure: Arc<AtomicUsize>,
-    fail_metadata_once: Arc<AtomicBool>,
-    fail_restored_metadata_once: Arc<AtomicBool>,
     fail_reclaim_once: Arc<AtomicBool>,
     fail_credentials_once: Arc<AtomicBool>,
     fail_extent_proof_once: Arc<AtomicBool>,
@@ -66,8 +61,6 @@ impl Default for FakeHost {
         Self {
             state: Arc::default(),
             marker_validations_before_failure: Arc::new(AtomicUsize::new(usize::MAX)),
-            fail_metadata_once: Arc::default(),
-            fail_restored_metadata_once: Arc::default(),
             fail_credentials_once: Arc::default(),
             fail_reclaim_once: Arc::default(),
             fail_extent_proof_once: Arc::default(),
@@ -145,6 +138,11 @@ impl FakeHost {
         self.state.lock().expect("fake state").unformatted_adopt = true;
     }
 
+    /// The canonical images still waiting to be published, as the fake holds them.
+    fn pending_clone_count(&self) -> usize {
+        self.state.lock().expect("fake state").pending.len()
+    }
+
     fn pending_adopt(&self) -> Option<PendingAdoption> {
         self.state
             .lock()
@@ -177,23 +175,9 @@ impl FakeHost {
             .store(0, Ordering::SeqCst);
     }
 
-    fn fail_marker_after(&self, successful_validations: usize) {
-        self.marker_validations_before_failure
-            .store(successful_validations, Ordering::SeqCst);
-    }
-
-    fn fail_next_metadata(&self) {
-        self.fail_metadata_once.store(true, Ordering::SeqCst);
-    }
-
     fn fail_next_credentials(&self) {
         self.fail_credentials_once.store(true, Ordering::SeqCst);
     }
-    fn fail_next_restored_metadata(&self) {
-        self.fail_restored_metadata_once
-            .store(true, Ordering::SeqCst);
-    }
-
     fn fail_next_reclaim(&self) {
         self.fail_reclaim_once.store(true, Ordering::SeqCst);
     }
@@ -255,17 +239,6 @@ impl ApfsExecutionHost for FakeHost {
                     repo: repo.clone(),
                     name: name.clone(),
                     topology_revision: *topology_revision,
-                },
-                LifecycleFact::Checkpoint {
-                    repo,
-                    workspace,
-                    label,
-                    revision,
-                } => LifecycleFact::Checkpoint {
-                    repo: repo.clone(),
-                    workspace: workspace.clone(),
-                    label: label.clone(),
-                    revision: *revision,
                 },
             })
             .collect())
@@ -700,11 +673,6 @@ impl ApfsExecutionHost for FakeHost {
         _: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
         self.record(format!("atomic-metadata+parent-fsync:{policy:?}"));
-        if self.fail_metadata_once.swap(false, Ordering::SeqCst) {
-            return Err(ApfsStorageError::Host(
-                "injected metadata failure".to_owned(),
-            ));
-        }
         if revision != workspace.revision()
             && matches!(
                 policy,
@@ -769,113 +737,6 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
-    fn publish_checkpoint_fact(
-        &self,
-        _: &Path,
-        label: &CheckpointLabel,
-        revision: Revision,
-        pin: Pin,
-    ) -> Result<(), ApfsStorageError> {
-        let workspace = self
-            .state
-            .lock()
-            .expect("fake state")
-            .published
-            .values()
-            .find(|fact| fact.workspace.name().is_main())
-            .expect("published workspace")
-            .workspace
-            .clone();
-        self.state
-            .lock()
-            .expect("fake state")
-            .checkpoints
-            .push(CheckpointFact {
-                repo: workspace.repo().clone(),
-                workspace: workspace.name().clone(),
-                label: label.clone(),
-                revision,
-                pin,
-            });
-        self.record(format!("checkpoint-fact:{pin:?}"));
-        Ok(())
-    }
-
-    fn restore_swap(
-        &self,
-        staged: &Path,
-        canonical: &Path,
-        undo: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        self.record("atomic-restore-swap+undo");
-        self.record_path(staged);
-        self.record_path(canonical);
-        self.record_path(undo);
-        Ok(())
-    }
-
-    fn publish_restored_metadata(
-        &self,
-        _: &Path,
-        canonical: &Path,
-        workspace: &LifecycleWorkspace,
-        revision: Revision,
-        source_image: &Path,
-        replaced_incarnation: &WorkspaceIncarnation,
-    ) -> Result<cowshed_core::storage::apfs::PendingPublicationFact, ApfsStorageError> {
-        self.record("publish-restored-metadata-after-mount");
-        if self
-            .fail_restored_metadata_once
-            .swap(false, Ordering::SeqCst)
-        {
-            return Err(ApfsStorageError::Host(
-                "injected restored metadata failure".to_owned(),
-            ));
-        }
-        self.publish_metadata(
-            canonical,
-            workspace,
-            revision,
-            MetadataPolicy::PendingFence,
-            None,
-            Some(source_image),
-        )?;
-        Ok(cowshed_core::storage::apfs::PendingPublicationFact {
-            workspace: workspace.clone(),
-            image: canonical.to_owned(),
-            mount_point: if workspace.name().is_main() {
-                PathBuf::from("/project")
-            } else {
-                PathBuf::from(format!(
-                    "/store/mnt/{}/{}",
-                    workspace.repo(),
-                    workspace.name()
-                ))
-            },
-            source_checkpoint: source_image
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .expect("checkpoint name")
-                .to_owned(),
-            source_incarnation: WorkspaceIncarnation::new("ffffffffffffffffffffffffffffffff")
-                .expect("source incarnation"),
-            replaced_incarnation: replaced_incarnation.clone(),
-            destination_incarnation: workspace.incarnation().clone(),
-        })
-    }
-
-    fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError> {
-        self.record("activate-restored-metadata");
-        let mut state = self.state.lock().expect("fake state");
-        let fact = state
-            .pending
-            .remove(canonical)
-            .ok_or_else(|| ApfsStorageError::PendingPublication(canonical.to_owned()))?;
-        let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
-        state.published.insert(key, fact);
-        Ok(())
-    }
-
     fn activate_pending(
         &self,
         image: &Path,
@@ -896,11 +757,6 @@ impl ApfsExecutionHost for FakeHost {
         state.published.insert(key, fact);
         state.resumable_clone = None;
         state.resumable_adopt = None;
-        Ok(())
-    }
-
-    fn rollback_restore(&self, _: &Path, _: &Path, _: &Path) -> Result<(), ApfsStorageError> {
-        self.record("rollback-before-publication");
         Ok(())
     }
 
@@ -1000,45 +856,6 @@ impl ApfsExecutionHost for FakeHost {
         })
     }
 
-    fn pending_publications(
-        &self,
-        repo: &RepoId,
-    ) -> Result<Vec<cowshed_core::storage::apfs::PendingPublicationFact>, ApfsStorageError> {
-        Ok(self
-            .state
-            .lock()
-            .expect("fake state")
-            .pending
-            .iter()
-            .filter(|(_, fact)| fact.workspace.repo() == repo)
-            .map(
-                |(image, fact)| cowshed_core::storage::apfs::PendingPublicationFact {
-                    workspace: fact.workspace.clone(),
-                    image: image.clone(),
-                    mount_point: if fact.workspace.name().is_main() {
-                        PathBuf::from("/project")
-                    } else {
-                        PathBuf::from(format!(
-                            "/store/mnt/{}/{}",
-                            fact.workspace.repo(),
-                            fact.workspace.name()
-                        ))
-                    },
-                    source_checkpoint: "checkpoint-source".to_owned(),
-                    source_incarnation: WorkspaceIncarnation::new(
-                        "ffffffffffffffffffffffffffffffff",
-                    )
-                    .expect("source incarnation"),
-                    replaced_incarnation: WorkspaceIncarnation::new(
-                        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                    )
-                    .expect("replaced incarnation"),
-                    destination_incarnation: fact.workspace.incarnation().clone(),
-                },
-            )
-            .collect())
-    }
-
     fn mounts(&self, repo: &RepoId) -> Result<Vec<MountJoin>, ApfsStorageError> {
         Ok(self
             .state
@@ -1048,18 +865,6 @@ impl ApfsExecutionHost for FakeHost {
             .iter()
             .filter(|((mounted_repo, _), _)| mounted_repo == repo)
             .map(|(_, fact)| MountJoin::Proven(fact.clone()))
-            .collect())
-    }
-
-    fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError> {
-        Ok(self
-            .state
-            .lock()
-            .expect("fake state")
-            .checkpoints
-            .iter()
-            .filter(|checkpoint| &checkpoint.repo == repo)
-            .cloned()
             .collect())
     }
 
@@ -1096,9 +901,6 @@ impl ApfsExecutionHost for FakeHost {
         Ok(SubstrateStats {
             logical_bytes: 4096,
             allocated_bytes: 1024,
-            checkpoint_count: 3,
-            checkpoint_bytes: 3072,
-            pinned_checkpoint_bytes: 2048,
         })
     }
 
@@ -1121,9 +923,7 @@ impl ApfsExecutionHost for FakeHost {
         Ok(StorageGcReport {
             examined: 2,
             reclaimed: 1,
-            retained_pinned: 1,
             retained_active: 0,
-            retained_recent: 0,
             released_bytes: 1024,
             deferred: Vec::new(),
             root_held_mountpoints: Vec::new(),
@@ -2022,135 +1822,7 @@ async fn marker_mismatch_detaches_and_reclaims_staging_before_publication() {
 }
 
 #[tokio::test]
-async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
-    let host = FakeHost::default();
-    let current = workspace("raven", 7);
-    host.seed(&current);
-    let substrate = substrate(host.clone(), CountingLane::default());
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
-        current.clone(),
-        CheckpointLabel::new("ready").expect("label"),
-        Revision::new(8),
-        true,
-    );
-    let plan = substrate
-        .plan_restore(
-            &current,
-            &checkpoint,
-            cowshed_core::storage::lifecycle::RestoreMode::Replace,
-            identity(),
-        )
-        .expect("restore plan");
-    host.fail_next_metadata();
-    host.clear_events();
-
-    substrate
-        .execute_restore_staged(plan, |_| async { Ok::<(), &'static str>(()) })
-        .await
-        .expect_err("staging metadata failure");
-
-    let events = host.events();
-    assert!(!events.contains(&"atomic-restore-swap+undo".to_owned()));
-    assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"detach-mounted:Release".to_owned()));
-    assert!(!events.contains(&"attach-mounted+checked".to_owned()));
-    assert_eq!(
-        host.list(&repo()).expect("active workspace"),
-        vec![StorageFact {
-            workspace: current,
-            volume_key: volume_key(&repo(), &WorkspaceName::new("raven").expect("workspace")),
-        }]
-    );
-}
-
-#[tokio::test]
-async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
-    let host = FakeHost::default();
-    let current = workspace("raven", 7);
-    host.seed(&current);
-    let substrate = substrate(host.clone(), CountingLane::default());
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
-        current.clone(),
-        CheckpointLabel::new("ready").expect("label"),
-        Revision::new(8),
-        true,
-    );
-    let plan = substrate
-        .plan_restore(
-            &current,
-            &checkpoint,
-            cowshed_core::storage::lifecycle::RestoreMode::Replace,
-            identity(),
-        )
-        .expect("restore plan");
-    host.fail_marker_after(2);
-    host.clear_events();
-
-    substrate
-        .execute_restore_staged(plan, |_| async { Ok::<(), &'static str>(()) })
-        .await
-        .expect_err("canonical marker failure");
-
-    let events = host.events();
-    let swap = events
-        .iter()
-        .position(|event| event == "atomic-restore-swap+undo")
-        .expect("swap");
-    let rollback = events
-        .iter()
-        .position(|event| event == "rollback-before-publication")
-        .expect("rollback");
-    assert!(swap < rollback);
-    assert!(
-        events[rollback + 1..]
-            .iter()
-            .any(|event| event == "attach-mounted+checked")
-    );
-    assert_eq!(events.last().map(String::as_str), Some("retain-mounted"));
-}
-
-#[tokio::test]
-async fn restore_metadata_publication_failure_rolls_back_after_verified_mount() {
-    let host = FakeHost::default();
-    let current = workspace("raven", 7);
-    host.seed(&current);
-    let substrate = substrate(host.clone(), CountingLane::default());
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
-        current.clone(),
-        CheckpointLabel::new("ready").expect("label"),
-        Revision::new(8),
-        true,
-    );
-    let plan = substrate
-        .plan_restore(&current, &checkpoint, RestoreMode::Replace, identity())
-        .expect("restore plan");
-    host.fail_next_restored_metadata();
-    host.clear_events();
-
-    substrate
-        .execute_restore_staged(plan, |_| async { Ok::<(), &'static str>(()) })
-        .await
-        .expect_err("restored metadata publication failure");
-
-    let events = host.events();
-    let publication = events
-        .iter()
-        .position(|event| event == "publish-restored-metadata-after-mount")
-        .expect("publication attempt");
-    let marker = events[..publication]
-        .iter()
-        .rposition(|event| event == "validate-marker")
-        .expect("canonical marker");
-    let rollback = events
-        .iter()
-        .position(|event| event == "rollback-before-publication")
-        .expect("rollback");
-    assert!(marker < publication && publication < rollback);
-    assert_eq!(events.last().map(String::as_str), Some("retain-mounted"));
-}
-
-#[tokio::test]
-async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin() {
+async fn lifecycle_receipts_preserve_exact_revisions_and_topology_for_create_and_fork() {
     let host = FakeHost::default();
     let source = workspace("main", 5);
     host.seed(&source);
@@ -2198,102 +1870,24 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert_eq!(forked.workspace.revision(), Revision::new(6));
     assert_eq!(forked.workspace.topology_revision(), Revision::new(11));
 
-    let exact_label = CheckpointLabel::new("exact").expect("label");
-    assert_eq!(exact_label.as_str(), "exact");
-    assert_eq!(format!("{exact_label}"), "exact");
-    let checkpoint = substrate
-        .execute_checkpoint_staged(
-            substrate
-                .plan_checkpoint(&source, exact_label, Pin::Pinned)
-                .expect("checkpoint plan"),
-            |_| async { Ok::<(), &'static str>(()) },
-        )
-        .await
-        .expect("checkpoint");
-    assert_eq!(checkpoint.revision(), Revision::new(6));
-    assert!(checkpoint.pinned());
-
-    let restored = substrate
-        .execute_restore_staged(
-            substrate
-                .plan_restore(&source, &checkpoint, RestoreMode::Replace, identity())
-                .expect("restore plan"),
-            |_| async { Ok::<(), &'static str>(()) },
-        )
-        .await
-        .expect("restore");
-    assert_eq!(restored.previous_incarnation, *source.incarnation());
-    assert_eq!(restored.workspace.revision(), Revision::new(6));
-    assert_eq!(
-        restored.workspace.topology_revision(),
-        source.topology_revision()
-    );
     assert_eq!(
         host.events()
             .iter()
             .filter(|event| event.as_str() == "mint-workspace-credentials")
             .count(),
-        3,
-        "create, fork, and replacement restore each mint one fresh authority"
+        2,
+        "create and fork each mint one fresh authority"
     );
     let relabels: Vec<_> = host
         .events()
         .into_iter()
         .filter(|event| event.starts_with("rename-volume:"))
         .collect();
-    assert_eq!(
-        relabels,
-        [format!(
-            "rename-volume:{}",
-            substrate
-                .config()
-                .namespace
-                .volume_label(format_args!("acme · widget — main"))
-        )],
-        "a replacement restore relabels its staging volume before publication; create and fork \
-         leave the inherited label to the workspace's supervisor, off the provisioning path"
+    assert!(
+        relabels.is_empty(),
+        "create and fork leave the inherited label to the workspace's supervisor, off the provisioning path"
     );
 
-    let restore_events = host.events();
-    let restore_swap = restore_events
-        .iter()
-        .position(|event| event == "atomic-restore-swap+undo")
-        .expect("restore swap");
-    let restore_marker = restore_events
-        .iter()
-        .rposition(|event| event == "validate-marker")
-        .expect("canonical marker validation");
-    let metadata_publication = restore_events
-        .iter()
-        .position(|event| event == "publish-restored-metadata-after-mount")
-        .expect("restored metadata publication");
-    assert!(
-        restore_swap < restore_marker && restore_marker < metadata_publication,
-        "replacement metadata must publish only after canonical mount and marker verification"
-    );
-    assert_eq!(
-        host.mount_paths()
-            .iter()
-            .filter(|path| path
-                .components()
-                .any(|component| component.as_os_str() == ".staging"))
-            .count(),
-        1,
-        "only replacement restore uses a hidden staging mount; create and fork mount canonical once"
-    );
-    let paths = host.paths();
-    assert!(
-        paths.iter().any(|path| path
-            .components()
-            .any(|component| component.as_os_str() == ".staging")),
-        "replacement restore preparation must use a hidden staging mount"
-    );
-    assert!(
-        paths.iter().any(|path| path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("pre-restore-"))),
-        "restore must retain a pre-restore undo image"
-    );
     let listed = substrate.list(&repo()).await.expect("list");
     assert!(
         listed
@@ -2305,20 +1899,10 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
             .iter()
             .any(|observed| observed.workspace == forked.workspace)
     );
-    let restored_observation = listed
-        .iter()
-        .find(|observed| observed.workspace == restored.workspace)
-        .expect("restored observation");
-    assert_eq!(
-        restored_observation.mount_state,
-        MountState::Mounted { mount_id: 3 }
-    );
-    assert_eq!(restored_observation.checkpoints.len(), 1);
-    assert_eq!(restored_observation.checkpoints[0].pin, Pin::Pinned);
 
     host.clear_events();
     substrate
-        .unmount(&restored.workspace)
+        .unmount(&created.workspace)
         .await
         .expect("unmount");
     assert_eq!(
@@ -2326,14 +1910,14 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         [
             "lock:1".to_owned(),
             "detach-mounted:WhenIdle".to_owned(),
-            format!("detach-build-volumes:{}", restored.workspace.name()),
+            format!("detach-build-volumes:{}", created.workspace.name()),
         ]
     );
 }
 
 /// A new workspace's clone proves its extents between the clone and the attach, and nothing writes
 /// it before its attach: its read-write mount pays the extent-map copy. A refused proof attaches
-/// nothing, and a checkpoint's clone is only cloned.
+/// nothing.
 #[tokio::test]
 async fn a_new_workspace_is_proven_after_its_clone_and_before_its_attach() {
     let host = FakeHost::default();
@@ -2437,100 +2021,8 @@ async fn a_new_workspace_is_proven_after_its_clone_and_before_its_attach() {
             "post-initializer refusal preserves the exact pending clone"
         );
     }
-
-    host.clear_events();
-    substrate
-        .execute_checkpoint_staged(
-            substrate
-                .plan_checkpoint(
-                    &source,
-                    CheckpointLabel::new("kept").expect("label"),
-                    Pin::Pinned,
-                )
-                .expect("checkpoint plan"),
-            |_| async { Ok::<(), &'static str>(()) },
-        )
-        .await
-        .expect("checkpoint");
-    let events = host.events();
-    assert!(events.iter().any(|event| event == "clone"), "{events:?}");
 }
 
-#[tokio::test]
-async fn repeated_restore_preserves_checkpoint_replaced_and_destination_identities() {
-    let host = FakeHost::default();
-    let original = workspace("main", 7);
-    host.seed(&original);
-    let substrate = substrate(host.clone(), CountingLane::default());
-    let label = CheckpointLabel::new("retained-origin").expect("checkpoint label");
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
-        original.clone(),
-        label.clone(),
-        Revision::new(8),
-        true,
-    );
-    let checkpoint_source =
-        WorkspaceIncarnation::new("ffffffffffffffffffffffffffffffff").expect("checkpoint source");
-
-    let expected_source = checkpoint_source.clone();
-    let expected_replaced = original.incarnation().clone();
-    let first = substrate
-        .execute_restore_staged(
-            substrate
-                .plan_restore(&original, &checkpoint, RestoreMode::Replace, identity())
-                .expect("first restore plan"),
-            move |fence| async move {
-                assert_eq!(fence.pending.source_checkpoint, "retained-origin");
-                assert_eq!(fence.pending.source_incarnation, expected_source);
-                assert_eq!(fence.pending.replaced_incarnation, expected_replaced);
-                assert_eq!(
-                    fence.pending.destination_incarnation,
-                    *fence.pending.workspace.incarnation()
-                );
-                Ok::<(), &'static str>(())
-            },
-        )
-        .await
-        .expect("first restore");
-
-    let repeated_checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
-        first.workspace.clone(),
-        label,
-        Revision::new(8),
-        true,
-    );
-    let first_destination = first.workspace.incarnation().clone();
-    let expected_source = checkpoint_source.clone();
-    let expected_replaced = first_destination.clone();
-    let second = substrate
-        .execute_restore_staged(
-            substrate
-                .plan_restore(
-                    &first.workspace,
-                    &repeated_checkpoint,
-                    RestoreMode::Replace,
-                    identity(),
-                )
-                .expect("second restore plan"),
-            move |fence| async move {
-                assert_eq!(fence.pending.source_checkpoint, "retained-origin");
-                assert_eq!(fence.pending.source_incarnation, expected_source);
-                assert_eq!(fence.pending.replaced_incarnation, expected_replaced);
-                assert_eq!(
-                    fence.pending.destination_incarnation,
-                    *fence.pending.workspace.incarnation()
-                );
-                Ok::<(), &'static str>(())
-            },
-        )
-        .await
-        .expect("second restore");
-
-    assert_eq!(first.previous_incarnation, *original.incarnation());
-    assert_eq!(second.previous_incarnation, first_destination);
-    assert_ne!(checkpoint_source, second.previous_incarnation);
-    assert_ne!(second.previous_incarnation, *second.workspace.incarnation());
-}
 #[tokio::test]
 async fn staged_retire_fences_after_durable_undiscovery_and_preserves_trash_on_failure() {
     let host = FakeHost::default();
@@ -2690,9 +2182,6 @@ async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
         SubstrateStats {
             logical_bytes: 4096,
             allocated_bytes: 1024,
-            checkpoint_count: 3,
-            checkpoint_bytes: 3072,
-            pinned_checkpoint_bytes: 2048,
         }
     );
     let gc_plan = substrate
@@ -2796,12 +2285,7 @@ async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_res
             1,
             "the crash-left canonical mount must survive for resume"
         );
-        assert_eq!(
-            host.pending_publications(&repo())
-                .expect("pending clone")
-                .len(),
-            1
-        );
+        assert_eq!(host.pending_clone_count(), 1);
         let events = host.events();
         assert!(!events.iter().any(|event| event.starts_with("detach:")));
         assert!(!events.contains(&"idempotent-reclaim".to_owned()));
@@ -2837,11 +2321,7 @@ async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_res
                 .expect("resume create")
         };
         assert_eq!(resumed.workspace.name(), &destination_name);
-        assert!(
-            host.pending_publications(&repo())
-                .expect("pending clone after resume")
-                .is_empty()
-        );
+        assert_eq!(host.pending_clone_count(), 0);
     }
 }
 
@@ -2879,14 +2359,14 @@ async fn a_refused_initializer_reclaims_a_fresh_clone_unless_it_reaches_main() {
                 },
             )
             .await;
-        let pending = host.pending_publications(&repo()).expect("pending clones");
+        let pending = host.pending_clone_count();
         let events = host.events();
         if git_worktree {
             assert!(matches!(
                 refusal,
                 Err(StagedExecutionError::Initializer("escaping link"))
             ));
-            assert_eq!(pending.len(), 1, "the registration's clone stays to resume");
+            assert_eq!(pending, 1, "the registration's clone stays to resume");
             assert_eq!(host.mounted_paths_now().len(), 1);
             assert!(!events.contains(&"idempotent-reclaim".to_owned()));
         } else {
@@ -2894,7 +2374,7 @@ async fn a_refused_initializer_reclaims_a_fresh_clone_unless_it_reaches_main() {
                 refusal,
                 Err(StagedExecutionError::InitializerReclaimed("escaping link"))
             ));
-            assert!(pending.is_empty(), "the refused clone is reclaimed");
+            assert_eq!(pending, 0, "the refused clone is reclaimed");
             assert!(host.mounted_paths_now().is_empty());
             assert!(events.contains(&"detach:Release".to_owned()));
             assert!(events.contains(&"idempotent-reclaim".to_owned()));
@@ -2919,172 +2399,8 @@ async fn a_refused_initializer_reclaims_a_fresh_clone_unless_it_reaches_main() {
             !git_worktree,
             "only a reclaimed clone is cloned again"
         );
-        assert!(
-            host.pending_publications(&repo())
-                .expect("pending clones after retry")
-                .is_empty()
-        );
+        assert_eq!(host.pending_clone_count(), 0);
     }
-}
-
-#[tokio::test]
-async fn checkpoint_barrier_runs_under_lock_before_snapshot_clone() {
-    let host = FakeHost::default();
-    let source = workspace("main", 5);
-    host.seed(&source);
-    let substrate = substrate(host.clone(), CountingLane::default());
-    let callback_host = host.clone();
-
-    substrate
-        .execute_checkpoint_staged(
-            substrate
-                .plan_checkpoint(
-                    &source,
-                    CheckpointLabel::new("durable-prefix").expect("label"),
-                    Pin::Pinned,
-                )
-                .expect("checkpoint plan"),
-            move |stage| async move {
-                assert!(
-                    stage
-                        .image
-                        .components()
-                        .any(|component| component.as_os_str() == "checkpoints")
-                );
-                assert!(
-                    !callback_host
-                        .events()
-                        .iter()
-                        .any(|event| event.as_str() == "clone"),
-                    "snapshot clone started before the artifact barrier completed"
-                );
-                callback_host.record("artifact-barrier+manifest-fsync");
-                Ok::<(), &'static str>(())
-            },
-        )
-        .await
-        .expect("checkpoint");
-
-    let events = host.events();
-    let barrier = events
-        .iter()
-        .position(|event| event == "artifact-barrier+manifest-fsync")
-        .expect("barrier event");
-    let clone = events
-        .iter()
-        .position(|event| event == "clone")
-        .expect("snapshot clone");
-    let publication = events
-        .iter()
-        .position(|event| event == "checkpoint-fact:Pinned")
-        .expect("checkpoint publication");
-    assert!(barrier < clone && clone < publication);
-    assert_eq!(events[0], "lock:1");
-}
-
-#[tokio::test]
-async fn aborting_checkpoint_barrier_creates_no_snapshot_or_fact() {
-    let host = FakeHost::default();
-    let source = workspace("main", 5);
-    host.seed(&source);
-    let substrate = substrate(host.clone(), CountingLane::default());
-    let plan = substrate
-        .plan_checkpoint(
-            &source,
-            CheckpointLabel::new("cancelled").expect("label"),
-            Pin::Automatic,
-        )
-        .expect("checkpoint plan");
-    let entered = Arc::new(AtomicBool::new(false));
-    let callback_entered = Arc::clone(&entered);
-    let task = tokio::spawn(async move {
-        substrate
-            .execute_checkpoint_staged(plan, move |_| async move {
-                callback_entered.store(true, Ordering::SeqCst);
-                std::future::pending::<Result<(), &'static str>>().await
-            })
-            .await
-    });
-
-    abort_at_callback(task, entered).await;
-
-    assert_no_orphan_stage(&host);
-    assert!(!host.events().iter().any(|event| event.as_str() == "clone"));
-    assert!(host.checkpoints(&repo()).expect("checkpoints").is_empty());
-}
-
-#[tokio::test]
-async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
-    let host = FakeHost::default();
-    let current = workspace("raven", 7);
-    host.seed(&current);
-    let substrate = substrate(host.clone(), CountingLane::default());
-    let checkpoint = cowshed_core::storage::lifecycle::CheckpointRef::new(
-        current.clone(),
-        CheckpointLabel::new("ready").expect("label"),
-        Revision::new(8),
-        true,
-    );
-    let plan = substrate
-        .plan_restore(&current, &checkpoint, RestoreMode::Replace, identity())
-        .expect("restore plan");
-    let entered = Arc::new(AtomicBool::new(false));
-    let callback_entered = Arc::clone(&entered);
-    let pending_workspace = Arc::new(Mutex::new(None));
-    let callback_workspace = Arc::clone(&pending_workspace);
-    let task = {
-        let substrate = substrate.clone();
-        tokio::spawn(async move {
-            substrate
-                .execute_restore_staged(plan, move |fence| async move {
-                    *callback_workspace.lock().expect("pending workspace") =
-                        Some(fence.pending.workspace);
-                    callback_entered.store(true, Ordering::SeqCst);
-                    std::future::pending::<Result<(), &'static str>>().await
-                })
-                .await
-        })
-    };
-
-    abort_at_callback(task, entered).await;
-
-    assert_eq!(
-        host.pending_publications(&repo())
-            .expect("pending publication")
-            .len(),
-        1
-    );
-    assert!(
-        host.mounted_paths_now().iter().all(|path| !path
-            .components()
-            .any(|component| component.as_os_str() == ".staging")),
-        "the persisted pending publication must not retain a staging mount"
-    );
-    let replacement = pending_workspace
-        .lock()
-        .expect("pending workspace")
-        .clone()
-        .expect("replacement workspace");
-    substrate
-        .ensure_mounted(&replacement, MountIntent { browse: false })
-        .await
-        .expect("ensure recovers pending publication");
-    assert!(
-        host.pending_publications(&repo())
-            .expect("pending publication after recovery")
-            .is_empty()
-    );
-    assert_eq!(
-        host.list(&repo()).expect("recovered publication"),
-        vec![StorageFact {
-            workspace: replacement,
-            volume_key: volume_key(&repo(), &WorkspaceName::new("raven").expect("workspace"),),
-        }]
-    );
-    assert!(
-        host.events()
-            .contains(&"recover-pending-publication".to_owned())
-    );
 }
 
 #[tokio::test]
@@ -3131,8 +2447,8 @@ async fn adoption_rollback_detaches_before_atomic_restore_and_never_copies() {
 
 proptest! {
     #[test]
-    fn clone_checkpoint_and_fork_each_clone_one_image(
-        operations in prop::collection::vec(0_u8..=2, 1..20),
+    fn clone_create_and_fork_each_clone_one_image(
+        operations in prop::collection::vec(0_u8..=1, 1..20),
     ) {
         let count = operations.len();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3165,7 +2481,7 @@ proptest! {
                             .await
                             .expect("create");
                     }
-                    1 => {
+                    _ => {
                         let destination = WorkspaceName::session(format!("fork-{index}"))
                             .expect("destination");
                         let plan = substrate.plan_fork(
@@ -3183,20 +2499,6 @@ proptest! {
                             })
                             .await
                             .expect("fork");
-                    }
-                    _ => {
-                        let plan = substrate.plan_checkpoint(
-                            &source,
-                            CheckpointLabel::new(format!("checkpoint-{index}"))
-                                .expect("label"),
-                            Pin::Automatic,
-                        ).expect("checkpoint plan");
-                        substrate
-                            .execute_checkpoint_staged(plan, |_| async {
-                                Ok::<(), &'static str>(())
-                            })
-                            .await
-                            .expect("checkpoint");
                     }
                 }
             }

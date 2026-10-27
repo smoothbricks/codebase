@@ -37,10 +37,10 @@ use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
-    ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
-    CommitmentDraft, CommitmentSink, NxDaemonRetirement, OwnedProcess, ProcessEvent, ProcessSignal,
-    ProcessSpawnRequest, RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller,
-    VolumeLabels, WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+    ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CommitmentDraft, CommitmentSink,
+    NxDaemonRetirement, OwnedProcess, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
+    RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller, VolumeLabels,
+    WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
     WorkspaceSupervisorHandle,
 };
 
@@ -184,14 +184,12 @@ enum ArtifactObservation {
     Admit(JobId),
     Write(JobId, StreamKind, Bytes),
     Seal(JobId, JobState),
-    Barrier(u64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OrderObservation {
     ArtifactAdmit(JobId),
     ArtifactSeal(JobId),
-    ArtifactBarrier(u64),
     Commitment(&'static str),
     Spawn(JobId),
 }
@@ -202,7 +200,6 @@ enum OrderObservation {
 struct FakeArtifactSink {
     sealed_stdout: Option<Vec<u8>>,
     next: JobId,
-    next_barrier: u64,
     quota: u64,
     jobs: BTreeMap<JobId, FakeArtifactJob>,
     terminals: BTreeMap<JobId, SealedJobReader>,
@@ -307,22 +304,6 @@ impl ArtifactSink for FakeArtifactSink {
             "one terminal entry per job"
         );
         Ok(sealed)
-    }
-
-    fn checkpoint(&mut self) -> Result<CheckpointBarrier> {
-        let barrier_id = self.next_barrier;
-        self.next_barrier += 1;
-        self.observations
-            .send(ArtifactObservation::Barrier(barrier_id))
-            .expect("artifact observer");
-        self.order
-            .send(OrderObservation::ArtifactBarrier(barrier_id))
-            .expect("order observer");
-        Ok(CheckpointBarrier {
-            checkpoint_id: String::new(),
-            barrier_id,
-            manifest_batch_sha256: Sha256Digest::compute(&barrier_id.to_be_bytes()),
-        })
     }
 
     /// Facts and reads use this same terminal entry; durable predecessor recovery stays on the
@@ -458,9 +439,7 @@ impl CommitmentSink for FakeCommitments {
                 ControllerCommitment::WorkspaceRetired(_) => "workspace-retired",
                 ControllerCommitment::Admission(_) => "admission",
                 ControllerCommitment::Terminal(_) => "terminal",
-                ControllerCommitment::Checkpoint(_) => "checkpoint",
                 ControllerCommitment::Fork(_) => "fork",
-                ControllerCommitment::Restore(_) => "restore",
                 ControllerCommitment::LandAdoption(_) => "land-adoption",
                 ControllerCommitment::LandOutcome(_) => "land-outcome",
             }))
@@ -629,7 +608,6 @@ fn harness_with_artifacts(
         Box::new(FakeArtifactSink {
             sealed_stdout,
             next: JobId::new(start_id).unwrap(),
-            next_barrier: 1,
             quota,
             jobs: BTreeMap::new(),
             terminals: BTreeMap::new(),
@@ -658,8 +636,8 @@ fn harness_with_artifacts(
 }
 
 /// A harness whose artifact sink is the production [`ArtifactStoreSink`] over the config's
-/// workspace root, so barrier state persists across supervisors exactly as it does across
-/// `cowshed checkpoint` processes.
+/// workspace root, so records and admissions persist across supervisors exactly as they do
+/// across `cowshed` processes.
 fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
     let (spawn_tx, spawned) = mpsc::unbounded_channel();
     let (process_tx, process) = mpsc::unbounded_channel();
@@ -1653,74 +1631,6 @@ async fn a_registered_credential_env_name_never_reaches_a_child() {
     h.handle.wait(job).await.unwrap();
 }
 
-#[tokio::test]
-async fn checkpoint_barrier_orders_artifact_digest_before_commitment() {
-    let (mut h, _root) = harness(1, 1024, false, false);
-    let barrier = h
-        .handle
-        .checkpoint_barrier("checkpoint-1".into())
-        .await
-        .unwrap();
-    assert_eq!(
-        barrier.manifest_batch_sha256,
-        Sha256Digest::compute(&1_u64.to_be_bytes())
-    );
-    assert_eq!(
-        h.artifacts.recv().await.unwrap(),
-        ArtifactObservation::Barrier(1)
-    );
-    assert_eq!(
-        h.order.recv().await.unwrap(),
-        OrderObservation::ArtifactBarrier(1)
-    );
-    assert_eq!(
-        h.order.recv().await.unwrap(),
-        OrderObservation::Commitment("checkpoint")
-    );
-    let commitment = h.commitments.recv().await.unwrap();
-    let ControllerCommitment::Checkpoint(checkpoint) = commitment else {
-        panic!("checkpoint commitment")
-    };
-    assert_eq!(checkpoint.barrier_id, 1);
-    assert_eq!(
-        checkpoint.manifest_batch_sha256,
-        barrier.manifest_batch_sha256
-    );
-    // The sink owns allocation: the next barrier over the same sink is simply the next id.
-    let next = h
-        .handle
-        .checkpoint_barrier("checkpoint-2".into())
-        .await
-        .unwrap();
-    assert_eq!(next.barrier_id, 2);
-}
-
-/// One `cowshed checkpoint` per process: each invocation starts a fresh supervisor over the same
-/// durable artifact store. The barrier sequence is owned by the store, so a later supervisor must
-/// continue where the previous one stopped — and a checkpoint that fails after its barrier must
-/// not wedge the sequence for every checkpoint that follows.
-#[tokio::test]
-async fn a_fresh_supervisor_continues_the_durable_barrier_sequence() {
-    let (supervisor_config, _root) =
-        isolated_config(&temp_parent::scratch_parent(), "barrier-durability");
-
-    let first = real_store_harness(supervisor_config.clone())
-        .handle
-        .checkpoint_barrier("checkpoint-1".into())
-        .await
-        .expect("first barrier over an empty store");
-    assert_eq!(first.barrier_id, 1);
-
-    // A second process over the same workspace. The durable store already holds barrier 1;
-    // no session-local counter may contradict it.
-    let second = real_store_harness(supervisor_config)
-        .handle
-        .checkpoint_barrier("checkpoint-2".into())
-        .await
-        .expect("a fresh supervisor must continue the durable barrier sequence");
-    assert_eq!(second.barrier_id, 2);
-}
-
 /// A job an earlier supervisor of the workspace incarnation ran and sealed is answered by the next
 /// one from the durable records — its terminal facts, and its output from any offset — although
 /// only the supervisor that ran a job answers its status. A client whose supervisor retired (a
@@ -2145,7 +2055,6 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
         Box::new(FakeArtifactSink {
             sealed_stdout: None,
             next: JobId::new(1).unwrap(),
-            next_barrier: 1,
             quota: 1024,
             jobs: BTreeMap::new(),
             terminals: BTreeMap::new(),
@@ -5128,7 +5037,6 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
         Box::new(FakeArtifactSink {
             sealed_stdout: None,
             next: JobId::new(1).unwrap(),
-            next_barrier: 1,
             quota: 1024,
             jobs: BTreeMap::new(),
             terminals: BTreeMap::new(),
@@ -5246,14 +5154,8 @@ async fn a_job_s_durable_record_keeps_its_exit_and_duration() {
         .unwrap()
         .frames
         .into_iter()
-        .find_map(|frame| match frame.record {
-            cowshed_core::storage::job_artifact::ProtectedRecord::Job(record)
-                if record.job_id == job_id && record.state == JobState::Exited =>
-            {
-                Some(record)
-            }
-            _ => None,
-        })
+        .map(|frame| frame.record)
+        .find(|record| record.job_id == job_id && record.state == JobState::Exited)
         .expect("the job's terminal record");
     assert_eq!(terminal.exit, Some(ExitStatus::Exited { code: 0 }));
     assert_eq!(terminal.duration_ms, info.duration_ms);
@@ -8689,15 +8591,13 @@ async fn a_host_gate_records_only_public_environment_without_restricting_executi
         let history = cowshed_core::storage::job_artifact::recover_records(&records).unwrap();
         assert!(!history.frames.is_empty());
         for frame in history.frames {
-            if let cowshed_core::storage::job_artifact::ProtectedRecord::Job(record) = frame.record
-            {
-                let admitted = record.admission.expect("keyed admission is durable");
-                assert_eq!(
-                    admitted.env,
-                    BTreeMap::from([("LANG".to_owned(), "C".to_owned())])
-                );
-                assert_ne!(admitted.env_sha256, Sha256Digest::compute(&[]));
-            }
+            let record = frame.record;
+            let admitted = record.admission.expect("keyed admission is durable");
+            assert_eq!(
+                admitted.env,
+                BTreeMap::from([("LANG".to_owned(), "C".to_owned())])
+            );
+            assert_ne!(admitted.env_sha256, Sha256Digest::compute(&[]));
         }
         let bytes = std::fs::read(&records).unwrap();
         assert!(

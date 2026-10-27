@@ -19,15 +19,14 @@ use cowshed_apfs::{ApfsError, DetachIntent, MountAccess, timed_apfs_step};
 use cowshed_os::timing::timed_async;
 
 use super::lifecycle::{
-    AdoptHandoff, AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef,
-    CreatePlan, DefragmentOutcome, DerivedWorkspace, Destination, ExecuteError, ForkPlan,
-    ImmutablePlan, LifecycleBackend, LifecycleFact, LifecyclePlanner, LifecycleReceipt,
-    LifecycleWorkspace, MountIntent, MountJoin, MountRefusal, MountRefusalReason, MountState,
-    Operation, OperationIdentity, Pin, PlanError, PurePlanner, ResizeOutcome, RestoreMode,
-    RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision, StorageFact, StorageGcOptions,
-    StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
+    AdoptHandoff, AdoptPlan, AdoptRequest, CreatePlan, DefragmentOutcome, DerivedWorkspace,
+    Destination, ExecuteError, ForkPlan, ImmutablePlan, LifecycleBackend, LifecycleFact,
+    LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace, MountIntent, MountJoin, MountRefusal,
+    MountRefusalReason, MountState, Operation, OperationIdentity, PlanError, PurePlanner,
+    ResizeOutcome, RetirePlan, RetiredRef, Revision, StorageFact, StorageGcOptions, StorageGcPlan,
+    StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
 };
-use super::{CheckpointLabel, PRE_RESTORE_PREFIX, StorageLayout, StorageLayoutError};
+use super::{StorageLayout, StorageLayoutError};
 
 pub const DEFAULT_IMAGE_CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(100);
 use super::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
@@ -281,22 +280,6 @@ impl Beside<std::future::Ready<()>, ReadyNone, Unit, Unit> {
         }
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointStage {
-    pub checkpoint: CheckpointRef,
-    pub image: PathBuf,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingPublicationFact {
-    pub workspace: LifecycleWorkspace,
-    pub image: PathBuf,
-    pub mount_point: PathBuf,
-    pub source_checkpoint: String,
-    pub source_incarnation: WorkspaceIncarnation,
-    pub replaced_incarnation: WorkspaceIncarnation,
-    pub destination_incarnation: WorkspaceIncarnation,
-}
 
 /// An adoption a crash interrupted: the canonical main image its `PendingFence` sidecar still
 /// fences, the incarnation that sidecar was minted for, and what it records of the adoption.
@@ -349,11 +332,6 @@ pub struct ResumedMount<A> {
     pub found: FoundMount,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RestoreFence {
-    pub pending: PendingPublicationFact,
-}
-
 #[derive(Debug, Error)]
 pub enum StagedExecutionError<E> {
     #[error("staged lifecycle execution failed: {0}")]
@@ -372,23 +350,6 @@ pub enum StagedExecutionError<E> {
         initializer: E,
         #[source]
         cleanup: ApfsStorageError,
-    },
-}
-
-#[derive(Debug, Error)]
-pub enum RestoreExecutionError<F> {
-    #[error("restore staging failed: {0}")]
-    Storage(#[source] ApfsStorageError),
-    #[error("restore fence failed with a pending forward-only publication: {source}")]
-    Fence {
-        source: F,
-        pending: Box<PendingPublicationFact>,
-    },
-    #[error("restore fence succeeded but pending publication activation failed: {source}")]
-    Activation {
-        #[source]
-        source: Box<ApfsStorageError>,
-        pending: Box<PendingPublicationFact>,
     },
 }
 
@@ -414,15 +375,9 @@ impl<F> From<ApfsStorageError> for RetireExecutionError<F> {
     }
 }
 
-impl<F> From<ApfsStorageError> for RestoreExecutionError<F> {
-    fn from(error: ApfsStorageError) -> Self {
-        Self::Storage(error)
-    }
-}
 pub type AdoptExecutionError<E> = StagedExecutionError<E>;
 pub type CreateExecutionError<E> = StagedExecutionError<E>;
 pub type ForkExecutionError<E> = StagedExecutionError<E>;
-pub type CheckpointExecutionError<E> = StagedExecutionError<E>;
 
 impl<E> From<ApfsStorageError> for StagedExecutionError<E> {
     fn from(error: ApfsStorageError) -> Self {
@@ -533,7 +488,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<Self::Attachment, ApfsStorageError>;
     /// Clone `source` to `destination` with the source's latest writes in it. `source_mount` is
     /// where the source is mounted when it is a live workspace — its volume is what gets flushed
-    /// — and `None` for an image nothing mounts (a staged image, a checkpoint).
+    /// — and `None` for an image nothing mounts (a staged image).
     fn clone_image(
         &self,
         source: &Path,
@@ -779,35 +734,6 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         let _ = (image, workspace);
         Ok(())
     }
-    fn publish_checkpoint_fact(
-        &self,
-        image: &Path,
-        label: &CheckpointLabel,
-        revision: Revision,
-        pin: Pin,
-    ) -> Result<(), ApfsStorageError>;
-    fn restore_swap(
-        &self,
-        staged: &Path,
-        canonical: &Path,
-        undo: &Path,
-    ) -> Result<(), ApfsStorageError>;
-    fn publish_restored_metadata(
-        &self,
-        staged: &Path,
-        canonical: &Path,
-        workspace: &LifecycleWorkspace,
-        revision: Revision,
-        source_image: &Path,
-        replaced_incarnation: &WorkspaceIncarnation,
-    ) -> Result<PendingPublicationFact, ApfsStorageError>;
-    fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError>;
-    fn rollback_restore(
-        &self,
-        canonical: &Path,
-        undo: &Path,
-        staged: &Path,
-    ) -> Result<(), ApfsStorageError>;
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError>;
     /// Release an exactly fenced canonical workspace, retaining its record until physical unlink.
     fn release_workspace(
@@ -827,14 +753,9 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         &self,
         workspace: &LifecycleWorkspace,
     ) -> Result<MountState, ApfsStorageError>;
-    fn pending_publications(
-        &self,
-        repo: &RepoId,
-    ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError>;
     /// Every published workspace's mount, joined or refused workspace by workspace. A refusal is
     /// that workspace's fact; only reading the mount table or the records at all fails the call.
     fn mounts(&self, repo: &RepoId) -> Result<Vec<MountJoin>, ApfsStorageError>;
-    fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError>;
     fn recover_pending(
         &self,
         config: &ApfsSubstrateConfig,
@@ -1872,156 +1793,6 @@ where
         Ok((retired, value))
     }
 
-    pub async fn execute_checkpoint_staged<F, Fut, E>(
-        &self,
-        plan: CheckpointPlan,
-        initialize: F,
-    ) -> Result<CheckpointRef, CheckpointExecutionError<E>>
-    where
-        F: FnOnce(CheckpointStage) -> Fut + Send,
-        Fut: Future<Output = Result<(), E>> + Send,
-        E: Send,
-    {
-        let backend = CheckedApfsBackend {
-            host: Arc::clone(&self.host),
-            lane: Arc::clone(&self.lane),
-            config: Arc::clone(&self.config),
-            incarnations: Arc::clone(&self.incarnations),
-            expected: plan.expected().to_vec(),
-            image_lock_mode: self.image_lock_mode,
-        };
-        let mut guard = backend.acquire(plan.operation()).await?;
-        let actual = backend
-            .read_authoritative(&mut guard, plan.expected())
-            .await?;
-        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
-
-        let config = Arc::clone(&self.config);
-        let expected = plan.expected().to_vec();
-        let operation = plan.operation().clone();
-        let planned = {
-            let Operation::Checkpoint {
-                workspace,
-                label,
-                pin,
-            } = &operation
-            else {
-                return Err(ApfsStorageError::InvalidPlan(
-                    "staged checkpoint executor requires a checkpoint operation",
-                )
-                .into());
-            };
-            plan_checkpoint_stage(&config, &expected, workspace, label, *pin)?
-        };
-
-        if let Err(initializer) = initialize(planned.stage.clone()).await {
-            return Err(StagedExecutionError::Initializer(initializer));
-        }
-
-        let host = Arc::clone(&self.host);
-        self.lane
-            .dispatch(move || {
-                let prepared = prepare_checkpoint_stage(host.as_ref(), planned)?;
-                commit_prepared_checkpoint(host.as_ref(), prepared)
-            })
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Restore `plan`'s checkpoint, then publish a replacement through `fence` before it becomes
-    /// discoverable. Staging and the swap run as one lane step, as a checkpoint does, so nothing
-    /// observes a half-prepared restore; a fence failure is forward-only and names the pending
-    /// publication for the caller or startup recovery to finish.
-    pub async fn execute_restore_staged<Fence, FenceFut, FenceError>(
-        &self,
-        plan: RestorePlan,
-        fence: Fence,
-    ) -> Result<RestoreReceipt, RestoreExecutionError<FenceError>>
-    where
-        Fence: FnOnce(RestoreFence) -> FenceFut + Send,
-        FenceFut: Future<Output = Result<(), FenceError>> + Send,
-        FenceError: Send,
-    {
-        let backend = CheckedApfsBackend {
-            host: Arc::clone(&self.host),
-            lane: Arc::clone(&self.lane),
-            config: Arc::clone(&self.config),
-            incarnations: Arc::clone(&self.incarnations),
-            expected: plan.expected().to_vec(),
-            image_lock_mode: self.image_lock_mode,
-        };
-        let mut guard = backend.acquire(plan.operation()).await?;
-        let actual = backend
-            .read_authoritative(&mut guard, plan.expected())
-            .await?;
-        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
-
-        let host = Arc::clone(&self.host);
-        let config = Arc::clone(&self.config);
-        let incarnations = Arc::clone(&self.incarnations);
-        let expected = plan.expected().to_vec();
-        let operation = plan.operation().clone();
-        let committed = self
-            .lane
-            .dispatch(move || {
-                let Operation::Restore {
-                    workspace,
-                    label,
-                    mode,
-                    identity,
-                } = &operation
-                else {
-                    return Err(ApfsStorageError::InvalidPlan(
-                        "staged restore executor requires a restore operation",
-                    ));
-                };
-                let prepared = prepare_restore_stage(
-                    host.as_ref(),
-                    &config,
-                    &expected,
-                    RestoreExecution {
-                        workspace,
-                        label,
-                        mode: *mode,
-                        identity,
-                    },
-                    incarnations.as_ref(),
-                )?;
-                commit_prepared_restore(host.as_ref(), &config, prepared)
-            })
-            .await?;
-        let CommittedRestore::Pending(pending) = committed else {
-            let CommittedRestore::Verified(receipt) = committed else {
-                unreachable!()
-            };
-            return Ok(receipt);
-        };
-
-        let fence_input = RestoreFence {
-            pending: pending.fact.clone(),
-        };
-        if let Err(source) = fence(fence_input).await {
-            return Err(RestoreExecutionError::Fence {
-                source,
-                pending: Box::new(pending.fact),
-            });
-        }
-        let host = Arc::clone(&self.host);
-        if let Err(source) = self
-            .lane
-            .dispatch({
-                let image = pending.fact.image.clone();
-                move || host.activate_restored_metadata(&image)
-            })
-            .await
-        {
-            return Err(RestoreExecutionError::Activation {
-                source: Box::new(source),
-                pending: Box::new(pending.fact),
-            });
-        }
-        Ok(pending.receipt)
-    }
     /// Retire under the existing image fence, then publish the lifecycle commitment.
     /// Clean recoverable sources are physically released; recovery sources retain trash.
     pub async fn execute_retire_staged<F, Fut, E>(
@@ -2344,25 +2115,6 @@ where
         self.planner.plan_fork(from, destination)
     }
 
-    fn plan_checkpoint(
-        &self,
-        workspace: &LifecycleWorkspace,
-        label: CheckpointLabel,
-        pin: Pin,
-    ) -> Result<CheckpointPlan, PlanError> {
-        self.planner.plan_checkpoint(workspace, label, pin)
-    }
-    fn plan_restore(
-        &self,
-        workspace: &LifecycleWorkspace,
-        checkpoint: &CheckpointRef,
-        mode: RestoreMode,
-        identity: OperationIdentity,
-    ) -> Result<RestorePlan, PlanError> {
-        self.planner
-            .plan_restore(workspace, checkpoint, mode, identity)
-    }
-
     fn plan_retire(&self, workspace: &LifecycleWorkspace) -> Result<RetirePlan, PlanError> {
         self.planner.plan_retire(workspace)
     }
@@ -2401,12 +2153,7 @@ where
         self.dispatch_read(move |host, _| {
             let storage = host.list(&repo)?;
             let mounts = host.mounts(&repo)?;
-            let checkpoints = host.checkpoints(&repo)?;
-            Ok(super::lifecycle::derive_workspaces(
-                storage,
-                mounts,
-                checkpoints,
-            )?)
+            Ok(super::lifecycle::derive_workspaces(storage, mounts)?)
         })
         .await
     }
@@ -2674,48 +2421,6 @@ struct PreparedClone<A> {
     found: FoundMount,
 }
 
-struct PendingRestore {
-    receipt: RestoreReceipt,
-    fact: PendingPublicationFact,
-}
-
-enum CommittedRestore {
-    Verified(RestoreReceipt),
-    Pending(Box<PendingRestore>),
-}
-
-struct PreparedCheckpoint {
-    stage: CheckpointStage,
-    source: PathBuf,
-    /// Where the checkpointed workspace is mounted, whose last writes the checkpoint must hold.
-    source_mount: PathBuf,
-    label: CheckpointLabel,
-    revision: Revision,
-    pin: Pin,
-}
-
-struct PreparedVerifyRestore<A> {
-    attachment: A,
-    receipt: RestoreReceipt,
-}
-
-struct PreparedReplaceRestore<A> {
-    stage: WorkspaceStage,
-    attachment: A,
-    staged_image: PathBuf,
-    canonical_image: PathBuf,
-    canonical_mount: PathBuf,
-    checkpoint_image: PathBuf,
-    undo_image: PathBuf,
-    current: LifecycleWorkspace,
-    previous_incarnation: WorkspaceIncarnation,
-    source_checkpoint: String,
-}
-
-enum PreparedRestore<A> {
-    Verify(PreparedVerifyRestore<A>),
-    Replace(Box<PreparedReplaceRestore<A>>),
-}
 pub(super) fn workspace_lock_path(
     config: &ApfsSubstrateConfig,
     repo: &RepoId,
@@ -2738,10 +2443,6 @@ fn operation_holding(operation: &Operation) -> LockHolding {
             LockHolding::of(LockOperation::Create, destination)
         }
         Operation::Fork { destination, .. } => LockHolding::of(LockOperation::Fork, destination),
-        Operation::Checkpoint { workspace, .. } => {
-            LockHolding::of(LockOperation::Checkpoint, workspace)
-        }
-        Operation::Restore { workspace, .. } => LockHolding::of(LockOperation::Restore, workspace),
         Operation::Retire { workspace } => LockHolding::of(LockOperation::Retire, workspace),
     }
 }
@@ -2770,9 +2471,7 @@ fn operation_lock_paths(
             workspace_lock_path(config, repo, source)?,
             workspace_lock_path(config, repo, destination)?,
         ],
-        Operation::Checkpoint { workspace, .. }
-        | Operation::Restore { workspace, .. }
-        | Operation::Retire { workspace, .. } => {
+        Operation::Retire { workspace, .. } => {
             vec![workspace_lock_path(config, repo, workspace)?]
         }
     };
@@ -2785,13 +2484,6 @@ struct CloneExecution<'a> {
     source: &'a WorkspaceName,
     destination: &'a WorkspaceName,
     fork: bool,
-    identity: &'a OperationIdentity,
-}
-
-struct RestoreExecution<'a> {
-    workspace: &'a WorkspaceName,
-    label: &'a CheckpointLabel,
-    mode: RestoreMode,
     identity: &'a OperationIdentity,
 }
 
@@ -2808,12 +2500,6 @@ fn apply_operation<H: ApfsExecutionHost>(
         )),
         Operation::Create { .. } | Operation::Fork { .. } => Err(ApfsStorageError::InvalidPlan(
             "create and fork operations require the staged controller executor",
-        )),
-        Operation::Checkpoint { .. } => Err(ApfsStorageError::InvalidPlan(
-            "checkpoint operations require the staged controller executor",
-        )),
-        Operation::Restore { .. } => Err(ApfsStorageError::InvalidPlan(
-            "restore operations require the staged controller executor",
         )),
         Operation::Retire { workspace, .. } => apply_retire(host, config, expected, workspace),
     }
@@ -3179,7 +2865,6 @@ fn finish_adoption<H: ApfsExecutionHost>(
     let derived = super::lifecycle::derive_workspaces(
         host.list(workspace.repo())?,
         host.mounts(workspace.repo())?,
-        host.checkpoints(workspace.repo())?,
     )?;
     // The workspace adoption names is read strictly: a mount at its checkout that does not prove
     // itself main's refuses, rather than reading as absent and being mounted over.
@@ -3523,368 +3208,6 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
     }))
 }
 
-fn plan_checkpoint_stage(
-    config: &ApfsSubstrateConfig,
-    expected: &[LifecycleFact],
-    workspace_name: &WorkspaceName,
-    label: &CheckpointLabel,
-    pin: Pin,
-) -> Result<PreparedCheckpoint, ApfsStorageError> {
-    let workspace = active_expected(expected, workspace_name)?;
-    let source = canonical_image_path(config, &workspace)?;
-    let source_mount = mount_point(config, &workspace)?;
-    let image = checkpoint_image(config, &workspace, label)?;
-    let revision = Revision::new(expected_revision(expected)? + 1);
-    let checkpoint = CheckpointRef::new(workspace, label.clone(), revision, pin == Pin::Pinned);
-    Ok(PreparedCheckpoint {
-        stage: CheckpointStage { checkpoint, image },
-        source,
-        source_mount,
-        label: label.clone(),
-        revision,
-        pin,
-    })
-}
-
-fn prepare_checkpoint_stage<H: ApfsExecutionHost>(
-    host: &H,
-    prepared: PreparedCheckpoint,
-) -> Result<PreparedCheckpoint, ApfsStorageError> {
-    host.clone_image(
-        &prepared.source,
-        Some(&prepared.source_mount),
-        &prepared.stage.image,
-    )?;
-    if let Err(primary) = host.publish_metadata(
-        &prepared.stage.image,
-        prepared.stage.checkpoint.workspace(),
-        prepared.revision,
-        MetadataPolicy::Preserve,
-        None,
-        Some(&prepared.source),
-    ) {
-        return combine_cleanup(
-            "checkpoint metadata",
-            primary,
-            host.reclaim_image(&prepared.stage.image),
-        );
-    }
-    let attachment = match host.attach_verified(&prepared.stage.image) {
-        Ok(attachment) => attachment,
-        Err(primary) => {
-            return combine_cleanup(
-                "checkpoint verification",
-                primary,
-                host.reclaim_image(&prepared.stage.image),
-            );
-        }
-    };
-    if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
-        return combine_cleanup(
-            "checkpoint verification detach",
-            primary,
-            host.reclaim_image(&prepared.stage.image),
-        );
-    }
-    Ok(prepared)
-}
-
-fn commit_prepared_checkpoint<H: ApfsExecutionHost>(
-    host: &H,
-    prepared: PreparedCheckpoint,
-) -> Result<CheckpointRef, ApfsStorageError> {
-    if let Err(primary) = host.publish_checkpoint_fact(
-        &prepared.stage.image,
-        &prepared.label,
-        prepared.revision,
-        prepared.pin,
-    ) {
-        return combine_cleanup(
-            "checkpoint fact",
-            primary,
-            host.reclaim_image(&prepared.stage.image),
-        );
-    }
-    Ok(prepared.stage.checkpoint)
-}
-
-fn prepare_restore_stage<H: ApfsExecutionHost>(
-    host: &H,
-    config: &ApfsSubstrateConfig,
-    expected: &[LifecycleFact],
-    execution: RestoreExecution<'_>,
-    incarnations: &dyn IncarnationSource,
-) -> Result<PreparedRestore<H::Attachment>, ApfsStorageError> {
-    let RestoreExecution {
-        workspace: workspace_name,
-        label,
-        mode,
-        identity,
-    } = execution;
-    let current = active_expected(expected, workspace_name)?;
-    let checkpoint_image = checkpoint_image(config, &current, label)?;
-    if mode == RestoreMode::VerifyOnly {
-        let mount_point = staging_mount(config, &current)?;
-        let attachment = host.attach_mounted(
-            &checkpoint_image,
-            &mount_point,
-            MountAccess::ReadOnly,
-            false,
-        )?;
-        let mounted =
-            host.validate_marker(&mount_point, &MarkerExpectation::owned(config, &current));
-        if let Err(primary) = mounted {
-            return detach_after_failure(host, attachment, primary, "restore verification mount");
-        }
-        let previous_incarnation = current.incarnation().clone();
-        return Ok(PreparedRestore::Verify(PreparedVerifyRestore {
-            attachment,
-            receipt: RestoreReceipt {
-                previous_incarnation,
-                workspace: current,
-            },
-        }));
-    }
-
-    let previous_incarnation = current.incarnation().clone();
-    let replacement = LifecycleWorkspace::new(
-        current.repo().clone(),
-        current.name().clone(),
-        incarnations.mint()?,
-        Revision::new(current.revision().get() + 1),
-        current.topology_revision(),
-        current.role(),
-    )
-    .map_err(|_| ApfsStorageError::InvalidPlan("invalid restore replacement identity"))?;
-    let canonical_image = canonical_image_path(config, &current)?;
-    let canonical_mount = mount_point(config, &replacement)?;
-    let staged_image = staging_image(config, &replacement)?;
-    let staging_mount = staging_mount(config, &replacement)?;
-    let undo_image = undo_image(config, &current, &replacement)?;
-    let staged_companion = companion_path(&staged_image);
-
-    host.clone_image(&checkpoint_image, None, &staged_image)?;
-    if let Err(primary) = host.publish_metadata(
-        &staged_image,
-        &replacement,
-        replacement.revision(),
-        MetadataPolicy::Preserve,
-        Some(identity),
-        Some(&checkpoint_image),
-    ) {
-        return combine_cleanup(
-            "restore staging metadata",
-            primary,
-            host.reclaim_image(&staged_image),
-        );
-    }
-    let attachment =
-        match host.attach_mounted(&staged_image, &staging_mount, MountAccess::ReadWrite, false) {
-            Ok(attachment) => attachment,
-            Err(primary) => {
-                return combine_cleanup(
-                    "restore staging attachment",
-                    primary,
-                    host.reclaim_image(&staged_image),
-                );
-            }
-        };
-    let prepared = (|| {
-        // The volume label is human-facing only (`volume_label`); a host without
-        // physical volumes has no label to set, and nothing reads one.
-        if H::HAS_PHYSICAL_VOLUMES {
-            host.rename_volume(
-                &attachment,
-                &staging_mount,
-                &volume_label(config.namespace, replacement.repo(), replacement.name()),
-            )?;
-        }
-        host.mint_workspace_credentials(
-            &replacement,
-            &staged_image,
-            &staging_mount,
-            &staged_companion,
-        )?;
-        host.write_marker(&staging_mount, &replacement, None, identity)?;
-        host.validate_marker(
-            &staging_mount,
-            &MarkerExpectation::freshly_stamped(&replacement),
-        )
-    })();
-    if let Err(primary) = prepared {
-        return combine_cleanup(
-            "restore preparation",
-            primary,
-            detach_and_reclaim(host, attachment, &staged_image, "restore staging detach"),
-        );
-    }
-    Ok(PreparedRestore::Replace(Box::new(PreparedReplaceRestore {
-        stage: WorkspaceStage {
-            workspace: replacement,
-            mount_point: staging_mount,
-            companion: staged_companion,
-            resuming: false,
-        },
-        attachment,
-        staged_image,
-        canonical_image,
-        canonical_mount,
-        checkpoint_image,
-        undo_image,
-        current,
-        previous_incarnation,
-        source_checkpoint: label.to_string(),
-    })))
-}
-
-fn commit_prepared_restore<H: ApfsExecutionHost>(
-    host: &H,
-    config: &ApfsSubstrateConfig,
-    prepared: PreparedRestore<H::Attachment>,
-) -> Result<CommittedRestore, ApfsStorageError> {
-    let PreparedRestore::Replace(prepared) = prepared else {
-        let PreparedRestore::Verify(prepared) = prepared else {
-            unreachable!()
-        };
-        host.detach(prepared.attachment, DetachIntent::Release)?;
-        return Ok(CommittedRestore::Verified(prepared.receipt));
-    };
-    let PreparedReplaceRestore {
-        stage,
-        attachment,
-        staged_image,
-        canonical_image,
-        canonical_mount,
-        checkpoint_image,
-        undo_image,
-        current,
-        previous_incarnation,
-        source_checkpoint,
-    } = *prepared;
-    if let Err(primary) = host
-        .validate_staged_companion(&stage.companion)
-        .and_then(|()| {
-            host.validate_marker(
-                &stage.mount_point,
-                &MarkerExpectation::freshly_stamped(&stage.workspace),
-            )
-        })
-    {
-        return combine_cleanup(
-            "restore post-callback validation",
-            primary,
-            detach_and_reclaim(host, attachment, &staged_image, "restore staging detach"),
-        );
-    }
-    if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
-        return combine_cleanup(
-            "restore staging detach",
-            primary,
-            host.reclaim_image(&staged_image),
-        );
-    }
-    if let Err(primary) = host.detach_mounted(&current, DetachIntent::Release) {
-        return combine_cleanup(
-            "restore canonical detach",
-            primary,
-            host.reclaim_image(&staged_image),
-        );
-    }
-    if let Err(primary) = host.restore_swap(&staged_image, &canonical_image, &undo_image) {
-        let cleanup = host.reclaim_image(&staged_image).and_then(|()| {
-            mount_canonical(host, config, &canonical_image, &canonical_mount, &current)
-        });
-        return combine_cleanup("restore swap", primary, cleanup);
-    }
-    if let Err(primary) = mount_canonical(
-        host,
-        config,
-        &canonical_image,
-        &canonical_mount,
-        &stage.workspace,
-    ) {
-        let cleanup = host
-            .detach_mounted(&stage.workspace, DetachIntent::Release)
-            .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
-            .and_then(|()| {
-                mount_canonical(host, config, &canonical_image, &canonical_mount, &current)
-            });
-        return combine_cleanup("restore rollback", primary, cleanup);
-    }
-    let fact = match host.publish_restored_metadata(
-        &staged_image,
-        &canonical_image,
-        &stage.workspace,
-        stage.workspace.revision(),
-        &checkpoint_image,
-        current.incarnation(),
-    ) {
-        Ok(fact) => fact,
-        Err(primary) => {
-            let cleanup = host
-                .detach_mounted(&stage.workspace, DetachIntent::Release)
-                .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
-                .and_then(|()| {
-                    mount_canonical(host, config, &canonical_image, &canonical_mount, &current)
-                });
-            return combine_cleanup("restore metadata publication", primary, cleanup);
-        }
-    };
-    if fact.workspace != stage.workspace {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restored publication workspace mismatch: expected={:?}, actual={:?}",
-            stage.workspace, fact.workspace
-        )));
-    }
-    if fact.image != canonical_image {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restored publication image mismatch: expected={}, actual={}",
-            canonical_image.display(),
-            fact.image.display()
-        )));
-    }
-    if fact.mount_point != canonical_mount {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restored publication mount point mismatch: expected={}, actual={}",
-            canonical_mount.display(),
-            fact.mount_point.display()
-        )));
-    }
-    if fact.source_checkpoint != source_checkpoint {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restored publication source checkpoint mismatch: expected={source_checkpoint}, actual={}",
-            fact.source_checkpoint
-        )));
-    }
-    if fact.replaced_incarnation != *current.incarnation() {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restored publication replaced incarnation mismatch: expected={}, actual={}",
-            current.incarnation(),
-            fact.replaced_incarnation
-        )));
-    }
-    if fact.destination_incarnation != *stage.workspace.incarnation() {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restored publication destination incarnation mismatch: expected={}, actual={}",
-            stage.workspace.incarnation(),
-            fact.destination_incarnation
-        )));
-    }
-    if fact.source_incarnation == *stage.workspace.incarnation() {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restored publication source incarnation equals destination: {}",
-            fact.source_incarnation
-        )));
-    }
-    Ok(CommittedRestore::Pending(Box::new(PendingRestore {
-        receipt: RestoreReceipt {
-            previous_incarnation,
-            workspace: stage.workspace,
-        },
-        fact,
-    })))
-}
-
 fn apply_retire<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
@@ -3902,25 +3225,6 @@ fn apply_retire<H: ApfsExecutionHost>(
     )))
 }
 
-fn mount_canonical<H: ApfsExecutionHost>(
-    host: &H,
-    config: &ApfsSubstrateConfig,
-    image: &Path,
-    mount_point: &Path,
-    workspace: &LifecycleWorkspace,
-) -> Result<(), ApfsStorageError> {
-    let attachment = host.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)?;
-    if let Err(primary) = timed_apfs_step("canonical", "validate", || {
-        host.validate_marker(mount_point, &MarkerExpectation::owned(config, workspace))
-    }) {
-        return detach_after_failure(host, attachment, primary, "canonical validation");
-    }
-    timed_apfs_step("canonical", "retain", || {
-        host.retain_mounted(workspace, attachment)
-    })
-    .map(|_| ())?;
-    Ok(())
-}
 /// Settle `workspace`'s mount under its image lock, which the caller holds: heal a mount the
 /// kernel no longer honours, mount a detached image, validate the marker, and settle the
 /// checkout's build link. Answers the mount point.
@@ -4054,18 +3358,6 @@ fn absent_expected(expected: &[LifecycleFact]) -> Result<Revision, ApfsStorageEr
         ))
 }
 
-fn expected_revision(expected: &[LifecycleFact]) -> Result<u64, ApfsStorageError> {
-    expected
-        .iter()
-        .find_map(|fact| match fact {
-            LifecycleFact::Exists { revision, .. } => Some(revision.get()),
-            _ => None,
-        })
-        .ok_or(ApfsStorageError::InvalidPlan(
-            "workspace revision expectation is missing",
-        ))
-}
-
 fn main_name() -> WorkspaceName {
     WorkspaceName::main()
 }
@@ -4085,33 +3377,6 @@ fn canonical_image_path(
     Ok(layout.canonical_image(workspace.name())?.image().to_owned())
 }
 
-fn staging_stem(
-    config: &ApfsSubstrateConfig,
-    repo: &RepoId,
-    workspace: &WorkspaceName,
-    incarnation: &WorkspaceIncarnation,
-) -> Result<PathBuf, ApfsStorageError> {
-    let project = layout(config, repo)?.project().project_root.clone();
-    Ok(project.join(STAGING_NAMESPACE).join(format!(
-        "{}-{}",
-        workspace.as_str(),
-        incarnation.as_str()
-    )))
-}
-
-fn staging_image(
-    config: &ApfsSubstrateConfig,
-    workspace: &LifecycleWorkspace,
-) -> Result<PathBuf, ApfsStorageError> {
-    let stem = staging_stem(
-        config,
-        workspace.repo(),
-        workspace.name(),
-        workspace.incarnation(),
-    )?;
-    Ok(stem.with_extension(IMAGE_EXTENSION))
-}
-
 pub(super) fn staging_mount(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
@@ -4124,51 +3389,6 @@ pub(super) fn staging_mount(
             "{}-{}",
             workspace.name().as_str(),
             workspace.incarnation().as_str()
-        )))
-}
-
-/// The staging mountpoint recovery uses to inspect a detached canonical image.
-///
-/// Deliberately not [`staging_mount`]: recovery runs while the interrupted publication it is
-/// unwinding may still hold the plain `<name>-<incarnation>` staging path, so inspecting the
-/// canonical image under that same stem could collide with or be mistaken for the staged clone.
-/// The `recover-` prefix keeps the mount inside [`STAGING_NAMESPACE`] — an abandoned one is still
-/// reclaimed by the ordinary staging sweep — while guaranteeing it never shadows the live path.
-fn recovery_staging_mount(
-    layout: &StorageLayout,
-    workspace: &WorkspaceName,
-    incarnation: &str,
-) -> PathBuf {
-    layout
-        .project()
-        .mount_root
-        .join(STAGING_NAMESPACE)
-        .join(format!("recover-{}-{}", workspace.as_str(), incarnation))
-}
-
-fn checkpoint_image(
-    config: &ApfsSubstrateConfig,
-    workspace: &LifecycleWorkspace,
-    label: &CheckpointLabel,
-) -> Result<PathBuf, ApfsStorageError> {
-    Ok(layout(config, workspace.repo())?
-        .checkpoint_image(workspace.name(), label)?
-        .image()
-        .to_owned())
-}
-
-fn undo_image(
-    config: &ApfsSubstrateConfig,
-    current: &LifecycleWorkspace,
-    replacement: &LifecycleWorkspace,
-) -> Result<PathBuf, ApfsStorageError> {
-    Ok(layout(config, current.repo())?
-        .project()
-        .checkpoints
-        .join(current.name().as_str())
-        .join(format!(
-            "{PRE_RESTORE_PREFIX}{}.{IMAGE_EXTENSION}",
-            replacement.incarnation().as_str(),
         )))
 }
 
@@ -4579,23 +3799,6 @@ mod tests {
                     identity: identity(),
                 },
                 clone_locks,
-            ),
-            (
-                Operation::Checkpoint {
-                    workspace: source.clone(),
-                    label: CheckpointLabel::new("automatic").expect("label"),
-                    pin: Pin::Automatic,
-                },
-                vec![source_lock.clone()],
-            ),
-            (
-                Operation::Restore {
-                    workspace: source.clone(),
-                    label: CheckpointLabel::new("automatic").expect("label"),
-                    mode: RestoreMode::Replace,
-                    identity: identity(),
-                },
-                vec![source_lock.clone()],
             ),
             (Operation::Retire { workspace: source }, vec![source_lock]),
         ];

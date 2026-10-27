@@ -21,20 +21,19 @@ use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, path
 
 use cowshed_core::{
     api::{
-        AbandonedPreservation, AbandonedWork, BinaryData, BranchLandings, CheckpointInfo,
-        CommandArg, CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule,
-        ExecClass, ExecScope, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred,
-        GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo,
-        JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark,
-        JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille,
-        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, PreservedRef, ProcessCoverage,
-        ProcessCoverageGap, ProtectedOutput, PushReport, RebaseReport, RemoveReport, RepoRule,
-        ResidentBytes, ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo,
-        StdinKind, StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UnlandedChange,
-        UnlandedPath, UnlandedPaths, UnprovenWorkspace, UsageReconciliation, UtcTimestamp,
-        VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
-        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
-        WorkspaceState,
+        AbandonedPreservation, AbandonedWork, BinaryData, BranchLandings, CommandArg, CpuMicros,
+        CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExecClass, ExecScope,
+        ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason, GcReport, GitOid,
+        GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution,
+        JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage,
+        LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille, OutputLimitInfo,
+        OutputStorage, OutputSummary, PortBlock, PreservedRef, ProcessCoverage, ProcessCoverageGap,
+        ProtectedOutput, PushReport, RebaseReport, RemoveReport, RepoRule, ResidentBytes,
+        ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
+        StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UnlandedChange, UnlandedPath,
+        UnlandedPaths, UnprovenWorkspace, UsageReconciliation, UtcTimestamp, VolumeUnavailable,
+        VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation, WorkspaceInfo,
+        WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -743,7 +742,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
 
 fn workspace_infos() -> BTreeMap<&'static str, Value> {
     // The main workspace as a bare controller listing reports it: no branch, no base commit, no
-    // creation stamp, no landing measurement, and no checkpoints.
+    // creation stamp, and no landing measurement.
     let main = WorkspaceInfo {
         repo_id: repo_id(),
         workspace: workspace_name("main"),
@@ -754,7 +753,6 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
         branch: None,
         base_commit: None,
         created_at: None,
-        checkpoints: Vec::new(),
         snapshot_stale: false,
         landing: None,
     };
@@ -767,18 +765,6 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
         branch: Some("cowshed/cs-seam".to_owned()),
         base_commit: Some(oid("0f1e2d3c4b5a69788796a5b4c3d2e1f001234567")),
         created_at: Some(timestamp()),
-        checkpoints: vec![
-            CheckpointInfo {
-                label: "pre-rebase".to_owned(),
-                revision: 3,
-                pinned: true,
-            },
-            CheckpointInfo {
-                label: "nightly".to_owned(),
-                revision: 4,
-                pinned: false,
-            },
-        ],
         snapshot_stale: true,
         landing: Some(WorkspaceLanding {
             dirty_files: Some(2),
@@ -1104,7 +1090,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     let gc_dry_run = GcReport {
         examined: 7,
         reclaimed: 0,
-        retained_pinned: 1,
         retained_active: 1,
         released_bytes: 0,
         dry_run: true,
@@ -1114,7 +1099,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             GcReason::OrphanStagingMetadata,
             GcReason::OrphanStagingMount,
             GcReason::OrphanMountpoint,
-            GcReason::ExpiredCheckpoint,
             GcReason::OrphanSessionImage,
             GcReason::AbandonedBundle,
             GcReason::UnlinkedBuildVolume,
@@ -1135,7 +1119,6 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     let gc_swept = GcReport {
         examined: 7,
         reclaimed: 5,
-        retained_pinned: 1,
         retained_active: 0,
         released_bytes: 21_504,
         dry_run: false,

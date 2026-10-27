@@ -5,7 +5,7 @@ in one pool, under one root dataset, and derives all runtime state from `zfs lis
 cowshed creates there attaches a disk image, and on macOS nothing below the root publishes an IOKit disk.
 
 Repository identity, logical layout, shared metadata and retention belong to [01_storage.md](./01_storage.md). The
-substrate contract, the dataset mapping, the clone-origin rule and the restore transaction belong to
+substrate contract, the dataset mapping, the clone-origin rule belongs to
 [09_substrates.md §ZFS substrate](./09_substrates.md#zfs-substrate); build volumes, seeds, land adoption and collection
 belong to [16_build_volumes.md](./16_build_volumes.md). This companion owns the ZFS realization: the pool and root, the
 datasets each workspace has, what land swaps and what `rm` destroys, and the macOS dataset properties. Its APFS
@@ -241,8 +241,8 @@ send it down mds's APFS branch, which asks `APFSVolumeRole` about a mount-source
 ### Inherited, never set per dataset
 
 The values live on `<pool>/cowshed`, plus `com.apple.ignoreowner=on` on `store`. A clone takes inheritable properties
-from its parent in the namespace, not from its origin, so every fork, seed clone and restore clone inherits them with no
-step of its own, as does a received dataset whose stream carries no properties. The one other local override is
+from its parent in the namespace, not from its origin, so every fork and seed clone inherits them with no step of its
+own, as does a received dataset whose stream carries no properties. The one other local override is
 `com.apple.browse=on`, set on a workspace created with `--browse`. `devdisk`, `mimic` and `ignoreowner` are never set
 below the root on a workspace or build dataset.
 

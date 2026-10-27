@@ -29,8 +29,8 @@ rejected. For `repo_id = acme/widget`, trusted project policy is controller-owne
 ## Authority split
 
 The coordinator is the sole mutating authority for create, fork, grant, revoke, land, mirror refresh, and destroy. A
-`WorkspaceHandle` is non-escalating and scoped to one workspace: it can run and observe jobs, checkpoint, and push, but
-cannot modify grants, destroy workspaces, refresh mirrors, or reach siblings.
+`WorkspaceHandle` is non-escalating and scoped to one workspace: it can run and observe jobs, and push, but cannot
+modify grants, destroy workspaces, refresh mirrors, or reach siblings.
 
 Workspace Git fetches from the main mount, and from the network only through an intercepted egress grant, which admits
 fetch and refuses push. Remote publication is coordinator work outside the sandbox.
@@ -114,10 +114,10 @@ binary calls reject missing, oversized, unsolicited, or length-mismatched frames
 base64/JSON-array allocation while the bounded actor/channel supplies backpressure.
 
 Protected in-volume Arrow records and canonical `Inline`/`File` artifacts are captured-content authority for their
-originating incarnation/checkpoint snapshot. The controller's audit records carry compact telemetry of job existence,
-lifecycle, ordering, fork/restore lineage, terminal state, terminal-batch digest, stream byte counts, and stream hashes;
-they store no artifact payload or path and are never read for a decision. A missing artifact or digest mismatch inside
-the image is a typed integrity failure, not a last-writer-wins repair.
+originating incarnation. The controller's audit records carry compact telemetry of job existence, lifecycle, ordering,
+fork lineage, terminal state, terminal-batch digest, stream byte counts, and stream hashes; they store no artifact
+payload or path and are never read for a decision. A missing artifact or digest mismatch inside the image is a typed
+integrity failure, not a last-writer-wins repair.
 
 A configurable combined stdout-plus-stderr quota defaults to 1 GiB and counts persisted plus read-but-not-yet-persisted
 bytes. At the first crossing, the supervisor atomically stops accepting payload past the boundary, sends TERM to the

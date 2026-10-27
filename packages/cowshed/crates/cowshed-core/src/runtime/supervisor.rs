@@ -74,8 +74,8 @@ use crate::runtime::supervisor_socket::AdmissionSource;
 use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, VolumeMountpoint};
 use crate::storage::job_artifact::{
     AdmissionLookup, AdmittedSession, AdmittedStdin, ArtifactConfig, ArtifactError, ArtifactStore,
-    CompletedJobArtifacts, JobAdmission, JobEnding, JobScheduling, OutputTargets,
-    SealedCheckpointManifest, SealedJobReader, StreamKind,
+    CompletedJobArtifacts, JobAdmission, JobEnding, JobScheduling, OutputTargets, SealedJobReader,
+    StreamKind,
 };
 
 mod group_ledger;
@@ -434,13 +434,6 @@ pub struct LogChunk {
     pub bytes: Bytes,
     pub next_offset: u64,
     pub eof: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CheckpointBarrier {
-    pub checkpoint_id: String,
-    pub barrier_id: u64,
-    pub manifest_batch_sha256: Sha256Digest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -909,7 +902,6 @@ pub trait ArtifactSink: Send {
         stdout_copy: Option<OutputPublication>,
         stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal>;
-    fn checkpoint(&mut self) -> Result<CheckpointBarrier>;
     /// One canonical terminal snapshot for facts and both stream reads. None is authoritative
     /// absence; unread or set-aside history retains its original refusal.
     fn sealed(&mut self, job_id: JobId) -> Result<Option<SealedJobReader>>;
@@ -1049,18 +1041,6 @@ impl ArtifactSink for ArtifactStoreSink {
             terminal_batch_sha256: sealed.terminal_batch_sha256,
             output_limit: sealed.output_limit,
             publication_failure,
-        })
-    }
-
-    fn checkpoint(&mut self) -> Result<CheckpointBarrier> {
-        let SealedCheckpointManifest {
-            record,
-            manifest_batch_sha256,
-        } = self.store.checkpoint().map_err(map_artifact_error)?;
-        Ok(CheckpointBarrier {
-            checkpoint_id: String::new(),
-            barrier_id: record.barrier_id,
-            manifest_batch_sha256,
         })
     }
 }
@@ -4004,15 +3984,6 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
-    pub async fn checkpoint_barrier(&self, checkpoint_id: String) -> Result<CheckpointBarrier> {
-        self.call(|reply| Command::Checkpoint {
-            authority: self.authority.clone(),
-            checkpoint_id,
-            reply,
-        })
-        .await
-    }
-
     /// Close admission and wait for the running jobs to end, retiring nothing. Only a caller
     /// in the supervisor's own process may leave it there, since it retires the supervisor
     /// itself afterwards; a remote handle refuses it. A caller in another process asks
@@ -4397,11 +4368,6 @@ pub(super) enum Command {
         cursor: Option<JobJournalCursor>,
         limits: JobTailLimits,
         reply: oneshot::Sender<Result<JobTail>>,
-    },
-    Checkpoint {
-        authority: WorkspaceAuthoritySnapshot,
-        checkpoint_id: String,
-        reply: oneshot::Sender<Result<CheckpointBarrier>>,
     },
     Quiesce {
         authority: WorkspaceAuthoritySnapshot,
@@ -5987,14 +5953,6 @@ impl SupervisorActor {
                     .validate_authority(&authority)
                     .and_then(|()| self.job(job_id))
                     .and_then(listening_ports);
-                let _ = reply.send(result);
-            }
-            Command::Checkpoint {
-                authority,
-                checkpoint_id,
-                reply,
-            } => {
-                let result = self.checkpoint(&authority, checkpoint_id).await;
                 let _ = reply.send(result);
             }
             Command::Quiesce { authority, reply } => {
@@ -7660,27 +7618,6 @@ impl SupervisorActor {
         });
     }
 
-    async fn checkpoint(
-        &mut self,
-        authority: &WorkspaceAuthoritySnapshot,
-        checkpoint_id: String,
-    ) -> Result<CheckpointBarrier> {
-        self.validate_authority(authority)?;
-        validate_checkpoint_id(&checkpoint_id)?;
-        let mut barrier = self.artifacts.checkpoint()?;
-        barrier.checkpoint_id = checkpoint_id.clone();
-        self.commitments
-            .record(CommitmentDraft::Checkpoint {
-                repo_id: self.authority.repo_id.clone(),
-                origin_incarnation: self.authority.workspace_incarnation.clone(),
-                checkpoint_id,
-                barrier_id: barrier.barrier_id,
-                manifest_batch_sha256: barrier.manifest_batch_sha256,
-            })
-            .await?;
-        Ok(barrier)
-    }
-
     fn handle_event(&mut self, event: ProcessEvent) {
         match event {
             ProcessEvent::Output {
@@ -9228,19 +9165,6 @@ fn validate_session_name(name: &str) -> Result<()> {
         Err(CowshedError::usage(
             "invalid session name",
             "use 1-64 ASCII letters, digits, dash, underscore, or dot",
-        ))
-    }
-}
-
-/// A checkpoint barrier is published as a commitment, so the commitment id grammar is the only
-/// grammar there is. Restating it here let the two drift silently in either direction.
-fn validate_checkpoint_id(value: &str) -> Result<()> {
-    if crate::api::dto::valid_commitment_id(value) {
-        Ok(())
-    } else {
-        Err(CowshedError::usage(
-            "invalid checkpoint commitment id",
-            "use a 1-128 character alphanumeric checkpoint id",
         ))
     }
 }
@@ -10990,7 +10914,7 @@ mod lifecycle_commitment_tests {
         let second_destination =
             WorkspaceIncarnation::new("4198f2c0b7e34dc795f17b238b331c80").unwrap();
         let foreign_only = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let baseline_only = WorkspaceIncarnation::new("3198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let unlineaged = WorkspaceIncarnation::new("3198f2c0b7e34dc795f17b238b331c80").unwrap();
         let mut publisher =
             CommitmentPublisher::open(&telemetry, crate::storage::audit::ContinuityAudit::Arrow, 8)
                 .unwrap();
@@ -11021,17 +10945,6 @@ mod lifecycle_commitment_tests {
             .unwrap();
         let first = artifacts.finish(first, JobState::Exited).unwrap();
         publish_sealed_job(&mut publisher, &repo_id, &source, &first).await;
-        let checkpoint = artifacts.checkpoint().unwrap();
-        publisher
-            .record(CommitmentDraft::Checkpoint {
-                repo_id: repo_id.clone(),
-                origin_incarnation: source.clone(),
-                checkpoint_id: "baseline".into(),
-                barrier_id: checkpoint.record.barrier_id,
-                manifest_batch_sha256: checkpoint.manifest_batch_sha256,
-            })
-            .await
-            .unwrap();
 
         let later = artifacts
             .begin_job(
@@ -11047,26 +10960,6 @@ mod lifecycle_commitment_tests {
         publish_sealed_job(&mut publisher, &repo_id, &source, &later).await;
         drop(artifacts);
         publisher
-            .record(CommitmentDraft::Restore {
-                repo_id: repo_id.clone(),
-                source_checkpoint: "baseline".into(),
-                source_incarnation: source.clone(),
-                replaced_incarnation: source.clone(),
-                destination_incarnation: destination.clone(),
-            })
-            .await
-            .unwrap();
-        publisher
-            .record(CommitmentDraft::Restore {
-                repo_id: repo_id.clone(),
-                source_checkpoint: "baseline".into(),
-                source_incarnation: source.clone(),
-                replaced_incarnation: destination.clone(),
-                destination_incarnation: second_destination.clone(),
-            })
-            .await
-            .unwrap();
-        publisher
             .record(CommitmentDraft::WorkspaceIntroduced {
                 repo_id: foreign_repo,
                 workspace_incarnation: foreign_only.clone(),
@@ -11074,14 +10967,14 @@ mod lifecycle_commitment_tests {
             .await
             .unwrap();
 
-        // The lineage a marker carries after restore → restore: nearest ancestor first. The
-        // records file under `workspace_root` was written by `source`, so it opens under any
-        // incarnation whose lineage names `source`; nothing names `foreign_only` or
-        // `baseline_only`, and a records file from them is an integrity fault.
+        // The lineage an incarnation carries, nearest ancestor first. The records file under
+        // `workspace_root` was written by `source`, so it opens under any incarnation whose lineage
+        // names `source`; nothing names `foreign_only` or `unlineaged`, and a records file from them
+        // is an integrity fault.
         let admitted: BTreeSet<WorkspaceIncarnation> =
             BTreeSet::from([destination.clone(), source.clone()]);
         assert!(!admitted.contains(&foreign_only));
-        assert!(!admitted.contains(&baseline_only));
+        assert!(!admitted.contains(&unlineaged));
 
         let defaults = WorkspaceSupervisorConfig::default();
         let config = WorkspaceSupervisorConfig {

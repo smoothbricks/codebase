@@ -1364,7 +1364,6 @@ fn listing_row(name: &str, role: WorkspaceRole, mount: PathBuf) -> WorkspaceInfo
         branch: None,
         base_commit: None,
         created_at: None,
-        checkpoints: Vec::new(),
         snapshot_stale: false,
         landing: None,
     }

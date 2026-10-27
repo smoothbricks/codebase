@@ -874,28 +874,6 @@ impl Serves<CoordinatorLand> for Coordinator {
     }
 }
 
-impl Serves<CoordinatorRestore> for Coordinator {
-    const BOUND: &'static [&'static str] = &["repoId"];
-
-    fn request(
-        authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<RestoreRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {
-            workspace: WorkspaceName,
-            label: String,
-        }
-        let Caller { workspace, label } = decode::<CoordinatorRestore, Caller>(arguments)?;
-        Ok(RestoreRequest {
-            repo_id: owned(authority.repo_id),
-            workspace,
-            label,
-        })
-    }
-}
-
 impl Serves<CoordinatorResize> for Coordinator {
     const BOUND: &'static [&'static str] = &["repoId"];
 
@@ -960,34 +938,6 @@ impl Serves<CoordinatorRekey> for Coordinator {
         Ok(WorkspaceRequest {
             repo_id: owned(authority.repo_id),
             workspace,
-        })
-    }
-}
-
-impl Serves<CoordinatorReseed> for Coordinator {
-    const BOUND: &'static [&'static str] = &["repoId"];
-
-    fn request(
-        authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<ReseedRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {
-            workspace: WorkspaceName,
-            from: WorkspaceName,
-            dry_run: bool,
-        }
-        let Caller {
-            workspace,
-            from,
-            dry_run,
-        } = decode::<CoordinatorReseed, Caller>(arguments)?;
-        Ok(ReseedRequest {
-            repo_id: owned(authority.repo_id),
-            workspace,
-            from,
-            dry_run,
         })
     }
 }
@@ -1156,29 +1106,6 @@ impl Serves<CoordinatorRepoMirror> for Coordinator {
             repo_id: owned(authority.repo_id),
             workspace,
             url,
-        })
-    }
-}
-
-impl Serves<CoordinatorSetCheckpointQuota> for Coordinator {
-    const BOUND: &'static [&'static str] = &["repoId"];
-
-    fn request(
-        authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<QuotaRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {
-            workspace: WorkspaceName,
-            quota: CheckpointQuota,
-        }
-        let Caller { workspace, quota } =
-            decode::<CoordinatorSetCheckpointQuota, Caller>(arguments)?;
-        Ok(QuotaRequest {
-            repo_id: owned(authority.repo_id),
-            workspace,
-            quota,
         })
     }
 }
@@ -1508,28 +1435,6 @@ impl Serves<WorkerJobByKey> for WorkspaceHandle {
             workspace: owned(authority.workspace),
             workspace_incarnation: owned(authority.workspace_incarnation),
             admission_key,
-        })
-    }
-}
-
-impl Serves<WorkerCheckpoint> for WorkspaceHandle {
-    const BOUND: &'static [&'static str] = &["repoId", "workspace", "workspaceIncarnation"];
-
-    fn request(
-        authority: &<Self as Binder>::Fields<'_>,
-        arguments: Arguments,
-    ) -> Result<CheckpointRequest> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Caller {
-            options: CheckpointOptions,
-        }
-        let Caller { options } = decode::<WorkerCheckpoint, Caller>(arguments)?;
-        Ok(CheckpointRequest {
-            repo_id: owned(authority.repo_id),
-            workspace: owned(authority.workspace),
-            workspace_incarnation: owned(authority.workspace_incarnation),
-            options,
         })
     }
 }
@@ -1965,11 +1870,9 @@ pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
     check.served::<CoordinatorRevokeProject, _>(handles.coordinator, &[]);
     check.served::<CoordinatorRebase, _>(handles.coordinator, &[]);
     check.served::<CoordinatorLand, _>(handles.coordinator, &[]);
-    check.served::<CoordinatorRestore, _>(handles.coordinator, &[]);
     check.served::<CoordinatorResize, _>(handles.coordinator, &[]);
     check.served::<CoordinatorDefragment, _>(handles.coordinator, &[]);
     check.served::<CoordinatorRekey, _>(handles.coordinator, &[]);
-    check.served::<CoordinatorReseed, _>(handles.coordinator, &[]);
     check.served::<CoordinatorClearNxState, _>(handles.coordinator, &[]);
     check.served::<CoordinatorDetach, _>(handles.coordinator, &[]);
     check.served::<CoordinatorAssignSlot, _>(handles.coordinator, &[]);
@@ -1978,7 +1881,6 @@ pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
     check.served::<CoordinatorRecoverImage, _>(handles.coordinator, &[]);
     check.served::<CoordinatorRemoveProject, _>(handles.coordinator, &[]);
     check.served::<CoordinatorRepoMirror, _>(handles.coordinator, &[]);
-    check.served::<CoordinatorSetCheckpointQuota, _>(handles.coordinator, &[]);
     check.served::<CoordinatorDoctor, _>(handles.coordinator, &[]);
     check.served::<CoordinatorWorker, _>(handles.coordinator, &[]);
     check.served::<CoordinatorExec, _>(handles.coordinator, &[]);
@@ -1990,7 +1892,6 @@ pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
     check.served::<WorkerListJobs, _>(handles.workspace_handle, &[]);
     check.served::<WorkerJob, _>(handles.workspace_handle, &[]);
     check.served::<WorkerJobByKey, _>(handles.workspace_handle, &[]);
-    check.served::<WorkerCheckpoint, _>(handles.workspace_handle, &[]);
     check.served::<WorkerPush, _>(handles.workspace_handle, &[]);
     check.served::<SessionClose, _>(handles.workspace_handle, &[]);
     check.served::<JobStatus, _>(handles.job_handle, &[]);

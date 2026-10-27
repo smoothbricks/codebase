@@ -13,12 +13,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::dto::{
-    AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo,
-    CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg, DefragmentResult,
-    DoctorReport, ExecClass, ExecCommand, ExecRequest, ExecScope, Finding, FindingSeverity,
-    ForkOptions, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo,
-    JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions, LandReport,
-    MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
+    AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, CommandArg,
+    DefragmentResult, DoctorReport, ExecClass, ExecCommand, ExecRequest, ExecScope, Finding,
+    FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, JobId,
+    JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions,
+    LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
     RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
@@ -86,9 +85,6 @@ enum Event {
     Stop(WorkspaceName),
     Retire(WorkspaceName),
     Reclaim(WorkspaceName),
-    RestorePending(WorkspaceName),
-    RestoreEvidence(WorkspaceName),
-    RestoreActivate(WorkspaceName),
     GitSafety(WorkspaceName),
     Bundle(WorkspaceName),
     Detach(WorkspaceName),
@@ -118,18 +114,12 @@ struct DurableWorkspace {
     lifecycle_revision: u64,
     topology_revision: u64,
     grants: GrantSet,
-    checkpoints: Vec<CheckpointInfo>,
-    active_bytes: u64,
-    checkpoint_bytes: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DurableState {
     workspaces: Vec<DurableWorkspace>,
-    pending_restore: Option<DurableWorkspace>,
-    pending_has_evidence: bool,
-    checkpoint_quotas: std::collections::BTreeMap<String, CheckpointQuota>,
     #[serde(default)]
     project_grants: cowshed_core::api::dto::ProjectGrants,
 }
@@ -272,7 +262,6 @@ struct FakeHost {
     refuse_snapshot_batch: bool,
     events: mpsc::UnboundedSender<Event>,
     fail_create_initializer: bool,
-    fail_restore_fence_once: bool,
     doctor_findings: Vec<Finding>,
     reclaim_gate: Option<Arc<Notify>>,
     removal: FakeRemoval,
@@ -297,7 +286,6 @@ impl FakeHost {
         root: &Path,
         events: mpsc::UnboundedSender<Event>,
         fail_create_initializer: bool,
-        fail_restore_fence_once: bool,
         doctor_findings: Vec<Finding>,
     ) -> Self {
         std::fs::create_dir_all(root.join("checkout")).expect("create fake checkout");
@@ -329,7 +317,6 @@ impl FakeHost {
             refuse_snapshot_batch: false,
             events,
             fail_create_initializer,
-            fail_restore_fence_once,
             doctor_findings,
             reclaim_gate: None,
             removal: FakeRemoval::default(),
@@ -426,7 +413,6 @@ impl FakeHost {
                 branch: None,
                 base_commit: None,
                 created_at: None,
-                checkpoints: workspace.checkpoints.clone(),
                 snapshot_stale: false,
                 landing: None,
             },
@@ -460,9 +446,6 @@ impl FakeHost {
                 .expect("test block"),
             ))
             .expect("test grants"),
-            checkpoints: Vec::new(),
-            active_bytes: 10,
-            checkpoint_bytes: std::collections::BTreeMap::new(),
         }
     }
 
@@ -548,22 +531,6 @@ impl ProjectRuntimeHost for FakeHost {
             }
         }
         self.load()?;
-        if self.state.pending_has_evidence
-            && let Some(pending) = self.state.pending_restore.take()
-        {
-            let name = pending.name.clone();
-            if let Some(current) = self
-                .state
-                .workspaces
-                .iter_mut()
-                .find(|workspace| workspace.name == name)
-            {
-                *current = pending;
-            }
-            self.events.send(Event::RestoreActivate(name)).ok();
-            self.state.pending_has_evidence = false;
-            self.persist()?;
-        }
         Ok(())
     }
 
@@ -842,20 +809,6 @@ impl ProjectRuntimeHost for FakeHost {
         )))
     }
 
-    async fn reseed(
-        &mut self,
-        workspace: WorkspaceName,
-        from: WorkspaceName,
-        _dry_run: bool,
-    ) -> Result<cowshed_core::api::dto::ReseedResult> {
-        self.workspace(&workspace)?;
-        self.workspace(&from)?;
-        Err(CowshedError::environment_missing(
-            "this lifecycle test host has no build-volume storage",
-            "use the directory or APFS reseed contract fixture",
-        ))
-    }
-
     async fn clear_nx_state(
         &mut self,
         workspace: WorkspaceName,
@@ -865,122 +818,6 @@ impl ProjectRuntimeHost for FakeHost {
             "this lifecycle test host has no build-volume storage",
             "use the directory Nx state clear fixture",
         ))
-    }
-
-    async fn checkpoint(
-        &mut self,
-        workspace: WorkspaceName,
-        expected_incarnation: Option<WorkspaceIncarnation>,
-        options: CheckpointOptions,
-    ) -> Result<CheckpointResult> {
-        let current = self.workspace(&workspace)?;
-        if expected_incarnation
-            .as_ref()
-            .is_some_and(|expected| expected != &current.incarnation)
-        {
-            return Err(CowshedError::conflict(
-                "stale workspace incarnation",
-                "refresh the worker",
-            ));
-        }
-        let explicitly_labeled = options.label.is_some();
-        let label = options
-            .label
-            .unwrap_or_else(|| format!("checkpoint-{}", current.lifecycle_revision + 1));
-        if current
-            .checkpoints
-            .iter()
-            .any(|checkpoint| checkpoint.label == label)
-        {
-            return Err(CowshedError::conflict(
-                "checkpoint label already exists",
-                "choose another label",
-            ));
-        }
-        if let Some(quota) = self.state.checkpoint_quotas.get(workspace.as_str()) {
-            let existing_bytes = current
-                .checkpoint_bytes
-                .values()
-                .try_fold(0_u64, |sum, bytes| sum.checked_add(*bytes))
-                .ok_or_else(|| {
-                    CowshedError::integrity("checkpoint byte overflow", "test fixture")
-                })?;
-            let projected_bytes = existing_bytes
-                .checked_add(current.active_bytes)
-                .ok_or_else(|| {
-                    CowshedError::integrity("checkpoint byte overflow", "test fixture")
-                })?;
-            let projected_count = u64::try_from(current.checkpoints.len()).map_err(|_| {
-                CowshedError::integrity("checkpoint count overflow", "test fixture")
-            })? + 1;
-            if projected_count > u64::from(quota.max_count) || projected_bytes > quota.max_bytes {
-                return Err(CowshedError::conflict(
-                    "checkpoint quota exceeded",
-                    "raise quota or remove checkpoints",
-                ));
-            }
-        }
-        let current = self.workspace_mut(&workspace)?;
-        current.lifecycle_revision += 1;
-        current.checkpoints.push(CheckpointInfo {
-            label: label.clone(),
-            revision: current.lifecycle_revision,
-            pinned: options.keep || explicitly_labeled,
-        });
-        current
-            .checkpoint_bytes
-            .insert(label.clone(), current.active_bytes);
-        self.persist()?;
-        Ok(CheckpointResult { label })
-    }
-
-    async fn restore(&mut self, workspace: WorkspaceName, _label: String) -> Result<()> {
-        if let Some(pending) = self.state.pending_restore.clone() {
-            if pending.name != workspace {
-                return Err(CowshedError::conflict(
-                    "another restore is pending",
-                    "recover it first",
-                ));
-            }
-            self.events
-                .send(Event::RestoreEvidence(workspace.clone()))
-                .ok();
-            self.state.pending_has_evidence = true;
-            self.persist()?;
-            let pending = self.state.pending_restore.take().expect("checked pending");
-            *self.workspace_mut(&workspace)? = pending;
-            self.state.pending_has_evidence = false;
-            self.events
-                .send(Event::RestoreActivate(workspace.clone()))
-                .ok();
-            self.persist()?;
-            return Ok(());
-        }
-        let current = self.workspace(&workspace)?.clone();
-        let mut replacement = current.clone();
-        replacement.incarnation = incarnation(current.topology_revision + 100);
-        replacement.lifecycle_revision += 1;
-        self.state.pending_restore = Some(replacement);
-        self.events
-            .send(Event::RestorePending(workspace.clone()))
-            .ok();
-        self.persist()?;
-        if std::mem::take(&mut self.fail_restore_fence_once) {
-            return Err(CowshedError::environment_missing(
-                "injected restore fence failure",
-                "retry restore",
-            ));
-        }
-        self.events
-            .send(Event::RestoreEvidence(workspace.clone()))
-            .ok();
-        self.state.pending_has_evidence = true;
-        self.persist()?;
-        let pending = self.state.pending_restore.take().expect("just staged");
-        *self.workspace_mut(&workspace)? = pending;
-        self.state.pending_has_evidence = false;
-        self.events.send(Event::RestoreActivate(workspace)).ok();
-        self.persist()
     }
 
     async fn remove(
@@ -1142,7 +979,6 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(GcReport {
             examined: u64::try_from(self.state.workspaces.len()).expect("test length"),
             reclaimed: 0,
-            retained_pinned: 0,
             retained_active: 0,
             released_bytes: 0,
             dry_run: options.dry_run,
@@ -1218,18 +1054,6 @@ impl ProjectRuntimeHost for FakeHost {
                 .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?,
         );
         current.grants.revision += 1;
-        self.persist()
-    }
-
-    async fn set_checkpoint_quota(
-        &mut self,
-        workspace: WorkspaceName,
-        quota: CheckpointQuota,
-    ) -> Result<()> {
-        self.workspace(&workspace)?;
-        self.state
-            .checkpoint_quotas
-            .insert(workspace.to_string(), quota);
         self.persist()
     }
 
@@ -1682,7 +1506,6 @@ async fn route(
 async fn start(
     root: &Path,
     fail_create: bool,
-    fail_restore: bool,
     findings: Vec<Finding>,
 ) -> (
     ProjectRuntime,
@@ -1690,20 +1513,12 @@ async fn start(
     RepoId,
     mpsc::UnboundedReceiver<Event>,
 ) {
-    start_with_removal(
-        root,
-        fail_create,
-        fail_restore,
-        findings,
-        FakeRemoval::default(),
-    )
-    .await
+    start_with_removal(root, fail_create, findings, FakeRemoval::default()).await
 }
 
 async fn start_with_removal(
     root: &Path,
     fail_create: bool,
-    fail_restore: bool,
     findings: Vec<Finding>,
     removal: FakeRemoval,
 ) -> (
@@ -1713,7 +1528,7 @@ async fn start_with_removal(
     mpsc::UnboundedReceiver<Event>,
 ) {
     let (events, receiver) = mpsc::unbounded_channel();
-    let mut host = FakeHost::new(root, events, fail_create, fail_restore, findings);
+    let mut host = FakeHost::new(root, events, fail_create, findings);
     host.removal = removal;
     let repo = host.descriptor.repo_id.clone();
     let runtime = ProjectRuntime::start(host).await.expect("start runtime");
@@ -1739,35 +1554,10 @@ async fn adopt(router: &RouterHandle, repo: &RepoId) -> Value {
     adopted["workspace"].clone()
 }
 
-async fn checkpoint_as_worker(
-    router: &RouterHandle,
-    repo: &RepoId,
-    workspace: &str,
-    incarnation: &WorkspaceIncarnation,
-    options: CheckpointOptions,
-) -> Result<Value> {
-    route(
-        router,
-        ConnectionAuthority::Worker {
-            repo_id: repo.clone(),
-            workspace: WorkspaceName::new(workspace).expect("workspace"),
-            workspace_incarnation: incarnation.clone(),
-        },
-        "worker.checkpoint",
-        json!({
-            "repoId": repo,
-            "workspace": workspace,
-            "workspaceIncarnation": incarnation,
-            "options": options
-        }),
-    )
-    .await
-}
-
 #[tokio::test]
 async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     let adopted = adopt(&router, &repo).await;
     while events.try_recv().is_ok() {}
     let incarnation = adopted["info"]["workspaceIncarnation"].clone();
@@ -1876,7 +1666,7 @@ async fn start_recording_admissions(
     Value,
 ) {
     let (events, mut receiver) = mpsc::unbounded_channel();
-    let host = FakeHost::new(root, events, false, false, Vec::new());
+    let host = FakeHost::new(root, events, false, Vec::new());
     let admitted = Arc::clone(&host.admitted);
     let repo = host.descriptor.repo_id.clone();
     let runtime = ProjectRuntime::start(host).await.expect("start runtime");
@@ -2126,7 +1916,7 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
     let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
     let supervisor = scripted_supervisor(&root, spawn_tx);
     let (event_tx, mut events) = mpsc::unbounded_channel();
-    let mut host = FakeHost::new(&root, event_tx, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, event_tx, false, Vec::new());
     host.supervisors
         .insert(WorkspaceName::new("main").unwrap(), supervisor.clone());
     let repo = host.descriptor.repo_id.clone();
@@ -2293,7 +2083,7 @@ async fn one_hundred_live_jobs_never_enumerate_foreign_workspace_snapshots() {
     let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
     let supervisor = scripted_supervisor(&root, spawn_tx);
     let (event_tx, mut events) = mpsc::unbounded_channel();
-    let mut host = FakeHost::new(&root, event_tx, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, event_tx, false, Vec::new());
     host.refuse_snapshot_batch = true;
     host.supervisors
         .insert(WorkspaceName::main(), supervisor.clone());
@@ -2388,7 +2178,7 @@ async fn one_hundred_live_jobs_never_enumerate_foreign_workspace_snapshots() {
 #[tokio::test]
 async fn log_binary_metadata_carries_the_exact_next_offset() {
     let root = test_root();
-    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, _events) = start(&root, false, Vec::new()).await;
     let adopted = adopt(&router, &repo).await;
     let incarnation: WorkspaceIncarnation =
         serde_json::from_value(adopted["info"]["workspaceIncarnation"].clone())
@@ -2428,7 +2218,7 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
     let root = test_root();
     let (events, _events) = mpsc::unbounded_channel();
     let held = HeldJob::new(incarnation(1));
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     host.held_job = Some(Arc::clone(&held));
     let repo = host.descriptor.repo_id.clone();
     let runtime = ProjectRuntime::start(host).await.expect("start runtime");
@@ -2990,7 +2780,7 @@ impl SupervisedJobs {
         supervisors: impl IntoIterator<Item = (WorkspaceName, WorkspaceSupervisorHandle)>,
     ) -> Self {
         let (events, _events) = mpsc::unbounded_channel();
-        let mut host = FakeHost::new(root, events, false, false, Vec::new());
+        let mut host = FakeHost::new(root, events, false, Vec::new());
         host.supervisors.extend(supervisors);
         let repo = host.descriptor.repo_id.clone();
         let runtime = ProjectRuntime::start(host).await.expect("start runtime");
@@ -5116,7 +4906,7 @@ async fn an_attachment_resumes_each_stream_at_its_cursor() {
 #[tokio::test]
 async fn the_controller_admits_open_stdin_and_routes_its_end() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     let adopted = adopt(&router, &repo).await;
     let incarnation = adopted["info"]["workspaceIncarnation"].clone();
     while events.try_recv().is_ok() {}
@@ -5171,7 +4961,7 @@ async fn a_pending_stdin_write_holds_no_other_call() {
     let (events, mut observed) = mpsc::unbounded_channel();
     let held = HeldJob::new(incarnation(1));
     let gate = Arc::new(Notify::new());
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     host.held_job = Some(Arc::clone(&held));
     host.stdin_gate = Some(Arc::clone(&gate));
     let repo = host.descriptor.repo_id.clone();
@@ -5223,7 +5013,7 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
     let root = test_root();
     let (events, mut observed) = mpsc::unbounded_channel();
     let held = HeldJob::new(incarnation(1));
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     host.held_job = Some(Arc::clone(&held));
     let repo = host.descriptor.repo_id.clone();
     let runtime = ProjectRuntime::start(host).await.expect("start runtime");
@@ -5301,7 +5091,7 @@ async fn a_reported_create_hears_its_steps_while_it_runs() {
     let root = test_root();
     let (events, _events) = mpsc::unbounded_channel();
     let gate = Arc::new(Notify::new());
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     host.create_gate = Some(Arc::clone(&gate));
     let repo = host.descriptor.repo_id.clone();
     let runtime = ProjectRuntime::start(host).await.expect("start runtime");
@@ -5369,7 +5159,7 @@ async fn a_reported_create_hears_its_steps_while_it_runs() {
 #[tokio::test]
 async fn adopt_option_identity_mismatch_rejects_before_host_mutation() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     let error = route(
         &router,
         coordinator(repo.clone()),
@@ -5395,7 +5185,7 @@ async fn adopt_option_identity_mismatch_rejects_before_host_mutation() {
 #[tokio::test]
 async fn secret_refusal_precedes_image_initialization_and_quarantine_preserves_paths() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     let secret = root.join("checkout/.env");
     std::fs::write(&secret, "API_TOKEN=not-for-images").expect("write secret");
 
@@ -5453,7 +5243,7 @@ async fn secret_refusal_precedes_image_initialization_and_quarantine_preserves_p
 #[tokio::test]
 async fn fork_ref_requires_clean_before_any_mint_effect() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     while events.try_recv().is_ok() {}
     let error = route(
@@ -5477,7 +5267,7 @@ async fn fork_ref_requires_clean_before_any_mint_effect() {
 #[tokio::test]
 async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     route(
         &router,
@@ -5540,7 +5330,7 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
 #[tokio::test]
 async fn workspace_at_uses_active_mount_facts_and_attach_preserves_exec_mount() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     let adopted = adopt(&router, &repo).await;
     let mount = PathBuf::from(adopted["info"]["mount"].as_str().expect("mount"));
     assert_eq!(mount, root.join("checkout"));
@@ -5659,7 +5449,7 @@ async fn workspace_at_uses_active_mount_facts_and_attach_preserves_exec_mount() 
 #[tokio::test]
 async fn moving_the_checkout_and_attaching_from_an_alias_both_move_the_recorded_path() {
     let root = test_root();
-    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, _events) = start(&root, false, Vec::new()).await;
     let adopted = adopt(&router, &repo).await;
     assert_eq!(
         adopted["info"]["mount"].as_str().expect("mount"),
@@ -5756,7 +5546,7 @@ async fn moving_the_checkout_and_attaching_from_an_alias_both_move_the_recorded_
 #[tokio::test]
 async fn opening_the_project_accepts_a_workspace_mount_and_still_refuses_a_stranger() {
     let root = test_root();
-    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, _events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     let checkout = root.join("checkout");
 
@@ -5820,7 +5610,7 @@ async fn opening_the_project_accepts_a_workspace_mount_and_still_refuses_a_stran
 async fn workspace_at_rejects_ambiguous_nested_active_mounts() {
     let root = test_root();
     let (events, _receiver) = mpsc::unbounded_channel();
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     let overlap = root.join("overlap");
     let mut outer = host.next_workspace(WorkspaceName::new("main").expect("main"));
     outer.mount = Some(overlap.clone());
@@ -5847,7 +5637,7 @@ async fn workspace_at_rejects_ambiguous_nested_active_mounts() {
 #[tokio::test]
 async fn the_build_volume_answer_is_the_hosts_grant_for_one_attached_incarnation() {
     let root = test_root();
-    let (runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let (runtime, router, repo, _events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     let created = route(
         &router,
@@ -5913,7 +5703,7 @@ async fn the_build_volume_answer_is_the_hosts_grant_for_one_attached_incarnation
 #[tokio::test]
 async fn a_grants_read_that_holds_an_incarnation_is_fenced_on_a_coordinator_connection() {
     let root = test_root();
-    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, _events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     let created = route(
         &router,
@@ -5951,198 +5741,9 @@ async fn a_grants_read_that_holds_an_incarnation_is_fenced_on_a_coordinator_conn
 }
 
 #[tokio::test]
-async fn labeled_checkpoint_is_pinned_and_projected_without_mount_inspection() {
-    let root = test_root();
-    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
-    adopt(&router, &repo).await;
-    let workspace = route(
-        &router,
-        coordinator(repo.clone()),
-        "coordinator.fork",
-        json!({ "repoId": repo, "workspace": "retry", "options": ForkOptions::default() }),
-    )
-    .await
-    .expect("create");
-    let incarnation: WorkspaceIncarnation =
-        serde_json::from_value(workspace["info"]["workspaceIncarnation"].clone())
-            .expect("incarnation");
-    let worker = ConnectionAuthority::Worker {
-        repo_id: repo.clone(),
-        workspace: WorkspaceName::new("retry").expect("name"),
-        workspace_incarnation: incarnation.clone(),
-    };
-    let checkpoint = route(
-        &router,
-        worker,
-        "worker.checkpoint",
-        json!({
-            "repoId": repo,
-            "workspace": "retry",
-            "workspaceIncarnation": incarnation,
-            "options": CheckpointOptions { label: Some("handoff".into()), keep: false }
-        }),
-    )
-    .await
-    .expect("checkpoint");
-    assert_eq!(checkpoint["label"], "handoff");
-
-    route(
-        &router,
-        coordinator(repo.clone()),
-        "coordinator.detach",
-        json!({ "repoId": repo, "workspace": "retry" }),
-    )
-    .await
-    .expect("detach");
-    let info = route(
-        &router,
-        coordinator(repo.clone()),
-        "workspace.info",
-        json!({ "repoId": repo, "workspace": "retry" }),
-    )
-    .await
-    .expect("detached info");
-    assert_eq!(
-        info["checkpoints"],
-        json!([{ "label": "handoff", "revision": 2, "pinned": true }])
-    );
-}
-
-#[tokio::test]
-async fn checkpoint_quota_charges_active_plus_all_workspace_checkpoints_at_exact_boundary() {
-    let root = test_root();
-    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
-    let main = adopt(&router, &repo).await;
-    let other = route(
-        &router,
-        coordinator(repo.clone()),
-        "coordinator.fork",
-        json!({ "repoId": repo, "workspace": "other", "options": ForkOptions::default() }),
-    )
-    .await
-    .expect("create other");
-    let main_incarnation: WorkspaceIncarnation =
-        serde_json::from_value(main["info"]["workspaceIncarnation"].clone())
-            .expect("main incarnation");
-    let other_incarnation: WorkspaceIncarnation =
-        serde_json::from_value(other["info"]["workspaceIncarnation"].clone())
-            .expect("other incarnation");
-
-    for (workspace, quota) in [
-        (
-            "main",
-            CheckpointQuota {
-                max_count: 3,
-                max_bytes: 30,
-            },
-        ),
-        (
-            "other",
-            CheckpointQuota {
-                max_count: 1,
-                max_bytes: 10,
-            },
-        ),
-    ] {
-        route(
-            &router,
-            coordinator(repo.clone()),
-            "coordinator.setCheckpointQuota",
-            json!({ "repoId": repo, "workspace": workspace, "quota": quota }),
-        )
-        .await
-        .expect("set quota");
-    }
-
-    checkpoint_as_worker(
-        &router,
-        &repo,
-        "main",
-        &main_incarnation,
-        CheckpointOptions {
-            label: Some("pinned".into()),
-            keep: false,
-        },
-    )
-    .await
-    .expect("pinned checkpoint");
-    checkpoint_as_worker(
-        &router,
-        &repo,
-        "main",
-        &main_incarnation,
-        CheckpointOptions::default(),
-    )
-    .await
-    .expect("automatic checkpoint");
-    checkpoint_as_worker(
-        &router,
-        &repo,
-        "other",
-        &other_incarnation,
-        CheckpointOptions::default(),
-    )
-    .await
-    .expect("other workspace exact boundary");
-    checkpoint_as_worker(
-        &router,
-        &repo,
-        "main",
-        &main_incarnation,
-        CheckpointOptions::default(),
-    )
-    .await
-    .expect("main exact count and byte boundary ignores other workspace");
-
-    let exact = route(
-        &router,
-        coordinator(repo.clone()),
-        "workspace.info",
-        json!({ "repoId": repo, "workspace": "main" }),
-    )
-    .await
-    .expect("main info");
-    assert_eq!(
-        exact["checkpoints"].as_array().expect("checkpoints").len(),
-        3
-    );
-    assert_eq!(exact["checkpoints"][0]["pinned"], true);
-    assert_eq!(exact["checkpoints"][1]["pinned"], false);
-
-    route(
-        &router,
-        coordinator(repo.clone()),
-        "coordinator.setCheckpointQuota",
-        json!({
-            "repoId": repo,
-            "workspace": "main",
-            "quota": CheckpointQuota { max_count: 4, max_bytes: 39 }
-        }),
-    )
-    .await
-    .expect("lower byte headroom");
-    let before = std::fs::read(root.join("durable.json")).expect("durable before denial");
-    let error = checkpoint_as_worker(
-        &router,
-        &repo,
-        "main",
-        &main_incarnation,
-        CheckpointOptions::default(),
-    )
-    .await
-    .expect_err("one byte over quota");
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert_eq!(
-        std::fs::read(root.join("durable.json")).expect("durable after denial"),
-        before,
-        "quota denial must publish no checkpoint fact or metadata"
-    );
-}
-
-#[tokio::test]
 async fn same_name_creates_serialize_to_one_success_and_one_conflict() {
     let root = test_root();
-    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, _events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     let params = json!({ "repoId": repo, "workspace": "same", "options": ForkOptions::default() });
     let left = route(
@@ -6166,7 +5767,7 @@ async fn same_name_creates_serialize_to_one_success_and_one_conflict() {
 #[tokio::test]
 async fn initializer_failure_never_publishes_or_lists_workspace() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, true, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, true, Vec::new()).await;
     adopt(&router, &repo).await;
     let error = route(
         &router,
@@ -6197,62 +5798,9 @@ async fn initializer_failure_never_publishes_or_lists_workspace() {
 }
 
 #[tokio::test]
-async fn restore_stays_pending_after_fence_failure_and_retry_activates_after_evidence() {
-    let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, true, Vec::new()).await;
-    adopt(&router, &repo).await;
-    let before = route(
-        &router,
-        coordinator(repo.clone()),
-        "project.workspace",
-        json!({ "repoId": repo, "workspace": "main" }),
-    )
-    .await
-    .expect("before");
-    route(
-        &router,
-        coordinator(repo.clone()),
-        "coordinator.restore",
-        json!({ "repoId": repo, "workspace": "main", "label": "checkpoint-1" }),
-    )
-    .await
-    .expect_err("fence failure");
-    let pending_view = route(
-        &router,
-        coordinator(repo.clone()),
-        "project.workspace",
-        json!({ "repoId": repo, "workspace": "main" }),
-    )
-    .await
-    .expect("pending remains hidden");
-    assert_eq!(
-        pending_view["info"]["workspaceIncarnation"],
-        before["info"]["workspaceIncarnation"]
-    );
-    route(
-        &router,
-        coordinator(repo.clone()),
-        "coordinator.restore",
-        json!({ "repoId": repo, "workspace": "main", "label": "checkpoint-1" }),
-    )
-    .await
-    .expect("retry");
-    let events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
-    let evidence = events
-        .iter()
-        .position(|event| matches!(event, Event::RestoreEvidence(_)))
-        .expect("evidence event");
-    let activate = events
-        .iter()
-        .position(|event| matches!(event, Event::RestoreActivate(_)))
-        .expect("activation event");
-    assert!(evidence < activate);
-}
-
-#[tokio::test]
 async fn stale_incarnation_and_revision_reject_before_mutation() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     let main = adopt(&router, &repo).await;
     while events.try_recv().is_ok() {}
     let stale = incarnation(999);
@@ -6263,12 +5811,11 @@ async fn stale_incarnation_and_revision_reject_before_mutation() {
             workspace: WorkspaceName::new("main").expect("main"),
             workspace_incarnation: stale.clone(),
         },
-        "worker.checkpoint",
+        "worker.listJobs",
         json!({
             "repoId": repo,
             "workspace": "main",
-            "workspaceIncarnation": stale,
-            "options": CheckpointOptions::default()
+            "workspaceIncarnation": stale
         }),
     )
     .await
@@ -6299,7 +5846,7 @@ async fn stale_incarnation_and_revision_reject_before_mutation() {
 #[tokio::test]
 async fn remove_stops_supervisor_before_retirement() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     route(
         &router,
@@ -6340,7 +5887,7 @@ async fn session_removal_refuses_dirty_work_until_forced() {
     let mut removal = FakeRemoval::default();
     removal.dirty.insert(name.clone());
     let (_runtime, router, repo, mut events) =
-        start_with_removal(&root, false, false, Vec::new(), removal).await;
+        start_with_removal(&root, false, Vec::new(), removal).await;
     adopt(&router, &repo).await;
     route(
         &router,
@@ -6394,7 +5941,7 @@ async fn unlanded_session_removal_survives_force_and_only_abandon_destroys_it() 
     let mut removal = FakeRemoval::default();
     removal.unlanded.insert(name.clone());
     let (_runtime, router, repo, mut events) =
-        start_with_removal(&root, false, false, Vec::new(), removal).await;
+        start_with_removal(&root, false, Vec::new(), removal).await;
     adopt(&router, &repo).await;
     route(
         &router,
@@ -6473,7 +6020,7 @@ async fn head_change_at_retirement_fence_preserves_the_workspace() {
     let mut removal = FakeRemoval::default();
     removal.change_head_at_fence.insert(name.clone());
     let (_runtime, router, repo, mut events) =
-        start_with_removal(&root, false, false, Vec::new(), removal).await;
+        start_with_removal(&root, false, Vec::new(), removal).await;
     adopt(&router, &repo).await;
     route(
         &router,
@@ -6502,7 +6049,7 @@ async fn head_change_at_retirement_fence_preserves_the_workspace() {
 #[tokio::test]
 async fn plain_main_removal_requires_force_and_still_requires_clean_git() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     while events.try_recv().is_ok() {}
     let error = route(
@@ -6538,7 +6085,7 @@ async fn plain_main_removal_requires_force_and_still_requires_clean_git() {
     let mut removal = FakeRemoval::default();
     removal.dirty.insert(main.clone());
     let (_runtime, router, repo, mut dirty_events) =
-        start_with_removal(&dirty_root, false, false, Vec::new(), removal).await;
+        start_with_removal(&dirty_root, false, Vec::new(), removal).await;
     adopt(&router, &repo).await;
     while dirty_events.try_recv().is_ok() {}
     let error = route(
@@ -6561,7 +6108,7 @@ async fn plain_main_removal_requires_force_and_still_requires_clean_git() {
 #[tokio::test]
 async fn main_restore_detaches_swaps_exact_checkout_and_then_retires() {
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     while events.try_recv().is_ok() {}
 
@@ -6613,7 +6160,7 @@ async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing(
             ..FakeRemoval::default()
         };
         let (_runtime, router, repo, mut events) =
-            start_with_removal(&root, false, false, Vec::new(), removal).await;
+            start_with_removal(&root, false, Vec::new(), removal).await;
         adopt(&router, &repo).await;
         while events.try_recv().is_ok() {}
         let error = route(
@@ -6637,7 +6184,7 @@ async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing(
     }
 
     let root = test_root();
-    let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
+    let (_runtime, router, repo, mut events) = start(&root, false, Vec::new()).await;
     adopt(&router, &repo).await;
     while events.try_recv().is_ok() {}
     let error = route(
@@ -6666,7 +6213,7 @@ async fn main_restore_retries_after_each_detach_and_swap_crash_boundary() {
             ..FakeRemoval::default()
         };
         let (_runtime, router, repo, mut events) =
-            start_with_removal(&root, false, false, Vec::new(), removal).await;
+            start_with_removal(&root, false, Vec::new(), removal).await;
         adopt(&router, &repo).await;
         while events.try_recv().is_ok() {}
         let options = RemoveOptions {
@@ -6716,7 +6263,7 @@ async fn destroy_waits_for_physical_reclaim_before_answering() {
     let root = test_root();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let gate = Arc::new(Notify::new());
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     host.reclaim_gate = Some(Arc::clone(&gate));
     let runtime = ProjectRuntime::start(host).await.expect("runtime");
     let router = runtime.router();
@@ -6796,7 +6343,7 @@ async fn doctor_aggregates_binding_metadata_mount_pending_and_integrity_findings
         path: None,
     })
     .collect();
-    let (_runtime, router, repo, _events) = start(&root, false, false, findings).await;
+    let (_runtime, router, repo, _events) = start(&root, false, findings).await;
     let report = route(
         &router,
         coordinator(repo.clone()),
@@ -6819,52 +6366,6 @@ async fn doctor_aggregates_binding_metadata_mount_pending_and_integrity_findings
 }
 
 #[tokio::test]
-async fn crash_reopen_recovers_published_and_pending_state() {
-    let root = test_root();
-    let (runtime, router, repo, _events) = start(&root, false, true, Vec::new()).await;
-    adopt(&router, &repo).await;
-    route(
-        &router,
-        coordinator(repo.clone()),
-        "coordinator.restore",
-        json!({ "repoId": repo, "workspace": "main", "label": "checkpoint-1" }),
-    )
-    .await
-    .expect_err("fence fails");
-    drop(router);
-    runtime.shutdown().await.expect("shutdown");
-
-    let (events, mut receiver) = mpsc::unbounded_channel();
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
-    host.load().expect("load pending");
-    host.state.pending_has_evidence = true;
-    host.persist().expect("persist evidence");
-    let runtime = ProjectRuntime::start(host).await.expect("reopen");
-    assert!(matches!(
-        receiver.recv().await,
-        Some(Event::RestoreActivate(_))
-    ));
-    let router = runtime.router();
-    let listed = route(
-        &router,
-        coordinator(repo.clone()),
-        "project.list",
-        json!({ "repoId": repo }),
-    )
-    .await
-    .expect("list after reopen");
-    assert_eq!(listed["workspaces"].as_array().expect("array").len(), 1);
-    assert_eq!(
-        PathBuf::from(
-            listed["workspaces"][0]["info"]["mount"]
-                .as_str()
-                .expect("recovered main mount")
-        ),
-        root.join("checkout")
-    );
-}
-
-#[tokio::test]
 async fn controller_startup_replans_after_cross_runtime_lifecycle_conflict() {
     let root = test_root();
     let race = Arc::new(RecoveryRace {
@@ -6874,12 +6375,12 @@ async fn controller_startup_replans_after_cross_runtime_lifecycle_conflict() {
         mutated: Notify::new(),
     });
     let (events, _receiver) = mpsc::unbounded_channel();
-    let mut starting = FakeHost::new(&root, events.clone(), false, false, Vec::new());
+    let mut starting = FakeHost::new(&root, events.clone(), false, Vec::new());
     starting.recovery_behavior = RecoveryBehavior::Contended(Arc::clone(&race));
     let startup = tokio::spawn(ProjectRuntime::start(starting));
 
     race.first_read.notified().await;
-    let mut mutating = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut mutating = FakeHost::new(&root, events, false, Vec::new());
     mutating.recovery_behavior = RecoveryBehavior::Mutate(Arc::clone(&race));
     let concurrent = ProjectRuntime::start(mutating)
         .await
@@ -6899,7 +6400,7 @@ async fn controller_startup_does_not_retry_non_lifecycle_failures() {
     let root = test_root();
     let attempts = Arc::new(AtomicUsize::new(0));
     let (events, _receiver) = mpsc::unbounded_channel();
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     host.recovery_behavior = RecoveryBehavior::ImmediateFailure(Arc::clone(&attempts));
 
     let error = match ProjectRuntime::start(host).await {
@@ -6915,7 +6416,7 @@ async fn controller_startup_names_exhausted_lifecycle_fact() {
     let root = test_root();
     let attempts = Arc::new(AtomicUsize::new(0));
     let (events, _receiver) = mpsc::unbounded_channel();
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     host.recovery_behavior = RecoveryBehavior::AlwaysLifecycleConflict(Arc::clone(&attempts));
 
     let error = match ProjectRuntime::start(host).await {
@@ -6974,7 +6475,7 @@ async fn removing_a_project_finishes_each_release_before_collecting_then_restore
     let root = test_root();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let gate = Arc::new(Notify::new());
-    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
     host.reclaim_gate = Some(Arc::clone(&gate));
     let unsafe_name = WorkspaceName::new("unsafe").expect("name");
     let stray = WorkspaceName::new("stray").expect("name");
@@ -7074,7 +6575,7 @@ async fn a_stale_collection_is_a_retryable_refusal_and_the_retry_finishes_the_re
     };
     let root = test_root();
     let (_runtime, router, repo, _events) =
-        start_with_removal(&root, false, false, Vec::new(), removal).await;
+        start_with_removal(&root, false, Vec::new(), removal).await;
     adopt(&router, &repo).await;
     route(
         &router,

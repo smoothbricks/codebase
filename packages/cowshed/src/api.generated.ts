@@ -390,43 +390,6 @@ export type ChargedMemoryUsage = {
   readonly peakBytes: ChargedMemoryBytes;
 };
 
-export type CheckpointCommitment = {
-  readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;
-  readonly order: number & tags.Type<'uint64'>;
-  readonly repoId: RepoId;
-  readonly originIncarnation: WorkspaceIncarnation;
-  readonly checkpointId: string;
-  readonly barrierId: number & tags.Type<'uint64'>;
-  readonly manifestBatchSha256: Sha256Digest;
-};
-
-export type CheckpointInfo = {
-  readonly label: string;
-  readonly revision: number & tags.Type<'uint64'>;
-  readonly pinned: boolean;
-};
-
-export type CheckpointOptions = {
-  readonly label?: string;
-  readonly keep?: boolean;
-};
-
-export type CheckpointQuota = {
-  readonly maxCount: number & tags.Type<'uint32'>;
-  readonly maxBytes: number & tags.Type<'uint64'>;
-};
-
-export type CheckpointRequest = {
-  readonly repoId: RepoId;
-  readonly workspace: WorkspaceName;
-  readonly workspaceIncarnation: WorkspaceIncarnation;
-  readonly options: CheckpointOptions;
-};
-
-export type CheckpointResult = {
-  readonly label: string;
-};
-
 /**
  * One immutable, byte-exact operating-system command argument.
  *
@@ -447,9 +410,7 @@ export type ControllerCommitmentRef =
   | ({ readonly kind: 'workspaceRetired' } & WorkspaceRetiredCommitment)
   | ({ readonly kind: 'admission' } & AdmissionCommitment)
   | ({ readonly kind: 'terminal' } & TerminalCommitment)
-  | ({ readonly kind: 'checkpoint' } & CheckpointCommitment)
   | ({ readonly kind: 'fork' } & ForkCommitment)
-  | ({ readonly kind: 'restore' } & RestoreCommitment)
   | ({ readonly kind: 'landAdoption' } & LandAdoptionCommitment)
   | ({ readonly kind: 'landOutcome' } & LandOutcomeCommitment);
 
@@ -1012,8 +973,7 @@ export type ForkOptions = {
   readonly register?: boolean;
   /**
    * Mint a registered linked worktree of main's repository instead of a standalone clone: one
-   * object store and one ref namespace, at the cost of requiring main mounted and giving up
-   * checkpoint and restore.
+   * object store and one ref namespace, at the cost of requiring main mounted.
    */
   readonly gitWorktree?: boolean;
   /**
@@ -1125,7 +1085,6 @@ export type GcReason =
   | 'orphanStagingMount'
   | 'orphanSessionImage'
   | 'orphanMountpoint'
-  | 'expiredCheckpoint'
   | 'abandonedBundle'
   | 'unlinkedBuildVolume'
   | 'supersededSeed'
@@ -1134,7 +1093,6 @@ export type GcReason =
 export type GcReport = {
   readonly examined: number & tags.Type<'uint64'>;
   readonly reclaimed: number & tags.Type<'uint64'>;
-  readonly retainedPinned: number & tags.Type<'uint64'>;
   /**
    * Staging entries an operation still holds the lifecycle lock for: not garbage yet.
    */
@@ -2254,8 +2212,6 @@ export type LockOperation =
   | 're-adopt'
   | 'create'
   | 'fork'
-  | 'checkpoint'
-  | 'restore'
   | 'retire'
   | 'retire-unpublished'
   | 'repair-unpublished'
@@ -2268,7 +2224,7 @@ export type LockOperation =
   | 'recover'
   | 'gc'
   | 'land'
-  | 'reseed'
+  | 'move-onto-seed'
   | 'clear-nx-state'
   | 'repair-ports'
   | 'grant'
@@ -2812,12 +2768,6 @@ export type PushRequest = {
   readonly options: PushOptions;
 };
 
-export type QuotaRequest = {
-  readonly repoId: RepoId;
-  readonly workspace: WorkspaceName;
-  readonly quota: CheckpointQuota;
-};
-
 /**
  * A completed re-adoption: the incarnation that replaced main, and every path it kept of what it
  * replaced. Once the replacement is checked, removing exactly those paths returns their space.
@@ -3031,32 +2981,6 @@ export type RepositoryBinding = {
   readonly formerIdentities?: ReadonlyArray<RepoId>;
 };
 
-export type ReseedRequest = {
-  readonly repoId: RepoId;
-  readonly workspace: WorkspaceName;
-  readonly from: WorkspaceName;
-  readonly dryRun: boolean;
-};
-
-/**
- * Replacing a workspace's live build state with a clone of an existing target seed.
- *
- * Byte counts are allocated image bytes, like GC accounting, not unique physical bytes:
- * APFS clones may share extents. A preview estimates replacement allocation from the seed,
- * names no replacement volume, and frees nothing. No seed is refreshed by this operation.
- */
-export type ReseedResult = {
-  readonly workspace: WorkspaceName;
-  readonly from: WorkspaceName;
-  readonly previousVolume: string;
-  readonly seed: string;
-  readonly replacementVolume?: string;
-  readonly previousBytes: number & tags.Type<'uint64'>;
-  readonly replacementBytes: number & tags.Type<'uint64'>;
-  readonly releasedBytes: number & tags.Type<'uint64'>;
-  readonly dryRun: boolean;
-};
-
 /**
  * Bytes of memory resident in RAM: what processes hold now, never memory charged to them
  * elsewhere (a cgroup's `memory.current` counts page cache and kernel charges too).
@@ -3085,22 +3009,6 @@ export type ResizeResult = {
  * workspace's seed with it (16_build_volumes.md, "Substrate").
  */
 export type ResizeVolume = 'workspace' | 'build';
-
-export type RestoreCommitment = {
-  readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;
-  readonly order: number & tags.Type<'uint64'>;
-  readonly repoId: RepoId;
-  readonly sourceCheckpoint: string;
-  readonly sourceIncarnation: WorkspaceIncarnation;
-  readonly replacedIncarnation: WorkspaceIncarnation;
-  readonly destinationIncarnation: WorkspaceIncarnation;
-};
-
-export type RestoreRequest = {
-  readonly repoId: RepoId;
-  readonly workspace: WorkspaceName;
-  readonly label: string;
-};
 
 /**
  * `retire-descendants --grace-ms`: the handle is the verb's standard input.
@@ -3840,7 +3748,6 @@ export type WorkspaceInfo = {
   readonly branch?: string;
   readonly baseCommit?: GitOid;
   readonly createdAt?: UtcTimestamp;
-  readonly checkpoints: ReadonlyArray<CheckpointInfo>;
   readonly snapshotStale: boolean;
   /**
    * Filled in only for a caller that asked to pay for the measurement (`project.list` with a

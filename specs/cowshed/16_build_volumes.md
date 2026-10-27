@@ -91,9 +91,9 @@ through the owned scratch lifetime. A retained recovery image keeps its authorit
 transfer preflight, under the name's lifecycle lock, the storage owner reclaims its exec-temp environment before any
 image or companion moves (02_workspaces.md, Recovering a recovery image). A live or newer namesake retains its own
 environment. A mount at exec-temp itself or beneath it refuses cleanup before any entry is removed, including a Linux
-bind mount on the same backing device; the recovery image and sidecar stay in place. Checkpoint payloads remain
-separately owned, never disposable merely because module compilation is. Restoration's refusal of unexplained project
-contents is unchanged: no blanket temporary-tree sweep or restore exception stands in for producer ownership.
+bind mount on the same backing device; the recovery image and sidecar stay in place. Restoration's refusal of
+unexplained project contents is unchanged: no blanket temporary-tree sweep or restore exception stands in for producer
+ownership.
 
 ### Substrate
 
@@ -130,10 +130,10 @@ contents is unchanged: no blanket temporary-tree sweep or restore exception stan
   land is unacceptable.
 
 The sidecar records: the git tree (`git rev-parse HEAD^{tree}`) the volume was last built at, the workspace that owns it
-(the checkout that links it, a target whose seed it is, or the workspace whose link an adoption or reseed moved off it,
-**superseded** at that workspace's incarnation), whether it is a **seed** (immutable, see below), its creation time, and
-its **stage**. Every operation that writes a build image (an empty mint, a seed capture, a fork's or refork's clone, a
-reseed's replacement, a re-adoption's replacement) writes the sidecar **registered** before the image's first byte
+(the checkout that links it, a target whose seed it is, or the workspace whose link an adoption or compaction moved off
+it, **superseded** at that workspace's incarnation), whether it is a **seed** (immutable, see below), its creation time,
+and its **stage**. Every operation that writes a build image (an empty mint, a seed capture, a fork's or refork's clone,
+a compaction's replacement, a re-adoption's replacement) writes the sidecar **registered** before the image's first byte
 exists, naming the owner and the registrant that answers for it: the existing workspace at its incarnation, or the
 unfinished create, fork, adopt or re-adopt the lifecycle intent journal records for a workspace that has none yet. It
 writes the sidecar **published** only once the image holds what the role promises. A registered seed is nobody's to fork
@@ -187,10 +187,10 @@ volume whose image is gone, whatever sidecar it left, nobody owns what the link 
 of its own latest seed, or, with no seed, loses the link, so its next build-state refresh makes its first volume; either
 is said on stderr with the lost volume's id. Every opening's mount settles this, `cowshed doctor --repair` and
 `cowshed setup` included. Anything else (several volumes, or none and no adopter's seed for a volume that exists)
-refuses. Why: the link lives inside the source image, so a restored checkpoint carries the link it had when taken, and a
-land interrupted between renaming a target's link and updating the sidecars leaves the target naming the landing volume.
+refuses. Why: the link lives inside the source image, so a fork carries the link it had when cloned, and a land
+interrupted between renaming a target's link and updating the sidecars leaves the target naming the landing volume.
 Mounting such a link as found would let the checkout write a volume a target or another checkout owns, or one already
-collected. A restore therefore never rewinds the build volume.
+collected.
 
 **Refresh.** Before a job of a checkout is admitted (exec, a land check, Land step 7 output restoration), at adoption
 for main, and from `cowshed setup` for every mounted workspace, cowshed refreshes the checkout's build state: it
@@ -251,13 +251,13 @@ deleting it. A background delete that finds another delete of the checkout runni
 and then takes whatever is still pending, so what its own refresh moved aside never waits for a later one. A process
 that ends first, a crash included, leaves the rest pending. Every later refresh of the checkout resumes the delete, and
 `cowshed gc` finishes it, naming each directory it deletes. A refresh whose fingerprint moved first probes the hold its
-job must take on the linked volume: an exclusive claim (a release, a seed capture, a reseed, a cache clear) refuses
-there, before discovery's shell activation is paid for an answer the refusal would discard. A discovery job that has not
-answered within 10 seconds says on stderr every 10 seconds what phase it is in: still preparing its sandbox environment,
-or running as a named process in a named kernel state. It names nothing inferred from other processes: a guessed cause
-printed beside a wait is read as fact. If the caller that asked for discovery ends first -- an interrupted command --
-the discovery job's process group is ended and its leader reaped before the caller answers -- or, past the reap bound,
-collected later with that said -- so no activation tree outlives it.
+job must take on the linked volume: an exclusive claim (a release, a seed capture, a compaction move, a cache clear)
+refuses there, before discovery's shell activation is paid for an answer the refusal would discard. A discovery job that
+has not answered within 10 seconds says on stderr every 10 seconds what phase it is in: still preparing its sandbox
+environment, or running as a named process in a named kernel state. It names nothing inferred from other processes: a
+guessed cause printed beside a wait is read as fact. If the caller that asked for discovery ends first -- an interrupted
+command -- the discovery job's process group is ended and its leader reaped before the caller answers -- or, past the
+reap bound, collected later with that said -- so no activation tree outlives it.
 
 Cargo discovery runs at most four queries concurrently within one activation of each selected workspace shell. Answers
 and failures retain manifest order; a failed manifest does not hide independent workspaces. The existing tracked-input
@@ -373,7 +373,7 @@ target keeps only its latest seed; a target's seed is deleted when the target re
 **No manual seed refresh or warm step exists.** Apart from the explicit re-adoption rule below, every seed refresh is a
 step of a land or of a fork: there is no command that refreezes one, no background warm build in the target, and no land
 script step. A land script that fast-forwards the target's branch itself is an external land, and the next fork takes
-care of it. `cowshed reseed` replaces a workspace's live build volume from an existing seed; it never refreshes a seed.
+care of it.
 
 Re-adoption preserves the live BuildVolumeId, its owner record, tree and creation time, and carries its warm filesystem
 into RAW at the capacity recorded from the kernel before detach (02_workspaces.md §Re-adoption). It leaves every
@@ -609,19 +609,19 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
   SEEK_DATA/SEEK_HOLE probes advance only past that region's end, never once per extent. A pure counting test covers
   leading, interior and trailing holes and many extents per region; probe count follows regions, not extents.
 - **Main's live volume moves onto the compacted seed.** After a publication, with main's image lock let go, main's live
-  build volume is replaced by a clone of the compacted seed through the workspace reseed of main from main (Workspace
-  reseed: both participants are main, so its image lock and lifecycle lease are each taken once). It moves only when it
-  holds no write the seed lacks: under the reseed's exclusive claim, with main's Nx daemon stopped, its volume is
-  flushed and its image's modification time compared with the seed's mark (Targets and seeds, "Behind is one comparison
-  of two modification times"), before the replacement is cloned and again once it is cloned, immediately before main's
-  volume is sealed, since a host process the claim does not fence can write while the clone is made. The comparison
-  cannot follow the seal: the unmount writes the image itself (measured 2026-10-26: a volume nothing wrote read 5,188 ms
-  behind its mark once sealed), so it would refuse every move. Between the last comparison and the unmount only a host
-  process outside any cowshed job can write, since the exclusive build hold taken before the first comparison and held
-  through the seal refuses every job admission and the daemon keeper's restart, and that is acceptable because it is the
-  writer no capture fences either (Targets and seeds: the guarantee "is not a kernel-wide filesystem-writer barrier");
-  one still holding a file open refuses the unforced seal. A later write refuses the move and releases the replacement.
-  A job's hold, an Nx holder, a file open on the volume (a Cargo build included), a detached main, a later write, a seed
+  build volume is replaced by a clone of its own compacted seed under main's image lock and lifecycle lease. This
+  internal move has no public target-only replacement path. It moves only when the live volume holds no write the seed
+  lacks: under its exclusive build claim, with main's Nx daemon stopped, its volume is flushed and its image's
+  modification time compared with the seed's mark (Targets and seeds, "Behind is one comparison of two modification
+  times"), before the replacement is cloned and again once it is cloned, immediately before main's volume is sealed,
+  since a host process the claim does not fence can write while the clone is made. The comparison cannot follow the
+  seal: the unmount writes the image itself (measured 2026-10-26: a volume nothing wrote read 5,188 ms behind its mark
+  once sealed), so it would refuse every move. Between the last comparison and the unmount only a host process outside
+  any cowshed job can write, since the exclusive build hold taken before the first comparison and held through the seal
+  refuses every job admission and the daemon keeper's restart, and that is acceptable because it is the writer no
+  capture fences either (Targets and seeds: the guarantee "is not a kernel-wide filesystem-writer barrier"); one still
+  holding a file open refuses the unforced seal. A later write refuses the move and releases the replacement. A job's
+  hold, an Nx holder, a file open on the volume (a Cargo build included), a detached main, a later write, a seed
   replaced in between, or a failure of the move leaves main's volume as it is, and the report says why; the compaction
   has still succeeded, and nothing is killed. Main then writes on in contiguous space, so the seeds later captured from
   it stay compact; without the move, the next fork's reseed would replace the compacted seed with a capture of main's
@@ -653,137 +653,13 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
   seed's mark, and a write made while the replacement is cloned refuses the move, is kept, and leaves no replacement
   behind.
 
-### Workspace reseed
+### Source and build state arrive together
 
-`cowshed reseed <ws> [--from <target>] [--dry-run]` discards a workspace's accumulated incremental build state and gives
-it a fresh clone of the named target's **existing latest seed at its current incarnation**; `--from` defaults to `main`.
-This is a maintenance verb like resize, not a `gc` option: garbage collection removes images nobody owns, whereas reseed
-explicitly discards state an active workspace owns. The workspace must already be mounted, so its authoritative build
-link can be read. The target need not be mounted. No source image, Git ref, HEAD, index, tracked edit, untracked file or
-declared task output is copied, reset or deleted. Only the excluded `.cowshed/build` link changes.
-
-Whether to reseed is decided by rebuild time: for the tree about to build, the Nx miss-work seconds plus the Cargo
-dirty-unit seconds each image leaves. The Nx term is the same for every image wherever the project's localhost Nx cache
-serves the tree's hashes (05_gateway.md, "/nx/v1/cache/{hash}"): every land publishes its gate's results there, so a
-seed's gate entries are already shared, and only Cargo freshness, with the non-cacheable tasks that compile through it,
-differs between images. Space decides only when no Cargo unit is priced (Cargo-only projects without a timed unit,
-projects without Cargo, and projects with the mbx capability, whose images hold no Cargo unit, included); the default is
-then the project's main seed, because unpriced workspace-only build state retains private blocks. A land makes this
-choice before its gate ("Picking a land's build volume", below).
-
-The seed is cloned as it stands, even when it is behind the target's live build volume or built at another tree.
-Workspace-specific output is lost: the next build pays a cold rebuild for incremental units or cache entries the seed
-does not contain, with shared content-addressed caches still available. A missing current-incarnation seed refuses
-before replacement; the operation neither creates an empty fallback nor captures the target's live volume. It never
-writes, refreshes, retires or deletes any seed, including the workspace's own seed, and never promotes retained
-old-incarnation evidence into a current seed.
-
-Preview is read-only: no attach, flush, daemon stop, hold-file creation, lifecycle recovery or link mutation. It records
-the workspace and target source-image identities, current build link and record, current seed identity and record, and
-the build images' identities, modification times and allocated bytes. Execution acquires the existing workspace and
-target lifecycle-intent leases and image locks without waiting, re-observes that plan, and refuses a stale observation
-before replacing anything. The target image lock remains held while the seed is cloned, exactly as in a fork, excluding
-a concurrent land or fork's seed replacement. An unfinished create/fork/adopt or re-adopt refuses with its workspace,
-journal path and recorded operation rather than replaying it.
-
-Before stopping the old build volume's Nx daemon, execution takes its `<id>.dmg.hold` **exclusively without waiting**.
-An admitted job's shared hold, a land's hold, or another exclusive claimant refuses and names the hold path and each
-visible holder's PID and command. Held lifecycle/image locks likewise name their paths and holders. No jobs are killed.
-With admission fenced, the existing Nx-close protocol stops only its own daemon; another database holder refuses by PID
-and command. The old build volume then seals without force: a filesystem holder or late writer refuses and is named,
-retaining the original build link. A prepublication failure restores the old canonical build mount.
-
-The replacement has a new BuildVolumeId and is registered to the workspace at its incarnation before its image exists,
-held from before cloning through publication. Its published `Linked <ws>` record precedes the atomic build-link rename;
-the old record becomes `Superseded <ws>` at the workspace's incarnation, and the old image is released under the same
-exclusive claim before the reseed answers. A release that fails is the reseed's error and leaves that superseded record
-naming its owner. A crash on either side of publication therefore leaves the link naming a correctly owned image and the
-other volume still recorded as the workspace's, for its release by id. An already-running supervisor grants the
-replacement at its next job admission, as after a land; it is not restarted to terminate holders.
-
-Byte accounting is the same as build-volume garbage collection: each RAW image contributes `st_blocks * 512`, a
-directory backend its allocated tree bytes. Dry-run reports the old image's allocated bytes and the seed clone's
-allocation estimate; execution reports the actual replacement allocation and, as `releasedBytes`, the old image's
-allocation once its release is committed (the gateway's cleanup frees the bytes later). A seal may flush more blocks
-than preview observed. These are **per-image allocated bytes**, not a promise of that much unique physical free space:
-APFS clones and retained seeds can share extents. Subtracting the replacement allocation gives a per-image net estimate,
-not a container-free-space measurement.
-
-- **Enforced by**: directory-host and real-APFS tests that refuse and name shared job holds, exclusive land claims and
-  filesystem readers; then replace the volume, report released allocation and verify dirty tracked source, untracked
-  files, Git state and index bytes unchanged. A stale source seed is used without refreshing or mounting it. Focused
-  directory tests refuse absent seeds, unfinished lifecycle journal entries, held image locks and stale plans.
-
-### Picking a land's build volume
-
-Before its gate, a land picks the image the gate builds on: the workspace's own build volume, or a clone of main's
-latest seed, the image `cowshed reseed <ws> --from main` clones. No land makes this choice yet: SmoothBricks's declared
-gate (`tooling/land-host.sh --gate`) runs after `cowshed land`'s rebase and builds on the workspace's own volume, so a
-land whose own volume is far from main's seed compiles more Cargo units than the pick would have left it. The pick is to
-move into `cowshed land`, which makes it after the rebase and before every gate, and again before every re-gate after
-main moved; `tooling/land-pick.ts` holds the pricing it ports. With the land and rebase carries gone, a land's Nx hits
-come only from the image it gates on and the shared cache, so the price is the Cargo term above.
-
-An image's price is the compile seconds of the workspace's Cargo units it would rebuild for the rebased tree:
-
-- **The tree each image was built at.** Main's seed: its sidecar's `tree` (01_storage.md, "Directory layout"). The
-  workspace's own volume: the tree its checkout had before this rebase, which its own builds ran at (a land refuses a
-  dirty tree, step 1) and which the previous gate ran at on a re-gate. A workspace that never built its own commits is
-  priced as if it had; the units of those commits rebuild in either image, so the error never favors the seed.
-- **Which units are dirty.** Cargo freshness is content identity ("Clones preserve mtimes; directories are never
-  copied"), so a unit is dirty when a source it reads differs between the image's tree and the rebased tree.
-  `git diff-tree` names the differing paths; the workspace member whose manifest directory is the deepest to hold a path
-  owns it. A path under a member's `tests/`, `benches/` or `examples/` dirties only that target's unit (`tests/<t>.rs`
-  and `tests/<t>/main.rs` are target `<t>`; any other file there, a shared `tests/common/mod.rs`, dirties every target
-  of that kind). Any other owned path dirties the member's library and, through the rebased tree's `cargo metadata`
-  resolve graph, every member depending on it, transitively. A registry package whose `Cargo.lock` entry the rebased
-  tree has and the image's tree lacked, or locked otherwise, dirties every member reaching it through any path of that
-  graph, a cycle of dev-dependencies between members included. A change in meaning (blank lines and whole-line comments
-  aside) to the root `Cargo.toml`, any `.cargo/config` or `.cargo/config.toml`, or
-  `rust-toolchain`/`rust-toolchain.toml` dirties every member: its effect on unit identity is not computed. A change to
-  one of them that is not one in meaning dirties no member, whichever member's directory holds it.
-- **What a unit costs.** Its compile seconds in the workspace's host dev/test target
-  (`target/debug/build/<package>/<unit hash>/fingerprint/`): the modification time of the unit's `<unit>.json`
-  fingerprint, which Cargo writes once the unit is built, less that of `invoked.timestamp`, written before the compiler
-  starts (a build script's run keeps it in `run/invoked.timestamp` beside `fingerprint/`; a generation with neither
-  stamp is not timed). Of a unit's generations, the one whose hash file was used last counts (`-Zmtime-on-use`, "One
-  Cargo environment on every path"). A unit costs the same whichever image holds it, so the workspace's own fingerprints
-  price both images. A dirty member with no timed unit is reported `unpriced`, never priced free. Registry units are not
-  priced: a lock change dirties them through the rules above, and otherwise both images hold them. Every price is serial
-  unit-seconds, not gate wall time. A member with no build directory has no timed unit; a target directory that exists
-  but cannot be read, or a tree file Git cannot read, is a pricing failure, never a member without timings.
-- **Equal Cargo environments and one freshness mode are assumed.** A unit whose environment input differs between the
-  build that filled an image and the gate (a `CC_<target>` one set and the other did not) rebuilds whatever its tree,
-  and so does every unit of an image built under the other fingerprint mode (`"fingerprint":"mtime"` units where the
-  gate's are `"content"`); the price sees neither. "One Cargo environment on every path" forbids the first, and "Clones
-  preserve mtimes; directories are never copied" the second: never mix modes in one build volume.
-
-The cheaper image wins; a tie keeps the workspace's own volume, so a land never replaces a volume for nothing. A seed
-that leaves a member `unpriced` that the own volume does not is never the cheaper image, whatever its seconds: that
-member's compile is unknown, not free. With no timed unit at all, space decides for main's seed (above). The reseed
-clones main's latest seed as it stands when it runs, so right before it the land previews again and reseeds only when
-that seed is still the one it priced. The pick only chooses where the gate starts: a reseed preview that fails (one
-finding nothing to price said apart from any other), a pricing failure and a seed that changed after it was priced are
-each said, and the gate builds on the workspace's own volume. A reseed that fails is said with cowshed's status, and the
-gate builds on whichever volume the build link then names: a refused reseed (a held lock, main's image lock under a
-fork, a land or a seed compaction included; an admitted job's hold) leaves the own volume linked, while one that fails
-after publication leaves the seed's clone linked (Workspace reseed). A seed compaction changes no price: it publishes a
-new seed at the tree of the seed whose bytes it holds, caught up or not ("Seed compaction"), so the pick prices it as
-that seed, and one published after the price is a seed that changed after it was priced.
-
-Measured 2026-10-25 on SmoothBricks (`cargo test --no-run --workspace` at tree `e5578ec`, each candidate a clone of a
-seed): main's seed (1 path apart) rebuilt 94 units, 1151-1290 serial s and 123-154 s wall, from a host shell that set
-`CC_aarch64_apple_darwin` where the seed's builder had not; with that variable unset, as the seed was built, it rebuilt
-87 units, 1076 serial s and 143 s wall, so the environment difference alone cost 75-215 serial s. Those 87 units are
-`--workspace` feature unification the gate's per-task Cargo runs do not share: they rebuild in every image and do not
-move the pick. A seed 442 paths apart rebuilt 144 units, 2650 serial s and 206 s wall, so the two images differ by about
-1574 serial s and 63 s wall. The fingerprint times of that build summed to 2616 s against Cargo's own 2650 s, and the
-dirty-unit rules named exactly the 18 packages that rebuilt.
-
-- **Enforced by**: `tooling/land-pick.test.ts` (ownership, test-only reach, closure, registry reach through a member
-  cycle, lock and configuration changes in meaning and not, pricing, the tie, space and unpriced-member rules, compile
-  and build-script run timing, an unreadable target directory, the preview's seed and refusal code). No script runs the
-  pick until `cowshed land` does, so no script test covers a reseed.
+A workspace keeps its own build volume through rebase and gate. A newer warm baseline arrives through a fresh fork,
+which carries the source tree and its build state together; there is no target-only build-volume replacement command and
+no land-time build-volume picker. This preserves ordinary mtime freshness without touching source metadata. Compaction's
+internal move onto the workspace's own seed is different: it proves that the old build volume holds no write the seed
+lacks, before cloning and immediately before sealing (Seed compaction).
 
 ### Clearing a checkout's Nx state
 
@@ -794,14 +670,14 @@ The directories stay, because they are what the build links name. `nx reset` is 
 `.nx/cache` and `.nx/workspace-data` themselves, which here are the links (`rmSync` of a link removes only the link,
 measured), so every entry stays on the volume and the next refresh links it back.
 
-It takes reseed's exclusions and refuses instead of stopping work. The workspace must be mounted. Its image lock is
-taken without waiting, so a fork, reseed or land of it refuses the clear. Its `<id>.dmg.hold` is claimed exclusively
+It fences admissions and refuses instead of stopping work. The workspace must be mounted. Its image lock is taken
+without waiting, so a fork, land or compaction move of it refuses the clear. Its `<id>.dmg.hold` is claimed exclusively
 without waiting: an admitted job's shared hold or a land's refuses, naming the hold path and each visible holder's PID
 and command. The Nx-close protocol then stops only the checkout's own daemon and refuses another database holder by PID
 and command. Nx's open locks (`<database>.lock`) are held for the whole deletion, with a second look at the databases
 under them, so no Nx client opens a task database meanwhile; those lock files stay. A checkout that links no build
-volume is `not-found` (`cowshed doctor` reports its `build-link`). Seeds are untouched: a fork or reseed from a seed
-captured before the clear still carries its entries until a land refreshes that seed.
+volume is `not-found` (`cowshed doctor` reports its `build-link`). Seeds are untouched: a fork from a seed captured
+before the clear still carries its entries until a land refreshes that seed.
 
 - **Enforced by**: a directory-host test in which a job's shared hold, an open task database and a held image lock each
   refuse by name and delete nothing; the clear then empties both directories, counts their entries, keeps Nx's open lock
@@ -911,11 +787,11 @@ unit's export.
 
    Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
    recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a
-   freshly verified attachment does (01a_apfs.md, "Mounts"). A concurrent fork's reseed may finish while that lease is
-   awaited: the lookup then resolves its restored device, not the earlier device name. Once pinned, a reseed cannot
-   detach that attachment before the mount decision completes. Reading the attachment before awaiting the lease would
-   let a land's `close-target` pin open a device a concurrent `cowshed new` has already detached, after Git delivery but
-   before the build-link swap. No retry or wider target-lock interval substitutes for this identity handoff.
+   freshly verified attachment does (01a_apfs.md, "Mounts"). A concurrent image replacement may finish while that lease
+   is awaited: the lookup then resolves its restored device, not the earlier device name. Once pinned, a replacement
+   cannot detach that attachment before the mount decision completes. Reading the attachment before awaiting the lease
+   would let a land's `close-target` pin open a device a concurrent operation has already detached, after Git delivery
+   but before the build-link swap. No retry or wider target-lock interval substitutes for this identity handoff.
 
    The mount-table decision is made under the image lease reacquired for mounting, not in the gap after attachment
    recovery releases its lease. A second mounter can win that gap without changing the pinned device. The image lease
@@ -1087,9 +963,9 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   a superseded volume then and waits for that release before it reports the job ended; a release that cannot run or
   fails is the job's terminal failure and leaves the record naming its owner, never a later collection's work. Job
   admission takes its hold without waiting and refuses while any exclusive claim has the volume (a release, a capture, a
-  reseed, a cache clear, a dry-run probe), naming it claimed, not released. A land's hold waits out an exclusive claim
-  instead, and then refuses only when the image is gone: only a release deletes it, so a capture, a probe or a release
-  that declines under its claim delays such a hold and never refuses it.
+  compaction move, a cache clear, a dry-run probe), naming it claimed, not released. A land's hold waits out an
+  exclusive claim instead, and then refuses only when the image is gone: only a release deletes it, so a capture, a
+  probe or a release that declines under its claim delays such a hold and never refuses it.
 - A held lifecycle or image lock likewise defers release. A superseded seed is claimed under its target's image lock,
   which the land and reseed paths hold while they replace it, and released once that lock is let go: the claim keeps
   collection, and a later land or reseed of the target, off it, so none releases a seed another is retiring, and no
@@ -1126,7 +1002,7 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   within the grace from a forced unmount. Editors or indexers without a cowshed job hold cannot retain a retiring build
   volume indefinitely. Force revokes their access to the volume; it does not kill them.
 - A release commits and frees nothing. The operation that retires the owner or replaces the volume (`rm`'s retirement,
-  `gc`, a land's release of its target's previous volume and of the seed its seal replaced, `cowshed reseed`'s release
+  `gc`, a land's release of its target's previous volume and of the seed its seal replaced, a compaction move's release
   of the volume it replaced, a job's end releasing a superseded volume, a failed creation's release of what it
   registered, a fork's seed refresh) detaches the image and commits its release with one `rename(2)` of it to
   `build/.deleting/<id>.dmg`, inside the images directory and so on the store volume, and syncs both directories: before
@@ -1151,16 +1027,16 @@ seed the lane base already had and builds the folded delta incrementally, as an 
   runs in the gateway, which holds no turn of any verb and no lock but the entry's own, and the verb only nudges the
   gateway about the entry (05_gateway.md, "Deleting released images").
 - `build/.deleting/` holds the committed releases of build volumes and seeds: an entry exists from its operation's
-  rename to its unlink. Every other image of the project (a removed workspace's, a checkpoint's, a staged clone's, an
-  orphan `gc` collects) commits the same way into `sessions/.deleting/`, a removed workspace's as
-  `<ws>-<incarnation>.dmg` and any other as `reclaimed-<fresh 32-hex>.dmg` (05_gateway.md, "Deleting released images").
-  Right after the rename is durable the releasing process nudges the gateway of its host namespace with one one-shot
-  `released` control request and returns without waiting, truncating nothing and starting no process (05_gateway.md,
-  "Deleting released images", for the request and its answer). A gateway that is absent, does not answer or refuses is
-  said once on stderr, and the entry waits in `.deleting` for the gateway's next listing; the release stands, its rename
-  being the commit. Nothing mounts, forks or reads an entry, and nothing is opened through a link: the images directory
-  and the deleting directory are held by descriptor, a link or any other non-regular file at the image's name or an
-  entry's refuses or is named and left, untouched.
+  rename to its unlink. Every other image of the project (a removed workspace's, a staged clone's, an orphan `gc`
+  collects) commits the same way into `sessions/.deleting/`, a removed workspace's as `<ws>-<incarnation>.dmg` and any
+  other as `reclaimed-<fresh 32-hex>.dmg` (05_gateway.md, "Deleting released images"). Right after the rename is durable
+  the releasing process nudges the gateway of its host namespace with one one-shot `released` control request and
+  returns without waiting, truncating nothing and starting no process (05_gateway.md, "Deleting released images", for
+  the request and its answer). A gateway that is absent, does not answer or refuses is said once on stderr, and the
+  entry waits in `.deleting` for the gateway's next listing; the release stands, its rename being the commit. Nothing
+  mounts, forks or reads an entry, and nothing is opened through a link: the images directory and the deleting directory
+  are held by descriptor, a link or any other non-regular file at the image's name or an entry's refuses or is named and
+  left, untouched.
 - The gateway's `image-cleanup` thread lists every `.deleting` directory on each pass and frees the entries it lists,
   oldest first, one entry at a time. Each pass lists every entry in each project's `build/.deleting` and
   `sessions/.deleting`, the same two directories of every archived project (`.retired-projects/<operation-id>/`) and the
@@ -1198,16 +1074,16 @@ seed the lane base already had and builds the folded delta incrementally, as an 
 - Workspace images containing the only copy of dirty or unlanded content keep their separate recovery rules; rebuildable
   build images do not use that preservation mechanism.
 - Every release that commits an image, a seed's or another volume's, whatever asked for it (collection, a land's release
-  of the target's previous volume or superseded seed, a reseed, a fork's seed refresh, a fork that never staged),
-  appends one line for the image to the project's `deletion-log.jsonl` (01_storage.md) once its rename is durable: op
-  `release-build-volume`, kind `build-seed` when its sidecar recorded it as a seed and `build-volume` otherwise, and the
-  workspace that sidecar named, read before the owner record is removed. A target's previous volume is recorded
-  superseded under the target before its release, so its line names that target. A held volume is not released and
-  leaves no line; a release that finds neither the image nor its committed entry commits none and leaves none. The
-  record such a release retires is journaled by a line of its own, `release-imageless-build-volume`: its artifact is the
-  sidecar record it deletes (which names the volume's id) and its image the missing path, so the journal says the record
-  went because its image was absent, not because collection reclaimed it. Without this journal, an `rm` that releases
-  the volume a land has just moved main onto leaves no trace of it.
+  of the target's previous volume or superseded seed, a compaction move, a fork's seed refresh, a fork that never
+  staged), appends one line for the image to the project's `deletion-log.jsonl` (01_storage.md) once its rename is
+  durable: op `release-build-volume`, kind `build-seed` when its sidecar recorded it as a seed and `build-volume`
+  otherwise, and the workspace that sidecar named, read before the owner record is removed. A target's previous volume
+  is recorded superseded under the target before its release, so its line names that target. A held volume is not
+  released and leaves no line; a release that finds neither the image nor its committed entry commits none and leaves
+  none. The record such a release retires is journaled by a line of its own, `release-imageless-build-volume`: its
+  artifact is the sidecar record it deletes (which names the volume's id) and its image the missing path, so the journal
+  says the record went because its image was absent, not because collection reclaimed it. Without this journal, an `rm`
+  that releases the volume a land has just moved main onto leaves no trace of it.
 - Each target keeps only its latest seed; a superseded seed is released when replaced (by a land's seal or a fork's seed
   refresh, committed to `build/.deleting` like every release, above), and a target's seed is released when the target
   retires. Detached seeds need no attach or label rename to be released. Main retires last, in `rm main --restore` (and
@@ -1271,8 +1147,8 @@ Each rule states what is enforced and why. Each has an enforcing test or check; 
 ### Read-only cache-reuse advisor
 
 `node packages/cowshed/bin/cache-advisor.cjs --workspace <checkout> --main <main-checkout> -- [bun] nx run-many <args>`
-advises an operator before a gate; it never rebases, restores outputs, reseeds, replaces or deletes an image. It accepts
-an explicit `run-many` argv, including project selection, configuration and task overrides, not shell text or
+advises an operator before a gate; it never rebases, restores outputs, replaces or deletes an image. It accepts an
+explicit `run-many` argv, including project selection, configuration and task overrides, not shell text or
 package-script indirection. It runs in the workspace's ordinary activated toolchain environment. Its one JSON report is
 stdout; Nx diagnostics and failures are stderr.
 

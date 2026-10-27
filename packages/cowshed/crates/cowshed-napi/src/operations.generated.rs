@@ -374,16 +374,6 @@ impl Coordinator {
         super::json_call::<operations::CoordinatorLand, _>(env, Arc::clone(&self.inner), arguments)
     }
 
-    /// Restores a workspace to a checkpoint.
-    #[napi(js_name = "restore")]
-    pub fn restore(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
-        super::json_call::<operations::CoordinatorRestore, _>(
-            env,
-            Arc::clone(&self.inner),
-            arguments,
-        )
-    }
-
     /// Grows a workspace's image or build volume.
     #[napi(js_name = "resize")]
     pub fn resize(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
@@ -408,16 +398,6 @@ impl Coordinator {
     #[napi(js_name = "rekey")]
     pub fn rekey(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
         super::json_call::<operations::CoordinatorRekey, _>(env, Arc::clone(&self.inner), arguments)
-    }
-
-    /// Replaces a workspace's build volume with a clone of an existing target seed.
-    #[napi(js_name = "reseed")]
-    pub fn reseed(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
-        super::json_call::<operations::CoordinatorReseed, _>(
-            env,
-            Arc::clone(&self.inner),
-            arguments,
-        )
     }
 
     /// Deletes a workspace's Nx cache and task database contents on its build volume.
@@ -490,16 +470,6 @@ impl Coordinator {
     #[napi(js_name = "repoMirror")]
     pub fn repo_mirror(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
         super::json_call::<operations::CoordinatorRepoMirror, _>(
-            env,
-            Arc::clone(&self.inner),
-            arguments,
-        )
-    }
-
-    /// Sets a workspace's checkpoint quota.
-    #[napi(js_name = "setCheckpointQuota")]
-    pub fn set_checkpoint_quota(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
-        super::json_call::<operations::CoordinatorSetCheckpointQuota, _>(
             env,
             Arc::clone(&self.inner),
             arguments,
@@ -613,12 +583,6 @@ impl WorkspaceHandle {
             Arc::clone(&self.inner),
             arguments,
         )
-    }
-
-    /// Takes a checkpoint.
-    #[napi(js_name = "checkpoint")]
-    pub fn checkpoint(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
-        super::json_call::<operations::WorkerCheckpoint, _>(env, Arc::clone(&self.inner), arguments)
     }
 
     /// Pushes the workspace's branch.

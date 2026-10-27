@@ -18,7 +18,7 @@ use cowshed_core::api::{
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, JobArtifactToken, JobScheduling, OutputTargets,
-    ProtectedRecord, PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
+    PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
     controller_commitments_to_batch, decode_controller_commitment, decode_controller_commitments,
     encode_controller_commitment, protected_record_schema, recover_records,
     recover_records_with_budget,
@@ -222,10 +222,7 @@ fn threshold_crossing_spills_only_the_crossing_stream_and_round_trips_arrow() {
 
     let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert_eq!(recovered.frames.len(), 2);
-    assert!(matches!(
-        &recovered.frames[1].record,
-        ProtectedRecord::Job(record) if record == &sealed.record
-    ));
+    assert!(recovered.frames[1].record == sealed.record);
 }
 
 #[test]
@@ -392,10 +389,7 @@ fn combined_quota_accepts_exact_boundary_and_reports_first_crossing() {
     );
     let recovered =
         recover_records(&crossed_root.path().join(".cowshed/job/records.arrow")).unwrap();
-    assert!(matches!(
-        &recovered.frames.last().unwrap().record,
-        ProtectedRecord::Job(record) if record.output_limit == sealed.record.output_limit
-    ));
+    assert!(recovered.frames.last().unwrap().record.output_limit == sealed.record.output_limit);
     assert_eq!(
         crossed
             .sealed(sealed.record.job_id)
@@ -473,11 +467,8 @@ fn non_utf8_argv_round_trips_through_binary_arrow_and_recovery() {
     let recovered = recovery
         .frames
         .iter()
-        .filter_map(|frame| match &frame.record {
-            ProtectedRecord::Job(record) if record.state == JobState::Exited => Some(record),
-            _ => None,
-        })
-        .next()
+        .map(|frame| &frame.record)
+        .find(|record| record.state == JobState::Exited)
         .expect("terminal job record");
     assert_eq!(recovered.command, ExecCommand::Argv(argv.clone()));
     assert_eq!(
@@ -522,10 +513,7 @@ fn invalid_utf8_is_tagged_base64_and_survives_json_and_arrow() {
         bytes
     );
     let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
-    assert!(matches!(
-        &recovered.frames[1].record,
-        ProtectedRecord::Job(record) if record.stdout == sealed.record.stdout
-    ));
+    assert!(recovered.frames[1].record.stdout == sealed.record.stdout);
 }
 
 #[test]
@@ -1129,8 +1117,8 @@ fn output_publication_rejects_control_paths_symlinks_and_corrupt_evidence() {
 }
 
 #[test]
-fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
-    let root = TempRoot::new("checkpoint-prefixes");
+fn background_prepare_forces_every_visible_prefix_to_durable_files() {
+    let root = TempRoot::new("background-prefixes");
     let mut store = store(
         root.path(),
         ArtifactConfig {
@@ -1139,67 +1127,21 @@ fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
             ..ArtifactConfig::default()
         },
     );
-    let committed_token = begin(&mut store, 1, OutputTargets::default());
-    let committed = store.finish(committed_token, JobState::Exited).unwrap();
     let active_token = begin(&mut store, 2, OutputTargets::default());
     store
         .append(&active_token, StreamKind::Stdout, b"background-prefix")
         .unwrap();
     store.prepare_background(&active_token).unwrap();
+    let job = root
+        .path()
+        .join(format!(".cowshed/job/{}", active_token.job_id().get()));
+    assert_eq!(fs::read(job.join("out")).unwrap(), b"background-prefix");
     assert_eq!(
-        fs::read(root.path().join(".cowshed/job/2/out")).unwrap(),
-        b"background-prefix"
-    );
-    assert_eq!(
-        fs::metadata(root.path().join(".cowshed/job/2/err"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
+        fs::metadata(job.join("err")).unwrap().permissions().mode() & 0o777,
         0o400
     );
 
-    let checkpoint = store.checkpoint().unwrap();
-    assert_eq!(checkpoint.record.barrier_id, 1);
-    // Allocation is the store's: the next barrier is the next id, never a caller-repeated one.
-    let second = store.checkpoint().unwrap();
-    assert_eq!(second.record.barrier_id, 2);
-    assert_eq!(checkpoint.record.visible_jobs.len(), 2);
-    let active = checkpoint
-        .record
-        .visible_jobs
-        .iter()
-        .find(|job| job.job_id == active_token.job_id())
-        .unwrap();
-    assert_eq!(active.stdout.bytes, b"background-prefix".len() as u64);
-    assert_eq!(
-        active.stdout.sha256,
-        Sha256Digest::compute(b"background-prefix")
-    );
-    assert_eq!(active.stderr.bytes, 0);
-    assert!(active.stdout.protected_path.is_some());
-    assert!(active.stderr.protected_path.is_some());
-    assert!(
-        checkpoint
-            .record
-            .visible_jobs
-            .iter()
-            .any(|job| job.job_id == committed.record.job_id)
-    );
-
     store.abort(active_token).unwrap();
-    drop(store);
-    let reopened = ArtifactStore::open(
-        root.path(),
-        OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
-        WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
-        ArtifactConfig::default(),
-    )
-    .unwrap();
-    assert!(matches!(
-        &reopened.recovery().frames.last().unwrap().record,
-        ProtectedRecord::CheckpointManifest(manifest) if *manifest == second.record
-    ));
 }
 
 #[test]
@@ -1577,12 +1519,8 @@ fn completion_seals_before_independent_publication_outcomes() {
     assert!(completed.sealed.record.stderr.summary.text.is_empty());
     let recovery = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
     assert!(recovery.frames.iter().any(|frame| {
-        matches!(
-            &frame.record,
-            ProtectedRecord::Job(record)
-                if record.job_id == completed.sealed.record.job_id
-                    && record.state == JobState::Exited
-        )
+        frame.record.job_id == completed.sealed.record.job_id
+            && frame.record.state == JobState::Exited
     }));
 }
 
@@ -1654,9 +1592,12 @@ fn same_length_overwrite_before_seal_refuses_the_terminal_record() {
     );
     assert!(store.sealed(id).unwrap().is_none());
     let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
-    assert!(!recovered.frames.iter().any(
-        |frame| matches!(&frame.record, ProtectedRecord::Job(record) if record.state.is_terminal())
-    ));
+    assert!(
+        !recovered
+            .frames
+            .iter()
+            .any(|frame| frame.record.state.is_terminal())
+    );
 }
 
 proptest! {
@@ -1714,12 +1655,10 @@ fn jobs_a_lost_supervisor_ran_are_sealed_failed_once_with_what_they_spilled() {
     let mut after = store(root.path(), config);
     assert!(after.seal_unterminated().unwrap().is_empty(), "sealed once");
     let recovered = recover_records(&root.path().join(".cowshed/job/records.arrow")).unwrap();
-    assert!(recovered.frames.iter().any(|frame| matches!(
-        &frame.record,
-        ProtectedRecord::Job(job)
-            if job.job_id == orphan.job_id()
-                && job.failure == Some(cowshed_core::api::JobFailure::SupervisorLost)
-    )));
+    assert!(recovered.frames.iter().any(|frame| {
+        frame.record.job_id == orphan.job_id()
+            && frame.record.failure == Some(cowshed_core::api::JobFailure::SupervisorLost)
+    }));
     assert_eq!(after.next_job_id().unwrap().get(), 3);
 }
 
@@ -1783,11 +1722,8 @@ fn a_terminal_record_torn_anywhere_leaves_its_job_sealed_lost_never_succeeded() 
             .frames
             .iter()
             .rev()
-            .find_map(|frame| match &frame.record {
-                ProtectedRecord::Job(record) if record.job_id == job => {
-                    Some((record.state, record.failure))
-                }
-                _ => None,
+            .find_map(|frame| {
+                (frame.record.job_id == job).then_some((frame.record.state, frame.record.failure))
             })
     };
     // Each tear leaves the next supervisor exactly the admission, so it seals the job lost.

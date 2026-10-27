@@ -1,26 +1,24 @@
 use super::call::{Binder, Binding, HostFields, JobFields, RepoFields, WorkspaceFields};
 use super::dto::{
-    AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    DefragmentResult, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions, GcReport,
-    GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
-    JobTailLimits, LandOptions, LandReport, MirrorInfo, NxStateClearResult, ProjectGrantDelta,
-    ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RekeyResult,
-    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
-    ResizeResult, ResizeVolume, SealedJob, StdinSource, StepReport, UnprovenWorkspace,
-    WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    AdmissionKey, AdoptOptions, AttachOptions, DefragmentResult, DoctorReport, EmptyResult,
+    ExecRequest, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo,
+    JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport,
+    MirrorInfo, NxStateClearResult, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport,
+    RebaseOptions, RebaseReport, RekeyResult, RemoveOptions, RemoveProjectOptions,
+    RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume, SealedJob, StdinSource,
+    StepReport, UnprovenWorkspace, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
-    self, AdmissionKeyRequest, AdoptRequest, AdoptView, ChangeRepoIdRequest, CheckpointRequest,
-    DestroyRequest, ExecParams, ExecStdin, ForkRequest, GcRequest, GrantRequest, JobRequest,
-    JobStream, LandRequest, ListLanding, ListRequest, LogsChunk, LogsRequest, MirrorRequest,
+    self, AdmissionKeyRequest, AdoptRequest, AdoptView, ChangeRepoIdRequest, DestroyRequest,
+    ExecParams, ExecStdin, ForkRequest, GcRequest, GrantRequest, JobRequest, JobStream,
+    LandRequest, ListLanding, ListRequest, LogsChunk, LogsRequest, MirrorRequest,
     MoveCheckoutRequest, Operation, ProgressRequest, ProjectGrantRequest, ProjectOpenRequest,
-    PushRequest, QuotaRequest, ReAdoption, RebaseRequest, RemoveProjectRequest, RepoRequest,
-    ReseedRequest, ResizeRequest, RestoreRequest, SessionRequest, SlotRequest,
-    SourceDestinationRequest, StdinWriteRequest, StreamOperation, TailRequest, WorkerScope,
-    WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest, WorkspaceGrantsRequest,
-    WorkspaceInSlotRequest, WorkspaceListView, WorkspaceRequest, WorkspaceView, encode_request,
-    read_result,
+    PushRequest, ReAdoption, RebaseRequest, RemoveProjectRequest, RepoRequest, ResizeRequest,
+    SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest, StreamOperation,
+    TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest,
+    WorkspaceGrantsRequest, WorkspaceInSlotRequest, WorkspaceListView, WorkspaceRequest,
+    WorkspaceView, encode_request, read_result,
 };
 use super::peer_credentials::PeerCredentialsError;
 use super::process::JobProcessTree;
@@ -2588,17 +2586,6 @@ impl Coordinator {
         invoke::<operations::CoordinatorLand>(&*self.runtime, &request).await
     }
 
-    pub async fn restore(&self, workspace: &str, label: &str) -> Result<()> {
-        let request = RestoreRequest {
-            repo_id: self.repo_id(),
-            workspace: workspace_name(workspace)?,
-            label: label.to_owned(),
-        };
-        invoke::<operations::CoordinatorRestore>(&*self.runtime, &request)
-            .await
-            .map(|EmptyResult {}| ())
-    }
-
     pub async fn detach(&self, workspace: &str) -> Result<EmptyResult> {
         let request = self.workspace_request(workspace)?;
         invoke::<operations::CoordinatorDetach>(&*self.runtime, &request).await
@@ -2633,18 +2620,6 @@ impl Coordinator {
     pub async fn rekey(&self, workspace: &str) -> Result<RekeyResult> {
         let request = self.workspace_request(workspace)?;
         invoke::<operations::CoordinatorRekey>(&*self.runtime, &request).await
-    }
-
-    /// Discard a workspace's live build state by cloning the target's latest existing seed.
-    /// Source files are untouched; missing incremental state is rebuilt cold. No seed is refreshed.
-    pub async fn reseed(&self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult> {
-        let request = ReseedRequest {
-            repo_id: self.repo_id(),
-            workspace: workspace_name(workspace)?,
-            from: workspace_name(from)?,
-            dry_run,
-        };
-        invoke::<operations::CoordinatorReseed>(&*self.runtime, &request).await
     }
 
     /// Delete a workspace's Nx cache and task database contents on its build volume, refused
@@ -2722,21 +2697,6 @@ impl Coordinator {
             url: url.as_str().to_owned(),
         };
         invoke::<operations::CoordinatorRepoMirror>(&*self.runtime, &request).await
-    }
-
-    pub async fn set_checkpoint_quota(
-        &self,
-        workspace: &str,
-        quota: CheckpointQuota,
-    ) -> Result<()> {
-        let request = QuotaRequest {
-            repo_id: self.repo_id(),
-            workspace: workspace_name(workspace)?,
-            quota,
-        };
-        invoke::<operations::CoordinatorSetCheckpointQuota>(&*self.runtime, &request)
-            .await
-            .map(|EmptyResult {}| ())
     }
 
     pub async fn doctor(&self) -> Result<DoctorReport> {
@@ -2971,23 +2931,6 @@ impl WorkspaceHandle {
             id,
             runtime: Arc::clone(&self.runtime),
         }
-    }
-
-    pub async fn checkpoint(&self, options: CheckpointOptions) -> Result<String> {
-        let WorkerScope {
-            repo_id,
-            workspace,
-            workspace_incarnation,
-        } = self.authority.scope();
-        let request = CheckpointRequest {
-            repo_id,
-            workspace,
-            workspace_incarnation,
-            options,
-        };
-        invoke::<operations::WorkerCheckpoint>(&*self.runtime, &request)
-            .await
-            .map(|result| result.label)
     }
 
     pub async fn push(&self, options: PushOptions) -> Result<PushReport> {
@@ -4155,7 +4098,6 @@ mod tests {
                 branch: None,
                 base_commit: None,
                 created_at: None,
-                checkpoints: Vec::new(),
                 snapshot_stale: false,
                 landing: None,
             },
@@ -4328,42 +4270,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn checkpoint_forwards_label_and_pin_intent() {
-        let (runtime, mut server) = actor_pair();
-        let handle = workspace_handle(runtime);
-        let server_task = tokio::spawn(async move {
-            let (_, request) = read_rpc_request(&mut server).await;
-            assert_eq!(request["method"], "worker.checkpoint");
-            assert_eq!(
-                request["params"],
-                json!({
-                    "repoId": "acme/widget",
-                    "workspace": "raven",
-                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
-                    "options": {"label": "before-write", "keep": true},
-                })
-            );
-            write_rpc_success(
-                &mut server,
-                request["id"].as_u64().unwrap(),
-                json!({"label": "before-write"}),
-                None,
-            )
-            .await;
-        });
-
-        let label = handle
-            .checkpoint(CheckpointOptions {
-                label: Some("before-write".into()),
-                keep: true,
-            })
-            .await
-            .unwrap();
-        assert_eq!(label, "before-write");
-        server_task.await.unwrap();
-    }
     #[cfg(unix)]
     #[tokio::test]
     async fn workspace_handle_keeps_the_original_incarnation_after_snapshot_mutation() {

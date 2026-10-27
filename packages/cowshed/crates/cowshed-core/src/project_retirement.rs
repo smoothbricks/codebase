@@ -1430,11 +1430,10 @@ mod tests {
     }
 
     /// A project tree carrying everything an archive must keep: the registration, images with Git
-    /// inside them, grants, a CA key, checkpoints, the trash, a job's TMPDIR and a link.
+    /// inside them, grants, a CA key, the trash, a job's TMPDIR and a link.
     fn plant_project(store: &Path, id: &str, registration: &[u8]) -> PathBuf {
         let tree = store.join(id);
         fs::create_dir_all(tree.join("sessions/.trash")).expect("trash");
-        fs::create_dir_all(tree.join("checkpoints/main")).expect("checkpoints");
         fs::create_dir_all(tree.join("tmp/raven/go")).expect("tmp");
         fs::write(tree.join(REPOSITORY_BINDING_FILE), registration).expect("registration");
         fs::write(tree.join("main.dmg"), b"apfs image; .git/objects inside").expect("main");
@@ -1452,7 +1451,6 @@ mod tests {
             b"abandoned commits",
         )
         .expect("bundle");
-        fs::write(tree.join("checkpoints/main/label.dmg"), b"checkpoint").expect("checkpoint");
         fs::write(tree.join("tmp/raven/go/module"), b"go module").expect("tmp file");
         fs::set_permissions(
             tree.join("tmp/raven/go/module"),

@@ -149,7 +149,7 @@ keeps the source.
 
 | What                                                                                             | Where                                                                                                 |
 | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| Images (main + workspaces + checkpoints)                                                         | `/private/cowshed/store/<owner>/<repo>/` (the primary, component-safe `repo_id`)                      |
+| Images (main + workspaces)                                                                       | `/private/cowshed/store/<owner>/<repo>/` (the primary, component-safe `repo_id`)                      |
 | Workspace mounts                                                                                 | `<mount-root>/<owner>/<repo>/<workspace>`                                                             |
 | Adopted main mount                                                                               | its original `<project-root>`                                                                         |
 | Trusted project policy                                                                           | `/private/cowshed/store/<owner>/<repo>/policy.json` (controller-owned, sandbox-denied)                |
@@ -217,13 +217,9 @@ is no manual seed-refresh or warm step. `doctor` reports target-only `seed-age`,
 index link points back to source only through a verified sealed snapshot; a holder refuses that change without losing
 bytes or being forced off.
 
-**Replace rebuildable state explicitly.** `cowshed reseed <workspace> [--from <target>] [--dry-run]` discards that
-workspace's live build-volume contents for a new clone of the target's current-incarnation latest existing seed (default
-main). Source files, HEAD, index, dirty and untracked work remain untouched; missing incremental work rebuilds cold.
-This never refreshes or deletes a seed: stale seeds are cloned as-is and absent seeds refuse. Preview reports old
-allocation and a seed-based replacement estimate without mutation; execution reports removed-image allocation. APFS
-shared extents mean these allocated bytes are GC accounting, not unique physical bytes or promised physical free space.
-See the [CLI reseed command](./cli.md#cowshed-reseed-namemain---from-target---dry-run) for refusals and JSON fields.
+**A fresh baseline carries source and build state together.** Fork from the newer baseline instead of replacing an
+existing workspace's build volume. Rebase and land keep that workspace's own build state, so ordinary mtime-based tools
+observe source edits without a tool-specific freshness mode.
 
 **Existing checkouts migrate by rebuilding, never copying.** Setup and the first admitted job create an empty build
 volume, publish `.cowshed/build`, discard only contributed real build-state directories, and install their fixed links.

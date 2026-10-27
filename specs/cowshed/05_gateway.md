@@ -36,15 +36,15 @@ connector; namespace separation makes it a different listener. Data-plane topolo
   allocate from, recorded as `portBlock {base, size}` (04_sandbox.md: a power-of-two size, a base aligned to it; new
   workspaces get 64 ports, and a live block grows only through a `service_ports` grant; one that moves keeps its old
   block reserved as `retainedPortBlocks`, which carries no gateway listener). `portBlock` is allocated at fork (adopt
-  for main), preserved across restore, and present only in macOS grant files. The gateway binds `base`;
-  `base+1 … base+size-1` are workspace service ports. A session carries its block's recorded size, and the gateway
-  validates the endpoint against it. A store allocates from its namespace's partition: production from the host
-  partition (32768–45055), a test namespace's fixture store from the fixture partition (45056–49151), so no test block
-  is ever one production holds. Seatbelt permits a workspace to connect only to its current and retained blocks. The
-  destination `base` listener is the primary, kernel-enforced workspace identity. Of two sessions whose blocks share a
-  port, the gateway serves the older workspace's and not the newer one's, at startup and in every per-project reconcile,
-  with `next: cowshed doctor --repair`, serving every other session (04_sandbox.md, `portBlock` collisions); neither
-  startup nor a reconcile fails over a collision.
+  for main), and present only in macOS grant files. The gateway binds `base`; `base+1 … base+size-1` are workspace
+  service ports. A session carries its block's recorded size, and the gateway validates the endpoint against it. A store
+  allocates from its namespace's partition: production from the host partition (32768–45055), a test namespace's fixture
+  store from the fixture partition (45056–49151), so no test block is ever one production holds. Seatbelt permits a
+  workspace to connect only to its current and retained blocks. The destination `base` listener is the primary,
+  kernel-enforced workspace identity. Of two sessions whose blocks share a port, the gateway serves the older
+  workspace's and not the newer one's, at startup and in every per-project reconcile, with
+  `next: cowshed doctor --repair`, serving every other session (04_sandbox.md, `portBlock` collisions); neither startup
+  nor a reconcile fails over a collision.
 - **Linux — Unix socket, private netns, and trusted connector.** No `portBlock` is allocated. The controller creates
   `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts
   that one socket as `/run/cowshed/gateway.sock` inside the workspace's private network namespace. The namespace has
@@ -96,17 +96,14 @@ separate uid for the gateway and its workspaces. The token is never exported bar
 `.cowshed/env` carries `COWSHED_WORKSPACE_TOKEN` (03_caches.md), and `.cowshed/workspace.json` is what marks a
 workspace.
 
-Create and fork mint a token. Restore stops admissions, drains the Linux connector and gateway connections, kills the
-connector cgroup, rotates the token, unlinks/recreates the Linux socket and namespace-local connector when applicable,
-and atomically rewrites the in-image token before new execution is admitted. Detach performs the same drain, cgroup
-kill, and socket unlink without rotating persistent authority; attach creates the socket and connector before admitting
-execs. The old token and every pre-restore keep-alive or tunnel are therefore invalid immediately; a preserved macOS
-port does not preserve authority. Remove uninstalls the session with its listener, so the removed workspace's token
-authenticates nowhere, including at a later workspace given the freed block, which mints its own. A policy miss after
-successful endpoint and token authentication is 403 with a machine-parsable grant hint naming both remedies, the
-standing one first: `cowshed grant --project-wide --egress <host>` (every workspace of the project) or
-`cowshed grant <ws> --egress <host>` (that workspace). The hint names the bare canonical DNS name or IP address, never a
-CONNECT authority: the grant host grammar is shared with grant admission and exec (04_sandbox.md).
+Create and fork mint a token. Detach drains the Linux connector and gateway connections, kills the connector cgroup and
+unlinks the socket without rotating persistent authority; attach creates the socket and connector before admitting
+execs. Remove uninstalls the session with its listener, so the removed workspace's token authenticates nowhere,
+including at a later workspace given the freed block, which mints its own. A policy miss after successful endpoint and
+token authentication is 403 with a machine-parsable grant hint naming both remedies, the standing one first:
+`cowshed grant --project-wide --egress <host>` (every workspace of the project) or `cowshed grant <ws> --egress <host>`
+(that workspace). The hint names the bare canonical DNS name or IP address, never a CONNECT authority: the grant host
+grammar is shared with grant admission and exec (04_sandbox.md).
 
 Main is a first-class data-plane client with identical platform wiring and policy. Gateway startup and absence are
 covered under "Availability and offline behavior".
@@ -979,18 +976,17 @@ the handshake bound.
     the backend left running.
 - **A short lock is a request.** A lock taken for one short critical section is waited for within its class's bound. The
   job records lock (11_shell.md, "Job control") is held for an open's recovery of the records and its scan of the job
-  directories that stay, a refresh, one record-sequence allocation and its append, and a checkpoint's hash of the
-  records and its manifest append. An open refuses records past the retained recovery budget (64 MiB) and its scan reads
-  one directory entry per job that stays, so each hold is short and its wait is control class. A free lock is taken
-  without blocking. A held one is waited for on a helper thread that blocks in `flock(2)` and hands the locked
-  descriptor back, so nothing polls. At the bound the wait fails `TIMEOUT`, naming the lock path and its holders as the
-  held-lock census reads them then (02_workspaces.md, "Held locks"); every caller (the supervisor, doctor's repair, a
-  workspace's lineage read) answers it as a wait on another process, never as damage to the store. The holder is never
-  signalled, and a lock the helper takes after its waiter left is released at once. A checkout's activation-record fence
-  (one read and write) and the lifecycle intent journal's lock (one read and write) are waited for within the control
-  bound the same way. The image lease is held for one disk-image command's run, so its wait is class `ffi` bounded by
-  that command's own deadline, 120 s (`DISK_CHILD_DEADLINE`), and it names the pid its holder recorded. The shell is
-  `cowshed-os::flock::exclusive`.
+  directories that stay, a refresh, one record-sequence allocation and its append. An open refuses records past the
+  retained recovery budget (64 MiB) and its scan reads one directory entry per job that stays, so each hold is short and
+  its wait is control class. A free lock is taken without blocking. A held one is waited for on a helper thread that
+  blocks in `flock(2)` and hands the locked descriptor back, so nothing polls. At the bound the wait fails `TIMEOUT`,
+  naming the lock path and its holders as the held-lock census reads them then (02_workspaces.md, "Held locks"); every
+  caller (the supervisor, doctor's repair, a workspace's lineage read) answers it as a wait on another process, never as
+  damage to the store. The holder is never signalled, and a lock the helper takes after its waiter left is released at
+  once. A checkout's activation-record fence (one read and write) and the lifecycle intent journal's lock (one read and
+  write) are waited for within the control bound the same way. The image lease is held for one disk-image command's run,
+  so its wait is class `ffi` bounded by that command's own deadline, 120 s (`DISK_CHILD_DEADLINE`), and it names the pid
+  its holder recorded. The shell is `cowshed-os::flock::exclusive`.
 - **A lock held across its holder's work is queued, not silent.** A waiter behind a holder that keeps the lock for as
   long as its work (an image's lifecycle lock, a project's retirement lock, a build volume's exclusive claim, the
   install slot, the ref lock) has no ceiling: a bound would fail a waiter that is only queued. It keeps its place in the
@@ -1722,8 +1718,7 @@ Gate-band units are granted concurrently; a work-unit class never creates exclus
   normalized path checks. Rotation is observed on next use. Values are never logged, cached in telemetry, placed in
   URLs, or returned to clients.
 - Each workspace CA private key is controller-owned mode 0600 outside every mount. The matching public certificate is an
-  in-image server trust anchor only. Create/fork mint a key; destroy removes it; restore rotates it and closes existing
-  intercepted connections before admitting execution.
+  in-image server trust anchor only. Create/fork mint a key; destroy removes it.
 - The gateway process is host-side and credential-store access is restricted to that executable identity.
 
 ## Startup contract: mains eagerly, sessions on use
@@ -1814,20 +1809,19 @@ One mount pathway cowshed owns end to end is worth more than the eager pass it w
 ## Deleting released images
 
 A released image is freed by the gateway. Every image a cowshed operation removes is released, never unlinked by the
-verb: a retirement (`rm`), the volume and seed a land or a `reseed` replaces, a superseded volume a job's end releases,
-a fork's seed refresh, the staged clone a failed creation or restore leaves, a staged copy a re-adoption leaves, and
-what `gc` collects (a retired workspace's trash, an orphan session or staging image, an expired checkpoint). The
-operation commits the release with one `rename(2)` of the detached image, never replacing a file, into a `.deleting`
-directory beside it: `build/.deleting/<id>.dmg` for a build volume, and for any other image of the project
-`sessions/.deleting/`, a removed workspace's as `<ws>-<incarnation>.dmg` and any other as
-`reclaimed-<fresh 32-hex>.dmg`. It syncs the directories it touched (16_build_volumes.md, "Garbage collection";
-02_workspaces.md, `rm` step 5). The commit never opens the image, so it reads none of its bytes and needs no access to
-it. No verb frees the bytes itself, because a verb that frees holds its turn and its locks, a land its land turn and an
-`rm` its workspace's locks, for as long as the free takes. No releasing process ever truncates an image, and none starts
-a process to do it: lands, forks and rebases never wait for a deletion. Measured 2026-10-25: two deletion children of a
-land, started under its land turn, held the repository's land turn after the land exited, until their frees ended, and
-nine children truncating released images at once saturated the store's container, with lsof, git, forks and execs in
-uninterruptible waits behind them.
+verb: a retirement (`rm`), the volume and seed a land replaces, a compaction move's previous volume, a superseded volume
+a job's end releases, a fork's seed refresh, the staged clone a failed creation leaves, a staged copy a re-adoption
+leaves, and what `gc` collects (a retired workspace's trash, an orphan session or staging image ). The operation commits
+the release with one `rename(2)` of the detached image, never replacing a file, into a `.deleting` directory beside it:
+`build/.deleting/<id>.dmg` for a build volume, and for any other image of the project `sessions/.deleting/`, a removed
+workspace's as `<ws>-<incarnation>.dmg` and any other as `reclaimed-<fresh 32-hex>.dmg`. It syncs the directories it
+touched (16_build_volumes.md, "Garbage collection"; 02_workspaces.md, `rm` step 5). The commit never opens the image, so
+it reads none of its bytes and needs no access to it. No verb frees the bytes itself, because a verb that frees holds
+its turn and its locks, a land its land turn and an `rm` its workspace's locks, for as long as the free takes. No
+releasing process ever truncates an image, and none starts a process to do it: lands, forks and rebases never wait for a
+deletion. Measured 2026-10-25: two deletion children of a land, started under its land turn, held the repository's land
+turn after the land exited, until their frees ended, and nine children truncating released images at once saturated the
+store's container, with lsof, git, forks and execs in uninterruptible waits behind them.
 
 - **The rename is the commit, and the `.deleting` directories are the queue** (the owner's ruling, 2026-10-26). That is
   what makes a release crash-safe with eventual cleanup: whatever stops between the rename and the free, the next

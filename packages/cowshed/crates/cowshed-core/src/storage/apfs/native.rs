@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread;
 
@@ -22,9 +21,7 @@ use crate::metadata::{
     PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
     WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
 };
-use crate::repository::{
-    CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY,
-};
+use crate::repository::{EXEC_TEMP_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
@@ -40,20 +37,18 @@ use sha2::{Digest, Sha256};
 
 use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
-    CheckpointFact, DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact,
-    LifecycleWorkspace, MountJoin, MountRefusal, MountRefusalReason, MountState, OperationIdentity,
-    Pin, ResizeOutcome, RetiredRef, Revision, RootHeldMountpoint, StorageFact, StorageGcCandidate,
-    StorageGcDeferred, StorageGcOptions, StorageGcPlan, StorageGcReason, StorageGcReport,
-    StorageGcRetained, SubstrateStats, derive_workspaces,
+    DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact, LifecycleWorkspace,
+    MountJoin, MountRefusal, MountRefusalReason, MountState, OperationIdentity, ResizeOutcome,
+    RetiredRef, Revision, RootHeldMountpoint, StorageFact, StorageGcCandidate, StorageGcDeferred,
+    StorageGcOptions, StorageGcPlan, StorageGcReason, StorageGcReport, StorageGcRetained,
+    SubstrateStats, derive_workspaces,
 };
-use super::super::{
-    CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
-};
+use super::super::{WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks};
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, COMPANION_SUFFIX, LockMode,
-    MarkerExpectation, MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError,
-    ResumableClone, companion_path, deleting_image_below, extents, layout, main_aware_mount_point,
-    recovery_staging_mount, retired_image_below, split_retired_stem, volume_key,
+    MarkerExpectation, MetadataPolicy, PendingAdoption, PublicationError, ResumableClone,
+    companion_path, deleting_image_below, extents, layout, main_aware_mount_point,
+    retired_image_below, split_retired_stem, volume_key,
 };
 use cowshed_os::timing::timed;
 use image_telemetry::{Image, ImageTelemetry};
@@ -69,8 +64,6 @@ pub use build_volumes::{
 };
 use cowshed_apfs::mounts::{KernelMountSnapshot, kernel_mounts};
 use cowshed_apfs::store_lock::{ImageLockGuard, acquire_image_locks};
-
-pub(in crate::storage) const CHECKPOINT_FACT_VERSION: u32 = 1;
 
 /// One payload rename commits retirement for both physical images and directory payloads.
 /// Callers prove store authority, unmounted payload state and the private CA companion first.
@@ -166,138 +159,6 @@ fn discard_prepared_retirement(trash: &Path) -> Result<(), ApfsStorageError> {
         }
     }
     sync_parent_path(trash)
-}
-
-const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(in crate::storage) enum CheckpointPinWire {
-    Pinned,
-    Automatic,
-}
-
-impl From<Pin> for CheckpointPinWire {
-    fn from(pin: Pin) -> Self {
-        match pin {
-            Pin::Pinned => Self::Pinned,
-            Pin::Automatic => Self::Automatic,
-        }
-    }
-}
-
-impl From<CheckpointPinWire> for Pin {
-    fn from(pin: CheckpointPinWire) -> Self {
-        match pin {
-            CheckpointPinWire::Pinned => Self::Pinned,
-            CheckpointPinWire::Automatic => Self::Automatic,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(in crate::storage) struct CheckpointFactWire {
-    pub(in crate::storage) version: u32,
-    pub(in crate::storage) repo_id: RepoId,
-    pub(in crate::storage) workspace: WorkspaceName,
-    pub(in crate::storage) label: CheckpointLabel,
-    pub(in crate::storage) revision: u64,
-    pub(in crate::storage) pin: CheckpointPinWire,
-}
-
-pub(in crate::storage) const RESTORE_RECOVERY_FACT_VERSION: u32 = 2;
-const RESTORE_RECOVERY_FACT_SUFFIX: &str = ".restore.json";
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(in crate::storage) struct RestoreRecoveryFactWire {
-    pub(in crate::storage) version: u32,
-    pub(in crate::storage) repo_id: RepoId,
-    pub(in crate::storage) workspace: WorkspaceName,
-    pub(in crate::storage) source_checkpoint: CheckpointLabel,
-    pub(in crate::storage) source_incarnation: WorkspaceIncarnation,
-    pub(in crate::storage) replaced_incarnation: WorkspaceIncarnation,
-    pub(in crate::storage) destination_incarnation: WorkspaceIncarnation,
-}
-
-pub(in crate::storage) fn checkpoint_fact_path(image: &Path) -> PathBuf {
-    let mut path = image.as_os_str().to_owned();
-    path.push(CHECKPOINT_FACT_SUFFIX);
-    PathBuf::from(path)
-}
-
-pub(in crate::storage) fn restore_recovery_fact_path(image: &Path) -> PathBuf {
-    let mut path = image.as_os_str().to_owned();
-    path.push(RESTORE_RECOVERY_FACT_SUFFIX);
-    PathBuf::from(path)
-}
-
-pub(in crate::storage) fn restore_recovery_fact(
-    config: &ApfsSubstrateConfig,
-    image: &Path,
-    metadata: &DetachedWorkspaceMetadata,
-) -> Result<RestoreRecoveryFactWire, ApfsStorageError> {
-    let path = restore_recovery_fact_path(image);
-    let fact: RestoreRecoveryFactWire = crate::metadata::read_json(&path)
-        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-    if fact.version != RESTORE_RECOVERY_FACT_VERSION
-        || fact.repo_id != metadata.repo_id
-        || fact.workspace != metadata.workspace
-        || fact.destination_incarnation != metadata.workspace_incarnation
-        || fact.replaced_incarnation == fact.destination_incarnation
-        || fact.source_incarnation == fact.destination_incarnation
-    {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restore recovery fact disagrees with pending metadata: {}",
-            path.display()
-        )));
-    }
-    validate_restore_recovery_lineage(config, &fact)?;
-    Ok(fact)
-}
-
-pub(in crate::storage) fn validate_restore_recovery_lineage(
-    config: &ApfsSubstrateConfig,
-    fact: &RestoreRecoveryFactWire,
-) -> Result<(), ApfsStorageError> {
-    let storage = layout(config, &fact.repo_id)?;
-    let source = storage
-        .checkpoint_image(&fact.workspace, &fact.source_checkpoint)?
-        .image()
-        .to_owned();
-    let source_metadata = DetachedWorkspaceMetadata::read_for_image(&source)
-        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-    if source_metadata.repo_id != fact.repo_id
-        || source_metadata.workspace != fact.workspace
-        || source_metadata.workspace_incarnation != fact.source_incarnation
-    {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restore recovery fact disagrees with checkpoint source metadata: source={}",
-            source.display()
-        )));
-    }
-    let undo = storage
-        .project()
-        .checkpoints
-        .join(fact.workspace.as_str())
-        .join(format!(
-            "{}{}.{IMAGE_EXTENSION}",
-            super::PRE_RESTORE_PREFIX,
-            fact.destination_incarnation,
-        ));
-    let undo_metadata = DetachedWorkspaceMetadata::read_for_image(&undo)
-        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-    if undo_metadata.repo_id != fact.repo_id
-        || undo_metadata.workspace != fact.workspace
-        || undo_metadata.workspace_incarnation != fact.replaced_incarnation
-    {
-        return Err(ApfsStorageError::MarkerMismatch(format!(
-            "restore recovery fact disagrees with replaced generation metadata: undo={}",
-            undo.display()
-        )));
-    }
-    Ok(())
 }
 
 fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
@@ -413,7 +274,6 @@ fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
         StorageGcReason::OrphanStagingMount => b"orphan-staging-mount",
         StorageGcReason::OrphanSessionImage => b"orphan-session-image",
         StorageGcReason::OrphanMountpoint => b"orphan-mountpoint",
-        StorageGcReason::ExpiredCheckpoint => b"expired-checkpoint",
         StorageGcReason::AbandonedBundle => b"abandoned-bundle",
     }
 }
@@ -457,14 +317,9 @@ fn is_gc_record(path: &Path) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| {
-            [
-                GRANTS_SIDECAR_SUFFIX,
-                COMPANION_SUFFIX,
-                CHECKPOINT_FACT_SUFFIX,
-                RESTORE_RECOVERY_FACT_SUFFIX,
-            ]
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
+            [GRANTS_SIDECAR_SUFFIX, COMPANION_SUFFIX]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
         })
 }
 
@@ -536,13 +391,7 @@ fn gc_candidate(
 }
 
 fn image_gc_paths(image: &Path) -> Vec<PathBuf> {
-    vec![
-        image.to_owned(),
-        sidecar_path(image),
-        companion_path(image),
-        checkpoint_fact_path(image),
-        restore_recovery_fact_path(image),
-    ]
+    vec![image.to_owned(), sidecar_path(image), companion_path(image)]
 }
 
 pub(in crate::storage) fn pre_cowshed_path(project_root: &Path) -> PathBuf {
@@ -657,9 +506,6 @@ pub trait KernelMountSource: Send + Sync + 'static {
     fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError>;
 }
 
-pub trait RecoveryMarkerSource: Send + Sync + 'static {
-    fn incarnation(&self, image: &Path) -> Result<String, ApfsStorageError>;
-}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemKernelMountSource;
 
@@ -667,22 +513,6 @@ impl KernelMountSource for SystemKernelMountSource {
     fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
         kernel_mounts().map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RestoreFailpoint {
-    Disabled = 0,
-    AfterUndoSidecar = 1,
-    AfterImageSwap = 2,
-    AfterUndoRename = 3,
-    AfterMetadataPublish = 4,
-    AfterMetadataFsync = 5,
-    AfterRestoreImageSwap = 13,
-    AfterRestoreUndoImageRename = 14,
-    AfterRestoreCanonicalParentFsync = 15,
-    AfterRestoreUndoParentFsync = 16,
-    AfterStagedMetadataRemoval = 17,
-    AfterRestoreMetadataParentFsync = 18,
 }
 
 fn collect_dir_entry_paths(
@@ -830,8 +660,8 @@ fn is_staged_image(path: &Path) -> bool {
             .is_some()
 }
 
-/// The workspace a staging stem (`<name>-<incarnation>`, or the `recover-` prefixed form recovery
-/// mounts under) belongs to. `None` for a name staging never produces, which the sweeps leave alone.
+/// The workspace a staging stem (`<name>-<incarnation>`, or the legacy `recover-` prefixed form)
+/// belongs to. `None` for a name staging never produces, which the sweeps leave alone.
 fn staged_stem_workspace(stem: &str) -> Option<WorkspaceName> {
     let stem = stem.strip_prefix("recover-").unwrap_or(stem);
     let (workspace, incarnation) = stem.rsplit_once('-')?;
@@ -851,8 +681,8 @@ pub(in crate::storage) fn collect_project_directories(
 
 /// What one `recover_pending` pass may read and settle.
 ///
-/// A pass run under workspace locks recovers exactly those workspaces: their canonical, staged
-/// and pre-restore records are selected by path and name before any record is read, so a
+/// A pass run under workspace locks recovers exactly those workspaces: their canonical and
+/// staged records are selected by path and name before any record is read, so a
 /// sibling's — or another project's — missing or corrupt metadata never fails a verb that does
 /// not touch it. Holding no lock is the explicit store-wide pass of startup and maintenance.
 pub(in crate::storage) enum HeldScope {
@@ -971,51 +801,11 @@ pub(in crate::storage) fn canonical_recovery_sidecars(
         .collect()
 }
 
-/// The pre-restore undo sidecars under `project`'s checkpoints, of every workspace or of only
-/// `workspaces`; a confined pass never lists a sibling's checkpoint directory.
-pub(in crate::storage) fn collect_restore_sidecars(
-    project: &Path,
-    workspaces: Option<&BTreeSet<WorkspaceName>>,
-    sidecars: &mut Vec<PathBuf>,
-) -> Result<(), ApfsStorageError> {
-    let checkpoints = project.join(CHECKPOINTS_DIRECTORY);
-    let directories = match workspaces {
-        None => directory_children(&checkpoints)?,
-        Some(workspaces) => workspaces
-            .iter()
-            .filter_map(|workspace| {
-                let directory = checkpoints.join(workspace.as_str());
-                let metadata = fs::symlink_metadata(&directory);
-                kept_child(directory, metadata, &|file_type: fs::FileType| {
-                    file_type.is_dir()
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    for workspace in directories {
-        for entry in fs::read_dir(&workspace)
-            .map_err(|error| io_error("enumerate restore sidecars", &workspace, error))?
-        {
-            let path = entry
-                .map_err(|error| io_error("read restore sidecar", &workspace, error))?
-                .path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name.starts_with(super::PRE_RESTORE_PREFIX) && name.ends_with(GRANTS_SIDECAR_SUFFIX)
-            {
-                sidecars.push(path);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The canonical grants sidecars of `project` whose image does not exist and that no restore
-/// owns: a publication a crash interrupted before its image was renamed in, or a retirement that
-/// committed its image rename and died before unlinking the canonical names. Store recovery
-/// (`recover_pending`) publishes the first from staging and removes the second; this only reads,
-/// so an inspection that recovers nothing can name what recovery would settle.
+/// The canonical grants sidecars of `project` whose image does not exist: a publication a crash
+/// interrupted before its image was renamed in, or a retirement that committed its image rename
+/// and died before unlinking the canonical names. Store recovery (`recover_pending`) publishes the
+/// first from staging and removes the second; this only reads, so an inspection that recovers
+/// nothing can name what recovery would settle.
 pub fn interrupted_publications(project: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     let sessions = project.join(SESSIONS_DIRECTORY);
     let mut interrupted = Vec::new();
@@ -1029,10 +819,7 @@ pub fn interrupted_publications(project: &Path) -> Result<Vec<PathBuf>, ApfsStor
                 continue;
             }
             let image = image_from_sidecar(&sidecar)?;
-            if is_image_path(&image)
-                && !image.exists()
-                && !restore_recovery_fact_path(&image).exists()
-            {
+            if is_image_path(&image) && !image.exists() {
                 interrupted.push(sidecar);
             }
         }
@@ -1043,7 +830,7 @@ pub fn interrupted_publications(project: &Path) -> Result<Vec<PathBuf>, ApfsStor
 pub(in crate::storage) fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
     crate::metadata::image_from_sidecar_path(sidecar).ok_or_else(|| {
         ApfsStorageError::Host(format!(
-            "invalid detached restore sidecar path: {}",
+            "invalid detached sidecar path: {}",
             sidecar.display()
         ))
     })
@@ -1054,13 +841,7 @@ struct MountedAttachment {
     attachment: AttachedImage,
 }
 
-struct RetiredCheckpointArtifacts {
-    images: Vec<PathBuf>,
-    paths: Vec<PathBuf>,
-}
-
 struct RetiredCleanupArtifacts {
-    checkpoint_images: Vec<PathBuf>,
     paths: Vec<PathBuf>,
     mount_point: Option<RetiredMountpoint>,
 }
@@ -1139,7 +920,7 @@ enum RootHeldInspection {
 }
 
 /// Whether a retirement may collect the artifacts keyed on its workspace name rather than on its
-/// incarnation: `checkpoints/<name>` and the mountpoint.
+/// incarnation: the exec temp and the mountpoint.
 ///
 /// A trash entry is unique per `<name>-<incarnation>`, so N retirements of one name are N
 /// independently collectable entries. Those two paths are not: re-minting a name hands the new
@@ -1285,9 +1066,7 @@ pub struct MacOsApfsExecutionHost<R> {
     config: ApfsSubstrateConfig,
     image_telemetry: ImageTelemetry,
     mounted: MountedRegistry,
-    restore_failpoint: AtomicU8,
     mount_source: Arc<dyn KernelMountSource>,
-    recovery_marker_source: Option<Arc<dyn RecoveryMarkerSource>>,
 }
 
 impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
@@ -1319,74 +1098,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             config,
             mounted: MountedRegistry::start()?,
             mount_source: Arc::new(mount_source),
-            recovery_marker_source: None,
-            restore_failpoint: AtomicU8::new(RestoreFailpoint::Disabled as u8),
         })
-    }
-
-    pub fn with_recovery_sources(
-        runner: R,
-        config: ApfsSubstrateConfig,
-        mount_source: impl KernelMountSource,
-        recovery_marker_source: impl RecoveryMarkerSource,
-    ) -> Result<Self, ApfsStorageError> {
-        Ok(Self {
-            backend: MacOsApfsBackend::new(runner),
-            image_telemetry: ImageTelemetry::new(&config.store_root),
-            config,
-            mounted: MountedRegistry::start()?,
-            mount_source: Arc::new(mount_source),
-            recovery_marker_source: Some(Arc::new(recovery_marker_source)),
-            restore_failpoint: AtomicU8::new(RestoreFailpoint::Disabled as u8),
-        })
-    }
-
-    pub fn set_restore_failpoint(&self, failpoint: RestoreFailpoint) {
-        self.restore_failpoint
-            .store(failpoint as u8, AtomicOrdering::SeqCst);
-    }
-
-    fn trip_restore_failpoint(&self, failpoint: RestoreFailpoint) -> Result<(), ApfsStorageError> {
-        if self
-            .restore_failpoint
-            .compare_exchange(
-                failpoint as u8,
-                RestoreFailpoint::Disabled as u8,
-                AtomicOrdering::SeqCst,
-                AtomicOrdering::SeqCst,
-            )
-            .is_ok()
-        {
-            Err(ApfsStorageError::Host(format!(
-                "injected restore failure after {}",
-                match failpoint {
-                    RestoreFailpoint::Disabled => "disabled",
-                    RestoreFailpoint::AfterUndoSidecar => "undo sidecar",
-                    RestoreFailpoint::AfterImageSwap => "image and CA companion swap",
-                    RestoreFailpoint::AfterUndoRename => "undo rename",
-                    RestoreFailpoint::AfterMetadataPublish => "metadata publish",
-                    RestoreFailpoint::AfterMetadataFsync => "metadata fsync",
-                    RestoreFailpoint::AfterRestoreImageSwap => "restore image swap",
-                    RestoreFailpoint::AfterRestoreUndoImageRename => {
-                        "restore undo image rename"
-                    }
-                    RestoreFailpoint::AfterRestoreCanonicalParentFsync => {
-                        "restore canonical parent fsync"
-                    }
-                    RestoreFailpoint::AfterRestoreUndoParentFsync => {
-                        "restore undo parent fsync"
-                    }
-                    RestoreFailpoint::AfterStagedMetadataRemoval => {
-                        "staged restore metadata removal"
-                    }
-                    RestoreFailpoint::AfterRestoreMetadataParentFsync => {
-                        "restore metadata parent fsync"
-                    }
-                }
-            )))
-        } else {
-            Ok(())
-        }
     }
 
     pub fn backend(&self) -> &MacOsApfsBackend<R> {
@@ -1484,95 +1196,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(read_canonical_record(repo, workspace, &image)?.map(|metadata| (image, metadata)))
     }
 
-    /// Observe pending restores only in the selected canonical names. `None` is the explicit
-    /// full inventory of Store/Inspect; a name-scoped opening never reads sibling sidecars.
-    pub(crate) fn pending_publications_for(
-        &self,
-        repo: &RepoId,
-        workspaces: Option<&BTreeSet<WorkspaceName>>,
-    ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError> {
-        let storage = layout(&self.config, repo)?;
-        let mut pending = Vec::new();
-        let main = WorkspaceName::main();
-        if workspaces.is_none_or(|names| names.contains(&main))
-            && let Some((image, metadata)) = self.find_canonical_image(repo, &main)?
-            && metadata.publication_state == PublicationState::PendingFence
-            && restore_recovery_fact_path(&image).exists()
-        {
-            let fact = restore_recovery_fact(&self.config, &image, &metadata)?;
-            pending.push(PendingPublicationFact {
-                workspace: metadata_workspace_ref(&metadata)?,
-                mount_point: self.expected_mount_point(&metadata)?,
-                source_checkpoint: fact.source_checkpoint.to_string(),
-                source_incarnation: fact.source_incarnation,
-                replaced_incarnation: fact.replaced_incarnation,
-                destination_incarnation: fact.destination_incarnation,
-                image,
-            });
-        }
-        let entries = match workspaces {
-            None => read_dir_paths(
-                &storage.project().sessions,
-                "enumerate pending session images",
-            )?,
-            Some(names) => names
-                .iter()
-                .filter(|name| !name.is_main())
-                .map(|name| {
-                    storage
-                        .canonical_image(name)
-                        .map(|image| image.image().to_owned())
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        for discovered in discover_session_images(entries) {
-            if !path_exists(discovered.path())? {
-                continue;
-            }
-            match grants_sidecar_missing(discovered.path()) {
-                Ok(false) => {}
-                Ok(true) => {
-                    warn_missing_session_sidecar(discovered.path());
-                    continue;
-                }
-                Err(error) => {
-                    warn_session_image_issue(
-                        discovered.path(),
-                        format!("cannot inspect grants sidecar: {error}"),
-                    );
-                    continue;
-                }
-            }
-            let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            if !restore_recovery_fact_path(discovered.path()).exists() {
-                continue;
-            }
-            if metadata.publication_state != PublicationState::PendingFence {
-                continue;
-            }
-            if metadata.repo_id != *repo || metadata.workspace != *discovered.workspace() {
-                return Err(ApfsStorageError::Host(format!(
-                    "pending detached metadata identity mismatch for {}",
-                    discovered.path().display()
-                )));
-            }
-            let fact = restore_recovery_fact(&self.config, discovered.path(), &metadata)?;
-            pending.push(PendingPublicationFact {
-                workspace: metadata_workspace_ref(&metadata)?,
-                mount_point: self.expected_mount_point(&metadata)?,
-                source_checkpoint: fact.source_checkpoint.to_string(),
-                source_incarnation: fact.source_incarnation,
-                replaced_incarnation: fact.replaced_incarnation,
-                destination_incarnation: fact.destination_incarnation,
-                image: discovered.path().to_owned(),
-            });
-        }
-        Ok(pending)
-    }
-
     /// The grants record of `workspace`'s canonical image, in any publication state, read from
-    /// that one image and its own sidecar only: storage state, no kernel mount or checkpoint read.
+    /// that one image and its own sidecar only: storage state, no kernel mount read.
     /// `None` when no canonical image exists, including a retirement that committed while this
     /// read ran; a canonical image whose record is missing, invalid or names another
     /// repository/workspace is an error (see `read_canonical_record`).
@@ -1586,16 +1211,16 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .map(|(_, metadata)| metadata))
     }
 
-    /// One published workspace, derived from its own canonical record, its own kernel mount and
-    /// its own checkpoints only: no sibling's sidecar, grants, mount or checkpoint is read, so a
-    /// sibling's missing or corrupt record cannot fail this workspace's read.
+    /// One published workspace, derived from its own canonical record and its own kernel mount
+    /// only: no sibling's sidecar, grants or mount is read, so a sibling's missing or corrupt
+    /// record cannot fail this workspace's read.
     ///
     /// `None` when the name is not published: no canonical image, a retirement that already
     /// committed, or a `PendingFence` publication. A canonical image whose record is missing,
     /// invalid or names another repository/workspace is an error, as is a volume at the
     /// workspace's mount point whose marker or flags do not fence it to this incarnation.
     ///
-    /// No lock is taken. The record is read before and after the mount and checkpoint reads;
+    /// No lock is taken. The record is read before and after the mount read;
     /// when a lifecycle transaction of this workspace committed between them, what was read may
     /// belong to either side of it, so the read is repeated against the new record. Each repeat
     /// needs another committed mutation of this one workspace inside one read, so it terminates
@@ -1605,8 +1230,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         repo: &RepoId,
         workspace: &WorkspaceName,
     ) -> Result<Option<(DerivedWorkspace, DetachedWorkspaceMetadata)>, ApfsStorageError> {
-        let storage = layout(&self.config, repo)?;
-        let checkpoints = storage.project().checkpoints.join(workspace.as_str());
         let mount_point = main_aware_mount_point(&self.config, repo, workspace)?;
         let published = || {
             self.canonical_metadata(repo, workspace).map(|record| {
@@ -1617,7 +1240,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             let Some(metadata) = published()? else {
                 return Ok(None);
             };
-            let derived = self.derive_named(repo, workspace, &metadata, &mount_point, &checkpoints);
+            let derived = self.derive_named(repo, workspace, &metadata, &mount_point);
             if published()?.as_ref() != Some(&metadata) {
                 continue;
             }
@@ -1631,7 +1254,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         workspace: &WorkspaceName,
         metadata: &DetachedWorkspaceMetadata,
         mount_point: &Path,
-        checkpoint_directory: &Path,
     ) -> Result<DerivedWorkspace, ApfsStorageError> {
         let fact = StorageFact {
             workspace: metadata_workspace_ref(metadata)?,
@@ -1655,36 +1277,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .named()?,
             );
         }
-        let mut checkpoints = Vec::new();
-        workspace_checkpoint_facts(
-            repo,
-            workspace,
-            regular_file_children(checkpoint_directory)?,
-            &mut checkpoints,
-        )?;
-        derive_workspaces([fact], mounts, checkpoints)?
+        derive_workspaces([fact], mounts)?
             .pop()
             .ok_or(ApfsStorageError::InvalidPlan(
                 "one canonical record derived no workspace",
             ))
-    }
-
-    fn find_checkpoint(
-        &self,
-        repo: &RepoId,
-        workspace: &WorkspaceName,
-        label: &CheckpointLabel,
-    ) -> Result<Option<DetachedWorkspaceMetadata>, ApfsStorageError> {
-        let image = layout(&self.config, repo)?
-            .checkpoint_image(workspace, label)?
-            .image()
-            .to_owned();
-        if !image.exists() {
-            return Ok(None);
-        }
-        DetachedWorkspaceMetadata::read_for_image(&image)
-            .map(Some)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
     fn observed_workspace(
@@ -1778,7 +1375,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// A missing or invalid CA companion beside a published image is a per-workspace integrity
     /// failure, not store-wide corruption: the grants sidecar (+ companion if present) moves to
     /// `<project>/quarantine/<ws>-<unix_ts>/` with a tombstone, the image stays in place, and
-    /// the pass continues. Genuine ambiguity (contradictory companions, restore states) still
+    /// the pass continues. Genuine ambiguity (contradictory companions) still
     /// propagates.
     fn check_canonical_companion(
         &self,
@@ -1873,15 +1470,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         fs::rename(&sidecar, &quarantined_sidecar)
             .map_err(|error| io_error("quarantine keyless grants sidecar", &sidecar, error))?;
         Ok(tombstone)
-    }
-
-    fn companions_match(left: &Path, right: &Path) -> Result<bool, ApfsStorageError> {
-        let left_metadata = fs::symlink_metadata(left)
-            .map_err(|error| io_error("inspect recovery CA identity", left, error))?;
-        let right_metadata = fs::symlink_metadata(right)
-            .map_err(|error| io_error("inspect recovery CA identity", right, error))?;
-        Ok(left_metadata.dev() == right_metadata.dev()
-            && left_metadata.ino() == right_metadata.ino())
     }
 
     fn remove_companion(image: &Path) -> Result<(), ApfsStorageError> {
@@ -2060,46 +1648,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
     }
 
-    fn detached_image_incarnation(
-        &self,
-        image: &Path,
-        mount_point: &Path,
-    ) -> Result<String, ApfsStorageError>
-    where
-        R: CommandRunner,
-    {
-        if let Some(source) = &self.recovery_marker_source {
-            return source.incarnation(image);
-        }
-        fs::create_dir_all(mount_point)
-            .map_err(|error| io_error("create recovery mount", mount_point, error))?;
-        let (attachment, _) =
-            self.backend
-                .attach_mounted(image, mount_point, MountAccess::ReadOnly, false)?;
-        let incarnation = WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH))
-            .map(|marker| marker.workspace_incarnation.to_string())
-            .map_err(|error| ApfsStorageError::Host(error.to_string()));
-        // The unforced detach already spends its grace and then forces (apfs::DetachGrace), so
-        // there is nothing left for a second attempt here to try.
-        let detach = self.detach_attachment(&attachment, DetachIntent::Release);
-        let cleanup = match (incarnation, detach) {
-            (Ok(incarnation), Ok(())) => Ok(incarnation),
-            (Err(primary), cleanup) => {
-                super::combine_cleanup("recovery marker read", primary, cleanup)
-            }
-            (Ok(_), Err(error)) => Err(error),
-        };
-        let remove = fs::remove_dir(mount_point)
-            .map_err(|error| io_error("remove recovery mount", mount_point, error));
-        match (cleanup, remove) {
-            (Ok(incarnation), Ok(())) => Ok(incarnation),
-            (Err(primary), cleanup) => {
-                super::combine_cleanup("recovery marker cleanup", primary, cleanup)
-            }
-            (Ok(_), Err(error)) => Err(error),
-        }
-    }
-
     fn transient_lock_path(project: &Path, image: &Path) -> Result<PathBuf, ApfsStorageError> {
         let stem = image
             .file_stem()
@@ -2228,147 +1776,21 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         })
     }
 
-    fn retired_checkpoint_artifacts(
-        &self,
-        project: &Path,
-        retired: &RetiredRef,
-    ) -> Result<RetiredCheckpointArtifacts, ApfsStorageError> {
-        let directory = project
-            .join(CHECKPOINTS_DIRECTORY)
-            .join(retired.workspace().name().as_str());
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries
-                .map(|entry| {
-                    entry.map(|entry| entry.path()).map_err(|error| {
-                        io_error("read retired checkpoint entry", &directory, error)
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(RetiredCheckpointArtifacts {
-                    images: Vec::new(),
-                    paths: Vec::new(),
-                });
-            }
-            Err(error) => {
-                return Err(io_error("enumerate retired checkpoints", &directory, error));
-            }
-        };
-        let mut images = BTreeSet::new();
-        for path in &entries {
-            let metadata = fs::symlink_metadata(path)
-                .map_err(|error| io_error("inspect retired checkpoint artifact", path, error))?;
-            if !metadata.file_type().is_file() {
-                return Err(ApfsStorageError::Host(format!(
-                    "retired checkpoint artifact is not a regular file: {}",
-                    path.display()
-                )));
-            }
-            if is_image_path(path) {
-                images.insert(path.clone());
-                continue;
-            }
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
-            {
-                let image = image_from_sidecar(path)?;
-                if is_image_path(&image) {
-                    images.insert(image);
-                }
-            }
-        }
-        let images = images.into_iter().collect::<Vec<_>>();
-
-        let mut expected = BTreeSet::new();
-        let mut labels = BTreeSet::new();
-        for image in &images {
-            let metadata = DetachedWorkspaceMetadata::read_for_image(image)
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            if metadata.repo_id != *retired.workspace().repo()
-                || metadata.workspace != *retired.workspace().name()
-                || metadata.publication_state != PublicationState::Active
-            {
-                return Err(ApfsStorageError::MarkerMismatch(format!(
-                    "retired checkpoint metadata disagrees with {}",
-                    image.display()
-                )));
-            }
-            let stem = image
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .ok_or_else(|| {
-                    ApfsStorageError::Host(format!(
-                        "invalid retired checkpoint image name: {}",
-                        image.display()
-                    ))
-                })?;
-            if let Some(destination) = stem.strip_prefix(super::PRE_RESTORE_PREFIX) {
-                WorkspaceIncarnation::new(destination)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            } else {
-                let label = CheckpointLabel::new(stem)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                if !labels.insert(label.clone()) {
-                    return Err(ApfsStorageError::Host(format!(
-                        "duplicate retired checkpoint label {label}"
-                    )));
-                }
-                let fact_path = checkpoint_fact_path(image);
-                match crate::metadata::read_json::<CheckpointFactWire>(&fact_path) {
-                    Ok(fact)
-                        if fact.version == CHECKPOINT_FACT_VERSION
-                            && fact.repo_id == *retired.workspace().repo()
-                            && fact.workspace == *retired.workspace().name()
-                            && fact.label == label => {}
-                    Ok(_) => {
-                        return Err(ApfsStorageError::Host(format!(
-                            "checkpoint fact does not match retired image path: {}",
-                            fact_path.display()
-                        )));
-                    }
-                    Err(_) if !image.exists() && !fact_path.exists() => {}
-                    Err(error) => return Err(ApfsStorageError::Host(error.to_string())),
-                }
-            }
-            expected.extend(image_gc_paths(image));
-        }
-        if let Some(unrecognized) = entries.iter().find(|path| !expected.contains(*path)) {
-            return Err(ApfsStorageError::Host(format!(
-                "unrecognized retired checkpoint artifact: {}",
-                unrecognized.display()
-            )));
-        }
-        let mut artifacts = expected.into_iter().collect::<Vec<_>>();
-        artifacts.sort();
-        Ok(RetiredCheckpointArtifacts {
-            images,
-            paths: artifacts,
-        })
-    }
-
     fn retired_cleanup_artifacts(
         &self,
-        project: &Path,
         retired: &RetiredRef,
         trash_image: &Path,
         scope: NameScope,
     ) -> Result<RetiredCleanupArtifacts, ApfsStorageError> {
-        let mut checkpoint_images = Vec::new();
         let mut artifacts = Vec::new();
         let mut mount_point = None;
         if scope == NameScope::Owned {
-            let checkpoints = self.retired_checkpoint_artifacts(project, retired)?;
-            checkpoint_images = checkpoints.images;
-            artifacts = checkpoints.paths;
             mount_point = Some(self.retired_mount_point(retired)?);
         }
         artifacts.extend(image_gc_paths(trash_image));
         artifacts.sort();
         artifacts.dedup();
         Ok(RetiredCleanupArtifacts {
-            checkpoint_images,
             paths: artifacts,
             mount_point,
         })
@@ -2659,7 +2081,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     }
 
     /// The name owner alone may remove its disposable environment. Recovery export and
-    /// complete retirement share this operation; it never releases source or checkpoints.
+    /// complete retirement share this operation; it never releases source.
     fn reclaim_exec_temp(
         &self,
         project: &Path,
@@ -2717,35 +2139,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     where
         R: CommandRunner + Send + Sync + 'static,
     {
-        let cleanup = self.retired_cleanup_artifacts(project, authority, trash_image, scope)?;
-        for image in cleanup.checkpoint_images {
-            self.reclaim_image(&image)?;
-        }
+        let cleanup = self.retired_cleanup_artifacts(authority, trash_image, scope)?;
         if scope == NameScope::Owned {
-            let checkpoint_directory = project
-                .join(CHECKPOINTS_DIRECTORY)
-                .join(authority.workspace().name().as_str());
-            match fs::remove_dir(&checkpoint_directory) {
-                Ok(()) => {
-                    deletion_log::log_deletion(
-                        project,
-                        DeletionOp::ReclaimRetiredArtifact,
-                        DeletionKind::Other,
-                        authority.workspace().name().as_str(),
-                        Some(trash_image),
-                        &checkpoint_directory,
-                    );
-                    sync_parent_path(&checkpoint_directory)?
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(io_error(
-                        "remove retired checkpoint directory",
-                        &checkpoint_directory,
-                        error,
-                    ));
-                }
-            }
             self.reclaim_exec_temp(project, authority, trash_image)?;
         }
         let retained = match cleanup.mount_point {
@@ -2843,8 +2238,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
     }
 
-    /// Release `image`, an image file nothing owns any more (a gc orphan, a reclaimed checkpoint, a
-    /// failed restore's staged image), as every release is: one rename into its project's
+    /// Release `image`, an image file nothing owns any more (a gc orphan), as every release is:
+    /// one rename into its project's
     /// `sessions/.deleting` under a fresh name, then its deletion in the background. Answers whether
     /// an image was there; one outside a project of this store refuses, untouched.
     fn release_image_file(&self, image: &Path) -> Result<bool, ApfsStorageError> {
@@ -3088,15 +2483,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let mut candidates = Vec::new();
         let mut lock_paths = Vec::new();
         let mut examined = 0_usize;
-        let mut retained_pinned = 0_usize;
-        let mut retained_recent = 0_usize;
         let mut retained_active = 0_usize;
         let mut root_held_mountpoints: Vec<RootHeldMountpoint> = Vec::new();
 
         let trash = sessions.join(super::TRASH_NAMESPACE);
         let trash_images = self.retired_trash_images(&trash)?;
         let name_owners = super::RetiredNameOwners::from_images(&trash_images);
-        let mut claimed_checkpoint_names = BTreeSet::new();
         // Every name a mountpoint may legitimately carry: the canonical workspace (its image
         // lives outside `sessions`, so no discovery pass names it), retired records (their
         // mountpoint is theirs to reclaim) and published sessions. Anything else under the
@@ -3118,7 +2510,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     continue;
                 };
                 named_mountpoints.insert(name.as_str().to_owned());
-                claimed_checkpoint_names.insert(name);
                 warn_session_image_issue(
                     &path,
                     "recovery image has no grants sidecar; retained, not garbage: recover it deliberately with cowshed gc --recover <image> --to <dir>",
@@ -3130,10 +2521,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 retired.workspace(),
                 name_owners.get(retired.workspace().name()),
             )?;
-            if scope == NameScope::Owned {
-                claimed_checkpoint_names.insert(retired.workspace().name().clone());
-            }
-            let cleanup = self.retired_cleanup_artifacts(project, &retired, &path, scope)?;
+            let cleanup = self.retired_cleanup_artifacts(&retired, &path, scope)?;
             #[cfg(target_os = "macos")]
             if let Some(RetiredMountpoint::RootHeld(held)) = &cleanup.mount_point {
                 root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path.clone()));
@@ -3253,7 +2641,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             candidates.push(candidate);
         }
 
-        // Staging is the half-written half of a lifecycle transaction — create, fork, restore —
+        // Staging is the half-written half of a lifecycle transaction — create or fork —
         // and the signs that one still owns an entry are its workspace lifecycle lock (running)
         // and a canonical sidecar naming it (a crashed publication `recover_pending` will
         // finish). An image beside its grants sidecar looks exactly like an in-flight clone and
@@ -3365,8 +2753,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             };
             let Some(workspace) = staged_stem_workspace(stem) else {
                 // Stems staging never produces cannot belong to a live operation: live
-                // mounts always use `<name>-<incarnation>` (or the `recover-` form) built
-                // by `staging_mount`/`recovery_staging_mount`. Reclaim only provably-stale
+                // mounts always use `<name>-<incarnation>` built by `staging_mount`, or the legacy
+                // `recover-` form. Reclaim only provably-stale
                 // evidence — an empty directory with no volume mounted at it — and leave
                 // everything else (foreign mounts, unexpected data) for a human. The
                 // tombstone records the reclaim; emptiness is re-verified at execution.
@@ -3403,97 +2791,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &[],
                 &[],
             )?);
-        }
-
-        let checkpoint_root = project.join(CHECKPOINTS_DIRECTORY);
-        for workspace_directory in directory_children(&checkpoint_root)? {
-            let workspace_name = workspace_directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| {
-                    ApfsStorageError::Host(format!(
-                        "checkpoint workspace directory is not UTF-8: {}",
-                        workspace_directory.display()
-                    ))
-                })
-                .and_then(|name| {
-                    WorkspaceName::new(name)
-                        .map_err(|error| ApfsStorageError::Host(error.to_string()))
-                })?;
-            if claimed_checkpoint_names.contains(&workspace_name) {
-                continue;
-            }
-            let mut checkpoints = Vec::new();
-            for image in regular_file_children(&workspace_directory)? {
-                if !is_image_path(&image) {
-                    continue;
-                }
-                lock_paths.push(super::workspace_lock_path(
-                    &self.config,
-                    repo,
-                    &workspace_name,
-                )?);
-                let fact_path = checkpoint_fact_path(&image);
-                if !fact_path.exists() {
-                    continue;
-                }
-                let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                let expected_label = image
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .ok_or_else(|| {
-                        ApfsStorageError::Host(format!(
-                            "invalid checkpoint image name: {}",
-                            image.display()
-                        ))
-                    })?;
-                if fact.version != CHECKPOINT_FACT_VERSION
-                    || fact.repo_id != *repo
-                    || fact.workspace != workspace_name
-                    || fact.label.as_str() != expected_label
-                {
-                    return Err(ApfsStorageError::Host(format!(
-                        "checkpoint fact does not match image path: {}",
-                        fact_path.display()
-                    )));
-                }
-                let modified = fs::metadata(&image)
-                    .and_then(|metadata| metadata.modified())
-                    .map_err(|error| io_error("read checkpoint age", &image, error))?;
-                checkpoints.push((modified, image, fact));
-            }
-            checkpoints
-                .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-            for (index, (modified, image, fact)) in checkpoints.into_iter().enumerate() {
-                examined = examined
-                    .checked_add(1)
-                    .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
-                if fact.pin == CheckpointPinWire::Pinned {
-                    retained_pinned = retained_pinned
-                        .checked_add(1)
-                        .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
-                    continue;
-                }
-                let younger_than_fourteen_days =
-                    observed_at.duration_since(modified).map_or(true, |age| {
-                        age < std::time::Duration::from_secs(14 * 24 * 60 * 60)
-                    });
-                if index < 5 || younger_than_fourteen_days {
-                    retained_recent = retained_recent
-                        .checked_add(1)
-                        .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
-                    continue;
-                }
-                let identity = serde_json::to_vec(&fact)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                candidates.push(gc_candidate(
-                    StorageGcReason::ExpiredCheckpoint,
-                    &image,
-                    &image_gc_paths(&image),
-                    &identity,
-                )?);
-            }
         }
 
         for discovered in discover_session_images(session_entries) {
@@ -3578,8 +2875,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 lock_paths,
                 examined,
                 retained: StorageGcRetained {
-                    pinned: retained_pinned,
-                    recent: retained_recent,
                     active: retained_active,
                 },
                 root_held_mountpoints,
@@ -3668,8 +2963,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         let mut report = StorageGcReport {
             examined: plan.examined(),
-            retained_pinned: plan.retained_pinned(),
-            retained_recent: plan.retained_recent(),
             retained_active: plan.retained_active(),
             root_held_mountpoints: plan
                 .root_held_mountpoints()
@@ -3932,13 +3225,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                             }
                         }
                     }
-                    StorageGcReason::ExpiredCheckpoint => {
-                        self.reclaim_image(candidate.path())?;
-                        report.released_bytes =
-                            report.released_bytes.checked_add(candidate.bytes()).ok_or(
-                                ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
-                            )?;
-                    }
                     StorageGcReason::AbandonedBundle => {
                         match fs::symlink_metadata(candidate.path()) {
                             Ok(metadata) if metadata.file_type().is_file() => {}
@@ -4018,24 +3304,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             }
         }
         Ok(report)
-    }
-
-    /// Remove every artifact a restore retained beside `undo` before it completed.
-    fn unretain_restore(undo: &Path) -> Result<(), ApfsStorageError> {
-        for artifact in [sidecar_path(undo), companion_path(undo)] {
-            match fs::remove_file(&artifact) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(io_error(
-                        "remove retained restore artifact",
-                        &artifact,
-                        error,
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -4460,25 +3728,6 @@ where
                         topology_revision: *topology_revision,
                     }),
                 },
-                LifecycleFact::Checkpoint {
-                    repo,
-                    workspace,
-                    label,
-                    revision,
-                } => self
-                    .find_checkpoint(repo, workspace, label)?
-                    .map(|metadata| LifecycleFact::Checkpoint {
-                        repo: metadata.repo_id,
-                        workspace: metadata.workspace,
-                        label: label.clone(),
-                        revision: Revision::new(metadata.grants.revision),
-                    })
-                    .ok_or_else(|| {
-                        ApfsStorageError::Host(format!(
-                            "checkpoint is missing: {repo}/{workspace}/{label}@{}",
-                            revision.get()
-                        ))
-                    }),
             })
             .collect()
     }
@@ -4892,7 +4141,7 @@ where
         // A cloned image arrives with its source's marker still in place: that marker is the
         // lineage. A fresh image (adopt) has none and starts a lineage of its own.
         let lineage = clone_lineage_from(&marker_path, workspace.repo());
-        // A copy of the same workspace (restore or re-adopt) keeps its owned-link revision, so a
+        // A copy of the same workspace (re-adopt) keeps its owned-link revision, so a
         // legacy tree still runs its one migration. A fork or a new mint starts at the current one.
         let copied = match WorkspaceMarker::read_from(&marker_path) {
             Ok(old) => Some(old).filter(|old| {
@@ -5588,270 +4837,6 @@ where
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
-    fn publish_checkpoint_fact(
-        &self,
-        image: &Path,
-        label: &CheckpointLabel,
-        revision: Revision,
-        pin: Pin,
-    ) -> Result<(), ApfsStorageError> {
-        self.verify_controller_path(image)?;
-        let metadata = DetachedWorkspaceMetadata::read_for_image(image)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let fact = CheckpointFactWire {
-            version: CHECKPOINT_FACT_VERSION,
-            repo_id: metadata.repo_id,
-            workspace: metadata.workspace,
-            label: label.clone(),
-            revision: revision.get(),
-            pin: pin.into(),
-        };
-        let path = checkpoint_fact_path(image);
-        crate::metadata::write_json(&path, &fact)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        sync_parent_path(&path)
-    }
-
-    fn restore_swap(
-        &self,
-        staged: &Path,
-        canonical: &Path,
-        undo: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        self.verify_controller_path(staged)?;
-        self.verify_controller_path(canonical)?;
-        self.verify_controller_path(undo)?;
-        Self::ensure_parent(undo)?;
-        if undo.exists() {
-            return Err(ApfsStorageError::Host(format!(
-                "restore undo image already exists: {}",
-                undo.display()
-            )));
-        }
-        let canonical_sidecar = sidecar_path(canonical);
-        let undo_sidecar = sidecar_path(undo);
-        let staged_companion = companion_path(staged);
-        let canonical_companion = companion_path(canonical);
-        let undo_companion = companion_path(undo);
-        DetachedWorkspaceMetadata::read_for_image(staged)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        DetachedWorkspaceMetadata::read_for_image(canonical)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        self.validate_staged_companion(&staged_companion)?;
-        self.validate_staged_companion(&canonical_companion)?;
-        fs::hard_link(&canonical_sidecar, &undo_sidecar)
-            .map_err(|error| io_error("retain restore metadata", &undo_sidecar, error))?;
-        if let Err(error) = fs::hard_link(&canonical_companion, &undo_companion) {
-            let _ = fs::remove_file(&undo_sidecar);
-            return Err(io_error("retain restore CA key", &undo_companion, error));
-        }
-        self.trip_restore_failpoint(RestoreFailpoint::AfterUndoSidecar)?;
-        if let Err(error) = swap_paths(canonical, staged) {
-            return super::combine_cleanup(
-                "restore image swap",
-                error,
-                Self::unretain_restore(undo),
-            );
-        }
-        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreImageSwap)?;
-        if let Err(primary) = swap_paths(&canonical_companion, &staged_companion) {
-            let rollback =
-                swap_paths(canonical, staged).and_then(|()| Self::unretain_restore(undo));
-            return super::combine_cleanup("restore CA key swap", primary, rollback);
-        }
-        self.trip_restore_failpoint(RestoreFailpoint::AfterImageSwap)?;
-        if let Err(error) = fs::rename(staged, undo) {
-            let primary = io_error("retain restore undo image", undo, error);
-            let rollback = swap_paths(&canonical_companion, &staged_companion)
-                .and_then(|()| swap_paths(canonical, staged))
-                .and_then(|()| Self::unretain_restore(undo));
-            return super::combine_cleanup("restore swap", primary, rollback);
-        }
-        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreUndoImageRename)?;
-        fs::remove_file(&staged_companion)
-            .map_err(|error| io_error("remove displaced CA key", &staged_companion, error))?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterUndoRename)?;
-        sync_parent_path(canonical)?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreCanonicalParentFsync)?;
-        sync_parent_path(undo)?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreUndoParentFsync)
-    }
-
-    fn activate_restored_metadata(&self, canonical: &Path) -> Result<(), ApfsStorageError> {
-        self.verify_controller_path(canonical)?;
-        let mut metadata = DetachedWorkspaceMetadata::read_for_image(canonical)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let fact_path = restore_recovery_fact_path(canonical);
-        match metadata.publication_state {
-            PublicationState::PendingFence => {
-                restore_recovery_fact(&self.config, canonical, &metadata)?;
-                metadata.publication_state = PublicationState::Active;
-                metadata
-                    .write_for_image(canonical)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                sync_parent_path(canonical)?;
-            }
-            PublicationState::Active if fact_path.exists() => {
-                restore_recovery_fact(&self.config, canonical, &metadata)?;
-            }
-            PublicationState::Active => return sync_parent_path(canonical),
-        }
-        match fs::remove_file(&fact_path) {
-            Ok(()) => sync_parent_path(canonical),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => sync_parent_path(canonical),
-            Err(error) => Err(io_error(
-                "remove completed restore recovery fact",
-                &fact_path,
-                error,
-            )),
-        }
-    }
-    fn publish_restored_metadata(
-        &self,
-        staged: &Path,
-        canonical: &Path,
-        workspace: &LifecycleWorkspace,
-        revision: Revision,
-        source_image: &Path,
-        replaced_incarnation: &WorkspaceIncarnation,
-    ) -> Result<PendingPublicationFact, ApfsStorageError> {
-        self.verify_controller_path(staged)?;
-        self.verify_controller_path(canonical)?;
-        self.verify_controller_path(source_image)?;
-        let source_metadata = DetachedWorkspaceMetadata::read_for_image(source_image)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let source_checkpoint = source_image
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .ok_or_else(|| {
-                ApfsStorageError::Host(format!(
-                    "restore checkpoint has invalid name: {}",
-                    source_image.display()
-                ))
-            })
-            .and_then(|label| {
-                CheckpointLabel::new(label)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))
-            })?;
-        if source_metadata.repo_id != *workspace.repo()
-            || source_metadata.workspace != *workspace.name()
-            || source_metadata.workspace_incarnation == *workspace.incarnation()
-            || replaced_incarnation == workspace.incarnation()
-        {
-            return Err(ApfsStorageError::MarkerMismatch(format!(
-                "restore checkpoint metadata disagrees with destination {}",
-                canonical.display()
-            )));
-        }
-        let recovery_fact = RestoreRecoveryFactWire {
-            version: RESTORE_RECOVERY_FACT_VERSION,
-            repo_id: workspace.repo().clone(),
-            workspace: workspace.name().clone(),
-            source_checkpoint,
-            source_incarnation: source_metadata.workspace_incarnation,
-            replaced_incarnation: replaced_incarnation.clone(),
-            destination_incarnation: workspace.incarnation().clone(),
-        };
-        let recovery_path = restore_recovery_fact_path(canonical);
-        crate::metadata::write_json(&recovery_path, &recovery_fact)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        sync_parent_path(&recovery_path)?;
-        self.publish_metadata(
-            canonical,
-            workspace,
-            revision,
-            MetadataPolicy::PendingFence,
-            None,
-            Some(source_image),
-        )?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataPublish)?;
-        sync_parent_path(canonical)?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
-        Self::remove_sidecar(staged)?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterStagedMetadataRemoval)?;
-        sync_parent_path(canonical)?;
-        self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreMetadataParentFsync)?;
-        let metadata = DetachedWorkspaceMetadata::read_for_image(canonical)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        if metadata.repo_id != *workspace.repo()
-            || metadata.workspace != *workspace.name()
-            || metadata.workspace_incarnation != *workspace.incarnation()
-            || metadata.grants.revision != revision.get()
-            || metadata.publication_state != PublicationState::PendingFence
-        {
-            return Err(ApfsStorageError::MarkerMismatch(format!(
-                "published restore metadata disagrees with authoritative workspace: {}",
-                canonical.display()
-            )));
-        }
-        Ok(PendingPublicationFact {
-            workspace: workspace.clone(),
-            image: canonical.to_owned(),
-            mount_point: self.expected_mount_point(&metadata)?,
-            source_checkpoint: recovery_fact.source_checkpoint.to_string(),
-            source_incarnation: recovery_fact.source_incarnation,
-            replaced_incarnation: recovery_fact.replaced_incarnation,
-            destination_incarnation: recovery_fact.destination_incarnation,
-        })
-    }
-
-    fn rollback_restore(
-        &self,
-        canonical: &Path,
-        undo: &Path,
-        staged: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        self.verify_controller_path(canonical)?;
-        self.verify_controller_path(undo)?;
-        self.verify_controller_path(staged)?;
-        let canonical_sidecar = sidecar_path(canonical);
-        let undo_sidecar = sidecar_path(undo);
-        let staged_sidecar = sidecar_path(staged);
-        let canonical_companion =
-            self.recovery_companion(canonical, "restore rollback canonical image")?;
-        let undo_companion = self.recovery_companion(undo, "restore rollback undo image")?;
-        let staged_companion = companion_path(staged);
-        if staged_companion.exists() {
-            return Err(ApfsStorageError::MarkerMismatch(format!(
-                "restore rollback staging CA destination is occupied: canonical={}, undo={}, staged={}, companion={}",
-                canonical.display(),
-                undo.display(),
-                staged.display(),
-                staged_companion.display()
-            )));
-        }
-        fs::rename(undo, staged)
-            .map_err(|error| io_error("stage failed restore image", staged, error))?;
-        fs::hard_link(&undo_companion, &staged_companion).map_err(|error| {
-            io_error("stage displaced restore CA key", &staged_companion, error)
-        })?;
-        swap_paths(canonical, staged)?;
-        swap_paths(&canonical_companion, &staged_companion)?;
-        fs::rename(&canonical_sidecar, &staged_sidecar).map_err(|error| {
-            io_error("stage failed replacement metadata", &staged_sidecar, error)
-        })?;
-        fs::rename(&undo_sidecar, &canonical_sidecar)
-            .map_err(|error| io_error("restore displaced metadata", &canonical_sidecar, error))?;
-        self.release_image_file(staged)?;
-        Self::remove_sidecar(staged)?;
-        Self::remove_companion(staged)?;
-        fs::remove_file(&undo_companion)
-            .map_err(|error| io_error("remove restore undo CA link", &undo_companion, error))?;
-        let recovery_path = restore_recovery_fact_path(canonical);
-        match fs::remove_file(&recovery_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(io_error(
-                    "remove rolled-back restore recovery fact",
-                    &recovery_path,
-                    error,
-                ));
-            }
-        }
-        sync_parent_path(canonical)
-    }
-
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(canonical)?;
         self.verify_controller_path(trash)?;
@@ -5924,31 +4909,7 @@ where
             Err(error) => return Err(io_error("inspect reclaim image", image, error)),
         }
         // The companion goes through the hooked remover so it always leaves a tombstone;
-        // the fact files are image-family metadata logged here with their own kinds.
         Self::remove_companion(image)?;
-        for (artifact, operation, kind) in [
-            (
-                checkpoint_fact_path(image),
-                "remove checkpoint fact",
-                DeletionKind::Sidecar,
-            ),
-            (
-                restore_recovery_fact_path(image),
-                "remove restore recovery fact",
-                DeletionKind::Other,
-            ),
-        ] {
-            match fs::remove_file(&artifact) {
-                Ok(()) => deletion_log::log_deletion_for_image(
-                    image,
-                    DeletionOp::ReclaimImage,
-                    kind,
-                    &artifact,
-                ),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io_error(operation, &artifact, error)),
-            }
-        }
         Self::remove_sidecar(image)?;
         sync_parent_path(image)
     }
@@ -5996,13 +4957,6 @@ where
         self.published_facts(repo)
     }
 
-    fn pending_publications(
-        &self,
-        repo: &RepoId,
-    ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError> {
-        self.pending_publications_for(repo, None)
-    }
-
     fn workspace_mount_state(
         &self,
         workspace: &LifecycleWorkspace,
@@ -6031,32 +4985,6 @@ where
             }
         }
         Ok(joins)
-    }
-
-    fn checkpoints(&self, repo: &RepoId) -> Result<Vec<CheckpointFact>, ApfsStorageError> {
-        let root = layout(&self.config, repo)?.project().checkpoints.clone();
-        let mut facts = Vec::new();
-        for workspace_directory in directory_children(&root)? {
-            let Some(workspace_name) = workspace_directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(WorkspaceName::new)
-                .transpose()
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?
-            else {
-                continue;
-            };
-            workspace_checkpoint_facts(
-                repo,
-                &workspace_name,
-                regular_file_children(&workspace_directory)?,
-                &mut facts,
-            )?;
-        }
-        facts.sort_by(|left, right| {
-            (&left.workspace, &left.label).cmp(&(&right.workspace, &right.label))
-        });
-        Ok(facts)
     }
 
     fn recover_pending(
@@ -6088,9 +5016,7 @@ where
                     if canonical.exists() {
                         let metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
                             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                        if metadata.publication_state == PublicationState::PendingFence
-                            && !restore_recovery_fact_path(&canonical).exists()
-                        {
+                        if metadata.publication_state == PublicationState::PendingFence {
                             // A canonical create, fork or adopt is deliberately visible by path
                             // while its init fence is pending. Its lifecycle intent owns
                             // resumption; generic publication recovery must neither bless nor
@@ -6119,15 +5045,6 @@ where
                     };
                     if canonical.exists() {
                         self.check_canonical_companion(&project, &metadata, &canonical)?;
-                        continue;
-                    }
-                    if restore_recovery_fact_path(&canonical).exists() {
-                        // The one reading of this state that is not "the payload is gone": a
-                        // restore is in flight, its undo generation under `checkpoints/` still
-                        // holds the old image, and the restore pass below owns that decision — it
-                        // fails closed naming the canonical, staged, fact, and undo artifacts.
-                        // Leave every artifact for it rather than deciding here with less
-                        // evidence.
                         continue;
                     }
                     // A canonical sidecar with no canonical image names a workspace whose payload
@@ -6222,28 +5139,14 @@ where
                     if refreshed != metadata {
                         continue;
                     }
-                    let restore_undo = storage
-                        .project()
-                        .checkpoints
-                        .join(metadata.workspace.as_str())
-                        .join(format!(
-                            "{}{}.{IMAGE_EXTENSION}",
-                            super::PRE_RESTORE_PREFIX,
-                            metadata.workspace_incarnation,
-                        ));
-                    if sidecar_path(&restore_undo).exists() {
-                        continue;
-                    }
                     if staged.exists() {
-                        // A staged image beside its grants sidecar, with no restore naming it, has
-                        // nothing here to complete: create, fork and adopt publish at the canonical
-                        // name behind a PendingFence sidecar, and a restore's stage is named by the
-                        // undo sidecar checked above. Such a pair is an orphan the gc sweep judges
-                        // by its lock and reclaims
-                        // (`OrphanStagingImage`), and doctor names as a staging orphan. Refusing
-                        // instead was the same over-breadth the canonical branch above retired -
-                        // a store-wide pass would let one dead operation fail startup and the very
-                        // `gc` that clears it.
+                        // A staged image beside its grants sidecar has nothing here to complete:
+                        // create, fork and adopt publish at the canonical name behind a
+                        // PendingFence sidecar. Such a pair is an orphan the gc sweep judges by
+                        // its lock and reclaims (`OrphanStagingImage`), and doctor names as a
+                        // staging orphan. Refusing instead was the same over-breadth the canonical
+                        // branch above retired - a store-wide pass would let one dead operation
+                        // fail startup and the very `gc` that clears it.
                         if companion_path(&staged).exists() {
                             self.recovery_companion(&staged, "staged publication image")?;
                         }
@@ -6264,309 +5167,6 @@ where
                         sync_parent_path(&canonical)?;
                     }
                 }
-            }
-            let mut undo_sidecars = Vec::new();
-            collect_restore_sidecars(&project, workspaces.as_ref(), &mut undo_sidecars)?;
-            undo_sidecars.sort();
-            for undo_sidecar in undo_sidecars {
-                let undo = image_from_sidecar(&undo_sidecar)?;
-                if !is_image_path(&undo) {
-                    continue;
-                }
-                let Some(replacement_incarnation) = undo
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.strip_prefix(super::PRE_RESTORE_PREFIX))
-                else {
-                    continue;
-                };
-                if replacement_incarnation.len() != 32
-                    || !replacement_incarnation
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-                {
-                    continue;
-                }
-                let old_metadata = DetachedWorkspaceMetadata::read_for_image(&undo)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                let storage = layout(config, &old_metadata.repo_id)?;
-                let expected_checkpoint_directory = storage
-                    .project()
-                    .checkpoints
-                    .join(old_metadata.workspace.as_str());
-                if storage.project().project_root != project
-                    || undo.parent() != Some(expected_checkpoint_directory.as_path())
-                {
-                    continue;
-                }
-                let canonical = storage
-                    .canonical_image(&old_metadata.workspace)?
-                    .image()
-                    .to_owned();
-                let Some(_guard) = self.recovery_lock(&canonical, held_locks)? else {
-                    continue;
-                };
-                let refreshed = DetachedWorkspaceMetadata::read_for_image(&undo)
-                    .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                if refreshed != old_metadata {
-                    continue;
-                }
-                let staged = storage
-                    .project()
-                    .project_root
-                    .join(super::STAGING_NAMESPACE)
-                    .join(format!(
-                        "{}-{}.{IMAGE_EXTENSION}",
-                        old_metadata.workspace.as_str(),
-                        replacement_incarnation,
-                    ));
-                let recovery_fact_path = restore_recovery_fact_path(&canonical);
-                if !canonical.exists() {
-                    if !staged.exists() && !recovery_fact_path.exists() {
-                        continue;
-                    }
-                    return Err(ApfsStorageError::MarkerMismatch(format!(
-                        "restore recovery has no canonical image: canonical={}, staged={}, fact={}, undo_sidecar={}",
-                        canonical.display(),
-                        staged.display(),
-                        recovery_fact_path.display(),
-                        undo_sidecar.display()
-                    )));
-                }
-                if recovery_fact_path.exists() {
-                    let recovery_fact: RestoreRecoveryFactWire =
-                        crate::metadata::read_json(&recovery_fact_path)
-                            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                    if recovery_fact.destination_incarnation.as_str() != replacement_incarnation {
-                        continue;
-                    }
-                    if recovery_fact.version != RESTORE_RECOVERY_FACT_VERSION
-                        || recovery_fact.repo_id != old_metadata.repo_id
-                        || recovery_fact.workspace != old_metadata.workspace
-                        || recovery_fact.replaced_incarnation != old_metadata.workspace_incarnation
-                        || recovery_fact.replaced_incarnation
-                            == recovery_fact.destination_incarnation
-                        || recovery_fact.source_incarnation == recovery_fact.destination_incarnation
-                    {
-                        return Err(ApfsStorageError::MarkerMismatch(format!(
-                            "restore recovery fact disagrees with selected undo generation: fact={}, undo_sidecar={}",
-                            recovery_fact_path.display(),
-                            undo_sidecar.display()
-                        )));
-                    }
-                    validate_restore_recovery_lineage(config, &recovery_fact)?;
-                } else if !staged.exists() && sidecar_path(&canonical).exists() {
-                    let canonical_metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
-                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                    if canonical_metadata.workspace_incarnation
-                        != old_metadata.workspace_incarnation
-                    {
-                        continue;
-                    }
-                }
-                let canonical_sidecar = sidecar_path(&canonical);
-                let canonical_companion =
-                    self.recovery_companion(&canonical, "restore recovery canonical image")?;
-                let undo_companion =
-                    self.recovery_companion(&undo, "restore recovery undo metadata")?;
-                let staged_companion = companion_path(&staged);
-                let canonical_metadata = if canonical_sidecar.exists() {
-                    Some(
-                        DetachedWorkspaceMetadata::read_for_image(&canonical)
-                            .map_err(|error| ApfsStorageError::Host(error.to_string()))?,
-                    )
-                } else {
-                    None
-                };
-                let published = canonical_metadata.as_ref().is_some_and(|metadata| {
-                    metadata.workspace_incarnation.as_str() == replacement_incarnation
-                });
-                if published {
-                    if Self::companions_match(&canonical_companion, &undo_companion)? {
-                        return Err(ApfsStorageError::MarkerMismatch(format!(
-                            "published restore pairs replacement image with old CA key: canonical={}, canonical_companion={}, undo_companion={}",
-                            canonical.display(),
-                            canonical_companion.display(),
-                            undo_companion.display()
-                        )));
-                    }
-                    if undo.exists() {
-                        if staged.exists() {
-                            self.release_image_file(&staged)?;
-                        }
-                    } else if staged.exists() {
-                        let displaced_companion =
-                            self.recovery_companion(&staged, "restore displaced staged image")?;
-                        if !Self::companions_match(&displaced_companion, &undo_companion)? {
-                            return Err(ApfsStorageError::MarkerMismatch(format!(
-                                "displaced restore image has the wrong CA key: staged={}, staged_companion={}, undo_companion={}",
-                                staged.display(),
-                                displaced_companion.display(),
-                                undo_companion.display()
-                            )));
-                        }
-                        fs::rename(&staged, &undo).map_err(|error| {
-                            io_error("complete restore undo rename", &undo, error)
-                        })?;
-                    } else {
-                        return Err(ApfsStorageError::MarkerMismatch(format!(
-                            "published restore is missing its old image: canonical={}, undo={}, staged={}",
-                            canonical.display(),
-                            undo.display(),
-                            staged.display()
-                        )));
-                    }
-                    Self::remove_sidecar(&staged)?;
-                    Self::remove_companion(&staged)?;
-                    sync_parent_path(&canonical)?;
-                    continue;
-                }
-                if canonical_metadata.as_ref().is_some_and(|metadata| {
-                    metadata.workspace_incarnation != old_metadata.workspace_incarnation
-                }) {
-                    return Err(ApfsStorageError::MarkerMismatch(format!(
-                        "restore metadata matches neither generation: canonical={}, undo_sidecar={}, staged={}",
-                        canonical.display(),
-                        undo_sidecar.display(),
-                        staged.display()
-                    )));
-                }
-
-                let recovery_mount = recovery_staging_mount(
-                    &storage,
-                    &old_metadata.workspace,
-                    replacement_incarnation,
-                );
-                let incarnation = self.detached_image_incarnation(&canonical, &recovery_mount)?;
-                let canonical_is_replacement = if incarnation == replacement_incarnation {
-                    true
-                } else if incarnation == old_metadata.workspace_incarnation.as_str() {
-                    false
-                } else {
-                    return Err(ApfsStorageError::MarkerMismatch(format!(
-                        "restore marker matches neither generation: canonical={}, marker={}, old={}, replacement={}",
-                        canonical.display(),
-                        incarnation,
-                        old_metadata.workspace_incarnation,
-                        replacement_incarnation
-                    )));
-                };
-                let canonical_has_old_key =
-                    Self::companions_match(&canonical_companion, &undo_companion)?;
-
-                if canonical_is_replacement {
-                    if undo.exists() {
-                        if staged.exists() {
-                            return Err(ApfsStorageError::MarkerMismatch(format!(
-                                "restore has both staged and undo old images: staged={}, undo={}",
-                                staged.display(),
-                                undo.display()
-                            )));
-                        }
-                        fs::rename(&undo, &staged).map_err(|error| {
-                            io_error("stage interrupted restore undo", &staged, error)
-                        })?;
-                    } else if !staged.exists() {
-                        return Err(ApfsStorageError::MarkerMismatch(format!(
-                            "restore cannot roll back without old image: canonical={}, staged={}, undo={}",
-                            canonical.display(),
-                            staged.display(),
-                            undo.display()
-                        )));
-                    }
-                    if canonical_has_old_key {
-                        let staged_key =
-                            self.recovery_companion(&staged, "restore replacement staged image")?;
-                        if Self::companions_match(&staged_key, &undo_companion)? {
-                            return Err(ApfsStorageError::MarkerMismatch(format!(
-                                "restore lost replacement CA key: canonical_companion={}, staged_companion={}, undo_companion={}",
-                                canonical_companion.display(),
-                                staged_key.display(),
-                                undo_companion.display()
-                            )));
-                        }
-                        swap_paths(&canonical, &staged)?;
-                    } else {
-                        if !staged_companion.exists() {
-                            fs::hard_link(&undo_companion, &staged_companion).map_err(|error| {
-                                io_error("stage retained old CA key", &staged_companion, error)
-                            })?;
-                        }
-                        let staged_key =
-                            self.recovery_companion(&staged, "restore displaced staged image")?;
-                        if !Self::companions_match(&staged_key, &undo_companion)? {
-                            return Err(ApfsStorageError::MarkerMismatch(format!(
-                                "restore cannot identify old CA key: canonical_companion={}, staged_companion={}, undo_companion={}",
-                                canonical_companion.display(),
-                                staged_key.display(),
-                                undo_companion.display()
-                            )));
-                        }
-                        swap_paths(&canonical, &staged)?;
-                        swap_paths(&canonical_companion, &staged_companion)?;
-                    }
-                } else {
-                    if undo.exists() {
-                        return Err(ApfsStorageError::MarkerMismatch(format!(
-                            "old canonical restore layout still has undo image: canonical={}, undo={}",
-                            canonical.display(),
-                            undo.display()
-                        )));
-                    }
-                    if !canonical_has_old_key {
-                        if !staged_companion.exists() {
-                            fs::hard_link(&undo_companion, &staged_companion).map_err(|error| {
-                                io_error("stage retained old CA key", &staged_companion, error)
-                            })?;
-                        }
-                        let staged_key =
-                            self.recovery_companion(&staged, "restore old staged CA key")?;
-                        if !Self::companions_match(&staged_key, &undo_companion)? {
-                            return Err(ApfsStorageError::MarkerMismatch(format!(
-                                "old image has no recoverable old CA key: canonical={}, canonical_companion={}, staged_companion={}, undo_companion={}",
-                                canonical.display(),
-                                canonical_companion.display(),
-                                staged_key.display(),
-                                undo_companion.display()
-                            )));
-                        }
-                        swap_paths(&canonical_companion, &staged_companion)?;
-                    } else if staged.exists() {
-                        let staged_key =
-                            self.recovery_companion(&staged, "restore replacement staged image")?;
-                        if Self::companions_match(&staged_key, &undo_companion)? {
-                            return Err(ApfsStorageError::MarkerMismatch(format!(
-                                "old and replacement images share old CA key: canonical={}, staged={}, undo_companion={}",
-                                canonical.display(),
-                                staged.display(),
-                                undo_companion.display()
-                            )));
-                        }
-                    }
-                }
-
-                if staged.exists() {
-                    self.release_image_file(&staged)?;
-                }
-                Self::remove_sidecar(&staged)?;
-                Self::remove_companion(&staged)?;
-                if canonical_sidecar.exists() {
-                    fs::remove_file(&undo_sidecar).map_err(|error| {
-                        io_error("remove redundant restore metadata", &undo_sidecar, error)
-                    })?;
-                } else {
-                    fs::rename(&undo_sidecar, &canonical_sidecar).map_err(|error| {
-                        io_error(
-                            "restore interrupted canonical metadata",
-                            &canonical_sidecar,
-                            error,
-                        )
-                    })?;
-                }
-                fs::remove_file(&undo_companion).map_err(|error| {
-                    io_error("remove redundant restore CA key", &undo_companion, error)
-                })?;
-                sync_parent_path(&canonical)?;
             }
         }
         Ok(())
@@ -6596,94 +5196,9 @@ where
         let metadata =
             fs::metadata(image).map_err(|error| io_error("read image statistics", image, error))?;
         let allocated_bytes = allocated_file_bytes(&metadata);
-        let storage = layout(&self.config, workspace.repo())?;
-        let checkpoint_directory = storage
-            .project()
-            .checkpoints
-            .join(workspace.name().as_str());
-        let mut checkpoint_count = 0_u64;
-        let mut checkpoint_bytes = 0_u64;
-        let mut pinned_checkpoint_bytes = 0_u64;
-        for checkpoint_image in regular_file_children(&checkpoint_directory)? {
-            if !is_image_path(&checkpoint_image) {
-                continue;
-            }
-            let checkpoint_metadata = DetachedWorkspaceMetadata::read_for_image(&checkpoint_image)
-                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-            if checkpoint_metadata.repo_id != *workspace.repo()
-                || checkpoint_metadata.workspace != *workspace.name()
-                || checkpoint_metadata.publication_state != PublicationState::Active
-            {
-                return Err(ApfsStorageError::MarkerMismatch(format!(
-                    "checkpoint metadata disagrees with image path: {}",
-                    checkpoint_image.display()
-                )));
-            }
-            let expected_label = checkpoint_image
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .ok_or_else(|| {
-                    ApfsStorageError::Host(format!(
-                        "invalid checkpoint image name: {}",
-                        checkpoint_image.display()
-                    ))
-                })?;
-            let pinned =
-                if let Some(destination) = expected_label.strip_prefix(super::PRE_RESTORE_PREFIX) {
-                    let destination = WorkspaceIncarnation::new(destination).map_err(|error| {
-                        ApfsStorageError::Host(format!(
-                            "invalid pre-restore checkpoint image {}: {error}",
-                            checkpoint_image.display()
-                        ))
-                    })?;
-                    if checkpoint_metadata.workspace_incarnation == destination {
-                        return Err(ApfsStorageError::MarkerMismatch(format!(
-                            "pre-restore checkpoint retained the destination incarnation: {}",
-                            checkpoint_image.display()
-                        )));
-                    }
-                    false
-                } else {
-                    let fact_path = checkpoint_fact_path(&checkpoint_image);
-                    let fact: CheckpointFactWire = crate::metadata::read_json(&fact_path)
-                        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                    if fact.version != CHECKPOINT_FACT_VERSION
-                        || fact.repo_id != *workspace.repo()
-                        || fact.workspace != *workspace.name()
-                        || fact.label.as_str() != expected_label
-                    {
-                        return Err(ApfsStorageError::Host(format!(
-                            "checkpoint fact does not match image path: {}",
-                            fact_path.display()
-                        )));
-                    }
-                    fact.pin == CheckpointPinWire::Pinned
-                };
-            let bytes =
-                allocated_file_bytes(&fs::metadata(&checkpoint_image).map_err(|error| {
-                    io_error("read checkpoint statistics", &checkpoint_image, error)
-                })?);
-            checkpoint_count = checkpoint_count
-                .checked_add(1)
-                .ok_or(ApfsStorageError::InvalidPlan("checkpoint count overflow"))?;
-            checkpoint_bytes =
-                checkpoint_bytes
-                    .checked_add(bytes)
-                    .ok_or(ApfsStorageError::InvalidPlan(
-                        "checkpoint byte accounting overflow",
-                    ))?;
-            if pinned {
-                pinned_checkpoint_bytes = pinned_checkpoint_bytes.checked_add(bytes).ok_or(
-                    ApfsStorageError::InvalidPlan("pinned checkpoint byte accounting overflow"),
-                )?;
-            }
-        }
         Ok(SubstrateStats {
             logical_bytes: metadata.len(),
             allocated_bytes,
-            checkpoint_count,
-            checkpoint_bytes,
-            pinned_checkpoint_bytes,
         })
     }
 
@@ -6737,59 +5252,6 @@ pub(crate) struct QuarantineTombstone {
     pub(crate) companion: String,
     pub(crate) quarantined_at: String,
     pub(crate) sidecar: String,
-}
-
-/// The versioned checkpoint facts in one workspace's checkpoint directory, appended to `facts`.
-///
-/// A fact absent beside its image is not a checkpoint yet (the fact is written after the image),
-/// and one removed between the listing and its read is no longer one: both are skipped, while a
-/// fact that exists and disagrees with its image path is an integrity error.
-pub(in crate::storage) fn workspace_checkpoint_facts(
-    repo: &RepoId,
-    workspace: &WorkspaceName,
-    images: impl IntoIterator<Item = PathBuf>,
-    facts: &mut Vec<CheckpointFact>,
-) -> Result<(), ApfsStorageError> {
-    for image in images {
-        if !is_image_path(&image) {
-            continue;
-        }
-        let fact_path = checkpoint_fact_path(&image);
-        let wire: CheckpointFactWire = match crate::metadata::read_json(&fact_path) {
-            Ok(wire) => wire,
-            Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                continue;
-            }
-            Err(error) => return Err(ApfsStorageError::Host(error.to_string())),
-        };
-        let expected_label = image
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .ok_or_else(|| {
-                ApfsStorageError::Host(format!(
-                    "invalid checkpoint image name: {}",
-                    image.display()
-                ))
-            })?;
-        if wire.version != CHECKPOINT_FACT_VERSION
-            || wire.repo_id != *repo
-            || wire.workspace != *workspace
-            || wire.label.as_str() != expected_label
-        {
-            return Err(ApfsStorageError::Host(format!(
-                "checkpoint fact does not match image path: {}",
-                fact_path.display()
-            )));
-        }
-        facts.push(CheckpointFact {
-            repo: wire.repo_id,
-            workspace: wire.workspace,
-            label: wire.label,
-            revision: Revision::new(wire.revision),
-            pin: Pin::from(wire.pin),
-        });
-    }
-    Ok(())
 }
 
 /// The grants record of `workspace`'s canonical `image`, or `None` when the image is not there.
@@ -7178,7 +5640,7 @@ pub(crate) fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageErr
     let right_name = CString::new(right.as_os_str().as_bytes())
         .map_err(|_| ApfsStorageError::Host("staged image path contains NUL".to_owned()))?;
     cowshed_os::fsio::rename_exchange(libc::AT_FDCWD, &left_name, &right_name)
-        .map_err(|error| io_error("atomically swap restore images", left, error))
+        .map_err(|error| io_error("atomically swap images", left, error))
 }
 
 /// Whether the volume mounted at `mount_point` already carries `label`, read straight from the
@@ -7843,8 +6305,7 @@ mod tests {
         root
     }
 
-    /// An image of `bytes` logical length and no allocated block, as a checkpoint of a mostly
-    /// empty volume is.
+    /// An image of `bytes` logical length and no allocated block, as a mostly empty volume is.
     fn sparse_image(path: &Path, bytes: u64) {
         File::create(path)
             .expect("image")
@@ -7863,7 +6324,7 @@ mod tests {
     }
 
     /// `gc_candidate` runs inside every `cowshed doctor` and again inside every reclaim, over a
-    /// retired workspace's checkpoint images. It once hashed each one, 250 GB sparse files read
+    /// retired workspace's images. It once hashed each one, 250 GB sparse files read
     /// in full for 23 CPU-minutes. Here the images are mode 000: any open of one to read it fails,
     /// so a plan taken at all proves no content read happened, and no read count or timing bound
     /// can be flaky.
@@ -7871,19 +6332,19 @@ mod tests {
     fn gc_identity_never_reads_an_image_however_large() {
         let root = gc_scratch("never-reads");
         let trash = root.join("retired-00000000000000000000000000000001.dmg");
-        let checkpoint = root.join("one.dmg");
-        for image in [&trash, &checkpoint] {
+        let sibling = root.join("one.dmg");
+        for image in [&trash, &sibling] {
             sparse_image(image, HUNDRED_GIB);
             write_gc_records(image, b"{}");
             fs::set_permissions(image, fs::Permissions::from_mode(0o000))
                 .expect("unreadable image");
         }
         assert!(
-            File::open(&checkpoint).is_err(),
+            File::open(&sibling).is_err(),
             "this test needs a process that mode 000 binds, not root"
         );
         let mut associated = image_gc_paths(&trash);
-        associated.extend(image_gc_paths(&checkpoint));
+        associated.extend(image_gc_paths(&sibling));
 
         let candidate = gc_candidate(StorageGcReason::RetiredWorkspace, &trash, &associated, &[])
             .expect("an identity taken from metadata alone");
@@ -7906,7 +6367,7 @@ mod tests {
         write_gc_records(&image, b"{\"revision\":1}");
         let identity = || {
             gc_candidate(
-                StorageGcReason::ExpiredCheckpoint,
+                StorageGcReason::OrphanSessionImage,
                 &image,
                 &image_gc_paths(&image),
                 &[],
@@ -8076,20 +6537,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn checkpoint_fact_pin_rejects_unknown_spellings() {
-        let json = r#"{
-            "version": 1,
-            "repoId": "acme/widget",
-            "workspace": "main",
-            "label": "ok",
-            "revision": 1,
-            "pin": "pinnned"
-        }"#;
-        serde_json::from_str::<CheckpointFactWire>(json)
-            .expect_err("unknown pin spelling is not a legitimate pin");
     }
 
     #[cfg(unix)]

@@ -10,15 +10,14 @@
 //! table changes every projection together; no adapter restates a field list.
 
 use super::dto::{
-    AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, EmptyResult, ExecClass,
-    ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo,
-    JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport,
-    MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta, PushOptions, PushReport,
-    RebaseOptions, RebaseReport, RecoveredImage, RekeyResult, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode,
-    ScriptCommand, SealedJob, TraceContext, UnprovenWorkspace, WorkspaceIncarnation, WorkspaceInfo,
-    WorkspacePath, WorkspaceTarget,
+    AdmissionKey, AdoptOptions, AttachOptions, CommandArg, DefragmentResult, DoctorReport,
+    EmptyResult, ExecClass, ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet,
+    JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions,
+    LandReport, MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta, PushOptions,
+    PushReport, RebaseOptions, RebaseReport, RecoveredImage, RekeyResult, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
+    RunSandboxMode, ScriptCommand, SealedJob, TraceContext, UnprovenWorkspace,
+    WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::dto::{
     BinaryData, BuildStateListing, CredentialReport, DiskCommandEvent, DiskCommandTool,
@@ -320,16 +319,12 @@ operations! {
     /// Lands a workspace into its target.
     coordinator json "coordinator.land" CoordinatorLand(LandRequest) -> LandReport;
 
-    /// Restores a workspace to a checkpoint.
-    coordinator json "coordinator.restore" CoordinatorRestore(RestoreRequest) -> EmptyResult;
     /// Grows a workspace's image or build volume.
     coordinator json "coordinator.resize" CoordinatorResize(ResizeRequest) -> ResizeResult;
     /// Rewrites a workspace's image contiguously.
     coordinator json "coordinator.defragment" CoordinatorDefragment(WorkspaceRequest) -> DefragmentResult;
     /// Rebuilds one keyless workspace's CA identity at its preserved incarnation.
     coordinator json "coordinator.rekey" CoordinatorRekey(WorkspaceRequest) -> RekeyResult;
-    /// Replaces a workspace's build volume with a clone of an existing target seed.
-    coordinator json "coordinator.reseed" CoordinatorReseed(ReseedRequest) -> ReseedResult;
     /// Deletes a workspace's Nx cache and task database contents on its build volume.
     coordinator json "coordinator.clearNxState" CoordinatorClearNxState(WorkspaceRequest) -> NxStateClearResult;
     /// Detaches a workspace.
@@ -346,8 +341,6 @@ operations! {
     coordinator json "coordinator.removeProject" CoordinatorRemoveProject(RemoveProjectRequest) -> RemoveProjectReport;
     /// Points a workspace's repository mirror at a URL.
     coordinator json "coordinator.repoMirror" CoordinatorRepoMirror(MirrorRequest) -> MirrorInfo;
-    /// Sets a workspace's checkpoint quota.
-    coordinator json "coordinator.setCheckpointQuota" CoordinatorSetCheckpointQuota(QuotaRequest) -> EmptyResult;
     /// Reports the project's health findings.
     coordinator json "coordinator.doctor" CoordinatorDoctor(RepoRequest) -> DoctorReport;
     /// Mints a worker capability for one workspace.
@@ -376,8 +369,6 @@ operations! {
     /// Names the job an admission key admitted in the workspace incarnation, or none when its
     /// durable records prove the key admitted no job.
     worker json "worker.jobByKey" WorkerJobByKey(AdmissionKeyRequest) -> Option<JobId>;
-    /// Takes a checkpoint.
-    worker json "worker.checkpoint" WorkerCheckpoint(CheckpointRequest) -> CheckpointResult;
     /// Pushes the workspace's branch.
     worker json "worker.push" WorkerPush(PushRequest) -> PushReport;
     /// Reads one job's status.
@@ -696,28 +687,11 @@ pub struct LandRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RestoreRequest {
-    pub repo_id: RepoId,
-    pub workspace: WorkspaceName,
-    pub label: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResizeRequest {
     pub repo_id: RepoId,
     pub workspace: WorkspaceName,
     pub capacity: String,
     pub volume: ResizeVolume,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReseedRequest {
-    pub repo_id: RepoId,
-    pub workspace: WorkspaceName,
-    pub from: WorkspaceName,
-    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -767,14 +741,6 @@ pub struct MirrorRequest {
     pub repo_id: RepoId,
     pub workspace: WorkspaceName,
     pub url: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct QuotaRequest {
-    pub repo_id: RepoId,
-    pub workspace: WorkspaceName,
-    pub quota: CheckpointQuota,
 }
 
 /// Where an admitted job's stdin comes from. Inline bytes travel as the call's upload frame; a
@@ -878,15 +844,6 @@ pub struct SessionRequest {
     pub workspace: WorkspaceName,
     pub workspace_incarnation: WorkspaceIncarnation,
     pub session: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CheckpointRequest {
-    pub repo_id: RepoId,
-    pub workspace: WorkspaceName,
-    pub workspace_incarnation: WorkspaceIncarnation,
-    pub options: CheckpointOptions,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1187,32 +1144,6 @@ mod tests {
                 .code,
             crate::error::ErrorCode::Usage
         );
-    }
-
-    #[test]
-    fn reseed_is_coordinator_only_and_requires_explicit_target_and_preview_mode() {
-        let declaration = operation("coordinator.reseed").expect("reseed operation");
-        assert_eq!(declaration.scope, Scope::Coordinator);
-        assert_eq!(declaration.lane, Lane::Json);
-        let params = serde_json::json!({
-            "repoId": "acme/widget", "workspace": "raven", "from": "main", "dryRun": true
-        });
-        let request = OperationRequest::decode("coordinator.reseed", &params).expect("reseed");
-        let OperationRequest::CoordinatorReseed(reseed) = &request else {
-            panic!("expected reseed")
-        };
-        assert_eq!(reseed.workspace.as_str(), "raven");
-        assert_eq!(reseed.from, WorkspaceName::main());
-        assert!(reseed.dry_run);
-        assert_eq!(request.params().unwrap(), params);
-        for field in ["from", "dryRun"] {
-            let mut missing = params.clone();
-            missing.as_object_mut().unwrap().remove(field);
-            assert!(OperationRequest::decode("coordinator.reseed", &missing).is_err());
-        }
-        let mut extra = params.clone();
-        extra["refreshSeed"] = serde_json::json!(true);
-        assert!(OperationRequest::decode("coordinator.reseed", &extra).is_err());
     }
 
     /// The latest tail names no cursor: the field is omitted, never `null`, both ways.

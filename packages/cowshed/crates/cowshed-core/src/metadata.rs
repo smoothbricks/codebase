@@ -594,8 +594,8 @@ pub struct WorkspaceMarker {
     pub created_at: String,
     pub forked_from: Option<WorkspaceName>,
     pub created_trace: String,
-    /// The ancestor incarnations this image was cloned from, nearest first: a fork or restore
-    /// copies the source image — including the job records its ancestors wrote — so the
+    /// The ancestor incarnations this image was cloned from, nearest first: a fork copies the
+    /// source image — including the job records its ancestors wrote — so the
     /// lineage is what authorizes those records when the supervisor opens the workspace. It
     /// lives in the image because it is a property of the image: the controller writes it when
     /// it mints the incarnation, and a host log has nothing to add. `None` marks a marker written
@@ -1012,7 +1012,7 @@ pub struct WorkspaceInfoSnapshot {
     /// This workspace is a registered linked worktree of main's repository rather than a
     /// standalone clone (`cowshed fork --git-worktree`).
     ///
-    /// Store-side, because every decision it drives — refusing checkpoint, pruning the
+    /// Store-side, because every decision it drives — pruning the
     /// registration out of main at retirement, requiring main mounted before attach — has to be
     /// made while the workspace itself is detached and its mount says nothing.
     ///
@@ -1919,7 +1919,7 @@ mod tests {
     }
 
     /// The git-worktree fact has to survive a sidecar round trip, because every decision it drives
-    /// — refusing checkpoint, pruning the registration out of main, requiring main mounted — is
+    /// — pruning the registration out of main, requiring main mounted — is
     /// taken from the store side while the workspace itself may be detached. It is written only
     /// when true, so a standalone workspace's sidecar keeps the spelling it always had.
     #[test]

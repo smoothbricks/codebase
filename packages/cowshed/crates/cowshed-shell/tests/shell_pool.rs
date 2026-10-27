@@ -2042,17 +2042,16 @@ async fn host_controller_worker_custom_environment_runs_but_is_absent_from_admis
     let history = cowshed_core::storage::job_artifact::recover_records(&records).unwrap();
     assert!(!history.frames.is_empty());
     for frame in history.frames {
-        if let cowshed_core::storage::job_artifact::ProtectedRecord::Job(record) = frame.record {
-            let admitted = record.admission.expect("a keyed worker record");
-            assert_eq!(
-                admitted.env,
-                std::collections::BTreeMap::from([("LANG".to_owned(), "C".to_owned())])
-            );
-            assert_ne!(
-                admitted.env_sha256,
-                cowshed_core::api::Sha256Digest::compute(&[])
-            );
-        }
+        let record = frame.record;
+        let admitted = record.admission.expect("a keyed worker record");
+        assert_eq!(
+            admitted.env,
+            std::collections::BTreeMap::from([("LANG".to_owned(), "C".to_owned())])
+        );
+        assert_ne!(
+            admitted.env_sha256,
+            cowshed_core::api::Sha256Digest::compute(&[])
+        );
     }
     let bytes = std::fs::read(&records).unwrap();
     assert!(

@@ -928,7 +928,7 @@ pub struct OtherBuildStopped {
 }
 
 /// Stop the supervisor of another cowshed build that serves `socket`, for a lifecycle verb about
-/// to change its workspace's substrate (`detach`, `rm`, `restore`, `resize`, `mv`).
+/// to change its workspace's substrate (`detach`, `rm`, `resize`, `mv`).
 ///
 /// This build speaks no request of that supervisor's protocol but `drain`, the one whose shape
 /// never changes, and `drain` alone only waits for its jobs. The connected peer's non-reusable

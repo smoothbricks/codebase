@@ -40,9 +40,8 @@ request authentication (05_gateway.md); it is not an MCP credential.
 - A 256-bit capability minted fresh at server start and transferred to the trusted spawning controller only over the
   inherited FD/socketpair above. It is never emitted on stderr, stdout, argv, environment, telemetry, or any filesystem
   path; it is never written into a workspace. The receiving endpoint is non-inheritable and closed after binding.
-- Authorizes the full coordinator surface: `workspace_create`, `workspace_destroy`, `fork`, `restore`, `rebase`, `land`,
-  `grant`, `revoke`, `slot_assign`, `gc`, `repo_mirror`, checkpoint-quota policy, and minting workspace-scoped
-  connections. Checkpoint creation is exercised through the quota-bound one-workspace worker capability.
+- Authorizes the full coordinator surface: `workspace_create`, `workspace_destroy`, `fork`, `rebase`, `land`, `grant`,
+  `revoke`, `slot_assign`, `gc`, `repo_mirror`, and minting workspace-scoped connections.
 - Held by the trusted orchestrator. It is the only authority that can change what a workspace may touch or perform
   cross-workspace/project maintenance.
 
@@ -57,9 +56,8 @@ request authentication (05_gateway.md); it is not an MCP credential.
   identity (uid plus available platform peer credentials); a mismatch authorizes nothing and does not consume a
   descriptor intended for the correct peer. Successful consume binds the connection to one `WorkspaceHandle` and
   permanently removes the descriptor.
-- The resulting session exposes `bash`, `job_list`, `job_status`, `job_logs`, quota-bound `checkpoint`, and `push` for
-  exactly that workspace. It exposes no grant/revoke, restore/destroy/rebase/land/gc/repo-mirror, descriptor minting, or
-  access to another workspace.
+- The resulting session exposes `bash`, `job_list`, `job_status`, `job_logs`, and `push` for exactly that workspace. It
+  exposes no grant/revoke, destroy/rebase/land/gc/repo-mirror, descriptor minting, or access to another workspace.
 
 Descriptors never appear in telemetry or workspace records. The in-volume `.cowshed/token` remains gateway-only.
 
@@ -89,8 +87,6 @@ even if compromised — escalation is strictly a decision made one level up.
 | `workspace_list`    | —                                                                                                             | records (name, state, base, age, written/referenced)     |
 | `workspace_destroy` | `name`, `force?`                                                                                              | ok                                                       |
 | `fork`              | `src`, `dst`                                                                                                  | mount path                                               |
-| `checkpoint`        | `name`, `label?`                                                                                              | label (generated UTC timestamp if omitted)               |
-| `restore`           | `name`, `label` (**required**)                                                                                | mount path                                               |
 | `rebase`            | `name`, `onto?`, `fresh?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedOntoHead?`        | new head sha                                             |
 | `land`              | `name`, `targetBranch?`, `check?`, `retire?`, `pushOnly?`, source/incarnation/target CAS expectations         | target branch, landed sha, checkout state, retired       |
 | `grant` / `revoke`  | `name`, `read[]?`, `write[]?`, `egress[]?`, `repo[]?`, `sim[]?`, `servicePorts?`, `all?`, `expectedRevision?` | new grant revision                                       |
@@ -103,7 +99,6 @@ A coordinator-scoped telemetry query tool (selector/SQL over controller commitme
 roadmap, not v1. Workers get only one-workspace job status/log tools: lifecycle and captured bytes both resolve from
 protected in-volume records and artifacts within their origin boundary.
 
-`restore` requires a label — there is no "restore the latest" default. Worker `checkpoint` accepts an optional label.
 `grant`/`revoke` carry `expectedRevision` for compare-and-swap (07_api.md/04_sandbox.md) and a `repo[]` selector for
 repo-scoped mirror grants (05_gateway.md). Each `egress[]` entry is `{ host, ports?, mode?: "intercept" | "opaque" }`,
 mirroring the grant-file schema (04_sandbox.md): a coordinator sets a host's interception mode at grant time, `mode`
@@ -128,7 +123,6 @@ new base. `push` remains the separate worker-scoped preservation primitive and i
 | `job_list`   | `state?`                                                                                                                       | resource-bearing `JobInfo` rows, with numeric job ids and trace identity                         |
 | `job_status` | `jobId` (numeric)                                                                                                              | resource-bearing `JobInfo` with current or terminal sample                                       |
 | `job_logs`   | `jobId` (numeric), `stream?: "out" \| "err"`, `offset?`, `follow?`                                                             | raw bytes resolved representation-transparently from the protected artifact                      |
-| `checkpoint` | `label?`                                                                                                                       | label                                                                                            |
 | `push`       | `branch?`, `expectedWorkspaceIncarnation?`, `expectedSourceHead?`, `expectedDestinationHead?: { missing: true } \| { oid }`    | source head, non-checked-out destination ref, previous destination head?                         |
 
 `bash` is the workhorse: it runs through the workspace supervisor (warm shell, 11_shell.md), honors `session` for
@@ -148,12 +142,6 @@ child stdin once, cancellation closes stdin and records incomplete delivery with
 Results/events carry stdin kind, delivered byte count, completion, and normalized relative file path when applicable,
 plus normal job/trace identity; inline bytes never enter JSON results or telemetry.
 
-`checkpoint` atomically enforces the coordinator-configured per-workspace checkpoint count and byte quotas. It reaches
-the supervisor barrier before cloning: running memory-only stream prefixes promote, protected files and a complete
-checkpoint-manifest Arrow batch fsync, and the controller records the audit checkpoint commitment. Quota exhaustion is a
-conflict carrying current usage and limits; it never silently prunes another checkpoint. Restore is coordinator-only and
-rejects a checkpoint whose own manifest does not match its records and artifacts as `Integrity`.
-
 `push` has the same preservation and compare-and-swap semantics as `WorkspaceHandle::push` (07_api.md): it installs the
 exact fetched source head under `refs/cowshed/<ws>/heads/<branch>` in the main workspace repository/object store without
 changing the checked-out Git `main` branch, index, or working tree. Any supplied incarnation, source-head, or
@@ -169,11 +157,11 @@ still applies. `stdoutCopy`/`stderrCopy` are the exact per-stream `{path,policy}
 never becomes authority.
 
 Every job result/event includes `(repoId, workspaceIncarnation, jobId)` and standard trace identity. Protected in-volume
-complete Arrow batches and sealed artifacts are the authoritative evidence within the origin incarnation/checkpoint
-boundary. Controller commitments are audit telemetry: they carry no output payload or artifact path, and the server
-reads none of them for a result. Missing/altered content, invalid complete batches, a count/hash/batch digest mismatch
-or a checkpoint-barrier counter behind a durable barrier return `Integrity` (`-32006`), preserving the evidence rather
-than trusting whichever copy appears newer. Discarding only an incomplete trailing batch is successful recovery.
+complete Arrow batches and sealed artifacts are the authoritative evidence within the origin incarnation boundary.
+Controller commitments are audit telemetry: they carry no output payload or artifact path, and the server reads none of
+them for a result. Missing/altered content, invalid complete batches, or a count/hash/batch digest mismatch return
+`Integrity` (`-32006`), preserving the evidence rather than trusting whichever copy appears newer. Discarding only an
+incomplete trailing batch is successful recovery.
 
 The resource sample is exactly `JobResourceSample` from 07_api.md: wall time, cumulative process-group CPU user/sys time
 and one-core CPU share, current/peak group RSS, immutable start and current/end host load1/cores, separate signed
