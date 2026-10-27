@@ -247,6 +247,11 @@ helper's exit, so startup failure reports the exited helper instead of waiting f
 and release readiness frames are newline-terminated messages; their completion does not depend on every inherited writer
 descriptor reaching EOF. Independent readiness publishers are read concurrently.
 
+The capability compile-check probe creates its scratch workspace through the shared fixture guard at runtime, never
+under a path baked into an archived test binary. Cargo metadata from the runtime manifest directory supplies its shared
+dependency target; warm-up and privacy checks use that same target and forward the checkout's ancestor Cargo configs
+(16_build_volumes.md, "One Cargo environment on every path"). Only the run-owned scratch workspace is removed.
+
 Process fixtures resolve real portable tools through the selected shell's PATH, not fixed FHS executable paths. A
 version-probe fixture prepends its selected executable directory without discarding that toolchain PATH. Host API proofs
 compare both successful answers and typed refusals with their CLI verbs; JSON failure diagnostics live on stdout. The

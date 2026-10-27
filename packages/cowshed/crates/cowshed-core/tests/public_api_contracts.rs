@@ -9,6 +9,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 fn repo() -> cowshed_core::repository::RepoId {
     cowshed_core::repository::RepoId::parse("acme/widget").expect("repo id")
 }
@@ -1625,22 +1629,11 @@ const CAPABILITY_CASES: [(&str, &str, &[&str]); 9] = [
 /// whole tree once per case. The outer lockfile pins the probe to the versions the outer build
 /// compiled, so resolution is a lookup.
 ///
-/// The probe's path, manifests and lockfile are the same whatever `source` returns, so its
-/// dependencies resolve, and their artifacts fingerprint, the same for the warm-up and for the
-/// test: only the case crates themselves differ.
+/// The probe's manifests, lockfile and shared target are the same whatever `source` returns, so
+/// dependencies fingerprint the same for the warm-up and the test. Only the case crates live in a
+/// fresh run-owned directory: an archived test binary must never clear its producer's fixture.
 fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process::Output {
-    let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .parent()
-        .expect("cargo target directory")
-        .to_path_buf();
-    let probe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capability-probe");
-    // Cases that no longer exist must not linger as members of the probe.
-    match fs::remove_dir_all(&probe) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("clear the probe workspace: {error}"),
-    }
-    fs::create_dir_all(&probe).expect("probe workspace directory");
+    let probe = TempRoot::new_in(&std::env::temp_dir(), "cowshed-capability-probe");
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR")
             .expect("cargo sets CARGO_MANIFEST_DIR for the tests it runs"),
@@ -1651,12 +1644,36 @@ fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process
         .find(|lockfile| lockfile.is_file())
         .expect("the workspace lockfile");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    // The probe lives under CARGO_TARGET_TMPDIR, which resolves into the build volume, and no
-    // ancestor of that holds this repository's `.cargo/config.toml`: without it the probe builds
-    // without the workspace's checksum freshness, linker and `[env]`, in units of a second
-    // freshness mode beside the workspace's (16_build_volumes.md, "One Cargo environment on every
-    // path"). It reads the files a Cargo started in cowshed-core's directory reads, shallowest
-    // first: a later `--config` wins, as a deeper file does.
+    // Ask Cargo in the executing checkout, not the checkout that compiled this test binary.
+    // Metadata honors its runtime target configuration without building any dependencies.
+    let metadata = Command::new(&cargo)
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(&manifest_dir)
+        .output_bounded()
+        .unwrap_or_else(|error| panic!("cargo metadata in {}: {error}", manifest_dir.display()));
+    assert!(
+        metadata.status.success(),
+        "cargo metadata in {}: {}",
+        manifest_dir.display(),
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata.stdout).expect("cargo metadata JSON");
+    let target = PathBuf::from(
+        metadata["target_directory"]
+            .as_str()
+            .expect("cargo metadata target_directory"),
+    );
+    // The owned scratch root has no repository config ancestors. Forward the files a Cargo
+    // started in cowshed-core's runtime directory reads, shallowest first: a later `--config`
+    // wins, as a deeper file does. This preserves checksum freshness, linker and `[env]` in
+    // the one Cargo environment (16_build_volumes.md, "One Cargo environment on every path").
     let mut workspace_configs: Vec<PathBuf> = manifest_dir
         .ancestors()
         .map(|directory| directory.join(".cargo").join("config.toml"))
@@ -1709,9 +1726,143 @@ fn check_capability_probe(source: impl Fn(&str) -> &'static str) -> std::process
         .arg("--message-format=short")
         .arg("--target-dir")
         .arg(&target)
-        .current_dir(&probe)
+        .current_dir(&*probe)
         .output_bounded()
         .unwrap_or_else(|error| panic!("cargo check: {error}"))
+}
+
+/// Exercise our Cargo CLI wiring without rebuilding Cargo's dependency tree. A child test process
+/// relocates the manifest and scratch parent at runtime, just as an archived nextest binary does.
+#[cfg(unix)]
+#[test]
+fn capability_probe_owns_runtime_scratch_and_reuses_runtime_target() {
+    const FIXTURE: &str = "COWSHED_CAPABILITY_PROBE_FIXTURE";
+    if std::env::var_os(FIXTURE).is_some() {
+        for _ in 0..2 {
+            let output = check_capability_probe(|_| "");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = TempRoot::new_in(&std::env::temp_dir(), "cowshed-capability-relocation");
+    let consumer = fixture.join("consumer");
+    let manifest = consumer.join("crates/probe-owner");
+    let scratch = fixture.join("scratch");
+    let target = consumer.join("configured-target");
+    let producer = fixture.join("producer-target/tmp/capability-probe");
+    let configs = [
+        consumer.join(".cargo/config.toml"),
+        manifest.join(".cargo/config.toml"),
+    ];
+    for directory in [&scratch, &producer] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    for config in &configs {
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(config, "# runtime checkout config\n").unwrap();
+    }
+    fs::write(consumer.join("Cargo.lock"), "# runtime checkout lock\n").unwrap();
+    fs::write(producer.join("keep"), "producer-owned bytes").unwrap();
+    fs::write(
+        fixture.join("metadata.json"),
+        serde_json::to_vec(&json!({ "target_directory": target })).unwrap(),
+    )
+    .unwrap();
+    let cargo = fixture.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+set -eu
+fixture="$COWSHED_CAPABILITY_PROBE_FIXTURE"
+if [ "$1" = metadata ]; then
+    printf '%s\n' "$PWD" >> "$fixture/metadata-cwds"
+    cat "$fixture/metadata.json"
+else
+    printf '%s\n' "$PWD" >> "$fixture/probe-roots"
+    printf '%s\0' "$@" >> "$fixture/check-args"
+    cp Cargo.lock "$fixture/probe-lock"
+    cp private_construction/Cargo.toml "$fixture/probe-manifest"
+fi
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "capability_probe_owns_runtime_scratch_and_reuses_runtime_target",
+            "--nocapture",
+        ])
+        .env(FIXTURE, &*fixture)
+        .env("CARGO", &cargo)
+        .env("CARGO_MANIFEST_DIR", &manifest)
+        .env("CARGO_TARGET_TMPDIR", producer.parent().unwrap())
+        .env("TMPDIR", &scratch)
+        .output_bounded()
+        .expect("run relocated capability probe");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let roots = fs::read_to_string(fixture.join("probe-roots")).unwrap();
+    let roots: Vec<PathBuf> = roots.lines().map(PathBuf::from).collect();
+    assert_eq!(roots.len(), 2);
+    assert_ne!(roots[0], roots[1]);
+    for root in roots {
+        assert_eq!(root.parent(), Some(scratch.as_path()));
+        assert!(!root.exists(), "run-owned root {} survived", root.display());
+    }
+    let metadata_cwds = fs::read_to_string(fixture.join("metadata-cwds")).unwrap();
+    assert_eq!(
+        metadata_cwds.lines().collect::<Vec<_>>(),
+        vec![manifest.to_str().unwrap(); 2]
+    );
+    let mut expected: Vec<OsString> = configs
+        .iter()
+        .flat_map(|config| [OsString::from("--config"), config.as_os_str().to_owned()])
+        .collect();
+    expected.extend(
+        [
+            "check",
+            "--workspace",
+            "--keep-going",
+            "--offline",
+            "--message-format=short",
+            "--target-dir",
+        ]
+        .map(OsString::from),
+    );
+    expected.push(target.into_os_string());
+    let arguments = fs::read(fixture.join("check-args")).unwrap();
+    let arguments: Vec<OsString> = arguments
+        .split_inclusive(|byte| *byte == 0)
+        .map(|argument| OsString::from_vec(argument[..argument.len() - 1].to_vec()))
+        .collect();
+    assert_eq!(arguments.len(), expected.len() * 2);
+    for invocation in arguments.chunks(expected.len()) {
+        assert_eq!(invocation, expected);
+    }
+    assert_eq!(
+        fs::read(fixture.join("probe-lock")).unwrap(),
+        b"# runtime checkout lock\n"
+    );
+    assert!(
+        fs::read_to_string(fixture.join("probe-manifest"))
+            .unwrap()
+            .contains(&format!("path = {manifest:?}"))
+    );
+    assert_eq!(
+        fs::read(producer.join("keep")).unwrap(),
+        b"producer-owned bytes"
+    );
 }
 
 /// The capability probe's build step: everything the probe checks except its snippets, which is
