@@ -2118,7 +2118,7 @@ const _: () = assert!(std::mem::size_of::<KinfoProc>() == 648);
 /// and for one that exited and is not yet reaped; `None` once nothing holds the pid. An
 /// unreadable process is never absent.
 #[cfg(target_os = "macos")]
-fn start_time(pid: i32) -> io::Result<Option<u64>> {
+pub(crate) fn start_time(pid: i32) -> io::Result<Option<u64>> {
     let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
     let mut info = std::mem::MaybeUninit::<KinfoProc>::zeroed();
     let mut size = std::mem::size_of::<KinfoProc>();
@@ -2189,7 +2189,7 @@ fn birth_time(pid: i32) -> io::Result<Option<u64>> {
 
 /// The leader's start time in ticks since boot, or confirmed absence on a mounted procfs.
 #[cfg(target_os = "linux")]
-fn start_time(pid: i32) -> io::Result<Option<u64>> {
+pub(crate) fn start_time(pid: i32) -> io::Result<Option<u64>> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

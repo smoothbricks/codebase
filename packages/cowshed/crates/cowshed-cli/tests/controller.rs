@@ -97,6 +97,73 @@ async fn host_controller_an_embedding_process_reaches_its_project_through_the_co
     assert!(output.stdout.is_empty());
 }
 
+/// The incident the SILENT rule was changed for, against the real host: a client whose call on a
+/// `cowshed controller` fell SILENT keeps its connection, so the controller lives on. The child is
+/// stopped (`SIGSTOP`) while a call waits on it, the call fails SILENT, the child is continued, and
+/// the next call on the same connection is answered by the same, still running controller. A
+/// client that closed its end on SILENT had made the controller exit 0 instead (06_cli.md).
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_controller_survives_a_client_whose_call_on_it_fell_silent() {
+    let root = checkout_root();
+    let (ours, theirs) = UnixStream::pair().expect("socketpair");
+    let mut child = tokio::process::Command::new(cowshed())
+        .arg("--project")
+        .arg(&root)
+        .arg("controller")
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start cowshed controller");
+    let pid = libc::pid_t::try_from(child.id().expect("the controller runs")).expect("pid fits");
+
+    let (cowshed, token) = Cowshed::connect(OwnedFd::from(ours))
+        .await
+        .expect("coordinator handshake over the inherited socket");
+    let project = cowshed.open(&root).await.expect("open the served project");
+    // SAFETY: `pid` is this test's own unreaped child.
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGSTOP) },
+        0,
+        "stop the controller"
+    );
+    let silent = tokio::time::timeout(std::time::Duration::from_secs(60), project.main()).await;
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGCONT) },
+        0,
+        "continue the controller"
+    );
+    let Err(silent) = silent.expect("a stopped controller's call fails within its silence bound")
+    else {
+        panic!("a stopped controller's call fails");
+    };
+    assert!(silent.message.starts_with("SILENT: "), "{}", silent.message);
+    let main = project
+        .main()
+        .await
+        .expect("the next call on the same connection is answered");
+    assert_eq!(main.name().as_str(), "main");
+    assert!(
+        child.try_wait().expect("poll the controller").is_none(),
+        "the controller lives on after its client's call fell SILENT"
+    );
+    drop(main);
+    drop(project);
+    drop(token);
+    drop(cowshed);
+    let output = child
+        .wait_with_output_bounded()
+        .await
+        .expect("wait for cowshed controller");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The checkout this test runs in: main's, or a workspace's, either of which names the project.
 /// The crate directory is read at run time, so a workspace that inherited main's compiled test
 /// asks git about its own tree, not main's.

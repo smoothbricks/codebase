@@ -1454,6 +1454,11 @@ fn spawn_controller_actor(
     Arc<dyn ControllerRuntime>,
     watch::Receiver<Option<OtherBuild>>,
 ) {
+    // The controller's start, read now beside the handshake: a silence samples its pid only while
+    // the process holding it started at this same instant (05_gateway.md "Deadlines", Spans).
+    let started = crate::runtime::wait_spans::peer_pid(&controller)
+        .and_then(|pid| crate::runtime::job_groups::start_time(pid).ok().flatten());
+    let recording = recording.map(|recording| SilenceRecording { recording, started });
     let (sender, receiver) = mpsc::channel::<ActorMessage>(32);
     let (closes, closed) = mpsc::unbounded_channel();
     let (answers, answer_receiver) = mpsc::unbounded_channel();
@@ -1519,14 +1524,17 @@ impl Inbound {
 #[cfg(unix)]
 const CONTROLLER_CALL: &str = "controller call";
 
-/// Whether the controller owes an answer: a call sent and unanswered, or a demand on an open
-/// stream.
+/// Whether the controller owes an answer: a call sent and unanswered, one that failed SILENT and is
+/// still open at the controller, or a demand on an open stream.
 #[cfg(unix)]
-fn outstanding<T>(
+fn owes<T>(
     pending: &std::collections::HashMap<u64, T>,
     streams: &std::collections::HashMap<u64, OpenStream>,
+    abandoned: &std::collections::HashSet<u64>,
 ) -> bool {
-    !pending.is_empty() || streams.values().any(|stream| stream.waiting.is_some())
+    !pending.is_empty()
+        || !abandoned.is_empty()
+        || streams.values().any(|stream| stream.waiting.is_some())
 }
 
 /// The controller a silent call waited on, and the op its last heartbeat said its router serves.
@@ -1581,6 +1589,85 @@ fn silent_controller(silent: &Silent<ControllerHolder>) -> CowshedError {
         "the controller is alive and not answering on its connection; nothing was stopped, and its pid is named above",
     )
     .with_wait(Some(failure))
+}
+
+/// How a process-external client records its controller's silence: the recording, and the
+/// controller's start time at the handshake, which tells its pid from one recycled since.
+#[cfg(unix)]
+#[derive(Clone)]
+struct SilenceRecording {
+    recording: crate::runtime::wait_spans::WaitRecording,
+    started: Option<u64>,
+}
+
+#[cfg(unix)]
+impl SilenceRecording {
+    /// Record `silent` once; its controller is sampled only while its pid is still the process
+    /// that answered the hello, so a recycled pid's process is never suspended by the sampler.
+    fn record(&self, silent: CowshedError) -> CowshedError {
+        let started = self.started;
+        self.recording.record_with(silent, move |pid| {
+            match (started, crate::runtime::job_groups::start_time(pid)) {
+                (Some(then), Ok(Some(now))) if then == now => Ok(()),
+                (Some(_), Ok(Some(_))) => Err(format!(
+                    "pid {pid} was recycled since the handshake: another process holds it, so it is not sampled"
+                )),
+                (_, Ok(None)) => Err(format!(
+                    "pid {pid} has ended since the handshake, so it is not sampled"
+                )),
+                (None, Ok(Some(_))) => Err(format!(
+                    "pid {pid}'s start time was unreadable at the handshake, so it cannot be told from a process that recycled it since the handshake, and it is not sampled"
+                )),
+                (_, Err(error)) => Err(format!(
+                    "pid {pid}'s start time is unreadable ({error}), so it cannot be told from a process that recycled it since the handshake, and it is not sampled"
+                )),
+            }
+        })
+    }
+}
+
+/// Tell the callers a silent controller left waiting: each failed call and each failed stream
+/// demand gets `error`.
+#[cfg(unix)]
+fn tell_silent(
+    calls: Vec<oneshot::Sender<Result<ActorResponse>>>,
+    demands: Vec<oneshot::Sender<Result<StreamStep>>>,
+    error: &CowshedError,
+) {
+    for call in calls {
+        let _ = call.send(Err(error.clone()));
+    }
+    for demand in demands {
+        let _ = demand.send(Err(error.clone()));
+    }
+}
+
+/// A controller silent for a second window while every call slot is held by calls that already
+/// failed SILENT: nothing it owes will be answered within a bound, so the connection is declared
+/// lost and closed (05_gateway.md "Deadlines"). The error names the controller and its pid, and
+/// the sample of its last recorded silence.
+#[cfg(unix)]
+fn lost_controller(
+    silent: &CowshedError,
+    receipt: Option<crate::runtime::wait_spans::WaitReceipt>,
+) -> CowshedError {
+    let sample = match receipt.as_ref().and_then(|receipt| receipt.sample.as_ref()) {
+        Some(Ok(path)) => format!("; cowshed controller stacks: {}", path.display()),
+        Some(Err(error)) => format!("; cowshed controller stack capture failed: {error}"),
+        None => String::new(),
+    };
+    let wait = silent.wait_source().cloned().map(|mut wait| {
+        wait.receipt = receipt;
+        wait
+    });
+    CowshedError::environment_missing(
+        format!(
+            "{}; it stayed silent for a second window with all {MAX_IN_FLIGHT_REQUESTS} call slots held by calls that failed SILENT, so this connection is lost and closed{sample}",
+            silent.message
+        ),
+        "the controller is wedged: closing this connection ends a `cowshed controller` serving it; open a fresh controller",
+    )
+    .with_wait(wait)
 }
 
 #[cfg(unix)]
@@ -1739,7 +1826,7 @@ async fn run_controller_actor(
     mut writer: impl AsyncWrite + Unpin,
     downloads: Downloads,
     mut answers: mpsc::UnboundedReceiver<Result<Inbound>>,
-    recording: Option<crate::runtime::wait_spans::WaitRecording>,
+    recording: Option<SilenceRecording>,
 ) {
     let mut pending =
         std::collections::HashMap::<u64, oneshot::Sender<Result<ActorResponse>>>::new();
@@ -1755,8 +1842,14 @@ async fn run_controller_actor(
     let mut abandoned = std::collections::HashSet::<u64>::new();
     // The controller's silence while it owes an answer, and the op its last heartbeat named.
     let mut stalled = ControllerSilence::start();
+    // Consecutive silence windows with no frame from the controller between them.
+    let mut silent_windows = 0_u32;
+    // The receipts of silences recorded off this task; a lost connection names the last one.
+    let (receipts, mut recorded) =
+        mpsc::unbounded_channel::<crate::runtime::wait_spans::WaitReceipt>();
+    let mut last_receipt = None;
     let failure = loop {
-        let owed = outstanding(&pending, &streams);
+        let owed = owes(&pending, &streams, &abandoned);
         let silence = stalled
             .idle
             .remaining(deadline::clock())
@@ -1789,7 +1882,7 @@ async fn run_controller_actor(
                             break error;
                         }
                         // The request is the stream's first demand.
-                        if !outstanding(&pending, &streams) {
+                        if !owes(&pending, &streams, &abandoned) {
                             stalled = ControllerSilence::start();
                         }
                         streams.insert(id, OpenStream { waiting: Some(first), closing: false });
@@ -1804,7 +1897,7 @@ async fn run_controller_actor(
                         );
                     }
                     ActorMessage::Next { id, reply } => {
-                        let quiet = !outstanding(&pending, &streams);
+                        let quiet = !owes(&pending, &streams, &abandoned);
                         let Some(stream) = streams
                             .get_mut(&id)
                             .filter(|stream| stream.waiting.is_none() && !stream.closing)
@@ -1837,9 +1930,14 @@ async fn run_controller_actor(
                 }
                 continue;
             }
+            Some(receipt) = recorded.recv() => {
+                last_receipt = Some(receipt);
+                continue;
+            }
             inbound = answers.recv() => {
                 if let Some(Ok(frame)) = &inbound {
                     stalled.idle.observe(frame.progress(), deadline::clock());
+                    silent_windows = 0;
                 }
                 let answer = match inbound {
                     Some(Ok(Inbound::Answer(answer))) => answer,
@@ -1930,37 +2028,33 @@ async fn run_controller_actor(
                     continue;
                 }
                 let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.take() };
-                let mut silent = silent_controller(&stalled.idle.silent(holder, deadline::clock()));
-                // Sampled while the controller is still silent, before any waiting call is told:
-                // the sampler and the seal block, so they run off this task (05_gateway.md
-                // "Deadlines", Spans).
-                if let Some(recording) = recording.clone() {
-                    let unrecorded = silent.clone();
-                    silent = tokio::task::spawn_blocking(move || recording.record(silent))
-                        .await
-                        .unwrap_or_else(|error| {
-                            cowshed_os::eprintln!(
-                                "cowshed: recording a silent controller's wait failed: {error}"
-                            );
-                            unrecorded
-                        });
+                let silent = silent_controller(&stalled.idle.silent(holder, deadline::clock()));
+                silent_windows = silent_windows.saturating_add(1);
+                // The next window measures from now, so the timer re-arms instead of spinning
+                // while the abandoned calls stay owed.
+                stalled = ControllerSilence::start();
+                if silent_windows >= 2 && pending.len() + abandoned.len() >= MAX_IN_FLIGHT_REQUESTS {
+                    break lost_controller(&silent, last_receipt.take());
                 }
                 // SILENT ends the waits, never the connection: a `cowshed controller` exits once
-                // its peer closes its end (06_cli.md), and every other op shares it.
+                // its peer closes its end (06_cli.md), and every other op shares it. A call queued
+                // behind the slots the silent controller holds was never sent; it is told too.
+                let mut calls = Vec::with_capacity(pending.len() + waiting.len());
                 for (id, reply) in pending.drain() {
                     listeners.remove(&id);
                     abandoned.insert(id);
-                    let _ = reply.send(Err(silent.clone()));
+                    calls.push(reply);
                 }
-                let silenced = streams
-                    .iter_mut()
-                    .filter_map(|(id, stream)| {
-                        let waiting = stream.waiting.take()?;
-                        let _ = waiting.send(Err(silent.clone()));
+                calls.extend(waiting.drain(..).map(|call| call.reply));
+                let mut demands = Vec::new();
+                let mut silenced = Vec::new();
+                for (id, stream) in &mut streams {
+                    if let Some(demand) = stream.waiting.take() {
+                        demands.push(demand);
                         stream.closing = true;
-                        Some(*id)
-                    })
-                    .collect::<Vec<_>>();
+                        silenced.push(*id);
+                    }
+                }
                 let mut closed = Ok(());
                 for id in silenced {
                     closed = send_demand(&mut writer, id, codec::Demand::Close).await;
@@ -1969,7 +2063,37 @@ async fn run_controller_actor(
                     }
                 }
                 if let Err(error) = closed {
+                    tell_silent(calls, demands, &silent);
                     break error;
+                }
+                if calls.is_empty() && demands.is_empty() {
+                    continue;
+                }
+                match recording.clone() {
+                    // Sampled and sealed off this task, which keeps serving calls, answers and
+                    // closes meanwhile; the callers are told once the silence is recorded. A real
+                    // answer for one of them that arrives meanwhile is dropped as abandoned.
+                    Some(recording) => {
+                        let receipts = receipts.clone();
+                        tokio::spawn(async move {
+                            let unrecorded = silent.clone();
+                            let recorded = tokio::task::spawn_blocking(move || recording.record(silent))
+                                .await
+                                .unwrap_or_else(|error| {
+                                    cowshed_os::eprintln!(
+                                        "cowshed: recording a silent controller's wait failed: {error}"
+                                    );
+                                    unrecorded
+                                });
+                            if let Some(receipt) =
+                                recorded.wait_source().and_then(|wait| wait.receipt.clone())
+                            {
+                                let _ = receipts.send(receipt);
+                            }
+                            tell_silent(calls, demands, &recorded);
+                        });
+                    }
+                    None => tell_silent(calls, demands, &silent),
                 }
                 continue;
             }
@@ -1994,7 +2118,7 @@ async fn run_controller_actor(
             let _ = reply.send(Err(error.clone()));
             break error;
         }
-        if !outstanding(&pending, &streams) {
+        if !owes(&pending, &streams, &abandoned) {
             stalled = ControllerSilence::start();
         }
         pending.insert(id, reply);
@@ -3467,22 +3591,71 @@ mod tests {
         drop(server);
     }
 
-    /// 05_gateway.md "Deadlines": SILENT ends the waits, never the controller. A `cowshed
-    /// controller` exits once its peer closes its end (06_cli.md), so the connection stays open:
-    /// an answer the controller sends late for a call that failed SILENT is read and dropped, and
-    /// the next call is served on the same connection.
+    /// A controller connection over a real socketpair whose controller is `pid`, recording its
+    /// silences with `recording`.
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
-    async fn a_silent_controller_keeps_its_connection_and_answers_the_next_call() {
-        let (runtime, mut server) = actor_in_memory();
+    fn recorded_actor_pair(
+        pid: i32,
+        recording: Option<crate::runtime::wait_spans::WaitRecording>,
+    ) -> (Arc<dyn ControllerRuntime>, tokio::net::UnixStream) {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (reader, writer) = client.into_split();
+        let (runtime, _) = spawn_controller_actor(
+            reader,
+            writer,
+            Peer::paired("cowshed controller", pid),
+            None,
+            recording,
+        );
+        (runtime, server)
+    }
+
+    /// The bound a real-clock silence test waits for the actor's verdict: two silence windows and
+    /// the sampler's bound, so a hang fails the case instead of the leg's backstop.
+    #[cfg(unix)]
+    const SILENCE_VERDICT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// 05_gateway.md "Deadlines": SILENT ends the waits, never the controller. A `cowshed
+    /// controller` exits once its peer closes its end (06_cli.md), so over a real socketpair the
+    /// connection stays open: a stream whose demand failed is closed with a Close demand, a late
+    /// step and a late answer for the abandoned call are read and dropped, and the next call is
+    /// read by the controller on the same connection and answered. The client that closed its
+    /// write half on SILENT fails the Close read with end of stream.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_controller_keeps_its_connection_closes_its_streams_and_answers_the_next_call()
+    {
+        let (runtime, mut server) = actor_pair();
+        let mut stream = runtime
+            .stream("job.processEvents", empty_params())
+            .await
+            .expect("the stream opens");
+        let (_, opened) = read_rpc_request(&mut server).await;
+        let stream_id = opened["id"].as_u64().expect("the stream's id");
+        let (steps, _reported) = mpsc::unbounded_channel();
         let silent = tokio::spawn({
             let runtime = Arc::clone(&runtime);
-            async move { runtime.call("job.status", empty_params()).await }
+            async move {
+                runtime
+                    .call_reporting("job.status", empty_params(), steps)
+                    .await
+            }
         });
         let (_, request) = read_rpc_request(&mut server).await;
         let late = request["id"].as_u64().expect("the silent call's id");
-        let failure = silent
+        let demand = tokio::time::timeout(SILENCE_VERDICT, stream.next())
             .await
+            .expect("the stream's demand fails within the silence bound")
+            .expect("the demand answers");
+        let failure = demand.expect_err("a silent controller's stream demand fails");
+        assert!(
+            failure.message.starts_with("SILENT: "),
+            "{}",
+            failure.message
+        );
+        let failure = tokio::time::timeout(SILENCE_VERDICT, silent)
+            .await
+            .expect("the call fails within the silence bound")
             .expect("the silent call joins")
             .expect_err("a silent controller's call fails");
         assert!(
@@ -3490,70 +3663,121 @@ mod tests {
             "{}",
             failure.message
         );
-        let answer = codec::encode_rpc_success(late, &json!({"late": true}), None).unwrap();
-        write_rpc_frame(&mut server, &answer)
+        let closed = read_rpc_frame(&mut server)
             .await
-            .expect("the controller's end stays open after SILENT");
+            .expect("the controller's end is still read: the client kept the connection");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&closed).unwrap(),
+            json!({"id": stream_id, "demand": "close"}),
+            "the stream whose demand failed SILENT is closed"
+        );
+        let step = codec::encode_rpc_step(
+            late,
+            &StepReport::Started {
+                step: 1,
+                parent: None,
+                scope: "fork".into(),
+                name: "links".into(),
+            },
+        )
+        .unwrap();
+        write_rpc_frame(&mut server, &step).await.unwrap();
+        write_rpc_success(&mut server, late, json!({"late": true}), None).await;
+        write_rpc_success(&mut server, stream_id, json!({}), None).await;
         let next = tokio::spawn({
             let runtime = Arc::clone(&runtime);
             async move { runtime.call("job.status", empty_params()).await }
         });
-        let (_, request) = read_rpc_frame(&mut server)
-            .await
-            .map(|bytes| ((), serde_json::from_slice::<Value>(&bytes).unwrap()))
-            .expect("the next call reaches the controller on the same connection");
+        let (_, request) = read_rpc_request(&mut server).await;
         let id = request["id"].as_u64().expect("the next call's id");
-        assert_ne!(id, late, "the next call is a new call");
-        let answer = codec::encode_rpc_success(id, &json!({"state": "running"}), None).unwrap();
-        write_rpc_frame(&mut server, &answer).await.unwrap();
+        assert!(id > late, "the next call is a new call");
+        write_rpc_success(&mut server, id, json!({"state": "running"}), None).await;
         let answered = next
             .await
             .expect("the next call joins")
-            .expect("the next call is answered, and the late answer before it was dropped");
+            .expect("the next call is answered after the late step and answer were dropped");
         assert_eq!(answered, json!({"state": "running"}));
     }
 
-    /// 05_gateway.md "Deadlines": a controller call that falls SILENT samples the controller it
-    /// waited on, by the pid its hello reported, before the waiting calls fail, and seals the
-    /// `cowshed.wait` span with the sample's path as its typed `wait_stack_sample` column. The
-    /// caller's error names the sample, so the next silence names its stalled call.
+    /// 05_gateway.md "Deadlines": calls that failed SILENT still hold their slots at the
+    /// controller, and a call queued behind them is never sent. A controller that stays silent
+    /// for a second window with every slot held by abandoned calls is lost: the queued call fails
+    /// with a typed error naming the controller, and the connection is closed, so a wedged
+    /// controller never leaves a caller waiting without a bound.
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    async fn a_controller_silent_for_two_windows_with_every_slot_abandoned_is_lost() {
+        let (runtime, mut server) = actor_pair();
+        let mut held = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_REQUESTS {
+            held.push(queued_actor_call(Arc::clone(&runtime), "job.status").await);
+            read_rpc_request(&mut server).await;
+        }
+        for call in held {
+            let failure = tokio::time::timeout(SILENCE_VERDICT, call)
+                .await
+                .expect("each held call fails within the silence bound")
+                .expect_err("a silent controller's call fails");
+            assert!(
+                failure.message.starts_with("SILENT: "),
+                "{}",
+                failure.message
+            );
+        }
+        let queued = tokio::time::timeout(
+            SILENCE_VERDICT,
+            runtime.call("project.list", empty_params()),
+        )
+        .await
+        .expect("a call queued behind abandoned slots is answered within a bound, never held")
+        .expect_err("a call behind a lost controller fails");
+        assert!(
+            queued.message.contains("is lost")
+                && queued.message.contains(&format!("pid {CONTROLLER_PID}")),
+            "{}",
+            queued.message
+        );
+        assert!(
+            read_rpc_frame(&mut server).await.is_err(),
+            "the lost connection is closed, and the queued call was never sent"
+        );
+    }
+
+    /// 05_gateway.md "Deadlines": a controller call that falls SILENT samples the controller it
+    /// waited on, by the pid its hello reported and still the same process, and seals the
+    /// `cowshed.wait` span with the sample's path as its typed `wait_stack_sample` column. The
+    /// caller's error names the sample.
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_silent_controller_call_samples_the_controller_and_seals_its_wait_span() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-silent-controller-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&root).expect("a telemetry root, as the host's exists");
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "silent-controller",
+        );
         let recording = crate::runtime::wait_spans::WaitRecording::new(
-            crate::runtime::wait_spans::WaitSpans::adopting(root.clone(), None),
+            crate::runtime::wait_spans::WaitSpans::adopting(root.to_path_buf(), None),
             |pid| Ok(format!("stacks of {pid}").into_bytes()),
         );
-        let (client, mut server) = tokio::io::duplex(MAX_RPC_BYTES);
-        let (reader, writer) = tokio::io::split(client);
-        let (runtime, _) =
-            spawn_controller_actor(reader, writer, controller(), None, Some(recording));
+        let controller = i32::try_from(std::process::id()).expect("a pid fits i32");
+        let (runtime, mut server) = recorded_actor_pair(controller, Some(recording));
         let call = tokio::spawn({
             let runtime = Arc::clone(&runtime);
             async move { runtime.call("job.status", empty_params()).await }
         });
         let _ = read_rpc_request(&mut server).await;
-        let failure = call
+        let failure = tokio::time::timeout(SILENCE_VERDICT, call)
             .await
+            .expect("the call fails within the silence bound")
             .expect("the silent call joins")
             .expect_err("a silent controller's call fails");
-        let wait = failure
-            .wait_source()
-            .expect("a SILENT controller call carries its wait")
-            .clone();
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             failure.message.contains("cowshed controller stacks: "),
             "{}",
             failure.message
         );
-        let receipt = wait
-            .receipt
+        let receipt = failure
+            .wait_source()
+            .and_then(|wait| wait.receipt.clone())
             .expect("the controller's silence was recorded once");
         assert!(
             receipt.span.is_ok(),
@@ -3564,8 +3788,56 @@ mod tests {
             .sample
             .expect("a silent controller is a stack target");
         assert!(
-            sample.is_ok_and(|path| path.to_string_lossy().ends_with(".sample.txt")),
+            sample
+                .is_ok_and(|path| path.starts_with(&*root)
+                    && path.to_string_lossy().ends_with(".sample.txt")),
             "the controller was sampled into the telemetry root"
+        );
+    }
+
+    /// A controller pid is sampled only while it is the process that answered the hello: one that
+    /// ended since may already be another process of this user, which a sample would suspend.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_controller_whose_process_ended_since_the_handshake_is_not_sampled() {
+        use cowshed_os::fork_lock::Spawn as _;
+        use cowshed_os::test_backstop::ChildBackstop as _;
+
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "ended-controller",
+        );
+        let recording = crate::runtime::wait_spans::WaitRecording::new(
+            crate::runtime::wait_spans::WaitSpans::adopting(root.to_path_buf(), None),
+            |pid| panic!("pid {pid} was sampled after its process ended"),
+        );
+        let mut ended = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn_locked()
+            .expect("a stand-in controller process");
+        let pid = i32::try_from(ended.id()).expect("a pid fits i32");
+        let (runtime, mut server) = recorded_actor_pair(pid, Some(recording));
+        ended.kill().expect("end the stand-in controller");
+        ended.wait_bounded().expect("reap the stand-in controller");
+        let call = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let _ = read_rpc_request(&mut server).await;
+        let failure = tokio::time::timeout(SILENCE_VERDICT, call)
+            .await
+            .expect("the call fails within the silence bound")
+            .expect("the silent call joins")
+            .expect_err("a silent controller's call fails");
+        let sample = failure
+            .wait_source()
+            .and_then(|wait| wait.receipt.clone())
+            .and_then(|receipt| receipt.sample)
+            .expect("the recording names why there is no sample");
+        let refused = sample.expect_err("an ended controller is never sampled");
+        assert!(
+            refused.contains(&format!("pid {pid}")) && refused.contains("since the handshake"),
+            "{refused}"
         );
     }
 

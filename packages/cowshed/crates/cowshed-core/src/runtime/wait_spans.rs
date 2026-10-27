@@ -254,7 +254,18 @@ impl WaitRecording {
     /// naming the sample and carrying the receipt, so a later boundary that sees it records
     /// nothing again. Capture and seal failures never replace the original failure or its exit
     /// code. An error with no expired wait comes back as it was.
-    pub fn record(&self, mut error: crate::CowshedError) -> crate::CowshedError {
+    pub fn record(&self, error: crate::CowshedError) -> crate::CowshedError {
+        self.record_with(error, |_| Ok(()))
+    }
+
+    /// [`Self::record`], sampling a stack target only once `still_ours` confirms its pid is
+    /// still the process the wait was on; its refusal is recorded as the capture failure
+    /// (`wait_stack_error`), and nothing is sampled.
+    pub fn record_with(
+        &self,
+        mut error: crate::CowshedError,
+        still_ours: impl FnOnce(i32) -> std::result::Result<(), String>,
+    ) -> crate::CowshedError {
         let Some(failure) = error.wait_source() else {
             return error;
         };
@@ -263,8 +274,10 @@ impl WaitRecording {
         }
         let mut failure = failure.clone();
         let original_message_len = failure.message.len();
-        self.spans
-            .record(&mut failure, SystemTime::now(), self.capture);
+        let capture = self.capture;
+        self.spans.record(&mut failure, SystemTime::now(), |pid| {
+            still_ours(pid).and_then(|()| capture(pid))
+        });
         if let Some(receipt) = &failure.receipt
             && let Err(reason) = &receipt.span
         {
