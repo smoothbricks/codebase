@@ -20,6 +20,14 @@ import {
 import { nodeLocks } from '../locks-node.js';
 import { outsideTreesTmpdir } from './outside-trees.js';
 
+/**
+ * The compiled modules a real Node imports, resolved through this package's published exports, the one authority
+ * for where the ordinary emit lands. A hand-joined dist path goes stale when the emit moves, and then imports
+ * whatever an older build left behind or nothing at all.
+ */
+export const RETENTION_MODULE_URL = import.meta.resolve('@smoothbricks/cargo-retain');
+export const NODE_LOCKS_MODULE_URL = import.meta.resolve('@smoothbricks/cargo-retain/locks-node');
+
 /** Three days past the newest stamp a fixture build can carry: drops only the recency root. */
 export const DAY3 = 3 * RECENT_USE_MS;
 export const RETENTION_LOCK = '.smoo-cargo-retention.lock';
@@ -592,8 +600,6 @@ export function retainWithoutPerl(
   perl: 'denied' | 'missing',
   env: NodeJS.ProcessEnv,
 ): RetentionRun {
-  const compiled = join(import.meta.dir, '..', '..', 'dist', 'cargo-retention.js');
-  const locksCompiled = join(import.meta.dir, '..', '..', 'dist', 'locks-node.js');
   const source = lines(
     'import cp from "node:child_process";',
     'import { syncBuiltinESMExports } from "node:module";',
@@ -605,8 +611,8 @@ export function retainWithoutPerl(
     '  return spawn.call(this, command, ...args);',
     '};',
     'syncBuiltinESMExports();',
-    `const { retainCargoWorkspace } = await import(${JSON.stringify(compiled)});`,
-    `const { nodeLocks } = await import(${JSON.stringify(locksCompiled)});`,
+    `const { retainCargoWorkspace } = await import(${JSON.stringify(RETENTION_MODULE_URL)});`,
+    `const { nodeLocks } = await import(${JSON.stringify(NODE_LOCKS_MODULE_URL)});`,
     'Object.defineProperty(process, "platform", { value: "linux" });',
     `const result = await retainCargoWorkspace(${JSON.stringify(workspace)}, { apply: process.argv[2] === "apply", now: ${future()} }, nodeLocks);`,
     'console.log(JSON.stringify(result));',

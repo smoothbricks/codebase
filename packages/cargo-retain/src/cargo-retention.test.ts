@@ -48,6 +48,7 @@ import {
   lines,
   metasOf,
   midAndApp,
+  NODE_LOCKS_MODULE_URL,
   nestedOf,
   nestedPlanned,
   only,
@@ -58,6 +59,7 @@ import {
   procMacroFixture,
   put,
   RETENTION_LOCK,
+  RETENTION_MODULE_URL,
   type RetentionRun,
   reclaimPaths,
   refused,
@@ -482,8 +484,6 @@ async function noOpPassReadsFingerprintsOnce(fx: Churn): Promise<void> {
   const check = labelled('a no-op pass reads current fingerprints once without async dispatch or duplicate type stats');
   await clearReceipt(fx.target);
   planned(await retain(fx.ws, { apply: true, now: future() }));
-  const module = join(import.meta.dir, '..', 'dist', 'ts', 'cargo-retention.js');
-  const locksModule = join(import.meta.dir, '..', 'dist', 'ts', 'locks-node.js');
   const source = lines(
     'import fs from "node:fs";',
     'import promises from "node:fs/promises";',
@@ -508,8 +508,8 @@ async function noOpPassReadsFingerprintsOnce(fx: Churn): Promise<void> {
     '  };',
     '}',
     'syncBuiltinESMExports();',
-    `const { retainCargoWorkspace } = await import(${JSON.stringify(module)});`,
-    `const { nodeLocks } = await import(${JSON.stringify(locksModule)});`,
+    `const { retainCargoWorkspace } = await import(${JSON.stringify(RETENTION_MODULE_URL)});`,
+    `const { nodeLocks } = await import(${JSON.stringify(NODE_LOCKS_MODULE_URL)});`,
     `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: process.argv[1] === 'automatic', automatic: process.argv[1] === 'automatic', now: ${future()} }, nodeLocks);`,
     'if (!result.ok) throw new Error(JSON.stringify(result.error));',
     'console.log(JSON.stringify({ report: result.value, reads, stats, asyncFingerprintCalls, children }));',
@@ -653,8 +653,6 @@ async function reclaimsOnlyProvenTrash(fx: Churn, superseded: readonly string[])
   await rename(mismatchedVictim, join(passDir, '1'));
   await put(join(passDir, '2', 'sentinel.txt'), 'unlisted\n');
   await put(join(trash, 'stray.txt'), 'stray\n');
-  const module = join(import.meta.dir, '..', 'dist', 'ts', 'cargo-retention.js');
-  const locksModule = join(import.meta.dir, '..', 'dist', 'ts', 'locks-node.js');
   const source = lines(
     'import fs from "node:fs";',
     'import promises from "node:fs/promises";',
@@ -672,8 +670,8 @@ async function reclaimsOnlyProvenTrash(fx: Churn, superseded: readonly string[])
     '}',
     'syncBuiltinESMExports();',
     // Install forwarding counters before loading the product; a static import runs too early.
-    `const { retainCargoWorkspace } = await import(${JSON.stringify(module)});`,
-    `const { nodeLocks } = await import(${JSON.stringify(locksModule)});`,
+    `const { retainCargoWorkspace } = await import(${JSON.stringify(RETENTION_MODULE_URL)});`,
+    `const { nodeLocks } = await import(${JSON.stringify(NODE_LOCKS_MODULE_URL)});`,
     `const result = await retainCargoWorkspace(${JSON.stringify(fx.ws)}, { apply: true, now: ${future()} }, nodeLocks);`,
     'if (!result.ok) throw new Error(JSON.stringify(result.error));',
     'console.log(JSON.stringify({ report: result.value, nativeTrees, asyncFiles }));',
