@@ -582,7 +582,7 @@ pub(in crate::storage) fn sync_parent_path(path: &Path) -> Result<(), ApfsStorag
         .parent()
         .ok_or(ApfsStorageError::InvalidPlan("image path has no parent"))?;
     fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
+        .and_then(|directory| cowshed_os::fsio::sync_held_directory(&directory))
         .map_err(|error| io_error("sync image directory", parent, error))
 }
 
@@ -1862,7 +1862,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         };
         crate::metadata::write_json(&tombstone, &record)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        sync_parent_path(&tombstone)?;
         if fs::symlink_metadata(companion).is_ok() {
             let name = companion.file_name().ok_or(ApfsStorageError::InvalidPlan(
                 "quarantined CA companion path has no file name",

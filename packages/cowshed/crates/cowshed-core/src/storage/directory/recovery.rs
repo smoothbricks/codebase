@@ -340,7 +340,6 @@ impl DirectoryExecutionHost {
             sidecar: quarantined_sidecar.display().to_string(),
         };
         crate::metadata::write_json(&tombstone, &record).map_err(host_error)?;
-        sync_parent_path(&tombstone)?;
         if path_exists(companion)? {
             let name = companion.file_name().ok_or(ApfsStorageError::InvalidPlan(
                 "quarantined CA companion path has no file name",

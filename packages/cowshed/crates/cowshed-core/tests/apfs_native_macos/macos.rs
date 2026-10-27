@@ -7261,8 +7261,14 @@ fn quarantine_keyless_canonical_sidecar_leaves_image_and_spares_healthy_sibling(
     assert!(!ca_key_path(keyless_canonical.image()).exists());
 
     let host = native_host(&fixture, RecordingRunner::default());
+    cowshed_os::fsio::take_syncs();
     host.recover_pending(&fixture.config(), &[])
         .expect("a keyless canonical must quarantine, not abort the pass");
+    assert_eq!(
+        cowshed_os::fsio::take_syncs(),
+        cowshed_os::fsio::Syncs { fsync: 0, full: 3 },
+        "one new quarantine-parent barrier and the JSON publisher's file/parent barriers"
+    );
 
     assert!(
         keyless_canonical.image().exists(),

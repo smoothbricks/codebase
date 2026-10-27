@@ -1165,6 +1165,8 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, MetadataError> {
     })
 }
 
+/// Atomically publishes private JSON and power-loss flushes both the file and its parent.
+/// Until a caller mutates that namespace, a second parent barrier adds no durability.
 pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), MetadataError> {
     publish(path, |writer| {
         serde_json::to_writer_pretty(&mut *writer, value).map_err(|source| {
