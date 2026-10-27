@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
+import { expandOutputs } from 'nx/src/native';
 import {
   BuildStateOutputError,
   type DeclaredOutput,
+  existingOutputFiles,
   OutputDeclarationError,
+  OutputEscapeError,
   OutputKindError,
   OutputOverlapError,
   refuseMisdeclaredOutputKinds,
@@ -537,6 +540,156 @@ describe('each literal output declares the kind the built tree holds', () => {
         expect(both.findings.map(({ output, kind }) => [output, kind])).toEqual([['packages/app/dist', 'file']]);
       }
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('every existing file a task output names', () => {
+  it('lists each regular file once across every task, never through a link, and drops what is absent', () => {
+    const root = mkdtempSync(join(tmpdir(), 'output-files-'));
+    const foreign = mkdtempSync(join(tmpdir(), 'output-foreign-'));
+    try {
+      for (const file of [
+        'README.md',
+        '.config/guide.md',
+        'packages/app/src/index.ts',
+        'packages/app/notes.md',
+        'packages/app/dist/main.js',
+        'packages/app/dist/.build.tsbuildinfo',
+        'packages/app/dist/nested/chunk.js',
+        'packages/app/out/dev/bundle.js',
+        'packages/app/out/prod/bundle.js',
+        'packages/app/serve/dev/index.html',
+        'packages/app/serve/prod/index.html',
+        'packages/types/lib/a.js',
+        'packages/types/lib/.hidden.js',
+        'packages/types/lib/internal/x.js',
+        'packages/types/lib/internal/y.js',
+        'packages/gen/generated/schema.ts',
+        'packages/legacy/build/index.js',
+      ]) {
+        mkdirSync(dirname(join(root, file)), { recursive: true });
+        writeFileSync(join(root, file), '');
+      }
+      writeFileSync(join(foreign, 'outside.md'), '');
+      writeFileSync(join(foreign, 'outside.js'), '');
+      // A link inside an output, a link that is an output's file, and a project root reached through a link.
+      symlinkSync(foreign, join(root, 'packages/app/dist/linked'));
+      symlinkSync(join(foreign, 'outside.js'), join(root, 'packages/app/dist/file-link.js'));
+      symlinkSync(join(root, 'packages/app'), join(root, 'packages/alias'));
+      const graph = projects({
+        workspace: { root: '.', targets: { docs: run(['{workspaceRoot}/**/*.md']) } },
+        app: {
+          root: 'packages/app',
+          targets: {
+            build: run(['{projectRoot}/dist/']),
+            // Two configurations declaring one directory list its files once.
+            bundle: writesTo(
+              { out: 'packages/app/out/dev' },
+              { production: { out: 'packages/app/out/prod' }, ci: { out: 'packages/app/out/prod' } },
+            ),
+            // A run naming no configuration is production, so the options' own directory is no task's output.
+            serve: run(['{options.out}/'], {
+              defaultConfiguration: 'production',
+              options: { command: 'true', out: 'packages/app/serve/dev' },
+              configurations: { production: { out: 'packages/app/serve/prod' } },
+            }),
+            later: run(['{projectRoot}/later/', '{projectRoot}/dist/main.js/inner']),
+          },
+        },
+        alias: { root: 'packages/alias', targets: { build: run(['{projectRoot}/dist/']) } },
+        types: {
+          root: 'packages/types',
+          targets: {
+            // The negation drops only this task's matches: another task still claims internal/x.js.
+            tsc: run(['{projectRoot}/lib/**/*.js', '!{projectRoot}/lib/internal/**']),
+            internal: run(['{projectRoot}/lib/internal/x.js']),
+          },
+        },
+        // No check selects a generator; its outputPath fallback is still an output.
+        gen: {
+          root: 'packages/gen',
+          targets: {
+            codegen: {
+              executor: 'nx:run-commands',
+              options: { command: 'true', outputPath: 'packages/gen/generated' },
+            },
+          },
+        },
+        legacy: {
+          root: 'packages/legacy',
+          targets: { build: { executor: 'nx:run-commands', options: { command: 'true' } } },
+        },
+      });
+      expect(existingOutputFiles(graph, root, expandOutputs)).toEqual([
+        '.config/guide.md',
+        'README.md',
+        'packages/app/dist/.build.tsbuildinfo',
+        'packages/app/dist/main.js',
+        'packages/app/dist/nested/chunk.js',
+        'packages/app/notes.md',
+        'packages/app/out/dev/bundle.js',
+        'packages/app/out/prod/bundle.js',
+        'packages/app/serve/prod/index.html',
+        'packages/gen/generated/schema.ts',
+        'packages/legacy/build/index.js',
+        'packages/types/lib/.hidden.js',
+        'packages/types/lib/a.js',
+        'packages/types/lib/internal/x.js',
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(foreign, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses outputs naming the workspace root or a path outside it, naming each task', () => {
+    let refusal: unknown;
+    try {
+      existingOutputFiles(
+        projects({
+          app: {
+            root: 'packages/app',
+            targets: {
+              whole: run(['{workspaceRoot}']),
+              parent: run(['{projectRoot}/../../../outside']),
+              absolute: run(['/elsewhere/dist/']),
+              inside: run(['{projectRoot}/dist/']),
+            },
+          },
+        }),
+        workspaceRoot,
+        expandOutputs,
+      );
+    } catch (error) {
+      refusal = error;
+    }
+    if (!(refusal instanceof OutputEscapeError))
+      throw new Error(`expected an OutputEscapeError, got ${String(refusal)}`);
+    expect(refusal.findings.map(({ target, output }) => [target, output])).toEqual([
+      ['whole', '/checkout'],
+      ['parent', '../outside'],
+      ['absolute', '/elsewhere/dist/'],
+    ]);
+    expect(refusal.message).toContain('app:parent: "../outside"');
+  });
+
+  it('throws an unreadable directory under a literal directory output rather than listing less', () => {
+    const root = mkdtempSync(join(tmpdir(), 'output-unreadable-'));
+    const sealed = join(root, 'packages/app/dist/sealed');
+    mkdirSync(sealed, { recursive: true });
+    chmodSync(sealed, 0o000);
+    try {
+      expect(() =>
+        existingOutputFiles(
+          projects({ app: { root: 'packages/app', targets: { build: run(['{projectRoot}/dist/']) } } }),
+          root,
+          expandOutputs,
+        ),
+      ).toThrow(/readdir "packages\/app\/dist\/sealed".*EACCES/);
+    } finally {
+      chmodSync(sealed, 0o755);
       rmSync(root, { recursive: true, force: true });
     }
   });

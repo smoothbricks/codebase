@@ -924,6 +924,19 @@ declared a file that is a directory on disk, or declared a directory that is a f
 output absent on disk is not judged, and patterns state no kind. The overlap policy reads only the declarations, so its
 verdict is the same in every checkout.
 
+`existingOutputFiles(graph, workspaceRoot, expandOutputs)` lists every existing regular file that a task's declared
+outputs name, for every target and configuration of the resolved graph, fallback outputs included, whether or not a run
+selected the task. Each task's outputs are expanded on their own with stock Nx's `expandOutputs`, the native expansion
+Nx's cache uses, so one task's negation never drops another task's claim. An expanded directory contributes every
+regular file beneath it, read without descending a symbolic link at, above or below it; symbolic links and other
+non-regular entries are not listed, and an absent output contributes nothing. A read failure other than absence while
+listing such a directory throws, naming the operation and the path, so an unreadable directory under a literal directory
+output does not pass for an absent one. Stock expansion silently drops entries it cannot read while matching a glob;
+that is Nx's behaviour, and it is accepted here. An output naming the workspace root or a path outside it raises
+`OutputEscapeError` naming every such task, before any disk access. A land enumerates these files before it freezes the
+target's seed (cowshed `source_paths.js`). An undeclared generated build input is outside this contract: only a
+generated input some task declares as an Nx output is listed, and so carried.
+
 ## Test Walk Policy
 
 A test pays its setup once and asserts after each step; two cases that test one path are one test. Consuming

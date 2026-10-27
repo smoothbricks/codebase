@@ -1674,6 +1674,9 @@ pub struct CheckedRun {
 /// The cache-only helper never executes a task, including on a missing or uncacheable result.
 pub const RESTORE_OUTPUTS_SCRIPT: &str = include_str!("restore_outputs.js");
 
+/// Enumerate every declared output file, including targets the landing check did not select.
+pub const SOURCE_PATHS_SCRIPT: &str = include_str!("source_paths.js");
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoredOutputs {
@@ -2567,6 +2570,67 @@ mod tests {
         super::super::link::point(&stock.checkout, &linked.from).unwrap();
         assert_eq!(events.next(), libc::EVFILT_PROC);
         assert!(!cowshed_os::process::running(daemon).unwrap());
+    }
+
+    /// Land 5.3's output enumeration (16_build_volumes.md): a root whose package graph resolves no
+    /// `@smoothbricks/nx-plugin` answers `null`, no policy naming its outputs, and a plugin that is
+    /// there but cannot answer — its policy module missing — is a failure, never read as absent.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_paths_answer_null_only_for_a_root_without_the_plugin() {
+        use std::io::Write as _;
+
+        let root =
+            crate::scratch_directory::ScratchRoot::new("nx-source-paths").expect("scratch root");
+        let stock = StockNx::new(root.path());
+        // The helper as the land runs it: `node -` with the program on stdin, in its own process
+        // (no daemon), without the caller's `NX_*` or `CI`.
+        let enumerate = || {
+            let mut node = std::process::Command::new("node");
+            node.args(["-", stock.checkout.to_str().expect("a UTF-8 checkout")])
+                .current_dir(&stock.checkout)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("NX_") || key == "CI" {
+                    node.env_remove(key);
+                }
+            }
+            node.env("NX_DAEMON", "false");
+            let mut child = node.spawn_locked().expect("node runs");
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(SOURCE_PATHS_SCRIPT.as_bytes())
+                .unwrap();
+            child.wait_with_output_bounded().expect("the helper ends")
+        };
+
+        let absent = enumerate();
+        assert!(
+            absent.status.success(),
+            "{}",
+            String::from_utf8_lossy(&absent.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&absent.stdout), "null\n");
+
+        let plugin = stock.checkout.join("node_modules/@smoothbricks/nx-plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join("package.json"),
+            r#"{"name":"@smoothbricks/nx-plugin","exports":{"./package.json":"./package.json","./build-state-output-policy":"./missing.js"}}"#,
+        )
+        .unwrap();
+        let broken = enumerate();
+        assert!(!broken.status.success(), "a broken plugin read as absent");
+        assert!(broken.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&broken.stderr).contains("missing.js"),
+            "{}",
+            String::from_utf8_lossy(&broken.stderr)
+        );
     }
 
     /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the

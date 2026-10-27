@@ -693,11 +693,17 @@ impl AnchoredDirectory {
         }
     }
 
-    /// The bytes of `name` when it is a regular file; `None` when it is absent or anything else
-    /// (a link, a directory, a FIFO), which publication then replaces.
-    fn read_regular_file(&self, name: &CStr) -> io::Result<Option<Vec<u8>>> {
-        // SAFETY: the held directory fd and NUL-terminated leaf outlive the call. NONBLOCK keeps a
-        // FIFO planted at `name` from stalling the open; it is rejected as not regular below.
+    /// Open a regular leaf beneath this held directory without following a symbolic link.
+    /// Missing and non-regular entries return None; other filesystem failures are preserved.
+    pub fn open_regular_file(&self, name: &CStr) -> io::Result<Option<File>> {
+        let Some(metadata) = self.stat_child(name)? else {
+            return Ok(None);
+        };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Ok(None);
+        }
+        // SAFETY: the held directory fd and validated NUL-terminated leaf outlive the call.
+        // NONBLOCK prevents a substituted FIFO from stalling before the regular-file check.
         let fd = unsafe {
             libc::openat(
                 self.0.as_raw_fd(),
@@ -708,15 +714,24 @@ impl AnchoredDirectory {
         if fd < 0 {
             let error = io::Error::last_os_error();
             return match error.raw_os_error() {
-                Some(libc::ENOENT | libc::ELOOP) => Ok(None),
+                Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR) => Ok(None),
                 _ => Err(error),
             };
         }
         // SAFETY: a successful openat returned a new owned file descriptor.
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        if !file.metadata()?.is_file() {
-            return Ok(None);
+        let file = unsafe { File::from_raw_fd(fd) };
+        if file.metadata()?.is_file() {
+            Ok(Some(file))
+        } else {
+            Ok(None)
         }
+    }
+
+    /// The bytes of a regular leaf, or None when publication must replace the entry.
+    fn read_regular_file(&self, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+        let Some(mut file) = self.open_regular_file(name)? else {
+            return Ok(None);
+        };
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut file, &mut bytes)?;
         Ok(Some(bytes))
@@ -1354,6 +1369,53 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(seen, 1, "each descriptor listing starts at its own offset");
+        }
+    }
+
+    #[test]
+    fn open_regular_file_skips_missing_and_nonregular_leaves() {
+        let scratch = TempRoot::new_in(&canonical_parent(), "fsio-open-regular");
+        let directory = AnchoredDirectory::open(&scratch).unwrap();
+        fs::write(scratch.join("regular"), b"regular bytes").unwrap();
+        fs::create_dir(scratch.join("directory")).unwrap();
+        std::os::unix::fs::symlink(scratch.join("regular"), scratch.join("link")).unwrap();
+        let fifo = CString::new(scratch.join("fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the owned scratch pathname is NUL-terminated and lives through mkfifo.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        for name in [c"missing", c"directory", c"link", c"fifo"] {
+            assert!(
+                directory.open_regular_file(name).unwrap().is_none(),
+                "{name:?}"
+            );
+        }
+        let mut file = directory.open_regular_file(c"regular").unwrap().unwrap();
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        assert_eq!(bytes, b"regular bytes");
+    }
+
+    #[test]
+    fn open_regular_file_retains_its_parent_and_refuses_path_components() {
+        let scratch = TempRoot::new_in(&canonical_parent(), "fsio-open-held");
+        let parent = scratch.join("parent");
+        let held = AnchoredDirectory::create(&parent).unwrap();
+        fs::write(parent.join("entry"), b"held bytes").unwrap();
+        let foreign = scratch.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("entry"), b"foreign bytes").unwrap();
+        fs::rename(&parent, scratch.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&foreign, &parent).unwrap();
+        let mut file = held.open_regular_file(c"entry").unwrap().unwrap();
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        assert_eq!(bytes, b"held bytes");
+        assert_eq!(fs::read(foreign.join("entry")).unwrap(), b"foreign bytes");
+        for name in [c"", c".", c"..", c"../foreign/entry", c"/entry"] {
+            assert_eq!(
+                held.open_regular_file(name).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{name:?}"
+            );
         }
     }
 

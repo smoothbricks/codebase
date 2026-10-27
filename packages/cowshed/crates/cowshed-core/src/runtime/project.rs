@@ -5816,6 +5816,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         into: &NativeLandingInto,
         checks: &CheckedLandChecks,
         retire: bool,
+        source_paths: Option<crate::runtime::build_volumes::SourcePaths>,
     ) -> Result<crate::api::dto::LandBuildVolume> {
         use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
         let workspace = &landing_owner.name;
@@ -5831,6 +5832,19 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         if volumes.layout.linked(&into.mount)?.is_none() {
             return Ok(skipped(AdoptionSkip::NoTargetVolume));
         }
+
+        let source_paths = match source_paths {
+            Some(paths) => paths,
+            // Linked after the land enumerated them before its fast-forward: enumerate now.
+            None => {
+                timed_async(
+                    "land",
+                    "source-paths",
+                    self.land_source_paths(workspace, landing),
+                )
+                .await?
+            }
+        };
         // Step 4, controller-owned (16_build_volumes.md, Land 4). Each landing Nx daemon's plan is
         // read from the trusted ledger before the supervisor retires: the record only nominates a
         // pid, and only a ledger-proven process of the job is ever signalled. The sandbox is taken
@@ -5994,6 +6008,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 timed_async("land", "target-lock", contended.wait()).await?
             }
         };
+        timed_async(
+            "land",
+            "source-mtimes",
+            volumes.harmonize_source_mtimes(
+                &locked,
+                landing.to_owned(),
+                into.mount.clone(),
+                source_paths,
+            ),
+        )
+        .await?;
         // A busy seal keeps the previous seed and the adoption still runs: the seal fences only
         // the captured bytes, and the restored volume is as quiet for the target as before. The
         // seeds a freeze replaced are claimed under the lock and retired once it is let go.
@@ -6551,6 +6576,107 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             });
         }
         Ok(peers)
+    }
+
+    /// Enumerate the tracked inputs and every declared Nx output before quiescing the landing.
+    /// The result lives only for this land; the index and resolved graph remain its authorities.
+    async fn land_source_paths(
+        &mut self,
+        workspace: &WorkspaceName,
+        landing: &Path,
+    ) -> Result<crate::runtime::build_volumes::SourcePaths> {
+        let git = crate::git::GitRepository::from_root(self.git.store_root(), landing);
+        let mut paths = crate::runtime::build_volumes::SourcePaths {
+            tracked: git.tracked_paths().await?,
+            outputs: Vec::new(),
+        };
+        let state = crate::build_volume::BuildVolumeState::read(
+            &landing.join(crate::build_volume::BUILD_LINK),
+        )?;
+        let mut roots = state.nx_project_roots().peekable();
+        if roots.peek().is_some() {
+            let (handle, build_volume) = self.admit_build_state(workspace).await?;
+            for relative_root in roots {
+                let root = landing.join(relative_root);
+                let request = ExecRequest {
+                    command: crate::api::dto::ExecCommand::Argv(vec![
+                        "node".into(),
+                        "-".into(),
+                        root.as_os_str().to_owned().into(),
+                    ]),
+                    cwd: None,
+                    mode: RunSandboxMode::ReadOnly,
+                    env: std::collections::HashMap::new(),
+                    trace: None,
+                    stdin: StdinSource::Inline(bytes::Bytes::from_static(
+                        crate::build_volume::nx::SOURCE_PATHS_SCRIPT.as_bytes(),
+                    )),
+                    stdout_copy: None,
+                    stderr_copy: None,
+                    admission_key: None,
+                    class: crate::api::dto::ExecClass::Background,
+                    want: Some(std::num::NonZeroUsize::MIN),
+                    scope: crate::api::dto::ExecScope::Workspace,
+                };
+                let job = handle
+                    .exec(
+                        None,
+                        build_volume.clone(),
+                        request,
+                        AdmissionSource::Coordinator,
+                    )
+                    .await?;
+                let info = handle.wait(job).await?;
+                if !matches!(
+                    info.exit,
+                    Some(crate::api::dto::ExitStatus::Exited { code: 0 })
+                ) {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "cannot enumerate declared source outputs at {}: helper ended {:?}: {}",
+                            root.display(),
+                            info.exit,
+                            read_job_stderr_tail(&handle, job).await,
+                        ),
+                        "repair the named Nx graph failure before publishing its build volume",
+                    ));
+                }
+                let stdout = read_job_stdout(&handle, job).await.map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot read the declared source-output paths the helper wrote for {}: {error}",
+                            root.display(),
+                        ),
+                        "repair the named job-output failure before publishing its build volume",
+                    )
+                })?;
+                let outputs: Option<Vec<PathBuf>> =
+                    serde_json::from_slice(&stdout).map_err(|error| {
+                        CowshedError::integrity(
+                            format!(
+                                "invalid declared source-output paths from {}: {error}",
+                                root.display(),
+                            ),
+                            "the source graph helper must return a JSON array of relative paths, \
+                             or null for a root without @smoothbricks/nx-plugin",
+                        )
+                    })?;
+                // A root whose package graph resolves no @smoothbricks/nx-plugin has no policy
+                // naming its declared outputs (Land 5.3): its tracked files are reconciled alone.
+                let Some(outputs) = outputs else {
+                    cowshed_os::eprintln!(
+                        "cowshed: {} resolves no @smoothbricks/nx-plugin, so no policy names its \
+                         declared outputs: the land reconciles its tracked files only",
+                        root.display()
+                    );
+                    continue;
+                };
+                paths
+                    .outputs
+                    .extend(outputs.into_iter().map(|path| relative_root.join(path)));
+            }
+        }
+        Ok(paths)
     }
 
     /// Land step 7: restore only the captured Nx runs, without a task runner or check shell.
@@ -16047,6 +16173,29 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 landing
             }
         };
+        // Land 5.3's paths, enumerated while the target has not moved (16_build_volumes.md, Land
+        // 5.3): a graph or plugin that cannot name them refuses the land here, never after the
+        // fast-forward. The landing head is fenced, so this is the answer the adoption reads.
+        let source_paths = match plan {
+            LandPlan::Gated => {
+                let volumes = self.build_volumes()?;
+                if volumes.layout.linked(&source_mount)?.is_some()
+                    && volumes.layout.linked(&into.mount)?.is_some()
+                {
+                    Some(
+                        timed_async(
+                            "land",
+                            "source-paths",
+                            self.land_source_paths(&workspace, &source_mount),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                }
+            }
+            LandPlan::Ungated => None,
+        };
         // The ref fence (02_workspaces.md "`cowshed land`" step 3). The caller's ref lock or ref
         // turn (land_plan admits one at most), when it names one, is held from re-reading the
         // target head through the fast-forward and for nothing else: the checks before it and the
@@ -16127,6 +16276,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     &into,
                     &checked,
                     retire,
+                    source_paths,
                 ),
             )
             .await

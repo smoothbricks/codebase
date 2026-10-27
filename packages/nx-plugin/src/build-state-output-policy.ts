@@ -1,8 +1,9 @@
-import { statSync } from 'node:fs';
+import { type Dirent, lstatSync, readdirSync, statSync } from 'node:fs';
 import { posix } from 'node:path';
 import { Minimatch } from 'minimatch';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
+import type { expandOutputs } from 'nx/src/native';
 import { getOutputsForTargetAndConfiguration, interpolate } from 'nx/src/tasks-runner/utils';
 
 /** The read-only path records returned by `cowshed build-state --json`. */
@@ -114,6 +115,18 @@ export class OutputKindError extends Error {
         .join('\n')}`,
     );
     this.name = 'OutputKindError';
+  }
+}
+
+/** Task outputs naming the workspace root itself or a path outside it: no file of the checkout is theirs to name. */
+export class OutputEscapeError extends Error {
+  constructor(readonly findings: readonly DeclaredOutput[]) {
+    super(
+      `Each Nx output names a path inside its workspace, below the root; these do not:\n${findings
+        .map((finding) => `  ${taskName(finding)}: ${JSON.stringify(finding.output)}`)
+        .join('\n')}`,
+    );
+    this.name = 'OutputEscapeError';
   }
 }
 
@@ -367,4 +380,135 @@ export function refuseMisdeclaredOutputKinds(graph: ProjectGraph, workspaceRoot:
     if (onDisk !== 'absent' && onDisk !== claim.declared.kind) findings.push({ ...claim.declared, onDisk });
   }
   if (findings.length) throw new OutputKindError(findings);
+}
+
+/** What a path itself is, read as written: a symbolic link is `other`, never what it points at. */
+type EntryKind = OutputKind | 'other' | 'absent';
+
+/** A path that is gone, or that runs through a file: what an output not written yet reads as. */
+function isAbsent(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
+}
+
+/** The failure a read under `existingOutputFiles` raises: the operation and the workspace-relative path it read. */
+function readError(operation: string, relative: string, cause: unknown): Error {
+  return new Error(
+    `existingOutputFiles: ${operation} ${JSON.stringify(relative)} failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+    { cause },
+  );
+}
+
+/** What the workspace-relative path itself is under `root`, without following a link at it. */
+function entryKind(root: string, relative: string): EntryKind {
+  try {
+    const stats = lstatSync(posix.join(root, relative), { throwIfNoEntry: false });
+    return stats === undefined ? 'absent' : stats.isDirectory() ? 'directory' : stats.isFile() ? 'file' : 'other';
+  } catch (error) {
+    if (isAbsent(error)) return 'absent';
+    throw readError('lstat', relative, error);
+  }
+}
+
+/** The entries of the directory at the workspace-relative path, each read as written; none once it is gone. */
+function directoryEntries(root: string, relative: string): Dirent[] {
+  try {
+    return readdirSync(posix.join(root, relative), { withFileTypes: true });
+  } catch (error) {
+    if (isAbsent(error)) return [];
+    throw readError('readdir', relative, error);
+  }
+}
+
+/**
+ * An output as stock Nx's expansion reads it: relative to `root`, a negation keeping its `!`. `undefined` when the
+ * output names `root` itself or a path outside it.
+ */
+function outputEntry(output: string, root: string): string | undefined {
+  const negated = output.startsWith('!');
+  const relative = posix.relative(root, posix.resolve(root, negated ? output.slice(1) : output));
+  if (relative === '' || relative === '..' || relative.startsWith('../')) return undefined;
+  return negated ? `!${relative}` : relative;
+}
+
+/**
+ * Whether some ancestor of `relative` below `root` is not a directory as written, a symbolic link above all: a path
+ * reached only through one is never listed under that spelling.
+ */
+function throughNonDirectory(root: string, relative: string): boolean {
+  const parts = relative.split('/');
+  let ancestor = '';
+  for (const [index, part] of parts.entries()) {
+    if (index === parts.length - 1) break;
+    ancestor = ancestor === '' ? part : `${ancestor}/${part}`;
+    if (entryKind(root, ancestor) !== 'directory') return true;
+  }
+  return false;
+}
+
+/** Add every regular file beneath the directory `relative` to `files`, never descending a symbolic link. */
+function collectDirectory(root: string, relative: string, files: Set<string>): void {
+  for (const entry of directoryEntries(root, relative)) {
+    const child = `${relative}/${entry.name}`;
+    if (entry.isFile()) files.add(child);
+    else if (entry.isDirectory()) collectDirectory(root, child, files);
+  }
+}
+
+/**
+ * Add what one path stock Nx's expansion returned contributes to `files`: a regular file itself, every regular file
+ * beneath a directory, and nothing for a symbolic link, any other kind, an absent path, or a path reached through a
+ * link above it.
+ */
+function collectExpanded(root: string, relative: string, files: Set<string>): void {
+  if (throughNonDirectory(root, relative)) return;
+  const kind = entryKind(root, relative);
+  if (kind === 'file') files.add(relative);
+  else if (kind === 'directory') collectDirectory(root, relative, files);
+}
+
+/**
+ * Every regular file the resolved graph's outputs name under `workspaceRoot`, workspace-relative, sorted and once each.
+ * Every task counts, whether or not a run selected it: each target under each configuration it runs under, Nx's
+ * fallback outputs of a target declaring none included (`declaredOutputs`).
+ *
+ * Each task's outputs are expanded on their own with stock Nx's `expandOutputs` (`expand`, from the caller's workspace Nx), the native expansion Nx's cache uses,
+ * so a task's negation drops only its own matches, never a path another task claims. An expanded regular file is
+ * listed; an expanded directory contributes every regular file beneath it, read without descending a symbolic link at,
+ * above or below it; a symbolic link or other entry is skipped, and an absent path contributes nothing. Any other
+ * read failure throws, naming the operation and the workspace-relative path, so an unreadable directory beneath a
+ * literal directory output is refused rather than passed over. Stock expansion silently drops entries it cannot read
+ * while matching a glob; that is Nx's behaviour, and it is accepted here. An undeclared generated build input is
+ * outside this contract: only a file some task's declared output names is listed. An output naming the workspace root
+ * or a path outside it throws an `OutputEscapeError` naming every such task, before any disk access.
+ */
+export function existingOutputFiles(
+  graph: ProjectGraph,
+  workspaceRoot: string,
+  expand: typeof expandOutputs,
+): string[] {
+  const root = absoluteRoot(workspaceRoot);
+  const tasks = new Map<string, string[]>();
+  const escapes: DeclaredOutput[] = [];
+  for (const declared of declaredOutputs(graph, root)) {
+    const entry = outputEntry(declared.output, root);
+    if (entry === undefined) {
+      escapes.push(declared);
+      continue;
+    }
+    const task = JSON.stringify([declared.project, declared.target, declared.configuration]);
+    const entries = tasks.get(task);
+    if (entries) entries.push(entry);
+    else tasks.set(task, [entry]);
+  }
+  if (escapes.length) throw new OutputEscapeError(escapes);
+  const files = new Set<string>();
+  const collected = new Set<string>();
+  for (const entries of tasks.values()) {
+    for (const expanded of expand(root, entries)) {
+      if (collected.has(expanded)) continue;
+      collected.add(expanded);
+      collectExpanded(root, expanded, files);
+    }
+  }
+  return [...files].sort();
 }

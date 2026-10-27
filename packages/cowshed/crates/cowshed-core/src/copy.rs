@@ -476,6 +476,75 @@ fn run_bytes<'a>(
     }
 }
 
+/// Scratch space reused across a pass comparing many files. Empty until content is compared.
+#[derive(Debug, Default)]
+pub(crate) struct FileComparison {
+    source: Vec<u8>,
+    destination: Vec<u8>,
+}
+
+impl FileComparison {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Compare `length` logical bytes positionally. Callers match lengths and recheck identities.
+    /// Its one caller, the land's source-mtime harmonization, runs on macOS.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn equal(
+        &mut self,
+        source: &fs::File,
+        destination: &fs::File,
+        length: u64,
+    ) -> io::Result<bool> {
+        self.visit_equal(source, destination, length, |_| {})
+    }
+
+    fn visit_equal(
+        &mut self,
+        source: &fs::File,
+        destination: &fs::File,
+        length: u64,
+        mut visit: impl FnMut(&[u8]),
+    ) -> io::Result<bool> {
+        use std::os::unix::fs::FileExt as _;
+        if length != 0 {
+            self.source.resize(COMPARE_CHUNK_BYTES, 0);
+            self.destination.resize(COMPARE_CHUNK_BYTES, 0);
+        }
+        for run in Runs::new(source, destination, length)? {
+            let run = run?;
+            let mut position = run.start;
+            while position < run.end {
+                let count = usize::try_from(run.end - position)
+                    .map_or(COMPARE_CHUNK_BYTES, |rest| rest.min(COMPARE_CHUNK_BYTES));
+                let held = run_bytes(source, run.source, &mut self.source[..count], position)?;
+                let copied = run_bytes(
+                    destination,
+                    run.destination,
+                    &mut self.destination[..count],
+                    position,
+                )?;
+                if held != copied {
+                    return Ok(false);
+                }
+                visit(held);
+                position += u64::try_from(count)
+                    .map_err(|_| io::Error::other("read length exceeds u64"))?;
+            }
+        }
+        let mut extra = [0];
+        if source.read_at(&mut extra, length)? != 0 || destination.read_at(&mut extra, length)? != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file grew during verification",
+            ));
+        }
+        Ok(true)
+    }
+}
+
 /// SHA-256 of the `length` logical bytes both files must hold identically, reading only where a
 /// file has data. A hole is compared and hashed from static zeros and read from neither file, so
 /// a run both files hold as holes costs no read at all. The digest still covers every logical
@@ -488,39 +557,13 @@ fn compare_file_bytes(
     length: u64,
 ) -> io::Result<crate::api::Sha256Digest> {
     use sha2::{Digest as _, Sha256};
-    use std::os::unix::fs::FileExt as _;
     let mut digest = Sha256::new();
-    let mut source_bytes = vec![0_u8; COMPARE_CHUNK_BYTES];
-    let mut destination_bytes = vec![0_u8; COMPARE_CHUNK_BYTES];
-    for run in Runs::new(source, destination, length)? {
-        let run = run?;
-        let mut position = run.start;
-        while position < run.end {
-            let count = usize::try_from(run.end - position)
-                .map_or(COMPARE_CHUNK_BYTES, |rest| rest.min(COMPARE_CHUNK_BYTES));
-            let held = run_bytes(source, run.source, &mut source_bytes[..count], position)?;
-            let copied = run_bytes(
-                destination,
-                run.destination,
-                &mut destination_bytes[..count],
-                position,
-            )?;
-            if held != copied {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "file content differs",
-                ));
-            }
-            digest.update(held);
-            position +=
-                u64::try_from(count).map_err(|_| io::Error::other("read length exceeds u64"))?;
-        }
-    }
-    let mut extra = [0];
-    if source.read_at(&mut extra, length)? != 0 || destination.read_at(&mut extra, length)? != 0 {
+    if !FileComparison::new()
+        .visit_equal(source, destination, length, |bytes| digest.update(bytes))?
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "file grew during verification",
+            "file content differs",
         ));
     }
     Ok(crate::api::Sha256Digest::from_bytes(

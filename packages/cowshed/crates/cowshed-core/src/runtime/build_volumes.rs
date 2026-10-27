@@ -46,11 +46,13 @@ type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 mod compaction;
 mod nx_clear;
 mod seed_move;
+mod source_mtimes;
 pub(crate) use compaction::{
     Admission, CompactionTurn, Published, SEED_COMPACTION_CATCH_UPS, SEED_COMPACTION_EXTENTS,
     SEED_COMPACTION_WAIT,
 };
 pub(crate) use seed_move::SeedMoveWorkspace;
+pub(crate) use source_mtimes::SourcePaths;
 
 pub(crate) use compaction::lands_hold;
 /// A workspace at one incarnation: whose seed a seed is.
@@ -1402,6 +1404,36 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
+    /// Land step 5.3 (16_build_volumes.md, "Land"): give the target's sources the landing
+    /// checkout's view of time before the landing volume becomes its seed. The target lock also
+    /// excludes forks that would otherwise capture the old source mtimes.
+    pub async fn harmonize_source_mtimes(
+        &self,
+        locked: &TargetLock<H>,
+        source: PathBuf,
+        target: PathBuf,
+        paths: SourcePaths,
+    ) -> Result<()> {
+        let name = locked.target.name.clone();
+        self.blocking(move |_, _| {
+            let started = Instant::now();
+            let report = source_mtimes::harmonize(&source, &target, &paths)?;
+            cowshed_os::eprintln!(
+                "cowshed: {name} source mtimes: {} tracked + {} output paths, {} regular files \
+                 examined, {} advanced, {} outputs compared, {} republished in {:?}",
+                paths.tracked.len(),
+                paths.outputs.len(),
+                report.examined,
+                report.advanced,
+                report.compared,
+                report.republished,
+                started.elapsed(),
+            );
+            Ok(())
+        })
+        .await
+    }
+
     /// Land step 5.4, under the target's image lock: close Nx, retain its open locks and the
     /// existing Cargo profile locks through mounted capture and publication, then claim every
     /// older seed for [`Self::retire_superseded`] once the lock is let go. Other contributed cache/index handles do not refuse capture. Quiet retains
@@ -1516,7 +1548,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         }
     }
 
-    /// Land step 5.1–5.3: when nothing but the target's daemon holds its task database,
+    /// Land step 5.1–5.2: when nothing but the target's daemon holds its task database,
     /// stop that daemon. Answers the target's volume, closed, for [`Self::adopt`].
     pub async fn close_target(
         &self,

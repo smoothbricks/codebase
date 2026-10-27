@@ -657,7 +657,9 @@ caught up to (Catch-up); a later qualifying foreground operation can advise anot
 
 A workspace keeps its own build volume through rebase and gate. A newer warm baseline arrives through a fresh fork,
 which carries the source tree and its build state together; there is no target-only build-volume replacement command and
-no land-time build-volume picker. This preserves ordinary mtime freshness without touching source metadata. Compaction's
+no land-time build-volume picker. This preserves ordinary mtime freshness without touching source metadata, with one
+exception: a land harmonizes the target checkout's source mtimes with the landing checkout's before it freezes the
+landing volume as the target's seed, the one place cowshed writes a source file's metadata (Land step 5.3). Compaction's
 internal move onto the workspace's own seed is different: it proves that the old build volume holds no write the seed
 lacks, before cloning and immediately before sealing (Seed compaction).
 
@@ -773,17 +775,43 @@ unit's export.
       not the daemon named by the target's `nx/workspace-data/d` record, skip;
    2. stop that daemon as stock `nx daemon --stop` does, a SIGTERM to the pid taken from the same record read that
       verified it live, and wait for its exit on a process-exit event (it restarts on the next client). A test with a
-      real stock daemon pins the equivalence: after this stop, `nx daemon` starts cleanly;
-   3. query again; any holder at all, including a daemon a host client started in between, means skip;
-   4. take the target's image lock and admit the landing volume's Nx state and, in a project without the mbx capability,
-      existing Cargo profile locks immediately before capture. A live task-database holder is `landingHeld`, a process
-      opening that database is `landingOpening`, a daemon that outlives its stop is `landingDaemonStayed`, and a held
-      Cargo profile is `landingBuilding`, with the resource and holder named. Retain the Nx open locks and any admitted
-      Cargo locks through the mounted-source capture. Every other contributed path is exempt under the named-list rule
-      above. Capture does not unmount the live volume or kill an index reader. On success, publish the target's new seed
-      and claim its previous seeds, released once the land lets go of the target's image lock (Garbage collection).
-      Writes after the snapshot reach the seed through a reseed (Targets and seeds); the documented new-host-profile gap
-      is not claimed closed.
+      real stock daemon pins the equivalence: after this stop, `nx daemon` starts cleanly. Query again; any holder at
+      all, including a daemon a host client started in between, means skip;
+   3. take the target's image lock and **harmonize the target's source mtimes** with the landing checkout's. A
+      fast-forward rewrites only the files it changes, so a file the landing checkout rewrote on its rebase — after its
+      volume had built a unit from the bytes that file held before the rewrite — holds the same bytes in the target with
+      an older mtime than that unit: paired with the landing volume by the freeze below and the adoption at step 6,
+      Cargo's mtime freshness would judge the unit fresh and reuse it over the landed bytes, and an ignored generated
+      output in the target can hold other bytes altogether. The paths reconciled were enumerated before the
+      fast-forward: the index's tracked files (`git ls-files --cached`) and every regular file on disk that a declared
+      Nx output names, for every target and configuration of the landing checkout's resolved graph, fallback outputs
+      included, whether or not a run selected the task (the plugin's `existingOutputFiles`,
+      `packages/nx-plugin/README.md`, "Cowshed Build-State Output Policy"). A root whose package graph does not resolve
+      `@smoothbricks/nx-plugin` has no policy naming its outputs, so only its tracked files are reconciled and stderr
+      says so, while any other failure to enumerate them, a plugin present but throwing or missing a module of its own
+      included, refuses the land before the fast-forward, with the target unmoved. A generated build input that no task
+      declares as an output and the index does not track is outside this contract: nothing enumerates it and nothing
+      reconciles it. Both checkouts are read through held directories and no-follow opens, so a planted link redirects
+      neither a read nor a timestamp write outside either checkout; a path that is not plainly relative is refused, and
+      one that is not a regular file in both checkouts — absent, a link, a directory or beneath a link in either — is
+      skipped. Files whose mtimes are already equal are skipped without reading a byte. Where they differ, a tracked
+      file, whose bytes the fast-forward made equal, takes the newer of the two mtimes. A declared output — generated
+      and ignored, so its bytes can differ, and reconciled as an output even when the index also tracks it — has its
+      bytes compared: equal bytes take the newer mtime in the same way; different bytes give the target file the time of
+      this pass, one time taken when the pass starts, unless it is already newer, so those bytes are newer than every
+      unit the landing volume built from the landing checkout's bytes. No byte of either checkout changes, only a target
+      file's mtime, and no mtime ever moves back. The pass is reported on stderr with the tracked and output path
+      counts, the regular files examined, the files advanced to the landing checkout's newer mtime, the outputs whose
+      bytes were compared, the outputs republished at the pass's time, and the time the pass took;
+   4. admit the landing volume's Nx state and, in a project without the mbx capability, existing Cargo profile locks
+      immediately before capture. A live task-database holder is `landingHeld`, a process opening that database is
+      `landingOpening`, a daemon that outlives its stop is `landingDaemonStayed`, and a held Cargo profile is
+      `landingBuilding`, with the resource and holder named. Retain the Nx open locks and any admitted Cargo locks
+      through the mounted-source capture. Every other contributed path is exempt under the named-list rule above.
+      Capture does not unmount the live volume or kill an index reader. On success, publish the target's new seed and
+      claim its previous seeds, released once the land lets go of the target's image lock (Garbage collection). Writes
+      after the snapshot reach the seed through a reseed (Targets and seeds); the documented new-host-profile gap is not
+      claimed closed.
 
    Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
    recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a
@@ -801,7 +829,7 @@ unit's export.
    image, expected device and mountpoint and the original command failure. There is no blind mount retry; unrelated
    command failures are never converted into success by a subsequent mount observation.
 
-   The land holds the target's image lock from 5.4 until 6.4 has renamed the target's link and a kept workspace has
+   The land holds the target's image lock from 5.3 until 6.4 has renamed the target's link and a kept workspace has
    captured its fresh clone of the target's latest seed (the new one, or the previous one retained by a skipped
    capture); the clone's mount and link run after the land lets go. Every fork of the target holds the same lock from
    before it reads the target's seed and link until it has captured its own (Fork steps 1 to 3), and so does every
@@ -811,7 +839,7 @@ unit's export.
    for it. It waits with the target's daemon already stopped (5.2), so the longer it waits, the likelier an Nx client
    restarts it and 6.2 skips the swap, reported as any skip is.
 
-   A skip at 1 or 3 still freezes the seed (5.4) and skips the swap. A skipped capture at 5.4 keeps the previous seed
+   A skip at 1 or 2 still freezes the seed (5.4) and skips the swap. A skipped capture at 5.4 keeps the previous seed
    and still swaps.
 
 6. **Adopt the build volume.** Under the Nx open locks and the target's image lock:
@@ -820,7 +848,7 @@ unit's export.
       pinned Nx 23.2.1 `native/db/mod.rs`). A lock some process holds means an Nx process is opening the database: skip,
       and name it. Held, the locks keep every Nx process from opening a database until the rename is done; one that
       starts meanwhile waits, then opens the database by its path, so through the moved link;
-   2. query the target's task database once more: a holder that opened it since 5.3 means skip;
+   2. query the target's task database once more: a holder that opened it since 5.2 means skip;
    3. delete `nx/workspace-data/d` in the landing build volume, then copy into it the target's record of a live daemon
       that runs outside every sandbox (the host daemon a client started since 5.2);
    4. `rename(2)` a new `.cowshed/build` symlink over the target's, naming the landing workspace's build volume, and let
@@ -1439,11 +1467,21 @@ every mtime. A file-by-file copy that restamps files in walk order (`cp -c -R`) 
 - **Enforced by**: the fork test above runs on a cloned build volume and requires every unit `Fresh`.
 - Cargo keeps its default mtime freshness in host shells, jobs and every checkout. That is sound because every producer
   of a Cargo-read input gives changed bytes a fresh mtime: an Nx cache restore stamps what it writes
-  (`packages/nx-plugin/README.md`, "A restored output is newer than the output it replaces"), and a checkout's sources
-  and build state come from one tree ("Source and build state arrive together"). A Cargo run whose directory has none of
-  the checkout's `.cargo/config.toml` above it reads them through `--config`, shallowest first: the cowshed-core
-  capability probe builds its workspace under `CARGO_TARGET_TMPDIR`, which resolves into the build volume, and without
-  them it built cowshed-core's tree without the workspace's linker or `[env]`.
+  (`packages/nx-plugin/README.md`, "A restored output is newer than the output it replaces"); a fork clones its sources
+  and build state from one tree ("Source and build state arrive together"); and a land harmonizes the target's source
+  mtimes with the landing checkout's under the target's image lock, before the landing volume is frozen as its seed or
+  adopted as its build volume (Land step 5.3). A Cargo run whose directory has none of the checkout's
+  `.cargo/config.toml` above it reads them through `--config`, shallowest first: the cowshed-core capability probe
+  builds its workspace under `CARGO_TARGET_TMPDIR`, which resolves into the build volume, and without them it built
+  cowshed-core's tree without the workspace's linker or `[env]`.
+- **Enforced by**: `source_mtimes_make_cargo_rebuild_a_unit_the_fast_forward_left_stale`
+  (`crates/cowshed-core/src/runtime/build_volumes/source_mtimes.rs`), in which real Cargo in its default mtime freshness
+  reuses a unit built from pre-rebase bytes beside the target's older landed source and, after harmonization, rebuilds
+  it from the landed bytes; and that module's unit tests —
+  `source_mtimes_take_only_a_newer_landing_mtime_for_tracked_files`,
+  `source_mtimes_republish_a_differing_output_and_advance_an_equal_one`,
+  `source_mtimes_skip_absent_files_and_never_follow_a_link` and
+  `source_mtimes_refuse_a_path_that_is_not_plainly_relative`.
 
 ### Nx outputs never live in the build volume
 

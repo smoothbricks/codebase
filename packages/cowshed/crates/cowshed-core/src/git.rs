@@ -1207,6 +1207,22 @@ impl GitRepository {
             .collect())
     }
 
+    /// The index's tracked paths, preserving non-UTF-8 names for source-mtime reconciliation, which
+    /// only the macOS land runs.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn tracked_paths(&self) -> Result<Vec<PathBuf>> {
+        let output = self.run(["ls-files", "--cached", "-z"]).await?;
+        if !output.status.success() {
+            return Err(git_internal("list tracked source paths", &output));
+        }
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+            .collect())
+    }
+
     /// Exclude cowshed's runtime metadata, the volume's own bookkeeping
     /// ([`cowshed_apfs::VOLUME_METADATA`]) and the Spotlight opt-out older volumes carry at their
     /// root ([`cowshed_apfs::SPOTLIGHT_OPT_OUT`]) in `.git/info/exclude`: a checkout is its
@@ -6226,6 +6242,26 @@ mod tests {
         assert!(!changes_path(&changes, b"a"));
         assert!(!changes_path(&changes, b"di"));
         assert!(!changes_path(&changes, b"dir/x/y"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn tracked_paths_keep_raw_names_and_exclude_ignored_outputs() {
+        let store = crate::temp_root::FixtureStore::new();
+        let root = repository();
+        // Every byte git's quoting would rewrite without `-z` (non-ASCII under the default
+        // `core.quotePath`, a tab, a double quote), in a name APFS accepts: it refuses a name that
+        // is not UTF-8 (EILSEQ).
+        let raw = PathBuf::from("source-é\t\"q\".rs");
+        fs::write(root.join(&raw), b"tracked").unwrap();
+        fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        fs::create_dir(root.join("ignored")).unwrap();
+        fs::write(root.join("ignored/generated.rs"), b"output").unwrap();
+        git(&root, &["add", "."]);
+        let repository = GitRepository::from_root(store.shared(), root.to_path_buf());
+        let mut expected = vec![PathBuf::from(".gitignore"), PathBuf::from("README"), raw];
+        expected.sort();
+        assert_eq!(repository.tracked_paths().await.unwrap(), expected);
     }
 
     fn repository() -> Repository {
