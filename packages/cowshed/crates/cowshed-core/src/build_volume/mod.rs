@@ -23,6 +23,7 @@ pub mod nx;
 #[cfg(test)]
 pub(crate) mod sqlite;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -657,6 +658,103 @@ impl VolumeFile {
     }
 }
 
+/// One read-only seed-record observation, indexed by target and incarnation. Record failures
+/// stay in enumeration order: earlier matching claim failures still take precedence over them.
+#[derive(Debug, Default)]
+pub(crate) struct SeedRecords {
+    records: Vec<(BuildVolumeId, BuildVolumeRecord)>,
+    targets: BTreeMap<WorkspaceName, BTreeMap<WorkspaceIncarnation, Vec<usize>>>,
+    error: Option<crate::CowshedError>,
+}
+
+impl SeedRecords {
+    fn observe(
+        records: impl IntoIterator<Item = crate::Result<(BuildVolumeId, Option<BuildVolumeRecord>)>>,
+    ) -> Self {
+        let mut observed = Self::default();
+        for read in records {
+            let (id, record) = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    observed.error = Some(error);
+                    break;
+                }
+            };
+            let Some(record) = record else { continue };
+            if let BuildVolumeRole::Seed {
+                target,
+                incarnation,
+            } = &record.role
+                && record.is_published()
+            {
+                let incarnations = if observed.targets.contains_key(target) {
+                    observed.targets.get_mut(target).expect("observed target")
+                } else {
+                    observed.targets.entry(target.clone()).or_default()
+                };
+                let seeds = if incarnations.contains_key(incarnation) {
+                    incarnations
+                        .get_mut(incarnation)
+                        .expect("observed incarnation")
+                } else {
+                    incarnations.entry(incarnation.clone()).or_default()
+                };
+                seeds.push(observed.records.len());
+                observed.records.push((id, record));
+            }
+        }
+        observed
+    }
+
+    fn latest(
+        &self,
+        target: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+        mut claimed: impl FnMut(&BuildVolumeId) -> crate::Result<bool>,
+    ) -> crate::Result<Option<usize>> {
+        let mut latest: Option<(usize, bool)> = None;
+        if let Some(seeds) = self.targets.get(target).and_then(|at| at.get(incarnation)) {
+            for &index in seeds {
+                let (id, record) = &self.records[index];
+                let unclaimed = !claimed(id)?;
+                if latest.is_none_or(|(previous, free)| {
+                    (&record.created_at, unclaimed) >= (&self.records[previous].1.created_at, free)
+                }) {
+                    latest = Some((index, unclaimed));
+                }
+            }
+        }
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(latest
+            .filter(|(_, unclaimed)| *unclaimed)
+            .map(|(index, _)| index))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn seed_of(
+        &self,
+        layout: &BuildVolumeLayout,
+        target: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+    ) -> crate::Result<Option<&(BuildVolumeId, BuildVolumeRecord)>> {
+        Ok(self
+            .latest(target, incarnation, |id| layout.seed_claimed(id))?
+            .map(|index| &self.records[index]))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEED_IO_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Actual build-directory listings and record reads on this test thread, not estimated syscalls.
+#[cfg(test)]
+pub(crate) fn seed_io_counts() -> (usize, usize) {
+    SEED_IO_COUNTS.with(std::cell::Cell::get)
+}
 /// Where one project's build volumes live.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildVolumeLayout {
@@ -958,6 +1056,11 @@ impl BuildVolumeLayout {
         &self,
         id: &BuildVolumeId,
     ) -> crate::Result<Option<BuildVolumeRecord>> {
+        #[cfg(test)]
+        SEED_IO_COUNTS.with(|counts| {
+            let (listings, reads) = counts.get();
+            counts.set((listings, reads + 1));
+        });
         let path = self.record(id);
         let record: BuildVolumeRecord = match read_json(&path) {
             Ok(record) => record,
@@ -1097,6 +1200,11 @@ impl BuildVolumeLayout {
     }
 
     fn list_entries(&self, include_records: bool) -> crate::Result<Vec<BuildVolumeId>> {
+        #[cfg(test)]
+        SEED_IO_COUNTS.with(|counts| {
+            let (listings, reads) = counts.get();
+            counts.set((listings + 1, reads));
+        });
         let entries = match fs::read_dir(&self.images) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1208,34 +1316,36 @@ impl BuildVolumeLayout {
         target: &WorkspaceName,
         incarnation: &WorkspaceIncarnation,
     ) -> crate::Result<Option<(BuildVolumeId, BuildVolumeRecord)>> {
-        let mut seeds = Vec::new();
-        for id in self.list()? {
-            let Some(record) = self.read_record_present(&id)? else {
-                continue;
-            };
-            let claimed = || {
-                self.claimed(&id).map_err(|error| {
-                    crate::CowshedError::integrity(
-                        format!(
-                            "build volume hold {} is unreadable: {error}",
-                            self.hold_path(&id).display()
-                        ),
-                        "cowshed doctor --json",
-                    )
-                })
-            };
-            if record.is_seed_of(target, incarnation) {
-                let unclaimed = !claimed()?;
-                seeds.push((unclaimed, id, record));
-            }
+        let mut observed = self.seed_records();
+        let latest = observed.latest(target, incarnation, |id| self.seed_claimed(id))?;
+        Ok(latest.map(|index| observed.records.swap_remove(index)))
+    }
+
+    /// Observe records without claiming images or granting mutation authority. An unreadable
+    /// record stops the observation, but is reported only by a target that reaches seed lookup.
+    pub(crate) fn seed_records(&self) -> SeedRecords {
+        match self.list() {
+            Ok(ids) => SeedRecords::observe(
+                ids.into_iter()
+                    .map(|id| self.read_record_present(&id).map(|record| (id, record))),
+            ),
+            Err(error) => SeedRecords {
+                error: Some(error),
+                ..SeedRecords::default()
+            },
         }
-        seeds.sort_by(|left, right| {
-            (&left.2.created_at, left.0).cmp(&(&right.2.created_at, right.0))
-        });
-        Ok(seeds
-            .pop()
-            .filter(|(unclaimed, ..)| *unclaimed)
-            .map(|(_, id, record)| (id, record)))
+    }
+
+    fn seed_claimed(&self, id: &BuildVolumeId) -> crate::Result<bool> {
+        self.claimed(id).map_err(|error| {
+            crate::CowshedError::integrity(
+                format!(
+                    "build volume hold {} is unreadable: {error}",
+                    self.hold_path(id).display()
+                ),
+                "cowshed doctor --json",
+            )
+        })
     }
 }
 
@@ -1606,13 +1716,10 @@ mod tests {
     }
 
     #[test]
-    fn the_latest_seed_of_a_target_wins_and_other_targets_are_invisible() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-build-seeds-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+    fn fresh_seed_lookup_observes_records_once_and_never_falls_back_from_claimed_newest() {
+        let root = crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-seed-records");
         let project = ProjectPaths::with_mount_root(
-            &root,
+            root.join("store"),
             root.join("mnt"),
             &RepoId::parse("acme/widget").unwrap(),
         )
@@ -1620,50 +1727,265 @@ mod tests {
         let layout = BuildVolumeLayout::new(&project).unwrap();
         fs::create_dir_all(layout.images()).unwrap();
         let main = WorkspaceName::main();
-        let incarnation = WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef").unwrap();
-        let seed = |created_at: &str, target: &WorkspaceName| {
+        let incarnation = WorkspaceIncarnation::new("0".repeat(32)).unwrap();
+        let seed = |second| {
             let id = BuildVolumeId::mint();
-            fs::write(layout.image(&id), b"").unwrap();
-            let mut record = BuildVolumeRecord::new(
-                None,
-                BuildVolumeRole::Seed {
-                    target: target.clone(),
+            let record = BuildVolumeRecord {
+                version: RECORD_VERSION,
+                tree: None,
+                role: BuildVolumeRole::Seed {
+                    target: main.clone(),
                     incarnation: incarnation.clone(),
                 },
-            );
-            record.created_at = created_at.to_owned();
+                created_at: format!("2026-10-05T00:00:{second:02}Z"),
+                checked_out: None,
+                stage: BuildVolumeStage::Published,
+            };
+            fs::write(layout.image(&id), b"").unwrap();
             layout.write_record(&id, &record).unwrap();
             id
         };
-        assert_eq!(layout.seed_of(&main, &incarnation).unwrap(), None);
-        seed("2026-10-05T00:00:00Z", &main);
-        let latest = seed("2026-10-05T00:00:01Z", &main);
-        seed("2026-10-05T00:00:02Z", &WorkspaceName::new("lane").unwrap());
-        // A seed still registered may be partial: it is no seed of anyone until published.
-        let forming = BuildVolumeId::mint();
-        fs::write(layout.image(&forming), b"").unwrap();
-        let mut record = BuildVolumeRecord::new(
-            None,
-            BuildVolumeRole::Seed {
-                target: main.clone(),
-                incarnation: incarnation.clone(),
-            },
-        );
-        record.created_at = "2026-10-05T00:00:03Z".to_owned();
-        layout
-            .write_record(
-                &forming,
-                Registration::new(record, Registrant::Intent).registered(),
-            )
-            .unwrap();
+        let predecessor = seed(0);
+        let claimed = layout.claim_release(&predecessor).unwrap().unwrap();
+        let successor = seed(0);
+        let missing = BuildVolumeId::mint();
+        fs::write(layout.image(&missing), b"").unwrap();
+        let before = seed_io_counts();
         assert_eq!(
             layout
                 .seed_of(&main, &incarnation)
                 .unwrap()
                 .map(|(id, _)| id),
-            Some(latest)
+            Some(successor)
         );
-        fs::remove_dir_all(&root).unwrap();
+        let after = seed_io_counts();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 3));
+        let retiring = seed(1);
+        let retirement = layout.claim_release(&retiring).unwrap().unwrap();
+        let before = seed_io_counts();
+        assert_eq!(
+            layout.seed_of(&main, &incarnation).unwrap(),
+            None,
+            "a new lifecycle lookup observes the new claimed seed, not the old observation"
+        );
+        let after = seed_io_counts();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 4));
+        drop((claimed, retirement));
+    }
+
+    #[test]
+    fn latest_seed_decision_table() {
+        let main = WorkspaceName::main();
+        let incarnation = WorkspaceIncarnation::new("0".repeat(32)).unwrap();
+        let record = |second, role| BuildVolumeRecord {
+            version: RECORD_VERSION,
+            tree: None,
+            role,
+            created_at: format!("2026-10-05T00:00:{second:02}Z"),
+            checked_out: None,
+            stage: BuildVolumeStage::Published,
+        };
+        let older = record(
+            0,
+            BuildVolumeRole::Seed {
+                target: main.clone(),
+                incarnation: incarnation.clone(),
+            },
+        );
+        let newer = BuildVolumeRecord {
+            created_at: "2026-10-05T00:00:01Z".to_owned(),
+            ..older.clone()
+        };
+        let foreign = record(
+            2,
+            BuildVolumeRole::Seed {
+                target: WorkspaceName::new("lane").unwrap(),
+                incarnation: incarnation.clone(),
+            },
+        );
+        let previous = record(
+            2,
+            BuildVolumeRole::Seed {
+                target: main.clone(),
+                incarnation: WorkspaceIncarnation::new("1".repeat(32)).unwrap(),
+            },
+        );
+        let live = record(
+            2,
+            BuildVolumeRole::Linked {
+                checkout: main.clone(),
+            },
+        );
+        let forming = BuildVolumeRecord {
+            stage: BuildVolumeStage::Registered {
+                by: Registrant::Intent,
+            },
+            ..newer.clone()
+        };
+        for (name, rows, expected, expected_claims) in [
+            ("empty", vec![], None, vec![]),
+            ("missing record", vec![(None, false)], None, vec![]),
+            (
+                "newer wins",
+                vec![(Some(older.clone()), false), (Some(newer.clone()), false)],
+                Some(1),
+                vec![0, 1],
+            ),
+            (
+                "older later",
+                vec![(Some(newer.clone()), false), (Some(older.clone()), false)],
+                Some(0),
+                vec![0, 1],
+            ),
+            (
+                "newest claimed",
+                vec![(Some(older.clone()), false), (Some(newer.clone()), true)],
+                None,
+                vec![0, 1],
+            ),
+            (
+                "claimed newest first",
+                vec![(Some(newer.clone()), true), (Some(older.clone()), false)],
+                None,
+                vec![0, 1],
+            ),
+            (
+                "same second successor",
+                vec![(Some(newer.clone()), true), (Some(newer.clone()), false)],
+                Some(1),
+                vec![0, 1],
+            ),
+            (
+                "same second claimed later",
+                vec![(Some(newer.clone()), false), (Some(newer.clone()), true)],
+                Some(0),
+                vec![0, 1],
+            ),
+            (
+                "exact tie keeps enumeration order",
+                vec![(Some(newer.clone()), false), (Some(newer.clone()), false)],
+                Some(1),
+                vec![0, 1],
+            ),
+            (
+                "all claimed",
+                vec![(Some(newer.clone()), true), (Some(newer.clone()), true)],
+                None,
+                vec![0, 1],
+            ),
+            (
+                "only current published owner",
+                vec![
+                    (Some(older.clone()), false),
+                    (Some(foreign), true),
+                    (Some(previous), true),
+                    (Some(live), true),
+                    (Some(forming), true),
+                    (None, true),
+                ],
+                Some(0),
+                vec![0],
+            ),
+        ] {
+            let holds = rows.iter().map(|(_, claimed)| *claimed).collect::<Vec<_>>();
+            let observed =
+                SeedRecords::observe(rows.into_iter().enumerate().map(|(index, (record, _))| {
+                    Ok((
+                        BuildVolumeId::parse(&format!("{index:032x}")).unwrap(),
+                        record,
+                    ))
+                }));
+            let mut claims = Vec::new();
+            let selected = observed
+                .latest(&main, &incarnation, |id| {
+                    let index = usize::from_str_radix(id.as_str(), 16).unwrap();
+                    claims.push(index);
+                    Ok(holds[index])
+                })
+                .unwrap();
+            assert_eq!(
+                selected.map(
+                    |index| usize::from_str_radix(observed.records[index].0.as_str(), 16).unwrap()
+                ),
+                expected,
+                "{name}"
+            );
+            assert_eq!(
+                claims, expected_claims,
+                "{name}: unrelated holds must not be probed"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_record_and_matching_claim_errors_keep_enumeration_priority() {
+        let main = WorkspaceName::main();
+        let incarnation = WorkspaceIncarnation::new("0".repeat(32)).unwrap();
+        let seed = BuildVolumeRecord {
+            version: RECORD_VERSION,
+            tree: None,
+            role: BuildVolumeRole::Seed {
+                target: main.clone(),
+                incarnation: incarnation.clone(),
+            },
+            created_at: "2026-10-05T00:00:00Z".to_owned(),
+            checked_out: None,
+            stage: BuildVolumeStage::Published,
+        };
+        let id = BuildVolumeId::parse(&"0".repeat(32)).unwrap();
+        let read_error = crate::CowshedError::integrity("record unreadable", "inspect record");
+        let claim_error = crate::CowshedError::integrity("claim unreadable", "inspect hold");
+        for (name, rows, refuse_claim, expected, expected_claims) in [
+            (
+                "record before matching seed",
+                vec![
+                    Err(read_error.clone()),
+                    Ok((id.clone(), Some(seed.clone()))),
+                ],
+                true,
+                read_error.clone(),
+                0,
+            ),
+            (
+                "matching claim before record",
+                vec![
+                    Ok((id.clone(), Some(seed.clone()))),
+                    Err(read_error.clone()),
+                ],
+                true,
+                claim_error.clone(),
+                1,
+            ),
+            (
+                "successful claim before record",
+                vec![
+                    Ok((id.clone(), Some(seed.clone()))),
+                    Err(read_error.clone()),
+                ],
+                false,
+                read_error.clone(),
+                1,
+            ),
+        ] {
+            let observed = SeedRecords::observe(rows);
+            let mut claims = 0;
+            let found = observed.latest(&main, &incarnation, |_| {
+                claims += 1;
+                if refuse_claim {
+                    Err(claim_error.clone())
+                } else {
+                    Ok(false)
+                }
+            });
+            assert_eq!(found, Err(expected), "{name}");
+            assert_eq!(claims, expected_claims, "{name}");
+            let foreign = WorkspaceName::new("unrelated").unwrap();
+            assert_eq!(
+                observed.latest(&foreign, &incarnation, |_| panic!("unrelated claim")),
+                Err(read_error.clone()),
+                "record failures precede owner filtering"
+            );
+        }
     }
 
     #[test]

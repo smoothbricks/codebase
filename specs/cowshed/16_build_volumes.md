@@ -465,7 +465,9 @@ limit (08_testing.md).
 compares the image modification times, never tool-file statistics. `seed-tree-behind` names the seed's tree and the
 target's `HEAD^{tree}` (and the number of commits since a matching tree when available); `target-moved-outside-land`
 names both recorded volume trees when neither equals HEAD. A next fork tries tree-matched capture; a plain Git
-fast-forward performs no output restoration or adoption.
+fast-forward performs no output restoration or adoption. Doctor shares one operation-local, target-indexed observation
+of build records across these seed probes, retaining per-target claim checks, image modification times and failure
+precedence; lifecycle seed lookups remain fresh.
 
 - **Enforced by**: a real-APFS test in which main runs an Nx task after adopting a landed volume and a fork reseeds main
   and hits that task; a keeper-held fork that reports a busy skip, keeps the existing seed and takes the cold path,

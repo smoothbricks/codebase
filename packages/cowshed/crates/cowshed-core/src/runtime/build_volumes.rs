@@ -13,7 +13,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::storage_host::RuntimeStorageHost;
@@ -25,7 +25,7 @@ use crate::build_volume::migrate::{MintedBeside, MintedVolume};
 use crate::build_volume::{
     BuildStateRefresh, BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord,
     BuildVolumeRole, BuildVolumeStage, BuildVolumeState, CapturedBuildVolume, Registrant,
-    Registration, ReleaseClaim, TrackedBuildStateRefusal, cargo, link, nx,
+    Registration, ReleaseClaim, SeedRecords, TrackedBuildStateRefusal, cargo, link, nx,
 };
 use crate::capabilities::BuildStatePath;
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
@@ -1384,17 +1384,18 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
-    /// `target`'s seed against the live volume `checkout` links, both measured against `tree`,
-    /// or `None` when it links none, or one an interrupted first touch left unpublished.
-    pub async fn seed_age(
+    /// Doctor's seed age, sharing only record observation across this operation's targets.
+    /// The live record, image clocks and matching claim probes remain per-target observations.
+    pub async fn doctor_seed_age(
         &self,
         target: Owner,
         checkout: PathBuf,
         tree: GitOid,
+        records: Arc<OnceLock<SeedRecords>>,
     ) -> Result<Option<SeedAge>> {
         let live = self.layout.linked(&checkout)?;
         self.blocking(move |host, layout| match live {
-            Some(live) => seed_age(host, layout, &target, live, &checkout, &tree),
+            Some(live) => doctor_seed_age(host, layout, &target, live, &checkout, &tree, &records),
             None => Ok(None),
         })
         .await
@@ -1458,7 +1459,11 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
 
     fn age_now(&self, target: &Owner, checkout: &Path, tree: &GitOid) -> Result<Option<SeedAge>> {
         match self.layout.linked(checkout)? {
-            Some(live) => seed_age(&*self.host, &self.layout, target, live, checkout, tree),
+            Some(live) => seed_age(&*self.host, &self.layout, live, checkout, tree, || {
+                self.layout
+                    .seed_of(&target.name, &target.incarnation)
+                    .map(|seed| seed.map(|(id, record)| (id, record.tree)))
+            }),
             None => Ok(None),
         }
     }
@@ -2715,26 +2720,44 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
     }
 }
 
-/// `target`'s seed against its live volume `live`, both measured against `tree` in the target's
-/// repository at `checkout`, or `None` when `live` is an interrupted first touch's, unpublished:
-/// only a fresh discovery finishes that one.
-fn seed_age(
+/// Doctor reaches the shared record observation only after this target's live record and
+/// image clock succeed. Unlinked/missing-live targets therefore cannot inherit its failure.
+fn doctor_seed_age(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     target: &Owner,
     live: BuildVolumeId,
     checkout: &Path,
     tree: &GitOid,
+    records: &OnceLock<SeedRecords>,
+) -> Result<Option<SeedAge>> {
+    seed_age(host, layout, live, checkout, tree, || {
+        records
+            .get_or_init(|| layout.seed_records())
+            .seed_of(layout, &target.name, &target.incarnation)
+            .map(|seed| seed.map(|(id, record)| (id.clone(), record.tree.clone())))
+    })
+}
+
+/// Compare this live volume with the selected seed, keeping live-record and image-clock
+/// errors ahead of seed lookup, and sampling every image's own actual modification time.
+fn seed_age(
+    host: &impl RuntimeStorageHost,
+    layout: &BuildVolumeLayout,
+    live: BuildVolumeId,
+    checkout: &Path,
+    tree: &GitOid,
+    select_seed: impl FnOnce() -> Result<Option<(BuildVolumeId, Option<GitOid>)>>,
 ) -> Result<Option<SeedAge>> {
     let Some(record) = layout.read_record_present(&live)? else {
         return Ok(None);
     };
     let written = host.build_volume_written(layout, &live).map_err(storage)?;
-    let seed = match layout.seed_of(&target.name, &target.incarnation)? {
-        Some((id, seed)) => Some(Frozen {
+    let seed = match select_seed()? {
+        Some((id, seed_tree)) => Some(Frozen {
             written: host.build_volume_written(layout, &id).map_err(storage)?,
-            nearness: nearness(checkout, seed.tree.as_ref(), tree),
-            tree: seed.tree,
+            nearness: nearness(checkout, seed_tree.as_ref(), tree),
+            tree: seed_tree,
             id,
         }),
         None => None,
@@ -3223,6 +3246,267 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn directory_doctor_seed_records_are_one_observation_for_many_targets() {
+        let scratch = Scratch::data_directory("doctor-seed-counts");
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        let mut claims = Vec::new();
+        let seed = |target: &Owner, second| {
+            let id = BuildVolumeId::mint();
+            let registration = registered(BuildVolumeRecord {
+                version: 1,
+                tree: Some(tree.clone()),
+                role: BuildVolumeRole::Seed {
+                    target: target.name.clone(),
+                    incarnation: target.incarnation.clone(),
+                },
+                created_at: format!("2026-10-05T00:00:{second:02}Z"),
+                checked_out: None,
+                stage: BuildVolumeStage::Published,
+            });
+            let (_, creating) = scratch
+                .host
+                .create_build_volume(
+                    &scratch.layout,
+                    &id,
+                    ImageCapacity::from_gibibytes(1),
+                    &registration,
+                )
+                .unwrap();
+            scratch.layout.publish(&id, &registration).unwrap();
+            drop(creating);
+            id
+        };
+        let mut checkouts = Vec::with_capacity(64);
+        for index in 0..64 {
+            let target = owner(&format!("target-{index}"), '0');
+            let (checkout, live, _) = scratch.linked_checkout(target.name.as_str(), 1);
+            let mut record = scratch.layout.read_record(&live).unwrap();
+            record.tree = Some(tree.clone());
+            record.checked_out = Some(tree.clone());
+            scratch.layout.write_record(&live, &record).unwrap();
+            let predecessor = seed(&target, 0);
+            claims.push(scratch.layout.claim_release(&predecessor).unwrap().unwrap());
+            let current = seed(&target, 0);
+            let expected = if matches!(index, 0 | 7 | 63) {
+                let retiring = seed(&target, 1);
+                claims.push(scratch.layout.claim_release(&retiring).unwrap().unwrap());
+                None
+            } else {
+                Some(current)
+            };
+            checkouts.push((target, checkout, live, expected));
+        }
+        let missing_record = BuildVolumeId::mint();
+        fs::create_dir(scratch.layout.image(&missing_record)).unwrap();
+        let mut added_unrelated = 0;
+        for unrelated in [1, 8, 64] {
+            for index in added_unrelated..unrelated {
+                let foreign = seed(&owner(&format!("foreign-{index}"), '1'), 2);
+                let hold = scratch.layout.hold_path(&foreign);
+                fs::remove_file(&hold).unwrap();
+                std::os::unix::fs::symlink(&hold, &hold).unwrap();
+            }
+            added_unrelated = unrelated;
+            for targets in [1, 8, 64] {
+                let images = scratch.layout.list().unwrap().len();
+                let records = OnceLock::new();
+                let before = crate::build_volume::seed_io_counts();
+                for (target, checkout, live, expected) in checkouts.iter().take(targets) {
+                    let age = doctor_seed_age(
+                        &*scratch.host,
+                        &scratch.layout,
+                        target,
+                        live.clone(),
+                        checkout,
+                        &tree,
+                        &records,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(age.live, *live);
+                    assert_eq!(age.nearness, Nearness::Equal);
+                    assert_eq!(age.placed, Placed::Here);
+                    assert_eq!(
+                        age.written,
+                        scratch
+                            .host
+                            .build_volume_written(&scratch.layout, live)
+                            .unwrap()
+                    );
+                    assert_eq!(age.seed.as_ref().map(|seed| &seed.id), expected.as_ref());
+                    if let Some(frozen) = age.seed {
+                        assert_eq!(frozen.tree, Some(tree.clone()));
+                        assert_eq!(frozen.nearness, Nearness::Equal);
+                        assert_eq!(
+                            frozen.written,
+                            scratch
+                                .host
+                                .build_volume_written(&scratch.layout, &frozen.id)
+                                .unwrap()
+                        );
+                    }
+                }
+                let after = crate::build_volume::seed_io_counts();
+                assert_eq!(
+                    after.0 - before.0,
+                    1,
+                    "B={images}, T={targets}, unrelated={unrelated}"
+                );
+                assert_eq!(
+                    after.1 - before.1,
+                    images + targets,
+                    "one B-record observation plus T live reads; B={images}, T={targets}"
+                );
+                cowshed_os::eprintln!(
+                    "doctor-seed counts: B={images} T={targets} unrelated={unrelated} listings={} records={}",
+                    after.0 - before.0,
+                    after.1 - before.1,
+                );
+            }
+        }
+
+        drop(claims);
+    }
+
+    #[tokio::test]
+    async fn directory_doctor_seed_age_keeps_per_target_failure_precedence() {
+        let scratch = Scratch::data_directory("doctor-seed-errors");
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        let target = owner("main", '0');
+        let (checkout, live, _) = scratch.linked_checkout("main", 1);
+        let (missing_checkout, missing_live, _) = scratch.linked_checkout("missing", 1);
+        fs::remove_file(scratch.layout.record(&missing_live)).unwrap();
+        let (unreadable_checkout, unreadable_live, _) = scratch.linked_checkout("unreadable", 1);
+        fs::write(scratch.layout.record(&unreadable_live), b"not json").unwrap();
+        let (clock_checkout, clock_live, _) = scratch.linked_checkout("clock", 1);
+        fs::remove_file(scratch.layout.image(&clock_live)).unwrap();
+        let unlinked = scratch.root.path().join("unlinked");
+        fs::create_dir(&unlinked).unwrap();
+        let records = Arc::new(OnceLock::new());
+        let diagnose = |path: PathBuf| {
+            scratch.volumes.doctor_seed_age(
+                target.clone(),
+                path,
+                tree.clone(),
+                Arc::clone(&records),
+            )
+        };
+        for path in [&unlinked, &missing_checkout] {
+            assert!(diagnose(path.clone()).await.unwrap().is_none());
+            assert!(
+                records.get().is_none(),
+                "no seed observation before a live record exists"
+            );
+        }
+        let live_error = diagnose(unreadable_checkout.clone()).await.unwrap_err();
+        assert!(
+            live_error.message.contains(
+                &scratch
+                    .layout
+                    .record(&unreadable_live)
+                    .display()
+                    .to_string()
+            ),
+            "{live_error:?}"
+        );
+        assert!(records.get().is_none());
+        let clock_error = diagnose(clock_checkout.clone()).await.unwrap_err();
+        assert!(
+            clock_error
+                .message
+                .contains(&scratch.layout.image(&clock_live).display().to_string()),
+            "{clock_error:?}"
+        );
+        assert!(
+            records.get().is_none(),
+            "live mtime failure precedes seed observation"
+        );
+        let record_error = diagnose(checkout.clone()).await.unwrap_err();
+        assert_eq!(
+            record_error, live_error,
+            "an unrelated unreadable record is still a seed-lookup error"
+        );
+        assert!(records.get().is_some());
+        for path in [&unlinked, &missing_checkout] {
+            assert!(
+                diagnose(path.clone()).await.unwrap().is_none(),
+                "an existing shared failure cannot override None"
+            );
+        }
+        assert_eq!(diagnose(unreadable_checkout).await.unwrap_err(), live_error);
+        assert_eq!(diagnose(clock_checkout).await.unwrap_err(), clock_error);
+        assert_eq!(
+            diagnose(checkout).await.unwrap_err(),
+            record_error,
+            "one observation shares the exact error value"
+        );
+        assert!(scratch.layout.image(&live).exists());
+    }
+
+    #[tokio::test]
+    async fn directory_doctor_seed_records_do_not_freeze_image_clocks() {
+        let scratch = Scratch::data_directory("doctor-seed-clock");
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        let target = owner("main", '0');
+        let (checkout, live, _) = scratch.linked_checkout("main", 1);
+        let (_, frozen, _) = scratch.linked_checkout("frozen", 1);
+        for (id, role) in [
+            (&live, linked("main")),
+            (
+                &frozen,
+                BuildVolumeRole::Seed {
+                    target: target.name.clone(),
+                    incarnation: target.incarnation.clone(),
+                },
+            ),
+        ] {
+            let mut record = scratch.layout.read_record(id).unwrap();
+            record.role = role;
+            record.tree = Some(tree.clone());
+            scratch.layout.write_record(id, &record).unwrap();
+        }
+        let records = Arc::new(OnceLock::new());
+        let age = scratch
+            .volumes
+            .doctor_seed_age(
+                target.clone(),
+                checkout.clone(),
+                tree.clone(),
+                Arc::clone(&records),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            age.written,
+            scratch
+                .host
+                .build_volume_written(&scratch.layout, &live)
+                .unwrap()
+        );
+        assert_eq!(
+            age.seed.unwrap().written,
+            scratch
+                .host
+                .build_volume_written(&scratch.layout, &frozen)
+                .unwrap()
+        );
+        assert!(records.get().is_some());
+        fs::remove_file(scratch.layout.image(&frozen)).unwrap();
+        let error = scratch
+            .volumes
+            .doctor_seed_age(target, checkout, tree, records)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains(&scratch.layout.image(&frozen).display().to_string()),
+            "a seed's actual image clock is reread even when its record was already observed: {error:?}"
+        );
     }
 
     #[test]
@@ -4329,6 +4613,8 @@ mod tests {
     enum FixtureRoot {
         Apfs(crate::scratch_apfs::ScratchRoot),
         Directory(crate::scratch_directory::ScratchRoot),
+
+        Files(crate::temp_root::TempRoot),
     }
 
     #[cfg(target_os = "macos")]
@@ -4337,6 +4623,8 @@ mod tests {
             match self {
                 Self::Apfs(root) => root.path(),
                 Self::Directory(root) => root.path(),
+
+                Self::Files(root) => root,
             }
         }
     }
@@ -4369,11 +4657,22 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl Scratch<crate::storage::directory::DirectoryExecutionHost> {
         fn directory(name: &str) -> Self {
+            Self::directory_in(FixtureRoot::Directory(
+                crate::scratch_directory::ScratchRoot::new(name).expect("scratch directory root"),
+            ))
+        }
+
+        /// Data-only scenarios use the ordinary exec's granted filesystem parent.
+        fn data_directory(name: &str) -> Self {
+            Self::directory_in(FixtureRoot::Files(crate::temp_root::TempRoot::new_in(
+                &std::env::temp_dir(),
+                name,
+            )))
+        }
+
+        fn directory_in(root: FixtureRoot) -> Self {
             Self::with_root(
-                FixtureRoot::Directory(
-                    crate::scratch_directory::ScratchRoot::new(name)
-                        .expect("scratch directory root"),
-                ),
+                root,
                 crate::storage::directory::DirectoryExecutionHost::new,
                 |host, layout, id, gib, registration| {
                     host.create_build_volume(
@@ -4403,8 +4702,8 @@ mod tests {
             let store = root.path().join("store");
             let namespace = match &root {
                 FixtureRoot::Apfs(apfs) => HostNamespace::Test(apfs.namespace()),
-                // A directory root names no namespace of its own, so this run mints one.
-                FixtureRoot::Directory(_) => {
+                // These live directory roots name no namespace directory of their own.
+                FixtureRoot::Directory(_) | FixtureRoot::Files(_) => {
                     HostNamespace::Test(TestNamespace::mint().expect("a test namespace"))
                 }
             };

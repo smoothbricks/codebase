@@ -16793,6 +16793,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .filter_map(|workspace| workspace.metadata.info_snapshot.forked_from.clone())
                     .chain(std::iter::once(main_name()))
                     .collect::<std::collections::BTreeSet<_>>();
+                let seed_records = std::sync::Arc::new(std::sync::OnceLock::new());
                 let main_mount = self.workspace_mount_path(&main_name()).ok();
                 companion_images.extend(workspaces.iter().map(|workspace| {
                     (
@@ -17014,7 +17015,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                         };
                                         let Some(age) = self
                                             .build_volumes()?
-                                            .seed_age(owner, expected_mount.clone(), tree.clone())
+                                            .doctor_seed_age(
+                                                owner,
+                                                expected_mount.clone(),
+                                                tree.clone(),
+                                                std::sync::Arc::clone(&seed_records),
+                                            )
                                             .await?
                                         else {
                                             return Ok(Vec::new());
