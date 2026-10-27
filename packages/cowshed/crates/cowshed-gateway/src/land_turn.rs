@@ -565,14 +565,15 @@ pub(crate) async fn hold<R, W>(
     loop {
         // Biased, in this order: an asker that sends its end and exits leaves both ready, and its
         // end, already in the socket's buffer, is read before its exit, so the turn records how
-        // the command ended rather than an abandonment.
+        // the command ended rather than an abandonment. An answer that cannot be written means
+        // the asker is gone, not that its steps are: what it sent before it went is read below.
         tokio::select! {
             biased;
             answer = answers.recv() => {
                 let Some(answer) = answer else { return };
                 held |= matches!(answer, TurnAnswer::Held { .. });
                 if write(&mut writer, &answer).await.is_err() {
-                    return;
+                    break;
                 }
             }
             step = steps.next_line() => {
@@ -582,16 +583,16 @@ pub(crate) async fn hold<R, W>(
                     return;
                 };
                 if write(&mut writer, &answer).await.is_err() {
-                    return;
+                    break;
                 }
             }
             () = &mut asker_gone => break,
         }
     }
-    // The asker has exited, but a command it forked may still be between its fork and its exec,
-    // its bind on the way on this connection, which it shares until its exec closes it. EOF, once
-    // every copy is closed, is the proof that none is: each bind before it is read and bound, so no
-    // command runs outside the turn (05_gateway.md "Land turns").
+    // The asker has exited or stopped reading, but a command it forked may still be between its
+    // fork and its exec, its bind on the way on this connection, which it shares until its exec
+    // closes it. EOF, once every copy is closed, is the proof that none is: each bind before it is
+    // read and bound, so no command runs outside the turn (05_gateway.md "Land turns").
     while let Ok(Some(step)) = steps.next_line().await {
         let Some(answer) = stepped(&turns, number, held, &step, &mut place).await else {
             return;
@@ -726,6 +727,59 @@ mod tests {
             .filter(|queue| queue.repo.as_str() == repo)
             .flat_map(|queue| queue.tickets.into_iter().map(|ticket| ticket.number))
             .collect()
+    }
+
+    /// The answers a gone asker cannot be written, never fail to be: a writer that refuses every
+    /// write ends nothing the asker sent before it went.
+    struct Gone;
+
+    impl AsyncWrite for Gone {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A land whose command fails to start sends its end and exits, and the gateway may answer
+    /// its turn only after: the answer it cannot write ends nothing, the end already sent is read,
+    /// and the ticket finishes with its outcome instead of being recorded abandoned
+    /// (05_gateway.md, "A ticket's life is said").
+    #[tokio::test]
+    async fn an_end_sent_before_an_unwritable_answer_finishes_the_ticket() {
+        let (_asker, gateway) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let asker = Process::of_socket_peer(&gateway).expect("the peer is this process");
+        let turns = LandTurns::start();
+        let steps: &[u8] = b"{\"step\":\"end\",\"outcome\":\"did not start: missing\"}\n";
+        hold(
+            steps,
+            Gone,
+            Some(asker),
+            ask("repo", "missing"),
+            turns.clone(),
+        )
+        .await;
+        let queues = turns.queues(0).await.expect("the land turns run");
+        assert!(
+            queues.is_empty(),
+            "the ticket finished, neither held nor abandoned: {queues:?}"
+        );
     }
 
     #[test]
