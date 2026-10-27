@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { cp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { AUTOMATIC_INTERVAL_MS, RETENTION_RECEIPT } from '@smoothbricks/cargo-retain';
@@ -19,6 +20,7 @@ import {
   parseReport,
   planned,
   put,
+  RETENTION_LOCK,
   reclaimPaths,
   relock,
   retain,
@@ -178,7 +180,13 @@ describe('cargo retention after real Nx runs', () => {
           const dueReceipt = await readFile(receiptPath, 'utf8');
           const skipped = await runNx('ws:build-uncached', preload);
           expect(skipped.code, skipped.log).toBe(0);
-          expect(skipped.log).toMatch(/Cargo retention .*: refused, .*: cannot attempt .*EPERM/);
+          const refusal =
+            process.platform === 'darwin'
+              ? `open '${join(fx.target, RETENTION_LOCK)}': errno ${constants.errno.EPERM}: operation not permitted`
+              : 'cannot run perl: spawn EPERM';
+          expect(skipped.log).toContain(
+            `Cargo retention ${fx.target}: refused, ${fx.target}: cannot attempt the retention lock: ${refusal}; nothing was changed`,
+          );
           expect(await readFile(receiptPath, 'utf8')).toBe(dueReceipt);
           // Whatever else escapes a pass is reported as well, never rethrown: here cargo itself cannot be spawned.
           await put(preload, denyPreload(['cargo'], false));
